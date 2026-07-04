@@ -1,7 +1,7 @@
 //! CLI interface for omni-dev.
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 pub mod ai;
 pub mod atlassian;
@@ -26,30 +26,18 @@ pub mod transcript;
 #[cfg(unix)]
 pub mod worktrees;
 
-/// CLI-side selector for the AI backend dispatched by
-/// [`create_default_claude_client`][crate::claude::client::create_default_claude_client].
-///
-/// `None` (flag omitted) preserves env-var dispatch; an explicit value
-/// overrides `OMNI_DEV_AI_BACKEND`. Propagation to the env var happens
-/// in `Cli::propagate_global_flags`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum AiBackend {
-    /// Default backend dispatch (HTTP to Anthropic/Bedrock/OpenAI/Ollama via
-    /// the existing `USE_*` env vars).
-    Default,
-    /// Shell out to the `claude -p` CLI (reuses an existing Claude Code auth
-    /// session). Equivalent to setting `OMNI_DEV_AI_BACKEND=claude-cli`.
-    ClaudeCli,
-}
+// The `--ai-backend` value enum lives with the shared backend/model resolver;
+// re-exported here so `crate::cli::AiBackend` keeps working.
+pub use crate::claude::backend::AiBackend;
 
 /// Top-level clap-derived CLI struct; the library entry point for embedding
 /// omni-dev programmatically.
 ///
-/// Global flags (`--ai-backend`, `--claude-cli-allow-tools`,
-/// `--claude-cli-allow-mcp`, `--claude-cli-max-budget-usd`, `--models-yaml`)
-/// are propagated to environment variables read by downstream factories
-/// before dispatching to a [`Commands`] variant.
+/// Global flags (`--ai-backend`, `--model`, `--beta-header`,
+/// `--claude-cli-allow-tools`, `--claude-cli-allow-mcp`,
+/// `--claude-cli-max-budget-usd`, `--models-yaml`) are propagated to
+/// environment variables read by downstream factories before dispatching to a
+/// [`Commands`] variant.
 #[derive(Parser)]
 #[command(name = "omni-dev")]
 #[command(
@@ -60,9 +48,28 @@ pub enum AiBackend {
 pub struct Cli {
     /// Selects the AI backend used by commands that invoke an AI model.
     ///
-    /// Overrides the `OMNI_DEV_AI_BACKEND` environment variable.
+    /// Overrides the `OMNI_DEV_AI_BACKEND` environment variable and the
+    /// legacy `USE_OPENAI`/`USE_OLLAMA`/`CLAUDE_CODE_USE_BEDROCK` variables
+    /// (`default` forces the direct Anthropic API even when they are set).
     #[arg(long, global = true, value_enum)]
     pub ai_backend: Option<AiBackend>,
+
+    /// AI model to use for commands that invoke an AI model.
+    ///
+    /// Highest-precedence model selector: it overrides `OMNI_DEV_MODEL` and
+    /// every per-backend model variable (`CLAUDE_MODEL`, `CLAUDE_CODE_MODEL`,
+    /// `ANTHROPIC_MODEL`, `OPENAI_MODEL`, `OLLAMA_MODEL`). Equivalent to
+    /// setting `OMNI_DEV_MODEL`.
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Beta header to send with AI API requests (format: key:value).
+    ///
+    /// Only sent if the model supports it in the model registry. Equivalent
+    /// to setting `OMNI_DEV_BETA_HEADER`. Ignored when `--ai-backend` is
+    /// `claude-cli` (the CLI negotiates betas itself).
+    #[arg(long, global = true, value_name = "KEY:VALUE")]
+    pub beta_header: Option<String>,
 
     /// Weakens the `claude-cli` sandbox by allowing the nested `claude -p`
     /// session to use its default built-in tools (Read, Edit, Write, Bash,
@@ -189,11 +196,19 @@ impl Cli {
     /// subcommand. Setting the env vars here (rather than threading extra
     /// arguments through every command) keeps factory signatures stable.
     fn propagate_global_flags(&self) {
+        // Every value — including `default` — is written to the env var so
+        // the flag decisively overrides both a pre-set OMNI_DEV_AI_BACKEND
+        // and the legacy USE_* selection flags (#1118).
         if let Some(backend) = self.ai_backend {
-            match backend {
-                AiBackend::Default => std::env::remove_var("OMNI_DEV_AI_BACKEND"),
-                AiBackend::ClaudeCli => std::env::set_var("OMNI_DEV_AI_BACKEND", "claude-cli"),
-            }
+            std::env::set_var(crate::claude::backend::AI_BACKEND_ENV, backend.env_value());
+        }
+
+        if let Some(model) = &self.model {
+            std::env::set_var(crate::claude::backend::MODEL_ENV, model);
+        }
+
+        if let Some(beta_header) = &self.beta_header {
+            std::env::set_var(crate::claude::backend::BETA_HEADER_ENV, beta_header);
         }
 
         if self.claude_cli_allow_tools {
@@ -324,6 +339,83 @@ mod tests {
     }
 
     #[test]
+    fn parses_ai_backend_openai_ollama_bedrock() {
+        for (value, expected) in [
+            ("openai", AiBackend::OpenAi),
+            ("ollama", AiBackend::Ollama),
+            ("bedrock", AiBackend::Bedrock),
+        ] {
+            let cli = Cli::try_parse_from(["omni-dev", "--ai-backend", value, "help-all"]).unwrap();
+            assert_eq!(cli.ai_backend, Some(expected), "value {value}");
+        }
+    }
+
+    #[test]
+    fn parses_model_before_and_after_subcommand() {
+        // Before the subcommand — the placement the docs show
+        // (`omni-dev --model … git commit message twiddle …`), broken
+        // pre-#1118 because --model was subcommand-local.
+        let before = Cli::try_parse_from([
+            "omni-dev",
+            "--model",
+            "claude-opus-4-6",
+            "git",
+            "commit",
+            "message",
+            "twiddle",
+        ])
+        .unwrap();
+        assert_eq!(before.model.as_deref(), Some("claude-opus-4-6"));
+
+        // After the subcommand — the pre-#1118 placement keeps parsing
+        // because the arg is global = true.
+        let after = Cli::try_parse_from([
+            "omni-dev",
+            "git",
+            "commit",
+            "message",
+            "twiddle",
+            "--model",
+            "claude-opus-4-6",
+        ])
+        .unwrap();
+        assert_eq!(after.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn parses_beta_header_before_and_after_subcommand() {
+        let before = Cli::try_parse_from([
+            "omni-dev",
+            "--beta-header",
+            "anthropic-beta:output-128k-2025-02-19",
+            "git",
+            "commit",
+            "message",
+            "check",
+        ])
+        .unwrap();
+        assert_eq!(
+            before.beta_header.as_deref(),
+            Some("anthropic-beta:output-128k-2025-02-19")
+        );
+
+        let after = Cli::try_parse_from([
+            "omni-dev",
+            "git",
+            "commit",
+            "message",
+            "check",
+            "--beta-header",
+            "anthropic-beta:output-128k-2025-02-19",
+        ])
+        .unwrap();
+        assert_eq!(
+            after.beta_header.as_deref(),
+            Some("anthropic-beta:output-128k-2025-02-19")
+        );
+    }
+
+    #[test]
     fn parses_ai_backend_absent() {
         let cli = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
         assert!(cli.ai_backend.is_none());
@@ -422,6 +514,8 @@ mod tests {
     // own env-mutating tests to avoid cross-module races).
 
     const BACKEND_VAR: &str = "OMNI_DEV_AI_BACKEND";
+    const MODEL_VAR: &str = "OMNI_DEV_MODEL";
+    const BETA_HEADER_VAR: &str = "OMNI_DEV_BETA_HEADER";
     const ALLOW_TOOLS_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
     const ALLOW_MCP_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
     const MAX_BUDGET_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
@@ -432,7 +526,7 @@ mod tests {
     /// `propagate_global_flags` may touch.
     struct GlobalFlagsEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 6],
+        saved: [(&'static str, Option<String>); 8],
     }
 
     impl GlobalFlagsEnvGuard {
@@ -442,6 +536,8 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let names = [
                 BACKEND_VAR,
+                MODEL_VAR,
+                BETA_HEADER_VAR,
                 ALLOW_TOOLS_VAR,
                 ALLOW_MCP_VAR,
                 MAX_BUDGET_VAR,
@@ -476,6 +572,8 @@ mod tests {
         let _g = GlobalFlagsEnvGuard::new();
         cli_with_defaults().propagate_global_flags();
         assert!(std::env::var(BACKEND_VAR).is_err());
+        assert!(std::env::var(MODEL_VAR).is_err());
+        assert!(std::env::var(BETA_HEADER_VAR).is_err());
         assert!(std::env::var(ALLOW_TOOLS_VAR).is_err());
         assert!(std::env::var(ALLOW_MCP_VAR).is_err());
         assert!(std::env::var(MAX_BUDGET_VAR).is_err());
@@ -496,13 +594,55 @@ mod tests {
     }
 
     #[test]
-    fn propagate_global_flags_default_backend_removes_env_var() {
+    fn propagate_global_flags_default_backend_overrides_env_var() {
+        // `--ai-backend default` must *set* the env var (not remove it) so it
+        // decisively overrides both a pre-set backend and the legacy USE_*
+        // flags (#1118).
         let _g = GlobalFlagsEnvGuard::new();
         std::env::set_var(BACKEND_VAR, "claude-cli");
         let mut cli = cli_with_defaults();
         cli.ai_backend = Some(AiBackend::Default);
         cli.propagate_global_flags();
-        assert!(std::env::var(BACKEND_VAR).is_err());
+        assert_eq!(std::env::var(BACKEND_VAR).ok().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_openai_ollama_bedrock() {
+        let _g = GlobalFlagsEnvGuard::new();
+        for (backend, expected) in [
+            (AiBackend::OpenAi, "openai"),
+            (AiBackend::Ollama, "ollama"),
+            (AiBackend::Bedrock, "bedrock"),
+        ] {
+            let mut cli = cli_with_defaults();
+            cli.ai_backend = Some(backend);
+            cli.propagate_global_flags();
+            assert_eq!(std::env::var(BACKEND_VAR).ok().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_model() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.model = Some("claude-opus-4-6".to_string());
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(MODEL_VAR).ok().as_deref(),
+            Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_beta_header() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.beta_header = Some("anthropic-beta:output-128k-2025-02-19".to_string());
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(BETA_HEADER_VAR).ok().as_deref(),
+            Some("anthropic-beta:output-128k-2025-02-19")
+        );
     }
 
     #[test]

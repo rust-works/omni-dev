@@ -854,9 +854,12 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 - **Claude API Key**: Required for AI-powered features
   - See [Authentication](docs/configuration.md#authentication) for
     setup (env var, `.env`, or CI/CD secrets)
-- **AI Model Selection**: Optional configuration for specific Claude models
+- **AI Model Selection**: Optional configuration for specific models
   - View available models: `omni-dev config models show`
-  - Configure via `~/.omni-dev/settings.json` or `ANTHROPIC_MODEL` environment variable
+  - Pick per-invocation with the global `--model` flag, or configure via
+    `OMNI_DEV_MODEL` / the per-backend env chain (`CLAUDE_MODEL`,
+    `CLAUDE_CODE_MODEL`, `ANTHROPIC_MODEL` for Claude-family backends;
+    `OPENAI_MODEL`; `OLLAMA_MODEL`) or `~/.omni-dev/settings.json`
   - Supports standard identifiers and Bedrock-style formats
 - **Atlassian Credentials** (for JIRA/Confluence features): Instance URL, email, and
   [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
@@ -867,15 +870,20 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ### AI backend selection
 
-omni-dev supports five AI backends, selected by env var or the
-`--ai-backend` flag (priority order, first match wins):
+omni-dev supports five AI backends. The global `--ai-backend` flag (or
+`OMNI_DEV_AI_BACKEND`) selects one decisively — `default`, `claude-cli`,
+`openai`, `ollama`, or `bedrock`:
 
-1. `--ai-backend claude-cli` / `OMNI_DEV_AI_BACKEND=claude-cli` — sandboxed
-   `claude -p` subprocess that reuses your Claude Code session.
-2. `USE_OLLAMA=true` — local Ollama or LM Studio server.
-3. `USE_OPENAI=true` — OpenAI Chat Completions API.
-4. `CLAUDE_CODE_USE_BEDROCK=true` — AWS Bedrock.
-5. *(default)* direct Anthropic API.
+- `--ai-backend claude-cli` — sandboxed `claude -p` subprocess that reuses
+  your Claude Code session.
+- `--ai-backend ollama` — local Ollama or LM Studio server.
+- `--ai-backend openai` — OpenAI Chat Completions API.
+- `--ai-backend bedrock` — AWS Bedrock.
+- `--ai-backend default` *(or no flag)* — direct Anthropic API.
+
+When `OMNI_DEV_AI_BACKEND` is unset, the legacy `USE_OLLAMA=true` /
+`USE_OPENAI=true` / `CLAUDE_CODE_USE_BEDROCK=true` variables still select
+their backends, in that order.
 
 See the **[AI Backends Guide](docs/ai-backends.md)** for required env vars,
 model selection, the Claude CLI sandbox and its escape hatches

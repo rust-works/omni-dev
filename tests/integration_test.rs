@@ -555,6 +555,8 @@ async fn cli_execute_dispatches_git_commit_message_view() {
 
     let cli = Cli {
         ai_backend: None,
+        model: None,
+        beta_header: None,
         claude_cli_allow_tools: false,
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
@@ -583,6 +585,8 @@ async fn cli_execute_dispatches_git_branch_info() {
 
     let cli = Cli {
         ai_backend: None,
+        model: None,
+        beta_header: None,
         claude_cli_allow_tools: false,
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
@@ -605,6 +609,8 @@ async fn cli_execute_dispatches_ai_chat() {
 
     let cli = Cli {
         ai_backend: None,
+        model: None,
+        beta_header: None,
         claude_cli_allow_tools: false,
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
@@ -612,13 +618,192 @@ async fn cli_execute_dispatches_ai_chat() {
         repo: None,
         profile: None,
         command: Commands::Ai(AiCommand {
-            command: AiSubcommands::Chat(ChatCommand { model: None }),
+            command: AiSubcommands::Chat(ChatCommand {}),
         }),
     };
     // Without API credentials this returns Err at the preflight check;
     // with credentials it returns Err in a non-TTY environment.
     // Either way the async dispatch chain is exercised.
     let _ = cli.execute().await;
+}
+
+// ── execute() boundary coverage via the spawned binary (#1118) ──────────
+//
+// These drive the thin interactive `execute()` wrappers (preflight → client
+// construction) end-to-end through the real binary. The AI backend is
+// pointed at a local wiremock server through per-child env vars
+// (`Command::env`), so no process-global environment is mutated
+// (STYLE-0028) and no credentials are required (the Ollama backend needs
+// none). Everything past client construction is expected to fail — the
+// wrappers' logic lives in the already unit-tested `run_*` cores; these
+// tests exist to exercise the boundary lines themselves.
+
+/// Hermetic command for the AI-boundary tests: `HOME` and the request log
+/// point at `home`, the backend is Ollama at `server_uri`, and any
+/// AI-selection vars leaking from the developer's shell are removed.
+fn hermetic_ai_cmd(home: &std::path::Path, server_uri: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"));
+    cmd.env("HOME", home)
+        .env("OMNI_DEV_LOG_FILE", home.join("log.jsonl"))
+        .env("USE_OLLAMA", "true")
+        .env("OLLAMA_BASE_URL", server_uri)
+        .env_remove("OMNI_DEV_AI_BACKEND")
+        .env_remove("OMNI_DEV_MODEL")
+        .env_remove("OMNI_DEV_BETA_HEADER")
+        .env_remove("OLLAMA_MODEL")
+        .env_remove("USE_OPENAI")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+fn hermetic_home() -> TempDir {
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    tempfile::tempdir_in(&tmp_root).unwrap()
+}
+
+/// A wiremock server whose LM Studio probe endpoint succeeds (so the
+/// factory's probed-context-length `info!` fields are evaluated under
+/// `RUST_LOG=omni_dev=info`) and whose chat endpoint fails, stopping each
+/// run right after client construction.
+async fn probe_ok_chat_fails_server() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v0/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{ "id": "llama2", "state": "loaded", "loaded_context_length": 8192_u64 }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn chat_execute_constructs_env_configured_client() {
+    let server = probe_ok_chat_fails_server().await;
+    let home = hermetic_home();
+
+    // With stdin null (not a TTY) the chat loop exits at the first read, so
+    // the process terminates on its own after connecting.
+    let output = hermetic_ai_cmd(home.path(), &server.uri())
+        .args(["ai", "chat"])
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Connected to Ollama"),
+        "expected chat to pass preflight and connect via Ollama, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn check_execute_constructs_env_configured_client() {
+    let server = probe_ok_chat_fails_server().await;
+    let home = hermetic_home();
+    let mut repo = TestRepo::new().unwrap();
+    repo.add_commit("feat: one", "content a").unwrap();
+    repo.add_commit("feat: two", "content b").unwrap();
+
+    let output = hermetic_ai_cmd(home.path(), &server.uri())
+        .args([
+            "-C",
+            repo.repo_path.to_str().unwrap(),
+            "git",
+            "commit",
+            "message",
+            "check",
+            "HEAD~1..HEAD",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("credentials verified"),
+        "expected check to pass preflight, got stdout: {stdout}"
+    );
+    // The AI call hits the failing chat endpoint after the client is built.
+    assert!(
+        !output.status.success(),
+        "expected the failing AI call to surface as a non-zero exit"
+    );
+}
+
+#[tokio::test]
+async fn twiddle_execute_constructs_env_configured_client() {
+    let server = probe_ok_chat_fails_server().await;
+    let home = hermetic_home();
+    let mut repo = TestRepo::new().unwrap();
+    repo.add_commit("feat: one", "content a").unwrap();
+    repo.add_commit("feat: two", "content b").unwrap();
+
+    let output = hermetic_ai_cmd(home.path(), &server.uri())
+        .args([
+            "-C",
+            repo.repo_path.to_str().unwrap(),
+            "git",
+            "commit",
+            "message",
+            "twiddle",
+            "HEAD~1..HEAD",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("credentials verified"),
+        "expected twiddle to pass preflight, got stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Working directory is clean"),
+        "expected the clean-worktree preflight to pass, got stdout: {stdout}"
+    );
+    assert!(
+        !output.status.success(),
+        "expected the failing AI call to surface as a non-zero exit"
+    );
+}
+
+#[tokio::test]
+async fn create_pr_execute_runs_pr_preflight() {
+    let server = probe_ok_chat_fails_server().await;
+    let home = hermetic_home();
+    let mut repo = TestRepo::new().unwrap();
+    repo.add_commit("feat: one", "content a").unwrap();
+
+    // The temp repo has no remote, so the GitHub CLI check fails after the
+    // git and AI preflights pass — whether `gh` is installed ("cannot
+    // access this repository") or not ("is not installed"), the combined
+    // PR preflight is exercised and the command exits non-zero.
+    let output = hermetic_ai_cmd(home.path(), &server.uri())
+        .args([
+            "-C",
+            repo.repo_path.to_str().unwrap(),
+            "git",
+            "branch",
+            "create",
+            "pr",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("GitHub"),
+        "expected the GitHub CLI preflight to fail in a remoteless repo, got: {stderr}"
+    );
+    assert!(!output.status.success());
 }
 
 // ── Request log (#1025) ─────────────────────────────────────────────────

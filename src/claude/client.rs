@@ -1758,12 +1758,14 @@ pub async fn create_default_claude_client(
 /// [`create_default_claude_client`] over an injected
 /// [`EnvSource`](crate::utils::env::EnvSource).
 ///
-/// This is the backend-dispatch boundary — it reads `OMNI_DEV_AI_BACKEND`,
-/// the `USE_*` flags, model vars and API keys. The production wrapper passes
-/// `&SettingsEnv::load()`; tests pass a pure `MapEnv`, so dispatch is tested
-/// without mutating the process environment or taking a lock (issue #1030).
-/// The `Sync` bound keeps the returned future `Send` (the reference is held
-/// across the Ollama context-length probe `.await`).
+/// This is the backend-dispatch boundary. Backend, model, and beta-header
+/// selection delegate to the shared resolvers in [`crate::claude::backend`]
+/// (also used by preflight); this function reads only the per-backend
+/// credential/endpoint vars and builds the client. The production wrapper
+/// passes `&SettingsEnv::load()`; tests pass a pure `MapEnv`, so dispatch is
+/// tested without mutating the process environment or taking a lock
+/// (issue #1030). The `Sync` bound keeps the returned future `Send` (the
+/// reference is held across the Ollama context-length probe `.await`).
 pub(crate) async fn create_default_claude_client_with(
     env: &(impl crate::utils::env::EnvSource + Sync),
     model: Option<String>,
@@ -1771,150 +1773,97 @@ pub(crate) async fn create_default_claude_client_with(
 ) -> Result<ClaudeClient> {
     use crate::claude::ai::claude_cli::ClaudeCliAiClient;
     use crate::claude::ai::openai::OpenAiAiClient;
+    use crate::claude::backend::{self, AiBackend};
 
-    // `claude -p` subprocess backend takes precedence when requested — it
-    // reuses an existing Claude Code auth session and is the only backend
-    // that accepts short model aliases (sonnet/opus/haiku), so it must
-    // short-circuit before `validate_beta_header` runs below.
-    let ai_backend = env.var("OMNI_DEV_AI_BACKEND");
-    let use_claude_cli = ai_backend
-        .as_deref()
-        .is_some_and(|v| matches!(v, "claude-cli" | "claude_cli"));
-
-    if use_claude_cli {
-        if beta_header.is_some() {
-            warn!(
-                "--beta-header is ignored when OMNI_DEV_AI_BACKEND=claude-cli \
-                 (the CLI's --betas flag has different semantics and is not forwarded)"
-            );
-        }
-        let registry = crate::claude::model_config::get_model_registry();
-        let cli_model = model
-            .or_else(|| env.var("CLAUDE_MODEL"))
-            .or_else(|| env.var("CLAUDE_CODE_MODEL"))
-            .or_else(|| env.var("ANTHROPIC_MODEL"))
-            .unwrap_or_else(|| {
-                registry
-                    .get_default_model("claude")
-                    .unwrap_or("claude-sonnet-4-6")
-                    .to_string()
-            });
-        debug!(model = %cli_model, "Creating claude -p subprocess client");
-        let ai_client = ClaudeCliAiClient::new(cli_model);
-        return Ok(ClaudeClient::new(Box::new(ai_client)));
-    }
-
-    // Check if we should use OpenAI-compatible API (OpenAI or Ollama)
-    let use_openai = env.var("USE_OPENAI").is_some_and(|val| val == "true");
-
-    let use_ollama = env.var("USE_OLLAMA").is_some_and(|val| val == "true");
-
-    // Check if we should use Bedrock
-    let use_bedrock = env
-        .var("CLAUDE_CODE_USE_BEDROCK")
-        .is_some_and(|val| val == "true");
-
-    debug!(
-        use_openai = use_openai,
-        use_ollama = use_ollama,
-        use_bedrock = use_bedrock,
-        "Client selection flags"
-    );
-
+    let ai_backend = backend::resolve_backend(env)?;
+    let beta_header = backend::resolve_beta_header(beta_header, env)?;
     let registry = crate::claude::model_config::get_model_registry();
+    let model = backend::resolve_model(ai_backend, model.as_deref(), env, registry);
+    debug!(backend = ?ai_backend, model = %model, "Resolved AI backend");
 
-    // Handle Ollama configuration
-    if use_ollama {
-        let ollama_model = model
-            .or_else(|| env.var("OLLAMA_MODEL"))
-            .unwrap_or_else(|| "llama2".to_string());
-        validate_beta_header(&ollama_model, &beta_header)?;
-        let base_url = env.var("OLLAMA_BASE_URL");
-        let mut ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header)?;
-        match ai_client.probe_loaded_context_length().await {
-            Some(source) => {
-                info!(
-                    loaded_context_length = ai_client.loaded_context_length(),
-                    source = source.as_str(),
-                    model = %ai_client.get_metadata().model,
-                    "Probed loaded context length from local server"
+    match ai_backend {
+        AiBackend::ClaudeCli => {
+            // The `claude -p` subprocess negotiates betas itself, so the
+            // beta header is deliberately not forwarded (and, uniquely, not
+            // validated — this backend accepts short model aliases like
+            // sonnet/opus/haiku that the registry does not know).
+            if beta_header.is_some() {
+                warn!(
+                    "--beta-header is ignored when OMNI_DEV_AI_BACKEND=claude-cli \
+                     (the CLI's --betas flag has different semantics and is not forwarded)"
                 );
             }
-            None => {
-                debug!(
-                    "Loaded context length probe did not return a value; \
-                     falling back to registry/default for token budget"
-                );
-            }
+            debug!(model = %model, "Creating claude -p subprocess client");
+            let ai_client = ClaudeCliAiClient::new(model);
+            Ok(ClaudeClient::new(Box::new(ai_client)))
         }
-        return Ok(ClaudeClient::new(Box::new(ai_client)));
+        AiBackend::Ollama => {
+            validate_beta_header(&model, &beta_header)?;
+            let base_url = env.var("OLLAMA_BASE_URL");
+            let mut ai_client = OpenAiAiClient::new_ollama(model, base_url, beta_header)?;
+            match ai_client.probe_loaded_context_length().await {
+                Some(source) => {
+                    info!(
+                        loaded_context_length = ai_client.loaded_context_length(),
+                        source = source.as_str(),
+                        model = %ai_client.get_metadata().model,
+                        "Probed loaded context length from local server"
+                    );
+                }
+                None => {
+                    debug!(
+                        "Loaded context length probe did not return a value; \
+                         falling back to registry/default for token budget"
+                    );
+                }
+            }
+            Ok(ClaudeClient::new(Box::new(ai_client)))
+        }
+        AiBackend::OpenAi => {
+            debug!("Creating OpenAI client");
+            validate_beta_header(&model, &beta_header)?;
+
+            let api_key = env
+                .var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
+                .ok_or_else(|| {
+                    debug!("Failed to get OpenAI API key");
+                    ClaudeError::ApiKeyNotFound
+                })?;
+            debug!("OpenAI API key found");
+
+            let ai_client = OpenAiAiClient::new_openai(model, api_key, beta_header)?;
+            debug!("OpenAI client created successfully");
+            Ok(ClaudeClient::new(Box::new(ai_client)))
+        }
+        AiBackend::Bedrock => {
+            validate_beta_header(&model, &beta_header)?;
+            let auth_token = env
+                .var("ANTHROPIC_AUTH_TOKEN")
+                .ok_or(ClaudeError::ApiKeyNotFound)?;
+
+            let base_url = env
+                .var("ANTHROPIC_BEDROCK_BASE_URL")
+                .ok_or(ClaudeError::ApiKeyNotFound)?;
+
+            let ai_client = BedrockAiClient::new(model, auth_token, base_url, beta_header)?;
+            Ok(ClaudeClient::new(Box::new(ai_client)))
+        }
+        AiBackend::Default => {
+            debug!("Creating direct Claude API client");
+            validate_beta_header(&model, &beta_header)?;
+            let api_key = env
+                .var_any(&[
+                    "CLAUDE_API_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                ])
+                .ok_or(ClaudeError::ApiKeyNotFound)?;
+
+            let ai_client = ClaudeAiClient::new(model, api_key, beta_header)?;
+            debug!("Claude client created successfully");
+            Ok(ClaudeClient::new(Box::new(ai_client)))
+        }
     }
-
-    // Handle OpenAI configuration
-    if use_openai {
-        debug!("Creating OpenAI client");
-        let openai_model = model
-            .or_else(|| env.var("OPENAI_MODEL"))
-            .unwrap_or_else(|| {
-                registry
-                    .get_default_model("openai")
-                    .unwrap_or("gpt-5")
-                    .to_string()
-            });
-        debug!(openai_model = %openai_model, "Selected OpenAI model");
-        validate_beta_header(&openai_model, &beta_header)?;
-
-        let api_key = env
-            .var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
-            .ok_or_else(|| {
-                debug!("Failed to get OpenAI API key");
-                ClaudeError::ApiKeyNotFound
-            })?;
-        debug!("OpenAI API key found");
-
-        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key, beta_header)?;
-        debug!("OpenAI client created successfully");
-        return Ok(ClaudeClient::new(Box::new(ai_client)));
-    }
-
-    // For Claude clients, try to get model from env vars or use default
-    let claude_model = model
-        .or_else(|| env.var("ANTHROPIC_MODEL"))
-        .unwrap_or_else(|| {
-            registry
-                .get_default_model("claude")
-                .unwrap_or("claude-sonnet-4-6")
-                .to_string()
-        });
-    validate_beta_header(&claude_model, &beta_header)?;
-
-    if use_bedrock {
-        // Use Bedrock AI client
-        let auth_token = env
-            .var("ANTHROPIC_AUTH_TOKEN")
-            .ok_or(ClaudeError::ApiKeyNotFound)?;
-
-        let base_url = env
-            .var("ANTHROPIC_BEDROCK_BASE_URL")
-            .ok_or(ClaudeError::ApiKeyNotFound)?;
-
-        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url, beta_header)?;
-        return Ok(ClaudeClient::new(Box::new(ai_client)));
-    }
-
-    // Default: use standard Claude AI client
-    debug!("Falling back to Claude client");
-    let api_key = env
-        .var_any(&[
-            "CLAUDE_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-        ])
-        .ok_or(ClaudeError::ApiKeyNotFound)?;
-
-    let ai_client = ClaudeAiClient::new(claude_model, api_key, beta_header)?;
-    debug!("Claude client created successfully");
-    Ok(ClaudeClient::new(Box::new(ai_client)))
 }
 
 #[cfg(test)]
@@ -4568,9 +4517,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_claude_cli_backend_ignores_beta_header_without_validation() {
+        // The claude-cli arm warns and drops the beta header instead of
+        // validating it — the model may be a short alias ("sonnet") the
+        // registry does not know, and even an unsupported header/model pair
+        // must not error on this backend.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("CLAUDE_MODEL", "sonnet")
+            .with("OMNI_DEV_BETA_HEADER", "anthropic-beta:not-a-real-beta");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("claude-cli must ignore the beta header, not validate it");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Claude CLI");
+        assert_eq!(metadata.model, "sonnet");
+        assert_eq!(
+            metadata.active_beta, None,
+            "beta header must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
     async fn factory_ollama_branch_probes_loaded_context_length() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Activate an INFO subscriber for this (current-thread) test so the
+        // probe's success `info!` event fires in-process and its fields are
+        // evaluated. Discard the formatted output — we assert on the probed
+        // value below, not the log line.
+        let _log_guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4735,5 +4718,122 @@ mod tests {
     async fn factory_default_claude_branch_errors_without_api_key() {
         let result = create_default_claude_client_with(&MapEnv::new(), None, None).await;
         assert!(result.is_err());
+    }
+
+    // ── shared-resolver behaviors introduced by #1118 ───────────────
+
+    #[tokio::test]
+    async fn factory_default_claude_branch_honours_claude_model_chain() {
+        // The headline #1118 bug: CLAUDE_MODEL / CLAUDE_CODE_MODEL were
+        // silently ignored by the direct-API branch.
+        let env = MapEnv::new()
+            .with("CLAUDE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_bedrock_branch_honours_claude_model_chain() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("CLAUDE_CODE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_omni_dev_model_beats_provider_var() {
+        let env = MapEnv::new()
+            .with("USE_OPENAI", "true")
+            .with("OMNI_DEV_MODEL", "gpt-4.1")
+            .with("OPENAI_MODEL", "gpt-5-mini")
+            .with("OPENAI_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "gpt-4.1");
+    }
+
+    #[tokio::test]
+    async fn factory_backend_env_var_beats_legacy_use_flags() {
+        // OMNI_DEV_AI_BACKEND=openai wins even though USE_OLLAMA is set.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("USE_OLLAMA", "true")
+            .with("OPENAI_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "gpt-5-mini");
+    }
+
+    #[tokio::test]
+    async fn factory_backend_default_value_forces_direct_api() {
+        // `--ai-backend default` propagates as OMNI_DEV_AI_BACKEND=default and
+        // must override the USE_* soup, dispatching the direct Claude client.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "default")
+            .with("USE_OLLAMA", "true")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_unknown_backend_value_is_hard_error() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "junk")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let err = create_default_claude_client_with(&env, None, None)
+            .await
+            .map(|_| ())
+            .expect_err("unknown backend must error");
+        assert!(format!("{err:#}").contains("junk"));
+    }
+
+    #[tokio::test]
+    async fn factory_beta_header_env_var_is_applied() {
+        let env = MapEnv::new()
+            .with("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
+            .with(
+                "OMNI_DEV_BETA_HEADER",
+                "anthropic-beta:output-128k-2025-02-19",
+            )
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should accept a registry-supported beta header");
+        // The beta header raises the model's max output tokens.
+        assert_eq!(client.get_ai_client_metadata().max_response_length, 128_000);
+    }
+
+    #[tokio::test]
+    async fn factory_beta_header_env_var_malformed_is_hard_error() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_BETA_HEADER", "no-colon-here")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let err = create_default_claude_client_with(&env, None, None)
+            .await
+            .map(|_| ())
+            .expect_err("malformed beta header must error");
+        assert!(format!("{err:#}").contains("no-colon-here"));
     }
 }
