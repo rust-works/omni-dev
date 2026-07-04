@@ -40,6 +40,7 @@ impl TranscriptCommand {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cli::transcript::format::CliFormat;
@@ -57,6 +58,26 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, TranscriptSubcommands::Fetch(_)));
+    }
+
+    /// Drives the `Fetch` dispatch arm end-to-end: an unrecognised locator
+    /// fails fast with the typed `InvalidLocator` error before any network
+    /// call — exercising `TranscriptCommand::execute` → `FetchCommand::execute`
+    /// → `detect`.
+    #[tokio::test]
+    async fn fetch_dispatch_surfaces_unrecognised_locator() {
+        let cmd = TranscriptCommand {
+            command: TranscriptSubcommands::Fetch(fetch::FetchCommand {
+                url: "https://vimeo.com/76979871".to_string(),
+                lang: "en".to_string(),
+                format: CliFormat::Srt,
+                auto: false,
+                translate: None,
+                output: None,
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("invalid transcript locator"));
     }
 
     #[test]
