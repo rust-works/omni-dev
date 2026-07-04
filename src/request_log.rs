@@ -592,10 +592,29 @@ fn scrub_flag_value(name: &str, value: &str) -> Option<String> {
     }
 }
 
-/// Scrubs secret-bearing flag values out of a raw argv before it is logged
-/// (`--header`/`--body` plus any [`is_secretish_flag`] name, in both
-/// `--flag value` and `--flag=value` forms). Everything else passes through.
+/// Scrubs secret-bearing values out of a raw argv before it is logged. Two
+/// write-side layers, so the on-disk line is clean and every reader/format is
+/// covered with no reader changes:
+///
+/// 1. [`scrub_flag_secrets`] — flag-aware whole-value redaction (`--header`/
+///    `--body` plus any [`is_secretish_flag`] name, in both `--flag value` and
+///    `--flag=value` forms).
+/// 2. [`redact_url`] over every resulting element — a secret-bearing query or
+///    fragment parameter on a URL argument (most naturally
+///    `--url /path?access_token=…`, which no flag-name rule catches) has its
+///    value redacted, while benign argv passes through byte-identical (#1162).
 fn scrub_argv(argv: &[String]) -> Vec<String> {
+    scrub_flag_secrets(argv)
+        .iter()
+        .map(|arg| redact_url(arg))
+        .collect()
+}
+
+/// Flag-aware first layer of [`scrub_argv`]: redacts secret-bearing flag values
+/// (`--header`/`--body` plus any [`is_secretish_flag`] name, in both
+/// `--flag value` and `--flag=value` forms). Everything else passes through to
+/// the URL layer.
+fn scrub_flag_secrets(argv: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len());
     let mut i = 0;
     while i < argv.len() {
@@ -916,6 +935,55 @@ mod tests {
     #[test]
     fn scrub_argv_exempts_path_flags_and_positionals() {
         let input = argv(&["omni-dev", "--token-file", "/tmp/t", "PROJ-123"]);
+        assert_eq!(scrub_argv(&input), input);
+    }
+
+    #[test]
+    fn scrub_argv_redacts_secret_bearing_url_query_in_both_forms() {
+        // `--url` is not a secret-ish flag name, so its value is caught by the
+        // redact_url layer, not the flag layer (#1162). Both argv shapes plus a
+        // bare positional URL are covered; the benign `page` param survives.
+        let space = scrub_argv(&argv(&[
+            "omni-dev",
+            "browser",
+            "bridge",
+            "request",
+            "--url",
+            "/api/export?access_token=hunter2&sig=deadbeef&page=3",
+        ]));
+        assert_eq!(
+            *space.last().unwrap(),
+            "/api/export?access_token=REDACTED&sig=REDACTED&page=3"
+        );
+
+        let eq_form = scrub_argv(&argv(&[
+            "omni-dev",
+            "--url=/api/export?access_token=hunter2&page=3",
+        ]));
+        assert_eq!(
+            *eq_form.last().unwrap(),
+            "--url=/api/export?access_token=REDACTED&page=3"
+        );
+
+        let positional = scrub_argv(&argv(&["omni-dev", "https://h/cb#id_token=xyz"]));
+        assert_eq!(
+            *positional.last().unwrap(),
+            "https://h/cb#id_token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn scrub_argv_leaves_benign_argv_byte_identical() {
+        let input = argv(&[
+            "omni-dev",
+            "browser",
+            "bridge",
+            "request",
+            "--control-port",
+            "19998",
+            "--url",
+            "/api/export?page=3&sort=asc",
+        ]);
         assert_eq!(scrub_argv(&input), input);
     }
 
