@@ -750,6 +750,42 @@ pub fn record_http(
     );
 }
 
+/// Appends one `kind: "http"` record from a `reqwest` send result, mapping
+/// `Ok` → status code and `Err` → error message.
+///
+/// Collapses the `match result { Ok → status, Err → error }` shape the REST
+/// clients previously each open-coded around [`record_http`] (#1152).
+pub fn record_http_result(
+    service: &str,
+    method: &str,
+    url: &str,
+    started: Instant,
+    result: &reqwest::Result<reqwest::Response>,
+) {
+    match result {
+        Ok(response) => {
+            record_http(
+                service,
+                method,
+                url,
+                started,
+                Some(response.status().as_u16()),
+                None,
+            );
+        }
+        Err(error) => {
+            record_http(
+                service,
+                method,
+                url,
+                started,
+                None,
+                Some(&error.to_string()),
+            );
+        }
+    }
+}
+
 /// Appends one `kind: "http"` record with extra, non-secret fields.
 ///
 /// Headers and bodies are dropped unless their opt-in env var is set, headers
