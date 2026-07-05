@@ -182,6 +182,10 @@ async fn daemon_start_detaches_into_its_own_session() {
         .arg("start")
         .arg("--socket")
         .arg(&socket)
+        // Force the detached-spawn path this test asserts on: without it, a host
+        // with a systemd user manager would install a real unit under the
+        // developer's `~/.config` and socket-activate the daemon instead (#1174).
+        .env("OMNI_DEV_DAEMON_DISABLE_SYSTEMD", "1")
         .status()
         .expect("failed to run `omni-dev daemon start`");
     assert!(launcher.success(), "daemon start failed: {launcher:?}");

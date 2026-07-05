@@ -10,9 +10,10 @@ use crate::daemon::server;
 
 /// Stops the running daemon, gracefully draining its services.
 ///
-/// On macOS it also boots out the launchd agent — removing the demand socket — so
-/// the daemon stays stopped rather than being re-activated on the next client
-/// connect or at the next login. Re-run `daemon start` to re-enable it.
+/// On macOS it also boots out the launchd agent, and on Linux it stops and
+/// disables the systemd user unit — either way removing/disarming the demand
+/// socket so the daemon stays stopped rather than being re-activated on the next
+/// client connect or at the next login. Re-run `daemon start` to re-enable it.
 #[derive(Parser)]
 pub struct StopCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
@@ -29,6 +30,11 @@ impl StopCommand {
         {
             // Disable launchd auto-start if this daemon was started via `daemon start`.
             let _ = crate::daemon::launchd::unload();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Disable systemd auto-start (best-effort; a no-op if no unit is installed).
+            let _ = crate::daemon::systemd::unload();
         }
         if stopped {
             println!("daemon stopping");

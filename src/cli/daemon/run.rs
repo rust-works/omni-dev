@@ -12,12 +12,13 @@ use crate::daemon::{self, paths, DaemonRunConfig};
 
 /// Runs the daemon in the foreground.
 ///
-/// Acquires the control socket — the launchd-activated fd when the daemon is
-/// socket-activated, otherwise a self-bound socket (which doubles as the
-/// single-instance lock) — starts every registered service (including the browser
-/// bridge on its loopback-TCP planes), and blocks until `SIGTERM`/`SIGINT` or a
-/// `daemon stop`. This is the process a launchd LaunchAgent demand-spawns on the
-/// first client connect (or that `daemon start` warms).
+/// Acquires the control socket — the service-manager-activated fd when the daemon
+/// is socket-activated (launchd on macOS, systemd on Linux), otherwise a self-bound
+/// socket (which doubles as the single-instance lock) — starts every registered
+/// service (including the browser bridge on its loopback-TCP planes), and blocks
+/// until `SIGTERM`/`SIGINT` or a `daemon stop`. This is the process the service
+/// manager demand-spawns on the first client connect (or that `daemon start`
+/// warms).
 ///
 /// On a macOS build with the `menu-bar` feature, this also shows the menu-bar
 /// tray unless `--no-menu` is given.

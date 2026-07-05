@@ -13,7 +13,8 @@
 //! - `daemon run` *becomes* the daemon ([`server::run`]), blocking until a
 //!   signal or a built-in `shutdown` op.
 //! - `daemon start` launches it in the background (a launchd LaunchAgent on
-//!   macOS); `stop` / `restart` / `status` are thin [`client::DaemonClient`]s.
+//!   macOS, a systemd user unit on Linux); `stop` / `restart` / `status` are thin
+//!   [`client::DaemonClient`]s.
 
 // The control plane is a Unix-domain socket (`UnixListener`/`UnixStream`), so the
 // daemon runtime is Unix-only and gated `#[cfg(unix)]`; running the daemon on
@@ -40,6 +41,9 @@ pub mod single_instance;
 
 #[cfg(target_os = "macos")]
 pub mod launchd;
+
+#[cfg(target_os = "linux")]
+pub mod systemd;
 
 #[cfg(all(target_os = "macos", feature = "menu-bar"))]
 pub mod tray;
