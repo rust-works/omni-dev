@@ -11,13 +11,14 @@ use crate::daemon::server;
 
 /// Starts the daemon in the background.
 ///
-/// On macOS this installs and loads a per-user launchd LaunchAgent that **owns**
-/// the control socket and demand-spawns the daemon on the first client connect
-/// (so it also activates at login); `start` then warms it with one readiness
-/// ping, which triggers that first spawn. Elsewhere it spawns a detached
-/// `daemon run` — its own session, stdout/stderr appended to a `daemon.log`
-/// beside the socket — with no auto-start at login. Returns once the control
-/// socket accepts connections.
+/// On macOS this installs and loads a per-user launchd LaunchAgent, and on Linux a
+/// per-user systemd socket unit (when a user manager is available); either **owns**
+/// the control socket and demand-spawns the daemon on the first client connect (so
+/// it also activates at login), and `start` warms it with one readiness ping to
+/// trigger that first spawn. Without a service manager (other Unix, or the systemd
+/// fallback) it spawns a detached `daemon run` — its own session, stdout/stderr
+/// appended to a `daemon.log` beside the socket — with no auto-start at login.
+/// Returns once the control socket accepts connections.
 #[derive(Parser)]
 pub struct StartCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
