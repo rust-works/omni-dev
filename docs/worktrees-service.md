@@ -79,6 +79,14 @@ omni-dev worktrees list --json
 omni-dev worktrees list --socket /path/to/daemon.sock
 ```
 
+Each row shows the window's repo, its **current branch** and **ahead/behind sync
+state** (`+ahead -behind`, or `-` when the branch tracks no upstream), the
+primary folder, and how long ago the window was last seen. The branch and sync
+columns are computed by the daemon from the worktree on disk — see
+[Git enrichment](#git-enrichment) — so they reflect the live branch rather than
+whatever the companion happened to report. `--json` carries the same fields plus
+the companion-reported `title`.
+
 The companion extension feeds the registry; the CLI only reads it. If the daemon
 is not running, `worktrees list` reports the connection failure (the companion, by
 contrast, no-ops silently).
@@ -86,9 +94,12 @@ contrast, no-ops silently).
 ## Tray
 
 On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:
-one line per open window, then a **"Focus …" action** per window. Clicking it
-spawns the VS Code CLI on that window's folder; since VS Code reuses an
-already-open window, this focuses the right window rather than opening a new one.
+one line per open window, then a **"Focus …" action** per window. Each window's
+line shows its name and, when the primary folder is a git worktree, the live
+branch and ahead/behind state (`repo · branch (+2 -1)`); windows that are not a
+repo fall back to their reported title. Clicking a "Focus" action spawns the VS
+Code CLI on that window's folder; since VS Code reuses an already-open window,
+this focuses the right window rather than opening a new one.
 
 Focusing is **best-effort**. The launcher is resolved in this order:
 
@@ -109,6 +120,30 @@ daemon: running
   worktrees        ok         3 window(s) across 2 repo(s)
 ```
 
+The `--json` status detail carries the same enriched window entries as
+`worktrees list --json`.
+
+## Git enrichment
+
+The companion reports only raw folder paths; the **daemon** computes the richer
+per-worktree git state — current branch and ahead/behind counts — with the
+`git2` dependency it already carries (#1186). Keeping this in Rust preserves the
+companion's thin-reporter contract ([ADR-0040](adrs/adr-0040.md)): the ~50-line
+extension never runs git.
+
+- **Computed on read.** Enrichment happens each time the registry is read
+  (`list`, `status`, and the tray menu), from the worktree on disk, so the branch
+  shown is always current — not a snapshot frozen at registration. `list` and
+  `status` run it on a blocking thread (`git2` is synchronous disk I/O) and never
+  under the registry lock.
+- **Primary folder only.** Only the first workspace folder of each window is
+  enriched — it is the one the table shows and the "Focus" action opens.
+- **Best-effort and degrading.** Discovery tolerates a folder inside a
+  subdirectory or a linked worktree. A folder that is not a git repo, a detached
+  HEAD, or a branch with no upstream is still listed — just without the fields it
+  cannot supply (no `branch`, or `branch` with no `ahead`/`behind`). The
+  enrichment never fails a `list`.
+
 ## Security
 
 **No new trust boundary** ([ADR-0040](adrs/adr-0040.md)). Requests ride the
@@ -118,11 +153,13 @@ bounded by socket ownership — reading the socket reveals your open repo *paths
 and writing it (already requiring the owning local user) could inject entries or
 trigger a focus. The focus action additionally requires the target to be an
 existing absolute directory before spawning `code`. Registry strings
-(`title`/`repo`/`folders`) are writer-influenced metadata, so the `worktrees
-list` table strips control characters (C0, DEL, C1) before rendering to the
-terminal — a registered entry cannot inject ANSI escape sequences into the
-operator's TTY (#1137). Native tray menus do not interpret ANSI, and the
-`--json` output escapes control bytes via JSON encoding.
+(`repo`/`folders`, and the companion `title`) are writer-influenced metadata, so
+the `worktrees list` table strips control characters (C0, DEL, C1) from the
+strings it renders before writing to the terminal — a registered entry cannot
+inject ANSI escape sequences into the operator's TTY (#1137). The daemon-computed
+`branch` is a git ref name (which cannot contain control bytes) but is sanitized
+on the same path as defense-in-depth. Native tray menus do not interpret ANSI,
+and the `--json` output escapes control bytes via JSON encoding.
 
 ## Companion contract (for the extension and other clients)
 
@@ -157,11 +194,20 @@ Where:
   it evicts the longest-silent entry rather than rejecting, so the companion
   needs no retry logic (an evicted window re-registers off its next heartbeat).
 - `folders` — absolute workspace-folder paths.
-- A `list` `entry` is `{ key, folders[], repo?, title?, pid?, last_seen }` with
-  `last_seen` as an RFC 3339 timestamp; consumers compute age from it. Entries are
-  sorted by `(repo, key)` for deterministic output. Fields are stored and served
-  verbatim on the wire (and in `--json`); only the human-readable `worktrees list`
-  table sanitizes them for terminal display (see Security).
+- A `list` `entry` is
+  `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, last_seen }`
+  with `last_seen` as an RFC 3339 timestamp; consumers compute age from it.
+  Entries are sorted by `(repo, key)` for deterministic output. The
+  companion-reported fields are stored and served verbatim on the wire (and in
+  `--json`); only the human-readable `worktrees list` table sanitizes them for
+  terminal display (see Security).
+- `branch`, `ahead`, `behind` are **daemon-computed, not companion-reported**:
+  the daemon derives them from the primary folder's git state on every read (see
+  [Git enrichment](#git-enrichment)). Each is optional and omitted when it does
+  not apply — no `branch` for a non-repo or detached HEAD; no `ahead`/`behind`
+  when the branch tracks no upstream. New optional fields like these follow the
+  protocol's `#[serde(skip_serializing_if)]` convention, so an older client
+  simply ignores them.
 
 Companion lifecycle, per window:
 
@@ -178,15 +224,18 @@ Example exchange:
 → {"service":"worktrees","op":"register","payload":{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321}}
 ← {"ok":true,"payload":{"ok":true}}
 → {"service":"worktrees","op":"list"}
-← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"last_seen":"2026-06-23T01:20:00Z"}]}}
+← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"last_seen":"2026-06-23T01:20:00Z"}]}}
 ```
+
+The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
+them to `list`/`status` replies.
 
 ## Scope and follow-ups
 
 - The companion extension is a separate deliverable (~50 lines): a minimal
   reporter that speaks the contract above.
-- Git enrichment lives in Rust: the companion reports raw folder paths; richer
-  per-worktree data (branch, ahead/behind) is a follow-up the daemon can compute
-  with `git2`, tracked in #1186.
+- Git enrichment lives in Rust (#1186): the companion reports raw folder paths
+  and the daemon computes per-worktree branch and ahead/behind state with `git2`
+  (see [Git enrichment](#git-enrichment)), keeping the companion thin.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
   Windows support is tracked with the broader daemon work (#1041).
