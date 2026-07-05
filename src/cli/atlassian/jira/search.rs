@@ -46,30 +46,49 @@ impl SearchCommand {
 
     /// Builds a JQL query from the provided flags, or returns the raw `--jql` value.
     fn build_jql(&self) -> Result<String> {
-        if let Some(ref jql) = self.jql {
-            return Ok(jql.clone());
-        }
-
-        let mut clauses = Vec::new();
-
-        if let Some(ref project) = self.project {
-            clauses.push(format!("project = \"{project}\""));
-        }
-        if let Some(ref assignee) = self.assignee {
-            clauses.push(format!("assignee = \"{assignee}\""));
-        }
-        if let Some(ref status) = self.status {
-            clauses.push(format!("status = \"{status}\""));
-        }
-
-        if clauses.is_empty() {
-            anyhow::bail!(
+        build_jql_from_filters(
+            self.jql.as_deref(),
+            self.project.as_deref(),
+            self.assignee.as_deref(),
+            self.status.as_deref(),
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
                 "Provide --jql for a raw query, or at least one filter flag (--project, --assignee, --status)"
-            );
-        }
-
-        Ok(clauses.join(" AND "))
+            )
+        })
     }
+}
+
+/// Assembles a JQL query from a raw query or convenience filters.
+///
+/// Returns the raw `jql` verbatim when present; otherwise ANDs together the
+/// `project`/`assignee`/`status` clauses. Returns `None` when neither a raw
+/// query nor any filter is supplied, leaving the "nothing provided" error to
+/// the caller — the CLI and the MCP `jira_search` tool word it differently.
+/// Shared so both surfaces build identical JQL from the same inputs.
+pub(crate) fn build_jql_from_filters(
+    jql: Option<&str>,
+    project: Option<&str>,
+    assignee: Option<&str>,
+    status: Option<&str>,
+) -> Option<String> {
+    if let Some(jql) = jql {
+        return Some(jql.to_string());
+    }
+
+    let mut clauses = Vec::new();
+    if let Some(project) = project {
+        clauses.push(format!("project = \"{project}\""));
+    }
+    if let Some(assignee) = assignee {
+        clauses.push(format!("assignee = \"{assignee}\""));
+    }
+    if let Some(status) = status {
+        clauses.push(format!("status = \"{status}\""));
+    }
+
+    (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
 
 /// Searches issues by JQL and displays results.

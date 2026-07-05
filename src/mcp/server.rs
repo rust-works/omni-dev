@@ -40,15 +40,26 @@ impl Default for OmniDevServer {
 impl OmniDevServer {
     /// Constructs a new server with all tool routers combined.
     pub fn new() -> Self {
+        let tool_router = Self::git_tool_router()
+            + Self::jira_tool_router()
+            + Self::jira_core_tool_router()
+            + Self::confluence_tool_router()
+            + Self::atlassian_tool_router()
+            + Self::ai_tool_router()
+            + Self::config_tool_router()
+            + Self::datadog_tool_router()
+            + Self::log_tool_router()
+            + Self::transcript_tool_router()
+            + Self::coverage_tool_router()
+            + Self::browser_tool_router();
+
+        // Snowflake tools reach the daemon over its Unix control socket, so they
+        // are compiled and registered only on Unix (matching `cli::snowflake`).
+        #[cfg(unix)]
+        let tool_router = tool_router + Self::snowflake_tool_router();
+
         Self {
-            tool_router: Self::git_tool_router()
-                + Self::jira_tool_router()
-                + Self::jira_core_tool_router()
-                + Self::confluence_tool_router()
-                + Self::atlassian_tool_router()
-                + Self::ai_tool_router()
-                + Self::config_tool_router()
-                + Self::datadog_tool_router(),
+            tool_router,
             catalogue_cache: Arc::new(CatalogueCache::default()),
         }
     }
@@ -323,6 +334,41 @@ mod tests {
             "datadog_dashboard_list",
             "datadog_dashboard_get",
             "datadog_logs_search",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_all_newer_subsystem_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            // request log
+            "log_search",
+            // transcript
+            "transcript_youtube_fetch",
+            "transcript_youtube_info",
+            "transcript_youtube_list_langs",
+            // coverage
+            "coverage_diff",
+            // git amend
+            "git_amend_commits",
+            // browser bridge
+            "browser_bridge_request",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    // Snowflake tools are Unix-only (they talk to the Unix-socket daemon).
+    #[cfg(unix)]
+    #[test]
+    fn tool_router_registers_snowflake_tools_on_unix() {
+        let server = OmniDevServer::new();
+        for name in [
+            "snowflake_query",
+            "snowflake_sessions",
+            "snowflake_disconnect",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

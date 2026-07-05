@@ -21,6 +21,33 @@ use crate::request_log::LogRecord;
 /// Poll interval while following the log.
 const FOLLOW_POLL: Duration = Duration::from_millis(250);
 
+/// Runs a one-shot backlog scan (no follow), capturing the rendered matches
+/// into a single string for programmatic consumers (the MCP `log_search` tool)
+/// rather than writing to stdout. A missing log file yields an empty string.
+///
+/// Only compiled with the `mcp` feature — its sole caller is the MCP
+/// `log_search` capture path.
+#[cfg(feature = "mcp")]
+pub(crate) fn run_capture(
+    path: &Path,
+    filter: &Filter,
+    format: Format,
+    limit: Option<usize>,
+) -> Result<String> {
+    use anyhow::Context as _;
+
+    let mut out: Vec<u8> = Vec::new();
+    match File::open(path) {
+        Ok(file) => {
+            let mut reader = BufReader::new(file);
+            emit_backlog(&mut reader, filter, format, limit, &mut out)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    String::from_utf8(out).context("log output was not valid UTF-8")
+}
+
 /// Streams the log file at `path`, applying `filter` and rendering as `format`.
 pub fn run(
     path: &Path,
@@ -294,6 +321,26 @@ mod tests {
         std::fs::write(&path, sample_lines()).unwrap();
         // Exercises the open + backlog path (output goes to captured stdout).
         assert!(run(&path, &empty_filter(), Format::Json, Some(2), false).is_ok());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn run_capture_returns_matches_as_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, sample_lines()).unwrap();
+        let out = run_capture(&path, &empty_filter(), Format::Json, Some(2)).unwrap();
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains(r#""url":"/x/4""#));
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn run_capture_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.jsonl");
+        let out = run_capture(&missing, &empty_filter(), Format::Json, None).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

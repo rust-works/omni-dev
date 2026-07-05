@@ -123,6 +123,69 @@ impl LogCommand {
     }
 }
 
+/// Filter inputs for a one-shot log search that captures its output, used by the
+/// MCP `log_search` tool. Mirrors the search flags on [`LogCommand`] minus
+/// `--follow` (a capturing search never tails).
+///
+/// Only compiled with the `mcp` feature — the MCP `log_search` tool is its sole
+/// consumer.
+#[cfg(feature = "mcp")]
+pub(crate) struct SearchRequest<'a> {
+    /// Lower time bound: a relative window (`30m`, `2h`, `1d`), a date, or an
+    /// RFC3339 timestamp.
+    pub since: Option<&'a str>,
+    /// Upper time bound: same forms as `since`.
+    pub until: Option<&'a str>,
+    /// Match the HTTP method (case-insensitive).
+    pub method: Option<&'a str>,
+    /// Match the status: exact, class (`5xx`), or list (`4xx,5xx`).
+    pub status: Option<&'a str>,
+    /// Match the service tag.
+    pub service: Option<&'a str>,
+    /// Match the resolved command-path prefix.
+    pub command: Option<&'a str>,
+    /// Match a substring of the request URL.
+    pub url: Option<&'a str>,
+    /// Match a regular expression against the raw JSON line.
+    pub grep: Option<&'a str>,
+    /// Fuzzy tokens (substrings of the raw line); AND-ed.
+    pub fuzzy: &'a [String],
+    /// Query expressions (AND/OR/NOT, `field:value`, bare tokens); AND-ed.
+    pub query: &'a [String],
+    /// Match this record `id` or `invocation_id`.
+    pub id: Option<&'a str>,
+    /// Output rendering.
+    pub format: Format,
+    /// Show at most N (most recent) matching records.
+    pub limit: Option<usize>,
+}
+
+/// Runs a one-shot (non-follow) log search and returns the rendered matches as a
+/// single string. Shared with the MCP `log_search` tool so it reuses the CLI's
+/// filter matrix and renderers verbatim; a missing log file yields an empty
+/// string.
+///
+/// Only compiled with the `mcp` feature — the MCP `log_search` tool is its sole
+/// consumer.
+#[cfg(feature = "mcp")]
+pub(crate) fn run_search_capture(req: SearchRequest<'_>) -> Result<String> {
+    let path = request_log::log_file_path().context("could not resolve the log file path")?;
+    let filter = Filter::build(query::FilterInput {
+        since: req.since,
+        until: req.until,
+        method: req.method,
+        status: req.status,
+        service: req.service,
+        command: req.command,
+        url: req.url,
+        grep: req.grep,
+        fuzzy: req.fuzzy,
+        query: req.query,
+        id: req.id,
+    })?;
+    stream::run_capture(&path, &filter, req.format, req.limit)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
