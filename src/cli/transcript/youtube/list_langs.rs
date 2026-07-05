@@ -14,7 +14,7 @@ pub struct ListLangsCommand {
     pub url: String,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = ListLangsOutput::Table)]
+    #[arg(short = 'o', long, value_enum, default_value_t = ListLangsOutput::Table)]
     pub output: ListLangsOutput,
 }
 

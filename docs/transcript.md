@@ -36,7 +36,7 @@ omni-dev transcript youtube fetch https://www.youtube.com/watch?v=jNQXAC9IVRw
 
 # Same video, written to disk as WebVTT.
 omni-dev transcript youtube fetch jNQXAC9IVRw \
-  --format vtt --output me-at-the-zoo.vtt
+  -o vtt --out-file me-at-the-zoo.vtt
 
 # Fall through to auto-generated captions when no manual track exists.
 omni-dev transcript youtube fetch <url> --auto
@@ -49,7 +49,7 @@ omni-dev transcript youtube fetch <url> --lang fr --translate fr
 omni-dev transcript youtube list-langs <url>
 
 # Show top-level metadata (title, channel, duration, available languages).
-omni-dev transcript youtube info <url> --output json
+omni-dev transcript youtube info <url> -o json
 
 # Sync every captioned video in one or more channels to a directory,
 # incrementally. Writes a transcript and a metadata sidecar per video.
@@ -66,10 +66,10 @@ omni-dev transcript youtube sync @RickAstleyYT --out ./transcripts \
 | Flag                | Default | Effect                                                                     |
 |---------------------|---------|----------------------------------------------------------------------------|
 | `--lang <code>`     | `en`    | Preferred language. Prefix fallback applies — `en` matches `en-US`.        |
-| `--format <fmt>`    | `srt`   | One of `srt`, `vtt`, `txt`, `json`.                                        |
+| `-o`, `--output <fmt>` | `srt` | One of `srt`, `vtt`, `txt`, `json`.                                       |
 | `--auto`            | off     | Allow falling through to auto-generated (ASR) captions.                    |
 | `--translate <lang>`| —       | Synthesise a translated track in `<lang>` when no native track matches.    |
-| `-o`, `--output`    | stdout  | Write the rendered transcript to a file instead of stdout.                 |
+| `--out-file <path>` | stdout  | Write the rendered transcript to a file instead of stdout.                 |
 
 ### `sync` output layout and metadata sidecars
 
