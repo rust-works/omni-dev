@@ -86,16 +86,11 @@ impl AtlassianApi for ConfluenceApi {
                 .await
                 .context("Failed to fetch Confluence page")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let page: ConfluencePageResponse = response
-                .json()
-                .await
-                .context("Failed to parse Confluence page response")?;
+            let page: ConfluencePageResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse Confluence page response",
+            )
+            .await?;
 
             debug!(
                 page_id = page.id,
@@ -275,16 +270,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to list Confluence spaces")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: ConfluenceSpacesResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence spaces response")?;
+        let resp: ConfluenceSpacesResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence spaces response",
+        )
+        .await?;
 
         let next_cursor = resp
             .links
@@ -340,16 +330,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to list Confluence space pages")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: ConfluenceSpacePagesSummaryResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence space pages response")?;
+        let resp: ConfluenceSpacePagesSummaryResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence space pages response",
+        )
+        .await?;
 
         let next_cursor = resp
             .links
@@ -489,11 +474,7 @@ impl ConfluenceApi {
             .await
             .context("Failed to fetch Confluence page with ancestors")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        let response = AtlassianClient::ensure_success(response).await?;
 
         response
             .json()
@@ -545,16 +526,11 @@ impl ConfluenceApi {
                 .await
                 .context("Failed to fetch child pages")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceChildrenResponse = response
-                .json()
-                .await
-                .context("Failed to parse children response")?;
+            let resp: ConfluenceChildrenResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse children response",
+            )
+            .await?;
 
             let page_count = resp.results.len();
             for child in resp.results {
@@ -596,16 +572,11 @@ impl ConfluenceApi {
                 .await
                 .context("Failed to fetch space root pages")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceSpacePagesResponse = response
-                .json()
-                .await
-                .context("Failed to parse space pages response")?;
+            let resp: ConfluenceSpacePagesResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse space pages response",
+            )
+            .await?;
 
             let page_count = resp.results.len();
             for entry in resp.results {
@@ -686,16 +657,11 @@ impl ConfluenceApi {
                 .await
                 .context("Failed to fetch Confluence comments")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceCommentsResponse = response
-                .json()
-                .await
-                .context("Failed to parse Confluence comments response")?;
+            let resp: ConfluenceCommentsResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse Confluence comments response",
+            )
+            .await?;
 
             let page_count = resp.results.len();
             for c in resp.results {
@@ -891,16 +857,11 @@ impl ConfluenceApi {
                 .await
                 .context("Failed to fetch page labels")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceLabelsResponse = response
-                .json()
-                .await
-                .context("Failed to parse labels response")?;
+            let resp: ConfluenceLabelsResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse labels response",
+            )
+            .await?;
 
             let page_count = resp.results.len();
             for entry in resp.results {
@@ -944,11 +905,7 @@ impl ConfluenceApi {
             .await
             .context("Failed to add labels")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        AtlassianClient::ensure_success(response).await?;
 
         Ok(())
     }
@@ -964,11 +921,7 @@ impl ConfluenceApi {
 
         let response = self.client.delete(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        AtlassianClient::ensure_success(response).await?;
 
         Ok(())
     }
@@ -990,16 +943,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to fetch Confluence page metadata")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let page: ConfluencePageResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence page response")?;
+        let page: ConfluencePageResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence page response",
+        )
+        .await?;
 
         Ok(PageMetadata {
             id: page.id,
@@ -1042,16 +990,11 @@ impl ConfluenceApi {
                 .await
                 .context("Failed to fetch Confluence page versions")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceVersionsResponse = response
-                .json()
-                .await
-                .context("Failed to parse Confluence versions response")?;
+            let resp: ConfluenceVersionsResponse = AtlassianClient::parse_json(
+                AtlassianClient::ensure_success(response).await?,
+                "Failed to parse Confluence versions response",
+            )
+            .await?;
 
             let page_count = resp.results.len();
             let next_link = resp.links.and_then(|l| l.next);
@@ -1153,16 +1096,11 @@ impl ConfluenceApi {
             .post_multipart(&url, form, &[("X-Atlassian-Token", "no-check")])
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: ConfluenceV1AttachmentResponse = response
-            .json()
-            .await
-            .context("Failed to parse upload attachment response")?;
+        let resp: ConfluenceV1AttachmentResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse upload attachment response",
+        )
+        .await?;
 
         let entry = resp
             .results
@@ -1200,16 +1138,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to fetch page attachments")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: ConfluenceAttachmentsResponse = response
-            .json()
-            .await
-            .context("Failed to parse attachments response")?;
+        let resp: ConfluenceAttachmentsResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse attachments response",
+        )
+        .await?;
 
         let next_cursor = resp
             .links
@@ -1240,11 +1173,7 @@ impl ConfluenceApi {
 
         let response = self.client.delete(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        AtlassianClient::ensure_success(response).await?;
 
         Ok(())
     }
@@ -1267,16 +1196,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to fetch attachment metadata")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entry: ConfluenceAttachmentEntry = response
-            .json()
-            .await
-            .context("Failed to parse attachment response")?;
+        let entry: ConfluenceAttachmentEntry = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse attachment response",
+        )
+        .await?;
         Ok(entry.into())
     }
 
@@ -1336,16 +1260,11 @@ impl ConfluenceApi {
             .await
             .context("Failed to fetch Confluence page version")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let page: ConfluencePageResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence page response")?;
+        let page: ConfluencePageResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence page response",
+        )
+        .await?;
 
         debug!(
             page_id = page.id,

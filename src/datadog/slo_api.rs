@@ -4,7 +4,7 @@
 //! Level Objective endpoints needed by the CLI: list and get. List
 //! auto-paginates when called with `limit == 0`, capped at [`HARD_CAP`].
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -54,14 +54,10 @@ impl<'a> SloApi<'a> {
             let remaining = cap - out.len();
             let page_size = remaining.min(LIST_PAGE_SIZE);
             let url = build_list_url(self.client.base_url(), filter, offset, page_size)?;
-            let response = self.client.get_json(url.as_str()).await?;
-            if !response.status().is_success() {
-                return Err(DatadogClient::response_to_error(response).await.into());
-            }
-            let parsed: SloListResponse = response
-                .json()
-                .await
-                .context("Failed to parse /api/v1/slo response")?;
+            let parsed: SloListResponse = self
+                .client
+                .get_parsed(url.as_str(), "Failed to parse /api/v1/slo response")
+                .await?;
             let exhausted = parsed.data.len() < page_size;
             let batch_len = parsed.data.len();
             out.extend(parsed.data);
@@ -77,14 +73,10 @@ impl<'a> SloApi<'a> {
     /// Fetches a single SLO definition by id.
     pub async fn get(&self, id: &str) -> Result<Slo> {
         let url = build_get_url(self.client.base_url(), id)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        let parsed: SloGetResponse = response
-            .json()
-            .await
-            .context("Failed to parse /api/v1/slo/<id> response")?;
+        let parsed: SloGetResponse = self
+            .client
+            .get_parsed(url.as_str(), "Failed to parse /api/v1/slo/<id> response")
+            .await?;
         Ok(parsed.data)
     }
 }
@@ -105,8 +97,7 @@ fn build_list_url(
     offset: usize,
     limit: usize,
 ) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/slo")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/slo")?;
     {
         let mut q = url.query_pairs_mut();
         if let Some(tags) = filter.tags.as_deref() {
@@ -128,8 +119,7 @@ fn build_list_url(
 }
 
 fn build_get_url(base_url: &str, id: &str) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/slo")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/slo")?;
     url.path_segments_mut()
         .map_err(|()| anyhow::anyhow!("Invalid Datadog base URL: cannot append path segment"))?
         .push(id);

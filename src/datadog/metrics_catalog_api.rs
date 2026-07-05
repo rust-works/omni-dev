@@ -5,7 +5,7 @@
 //! Phase 1 metrics *query* endpoint (`/api/v1/query`); the catalog
 //! returns the names of metrics ingested since `from`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -32,20 +32,14 @@ impl<'a> MetricsCatalogApi<'a> {
         from: Option<i64>,
     ) -> Result<MetricCatalogResponse> {
         let url = build_list_url(self.client.base_url(), host, from)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<MetricCatalogResponse>()
+        self.client
+            .get_parsed(url.as_str(), "Failed to parse /api/v1/metrics response")
             .await
-            .context("Failed to parse /api/v1/metrics response")
     }
 }
 
 fn build_list_url(base_url: &str, host: Option<&str>, from: Option<i64>) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/metrics")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/metrics")?;
     {
         let mut q = url.query_pairs_mut();
         if let Some(host) = host {
