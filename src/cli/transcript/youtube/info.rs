@@ -13,7 +13,7 @@ pub struct InfoCommand {
     pub url: String,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = InfoOutput::Table)]
+    #[arg(short = 'o', long, value_enum, default_value_t = InfoOutput::Table)]
     pub output: InfoOutput,
 }
 

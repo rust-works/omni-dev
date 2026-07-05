@@ -73,8 +73,11 @@ pub struct LogCommand {
     #[arg(long, value_name = "ID")]
     id: Option<String>,
     /// Output format.
-    #[arg(long, value_enum, default_value_t = Format::Oneline)]
-    format: Format,
+    #[arg(short = 'o', long, value_enum, default_value_t = Format::Oneline)]
+    output: Format,
+    /// Deprecated: use `-o`/`--output` instead.
+    #[arg(long = "format", hide = true)]
+    format: Option<Format>,
     /// Show at most N (most recent) matching records.
     #[arg(short = 'n', long, value_name = "N")]
     limit: Option<usize>,
@@ -92,11 +95,15 @@ enum LogAction {
 
 impl LogCommand {
     /// Executes the `omni-dev log` command.
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(mut self) -> Result<()> {
         if let Some(action) = self.action {
             return match action {
                 LogAction::Prune(cmd) => cmd.execute(),
             };
+        }
+        if let Some(format) = self.format.take() {
+            eprintln!("warning: --format is deprecated; use -o/--output instead");
+            self.output = format;
         }
         let path = request_log::log_file_path().context("could not resolve the log file path")?;
         let filter = Filter::build(query::FilterInput {
@@ -112,7 +119,7 @@ impl LogCommand {
             query: &self.query,
             id: self.id.as_deref(),
         })?;
-        stream::run(&path, &filter, self.format, self.limit, self.follow)
+        stream::run(&path, &filter, self.output, self.limit, self.follow)
     }
 }
 
@@ -143,9 +150,18 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let cmd = parse(&[]);
-        assert_eq!(cmd.format, Format::Oneline);
+        assert_eq!(cmd.output, Format::Oneline);
+        assert!(cmd.format.is_none());
         assert!(cmd.limit.is_none());
         assert!(!cmd.follow);
+    }
+
+    #[test]
+    fn deprecated_format_alias_still_parses() {
+        let cmd = parse(&["--format", "json"]);
+        // Captured separately; `execute` folds it into `output` with a warning.
+        assert_eq!(cmd.format, Some(Format::Json));
+        assert_eq!(cmd.output, Format::Oneline);
     }
 
     #[test]
@@ -173,7 +189,7 @@ mod tests {
             "status:5xx OR method:POST",
             "--id",
             "abc",
-            "--format",
+            "-o",
             "json",
             "-n",
             "10",
@@ -183,7 +199,7 @@ mod tests {
         assert_eq!(cmd.status.as_deref(), Some("5xx"));
         assert_eq!(cmd.fuzzy, vec!["a", "b"]);
         assert_eq!(cmd.query.len(), 1);
-        assert_eq!(cmd.format, Format::Json);
+        assert_eq!(cmd.output, Format::Json);
         assert_eq!(cmd.limit, Some(10));
         assert!(cmd.follow);
     }

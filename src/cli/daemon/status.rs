@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 
+use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::StatusReport;
 use crate::daemon::server;
@@ -21,15 +22,22 @@ pub struct StatusCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
-    /// Emit machine-readable JSON instead of a table.
-    #[arg(long)]
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+    /// Deprecated: use `-o`/`--output json` instead.
+    #[arg(long, hide = true)]
     pub json: bool,
 }
 
 impl StatusCommand {
     /// Executes the status command.
-    pub async fn execute(self) -> Result<()> {
-        let json_out = self.json;
+    pub async fn execute(mut self) -> Result<()> {
+        if self.json {
+            eprintln!("warning: --json is deprecated; use -o/--output json instead");
+            self.output = TableOrJson::Json;
+        }
+        let json_out = self.output == TableOrJson::Json;
         let socket_path = server::resolve_socket(self.socket)?;
         match DaemonClient::new(&socket_path).status().await {
             Ok(report) => print_running(json_out, &report),

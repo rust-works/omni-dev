@@ -52,10 +52,11 @@ mod tests {
             command: YoutubeSubcommands::Fetch(fetch::FetchCommand {
                 url: "https://youtu.be/abc".to_string(),
                 lang: "en".to_string(),
-                format: CliFormat::Srt,
+                output: CliFormat::Srt,
+                format: None,
                 auto: false,
                 translate: None,
-                output: None,
+                out_file: None,
             }),
         };
         assert!(matches!(cmd.command, YoutubeSubcommands::Fetch(_)));

@@ -91,7 +91,7 @@ use is invisible to the `request` / `harvest` thin clients.
 | `omni-dev daemon start` | Installs the daemon in the background and returns once it is ready. On macOS it bootstraps a launchd LaunchAgent that **owns** the control socket and spawns the daemon on the first client connect (so it also activates at login); `start` warms it with one ping. Elsewhere it spawns `daemon run` in its own session (`setsid`, so it survives the launching terminal) with stdout/stderr appended to a `0600` `daemon.log` beside the socket — but with no auto-start at login ([#1174](https://github.com/rust-works/omni-dev/issues/1174) tracks a systemd user unit). You normally run this once — after that any CLI call re-activates the daemon on demand (macOS socket activation; elsewhere re-run `daemon start` after a reboot). |
 | `omni-dev daemon stop` | Stops the daemon and, on macOS, boots out the LaunchAgent — removing the demand socket — so it is not re-activated until the next `daemon start` or login. |
 | `omni-dev daemon restart` | `stop` then `start`. On macOS, the only step needed after upgrading from an older `RunAtLoad` daemon to pick up the socket-activated agent. |
-| `omni-dev daemon status` | Reports the daemon and each hosted service (`--json` for machines). Under socket activation, "running" means a process is currently spawned; "not running" means none is resident right now, not that the daemon is unavailable (it re-activates on the next connect) — unless it was `stop`ped. |
+| `omni-dev daemon status` | Reports the daemon and each hosted service (`-o json` for machines). Under socket activation, "running" means a process is currently spawned; "not running" means none is resident right now, not that the daemon is unavailable (it re-activates on the next connect) — unless it was `stop`ped. |
 
 `daemon run` accepts the bridge's port/scope flags as `--bridge-ws-port`,
 `--bridge-control-port`, `--bridge-allow-origin`, and `--bridge-token-file`
@@ -126,7 +126,7 @@ omni-dev daemon status
 ```
 
 Before any tab connects the line reads `no tab connected (control :9998, ws
-:9999)`; `omni-dev daemon status --json` emits the structured per-service report.
+:9999)`; `omni-dev daemon status -o json` emits the structured per-service report.
 The `GET /__bridge/status` endpoint is unchanged and still feeds this view.
 
 ### Menu bar (macOS, `menu-bar` feature)

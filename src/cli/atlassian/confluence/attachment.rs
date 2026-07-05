@@ -233,16 +233,25 @@ pub struct DownloadCommand {
     /// filename in the current directory. If this names an existing
     /// directory, the file is written inside it under the attachment's
     /// filename.
-    #[arg(short = 'o', long)]
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<PathBuf>,
+
+    /// Deprecated: use `--out-file` instead.
+    #[arg(long = "output", hide = true)]
     pub output: Option<PathBuf>,
 }
 
 impl DownloadCommand {
     /// Executes the download command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        if let Some(output) = self.output.take() {
+            eprintln!("warning: --output is deprecated; use --out-file instead");
+            self.out_file = Some(output);
+        }
+
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        run_download(&api, &self.attachment_id, self.output.as_deref()).await
+        run_download(&api, &self.attachment_id, self.out_file.as_deref()).await
     }
 }
 
@@ -266,9 +275,9 @@ async fn run_download(
 
 /// Resolves the on-disk destination for a downloaded attachment.
 ///
-/// An explicit `--output` that points at an existing directory is joined
+/// An explicit `--out-file` that points at an existing directory is joined
 /// with the attachment's title; otherwise it is used verbatim. With no
-/// `--output`, the attachment's title is written to the current directory.
+/// `--out-file`, the attachment's title is written to the current directory.
 /// The title is remote-controlled, so it is sanitized to its final path
 /// component (falling back to the attachment ID) before use.
 fn resolve_output_path(output: Option<&Path>, title: &str, attachment_id: &str) -> PathBuf {
@@ -426,6 +435,7 @@ mod tests {
         let cmd = AttachmentCommand {
             command: AttachmentSubcommands::Download(DownloadCommand {
                 attachment_id: "att-1".to_string(),
+                out_file: None,
                 output: None,
             }),
         };
@@ -766,13 +776,29 @@ mod tests {
         let cmd = AttachmentCommand {
             command: AttachmentSubcommands::Download(DownloadCommand {
                 attachment_id: "att-1".to_string(),
-                output: Some(out.clone()),
+                out_file: Some(out.clone()),
+                output: None,
             }),
         };
         let result = cmd.execute().await;
         clear_atlassian_env();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(&out).unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn download_execute_folds_deprecated_output_flag() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        // The deprecated `--output` (file destination) is folded into
+        // `out_file` with a warning before the credential-less client is built.
+        let cmd = DownloadCommand {
+            attachment_id: "att-1".to_string(),
+            out_file: None,
+            output: Some(std::path::PathBuf::from("diagram.png")),
+        };
+        assert!(cmd.execute().await.is_err());
     }
 
     // ── DeleteCommand::execute_with_io (wiremock, injected IO) ────

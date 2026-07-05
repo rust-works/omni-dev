@@ -14,6 +14,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
@@ -52,21 +53,27 @@ pub struct ListCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
-    /// Emit machine-readable JSON instead of a table.
-    #[arg(long)]
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+    /// Deprecated: use `-o`/`--output json` instead.
+    #[arg(long, hide = true)]
     pub json: bool,
 }
 
 impl ListCommand {
     /// Executes the list command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        if self.json {
+            eprintln!("warning: --json is deprecated; use -o/--output json instead");
+            self.output = TableOrJson::Json;
+        }
         let socket = server::resolve_socket(self.socket)?;
         let result = call(&socket, "list", Value::Null).await?;
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
+        match self.output {
+            TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            TableOrJson::Table => println!("{}", render_windows(&result)),
         }
-        println!("{}", render_windows(&result));
         Ok(())
     }
 }
@@ -189,12 +196,22 @@ mod tests {
     #[test]
     fn list_parses_flags_and_defaults() {
         let WorktreesSubcommands::List(cmd) = parse(&["list"]);
+        assert_eq!(cmd.output, TableOrJson::Table);
         assert!(!cmd.json);
         assert!(cmd.socket.is_none());
 
-        let WorktreesSubcommands::List(cmd) = parse(&["list", "--json", "--socket", "/tmp/d.sock"]);
-        assert!(cmd.json);
+        let WorktreesSubcommands::List(cmd) =
+            parse(&["list", "-o", "json", "--socket", "/tmp/d.sock"]);
+        assert_eq!(cmd.output, TableOrJson::Json);
         assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
+    }
+
+    #[test]
+    fn list_deprecated_json_flag_still_parses() {
+        // `--json` is captured separately; `execute` folds it into `output`.
+        let WorktreesSubcommands::List(cmd) = parse(&["list", "--json"]);
+        assert!(cmd.json);
+        assert_eq!(cmd.output, TableOrJson::Table);
     }
 
     #[test]

@@ -17,7 +17,11 @@ pub struct ReadCommand {
     pub id: String,
 
     /// Output file (writes to stdout if omitted).
-    #[arg(short, long)]
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<String>,
+
+    /// Deprecated: use `--out-file` instead.
+    #[arg(long = "output", hide = true)]
     pub output: Option<String>,
 
     /// Output format.
@@ -33,7 +37,12 @@ pub struct ReadCommand {
 
 impl ReadCommand {
     /// Fetches the page and outputs it.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        if let Some(output) = self.output.take() {
+            eprintln!("warning: --output is deprecated; use --out-file instead");
+            self.out_file = Some(output);
+        }
+
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
@@ -42,12 +51,12 @@ impl ReadCommand {
                 // `get_page_at_version` is Confluence-specific (not on the shared
                 // `AtlassianApi` trait), so fetch here and reuse the shared renderer.
                 let item = api.get_page_at_version(&self.id, version).await?;
-                render_content_item(&item, self.output.as_deref(), &self.format, &instance_url)
+                render_content_item(&item, self.out_file.as_deref(), &self.format, &instance_url)
             }
             None => {
                 run_read(
                     &self.id,
-                    self.output.as_deref(),
+                    self.out_file.as_deref(),
                     &self.format,
                     &api,
                     &instance_url,
@@ -67,12 +76,13 @@ mod tests {
     fn read_command_struct_fields() {
         let cmd = ReadCommand {
             id: "12345".to_string(),
-            output: Some("page.md".to_string()),
+            out_file: Some("page.md".to_string()),
+            output: None,
             format: ContentFormat::Jfm,
             version: None,
         };
         assert_eq!(cmd.id, "12345");
-        assert_eq!(cmd.output.as_deref(), Some("page.md"));
+        assert_eq!(cmd.out_file.as_deref(), Some("page.md"));
         assert!(matches!(cmd.format, ContentFormat::Jfm));
         assert!(cmd.version.is_none());
     }
@@ -81,12 +91,13 @@ mod tests {
     fn read_command_adf_format() {
         let cmd = ReadCommand {
             id: "99999".to_string(),
+            out_file: None,
             output: None,
             format: ContentFormat::Adf,
             version: Some(3),
         };
         assert_eq!(cmd.id, "99999");
-        assert!(cmd.output.is_none());
+        assert!(cmd.out_file.is_none());
         assert!(matches!(cmd.format, ContentFormat::Adf));
         assert_eq!(cmd.version, Some(3));
     }
@@ -146,7 +157,25 @@ mod tests {
 
         let cmd = ReadCommand {
             id: "12345".to_string(),
+            out_file: None,
             output: None,
+            format: ContentFormat::Jfm,
+            version: None,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_command_execute_folds_deprecated_output_flag() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        // The deprecated `--output` (file destination) is folded into
+        // `out_file` with a warning before the credential-less client is built.
+        let cmd = ReadCommand {
+            id: "12345".to_string(),
+            out_file: None,
+            output: Some("page.md".to_string()),
             format: ContentFormat::Jfm,
             version: None,
         };
@@ -168,7 +197,8 @@ mod tests {
         set_atlassian_env(&server.uri());
         let cmd = ReadCommand {
             id: "12345".to_string(),
-            output: Some(out_path.to_str().unwrap().to_string()),
+            out_file: Some(out_path.to_str().unwrap().to_string()),
+            output: None,
             format: ContentFormat::Jfm,
             version: None,
         };
@@ -195,7 +225,8 @@ mod tests {
         set_atlassian_env(&server.uri());
         let cmd = ReadCommand {
             id: "12345".to_string(),
-            output: Some(out_path.to_str().unwrap().to_string()),
+            out_file: Some(out_path.to_str().unwrap().to_string()),
+            output: None,
             format: ContentFormat::Jfm,
             version: Some(3),
         };
