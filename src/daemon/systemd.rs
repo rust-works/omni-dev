@@ -214,19 +214,25 @@ fn enable_now() -> Result<()> {
     bail!("`systemctl --user enable --now {SOCKET_UNIT}` failed: {last_err}");
 }
 
+/// Writes the `.service` + `.socket` unit files into `dir` (creating it if
+/// absent). Split from [`install_and_load`] so the rendering and on-disk layout
+/// are testable without invoking `systemctl`.
+fn write_units(dir: &Path, exe: &Path, socket: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let service_unit = dir.join(SERVICE_UNIT);
+    let socket_unit = dir.join(SOCKET_UNIT);
+    std::fs::write(&service_unit, render_service(exe, socket)?)
+        .with_context(|| format!("failed to write {}", service_unit.display()))?;
+    std::fs::write(&socket_unit, render_socket(socket)?)
+        .with_context(|| format!("failed to write {}", socket_unit.display()))?;
+    Ok(())
+}
+
 /// Writes the unit files and enables the socket so systemd listens on the demand
 /// socket and spawns the daemon on the first client connect (and at login).
 pub fn install_and_load(socket: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("could not resolve the current executable")?;
-    let dir = unit_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-
-    let service_unit = dir.join(SERVICE_UNIT);
-    let socket_unit = dir.join(SOCKET_UNIT);
-    std::fs::write(&service_unit, render_service(&exe, socket)?)
-        .with_context(|| format!("failed to write {}", service_unit.display()))?;
-    std::fs::write(&socket_unit, render_socket(socket)?)
-        .with_context(|| format!("failed to write {}", socket_unit.display()))?;
+    write_units(&unit_dir()?, &exe, socket)?;
 
     // systemd creates the demand socket at `ListenStream` when the socket unit
     // starts — *before* our process runs — and does not create missing parent
@@ -502,6 +508,30 @@ mod tests {
     fn unit_dir_sits_under_systemd_user() {
         let dir = unit_dir().expect("config dir resolves in test");
         assert!(dir.ends_with("systemd/user"), "{}", dir.display());
+    }
+
+    #[test]
+    fn write_units_lays_down_both_unit_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_dir = tmp.path().join("systemd").join("user");
+        write_units(
+            &unit_dir,
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+        )
+        .expect("units are written");
+
+        let service = std::fs::read_to_string(unit_dir.join(SERVICE_UNIT)).unwrap();
+        let socket = std::fs::read_to_string(unit_dir.join(SOCKET_UNIT)).unwrap();
+        assert!(
+            service.contains("ExecStart=\"/usr/local/bin/omni-dev\" daemon run --socket \"/tmp/omni-dev/daemon.sock\""),
+            "{service}"
+        );
+        assert!(
+            socket.contains("ListenStream=/tmp/omni-dev/daemon.sock"),
+            "{socket}"
+        );
+        assert!(socket.contains("WantedBy=sockets.target"), "{socket}");
     }
 
     #[test]
