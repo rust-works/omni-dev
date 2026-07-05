@@ -9,7 +9,7 @@ mod staged;
 mod twiddle;
 mod view;
 
-pub use amend::AmendCommand;
+pub use amend::{run_amend, AmendCommand, AmendOutcome};
 pub use check::{run_check, CheckCommand, CheckOutcome};
 pub use create_pr::{run_create_pr, CreatePrCommand, CreatePrOutcome, PrContent};
 pub use info::{run_info, InfoCommand};
