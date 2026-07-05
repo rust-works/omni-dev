@@ -94,8 +94,9 @@ fn reply_payload(reply: DaemonReply) -> Result<Value> {
 }
 
 /// Renders a `list` reply as a human-readable table: a header and one row per
-/// open window (repo, title, primary folder, and how long ago it was last
-/// seen). Returns a placeholder line when nothing is open.
+/// open window (repo, the daemon-computed branch and its ahead/behind sync
+/// state, the primary folder, and how long ago it was last seen). Returns a
+/// placeholder line when nothing is open.
 fn render_windows(result: &Value) -> String {
     let windows = result
         .get("windows")
@@ -106,19 +107,32 @@ fn render_windows(result: &Value) -> String {
         return "No open windows.".to_string();
     }
     let mut out = format!(
-        "{:<24} {:<32} {:<40} {:>5}",
-        "REPO", "TITLE", "FOLDER", "AGE"
+        "{:<22} {:<24} {:<9} {:<40} {:>5}",
+        "REPO", "BRANCH", "SYNC", "FOLDER", "AGE"
     );
     for window in windows {
         let repo = sanitize(window.get("repo").and_then(Value::as_str).unwrap_or("-"));
-        let title = sanitize(window.get("title").and_then(Value::as_str).unwrap_or(""));
+        let branch = sanitize(window.get("branch").and_then(Value::as_str).unwrap_or("-"));
+        let sync = sync_summary(window);
         let folder_disp = folder_summary(window);
         let age = age_secs(window.get("last_seen").and_then(Value::as_str));
         out.push_str(&format!(
-            "\n{repo:<24} {title:<32} {folder_disp:<40} {age:>4}s"
+            "\n{repo:<22} {branch:<24} {sync:<9} {folder_disp:<40} {age:>4}s"
         ));
     }
     out
+}
+
+/// A compact `+ahead -behind` divergence indicator for a window, or `-` when
+/// the branch tracks no upstream (or there is no branch at all). The counts are
+/// daemon-computed integers, so no sanitizing is needed.
+fn sync_summary(window: &Value) -> String {
+    let ahead = window.get("ahead").and_then(Value::as_u64);
+    let behind = window.get("behind").and_then(Value::as_u64);
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => format!("+{ahead} -{behind}"),
+        _ => "-".to_string(),
+    }
 }
 
 /// The primary folder of a window, with a `(+N)` suffix when it has more than
@@ -197,13 +211,17 @@ mod tests {
         let result = json!({ "windows": [{
             "key": "w1",
             "repo": "omni-dev",
-            "title": "issue-1011 — worktrees",
+            "branch": "issue-1011",
+            "ahead": 2,
+            "behind": 1,
             "folders": ["/home/me/omni-dev", "/home/me/docs"],
             "last_seen": "2000-01-01T00:00:00Z",
         }]});
         let table = render_windows(&result);
         assert!(table.contains("omni-dev"), "{table}");
+        // The computed branch and its sync state both render.
         assert!(table.contains("issue-1011"), "{table}");
+        assert!(table.contains("+2 -1"), "{table}");
         // Primary folder plus a (+1) for the second workspace folder.
         assert!(table.contains("/home/me/omni-dev (+1)"), "{table}");
         // A header line plus exactly one data row.
@@ -212,12 +230,12 @@ mod tests {
 
     #[test]
     fn render_windows_strips_control_bytes() {
-        // C0 (ESC, CR, BEL), DEL, and C1 (CSI) bytes in every untrusted field
-        // must not reach the terminal (#1137).
+        // C0 (ESC, CR, BEL), DEL, and C1 (CSI) bytes in every string-valued
+        // field must not reach the terminal (#1137).
         let result = json!({ "windows": [{
             "key": "w1",
             "repo": "evil\x1b[31mrepo",
-            "title": "ti\rtle\x07\u{9b}2J",
+            "branch": "br\ranch\x07\u{9b}2J",
             "folders": ["/tmp/a\x1b]0;owned\x07\u{7f}", "/tmp/b"],
             "last_seen": "2000-01-01T00:00:00Z",
         }]});
@@ -228,10 +246,19 @@ mod tests {
         );
         // Visible text survives with only the control bytes removed.
         assert!(table.contains("evil[31mrepo"), "{table:?}");
-        assert!(table.contains("title2J"), "{table:?}");
+        assert!(table.contains("branch2J"), "{table:?}");
         assert!(table.contains("/tmp/a]0;owned (+1)"), "{table:?}");
         // Embedded CR/LF cannot forge extra rows: header plus one data row.
         assert_eq!(table.lines().count(), 2, "{table:?}");
+    }
+
+    #[test]
+    fn sync_summary_formats_or_dashes() {
+        assert_eq!(sync_summary(&json!({ "ahead": 2, "behind": 1 })), "+2 -1");
+        assert_eq!(sync_summary(&json!({ "ahead": 0, "behind": 0 })), "+0 -0");
+        // Branch present but no upstream, or nothing at all → a dash.
+        assert_eq!(sync_summary(&json!({ "branch": "main" })), "-");
+        assert_eq!(sync_summary(&json!({})), "-");
     }
 
     #[test]
