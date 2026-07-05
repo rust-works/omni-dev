@@ -48,12 +48,16 @@ fn unit_dir() -> Result<PathBuf> {
 
 /// Whether `OMNI_DEV_DAEMON_DISABLE_SYSTEMD` is set to a truthy value.
 fn systemd_disabled() -> bool {
-    std::env::var(DISABLE_ENV).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    std::env::var(DISABLE_ENV).is_ok_and(|v| flag_is_truthy(&v))
+}
+
+/// Whether an environment-flag string counts as "on" (`1`/`true`/`yes`/`on`,
+/// case- and surrounding-whitespace-insensitive).
+fn flag_is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Whether a systemd **user** manager is running and can host the daemon.
@@ -491,6 +495,71 @@ mod tests {
         assert!(
             matches!(result, Ok(None)),
             "expected Ok(None) outside systemd activation, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unit_dir_sits_under_systemd_user() {
+        let dir = unit_dir().expect("config dir resolves in test");
+        assert!(dir.ends_with("systemd/user"), "{}", dir.display());
+    }
+
+    #[test]
+    fn systemctl_targets_the_user_manager() {
+        let cmd = systemctl();
+        assert_eq!(cmd.get_program().to_str(), Some("systemctl"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args, ["--user"]);
+    }
+
+    #[test]
+    fn flag_is_truthy_recognises_on_and_off_values() {
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(flag_is_truthy(on), "{on:?} should be truthy");
+        }
+        for off in ["0", "false", "no", "", "off", "disable"] {
+            assert!(!flag_is_truthy(off), "{off:?} should be falsey");
+        }
+    }
+
+    #[test]
+    fn is_available_is_a_total_bool() {
+        // Environment-dependent, so we only assert it never panics — exercising the
+        // disabled/booted/runtime-socket probe path in whatever env the test runs.
+        let _ = is_available();
+    }
+
+    /// `set_cloexec` must actually set the flag: clear it first, then confirm the
+    /// call turns it back on.
+    #[allow(unsafe_code)]
+    #[test]
+    fn set_cloexec_sets_the_flag() {
+        use std::os::unix::io::AsRawFd;
+
+        use nix::libc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = StdUnixListener::bind(dir.path().join("s.sock")).unwrap();
+        let fd = listener.as_raw_fd();
+
+        // Rust sets `FD_CLOEXEC` on sockets it creates, so clear it first to make
+        // the assertion meaningful.
+        // SAFETY: `F_SETFD`/`F_GETFD` on a live owned descriptor are simple flag
+        // syscalls with no memory effects.
+        let cleared = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        assert_eq!(cleared, 0, "clearing FD_CLOEXEC failed");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "precondition: FD_CLOEXEC should be cleared"
+        );
+
+        set_cloexec(fd).expect("set_cloexec succeeds on a valid fd");
+
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "FD_CLOEXEC should be set after set_cloexec"
         );
     }
 }
