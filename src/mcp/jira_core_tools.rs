@@ -15,14 +15,15 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
-use crate::atlassian::client::{
-    AtlassianClient, JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
-};
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::create::{create_resolved_jira_issue, prepend_warnings, resolve_jira_create};
 use crate::atlassian::custom_fields::{
     apply_user_field_overrides, convert_textarea_string_values, resolve_custom_fields,
 };
 use crate::atlassian::document::{issue_to_jfm_document, CustomFieldSection, JfmDocument};
+use crate::atlassian::jira_types::{
+    JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
+};
 use crate::cli::atlassian::helpers::create_client;
 
 use super::catalogue_cache::CatalogueCache;
@@ -466,11 +467,11 @@ async fn run_jira_read(
     }
 }
 
-/// Renders a fetched [`crate::atlassian::client::JiraIssue`] in the requested
+/// Renders a fetched [`crate::atlassian::jira_types::JiraIssue`] in the requested
 /// format. Split out from [`run_jira_read`] so the rendering branch can be
 /// unit-tested without going through the HTTP client.
 fn render_jira_issue(
-    issue: &crate::atlassian::client::JiraIssue,
+    issue: &crate::atlassian::jira_types::JiraIssue,
     instance_url: &str,
     format: &ReadFormat,
 ) -> Result<String> {
@@ -1803,8 +1804,8 @@ mod tests {
 
     fn issue_with_description(
         adf: Option<serde_json::Value>,
-    ) -> crate::atlassian::client::JiraIssue {
-        crate::atlassian::client::JiraIssue {
+    ) -> crate::atlassian::jira_types::JiraIssue {
+        crate::atlassian::jira_types::JiraIssue {
             key: "PROJ-1".to_string(),
             summary: "S".to_string(),
             description_adf: adf,

@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, JiraField, JiraFieldOption};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{JiraField, JiraFieldOption};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 

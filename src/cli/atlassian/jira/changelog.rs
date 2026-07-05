@@ -5,7 +5,8 @@ use clap::Parser;
 
 use serde::Serialize;
 
-use crate::atlassian::client::{AtlassianClient, JiraChangelogEntry, JiraChangelogItem};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{JiraChangelogEntry, JiraChangelogItem};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 

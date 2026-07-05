@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use serde::Serialize;
 
-use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::ChildPage;
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 

@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::{ContentItem, ContentMetadata};
-use crate::atlassian::client::{JiraCustomField, JiraIssue};
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
+use crate::atlassian::jira_types::{JiraCustomField, JiraIssue};
 
 /// A JFM document consisting of YAML frontmatter and a markdown body.
 #[derive(Debug, Clone)]

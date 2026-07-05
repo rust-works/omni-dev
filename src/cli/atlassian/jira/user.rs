@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, JiraUserGetResults, JiraUserSearchResults};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{JiraUserGetResults, JiraUserSearchResults};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -212,7 +213,7 @@ fn print_user_get_results(result: &JiraUserGetResults) {
 mod tests {
     use super::*;
     use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
-    use crate::atlassian::client::{JiraUserRecord, JiraUserSearchResult};
+    use crate::atlassian::jira_types::{JiraUserRecord, JiraUserSearchResult};
 
     fn mock_client(base_url: &str) -> AtlassianClient {
         AtlassianClient::new(base_url, "user@test.com", "token").unwrap()

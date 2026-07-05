@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 
 use std::io::{self, BufRead, Write};
 
-use crate::atlassian::client::{AtlassianClient, JiraWatcherList};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::JiraWatcherList;
 use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -199,7 +200,7 @@ fn print_watchers(result: &JiraWatcherList) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::JiraUser;
+    use crate::atlassian::jira_types::JiraUser;
 
     fn sample_user(name: &str, account_id: &str) -> JiraUser {
         JiraUser {

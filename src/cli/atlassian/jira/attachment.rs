@@ -6,7 +6,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, JiraAttachment};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::JiraAttachment;
 use crate::cli::atlassian::helpers::create_client;
 use crate::utils::path::attachment_filename;
 
