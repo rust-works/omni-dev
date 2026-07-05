@@ -9,6 +9,12 @@
 //! ops, renders the menu/status, and drives the VS Code launcher. Like the
 //! Snowflake service it is a cheap, in-memory adapter — no async setup, no
 //! secret persisted.
+//!
+//! The adapter also computes the **per-worktree git enrichment** (current
+//! branch, ahead/behind counts) on read via `git2` (#1186), keeping the
+//! companion a thin reporter of raw folder paths (ADR-0040). The engine stores
+//! only what the companion sends; disk I/O for the enrichment lives here,
+//! alongside the launcher, never under the registry lock.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -16,6 +22,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use git2::Repository;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
@@ -75,7 +83,7 @@ impl DaemonService for WorktreesService {
                 let key = require_key(&payload, "unregister")?;
                 Ok(json!({ "removed": self.registry.unregister(key) }))
             }
-            "list" => Ok(json!({ "windows": self.registry.list() })),
+            "list" => Ok(json!({ "windows": enriched_windows(self.registry.list()).await })),
             other => bail!("unknown worktrees op: {other}"),
         }
     }
@@ -110,11 +118,13 @@ impl DaemonService for WorktreesService {
     async fn status(&self) -> ServiceStatus {
         let entries = self.registry.list();
         let repos: BTreeSet<&str> = entries.iter().filter_map(|e| e.repo.as_deref()).collect();
+        let summary = format!("{} window(s) across {} repo(s)", entries.len(), repos.len());
+        let windows = enriched_windows(entries).await;
         ServiceStatus {
             name: SERVICE_NAME.to_string(),
             healthy: true,
-            summary: format!("{} window(s) across {} repo(s)", entries.len(), repos.len()),
-            detail: json!({ "windows": entries }),
+            summary,
+            detail: json!({ "windows": windows }),
         }
     }
 
@@ -130,6 +140,108 @@ fn require_key<'a>(payload: &'a Value, op: &str) -> Result<&'a str> {
         .get("key")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("`{op}` requires `key`"))
+}
+
+/// The live git state of a worktree folder: the checked-out branch and how far
+/// it has diverged from its upstream. Computed on read from the on-disk repo
+/// (#1186), so `list`/`status`/`menu` reflect the current branch rather than a
+/// snapshot taken at registration.
+///
+/// Every field is optional and degrades independently: a folder that is not a
+/// git repo, is on a detached HEAD, or whose branch tracks no upstream is still
+/// listed — just without the fields it cannot supply. The `skip_serializing_if`
+/// attributes let it flatten cleanly onto an entry (see [`EnrichedEntry`]),
+/// omitting each absent field on the wire.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+struct GitStatus {
+    /// The checked-out branch, or `None` when detached or not in a repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    /// Commits the branch is ahead of its upstream (`None` without an upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ahead: Option<usize>,
+    /// Commits the branch is behind its upstream (`None` without an upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<usize>,
+}
+
+/// Computes the [`GitStatus`] of `folder` by discovering the repository that
+/// contains it — so a subdirectory or a linked worktree both resolve — and
+/// reading HEAD. Every failure mode degrades to an empty status rather than
+/// erroring: the enrichment is best-effort and must never sink a `list`.
+fn git_status(folder: &Path) -> GitStatus {
+    let Ok(repo) = Repository::discover(folder) else {
+        return GitStatus::default();
+    };
+    let Ok(head) = repo.head() else {
+        // An unborn branch (fresh repo, no commits) or an unreadable HEAD.
+        return GitStatus::default();
+    };
+    // A branch HEAD has a UTF-8 shorthand; anything else — a detached HEAD
+    // (mid-rebase or a checked-out tag/commit), or the rare non-UTF-8 branch
+    // name — degrades to no branch through this one path.
+    let Some(name) = head
+        .shorthand()
+        .ok()
+        .filter(|_| head.is_branch())
+        .map(str::to_string)
+    else {
+        return GitStatus::default();
+    };
+    let branch = git2::Branch::wrap(head);
+    let (ahead, behind) = match upstream_ahead_behind(&repo, &branch) {
+        Some((ahead, behind)) => (Some(ahead), Some(behind)),
+        None => (None, None),
+    };
+    GitStatus {
+        branch: Some(name),
+        ahead,
+        behind,
+    }
+}
+
+/// Ahead/behind commit counts of `branch` versus its configured upstream, or
+/// `None` when the branch tracks no upstream (or either tip is unresolvable).
+fn upstream_ahead_behind(repo: &Repository, branch: &git2::Branch<'_>) -> Option<(usize, usize)> {
+    let upstream = branch.upstream().ok()?;
+    let local_oid = branch.get().target()?;
+    let upstream_oid = upstream.get().target()?;
+    repo.graph_ahead_behind(local_oid, upstream_oid).ok()
+}
+
+/// The wire shape of an enriched window: the stored entry fields plus the
+/// daemon-computed git state, flattened into one JSON object. Serializing
+/// through a single struct (rather than mutating a `Value`) keeps every present
+/// field on one code path and lets `skip_serializing_if` on [`GitStatus`] drop
+/// the absent git fields — no manual per-field insertion.
+#[derive(Serialize)]
+struct EnrichedEntry<'a> {
+    #[serde(flatten)]
+    entry: &'a WindowEntry,
+    #[serde(flatten)]
+    git: GitStatus,
+}
+
+/// Serializes a registry entry and folds in the live [`git_status`] of its
+/// primary (first) folder, producing the JSON object served on the wire
+/// (`list`/`status`) and read by the extension UI. Only the primary folder is
+/// enriched — it is the one the table shows and the "focus" action opens.
+fn enriched_entry(entry: &WindowEntry) -> Value {
+    let git = entry
+        .folders
+        .first()
+        .map(|folder| git_status(folder))
+        .unwrap_or_default();
+    serde_json::to_value(EnrichedEntry { entry, git }).unwrap_or_else(|_| json!({}))
+}
+
+/// Enriches a batch of entries with their git state on a blocking thread, since
+/// `git2` does synchronous disk I/O and this runs inside the async control-socket
+/// handler. A join failure degrades to an empty list rather than erroring.
+async fn enriched_windows(entries: Vec<WindowEntry>) -> Vec<Value> {
+    tokio::task::spawn_blocking(move || entries.iter().map(enriched_entry).collect())
+        .await
+        .unwrap_or_default()
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,
@@ -148,16 +260,13 @@ fn display_name(entry: &WindowEntry) -> String {
 }
 
 /// Builds the tray items for a non-empty window list: a label per window, a
-/// separator, then a "Focus" action per window that has a folder to open.
+/// separator, then a "Focus" action per window that has a folder to open. The
+/// labels carry live git state, so this reads each worktree from disk — cheap
+/// for a realistic window count and consistent with reap-on-read.
 fn window_menu_items(entries: &[WindowEntry]) -> Vec<MenuItem> {
     let mut items = Vec::new();
     for entry in entries {
-        let name = display_name(entry);
-        let label = match &entry.title {
-            Some(title) if title != &name => format!("{name} · {title}"),
-            _ => name,
-        };
-        items.push(MenuItem::Label(label));
+        items.push(MenuItem::Label(window_label(entry)));
     }
     items.push(MenuItem::Separator);
     for entry in entries {
@@ -171,6 +280,38 @@ fn window_menu_items(entries: &[WindowEntry]) -> Vec<MenuItem> {
         }
     }
     items
+}
+
+/// The tray label for one window: its display name, then live branch state
+/// (`repo · branch (+2 -1)`) when the primary folder is a git worktree,
+/// otherwise the reported title if it adds anything the name does not.
+fn window_label(entry: &WindowEntry) -> String {
+    let name = display_name(entry);
+    let status = entry
+        .folders
+        .first()
+        .map(|folder| git_status(folder))
+        .unwrap_or_default();
+    if let Some(branch) = &status.branch {
+        return match sync_indicator(status.ahead, status.behind) {
+            Some(sync) => format!("{name} · {branch} {sync}"),
+            None => format!("{name} · {branch}"),
+        };
+    }
+    // No git branch (not a repo / detached): fall back to the reported title.
+    match &entry.title {
+        Some(title) if title != &name => format!("{name} · {title}"),
+        _ => name,
+    }
+}
+
+/// A compact `(+ahead -behind)` divergence indicator, or `None` when the branch
+/// has no upstream to compare against.
+fn sync_indicator(ahead: Option<usize>, behind: Option<usize>) -> Option<String> {
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => Some(format!("(+{ahead} -{behind})")),
+        _ => None,
+    }
 }
 
 /// Well-known absolute locations for the VS Code launcher, tried in order so a
@@ -546,5 +687,214 @@ mod tests {
         );
         // The real-env wrapper resolves without panicking.
         let _ = resolve_code_binary();
+    }
+
+    // --- Git enrichment (#1186) --------------------------------------------
+
+    /// Initializes a fresh repo with a deterministic identity so `commit()`
+    /// works without depending on a global git config.
+    fn init_repo(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        repo
+    }
+
+    /// Writes an empty-tree commit (file content is irrelevant to ahead/behind),
+    /// optionally moving `refname` to it, and returns its oid.
+    fn empty_commit(
+        repo: &Repository,
+        refname: Option<&str>,
+        parents: &[&git2::Commit<'_>],
+        msg: &str,
+    ) -> git2::Oid {
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(refname, &sig, &sig, msg, &tree, parents)
+            .unwrap()
+    }
+
+    /// Builds a repo whose `main` is 1 commit ahead of and 1 behind a configured
+    /// `origin/main` upstream, so enrichment reports `ahead: 1, behind: 1`.
+    fn diverging_repo(dir: &Path) -> Repository {
+        let repo = init_repo(dir);
+        // A: the shared base on `main`.
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        let a_commit = repo.find_commit(a).unwrap();
+        // origin/main diverges to C, a sibling of the local tip.
+        let c = empty_commit(&repo, None, &[&a_commit], "C");
+        repo.reference("refs/remotes/origin/main", c, true, "origin main")
+            .unwrap();
+        // Local `main` advances to B → 1 ahead of / 1 behind origin/main.
+        empty_commit(&repo, Some("refs/heads/main"), &[&a_commit], "B");
+        // Release the commit's borrow of `repo` so it can be returned.
+        drop(a_commit);
+        repo.set_head("refs/heads/main").unwrap();
+        // Configure the tracking relationship so `upstream()` resolves.
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/x.git")
+            .unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.main.remote", "origin").unwrap();
+        cfg.set_str("branch.main.merge", "refs/heads/main").unwrap();
+        repo
+    }
+
+    #[test]
+    fn git_status_reads_branch_and_ahead_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        let status = git_status(dir.path());
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.ahead, Some(1));
+        assert_eq!(status.behind, Some(1));
+    }
+
+    #[test]
+    fn git_status_empty_repo_is_unborn() {
+        // A repo with no commits has an unborn HEAD, so `head()` errors and the
+        // status degrades to empty rather than panicking.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        assert_eq!(git_status(dir.path()), GitStatus::default());
+    }
+
+    #[test]
+    fn git_status_no_upstream_reports_branch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let status = git_status(dir.path());
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        // No upstream → ahead/behind stay absent rather than zero.
+        assert_eq!(status.ahead, None);
+        assert_eq!(status.behind, None);
+    }
+
+    #[test]
+    fn git_status_non_repo_and_detached_are_empty() {
+        // A plain directory that is not a git repo.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_status(plain.path()), GitStatus::default());
+
+        // A detached HEAD reports no branch (and thus no sync).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head_detached(a).unwrap();
+        assert_eq!(git_status(dir.path()), GitStatus::default());
+    }
+
+    #[test]
+    fn sync_indicator_formats_only_with_upstream() {
+        assert_eq!(sync_indicator(Some(2), Some(1)).as_deref(), Some("(+2 -1)"));
+        assert_eq!(sync_indicator(Some(0), Some(0)).as_deref(), Some("(+0 -0)"));
+        assert_eq!(sync_indicator(None, None), None);
+        // A partial pair (no real upstream) yields nothing.
+        assert_eq!(sync_indicator(Some(1), None), None);
+    }
+
+    #[tokio::test]
+    async fn list_enriches_entries_with_git_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [dir.path()], "repo": "r" }),
+        )
+        .await
+        .unwrap();
+        let payload = svc.handle("list", Value::Null).await.unwrap();
+        let windows = windows_of(&payload);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].get("branch").and_then(Value::as_str),
+            Some("main")
+        );
+        // No upstream configured → the ahead/behind keys are absent, not zero.
+        assert!(windows[0].get("ahead").is_none());
+        assert!(windows[0].get("behind").is_none());
+
+        // A non-repo folder is still listed, just without a branch.
+        let plain = tempfile::tempdir().unwrap();
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [plain.path()], "repo": "plain" }),
+        )
+        .await
+        .unwrap();
+        let windows = windows_of(&svc.handle("list", Value::Null).await.unwrap()).clone();
+        let w2 = windows
+            .iter()
+            .find(|w| w.get("key").and_then(Value::as_str) == Some("w2"))
+            .unwrap();
+        assert!(w2.get("branch").is_none());
+    }
+
+    #[test]
+    fn window_label_prefers_git_branch_over_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let entry = WindowEntry {
+            key: "k".to_string(),
+            folders: vec![dir.path().to_path_buf()],
+            repo: Some("my-repo".to_string()),
+            title: Some("ignored title".to_string()),
+            pid: None,
+            last_seen: Utc::now(),
+        };
+        // The computed branch wins over the reported title; with no upstream
+        // there is no sync suffix.
+        assert_eq!(window_label(&entry), "my-repo · main");
+    }
+
+    #[tokio::test]
+    async fn list_includes_ahead_behind_for_tracking_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [dir.path()], "repo": "r" }),
+        )
+        .await
+        .unwrap();
+        let payload = svc.handle("list", Value::Null).await.unwrap();
+        let windows = windows_of(&payload);
+        // A tracking branch serializes branch plus both divergence counts.
+        assert_eq!(
+            windows[0].get("branch").and_then(Value::as_str),
+            Some("main")
+        );
+        assert_eq!(windows[0].get("ahead").and_then(Value::as_u64), Some(1));
+        assert_eq!(windows[0].get("behind").and_then(Value::as_u64), Some(1));
+    }
+
+    #[test]
+    fn window_label_includes_sync_for_tracking_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        let entry = WindowEntry {
+            key: "k".to_string(),
+            folders: vec![dir.path().to_path_buf()],
+            repo: Some("my-repo".to_string()),
+            title: None,
+            pid: None,
+            last_seen: Utc::now(),
+        };
+        // A tracking branch appends the `(+ahead -behind)` sync indicator.
+        assert_eq!(window_label(&entry), "my-repo · main (+1 -1)");
     }
 }
