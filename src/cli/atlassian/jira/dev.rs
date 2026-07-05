@@ -3,9 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
-use crate::atlassian::client::{
-    AtlassianClient, JiraDevBranch, JiraDevCommit, JiraDevPullRequest, JiraDevRepository,
-    JiraDevStatus, JiraDevStatusSummary,
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{
+    JiraDevBranch, JiraDevCommit, JiraDevPullRequest, JiraDevRepository, JiraDevStatus,
+    JiraDevStatusSummary,
 };
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -322,7 +323,7 @@ fn print_commits(commits: &[JiraDevCommit]) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::{JiraDevProvider, JiraDevStatusCount};
+    use crate::atlassian::jira_types::{JiraDevProvider, JiraDevStatusCount};
 
     fn github_provider() -> JiraDevProvider {
         JiraDevProvider {

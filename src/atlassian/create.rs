@@ -12,12 +12,13 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
-use crate::atlassian::client::{AtlassianClient, JiraCreatedIssue};
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::custom_fields::{merge_set_field_overrides, resolve_custom_fields};
 use crate::atlassian::document::{
     split_custom_sections, split_frontmatter, CustomFieldSection, JfmDocument, JfmFrontmatter,
     JiraCreateFrontmatter,
 };
+use crate::atlassian::jira_types::JiraCreatedIssue;
 
 // ── override warnings ───────────────────────────────────────────────────────
 

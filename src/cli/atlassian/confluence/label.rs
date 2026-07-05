@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 
 use std::io::{self, BufRead, Write};
 
-use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceLabel};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::ConfluenceLabel;
 use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -179,7 +180,7 @@ impl RemoveCommand {
 }
 
 /// Prints labels as a formatted table.
-fn print_labels(labels: &[crate::atlassian::confluence_api::ConfluenceLabel]) {
+fn print_labels(labels: &[crate::atlassian::confluence_types::ConfluenceLabel]) {
     if labels.is_empty() {
         println!("No labels found.");
         return;

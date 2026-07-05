@@ -9,9 +9,10 @@ use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{validate_with_source, ValidatedAdfDocument};
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::auth;
-use crate::atlassian::client::{AtlassianClient, FieldSelection};
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, issue_to_jfm_document, JfmDocument};
+use crate::atlassian::jira_types::FieldSelection;
 
 use super::format::ContentFormat;
 
