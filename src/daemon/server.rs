@@ -56,7 +56,7 @@ pub async fn run_with_shutdown(
     }
     paths::check_socket_path_len(&opts.socket_path)?;
 
-    let (listener, launchd_owned) = acquire_listener(&opts.socket_path).await?;
+    let (listener, socket_activated) = acquire_listener(&opts.socket_path).await?;
     tracing::info!("daemon listening on {}", opts.socket_path.display());
 
     lifecycle::install_signal_handlers(shutdown.clone());
@@ -101,12 +101,13 @@ pub async fn run_with_shutdown(
     // — rather than after the drain — to avoid a restart race: a replacement
     // daemon could reclaim the stale socket and rebind its *own* listener
     // mid-drain, and a late unlink would then delete that fresh socket out from
-    // under it. On the launchd-activated path the socket inode belongs to launchd,
-    // not us: unlinking it would make the next `connect(path)` hit ENOENT and
-    // never re-activate the daemon — so we leave it in place for launchd to reuse
-    // on the next demand spawn (#1081).
+    // under it. On the socket-activated path the socket inode belongs to the
+    // service manager (launchd on macOS, systemd on Linux), not us: unlinking it
+    // would make the next `connect(path)` hit ENOENT and never re-activate the
+    // daemon — so we leave it in place for the manager to reuse on the next demand
+    // spawn (#1081).
     drop(listener);
-    if !launchd_owned {
+    if !socket_activated {
         remove_socket(&opts.socket_path);
     }
 
@@ -118,23 +119,30 @@ pub async fn run_with_shutdown(
     Ok(())
 }
 
-/// Acquires the control-socket listener, returning it alongside whether launchd
-/// owns the socket inode.
+/// Acquires the control-socket listener, returning it alongside whether the
+/// service manager owns the socket inode (i.e. the daemon was socket-activated).
 ///
-/// On macOS the daemon is normally **socket-activated**: launchd creates and owns
-/// the listening socket and hands us the inherited fd (`launchd::launchd_listener`
-/// — a plain code span, not an intra-doc link, since the `launchd` module is
-/// macOS-gated and absent from the cross-platform docs build), so there is
-/// no bind and no single-instance handling — launchd guarantees at most one spawn
-/// per socket. When that lookup reports no inherited socket (a manual
-/// `daemon run` from a shell, CI, or any non-macOS platform) the daemon binds the
-/// socket itself via [`single_instance::bind_or_reclaim`], which doubles as the
-/// single-instance lock. The returned bool gates whether shutdown unlinks the
-/// path: launchd's inode must be left in place to re-activate (#1081).
+/// On macOS (launchd) and Linux (systemd) the daemon is normally
+/// **socket-activated**: the service manager creates and owns the listening
+/// socket and hands us the inherited fd (`launchd::launchd_listener` /
+/// `systemd::systemd_listener` — plain code spans, not intra-doc links, since
+/// those modules are OS-gated and absent from the cross-platform docs build), so
+/// there is no bind and no single-instance handling — the manager guarantees at
+/// most one spawn per socket. When that lookup reports no inherited socket (a
+/// manual `daemon run` from a shell, CI, the detached-spawn fallback, or any
+/// other platform) the daemon binds the socket itself via
+/// [`single_instance::bind_or_reclaim`], which doubles as the single-instance
+/// lock. The returned bool gates whether shutdown unlinks the path: a
+/// manager-owned inode must be left in place to re-activate (#1081).
 async fn acquire_listener(socket_path: &Path) -> Result<(UnixListener, bool)> {
     #[cfg(target_os = "macos")]
     if let Some(listener) = super::launchd::launchd_listener("Listener")? {
         tracing::info!("daemon adopting launchd-activated control socket");
+        return Ok((listener, true));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(listener) = super::systemd::systemd_listener()? {
+        tracing::info!("daemon adopting systemd-activated control socket");
         return Ok((listener, true));
     }
     let listener = single_instance::bind_or_reclaim(socket_path).await?;

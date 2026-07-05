@@ -22,19 +22,48 @@ const POLL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Launches a background daemon bound to `socket`.
 ///
-/// macOS installs and loads a launchd LaunchAgent (auto-start at login);
-/// elsewhere a detached `omni-dev daemon run` is spawned: `setsid` puts it in
-/// its own session (so it survives the launching terminal and its SIGHUP),
-/// stdin comes from `/dev/null`, and stdout/stderr are appended to a `0600`
-/// `daemon.log` beside the socket. Auto-start at login is macOS-only for now
-/// (#1174 tracks a systemd user unit).
+/// macOS installs and loads a socket-activated launchd LaunchAgent; Linux installs
+/// a socket-activated systemd **user** unit when a user manager is available
+/// (falling back to a detached spawn otherwise); any other Unix spawns a detached
+/// `omni-dev daemon run` directly. Both service managers auto-start the daemon at
+/// login; the detached-spawn fallback (`spawn_detached`) does not (#1174).
 #[cfg(target_os = "macos")]
 pub(super) fn launch(socket: &Path) -> Result<()> {
     crate::daemon::launchd::install_and_load(socket)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux `launch`: install a systemd user unit for auto-start at login when a user
+/// manager is available, else fall back to the detached spawn. See the macOS
+/// `launch` for the cross-platform contract.
+#[cfg(target_os = "linux")]
 pub(super) fn launch(socket: &Path) -> Result<()> {
+    use crate::daemon::systemd;
+
+    if systemd::is_available() {
+        match systemd::install_and_load(socket) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!(
+                "systemd auto-start unavailable ({e}); falling back to a detached spawn"
+            ),
+        }
+    }
+    spawn_detached(socket)
+}
+
+/// Non-macOS, non-Linux Unix `launch`: there is no login auto-start integration,
+/// so always use the detached spawn.
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+pub(super) fn launch(socket: &Path) -> Result<()> {
+    spawn_detached(socket)
+}
+
+/// Spawns a detached `omni-dev daemon run`: `setsid` puts it in its own session
+/// (so it survives the launching terminal and its SIGHUP), stdin comes from
+/// `/dev/null`, and stdout/stderr are appended to a `0600` `daemon.log` beside the
+/// socket. The off-macOS fallback when no service-manager auto-start is installed;
+/// it does not restart the daemon at login (#1174).
+#[cfg(not(target_os = "macos"))]
+fn spawn_detached(socket: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -125,6 +154,11 @@ pub(super) async fn wait_until_ready(socket: &Path) -> Result<()> {
 }
 
 /// Polls until the daemon stops answering `ping`, or the ~5s budget elapses.
+///
+/// Not compiled on Linux: `restart` there may face a systemd socket-activated
+/// daemon, where pinging the still-armed socket would re-activate it. See
+/// [`restart`](super::restart) (#1174).
+#[cfg(not(target_os = "linux"))]
 pub(super) async fn wait_until_down(socket: &Path) -> Result<()> {
     if poll_until(socket, false, POLL_BUDGET).await {
         Ok(())
@@ -141,6 +175,7 @@ pub(super) async fn wait_until_down(socket: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn wait_until_down_returns_when_no_daemon() {
         // Nothing is listening on this socket, so `ping` fails on the first try

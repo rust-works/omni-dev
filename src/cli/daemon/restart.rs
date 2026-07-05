@@ -24,6 +24,13 @@ impl RestartCommand {
         let client = DaemonClient::new(&socket_path);
         if client.ping().await.is_ok() {
             client.shutdown().await.ok();
+            // On the socket-activated Linux path, pinging the still-armed systemd
+            // socket would re-activate the daemon; the relaunch + readiness ping
+            // below drive a clean handoff instead (systemd serializes at most one
+            // service instance, so the old drains and a fresh one comes up). Safe
+            // on the detached-spawn fallback too, where `bind_or_reclaim` handles
+            // the brief socket contention. (#1174)
+            #[cfg(not(target_os = "linux"))]
             control::wait_until_down(&socket_path).await?;
         }
         // On macOS `launch` re-bootstraps via `install_and_load`, which already
