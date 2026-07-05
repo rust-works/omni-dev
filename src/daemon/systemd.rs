@@ -171,19 +171,28 @@ WantedBy=sockets.target
     ))
 }
 
-/// A `systemctl --user …` command builder.
-fn systemctl() -> Command {
+/// A `systemctl --user <args>` command builder.
+fn systemctl(args: &[&str]) -> Command {
     let mut command = Command::new("systemctl");
-    command.arg("--user");
+    command.arg("--user").args(args);
     command
 }
 
+/// A runner for `systemctl --user <args>`: the args after `--user` in, the
+/// process output out. Abstracted behind a function type so the
+/// result-handling logic (`daemon_reload` / `enable_now` / `unload`) is
+/// unit-testable against a fake runner without spawning `systemctl`.
+type Systemctl<'a> = dyn Fn(&[&str]) -> std::io::Result<std::process::Output> + 'a;
+
+/// The production [`Systemctl`] runner: actually spawns the command.
+fn spawn_systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+    systemctl(args).output()
+}
+
 /// Runs `systemctl --user daemon-reload` so a freshly written unit is picked up.
-fn daemon_reload() -> Result<()> {
-    let output = systemctl()
-        .arg("daemon-reload")
-        .output()
-        .context("failed to run `systemctl --user daemon-reload`")?;
+fn daemon_reload(run: &Systemctl) -> Result<()> {
+    let output =
+        run(&["daemon-reload"]).context("failed to run `systemctl --user daemon-reload`")?;
     if !output.status.success() {
         bail!(
             "`systemctl --user daemon-reload` failed: {}",
@@ -196,15 +205,13 @@ fn daemon_reload() -> Result<()> {
 /// Enables and starts the `.socket` unit (auto-start at login via
 /// `sockets.target`, plus arming the demand socket now), retrying a few times on
 /// a transient failure the way launchd's `bootstrap` does.
-fn enable_now() -> Result<()> {
+fn enable_now(run: &Systemctl) -> Result<()> {
     let mut last_err = String::new();
     for attempt in 0..5 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(200));
         }
-        let output = systemctl()
-            .args(["enable", "--now", SOCKET_UNIT])
-            .output()
+        let output = run(&["enable", "--now", SOCKET_UNIT])
             .context("failed to run `systemctl --user enable --now`")?;
         if output.status.success() {
             return Ok(());
@@ -242,8 +249,8 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
         paths::ensure_dir_0700(parent)?;
     }
 
-    daemon_reload()?;
-    enable_now()
+    daemon_reload(&spawn_systemctl)?;
+    enable_now(&spawn_systemctl)
 }
 
 /// Best-effort `systemctl --user …`: a non-zero exit is ignored (the common
@@ -251,8 +258,8 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
 /// is logged rather than discarded so `stop` does not silently claim to have
 /// disabled auto-start when it had not — the same posture as launchd's `bootout`
 /// (issue #996).
-fn run_best_effort(args: &[&str]) {
-    if let Err(e) = systemctl().args(args).output() {
+fn run_best_effort(run: &Systemctl, args: &[&str]) {
+    if let Err(e) = run(args) {
         tracing::warn!("failed to run `systemctl --user {}`: {e}", args.join(" "));
     }
 }
@@ -264,10 +271,16 @@ fn run_best_effort(args: &[&str]) {
 /// unit is not an error. The unit files are left on disk (a disabled unit does
 /// not auto-start); a later `daemon start` rewrites and re-enables them.
 pub fn unload() -> Result<()> {
+    unload_with(&spawn_systemctl)
+}
+
+/// [`unload`] against an injectable runner, so the stop/disable sequence is
+/// unit-testable without touching a real systemd manager.
+fn unload_with(run: &Systemctl) -> Result<()> {
     // Stop the socket first so it is disarmed before the service is torn down;
     // then drop the login-time enablement.
-    run_best_effort(&["stop", SOCKET_UNIT, SERVICE_UNIT]);
-    run_best_effort(&["disable", SOCKET_UNIT]);
+    run_best_effort(run, &["stop", SOCKET_UNIT, SERVICE_UNIT]);
+    run_best_effort(run, &["disable", SOCKET_UNIT]);
     Ok(())
 }
 
@@ -536,10 +549,84 @@ mod tests {
 
     #[test]
     fn systemctl_targets_the_user_manager() {
-        let cmd = systemctl();
+        let cmd = systemctl(&["daemon-reload"]);
         assert_eq!(cmd.get_program().to_str(), Some("systemctl"));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert_eq!(args, ["--user"]);
+        assert_eq!(args, ["--user", "daemon-reload"]);
+    }
+
+    /// A canned `systemctl` output for the runner-injection tests. `raw` is a
+    /// Unix wait-status: `0` = success, `256` = exited with code 1.
+    fn fake_output(raw: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn daemon_reload_reports_success_and_failure() {
+        daemon_reload(&|args| {
+            assert_eq!(args, ["daemon-reload"]);
+            Ok(fake_output(0, ""))
+        })
+        .expect("a zero-exit reload succeeds");
+
+        let err =
+            daemon_reload(&|_| Ok(fake_output(256, "boom"))).expect_err("a non-zero reload fails");
+        assert!(err.to_string().contains("boom"), "{err}");
+
+        assert!(
+            daemon_reload(&|_| Err(std::io::Error::other("no systemctl"))).is_err(),
+            "a spawn error must surface"
+        );
+    }
+
+    #[test]
+    fn enable_now_succeeds_on_the_first_attempt() {
+        let calls = std::cell::Cell::new(0);
+        enable_now(&|args| {
+            calls.set(calls.get() + 1);
+            assert_eq!(args, ["enable", "--now", SOCKET_UNIT]);
+            Ok(fake_output(0, ""))
+        })
+        .expect("first-attempt success");
+        assert_eq!(calls.get(), 1, "no retries on success");
+    }
+
+    #[test]
+    fn enable_now_retries_then_bails() {
+        let calls = std::cell::Cell::new(0);
+        let err = enable_now(&|_| {
+            calls.set(calls.get() + 1);
+            Ok(fake_output(256, "still failing"))
+        })
+        .expect_err("all attempts fail");
+        assert_eq!(calls.get(), 5, "retries the full budget");
+        assert!(err.to_string().contains("still failing"), "{err}");
+    }
+
+    #[test]
+    fn unload_stops_then_disables_best_effort() {
+        let seen: std::cell::RefCell<Vec<Vec<String>>> = std::cell::RefCell::new(Vec::new());
+        unload_with(&|args| {
+            seen.borrow_mut()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            Ok(fake_output(0, ""))
+        })
+        .expect("unload is infallible");
+        let seen = seen.into_inner();
+        assert_eq!(seen[0], ["stop", SOCKET_UNIT, SERVICE_UNIT]);
+        assert_eq!(seen[1], ["disable", SOCKET_UNIT]);
+    }
+
+    #[test]
+    fn unload_swallows_a_missing_systemctl() {
+        // A spawn failure (systemd absent) must not turn `stop` into an error.
+        unload_with(&|_| Err(std::io::Error::other("no systemctl")))
+            .expect("best-effort teardown never fails");
     }
 
     #[test]
@@ -591,5 +678,12 @@ mod tests {
             0,
             "FD_CLOEXEC should be set after set_cloexec"
         );
+    }
+
+    #[test]
+    fn set_cloexec_errors_on_a_bad_fd() {
+        // -1 is never a valid descriptor, so `F_GETFD` fails and the error is
+        // surfaced rather than ignored.
+        assert!(set_cloexec(-1).is_err());
     }
 }
