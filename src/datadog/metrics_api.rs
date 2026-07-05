@@ -5,7 +5,7 @@
 //! (`GET /api/v1/query`); subsequent slices will add scalar and multi-query
 //! variants.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -37,24 +37,16 @@ impl<'a> MetricsApi<'a> {
         to: i64,
     ) -> Result<MetricQueryResponse> {
         let url = build_query_url(self.client.base_url(), query, from, to)?;
-        let response = self.client.get_json(url.as_str()).await?;
-
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-
-        response
-            .json::<MetricQueryResponse>()
+        self.client
+            .get_parsed(url.as_str(), "Failed to parse /api/v1/query response")
             .await
-            .context("Failed to parse /api/v1/query response")
     }
 }
 
 /// Builds `{base_url}/api/v1/query?from=…&to=…&query=…` with proper
 /// percent-encoding for the query string.
 fn build_query_url(base_url: &str, query: &str, from: i64, to: i64) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/query")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/query")?;
     url.query_pairs_mut()
         .append_pair("from", &from.to_string())
         .append_pair("to", &to.to_string())

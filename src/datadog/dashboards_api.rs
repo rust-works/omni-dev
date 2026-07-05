@@ -8,7 +8,7 @@
 //! list façade does not loop. Any client-side `--limit` truncation belongs
 //! in the CLI layer.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -47,35 +47,28 @@ impl<'a> DashboardsApi<'a> {
     /// page this endpoint.
     pub async fn list(&self, filter: &DashboardListFilter) -> Result<Vec<DashboardSummary>> {
         let url = build_list_url(self.client.base_url(), filter)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        let parsed: DashboardListResponse = response
-            .json()
-            .await
-            .context("Failed to parse /api/v1/dashboard response")?;
+        let parsed: DashboardListResponse = self
+            .client
+            .get_parsed(url.as_str(), "Failed to parse /api/v1/dashboard response")
+            .await?;
         Ok(parsed.dashboards)
     }
 
     /// Fetches a single dashboard definition by id.
     pub async fn get(&self, id: &str) -> Result<Dashboard> {
         let url = build_get_url(self.client.base_url(), id)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<Dashboard>()
+        self.client
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse /api/v1/dashboard/<id> response",
+            )
             .await
-            .context("Failed to parse /api/v1/dashboard/<id> response")
     }
 }
 
 /// Builds `{base_url}/api/v1/dashboard?{filters}`.
 fn build_list_url(base_url: &str, filter: &DashboardListFilter) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/dashboard")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/dashboard")?;
     if let Some(shared) = filter.filter_shared {
         url.query_pairs_mut()
             .append_pair("filter_shared", if shared { "true" } else { "false" });
@@ -88,8 +81,7 @@ fn build_list_url(base_url: &str, filter: &DashboardListFilter) -> Result<Url> {
 /// `id` is percent-encoded as a path segment so dashboard ids that
 /// contain reserved characters round-trip correctly.
 fn build_get_url(base_url: &str, id: &str) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/dashboard")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/dashboard")?;
     url.path_segments_mut()
         .map_err(|()| anyhow::anyhow!("Invalid Datadog base URL: cannot append path segment"))?
         .push(id);
