@@ -3,11 +3,13 @@
 //! Provides HTTP access to JIRA Cloud REST API v3 for reading and
 //! writing issues. Uses Basic Auth (email + API token).
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::Client;
+use tokio_util::io::ReaderStream;
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
@@ -23,20 +25,20 @@ use crate::atlassian::jira_types::{
     AgileSprintEntry, AgileSprintList, AgileSprintListResponse, CreateMeta, CreateMetaField,
     DevStatusCommit, DevStatusResponse, DevStatusSummaryCategory, DevStatusSummaryResponse,
     EditMeta, EditMetaField, FieldSelection, JiraAllowedValueRaw, JiraAttachment,
-    JiraAttachmentIssueResponse, JiraChangelogEntry, JiraChangelogItem, JiraChangelogResponse,
-    JiraComment, JiraCommentEntry, JiraCommentsResponse, JiraCreateMetaFullResponse,
-    JiraCreateMetaResponse, JiraCreateMetaSchemaRaw, JiraCreateResponse, JiraCreatedIssue,
-    JiraDevBranch, JiraDevCommit, JiraDevProvider, JiraDevPullRequest, JiraDevRepository,
-    JiraDevStatus, JiraDevStatusCount, JiraDevStatusSummary, JiraEditMetaResponse, JiraField,
-    JiraFieldContextsResponse, JiraFieldEntry, JiraFieldOption, JiraFieldOptionsResponse,
-    JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse, JiraIssueLink, JiraIssueLinksResponse,
-    JiraLinkType, JiraLinkTypesResponse, JiraProject, JiraProjectList, JiraProjectSearchResponse,
-    JiraProjectVersion, JiraProjectVersionEntry, JiraProjectVersionList, JiraRemoteIssueLink,
-    JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon, JiraRemoteIssueLinkObject,
-    JiraSearchResponse, JiraSearchResult, JiraTransition, JiraTransitionToStatus,
-    JiraTransitionsResponse, JiraUser, JiraUserGetResults, JiraUserRecord, JiraUserSearchEntry,
-    JiraUserSearchResult, JiraUserSearchResults, JiraVisibility, JiraWatcherList, JiraWorklog,
-    JiraWorklogList, JiraWorklogResponse, TEXTAREA_CUSTOM_TYPE,
+    JiraAttachmentEntry, JiraAttachmentIssueResponse, JiraChangelogEntry, JiraChangelogItem,
+    JiraChangelogResponse, JiraComment, JiraCommentEntry, JiraCommentsResponse,
+    JiraCreateMetaFullResponse, JiraCreateMetaResponse, JiraCreateMetaSchemaRaw,
+    JiraCreateResponse, JiraCreatedIssue, JiraDevBranch, JiraDevCommit, JiraDevProvider,
+    JiraDevPullRequest, JiraDevRepository, JiraDevStatus, JiraDevStatusCount, JiraDevStatusSummary,
+    JiraEditMetaResponse, JiraField, JiraFieldContextsResponse, JiraFieldEntry, JiraFieldOption,
+    JiraFieldOptionsResponse, JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse, JiraIssueLink,
+    JiraIssueLinksResponse, JiraLinkType, JiraLinkTypesResponse, JiraProject, JiraProjectList,
+    JiraProjectSearchResponse, JiraProjectVersion, JiraProjectVersionEntry, JiraProjectVersionList,
+    JiraRemoteIssueLink, JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon,
+    JiraRemoteIssueLinkObject, JiraSearchResponse, JiraSearchResult, JiraTransition,
+    JiraTransitionToStatus, JiraTransitionsResponse, JiraUser, JiraUserGetResults, JiraUserRecord,
+    JiraUserSearchEntry, JiraUserSearchResult, JiraUserSearchResults, JiraVisibility,
+    JiraWatcherList, JiraWorklog, JiraWorklogList, JiraWorklogResponse, TEXTAREA_CUSTOM_TYPE,
 };
 use crate::request_log;
 use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
@@ -4082,6 +4084,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_attachments_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/attachments",
+            ))
+            .and(wiremock::matchers::header("X-Atlassian-Token", "no-check"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 5, "content": "https://org.atlassian.net/attachment/10001"},
+                {"id": "10002", "filename": "shot.png", "mimeType": "image/png", "size": 4, "content": "https://org.atlassian.net/attachment/10002"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("log.txt");
+        let b = dir.path().join("shot.png");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"\x89PNG").unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let created = client.upload_attachments("PROJ-1", &[a, b]).await.unwrap();
+
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].id, "10001");
+        assert_eq!(created[0].filename, "log.txt");
+        assert_eq!(created[1].mime_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/attachments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("log.txt");
+        std::fs::write(&f, b"hello").unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.upload_attachments("PROJ-1", &[f]).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/attachment/10042"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        client.delete_attachment("10042").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/attachment/nope"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_attachment("nope").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_changelog_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -7729,14 +7812,76 @@ impl AtlassianClient {
             .fields
             .attachment
             .into_iter()
-            .map(|a| JiraAttachment {
-                id: a.id,
-                filename: a.filename,
-                mime_type: a.mime_type,
-                size: a.size,
-                content_url: a.content,
-            })
+            .map(JiraAttachment::from)
             .collect())
+    }
+
+    /// Uploads one or more files as attachments to a JIRA issue.
+    ///
+    /// Streams each file body — files are never fully buffered in memory. All
+    /// files ride a single multipart POST (JIRA accepts repeated `file` parts),
+    /// and the endpoint returns metadata for every created attachment.
+    ///
+    /// Sends `X-Atlassian-Token: no-check` (Atlassian's XSRF opt-out required
+    /// on this endpoint). Does not retry on 429: see
+    /// [`AtlassianClient::post_multipart`].
+    pub async fn upload_attachments(
+        &self,
+        key: &str,
+        files: &[PathBuf],
+    ) -> Result<Vec<JiraAttachment>> {
+        let mut form = reqwest::multipart::Form::new();
+        for file in files {
+            let metadata = tokio::fs::metadata(file)
+                .await
+                .with_context(|| format!("Failed to read file metadata for {}", file.display()))?;
+            let size = metadata.len();
+            let handle = tokio::fs::File::open(file)
+                .await
+                .with_context(|| format!("Failed to open {}", file.display()))?;
+
+            let filename = file
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("File path has no filename component: {}", file.display())
+                })?;
+
+            let mime = mime_guess::from_path(file).first_or_octet_stream();
+            let body = reqwest::Body::wrap_stream(ReaderStream::new(handle));
+            let part = reqwest::multipart::Part::stream_with_length(body, size)
+                .file_name(filename)
+                .mime_str(mime.essence_str())
+                .with_context(|| format!("Invalid MIME type for {}", file.display()))?;
+            form = form.part("file", part);
+        }
+
+        let url = format!("{}/rest/api/3/issue/{}/attachments", self.instance_url, key);
+
+        let response = self
+            .post_multipart(&url, form, &[("X-Atlassian-Token", "no-check")])
+            .await?;
+
+        let entries: Vec<JiraAttachmentEntry> = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse attachment upload response",
+        )
+        .await?;
+
+        Ok(entries.into_iter().map(JiraAttachment::from).collect())
+    }
+
+    /// Deletes a JIRA attachment by ID.
+    ///
+    /// `DELETE /rest/api/3/attachment/{id}` — permanent (JIRA has no trash).
+    pub async fn delete_attachment(&self, attachment_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/attachment/{}",
+            self.instance_url, attachment_id
+        );
+        let response = self.delete(&url).await?;
+        Self::ensure_success(response).await?;
+        Ok(())
     }
 
     /// Gets the changelog for a JIRA issue with auto-pagination.

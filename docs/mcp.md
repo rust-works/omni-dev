@@ -108,7 +108,7 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `jira_user_search` | Resolve a display name or email substring to an Atlassian `accountId` (call before `jira_write` for assignee/reporter) |
 | `jira_delete` | Permanently delete an issue. Requires `confirm: true` |
 
-### JIRA — extensions (25 tools)
+### JIRA — extensions (27 tools)
 
 Sprints, boards, watchers, worklogs, links, field metadata, attachments,
 project listing and create-screen introspection, and changelog history.
@@ -121,7 +121,7 @@ project listing and create-screen introspection, and changelog history.
 | Worklogs | `jira_worklog_list`, `jira_worklog_add` |
 | Links | `jira_link_list`, `jira_link_types`, `jira_link_create`, `jira_link_parent`, `jira_link_remove` (requires `confirm: true`), `jira_link_remote_list` — one tool per `omni-dev atlassian jira link` subcommand |
 | Fields | `jira_field_list`, `jira_field_options` (custom-field discovery — see [user guide](user-guide.md#jira-fields)) |
-| Attachments | `jira_attachment_download`, `jira_attachment_images` |
+| Attachments | `jira_attachment_upload`, `jira_attachment_download`, `jira_attachment_images`, `jira_attachment_delete` (requires `confirm: true`) |
 | Projects | `jira_project_list`, `jira_project_create_meta` (pre-flight required/allowed fields — see [user guide](user-guide.md#jira-fields)) |
 | History | `jira_changelog` |
 

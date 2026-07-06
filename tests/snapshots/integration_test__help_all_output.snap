@@ -1078,12 +1078,31 @@ Downloads JIRA issue attachments
 Usage: attachment <COMMAND>
 
 Commands:
+  upload    Uploads one or more files as attachments to an issue (mirrors the `jira_attachment_upload` MCP tool)
   download  Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool)
   images    Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool)
+  delete    Deletes an attachment by ID (mirrors the `jira_attachment_delete` MCP tool)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira attachment delete - Deletes an attachment by ID (mirrors the `jira_attachment_delete` MCP tool)
+
+Deletes an attachment by ID (mirrors the `jira_attachment_delete` MCP tool)
+
+Usage: delete [OPTIONS] <ATTACHMENT_ID>
+
+Arguments:
+  <ATTACHMENT_ID>  Attachment ID
+
+Options:
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+  -h, --help     Print help
 
 
 ================================================================================
@@ -1117,6 +1136,22 @@ Arguments:
 Options:
       --output-dir <OUTPUT_DIR>  Output directory (defaults to current directory) [default: .]
   -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira attachment upload - Uploads one or more files as attachments to an issue (mirrors the `jira_attachment_upload` MCP tool)
+
+Uploads one or more files as attachments to an issue (mirrors the `jira_attachment_upload` MCP tool)
+
+Usage: upload <KEY> <FILES>...
+
+Arguments:
+  <KEY>       JIRA issue key (e.g., PROJ-123)
+  <FILES>...  Path(s) to the local file(s) to upload
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================

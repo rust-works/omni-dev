@@ -246,6 +246,8 @@ mod tests {
         let expected = [
             "jira_attachment_download",
             "jira_attachment_images",
+            "jira_attachment_upload",
+            "jira_attachment_delete",
             "jira_board_list",
             "jira_board_issues",
             "jira_changelog",
