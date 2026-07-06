@@ -53,6 +53,7 @@ mod tests {
                 format: None,
                 fail_under_patch: None,
                 strip_prefix: None,
+                ignore_filename_regex: Vec::new(),
                 collapse_ranges: false,
                 all_files: false,
                 artifact_url: None,
