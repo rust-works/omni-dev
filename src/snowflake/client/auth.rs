@@ -1,6 +1,8 @@
-//! External-browser SSO login (the v1 login flow).
+//! v1 login flows. All methods finish through the shared [`complete_login`],
+//! which POSTs `session/v1/login-request` and parses the token response; they
+//! differ only in the `AUTHENTICATOR` + credential fields they contribute.
 //!
-//! The documented handshake:
+//! External-browser SSO — the documented handshake:
 //! 1. Bind a localhost callback listener (its port is the redirect target).
 //! 2. `POST session/authenticator-request` with `AUTHENTICATOR=EXTERNALBROWSER`
 //!    and `BROWSER_MODE_REDIRECT_PORT` → returns an `ssoUrl` and a `proofKey`.
@@ -13,15 +15,17 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::form_urlencoded;
 
-use super::config::{BrowserConfig, BrowserLaunch, SnowflakeClientConfig};
+use super::config::{BrowserConfig, BrowserLaunch, KeyPairConfig, SnowflakeClientConfig};
 use super::error::{Error, Result};
+use super::jwt;
 use super::session::LoginTokens;
 use super::transport::{request_id, Transport};
+use crate::utils::secret::Secret;
 
 /// Identifies this client to Snowflake.
 const CLIENT_APP_ID: &str = "omni-dev";
@@ -80,7 +84,35 @@ pub(crate) async fn external_browser_login(
     // 4. Capture the token from the localhost redirect.
     let token = wait_for_callback(listener).await?;
 
-    // 5. Complete the login.
+    // 5. Complete the login with the captured SSO token + proof key.
+    let data = Map::from_iter([
+        ("AUTHENTICATOR".to_string(), json!("EXTERNALBROWSER")),
+        ("TOKEN".to_string(), json!(token)),
+        ("PROOF_KEY".to_string(), json!(proof_key)),
+    ]);
+    complete_login(transport, config, data).await
+}
+
+/// The shared tail of every v1 login: augments the method-specific `data`
+/// (which supplies `AUTHENTICATOR` and the credential fields) with the common
+/// identity/app fields, POSTs `session/v1/login-request` — carrying the config's
+/// default warehouse/role/database/schema as query params — and parses the token
+/// response into [`LoginTokens`].
+pub(super) async fn complete_login(
+    transport: &Transport,
+    config: &SnowflakeClientConfig,
+    mut data: Map<String, Value>,
+) -> Result<LoginTokens> {
+    data.insert("ACCOUNT_NAME".into(), json!(config.account));
+    data.insert("LOGIN_NAME".into(), json!(config.user));
+    data.insert("CLIENT_APP_ID".into(), json!(CLIENT_APP_ID));
+    data.insert("CLIENT_APP_VERSION".into(), json!(CLIENT_APP_VERSION));
+    // We never advertise Arrow capability, so the server returns result sets as
+    // JSON (`parse_rows` keeps an Arrow guard as a backstop). Keep the session
+    // alive so the master token can be renewed for the daemon's lifetime.
+    data.entry("SESSION_PARAMETERS")
+        .or_insert_with(|| json!({ "CLIENT_SESSION_KEEP_ALIVE": true }));
+
     let rid = request_id();
     let mut query: Vec<(&str, &str)> = vec![("requestId", rid.as_str())];
     if let Some(warehouse) = &config.warehouse {
@@ -95,37 +127,26 @@ pub(crate) async fn external_browser_login(
     if let Some(role) = &config.role {
         query.push(("roleName", role));
     }
-    let body = json!({ "data": {
-        "ACCOUNT_NAME": config.account,
-        "LOGIN_NAME": config.user,
-        "AUTHENTICATOR": "EXTERNALBROWSER",
-        "TOKEN": token,
-        "PROOF_KEY": proof_key,
-        "CLIENT_APP_ID": CLIENT_APP_ID,
-        "CLIENT_APP_VERSION": CLIENT_APP_VERSION,
-        // We never advertise Arrow capability, so the server returns result sets
-        // as JSON (`parse_rows` keeps an Arrow guard as a backstop).
-        "SESSION_PARAMETERS": { "CLIENT_SESSION_KEEP_ALIVE": true },
-    }});
-    let data = transport
+    let body = json!({ "data": Value::Object(data) });
+    let resp = transport
         .post("session/v1/login-request", &query, &body, None)
         .await?;
 
-    let session_token = data
+    let session_token = resp
         .get("token")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Auth("login-request returned no session token".into()))?
         .to_string();
-    let master_token = data
+    let master_token = resp
         .get("masterToken")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let session_validity_secs = data
+    let session_validity_secs = resp
         .get("validityInSeconds")
         .and_then(Value::as_i64)
         .unwrap_or(3600);
-    let master_validity_secs = data
+    let master_validity_secs = resp
         .get("masterValidityInSeconds")
         .and_then(Value::as_i64)
         .unwrap_or(14400);
@@ -136,6 +157,45 @@ pub(crate) async fn external_browser_login(
         session_validity_secs,
         master_validity_secs,
     })
+}
+
+/// Non-interactive login with a programmatic access token (PAT). The PAT is
+/// presented as the login `TOKEN` under `AUTHENTICATOR=PROGRAMMATIC_ACCESS_TOKEN`;
+/// no browser or callback listener is involved.
+pub(crate) async fn pat_login(
+    transport: &Transport,
+    config: &SnowflakeClientConfig,
+    token: &Secret,
+) -> Result<LoginTokens> {
+    let data = Map::from_iter([
+        (
+            "AUTHENTICATOR".to_string(),
+            json!("PROGRAMMATIC_ACCESS_TOKEN"),
+        ),
+        ("TOKEN".to_string(), json!(token.expose_secret())),
+    ]);
+    complete_login(transport, config, data).await
+}
+
+/// Non-interactive login with a locally-signed RS256 JWT (key-pair auth). The
+/// JWT is built from the account/user and the configured RSA private key and
+/// presented as the login `TOKEN` under `AUTHENTICATOR=SNOWFLAKE_JWT`; no
+/// browser or callback listener is involved.
+pub(crate) async fn keypair_jwt_login(
+    transport: &Transport,
+    config: &SnowflakeClientConfig,
+    keypair: &KeyPairConfig,
+) -> Result<LoginTokens> {
+    let jwt = jwt::build_jwt(
+        &config.account,
+        &config.user,
+        keypair.private_key_pem.expose_secret(),
+    )?;
+    let data = Map::from_iter([
+        ("AUTHENTICATOR".to_string(), json!("SNOWFLAKE_JWT")),
+        ("TOKEN".to_string(), json!(jwt)),
+    ]);
+    complete_login(transport, config, data).await
 }
 
 /// Opens `url` in the configured browser. With [`BrowserLaunch::Command`], a
