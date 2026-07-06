@@ -34,9 +34,10 @@ the view correct over time. See [ADR-0040](adrs/adr-0040.md).
   renders the tray menu/status, and drives the VS Code launcher. Cheap to
   construct; persists nothing.
 - `src/cli/worktrees.rs` — the read-only `omni-dev worktrees list` client.
-- The companion VS Code extension (separate deliverable) — the **writer**: it
-  `register`s on activation, `heartbeat`s every ~10 s, and `unregister`s on
-  deactivation, talking to the daemon socket directly from each window.
+- The companion VS Code extension in [`editors/vscode/`](../editors/vscode/) —
+  the **writer**: it `register`s on activation, `heartbeat`s every ~10 s, and
+  `unregister`s on deactivation, talking to the daemon socket directly from each
+  window.
 
 ### Data flow
 
@@ -232,8 +233,12 @@ them to `list`/`status` replies.
 
 ## Scope and follow-ups
 
-- The companion extension is a separate deliverable (~50 lines): a minimal
-  reporter that speaks the contract above.
+- The companion extension lives in [`editors/vscode/`](../editors/vscode/): a
+  small TypeScript reporter that speaks the contract above, bundled with esbuild
+  and packaged as a `.vsix` by its own path-filtered CI workflow. Publishing to
+  the VS Code Marketplace / Open VSX is a follow-up (it needs a publisher account
+  and CI secrets); until then, install the `.vsix` built by CI with
+  `code --install-extension`.
 - Git enrichment lives in Rust (#1186): the companion reports raw folder paths
   and the daemon computes per-worktree branch and ahead/behind state with `git2`
   (see [Git enrichment](#git-enrichment)), keeping the companion thin.

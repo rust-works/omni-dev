@@ -14,11 +14,13 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.80.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping
 # assets that consumers of the library/binary do not need: the promo website,
-# social-preview images, and scratch space.
+# social-preview images, scratch space, and the VS Code companion extension
+# (a Node/TypeScript deliverable published separately to the Marketplace).
 exclude = [
     "website/",
     "assets/",
     "scratch/",
+    "editors/",
 ]
 
 [dependencies]
