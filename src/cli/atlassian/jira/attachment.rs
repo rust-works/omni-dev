@@ -1,13 +1,15 @@
 //! CLI commands for JIRA issue attachments.
 
 use std::fs;
-use std::path::Path;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::jira_types::JiraAttachment;
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
 use crate::utils::path::attachment_filename;
 
@@ -31,20 +33,130 @@ pub struct AttachmentCommand {
 /// Attachment subcommands.
 #[derive(Subcommand)]
 pub enum AttachmentSubcommands {
+    /// Uploads one or more files as attachments to an issue (mirrors the `jira_attachment_upload` MCP tool).
+    Upload(UploadCommand),
     /// Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool).
     Download(DownloadCommand),
     /// Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool).
     Images(ImagesCommand),
+    /// Deletes an attachment by ID (mirrors the `jira_attachment_delete` MCP tool).
+    Delete(DeleteCommand),
 }
 
 impl AttachmentCommand {
     /// Executes the attachment command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
+            AttachmentSubcommands::Upload(cmd) => cmd.execute().await,
             AttachmentSubcommands::Download(cmd) => cmd.execute().await,
             AttachmentSubcommands::Images(cmd) => cmd.execute().await,
+            AttachmentSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
+}
+
+/// Uploads one or more files as attachments to an issue.
+#[derive(Parser)]
+pub struct UploadCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Path(s) to the local file(s) to upload.
+    #[arg(required = true, num_args = 1..)]
+    pub files: Vec<PathBuf>,
+}
+
+impl UploadCommand {
+    /// Executes the upload command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_upload(&client, &self.key, &self.files).await
+    }
+}
+
+/// Uploads the given files to an issue and prints the created attachments.
+async fn run_upload(client: &AtlassianClient, key: &str, files: &[PathBuf]) -> Result<()> {
+    let attachments = client.upload_attachments(key, files).await?;
+    println!("Uploaded {} file(s) to {key}:", attachments.len());
+    for attachment in &attachments {
+        println!(
+            "  {} (id={}, {})",
+            attachment.filename,
+            attachment.id,
+            format_size(attachment.size)
+        );
+    }
+    Ok(())
+}
+
+/// Deletes an attachment by ID.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// Attachment ID.
+    pub attachment_id: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Executes the delete command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, instance_url) = create_client()?;
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&client, &instance_url, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client, instance URL, and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        instance_url: &str,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format_delete_prompt(&self.attachment_id);
+            let dry_run_message = format!("Would delete attachment {}.", self.attachment_id);
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
+        client.delete_attachment(&self.attachment_id).await?;
+        writeln!(
+            writer,
+            "Deleted attachment {} from {}.",
+            self.attachment_id, instance_url
+        )?;
+
+        Ok(())
+    }
+}
+
+/// Formats the deletion confirmation prompt.
+fn format_delete_prompt(attachment_id: &str) -> String {
+    format!("Delete attachment {attachment_id}? [y/N] ")
 }
 
 /// Downloads all attachments for an issue.
@@ -529,5 +641,153 @@ mod tests {
             filter: Some("screenshot".to_string()),
         };
         assert_eq!(cmd.filter.as_deref(), Some("screenshot"));
+    }
+
+    #[test]
+    fn attachment_command_upload_variant() {
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Upload(UploadCommand {
+                key: "PROJ-1".to_string(),
+                files: vec![PathBuf::from("a.txt")],
+            }),
+        };
+        assert!(matches!(cmd.command, AttachmentSubcommands::Upload(_)));
+    }
+
+    #[test]
+    fn attachment_command_delete_variant() {
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Delete(DeleteCommand {
+                attachment_id: "10042".to_string(),
+                force: true,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, AttachmentSubcommands::Delete(_)));
+    }
+
+    // ── run_upload (wiremock) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_upload_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/attachments",
+            ))
+            .and(wiremock::matchers::header("X-Atlassian-Token", "no-check"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 5, "content": "https://example.com/10001"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let result = run_upload(&client, "PROJ-1", &[file]).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ── DeleteCommand::execute_with_io (wiremock, injected IO) ────────
+
+    fn delete_test_client(server: &wiremock::MockServer) -> AtlassianClient {
+        AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap()
+    }
+
+    async fn mount_delete_mock(server: &wiremock::MockServer, attachment_id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(format!(
+                "/rest/api/3/attachment/{attachment_id}"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn run_delete_with_io(
+        cmd: DeleteCommand,
+        client: &AtlassianClient,
+        input: &[u8],
+    ) -> (Result<()>, String) {
+        let mut reader = std::io::Cursor::new(input.to_vec());
+        let mut output = Vec::<u8>::new();
+        let result = cmd
+            .execute_with_io(
+                client,
+                "https://example.atlassian.net",
+                &mut reader,
+                &mut output,
+            )
+            .await;
+        (result, String::from_utf8(output).unwrap())
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "10042").await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "10042".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_client(&server), b"").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Deleted attachment 10042 from https://example.atlassian.net."));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_dry_run_does_not_call_delete() {
+        // No DELETE mock — confirms the API is *not* called on dry-run.
+        let server = wiremock::MockServer::start().await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "10042".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_client(&server), b"").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Would delete attachment 10042."));
+        assert!(!out.contains("Deleted attachment"));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "10042").await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "10042".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_client(&server), b"y\n").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Delete attachment 10042? [y/N]"));
+        assert!(out.contains("Deleted attachment 10042"));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_prompt_no_skips_api() {
+        // No DELETE mock — confirms the API is *not* called when declined.
+        let server = wiremock::MockServer::start().await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "10042".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_client(&server), b"n\n").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!out.contains("Deleted attachment"));
     }
 }
