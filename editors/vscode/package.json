@@ -1,0 +1,61 @@
+{
+  "name": "omni-dev-worktrees",
+  "displayName": "omni-dev Worktrees Reporter",
+  "description": "Reports each VS Code window's open worktrees to the omni-dev daemon so `omni-dev worktrees list` and the tray can show every window.",
+  "version": "0.1.0",
+  "publisher": "rust-works",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rust-works/omni-dev.git",
+    "directory": "editors/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/rust-works/omni-dev/issues"
+  },
+  "homepage": "https://github.com/rust-works/omni-dev/blob/main/editors/vscode/README.md",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "omni-dev Worktrees",
+      "properties": {
+        "omniDevWorktrees.socketPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the omni-dev daemon control socket path (mirrors the daemon's `--socket`). Leave empty to use the computed default: `<data_dir>/omni-dev/daemon.sock`."
+        },
+        "omniDevWorktrees.heartbeatSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "markdownDescription": "Seconds between heartbeats to the daemon. The daemon reaps a window after a 30s silence, so keep this well under 30."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "compile-tests": "tsc -p tsconfig.json",
+    "test": "npm run compile-tests && node --test out/",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
