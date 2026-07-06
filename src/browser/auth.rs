@@ -37,6 +37,14 @@ pub const BRIDGE_HEADER_VALUE: &str = "1";
 /// takes precedence over a `target` body field, and is stripped before forwarding.
 pub const BRIDGE_TARGET_HEADER: &str = "x-omni-bridge-target";
 
+/// Optional header carrying the originating client's request-log `invocation_id`.
+///
+/// Threaded so the bridge can correlate the HTTP records it writes while serving
+/// a request back to the CLI/MCP invocation that issued it, rather than the
+/// bridge's own (#1198). Non-secret, server-side only — never forwarded to the
+/// browser.
+pub const BRIDGE_ORIGIN_HEADER: &str = "x-omni-bridge-origin";
+
 /// Number of random bytes behind a generated token (URL-safe base64, no pad).
 const TOKEN_BYTES: usize = 32;
 

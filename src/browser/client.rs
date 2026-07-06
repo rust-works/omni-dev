@@ -40,11 +40,20 @@ impl BridgeClient {
     /// Builds the authenticated `POST /__bridge/request` request for `payload`,
     /// without sending it. Callers that need the raw streamed response (e.g. the
     /// `request --stream` path) drive this builder themselves.
+    ///
+    /// Carries this process's request-log `invocation_id` on the
+    /// [`auth::BRIDGE_ORIGIN_HEADER`] so daemon-hosted (or standalone) bridge HTTP
+    /// records correlate back to the originating CLI invocation (#1198). This
+    /// covers every `BridgeClient` caller — `request` and `harvest` alike.
     pub fn request_builder(&self, payload: &ControlRequest) -> reqwest::RequestBuilder {
         self.http
             .post(self.endpoint())
             .bearer_auth(&self.token)
             .header(auth::BRIDGE_HEADER, auth::BRIDGE_HEADER_VALUE)
+            .header(
+                auth::BRIDGE_ORIGIN_HEADER,
+                crate::request_log::current_context().invocation_id,
+            )
             .json(payload)
     }
 
@@ -78,7 +87,7 @@ impl BridgeClient {
 mod tests {
     use std::collections::BTreeMap;
 
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -128,6 +137,28 @@ mod tests {
         let env = client_for(&server).await.send(&req()).await.unwrap();
         assert_eq!(env.status, 200);
         assert_eq!(env.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn send_attaches_origin_correlation_header() {
+        // Every control-plane request carries the origin id header (#1198); the
+        // mock only matches when it is present, so a successful send proves it.
+        let server = MockServer::start().await;
+        let envelope = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: String::new(),
+            encoding: None,
+        };
+        Mock::given(method("POST"))
+            .and(path("/__bridge/request"))
+            .and(header_exists(auth::BRIDGE_ORIGIN_HEADER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&envelope))
+            .mount(&server)
+            .await;
+
+        assert!(client_for(&server).await.send(&req()).await.is_ok());
     }
 
     #[tokio::test]

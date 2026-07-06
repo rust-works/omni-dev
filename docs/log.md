@@ -259,10 +259,21 @@ data-sensitivity note, not a credential leak.
 ## Daemon-served requests
 
 Requests executed inside the daemon (the browser bridge and the Snowflake
-session pool) set `via_daemon: true`. Because the daemon is a separate process
-from the CLI that asked it to act, such requests carry the *daemon's*
-`invocation_id`, not the CLI's — cross-socket correlation is a planned follow-up
+session pool) set `via_daemon: true`. Although the daemon is a separate process
+from the CLI that asked it to act, such requests are still stamped with the
+*originating* CLI invocation's `invocation_id`: the thin client threads its id
+across to the daemon — on the control socket for Snowflake (an
+`origin_invocation_id` envelope field) and on the `X-Omni-Bridge-Origin` header
+for the bridge — and the daemon scopes it around the request it serves. So
+`omni-dev log --id <cli-invocation>` surfaces the `via_daemon` requests that run
+triggered, correlating both halves of one logical operation
 ([#1198](https://github.com/rust-works/omni-dev/issues/1198)).
+
+The threaded id is non-secret (it is not a token), and the record's `source`
+stays `daemon`, so a daemon-served request remains distinguishable by
+`via_daemon` / `source` even while its `invocation_id` points at the caller. The
+same mechanism correlates a standalone `bridge serve` (there `source` stays
+`cli` and `via_daemon` is unset).
 
 ## Schema and compatibility
 
