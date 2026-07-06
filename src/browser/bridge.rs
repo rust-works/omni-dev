@@ -668,13 +668,26 @@ async fn request_handler(
     if let Some(target) = target_header(&headers) {
         req.target = Some(target);
     }
+    // Correlate the HTTP records this request spawns to the originating client's
+    // invocation when it threaded its id on the origin header (#1198).
+    let origin = origin_header(&headers);
     if req.stream {
-        return match start_stream(&state, req).await {
+        let stream = start_stream(&state, req);
+        let result = match origin {
+            Some(id) => request_log::scope_origin_id(id, stream).await,
+            None => stream.await,
+        };
+        return match result {
             Ok((status, headers, driver)) => ndjson_stream_response(status, headers, driver),
             Err((code, msg)) => (code, msg).into_response(),
         };
     }
-    match dispatch(&state, req).await {
+    let dispatch = dispatch(&state, req);
+    let result = match origin {
+        Some(id) => request_log::scope_origin_id(id, dispatch).await,
+        None => dispatch.await,
+    };
+    match result {
         Ok(env) => Json(env).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }
@@ -803,6 +816,18 @@ fn forwardable_headers(headers: &axum::http::HeaderMap) -> BTreeMap<String, Stri
 fn target_header(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(auth::BRIDGE_TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the `X-Omni-Bridge-Origin` correlation id from request headers, if
+/// present and non-empty — the originating client's request-log `invocation_id`
+/// (#1198).
+fn origin_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(auth::BRIDGE_ORIGIN_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1561,6 +1586,16 @@ mod tests {
         assert_eq!(target_header(&h).as_deref(), Some("2"));
         h.insert(auth::BRIDGE_TARGET_HEADER, "   ".parse().unwrap());
         assert_eq!(target_header(&h), None);
+    }
+
+    #[test]
+    fn origin_header_trims_and_drops_empty() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(origin_header(&h), None);
+        h.insert(auth::BRIDGE_ORIGIN_HEADER, "  cli-42  ".parse().unwrap());
+        assert_eq!(origin_header(&h).as_deref(), Some("cli-42"));
+        h.insert(auth::BRIDGE_ORIGIN_HEADER, "   ".parse().unwrap());
+        assert_eq!(origin_header(&h), None);
     }
 
     #[test]

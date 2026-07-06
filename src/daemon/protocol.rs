@@ -33,6 +33,12 @@ pub struct DaemonEnvelope {
     /// Operation payload; `null` when the op takes no arguments.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub payload: Value,
+    /// Originating client's request-log `invocation_id`, threaded across the
+    /// socket so daemon-side HTTP records correlate to the CLI/MCP invocation
+    /// that triggered them rather than the daemon's own (#1198). Non-secret.
+    /// Absent from older clients; the daemon simply skips the correlation then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_invocation_id: Option<String>,
 }
 
 impl DaemonEnvelope {
@@ -42,6 +48,7 @@ impl DaemonEnvelope {
             service: Some(name.into()),
             op: op.into(),
             payload,
+            origin_invocation_id: None,
         }
     }
 
@@ -51,7 +58,17 @@ impl DaemonEnvelope {
             service: None,
             op: op.into(),
             payload: Value::Null,
+            origin_invocation_id: None,
         }
+    }
+
+    /// Stamps the originating client's request-log `invocation_id` on the
+    /// envelope so the daemon can correlate the requests it serves back to the
+    /// caller's invocation (#1198).
+    #[must_use]
+    pub fn with_origin(mut self, invocation_id: impl Into<String>) -> Self {
+        self.origin_invocation_id = Some(invocation_id.into());
+        self
     }
 }
 
@@ -93,4 +110,40 @@ impl DaemonReply {
 pub struct StatusReport {
     /// One entry per registered service, in registration order.
     pub services: Vec<ServiceStatus>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_omits_origin_when_absent() {
+        // Without an origin the field is skipped, keeping the wire byte-identical
+        // to what older clients/servers exchange.
+        let line = serde_json::to_string(&DaemonEnvelope::service(
+            "snowflake",
+            "query",
+            serde_json::json!({ "sql": "SELECT 1" }),
+        ))
+        .unwrap();
+        assert!(!line.contains("origin_invocation_id"), "{line}");
+    }
+
+    #[test]
+    fn envelope_round_trips_origin() {
+        let env = DaemonEnvelope::service("snowflake", "query", Value::Null).with_origin("cli-42");
+        let line = serde_json::to_string(&env).unwrap();
+        assert!(line.contains("origin_invocation_id"), "{line}");
+        let back: DaemonEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.origin_invocation_id.as_deref(), Some("cli-42"));
+    }
+
+    #[test]
+    fn envelope_from_older_client_defaults_origin_to_none() {
+        // A line written before #1198 has no origin field; it must decode fine.
+        let back: DaemonEnvelope =
+            serde_json::from_str(r#"{"service":"snowflake","op":"query"}"#).unwrap();
+        assert!(back.origin_invocation_id.is_none());
+    }
 }

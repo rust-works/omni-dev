@@ -271,6 +271,24 @@ pub fn current_context() -> RequestLogContext {
     RequestLogContext::default()
 }
 
+/// Runs `fut` with the active context's `invocation_id` replaced by
+/// `origin_id`, preserving `source` and `mcp_tool`.
+///
+/// The daemon and the browser bridge scope this around a request they serve on
+/// behalf of a CLI/MCP client, so the HTTP records that request spawns
+/// correlate to the *originating* invocation rather than the server's own
+/// (#1198). `source` is deliberately preserved: a request served inside the
+/// daemon keeps `source = Daemon`, so `via_daemon` detection is unaffected while
+/// `invocation_id` now points at the caller's invocation record.
+pub async fn scope_origin_id<F, T>(origin_id: String, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut ctx = current_context();
+    ctx.invocation_id = origin_id;
+    CTX.scope(ctx, fut).await
+}
+
 /// Whether logging is disabled entirely (`OMNI_DEV_LOG_DISABLE=1`).
 pub fn disabled() -> bool {
     env_flag("OMNI_DEV_LOG_DISABLE")
@@ -1822,5 +1840,29 @@ mod tests {
         );
         assert!(result.is_err(), "a failing rewrite surfaces as an error");
         let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[tokio::test]
+    async fn scope_origin_id_overwrites_id_but_preserves_source() {
+        // A daemon-side base context: source = Daemon (so `via_daemon` detection
+        // keeps working) with the daemon's own invocation id.
+        let base = RequestLogContext {
+            invocation_id: "daemon-1".to_string(),
+            source: Source::Daemon,
+            mcp_tool: None,
+        };
+        CTX.scope(base, async {
+            scope_origin_id("cli-42".to_string(), async {
+                let ctx = current_context();
+                // Correlation id now points at the originating CLI invocation…
+                assert_eq!(ctx.invocation_id, "cli-42");
+                // …while the source stays Daemon, so `via_daemon` is unaffected.
+                assert_eq!(ctx.source, Source::Daemon);
+            })
+            .await;
+            // The override is scoped: outside it, the base id is restored.
+            assert_eq!(current_context().invocation_id, "daemon-1");
+        })
+        .await;
     }
 }
