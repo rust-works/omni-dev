@@ -8,8 +8,8 @@
 use anyhow::{Context, Result};
 use rmcp::{
     model::{
-        ListResourceTemplatesResult, ListResourcesResult, RawResource, RawResourceTemplate,
-        ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+        ListResourceTemplatesResult, ListResourcesResult, ReadResourceResult, Resource,
+        ResourceContents, ResourceTemplate,
     },
     ErrorData as McpError,
 };
@@ -160,25 +160,25 @@ fn specs_only_csv() -> String {
 /// Returned by `list_resource_templates`. URIs are RFC 6570 templates; the
 /// placeholders match the identifiers [`ResourceUri::parse`] understands.
 pub fn resource_templates() -> Vec<ResourceTemplate> {
-    let jira_issue_jfm = RawResourceTemplate::new("jira://issue/{key}", "jira_issue_jfm")
+    let jira_issue_jfm = ResourceTemplate::new("jira://issue/{key}", "jira_issue_jfm")
         .with_description("JIRA issue rendered as JFM (JIRA-flavoured markdown).")
         .with_mime_type("text/markdown");
 
-    let jira_issue_adf = RawResourceTemplate::new("jira://issue/{key}.adf", "jira_issue_adf")
+    let jira_issue_adf = ResourceTemplate::new("jira://issue/{key}.adf", "jira_issue_adf")
         .with_description("JIRA issue body as raw Atlassian Document Format (ADF) JSON.")
         .with_mime_type("application/json");
 
     let confluence_page_jfm =
-        RawResourceTemplate::new("confluence://page/{id}", "confluence_page_jfm")
+        ResourceTemplate::new("confluence://page/{id}", "confluence_page_jfm")
             .with_description("Confluence page rendered as JFM markdown.")
             .with_mime_type("text/markdown");
 
     let confluence_page_adf =
-        RawResourceTemplate::new("confluence://page/{id}.adf", "confluence_page_adf")
+        ResourceTemplate::new("confluence://page/{id}.adf", "confluence_page_adf")
             .with_description("Confluence page body as raw ADF JSON.")
             .with_mime_type("application/json");
 
-    let omni_dev_spec = RawResourceTemplate::new("omni-dev://specs/{name}", "omni_dev_spec")
+    let omni_dev_spec = ResourceTemplate::new("omni-dev://specs/{name}", "omni_dev_spec")
         .with_description(
             "Reference specs maintained by omni-dev. Currently supports `jfm` \
              (JIRA-Flavoured Markdown) — fetch before writing JIRA or Confluence \
@@ -187,19 +187,12 @@ pub fn resource_templates() -> Vec<ResourceTemplate> {
         .with_mime_type("text/markdown");
 
     vec![
-        annotate_template(jira_issue_jfm),
-        annotate_template(jira_issue_adf),
-        annotate_template(confluence_page_jfm),
-        annotate_template(confluence_page_adf),
-        annotate_template(omni_dev_spec),
+        jira_issue_jfm,
+        jira_issue_adf,
+        confluence_page_jfm,
+        confluence_page_adf,
+        omni_dev_spec,
     ]
-}
-
-fn annotate_template(raw: RawResourceTemplate) -> ResourceTemplate {
-    ResourceTemplate {
-        raw,
-        annotations: None,
-    }
 }
 
 /// Resources surfaced by `list_resources`.
@@ -211,30 +204,32 @@ fn annotate_template(raw: RawResourceTemplate) -> ResourceTemplate {
 pub fn resource_listing() -> Vec<Resource> {
     resource_templates()
         .into_iter()
-        .map(|tpl| {
-            let RawResourceTemplate {
-                uri_template,
-                name,
-                title,
-                description,
-                mime_type,
-                icons,
-            } = tpl.raw;
-            Resource {
-                raw: RawResource {
-                    uri: uri_template,
-                    name,
-                    title,
-                    description,
-                    mime_type,
-                    size: None,
-                    icons,
-                    meta: None,
-                },
-                annotations: None,
-            }
-        })
+        .map(template_to_resource)
         .collect()
+}
+
+/// Projects a [`ResourceTemplate`] into an informational [`Resource`] whose
+/// concrete URI is the template's URI template, copying through every optional
+/// field the template carries.
+///
+/// The catalogue templates only populate `description` and `mime_type` today,
+/// but faithfully carrying `title`/`icons` keeps the listing correct if a
+/// future template sets them.
+fn template_to_resource(tpl: ResourceTemplate) -> Resource {
+    let mut resource = Resource::new(tpl.uri_template, tpl.name);
+    if let Some(title) = tpl.title {
+        resource = resource.with_title(title);
+    }
+    if let Some(description) = tpl.description {
+        resource = resource.with_description(description);
+    }
+    if let Some(mime_type) = tpl.mime_type {
+        resource = resource.with_mime_type(mime_type);
+    }
+    if let Some(icons) = tpl.icons {
+        resource = resource.with_icons(icons);
+    }
+    resource
 }
 
 /// Resolves a parsed URI into [`ReadResourceResult`] contents.
@@ -470,10 +465,7 @@ mod tests {
     #[test]
     fn templates_include_all_known_uris() {
         let templates = resource_templates();
-        let template_uris: Vec<&str> = templates
-            .iter()
-            .map(|t| t.raw.uri_template.as_str())
-            .collect();
+        let template_uris: Vec<&str> = templates.iter().map(|t| t.uri_template.as_str()).collect();
         assert!(template_uris.contains(&"jira://issue/{key}"));
         assert!(template_uris.contains(&"jira://issue/{key}.adf"));
         assert!(template_uris.contains(&"confluence://page/{id}"));
@@ -485,14 +477,14 @@ mod tests {
     fn every_template_has_description_and_mime() {
         for tpl in resource_templates() {
             assert!(
-                tpl.raw.description.is_some(),
+                tpl.description.is_some(),
                 "missing description for {}",
-                tpl.raw.uri_template
+                tpl.uri_template
             );
             assert!(
-                tpl.raw.mime_type.is_some(),
+                tpl.mime_type.is_some(),
                 "missing mime for {}",
-                tpl.raw.uri_template
+                tpl.uri_template
             );
         }
     }
@@ -503,9 +495,32 @@ mod tests {
         let templates = resource_templates();
         assert_eq!(resources.len(), templates.len());
         for (resource, tpl) in resources.iter().zip(templates.iter()) {
-            assert_eq!(resource.raw.uri, tpl.raw.uri_template);
-            assert_eq!(resource.raw.name, tpl.raw.name);
+            assert_eq!(resource.uri, tpl.uri_template);
+            assert_eq!(resource.name, tpl.name);
         }
+    }
+
+    #[test]
+    fn template_to_resource_copies_every_optional_field() {
+        // The catalogue templates never set `title`/`icons`, so exercise those
+        // branches directly with a template that populates all optional fields.
+        use rmcp::model::Icon;
+        let tpl = ResourceTemplate::new("jira://issue/{key}", "jira_issue_jfm")
+            .with_title("JIRA Issue")
+            .with_description("desc")
+            .with_mime_type("text/markdown")
+            .with_icons(vec![Icon::new("https://example.com/icon.png")]);
+
+        let resource = template_to_resource(tpl);
+
+        assert_eq!(resource.uri, "jira://issue/{key}");
+        assert_eq!(resource.name, "jira_issue_jfm");
+        assert_eq!(resource.title.as_deref(), Some("JIRA Issue"));
+        assert_eq!(resource.description.as_deref(), Some("desc"));
+        assert_eq!(resource.mime_type.as_deref(), Some("text/markdown"));
+        let icons = resource.icons.expect("icons copied through");
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].src, "https://example.com/icon.png");
     }
 
     #[test]
@@ -683,7 +698,7 @@ mod tests {
                 assert_eq!(mime_type.as_deref(), Some("text/markdown"));
                 assert_eq!(reply_uri, "jira://issue/PROJ-7");
             }
-            other @ ResourceContents::BlobResourceContents { .. } => {
+            other => {
                 panic!("expected text, got {other:?}")
             }
         }
@@ -735,7 +750,7 @@ mod tests {
                 let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
                 assert_eq!(parsed["type"], "doc");
             }
-            other @ ResourceContents::BlobResourceContents { .. } => {
+            other => {
                 panic!("expected text, got {other:?}")
             }
         }
@@ -829,7 +844,7 @@ mod tests {
                 ResourceContents::TextResourceContents { mime_type, .. } => {
                     assert_eq!(mime_type.as_deref(), Some("text/markdown"));
                 }
-                other @ ResourceContents::BlobResourceContents { .. } => {
+                other => {
                     panic!("expected text, got {other:?}")
                 }
             },
@@ -1007,7 +1022,7 @@ mod tests {
                     "spec body missing heading"
                 );
             }
-            other @ ResourceContents::BlobResourceContents { .. } => {
+            other => {
                 panic!("expected text resource contents, got {other:?}")
             }
         }
