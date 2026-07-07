@@ -3,6 +3,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+use crate::utils::secret::Secret;
+
 /// Default per-request HTTP timeout for Snowflake REST calls.
 ///
 /// Generous so the query-request long-poll (the server holds it open until
@@ -49,11 +51,29 @@ impl Default for BrowserConfig {
     }
 }
 
+/// Key-pair (RS256 JWT) authentication settings.
+#[derive(Clone, Debug)]
+pub struct KeyPairConfig {
+    /// The RSA private key, PEM-encoded. Must be **unencrypted** PKCS#8
+    /// (`-----BEGIN PRIVATE KEY-----`); encrypted keys are not yet supported.
+    pub private_key_pem: Secret,
+}
+
 /// The authentication method used to establish a session.
 #[derive(Clone, Debug)]
 pub enum AuthMethod {
-    /// External-browser SSO (the only method implemented).
+    /// External-browser SSO: opens a browser and waits on a localhost callback.
     ExternalBrowser(BrowserConfig),
+    /// A Snowflake programmatic access token, presented in place of a password.
+    /// Non-interactive; requires the user to be covered by a network policy.
+    ProgrammaticAccessToken {
+        /// The PAT secret.
+        token: Secret,
+    },
+    /// Key-pair authentication: a locally-signed RS256 JWT. Non-interactive;
+    /// requires the user's RSA public key to be registered with the account
+    /// (`ALTER USER … SET RSA_PUBLIC_KEY = …`).
+    KeyPairJwt(KeyPairConfig),
 }
 
 /// Everything needed to authenticate and run queries against one account/user.
