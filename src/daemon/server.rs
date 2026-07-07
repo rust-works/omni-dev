@@ -268,16 +268,24 @@ async fn dispatch_line(
     };
     match envelope.service.as_deref() {
         None | Some(DAEMON_SERVICE) => handle_builtin(&envelope.op, registry, shutdown).await,
-        Some(name) => match registry
-            .dispatch(name, &envelope.op, envelope.payload)
-            .await
-        {
-            Ok(payload) => DaemonReply::ok(payload),
-            // `{:#}` includes the full anyhow source chain (e.g. "Snowflake
-            // query failed: snowflake server error (000630): …") so the client
-            // can see the underlying cause, not just the top-level wrapper.
-            Err(e) => DaemonReply::err(format!("{e:#}")),
-        },
+        Some(name) => {
+            // Correlate any HTTP the service issues to the originating client's
+            // invocation, when it threaded its id across the socket (#1198).
+            // Built-in ops issue no HTTP, so only the service path is scoped.
+            let dispatch = registry.dispatch(name, &envelope.op, envelope.payload);
+            let result = match envelope.origin_invocation_id {
+                Some(origin) => crate::request_log::scope_origin_id(origin, dispatch).await,
+                None => dispatch.await,
+            };
+            match result {
+                Ok(payload) => DaemonReply::ok(payload),
+                // `{:#}` includes the full anyhow source chain (e.g. "Snowflake
+                // query failed: snowflake server error (000630): …") so the
+                // client can see the underlying cause, not just the top-level
+                // wrapper.
+                Err(e) => DaemonReply::err(format!("{e:#}")),
+            }
+        }
     }
 }
 

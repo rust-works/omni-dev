@@ -289,9 +289,14 @@ fn disconnect_message(disconnected: bool, account: &str, user: &str) -> String {
 
 /// Sends one `snowflake` service op over the control socket, returning its
 /// payload or turning an `ok: false` reply into an error.
+///
+/// The envelope carries this CLI process's request-log `invocation_id` so the
+/// HTTP records the daemon writes while serving the op correlate back to this
+/// invocation rather than the daemon's own (#1198).
 async fn call(socket: &Path, op: &str, payload: Value) -> Result<Value> {
+    let origin = crate::request_log::current_context().invocation_id;
     let reply = DaemonClient::new(socket)
-        .request(DaemonEnvelope::service(SERVICE, op, payload))
+        .request(DaemonEnvelope::service(SERVICE, op, payload).with_origin(origin))
         .await?;
     if reply.ok {
         Ok(reply.payload)
