@@ -27,8 +27,8 @@ pub enum Error {
     #[error("snowflake protocol error: {0}")]
     Protocol(String),
 
-    /// The external-browser SSO flow failed.
-    #[error("snowflake external-browser auth error: {0}")]
+    /// Authentication failed (external-browser SSO, PAT, or key-pair JWT).
+    #[error("snowflake auth error: {0}")]
     Auth(String),
 
     /// A result feature the client does not yet implement was encountered.

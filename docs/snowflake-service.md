@@ -59,8 +59,9 @@ pool** of authenticated sessions (`SNOWFLAKE_POOL_SIZE`, default 4):
 
 A separate session is required per concurrent in-flight context because v1 `USE`
 mutates session-global state; the SQL API **v2** would allow per-request context
-without this (a v2 client was proposed in #1003 but closed as not planned;
-non-interactive auth — PAT / key-pair JWT — is tracked in #1108).
+without this (a v2 client was proposed in #1003 but closed as not planned).
+Non-interactive auth — PAT and key-pair JWT — is supported on the v1 client for
+headless/daemon use; see [Authentication](#authentication).
 
 `daemon status`, `omni-dev snowflake sessions`, and the tray submenu list each
 pool **and each individual authenticated session** under it — its id, current
@@ -195,19 +196,82 @@ contexts without re-auth.
   are the trust boundary. Arbitrary SQL runs as the authenticated user — intended.
 - **No secret persisted.** Unlike the browser bridge (which writes a `0600` token
   file), the Snowflake service keeps the live `SnowflakeSession` in memory only;
-  shutdown simply drops it. Per-query context flags are validated as bare
-  identifiers before interpolation into `USE …`.
+  shutdown simply drops it. The non-interactive credentials (PAT, private key) are
+  held in memory in a redacting wrapper that keeps them out of logs and are never
+  written to disk by the service — but they enter the process from the daemon's
+  environment or `settings.json`, so protect those as you would any secret (a PAT
+  or private key in `settings.json` sits in plaintext at rest; prefer
+  `SNOWFLAKE_PRIVATE_KEY_PATH` to a `0600` key file over an inline key). Enabling
+  request-body logging (`OMNI_DEV_LOG_BODIES`, opt-in and off by default) would
+  capture the login body, which carries the credential — leave it off in
+  production. Per-query context flags are validated as bare identifiers before
+  interpolation into `USE …`.
 
-## SSO under the daemon
+## Authentication
 
-The client's default external-browser flow auto-opens a browser and binds an
-ephemeral localhost callback — no TTY needed, suitable for the resident daemon.
-(The browser launch is configurable, so it can target a specific profile in a new
-window; threading that from settings is a follow-up.) The first query for a new `(account, user)`
-triggers the popup; reuse is silent. On a session-expiry error the session is
-evicted and the next query re-authenticates (so the popup is always tied to a user
-action). If browser launch is unreliable under a background launchd daemon, run
-the first auth from a foreground context (`omni-dev daemon start --foreground`).
+The engine authenticates every session in every pool with one method, selected by
+`SNOWFLAKE_AUTHENTICATOR` (resolved from the daemon's environment, then
+`settings.json`, once at startup). The default is interactive external-browser
+SSO; two **non-interactive** methods make the daemon usable headless — CI,
+servers, or containers with no display.
+
+| `SNOWFLAKE_AUTHENTICATOR` | Method | Credential var(s) |
+|---|---|---|
+| `externalbrowser` (default) | External-browser SSO | — |
+| `programmatic_access_token` (alias `pat`) | Programmatic access token | `SNOWFLAKE_TOKEN` |
+| `snowflake_jwt` (aliases `keypair`, `key_pair`, `jwt`) | Key-pair RS256 JWT | `SNOWFLAKE_PRIVATE_KEY_PATH` or `SNOWFLAKE_PRIVATE_KEY` |
+
+An unknown selector — or a non-interactive method missing its credential — fails
+fast at daemon startup with an actionable error. All three reuse the same session
+pool, token renewal, and keep-alive heartbeat; they differ only in how the first
+session for each `(account, user)` is established.
+
+### External-browser SSO (default)
+
+The client's external-browser flow auto-opens a browser and binds an ephemeral
+localhost callback — no TTY needed, suitable for the resident daemon. (The browser
+launch is configurable, so it can target a specific profile in a new window;
+threading that from settings is a follow-up.) The first query for a new
+`(account, user)` triggers the popup; reuse is silent. On a session-expiry error
+the session is evicted and the next query re-authenticates (so the popup is always
+tied to a user action). If browser launch is unreliable under a background launchd
+daemon, run the first auth from a foreground context
+(`omni-dev daemon start --foreground`).
+
+### Programmatic access token (PAT)
+
+Set `SNOWFLAKE_AUTHENTICATOR=programmatic_access_token` and `SNOWFLAKE_TOKEN` to a
+PAT minted in Snowsight (or via SQL). The token is presented in place of a
+password — no browser, no callback. **Prerequisite:** Snowflake requires the user
+to be covered by a **network policy** to use a PAT; without one the login is
+rejected. Mint and scope the token per Snowflake's
+[programmatic access tokens](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens)
+guide.
+
+### Key-pair JWT
+
+Set `SNOWFLAKE_AUTHENTICATOR=snowflake_jwt` and point `SNOWFLAKE_PRIVATE_KEY_PATH`
+at an **unencrypted PKCS#8** PEM private key (`-----BEGIN PRIVATE KEY-----`), or
+put the PEM inline in `SNOWFLAKE_PRIVATE_KEY`. The client signs a short-lived
+RS256 JWT locally each time it authenticates — no browser, no callback, and no
+secret leaves the machine except the signed assertion. **Prerequisite:** register
+the matching public key on the user once:
+
+```sql
+ALTER USER my_user SET RSA_PUBLIC_KEY = 'MIIB...';
+```
+
+Generate a key pair with, e.g.:
+
+```bash
+openssl genpkey -algorithm RSA -out sf_key.p8 -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in sf_key.p8 -pubout -out sf_key.pub   # its body is the RSA_PUBLIC_KEY value
+```
+
+**Encrypted keys are not yet supported.** If your `.p8` is passphrase-encrypted
+(`-----BEGIN ENCRYPTED PRIVATE KEY-----`), decrypt it first
+(`openssl pkcs8 -in enc.p8 -out sf_key.p8`); setting
+`SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` is rejected with that same guidance.
 
 ## Reliability
 

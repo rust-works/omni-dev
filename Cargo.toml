@@ -59,6 +59,11 @@ mime_guess = "2"
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.11"
+# RSA signing for Snowflake key-pair (RS256) JWT auth. Already in the tree via
+# rustls; a direct dep pins it. Deliberately not the `rsa` crate (RUSTSEC-2023-0071
+# Marvin advisory + edition-2024 MSRV bump — the reasons #1003 dropped
+# snowflake-connector-rs).
+aws-lc-rs = "1.16"
 ureq = "3"
 quick-xml = "0.41"
 
