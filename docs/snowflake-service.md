@@ -88,6 +88,12 @@ omni-dev snowflake query --account MYACCT --user me \
 # YAML instead of JSON.
 omni-dev snowflake query --account MYACCT --user me -o yaml "SELECT 1"
 
+# CSV / TSV (a header row plus one row per result row).
+omni-dev snowflake query --account MYACCT --user me -o csv "SELECT 1, 'x'"
+
+# Write to a file instead of stdout (works for any -o format).
+omni-dev snowflake query --account MYACCT --user me -o csv --out-file rows.csv "SELECT 1"
+
 # List / evict multiplexed sessions.
 omni-dev snowflake sessions          # table; -o json for machines
 omni-dev snowflake disconnect --account MYACCT --user me
@@ -108,6 +114,15 @@ when it overflows `i64`); `fixed` (scale > 0) / `real`/`float`/`double` → numb
 `variant`/`object`/`array` → parsed JSON; `binary` (hex) and other types → the raw
 string. An empty result reports `columns: []` (the connector exposes column
 metadata per-row only).
+
+`-o json` (default) and `-o yaml` serialize that whole payload. `-o csv` / `-o tsv`
+instead render the tabular shape directly: a header row of column names (order taken
+from `columns[]`) followed by one row per result row, with RFC 4180 quoting — a field
+is double-quoted, and embedded quotes doubled, when it contains the delimiter, a
+quote, or a newline. `null` cells become empty fields and `variant`/`object`/`array`
+cells become compact JSON. Because an empty result reports `columns: []`, CSV/TSV of a
+zero-row query is empty. `--out-file <PATH>` writes the rendered output to a file
+instead of stdout (for any `-o` format).
 
 ## Configuration
 
