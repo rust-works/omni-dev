@@ -67,3 +67,4 @@ by Michael Nygard.
 | [ADR-0041](adr-0041.md)  | ✅ Accepted                              | 2026-07-07 | Refuse to Amend Pushed Commits; Override Denied Only to Autonomous AI Rewrites         |
 | [ADR-0042](adr-0042.md)  | ✅ Accepted                              | 2026-07-07 | Local Append-Only Invocation and HTTP Request Log                                      |
 | [ADR-0043](adr-0043.md)  | ✅ Accepted                              | 2026-07-07 | Default-On Denylist Redaction of Credential Material in Persisted and Debug Output     |
+| [ADR-0044](adr-0044.md)  | ✅ Accepted                              | 2026-07-07 | Unified AI Backend and Model Resolution with a Single-Source-of-Truth Precedence Chain |
