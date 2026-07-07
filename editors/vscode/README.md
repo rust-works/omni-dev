@@ -36,7 +36,7 @@ never surfaces an error or blocks the window.
 - The omni-dev daemon running locally (`omni-dev daemon start`).
 - **macOS or Linux only** — like the daemon, the companion is Unix-only; on
   Windows there is no daemon socket to talk to (tracked in
-  [#1041](https://github.com/rust-works/omni-dev/issues/1041)).
+  [#1237](https://github.com/rust-works/omni-dev/issues/1237)).
 
 ## Settings
 
