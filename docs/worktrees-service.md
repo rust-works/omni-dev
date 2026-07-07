@@ -243,4 +243,4 @@ them to `list`/`status` replies.
   and the daemon computes per-worktree branch and ahead/behind state with `git2`
   (see [Git enrichment](#git-enrichment)), keeping the companion thin.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
-  Windows support is tracked with the broader daemon work (#1041).
+  Windows support is tracked with the broader daemon work (#1237).
