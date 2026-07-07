@@ -4136,6 +4136,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_attachments_rejects_path_without_filename() {
+        // A path terminating in `..` has no `file_name()` component, yet its
+        // metadata resolves and it opens as a directory — so it reaches the
+        // filename guard rather than failing earlier.
+        let dir = tempfile::tempdir().unwrap();
+        let no_name = dir.path().join("..");
+        let client =
+            AtlassianClient::new("https://org.atlassian.net", "user@test.com", "token").unwrap();
+        let err = client
+            .upload_attachments("PROJ-1", &[no_name])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no filename component"));
+    }
+
+    #[tokio::test]
     async fn delete_attachment_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
