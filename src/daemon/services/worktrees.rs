@@ -20,12 +20,16 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use git2::Repository;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
 use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
@@ -33,23 +37,94 @@ use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
 /// The worktrees service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "worktrees";
 
+/// The tray submenu title.
+const SUBMENU_TITLE: &str = "Worktrees";
+
 /// Environment override for the VS Code launcher used by the "focus" tray
 /// action, for when the daemon runs under launchd with a minimal `PATH`.
 const VSCODE_BIN_ENV: &str = "OMNI_DEV_VSCODE_BIN";
 
+/// How often the background task recomputes the tray menu snapshot off the main
+/// thread. The macOS tray polls `menu()` ~1 Hz; caching a couple of seconds keeps
+/// the displayed branch/sync state fresh without ever doing git I/O on the GUI
+/// thread (which would peg a core and stall shutdown — the #1186 regression).
+const MENU_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A running background menu-refresh task and the token that stops it.
+struct RefreshTask {
+    /// Cancelled by `shutdown` to end the refresh loop.
+    token: CancellationToken,
+    /// The spawned loop, awaited on shutdown so it fully unwinds.
+    handle: JoinHandle<()>,
+}
+
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
 pub struct WorktreesService {
-    /// The cross-window registry this adapter routes ops to.
-    registry: WorktreesRegistry,
+    /// The cross-window registry this adapter routes ops to. Behind an `Arc` so
+    /// the background menu-refresh task can read it off the main thread.
+    registry: Arc<WorktreesRegistry>,
+    /// The most recent tray menu snapshot, recomputed off the main thread by
+    /// [`start_menu_refresh`](Self::start_menu_refresh). `menu()` serves a clone
+    /// of this so it never blocks on git enrichment. `None` until the first
+    /// refresh lands — or when no runtime started a task (e.g. unit tests) — in
+    /// which case `menu()` falls back to a one-off inline compute.
+    menu_cache: Arc<Mutex<Option<Vec<MenuItem>>>>,
+    /// The background refresh task, once started (`None` in tests / no runtime).
+    refresh: Mutex<Option<RefreshTask>>,
 }
 
 impl WorktreesService {
-    /// Creates the service with an empty registry. Cheap — no I/O.
+    /// Creates the service with an empty registry. Cheap — no I/O and no task;
+    /// the daemon calls [`start_menu_refresh`](Self::start_menu_refresh) to begin
+    /// off-thread menu caching, while tests use the bare service (menu computed
+    /// inline on demand).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            registry: WorktreesRegistry::new(),
+            registry: Arc::new(WorktreesRegistry::new()),
+            menu_cache: Arc::new(Mutex::new(None)),
+            refresh: Mutex::new(None),
         }
+    }
+
+    /// Starts the background task that recomputes the tray menu snapshot every
+    /// [`MENU_REFRESH_INTERVAL`] **off the main thread** — git enrichment is
+    /// blocking disk I/O — and stores it in [`menu_cache`](Self::menu_cache), so
+    /// the macOS tray's `menu()` serves a cache instead of running git on the GUI
+    /// event loop. Idempotent, and a no-op outside a tokio runtime (mirroring the
+    /// Snowflake keep-alive heartbeat), so unit tests that build a bare service
+    /// keep computing the menu inline.
+    pub fn start_menu_refresh(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; worktrees menu refresh not started");
+            return;
+        }
+        let mut guard = self.refresh.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let registry = self.registry.clone();
+        let cache = self.menu_cache.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                // Snapshot the registry (a cheap lock), then build the menu —
+                // which opens repos and parses git config — on a blocking thread,
+                // never on this async worker or the tray's main thread.
+                let entries = registry.list();
+                if let Ok(items) =
+                    tokio::task::spawn_blocking(move || menu_items_for(&entries)).await
+                {
+                    *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(items);
+                }
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(MENU_REFRESH_INTERVAL) => {}
+                }
+            }
+        });
+        *guard = Some(RefreshTask { token, handle });
     }
 }
 
@@ -90,14 +165,18 @@ impl DaemonService for WorktreesService {
     }
 
     fn menu(&self) -> MenuSnapshot {
-        let entries = self.registry.list();
-        let items = if entries.is_empty() {
-            vec![MenuItem::Label("No open windows".to_string())]
-        } else {
-            window_menu_items(&entries)
-        };
+        // Serve the snapshot the background task maintains off the main thread;
+        // fall back to a one-off inline compute only before the first refresh
+        // lands (or with no runtime — the unit tests). Never blocks on git here
+        // in the daemon, honouring the trait's "cheap, must not block" contract.
+        let cached = self
+            .menu_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let items = cached.unwrap_or_else(|| menu_items_for(&self.registry.list()));
         MenuSnapshot {
-            title: "Worktrees".to_string(),
+            title: SUBMENU_TITLE.to_string(),
             items,
         }
     }
@@ -130,7 +209,18 @@ impl DaemonService for WorktreesService {
     }
 
     async fn shutdown(&self) {
-        // In-memory only; nothing to drain or persist.
+        // Stop the background menu-refresh task; the registry itself is in-memory
+        // with nothing to drain or persist. Take the task out from under the lock
+        // first so the `std::Mutex` is never held across the `.await`.
+        let task = self
+            .refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.token.cancel();
+            let _ = task.handle.await;
+        }
     }
 }
 
@@ -315,6 +405,18 @@ const REPO_SEP: char = '·';
 /// Separator marking a **linked worktree** (a git "fork" glyph), so a worktree
 /// line is distinguishable at a glance from its parent repo's main checkout.
 const WORKTREE_SEP: char = '⑂';
+
+/// The full tray item list for a window set: the "No open windows" placeholder
+/// when empty, else one line per window via [`window_menu_items`]. Does the git
+/// enrichment (blocking disk I/O), so it runs on a blocking thread from the
+/// background refresh task — and inline only as a cold-start fallback in `menu`.
+fn menu_items_for(entries: &[WindowEntry]) -> Vec<MenuItem> {
+    if entries.is_empty() {
+        vec![MenuItem::Label("No open windows".to_string())]
+    } else {
+        window_menu_items(entries)
+    }
+}
 
 /// Builds the tray items for a non-empty window list: **one clickable line per
 /// window** whose label carries the live git state and whose click focuses that
@@ -681,6 +783,52 @@ mod tests {
             .collect();
         assert!(action_ids.contains(&"focus:w1"));
         assert!(action_ids.contains(&"focus:w2"));
+    }
+
+    #[test]
+    fn start_menu_refresh_is_a_noop_outside_a_runtime() {
+        // With no tokio runtime, the background task is never spawned, so the
+        // bare service keeps computing `menu()` inline (what the tests rely on).
+        let svc = WorktreesService::new();
+        svc.start_menu_refresh();
+        assert!(svc.refresh.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_menu_refresh_populates_cache_and_shutdown_stops_it() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("repo-a"), "/tmp/a"))
+            .await
+            .unwrap();
+        // Before the task runs, `menu()` computes inline from an empty cache.
+        assert!(svc.menu_cache.lock().unwrap().is_none());
+
+        svc.start_menu_refresh();
+        // Idempotent: a second call does not start a second task.
+        svc.start_menu_refresh();
+
+        // The task fills the cache off the main thread; poll briefly for it.
+        let mut filled = false;
+        for _ in 0..100 {
+            if svc.menu_cache.lock().unwrap().is_some() {
+                filled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(filled, "background refresh should populate the menu cache");
+
+        // `menu()` now serves the cache: one clickable line for the window.
+        let menu = svc.menu();
+        assert_eq!(menu.title, "Worktrees");
+        assert!(menu
+            .items
+            .iter()
+            .any(|i| matches!(i, MenuItem::Action(a) if a.id == "focus:w1")));
+
+        // Shutdown cancels and joins the task, clearing the handle.
+        svc.shutdown().await;
+        assert!(svc.refresh.lock().unwrap().is_none());
     }
 
     #[tokio::test]
