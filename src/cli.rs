@@ -12,7 +12,7 @@ pub mod config;
 pub mod coverage;
 // The daemon and the Snowflake client (which talks to the daemon over its
 // Unix-domain control socket) are Unix-only; running them on Windows is future
-// work (#1041).
+// work (#1237).
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
