@@ -97,8 +97,15 @@ omni-dev snowflake query --account MYACCT --user me -o csv --out-file rows.csv "
 
 # List / evict multiplexed sessions.
 omni-dev snowflake sessions          # table; -o json for machines
-omni-dev snowflake disconnect --account MYACCT --user me
+omni-dev snowflake disconnect --account MYACCT --user me   # one pool by identity
+omni-dev snowflake disconnect --id 3                       # one pool by id (from `sessions`)
+omni-dev snowflake disconnect --all                        # every pool
 ```
+
+`disconnect` takes exactly one selector — the `--account`/`--user` pair, `--id`
+(the numeric pool id shown by `sessions`), or `--all`. The by-id and bulk forms
+were previously reachable only from the macOS tray, so non-macOS operators had to
+restart the daemon to bulk-evict sessions (#1228).
 
 `query` returns a self-describing payload:
 
@@ -331,7 +338,13 @@ Ops:
 |--------------|--------------------------------------------------------------------|--------------------------------------------------------|
 | `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`  | `{ columns: [...], rows: [...] }`                      |
 | `sessions`   | `null`                                                             | `{ sessions: [<pool>] }` — one entry per pool, see below |
-| `disconnect` | `{ account, user }`                                                | `{ disconnected: <bool> }`                             |
+| `disconnect` | `{ account, user }` \| `{ id }` \| `{ all: true }`                 | `{ disconnected: <bool>, count: <n> }`                |
+
+`disconnect` accepts three mutually-exclusive selectors: the `(account, user)`
+pair (the original contract), `id` (a numeric pool id from `sessions`), or
+`all: true` (every pool). `count` is the number of pools evicted (`0` or `1` for
+the pair/id forms); `disconnected` is `count > 0`, preserved for callers written
+against the pre-#1228 reply.
 
 Each `<pool>` entry in the `sessions` reply describes one `(account, user)`
 session pool, including its live members (the CLI and tray render all of these
