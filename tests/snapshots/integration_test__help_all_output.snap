@@ -3300,7 +3300,8 @@ Options:
       --database <DATABASE>    Per-query database (`USE DATABASE`)
       --schema <SCHEMA>        Per-query schema (`USE SCHEMA`)
       --socket <PATH>          Control-socket path. Defaults to the per-user runtime location
-  -o, --output <OUTPUT>        Output format [default: json] [possible values: json, yaml]
+  -o, --output <OUTPUT>        Output format [default: json] [possible values: json, yaml, csv, tsv]
+      --out-file <PATH>        Output file (writes to stdout if omitted)
   -h, --help                   Print help (see more with '--help')
 
 
