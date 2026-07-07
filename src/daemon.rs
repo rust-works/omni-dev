@@ -18,7 +18,7 @@
 
 // The control plane is a Unix-domain socket (`UnixListener`/`UnixStream`), so the
 // daemon runtime is Unix-only and gated `#[cfg(unix)]`; running the daemon on
-// Windows is future work (#1041). `paths` stays cross-platform because the
+// Windows is future work (#1237). `paths` stays cross-platform because the
 // request log and the browser thin-client token discovery depend on it.
 pub mod paths;
 
