@@ -82,11 +82,13 @@ omni-dev worktrees list --socket /path/to/daemon.sock
 
 Each row shows the window's repo, its **current branch** and **ahead/behind sync
 state** (`+ahead -behind`, or `-` when the branch tracks no upstream), the
-primary folder, and how long ago the window was last seen. The branch and sync
-columns are computed by the daemon from the worktree on disk — see
-[Git enrichment](#git-enrichment) — so they reflect the live branch rather than
-whatever the companion happened to report. `-o json` carries the same fields plus
-the companion-reported `title`.
+primary folder, and how long ago the window was last seen. The REPO column shows
+the daemon-computed **main repository** (a linked worktree's parent repo, not its
+worktree-folder basename) when available, falling back to the companion-reported
+`repo`. The branch and sync columns are likewise computed by the daemon from the
+worktree on disk — see [Git enrichment](#git-enrichment) — so they reflect the
+live branch rather than whatever the companion happened to report. `-o json`
+carries the same fields plus the companion-reported `title`.
 
 The companion extension feeds the registry; the CLI only reads it. If the daemon
 is not running, `worktrees list` reports the connection failure (the companion, by
@@ -95,12 +97,21 @@ contrast, no-ops silently).
 ## Tray
 
 On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:
-one line per open window, then a **"Focus …" action** per window. Each window's
-line shows its name and, when the primary folder is a git worktree, the live
-branch and ahead/behind state (`repo · branch (+2 -1)`); windows that are not a
-repo fall back to their reported title. Clicking a "Focus" action spawns the VS
-Code CLI on that window's folder; since VS Code reuses an already-open window,
-this focuses the right window rather than opening a new one.
+**one clickable line per open window** — the live stats and the focus action are
+the same item, not two separate rows. Each line shows the **main repository**
+name and, when the primary folder is a git repo, the live branch and ahead/behind
+state:
+
+- a normal checkout reads `omni-dev · branch (+2 -1)` (a middle dot);
+- a **linked worktree** reads `omni-dev ⑂ branch (+2 -1)` — the `⑂` fork glyph
+  sets it off from the main checkout, and the name is the **parent** repository
+  it belongs to (not the worktree-folder basename);
+- a window that is not a git repo falls back to its reported title.
+
+Clicking a line spawns the VS Code CLI on that window's folder; since VS Code
+reuses an already-open window, this focuses the right window rather than opening
+a new one. A window with no workspace folder has nothing to open, so it stays a
+non-clickable status line.
 
 Focusing is **best-effort**. The launcher is resolved in this order:
 
@@ -127,8 +138,10 @@ The `-o json` status detail carries the same enriched window entries as
 ## Git enrichment
 
 The companion reports only raw folder paths; the **daemon** computes the richer
-per-worktree git state — current branch and ahead/behind counts — with the
-`git2` dependency it already carries (#1186). Keeping this in Rust preserves the
+per-worktree git state — current branch, ahead/behind counts, the **main
+repository** name (from git's common dir, so a linked worktree resolves the
+parent repo it belongs to), and an **`is_worktree`** flag — with the `git2`
+dependency it already carries (#1186). Keeping this in Rust preserves the
 companion's thin-reporter contract ([ADR-0040](adrs/adr-0040.md)): the ~50-line
 extension never runs git.
 
@@ -143,7 +156,9 @@ extension never runs git.
   subdirectory or a linked worktree. A folder that is not a git repo, a detached
   HEAD, or a branch with no upstream is still listed — just without the fields it
   cannot supply (no `branch`, or `branch` with no `ahead`/`behind`). The
-  enrichment never fails a `list`.
+  `main_repo` name and `is_worktree` flag are resolved from the repository itself,
+  so they are present even for an unborn or detached HEAD (only a non-repo folder
+  omits them). The enrichment never fails a `list`.
 
 ## Security
 
@@ -196,19 +211,22 @@ Where:
   needs no retry logic (an evicted window re-registers off its next heartbeat).
 - `folders` — absolute workspace-folder paths.
 - A `list` `entry` is
-  `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, last_seen }`
-  with `last_seen` as an RFC 3339 timestamp; consumers compute age from it.
-  Entries are sorted by `(repo, key)` for deterministic output. The
-  companion-reported fields are stored and served verbatim on the wire (and in
-  `-o json`); only the human-readable `worktrees list` table sanitizes them for
-  terminal display (see Security).
-- `branch`, `ahead`, `behind` are **daemon-computed, not companion-reported**:
-  the daemon derives them from the primary folder's git state on every read (see
-  [Git enrichment](#git-enrichment)). Each is optional and omitted when it does
-  not apply — no `branch` for a non-repo or detached HEAD; no `ahead`/`behind`
-  when the branch tracks no upstream. New optional fields like these follow the
-  protocol's `#[serde(skip_serializing_if)]` convention, so an older client
-  simply ignores them.
+  `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
+  is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
+  compute age from it. Entries are sorted by `(repo, key)` for deterministic
+  output. The companion-reported fields are stored and served verbatim on the wire
+  (and in `-o json`); only the human-readable `worktrees list` table sanitizes
+  them for terminal display (see Security).
+- `branch`, `ahead`, `behind`, `main_repo`, `is_worktree` are **daemon-computed,
+  not companion-reported**: the daemon derives them from the primary folder's git
+  state on every read (see [Git enrichment](#git-enrichment)). Each is optional
+  and omitted when it does not apply — no `branch` for a non-repo or detached
+  HEAD; no `ahead`/`behind` when the branch tracks no upstream; no `main_repo` for
+  a non-repo folder; `is_worktree` omitted (false) for a normal checkout.
+  `main_repo` is the parent repository's directory name (so a linked worktree
+  names the repo it belongs to rather than its worktree-folder basename). New
+  optional fields like these follow the protocol's `#[serde(skip_serializing_if)]`
+  convention, so an older client simply ignores them.
 
 Companion lifecycle, per window:
 
@@ -225,7 +243,7 @@ Example exchange:
 → {"service":"worktrees","op":"register","payload":{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321}}
 ← {"ok":true,"payload":{"ok":true}}
 → {"service":"worktrees","op":"list"}
-← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"last_seen":"2026-06-23T01:20:00Z"}]}}
+← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 ```
 
 The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
