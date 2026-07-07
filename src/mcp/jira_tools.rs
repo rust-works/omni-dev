@@ -1974,6 +1974,72 @@ mod tests {
         assert!(yaml.contains("status: ok"));
     }
 
+    // ── attachment tool handlers (create_client boundary) ───────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_upload_handler_success_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/attachments"))
+            .and(header("X-Atlassian-Token", "no-check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 5, "content": "https://example.com/10001"}
+            ])))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_upload(Parameters(AttachmentUploadParams {
+                key: "PROJ-1".to_string(),
+                file_paths: vec![file.to_string_lossy().into_owned()],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_delete_handler_without_confirm_returns_tool_error() {
+        // Rejects before create_client, so no env/mock is needed.
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_delete(Parameters(AttachmentDeleteParams {
+                attachment_id: "10042".to_string(),
+                confirm: false,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_delete_handler_success_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/attachment/10042"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_delete(Parameters(AttachmentDeleteParams {
+                attachment_id: "10042".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
     // ── boards ─────────────────────────────────────────────────────
 
     #[tokio::test]

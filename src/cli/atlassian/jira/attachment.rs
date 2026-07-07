@@ -790,4 +790,60 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(!out.contains("Deleted attachment"));
     }
+
+    // ── execute() wrappers via dispatch (create_client boundary) ────
+    //
+    // These drive AttachmentCommand::execute → the subcommand execute() →
+    // create_client(), pointing the credential env at a wiremock server so the
+    // real credential-loading path runs end to end.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_command_upload_dispatch_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/attachments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 2, "content": "https://example.com/10001"}
+            ])))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log.txt");
+        fs::write(&file, b"hi").unwrap();
+
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Upload(UploadCommand {
+                key: "PROJ-1".to_string(),
+                files: vec![file],
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_command_delete_dispatch_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/attachment/10042"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        // force: true skips the prompt, so stdin is never read.
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Delete(DeleteCommand {
+                attachment_id: "10042".to_string(),
+                force: true,
+                dry_run: false,
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
 }
