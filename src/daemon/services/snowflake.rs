@@ -37,6 +37,34 @@ impl SnowflakeService {
         engine.start_heartbeat();
         Self { engine }
     }
+
+    /// Handles the `disconnect` op's three mutually-exclusive selectors — every
+    /// pool (`{ all: true }`), a pool by numeric id (`{ id }`), or the
+    /// `(account, user)` pair (`{ account, user }`, the original contract). The
+    /// bulk and by-id forms were previously reachable only from the macOS tray
+    /// (#1228). Every reply carries `count` (pools evicted) plus `disconnected`
+    /// (`count > 0`), so the by-id and pair forms stay wire-compatible with the
+    /// pre-#1228 `{ disconnected }` reply.
+    fn handle_disconnect(&self, payload: &Value) -> Result<Value> {
+        if payload.get("all").and_then(Value::as_bool) == Some(true) {
+            let count = self.engine.disconnect_all();
+            return Ok(json!({ "disconnected": count > 0, "count": count }));
+        }
+        if let Some(id) = payload.get("id").and_then(Value::as_u64) {
+            let removed = self.engine.disconnect_by_id(id);
+            return Ok(json!({ "disconnected": removed, "count": u64::from(removed) }));
+        }
+        let account = payload
+            .get("account")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("`disconnect` requires `account`, `id`, or `all`"))?;
+        let user = payload
+            .get("user")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("`disconnect` requires `user`"))?;
+        let removed = self.engine.disconnect(account, user);
+        Ok(json!({ "disconnected": removed, "count": u64::from(removed) }))
+    }
 }
 
 #[async_trait]
@@ -56,17 +84,7 @@ impl DaemonService for SnowflakeService {
                 self.engine.query(req).await
             }
             "sessions" => Ok(json!({ "sessions": self.engine.sessions() })),
-            "disconnect" => {
-                let account = payload
-                    .get("account")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("`disconnect` requires `account`"))?;
-                let user = payload
-                    .get("user")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("`disconnect` requires `user`"))?;
-                Ok(json!({ "disconnected": self.engine.disconnect(account, user) }))
-            }
+            "disconnect" => self.handle_disconnect(&payload),
             other => bail!("unknown snowflake op: {other}"),
         }
     }
@@ -219,7 +237,21 @@ mod tests {
             .handle("disconnect", json!({ "account": "ACCT", "user": "me" }))
             .await
             .unwrap();
-        assert_eq!(payload, json!({ "disconnected": false }));
+        assert_eq!(payload, json!({ "disconnected": false, "count": 0 }));
+    }
+
+    #[tokio::test]
+    async fn disconnect_by_id_and_all_selectors() {
+        let svc = offline_service();
+        // Nothing to evict on an empty engine, but both bulk forms succeed and
+        // report a zero count.
+        let by_id = svc.handle("disconnect", json!({ "id": 7 })).await.unwrap();
+        assert_eq!(by_id, json!({ "disconnected": false, "count": 0 }));
+        let all = svc
+            .handle("disconnect", json!({ "all": true }))
+            .await
+            .unwrap();
+        assert_eq!(all, json!({ "disconnected": false, "count": 0 }));
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::cli::format::TableOrJson;
@@ -41,7 +41,8 @@ pub enum SnowflakeSubcommands {
     Query(QueryCommand),
     /// List active multiplexed sessions.
     Sessions(SessionsCommand),
-    /// Disconnect (evict) one session.
+    /// Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or
+    /// all pools.
     Disconnect(DisconnectCommand),
 }
 
@@ -255,15 +256,28 @@ fn render_member(member: &Value) -> String {
     format!("#{mid} {context} · {state} · {qc} queries")
 }
 
-/// Evicts a single multiplexed session.
+/// Evicts multiplexed sessions: one `(account, user)` pool, a pool by numeric id
+/// (from `sessions`), or every pool. Exactly one selector is required — the
+/// `--account`/`--user` pair, `--id`, or `--all`.
 #[derive(Parser)]
+#[command(group(
+    ArgGroup::new("target")
+        .required(true)
+        .args(["account", "id", "all"]),
+))]
 pub struct DisconnectCommand {
-    /// Account of the session to evict.
+    /// Account of the pool to evict (requires `--user`).
+    #[arg(long, requires = "user")]
+    pub account: Option<String>,
+    /// User of the pool to evict (requires `--account`).
+    #[arg(long, requires = "account")]
+    pub user: Option<String>,
+    /// Numeric id of the pool to evict (as shown by `sessions`).
     #[arg(long)]
-    pub account: String,
-    /// User of the session to evict.
+    pub id: Option<u64>,
+    /// Evict every pool.
     #[arg(long)]
-    pub user: String,
+    pub all: bool,
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
@@ -271,24 +285,54 @@ pub struct DisconnectCommand {
 
 impl DisconnectCommand {
     /// Executes the disconnect command.
-    pub async fn execute(self) -> Result<()> {
-        let socket = server::resolve_socket(self.socket)?;
-        let payload = json!({ "account": self.account, "user": self.user });
+    pub async fn execute(mut self) -> Result<()> {
+        let payload = self.payload();
+        let socket = server::resolve_socket(self.socket.take())?;
         let result = call(&socket, "disconnect", payload).await?;
+        println!("{}", self.message(&result));
+        Ok(())
+    }
+
+    /// Builds the socket payload for whichever selector was chosen. Exactly one
+    /// is present (enforced by the `target` arg group), so the `--account`/
+    /// `--user` fallthrough always has both.
+    fn payload(&self) -> Value {
+        if self.all {
+            json!({ "all": true })
+        } else if let Some(id) = self.id {
+            json!({ "id": id })
+        } else {
+            json!({ "account": self.account, "user": self.user })
+        }
+    }
+
+    /// The line printed after the socket call, matched to the selector and the
+    /// number of pools the daemon actually evicted (`count`).
+    fn message(&self, result: &Value) -> String {
+        let count = result.get("count").and_then(Value::as_u64).unwrap_or(0);
         let disconnected = result
             .get("disconnected")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        println!(
-            "{}",
-            disconnect_message(disconnected, &self.account, &self.user)
-        );
-        Ok(())
+            .unwrap_or(count > 0);
+        if self.all {
+            format!("Disconnected {count} session pool(s).")
+        } else if let Some(id) = self.id {
+            if disconnected {
+                format!("Disconnected session pool #{id}.")
+            } else {
+                format!("No active session pool with id {id}.")
+            }
+        } else {
+            // The arg group guarantees the pair when neither --all nor --id.
+            let account = self.account.as_deref().unwrap_or_default();
+            let user = self.user.as_deref().unwrap_or_default();
+            disconnect_message(disconnected, account, user)
+        }
     }
 }
 
-/// The message printed after a `disconnect`, depending on whether a session was
-/// actually evicted.
+/// The message printed after a `(account, user)` disconnect, depending on whether
+/// a session pool was actually evicted.
 fn disconnect_message(disconnected: bool, account: &str, user: &str) -> String {
     if disconnected {
         format!("Disconnected {account} / {user}.")
@@ -493,9 +537,13 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> SnowflakeSubcommands {
+        try_parse(args).unwrap().cmd
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Wrapper, clap::Error> {
         let mut full = vec!["omni-dev"];
         full.extend_from_slice(args);
-        Wrapper::try_parse_from(full).unwrap().cmd
+        Wrapper::try_parse_from(full)
     }
 
     #[test]
@@ -644,18 +692,77 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_requires_account_and_user() {
+    fn disconnect_pair_parses_and_pairs_are_required_together() {
         let SnowflakeSubcommands::Disconnect(cmd) =
             parse(&["disconnect", "--account", "ACCT", "--user", "me"])
         else {
             panic!("expected disconnect");
         };
-        assert_eq!(cmd.account, "ACCT");
-        assert_eq!(cmd.user, "me");
+        assert_eq!(cmd.account.as_deref(), Some("ACCT"));
+        assert_eq!(cmd.user.as_deref(), Some("me"));
+        assert!(cmd.id.is_none());
+        assert!(!cmd.all);
+        assert_eq!(cmd.payload(), json!({ "account": "ACCT", "user": "me" }));
 
-        // Missing required flags is a parse error.
-        let mut full = vec!["omni-dev", "disconnect", "--account", "ACCT"];
-        assert!(Wrapper::try_parse_from(std::mem::take(&mut full)).is_err());
+        // --account without --user (and vice versa) is a parse error.
+        assert!(try_parse(&["disconnect", "--account", "ACCT"]).is_err());
+        assert!(try_parse(&["disconnect", "--user", "me"]).is_err());
+    }
+
+    #[test]
+    fn disconnect_by_id_and_all_selectors_parse() {
+        let SnowflakeSubcommands::Disconnect(cmd) = parse(&["disconnect", "--id", "7"]) else {
+            panic!("expected disconnect");
+        };
+        assert_eq!(cmd.id, Some(7));
+        assert_eq!(cmd.payload(), json!({ "id": 7 }));
+
+        let SnowflakeSubcommands::Disconnect(cmd) = parse(&["disconnect", "--all"]) else {
+            panic!("expected disconnect");
+        };
+        assert!(cmd.all);
+        assert_eq!(cmd.payload(), json!({ "all": true }));
+    }
+
+    #[test]
+    fn disconnect_requires_and_conflicts_selectors() {
+        // No selector at all is an error (the `target` group is required).
+        assert!(try_parse(&["disconnect"]).is_err());
+        // Selectors are mutually exclusive.
+        assert!(try_parse(&["disconnect", "--all", "--id", "1"]).is_err());
+        assert!(try_parse(&["disconnect", "--account", "A", "--user", "u", "--all"]).is_err());
+        assert!(try_parse(&["disconnect", "--id", "1", "--account", "A", "--user", "u"]).is_err());
+    }
+
+    #[test]
+    fn disconnect_message_reflects_selector_and_count() {
+        let all = DisconnectCommand {
+            account: None,
+            user: None,
+            id: None,
+            all: true,
+            socket: None,
+        };
+        assert_eq!(
+            all.message(&json!({ "disconnected": true, "count": 3 })),
+            "Disconnected 3 session pool(s)."
+        );
+
+        let by_id = DisconnectCommand {
+            account: None,
+            user: None,
+            id: Some(5),
+            all: false,
+            socket: None,
+        };
+        assert_eq!(
+            by_id.message(&json!({ "disconnected": true, "count": 1 })),
+            "Disconnected session pool #5."
+        );
+        assert_eq!(
+            by_id.message(&json!({ "disconnected": false, "count": 0 })),
+            "No active session pool with id 5."
+        );
     }
 
     #[test]
