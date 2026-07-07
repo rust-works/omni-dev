@@ -1079,6 +1079,10 @@ omni-dev atlassian jira changelog --keys PROJ-1,PROJ-2 --limit 100
 #### JIRA: Attachments
 
 ```bash
+# Upload one or more files to an issue (single multipart request)
+omni-dev atlassian jira attachment upload PROJ-123 ./build.log
+omni-dev atlassian jira attachment upload PROJ-123 ./build.log ./screenshot.png
+
 # Download all attachments
 omni-dev atlassian jira attachment download --key PROJ-123
 omni-dev atlassian jira attachment download --key PROJ-123 --output-dir ./files
@@ -1089,6 +1093,11 @@ omni-dev atlassian jira attachment download --key PROJ-123 --filter screenshot
 # Download only images (png, jpeg, gif, svg, webp)
 omni-dev atlassian jira attachment images --key PROJ-123
 omni-dev atlassian jira attachment images --key PROJ-123 --output-dir ./images
+
+# Delete an attachment by ID (permanent — prompts for confirmation)
+omni-dev atlassian jira attachment delete 10042
+omni-dev atlassian jira attachment delete 10042 --dry-run   # preview, no API call
+omni-dev atlassian jira attachment delete 10042 --force     # skip the prompt
 ```
 
 #### Confluence: Reading and Writing Pages
