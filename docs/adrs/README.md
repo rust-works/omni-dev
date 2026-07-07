@@ -66,3 +66,4 @@ by Michael Nygard.
 | [ADR-0040](adr-0040.md)  | ✅ Accepted                              | 2026-06-23 | Cross-Window Worktrees Daemon Service Fed by a Companion VS Code Extension             |
 | [ADR-0041](adr-0041.md)  | ✅ Accepted                              | 2026-07-07 | Refuse to Amend Pushed Commits; Override Denied Only to Autonomous AI Rewrites         |
 | [ADR-0042](adr-0042.md)  | ✅ Accepted                              | 2026-07-07 | Local Append-Only Invocation and HTTP Request Log                                      |
+| [ADR-0043](adr-0043.md)  | ✅ Accepted                              | 2026-07-07 | Default-On Denylist Redaction of Credential Material in Persisted and Debug Output     |
