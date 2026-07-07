@@ -545,7 +545,9 @@ target's `.git/info/exclude` is the only file modified outside
 are preserved across syncs and cleans.
 
 See also: [`claude_skills_sync` / `claude_skills_status` / `claude_skills_clean`](mcp.md#ai--config-5-tools)
-for the MCP equivalents.
+for the MCP equivalents, and [CI Path-Split](ci-path-split.md) for the in-repo
+CI alternative — splitting required checks so skills can live in the project
+repo yet still iterate in seconds, instead of being symlinked in from a source.
 
 ### `ai claude cli model resolve` — Model Resolution Diagnostics
 
