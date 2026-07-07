@@ -11,8 +11,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Path-split gate (#609). Docs/skills-only PRs skip the heavy jobs while still
+  # publishing every required status context, so they merge in seconds without
+  # deadlocking branch protection. A single gate is the source of truth for the
+  # split — no twin `ci-skip.yml` whose stub names must be hand-mirrored against
+  # this matrix (which would silently rot when the matrix or protection set
+  # changes). Non-PR events (main pushes, release tags) always take the full
+  # path. `src/templates/*.md` are include_str!-compiled and unit-tested
+  # (ADR-0030), so the doc set scopes `*.md` to the repo root only — never
+  # `**/*.md` — and anything not explicitly a doc runs full CI (fail-safe).
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.decide.outputs.code }}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dorny/paths-filter@v3
+      id: filter
+      if: github.event_name == 'pull_request'
+      with:
+        filters: |
+          code:
+            - '**'
+            - '!*.md'
+            - '!docs/**'
+            - '!.claude/skills/**'
+    - id: decide
+      run: |
+        if [ "${{ github.event_name }}" != "pull_request" ]; then
+          echo "code=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
+        fi
+
+  # Required-context jobs (Test, Clippy, Rustfmt, Docs) always run so their
+  # contexts always report `success`; on the fast path every step is skipped,
+  # which is a genuine passing job — not a `skipped` conclusion whose
+  # branch-protection semantics vary. Non-required jobs below skip wholesale.
   test:
     name: Test
+    needs: gate
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -25,12 +64,16 @@ jobs:
           - "mcp"
     steps:
     - uses: actions/checkout@v7
+      if: needs.gate.outputs.code == 'true'
     - uses: dtolnay/rust-toolchain@master
+      if: needs.gate.outputs.code == 'true'
       with:
         toolchain: ${{ matrix.rust }}
         components: rustfmt
     - uses: Swatinem/rust-cache@v2
+      if: needs.gate.outputs.code == 'true'
     - name: Run tests
+      if: needs.gate.outputs.code == 'true'
       run: |
         if [ -z "${{ matrix.features }}" ]; then
           cargo test --verbose
@@ -40,6 +83,8 @@ jobs:
 
   mcp-build:
     name: MCP Release Build
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -50,6 +95,8 @@ jobs:
 
   windows-build:
     name: Windows Build
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
     # Mirrors the release.yml win-msvc binary build so platform-portability
     # regressions (e.g. the Unix-only daemon, #1041) are caught on every PR
@@ -63,17 +110,22 @@ jobs:
 
   fmt:
     name: Rustfmt
+    needs: gate
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      if: needs.gate.outputs.code == 'true'
     - uses: dtolnay/rust-toolchain@stable
+      if: needs.gate.outputs.code == 'true'
       with:
         components: rustfmt
     - name: Check formatting
+      if: needs.gate.outputs.code == 'true'
       run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
+    needs: gate
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -82,11 +134,15 @@ jobs:
           - "mcp"
     steps:
     - uses: actions/checkout@v7
+      if: needs.gate.outputs.code == 'true'
     - uses: dtolnay/rust-toolchain@stable
+      if: needs.gate.outputs.code == 'true'
       with:
         components: clippy
     - uses: Swatinem/rust-cache@v2
+      if: needs.gate.outputs.code == 'true'
     - name: Run clippy
+      if: needs.gate.outputs.code == 'true'
       run: |
         if [ -z "${{ matrix.features }}" ]; then
           cargo clippy --all-targets -- -D warnings
@@ -96,16 +152,23 @@ jobs:
 
   docs:
     name: Docs
+    needs: gate
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      if: needs.gate.outputs.code == 'true'
     - uses: dtolnay/rust-toolchain@stable
+      if: needs.gate.outputs.code == 'true'
     - uses: Swatinem/rust-cache@v2
+      if: needs.gate.outputs.code == 'true'
     - name: Build docs
+      if: needs.gate.outputs.code == 'true'
       run: cargo doc --no-deps --document-private-items
 
   coverage:
     name: Coverage
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -128,6 +191,8 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -142,6 +207,8 @@ jobs:
 
   deny:
     name: Dependency Policy
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -151,6 +218,8 @@ jobs:
 
   secrets:
     name: Secret Scanning
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -160,4 +229,3 @@ jobs:
       uses: trufflesecurity/trufflehog@main
       with:
         extra_args: --only-verified
-
