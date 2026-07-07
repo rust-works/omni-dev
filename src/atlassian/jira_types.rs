@@ -675,6 +675,18 @@ pub struct JiraAttachment {
     pub content_url: String,
 }
 
+impl From<JiraAttachmentEntry> for JiraAttachment {
+    fn from(entry: JiraAttachmentEntry) -> Self {
+        Self {
+            id: entry.id,
+            filename: entry.filename,
+            mime_type: entry.mime_type,
+            size: entry.size,
+            content_url: entry.content,
+        }
+    }
+}
+
 /// A JIRA workflow transition returned by
 /// `GET /rest/api/3/issue/{key}/transitions`. Executed via
 /// `POST /rest/api/3/issue/{key}/transitions`.

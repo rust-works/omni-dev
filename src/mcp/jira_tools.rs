@@ -92,6 +92,39 @@ pub struct AttachmentImagesParams {
     pub output_dir: Option<String>,
 }
 
+/// Parameters for the `jira_attachment_upload` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentUploadParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Local filesystem path(s) to the file(s) to upload. Each is streamed
+    /// from disk (never fully buffered in memory) and rides a single
+    /// multipart request.
+    pub file_paths: Vec<String>,
+}
+
+/// Parameters for the `jira_attachment_delete` tool.
+///
+/// `confirm` must be `true` for the deletion to proceed. This is the
+/// MCP-side guard for an irreversible operation; the assistant must
+/// explicitly opt in.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentDeleteParams {
+    /// Attachment ID to delete.
+    pub attachment_id: String,
+    /// Must be set to `true` — destructive guard.
+    pub confirm: bool,
+}
+
+/// Result returned by [`attachment_upload_yaml`].
+#[derive(Debug, Serialize)]
+struct UploadResult {
+    /// Issue the files were attached to.
+    key: String,
+    /// Metadata for each created attachment.
+    uploaded: Vec<JiraAttachment>,
+}
+
 /// Downloads matching attachments to disk and returns YAML metadata
 /// describing each downloaded file (including its on-disk path).
 pub(crate) async fn attachment_download_yaml(
@@ -172,6 +205,38 @@ fn resolve_output_dir(requested: Option<&str>) -> Result<PathBuf> {
             .context("Failed to create temp dir for attachment download")?;
         Ok(tmp.keep())
     }
+}
+
+/// Uploads the given files to an issue and returns YAML metadata for each
+/// created attachment.
+pub(crate) async fn attachment_upload_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    file_paths: &[String],
+) -> Result<String> {
+    let files: Vec<PathBuf> = file_paths.iter().map(PathBuf::from).collect();
+    let uploaded = client.upload_attachments(key, &files).await?;
+    let result = UploadResult {
+        key: key.to_string(),
+        uploaded,
+    };
+    serde_yaml::to_string(&result).context("Failed to serialize upload result as YAML")
+}
+
+/// Deletes an attachment by ID (guarded by `confirm`) and returns YAML
+/// `{status: ok}` on success.
+pub(crate) async fn attachment_delete_yaml(
+    client: &AtlassianClient,
+    attachment_id: &str,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete attachment {attachment_id}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client.delete_attachment(attachment_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -944,6 +1009,57 @@ impl OmniDevServer {
             let (client, _) = create_client()?;
             let dir = resolve_output_dir(params.output_dir.as_deref())?;
             attachment_images_yaml(&client, &params.key, &dir).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: upload one or more local files as attachments to an issue.
+    #[tool(
+        description = "Upload one or more local files as attachments to a JIRA issue. Provide \
+                       `file_paths` as absolute paths on the MCP server's filesystem; each is \
+                       streamed from disk and rides a single multipart request. Returns YAML \
+                       metadata (id, filename, mime_type, size, content_url) for each created \
+                       attachment. Mirrors `omni-dev atlassian jira attachment upload`."
+    )]
+    pub async fn jira_attachment_upload(
+        &self,
+        Parameters(params): Parameters<AttachmentUploadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            attachment_upload_yaml(&client, &params.key, &params.file_paths).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: delete a JIRA attachment by ID. **Irreversible** — caller must
+    /// pass `confirm: true`.
+    #[tool(
+        description = "Delete a JIRA attachment by ID. **DESTRUCTIVE AND IRREVERSIBLE** (JIRA \
+                       has no trash). You must explicitly pass `confirm: true` for the deletion \
+                       to proceed; otherwise the tool returns an error without contacting the \
+                       API. Returns YAML `{status: ok}` on success. Mirrors `omni-dev atlassian \
+                       jira attachment delete --force`."
+    )]
+    pub async fn jira_attachment_delete(
+        &self,
+        Parameters(params): Parameters<AttachmentDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Reject before loading credentials so a missing-config environment can
+        // still see the destructive guard.
+        if !params.confirm {
+            return Err(tool_error(anyhow!(
+                "Refusing to delete attachment {}: pass `confirm: true` to authorise this irreversible operation.",
+                params.attachment_id
+            )));
+        }
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            attachment_delete_yaml(&client, &params.attachment_id, params.confirm).await
         })
         .await
         .map_err(tool_error)?;
@@ -1804,6 +1920,124 @@ mod tests {
         let dir = resolve_output_dir(None).unwrap();
         assert!(dir.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_yaml_returns_created_attachments() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/attachments"))
+            .and(header("X-Atlassian-Token", "no-check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 5, "content": "https://example.com/10001"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let client = mock_client(&server.uri());
+        let yaml =
+            attachment_upload_yaml(&client, "PROJ-1", &[file.to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+        assert!(yaml.contains("key: PROJ-1"));
+        assert!(yaml.contains("log.txt"));
+        assert!(yaml.contains("10001"));
+    }
+
+    #[tokio::test]
+    async fn attachment_delete_yaml_requires_confirm() {
+        let client = mock_client("https://example.atlassian.net");
+        let err = attachment_delete_yaml(&client, "10042", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn attachment_delete_yaml_with_confirm_calls_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/attachment/10042"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let yaml = attachment_delete_yaml(&client, "10042", true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("status: ok"));
+    }
+
+    // ── attachment tool handlers (create_client boundary) ───────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_upload_handler_success_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/attachments"))
+            .and(header("X-Atlassian-Token", "no-check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10001", "filename": "log.txt", "mimeType": "text/plain", "size": 5, "content": "https://example.com/10001"}
+            ])))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("log.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_upload(Parameters(AttachmentUploadParams {
+                key: "PROJ-1".to_string(),
+                file_paths: vec![file.to_string_lossy().into_owned()],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_delete_handler_without_confirm_returns_tool_error() {
+        // Rejects before create_client, so no env/mock is needed.
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_delete(Parameters(AttachmentDeleteParams {
+                attachment_id: "10042".to_string(),
+                confirm: false,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_attachment_delete_handler_success_via_mock() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/attachment/10042"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _home = guard.set_credentials(&server.uri());
+
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_attachment_delete(Parameters(AttachmentDeleteParams {
+                attachment_id: "10042".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     // ── boards ─────────────────────────────────────────────────────
