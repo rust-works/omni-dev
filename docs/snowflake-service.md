@@ -146,6 +146,7 @@ directly without resolving defaults themselves):
 |-----------|-----------------------|-----------------|
 | Account   | `SNOWFLAKE_ACCOUNT`   | `--account`     |
 | User      | `SNOWFLAKE_USER`      | `--user`        |
+| Host override | `SNOWFLAKE_HOST`  | — (config only) |
 | Warehouse | `SNOWFLAKE_WAREHOUSE` | `--warehouse`   |
 | Role      | `SNOWFLAKE_ROLE`      | `--role`        |
 | Database  | `SNOWFLAKE_DATABASE`  | `--database`    |
@@ -170,10 +171,17 @@ rather than by the per-request timeout.
 background keep-alive task heartbeats idle sessions (see
 [Reliability](#reliability)).
 
-The pool size, the timeouts, and the heartbeat interval are operational
-(config-only) settings read from the **daemon's** environment once at startup —
-restart the daemon (`omni-dev daemon restart`) to change them. They are not
-affected by the client's `--profile`.
+`SNOWFLAKE_HOST`, when set, is used **verbatim** as the API host instead of
+deriving `<account>.snowflakecomputing.com` from the account identifier. Set it
+to reach an AWS/Azure **PrivateLink** endpoint
+(`<account>.privatelink.snowflakecomputing.com`) or a gov/custom host that the
+default derivation can't produce. It applies to every session this daemon
+creates; leave it unset for the standard public host.
+
+The host override, the pool size, the timeouts, and the heartbeat interval are
+operational (config-only) settings read from the **daemon's** environment once
+at startup — restart the daemon (`omni-dev daemon restart`) to change them. They
+are not affected by the client's `--profile`.
 
 `settings.json` fallback example:
 
