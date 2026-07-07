@@ -28,6 +28,11 @@ use crate::daemon::server::{self, DaemonOptions};
 use crate::daemon::service::{MenuItem as ServiceMenuItem, MenuSnapshot};
 use crate::daemon::{build_default_registry, DaemonRunConfig};
 
+/// How often the tray re-polls each service's `menu()` and rebuilds/refreshes
+/// the tray. Bounds the per-service `menu()` work to ~1 Hz regardless of how
+/// often the OS invokes the event-loop callback (which can be many times a
+/// second) — otherwise those `menu()` calls churn a core.
+const MENU_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Menu id of the daemon-level Quit item.
 const QUIT_ID: &str = "omni-dev:quit";
 /// Separator between a service name and its action id inside a tray menu id.
@@ -238,28 +243,39 @@ fn event_loop(
 
     let menu_rx = MenuEvent::receiver();
     let mut clipboard: Option<Clipboard> = None;
+    // The initial menu was just built, so the first re-poll is one interval away.
+    let mut last_poll = Instant::now();
 
     event_loop.run_return(move |_event, _target, control_flow| {
-        // Wake at least once per second to refresh the live menu state.
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(1));
+        // Wake at least once per interval to refresh the live menu state.
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + MENU_POLL_INTERVAL);
 
         // Close the tray when the daemon is stopped by a signal or `daemon stop`.
+        // This cheap check runs on every callback so shutdown is observed
+        // promptly, even though the menu re-poll below is throttled.
         if shutdown.is_cancelled() {
             *control_flow = ControlFlow::Exit;
             return;
         }
 
-        let snaps = snapshots(&registry);
-        let sig = signature(&snaps);
-        if sig != last_sig {
-            // Update item text/enabled in place so an open menu isn't closed;
-            // only a structural change (sessions added/removed) rebuilds it.
-            if !update_in_place(&handles, &snaps) {
-                let (menu, new_handles) = build_menu(&snaps);
-                tray.set_menu(Some(Box::new(menu)));
-                handles = new_handles;
+        // Re-poll each service's `menu()` at most once per interval rather than on
+        // every OS callback (which fires many times a second) — the callback is
+        // invoked far more often than the WaitUntil timer, and recomputing the
+        // snapshots every time needlessly burns CPU.
+        if last_poll.elapsed() >= MENU_POLL_INTERVAL {
+            last_poll = Instant::now();
+            let snaps = snapshots(&registry);
+            let sig = signature(&snaps);
+            if sig != last_sig {
+                // Update item text/enabled in place so an open menu isn't closed;
+                // only a structural change (sessions added/removed) rebuilds it.
+                if !update_in_place(&handles, &snaps) {
+                    let (menu, new_handles) = build_menu(&snaps);
+                    tray.set_menu(Some(Box::new(menu)));
+                    handles = new_handles;
+                }
+                last_sig = sig;
             }
-            last_sig = sig;
         }
 
         while let Ok(event) = menu_rx.try_recv() {
