@@ -112,7 +112,11 @@ pub async fn build_default_registry(
     registry.register(Arc::new(bridge));
     let snowflake = SnowflakeService::new(SnowflakeEngineConfig::from_env_and_settings()?);
     registry.register(Arc::new(snowflake));
-    registry.register(Arc::new(WorktreesService::new()));
+    // Start the off-thread menu-refresh loop so the tray serves a cached menu
+    // instead of running git enrichment on the macOS GUI thread (#1186 fix).
+    let worktrees = WorktreesService::new();
+    worktrees.start_menu_refresh();
+    registry.register(Arc::new(worktrees));
     Ok(registry)
 }
 

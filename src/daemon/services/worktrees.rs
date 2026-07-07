@@ -11,20 +11,25 @@
 //! secret persisted.
 //!
 //! The adapter also computes the **per-worktree git enrichment** (current
-//! branch, ahead/behind counts) on read via `git2` (#1186), keeping the
-//! companion a thin reporter of raw folder paths (ADR-0040). The engine stores
-//! only what the companion sends; disk I/O for the enrichment lives here,
-//! alongside the launcher, never under the registry lock.
+//! branch, ahead/behind counts, and the parent repository a linked worktree
+//! belongs to) on read via `git2` (#1186), keeping the companion a thin reporter
+//! of raw folder paths (ADR-0040). The engine stores only what the companion
+//! sends; disk I/O for the enrichment lives here, alongside the launcher, never
+//! under the registry lock.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use git2::Repository;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
 use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
@@ -32,23 +37,94 @@ use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
 /// The worktrees service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "worktrees";
 
+/// The tray submenu title.
+const SUBMENU_TITLE: &str = "Worktrees";
+
 /// Environment override for the VS Code launcher used by the "focus" tray
 /// action, for when the daemon runs under launchd with a minimal `PATH`.
 const VSCODE_BIN_ENV: &str = "OMNI_DEV_VSCODE_BIN";
 
+/// How often the background task recomputes the tray menu snapshot off the main
+/// thread. The macOS tray polls `menu()` ~1 Hz; caching a couple of seconds keeps
+/// the displayed branch/sync state fresh without ever doing git I/O on the GUI
+/// thread (which would peg a core and stall shutdown — the #1186 regression).
+const MENU_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A running background menu-refresh task and the token that stops it.
+struct RefreshTask {
+    /// Cancelled by `shutdown` to end the refresh loop.
+    token: CancellationToken,
+    /// The spawned loop, awaited on shutdown so it fully unwinds.
+    handle: JoinHandle<()>,
+}
+
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
 pub struct WorktreesService {
-    /// The cross-window registry this adapter routes ops to.
-    registry: WorktreesRegistry,
+    /// The cross-window registry this adapter routes ops to. Behind an `Arc` so
+    /// the background menu-refresh task can read it off the main thread.
+    registry: Arc<WorktreesRegistry>,
+    /// The most recent tray menu snapshot, recomputed off the main thread by
+    /// [`start_menu_refresh`](Self::start_menu_refresh). `menu()` serves a clone
+    /// of this so it never blocks on git enrichment. `None` until the first
+    /// refresh lands — or when no runtime started a task (e.g. unit tests) — in
+    /// which case `menu()` falls back to a one-off inline compute.
+    menu_cache: Arc<Mutex<Option<Vec<MenuItem>>>>,
+    /// The background refresh task, once started (`None` in tests / no runtime).
+    refresh: Mutex<Option<RefreshTask>>,
 }
 
 impl WorktreesService {
-    /// Creates the service with an empty registry. Cheap — no I/O.
+    /// Creates the service with an empty registry. Cheap — no I/O and no task;
+    /// the daemon calls [`start_menu_refresh`](Self::start_menu_refresh) to begin
+    /// off-thread menu caching, while tests use the bare service (menu computed
+    /// inline on demand).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            registry: WorktreesRegistry::new(),
+            registry: Arc::new(WorktreesRegistry::new()),
+            menu_cache: Arc::new(Mutex::new(None)),
+            refresh: Mutex::new(None),
         }
+    }
+
+    /// Starts the background task that recomputes the tray menu snapshot every
+    /// [`MENU_REFRESH_INTERVAL`] **off the main thread** — git enrichment is
+    /// blocking disk I/O — and stores it in [`menu_cache`](Self::menu_cache), so
+    /// the macOS tray's `menu()` serves a cache instead of running git on the GUI
+    /// event loop. Idempotent, and a no-op outside a tokio runtime (mirroring the
+    /// Snowflake keep-alive heartbeat), so unit tests that build a bare service
+    /// keep computing the menu inline.
+    pub fn start_menu_refresh(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; worktrees menu refresh not started");
+            return;
+        }
+        let mut guard = self.refresh.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let registry = self.registry.clone();
+        let cache = self.menu_cache.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                // Snapshot the registry (a cheap lock), then build the menu —
+                // which opens repos and parses git config — on a blocking thread,
+                // never on this async worker or the tray's main thread.
+                let entries = registry.list();
+                if let Ok(items) =
+                    tokio::task::spawn_blocking(move || menu_items_for(&entries)).await
+                {
+                    *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(items);
+                }
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(MENU_REFRESH_INTERVAL) => {}
+                }
+            }
+        });
+        *guard = Some(RefreshTask { token, handle });
     }
 }
 
@@ -89,14 +165,18 @@ impl DaemonService for WorktreesService {
     }
 
     fn menu(&self) -> MenuSnapshot {
-        let entries = self.registry.list();
-        let items = if entries.is_empty() {
-            vec![MenuItem::Label("No open windows".to_string())]
-        } else {
-            window_menu_items(&entries)
-        };
+        // Serve the snapshot the background task maintains off the main thread;
+        // fall back to a one-off inline compute only before the first refresh
+        // lands (or with no runtime — the unit tests). Never blocks on git here
+        // in the daemon, honouring the trait's "cheap, must not block" contract.
+        let cached = self
+            .menu_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let items = cached.unwrap_or_else(|| menu_items_for(&self.registry.list()));
         MenuSnapshot {
-            title: "Worktrees".to_string(),
+            title: SUBMENU_TITLE.to_string(),
             items,
         }
     }
@@ -129,7 +209,18 @@ impl DaemonService for WorktreesService {
     }
 
     async fn shutdown(&self) {
-        // In-memory only; nothing to drain or persist.
+        // Stop the background menu-refresh task; the registry itself is in-memory
+        // with nothing to drain or persist. Take the task out from under the lock
+        // first so the `std::Mutex` is never held across the `.await`.
+        let task = self
+            .refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.token.cancel();
+            let _ = task.handle.await;
+        }
     }
 }
 
@@ -163,6 +254,24 @@ struct GitStatus {
     /// Commits the branch is behind its upstream (`None` without an upstream).
     #[serde(skip_serializing_if = "Option::is_none")]
     behind: Option<usize>,
+    /// The main repository's directory name — the parent repo for a linked
+    /// worktree, the checkout's own directory otherwise. Derived from git's
+    /// common dir so a worktree names the repo it belongs to rather than its
+    /// worktree-folder basename. `None` when not in a repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_repo: Option<String>,
+    /// Whether the enriched folder is a **linked** git worktree rather than the
+    /// repository's main working tree. Omitted (false) for a normal checkout.
+    #[serde(skip_serializing_if = "is_false")]
+    is_worktree: bool,
+}
+
+/// `skip_serializing_if` predicate for a `bool` defaulting to `false`, so the
+/// field is dropped on the wire unless set — keeping older clients byte-identical
+/// (the protocol's forward-compatibility convention).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Computes the [`GitStatus`] of `folder` by discovering the repository that
@@ -173,9 +282,16 @@ fn git_status(folder: &Path) -> GitStatus {
     let Ok(repo) = Repository::discover(folder) else {
         return GitStatus::default();
     };
+    // Repo identity applies even when HEAD is unborn or detached, so a worktree
+    // still names its parent repo (and is flagged as a worktree) in those states.
+    let base = GitStatus {
+        main_repo: main_repo_name(repo.commondir()),
+        is_worktree: repo.is_worktree(),
+        ..GitStatus::default()
+    };
     let Ok(head) = repo.head() else {
         // An unborn branch (fresh repo, no commits) or an unreadable HEAD.
-        return GitStatus::default();
+        return base;
     };
     // A branch HEAD has a UTF-8 shorthand; anything else — a detached HEAD
     // (mid-rebase or a checked-out tag/commit), or the rare non-UTF-8 branch
@@ -186,7 +302,7 @@ fn git_status(folder: &Path) -> GitStatus {
         .filter(|_| head.is_branch())
         .map(str::to_string)
     else {
-        return GitStatus::default();
+        return base;
     };
     let branch = git2::Branch::wrap(head);
     let (ahead, behind) = match upstream_ahead_behind(&repo, &branch) {
@@ -197,6 +313,31 @@ fn git_status(folder: &Path) -> GitStatus {
         branch: Some(name),
         ahead,
         behind,
+        ..base
+    }
+}
+
+/// The main repository's directory name from git's common dir. For the usual
+/// `<repo>/.git` layout — shared by a checkout and all its linked worktrees —
+/// that is the working-tree directory's name; for a bare repo (`<name>.git`) it
+/// is that directory with a trailing `.git` stripped. Best-effort: `None` when
+/// no name can be derived.
+fn main_repo_name(commondir: &Path) -> Option<String> {
+    let file_name = commondir.file_name()?.to_string_lossy().into_owned();
+    if file_name == ".git" {
+        // Normal layout: the repo is the directory that contains `.git`.
+        commondir
+            .parent()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+    } else {
+        // A bare repo: use its own directory name, without any `.git` suffix.
+        Some(
+            file_name
+                .strip_suffix(".git")
+                .unwrap_or(&file_name)
+                .to_string(),
+        )
     }
 }
 
@@ -259,48 +400,79 @@ fn display_name(entry: &WindowEntry) -> String {
     "(no folder)".to_string()
 }
 
-/// Builds the tray items for a non-empty window list: a label per window, a
-/// separator, then a "Focus" action per window that has a folder to open. The
-/// labels carry live git state, so this reads each worktree from disk — cheap
-/// for a realistic window count and consistent with reap-on-read.
-fn window_menu_items(entries: &[WindowEntry]) -> Vec<MenuItem> {
-    let mut items = Vec::new();
-    for entry in entries {
-        items.push(MenuItem::Label(window_label(entry)));
+/// Separator between the repo name and branch for a normal working tree.
+const REPO_SEP: char = '·';
+/// Separator marking a **linked worktree** (a git "fork" glyph), so a worktree
+/// line is distinguishable at a glance from its parent repo's main checkout.
+const WORKTREE_SEP: char = '⑂';
+
+/// The full tray item list for a window set: the "No open windows" placeholder
+/// when empty, else one line per window via [`window_menu_items`]. Does the git
+/// enrichment (blocking disk I/O), so it runs on a blocking thread from the
+/// background refresh task — and inline only as a cold-start fallback in `menu`.
+fn menu_items_for(entries: &[WindowEntry]) -> Vec<MenuItem> {
+    if entries.is_empty() {
+        vec![MenuItem::Label("No open windows".to_string())]
+    } else {
+        window_menu_items(entries)
     }
-    items.push(MenuItem::Separator);
-    for entry in entries {
-        // No folder means nothing for `code` to open, so omit the action.
-        if !entry.folders.is_empty() {
-            items.push(MenuItem::Action(MenuAction {
-                id: format!("focus:{}", entry.key),
-                label: format!("Focus {}", display_name(entry)),
-                enabled: true,
-            }));
-        }
-    }
-    items
 }
 
-/// The tray label for one window: its display name, then live branch state
-/// (`repo · branch (+2 -1)`) when the primary folder is a git worktree,
-/// otherwise the reported title if it adds anything the name does not.
+/// Builds the tray items for a non-empty window list: **one clickable line per
+/// window** whose label carries the live git state and whose click focuses that
+/// window. A window with no workspace folder has nothing for `code` to open, so
+/// it stays a non-clickable status line. The labels read each worktree from disk
+/// (via [`window_label`]) — cheap for a realistic window count and consistent
+/// with reap-on-read.
+fn window_menu_items(entries: &[WindowEntry]) -> Vec<MenuItem> {
+    entries
+        .iter()
+        .map(|entry| {
+            let label = window_label(entry);
+            if entry.folders.is_empty() {
+                MenuItem::Label(label)
+            } else {
+                MenuItem::Action(MenuAction {
+                    id: format!("focus:{}", entry.key),
+                    label,
+                    enabled: true,
+                })
+            }
+        })
+        .collect()
+}
+
+/// The tray label for one window: the **main repository** name, then live branch
+/// state (`omni-dev · branch (+2 -1)`) when the primary folder is a git repo. A
+/// linked worktree is set off with the [`WORKTREE_SEP`] fork glyph
+/// (`omni-dev ⑂ branch`) so it reads distinctly from the main checkout; a folder
+/// that is not a repo falls back to its reported title.
 fn window_label(entry: &WindowEntry) -> String {
-    let name = display_name(entry);
     let status = entry
         .folders
         .first()
         .map(|folder| git_status(folder))
         .unwrap_or_default();
+    // Prefer the git-derived main repo so a linked worktree names its parent
+    // repository rather than its worktree-folder basename.
+    let name = status
+        .main_repo
+        .clone()
+        .unwrap_or_else(|| display_name(entry));
     if let Some(branch) = &status.branch {
+        let sep = if status.is_worktree {
+            WORKTREE_SEP
+        } else {
+            REPO_SEP
+        };
         return match sync_indicator(status.ahead, status.behind) {
-            Some(sync) => format!("{name} · {branch} {sync}"),
-            None => format!("{name} · {branch}"),
+            Some(sync) => format!("{name} {sep} {branch} {sync}"),
+            None => format!("{name} {sep} {branch}"),
         };
     }
     // No git branch (not a repo / detached): fall back to the reported title.
     match &entry.title {
-        Some(title) if title != &name => format!("{name} · {title}"),
+        Some(title) if title != &name => format!("{name} {REPO_SEP} {title}"),
         _ => name,
     }
 }
@@ -520,20 +692,13 @@ mod tests {
     }
 
     #[test]
-    fn window_menu_items_label_omits_redundant_title_and_skips_folderless_actions() {
+    fn window_menu_items_merge_stats_and_focus_into_one_clickable_line() {
         let now = Utc::now();
         let entries = vec![
-            // Title differs from the repo name → "name · title".
-            WindowEntry {
-                key: "k1".to_string(),
-                folders: vec![PathBuf::from("/tmp/a")],
-                repo: Some("repo".to_string()),
-                title: Some("a branch".to_string()),
-                pid: None,
-                last_seen: now,
-            },
-            // Title equals the display name → label is just the name (the
-            // `_ => name` arm), and no folder means no Focus action.
+            // A folderless window has nothing to focus, so it stays a plain
+            // Label; a title equal to the name collapses to just the name. It
+            // leads the list so the focus-action lookup below is exercised
+            // against a leading non-Action item it has to skip.
             WindowEntry {
                 key: "k2".to_string(),
                 folders: vec![],
@@ -542,8 +707,35 @@ mod tests {
                 pid: None,
                 last_seen: now,
             },
+            // A folder-bearing, non-repo window: one clickable Action whose label
+            // is the stats line ("name · title", since /tmp is not a git repo).
+            WindowEntry {
+                key: "k1".to_string(),
+                folders: vec![PathBuf::from("/tmp/a")],
+                repo: Some("repo".to_string()),
+                title: Some("a branch".to_string()),
+                pid: None,
+                last_seen: now,
+            },
         ];
         let items = window_menu_items(&entries);
+        // Exactly one item per window — no duplicate label, no separator.
+        assert_eq!(items.len(), 2);
+        assert!(!items.iter().any(|i| matches!(i, MenuItem::Separator)));
+
+        // The folder-bearing window is a single clickable action carrying the
+        // stats label (the old label + Focus action, merged).
+        let action = items
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::Action(a) => Some(a),
+                _ => None,
+            })
+            .expect("a focus action");
+        assert_eq!(action.id, "focus:k1");
+        assert_eq!(action.label, "repo · a branch");
+
+        // The folderless window is a non-clickable label (not "solo · solo").
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|i| match i {
@@ -551,18 +743,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(labels.contains(&"repo · a branch"));
-        assert!(labels.contains(&"solo")); // not "solo · solo"
-
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|i| match i {
-                MenuItem::Action(a) => Some(a.id.as_str()),
-                _ => None,
-            })
-            .collect();
-        // Only the folder-bearing window gets a Focus action.
-        assert_eq!(action_ids, vec!["focus:k1"]);
+        assert_eq!(labels, vec!["solo"]);
     }
 
     #[tokio::test]
@@ -580,19 +761,27 @@ mod tests {
         assert!(status.healthy);
         assert_eq!(status.summary, "0 window(s) across 0 repo(s)");
 
-        // With two windows in the same repo.
+        // Two folder-bearing windows in the same repo, plus one folderless
+        // window that shares the repo but has nothing for `code` to open.
         svc.handle("register", register_payload("w1", Some("repo-a"), "/tmp/a"))
             .await
             .unwrap();
         svc.handle("register", register_payload("w2", Some("repo-a"), "/tmp/b"))
             .await
             .unwrap();
+        svc.handle(
+            "register",
+            json!({ "key": "w3", "repo": "repo-a", "folders": [] }),
+        )
+        .await
+        .unwrap();
         let status = svc.status().await;
-        assert_eq!(status.summary, "2 window(s) across 1 repo(s)");
+        assert_eq!(status.summary, "3 window(s) across 1 repo(s)");
 
         let menu = svc.menu();
-        // Two labels + a separator + two focus actions.
-        assert!(menu.items.iter().any(|i| matches!(i, MenuItem::Separator)));
+        // One line per window — no separator, no duplicate label.
+        assert_eq!(menu.items.len(), 3);
+        assert!(!menu.items.iter().any(|i| matches!(i, MenuItem::Separator)));
         let action_ids: Vec<&str> = menu
             .items
             .iter()
@@ -601,8 +790,57 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // The two folder-bearing windows are clickable; the folderless one is a
+        // plain Label, so it never yields a focus action.
         assert!(action_ids.contains(&"focus:w1"));
         assert!(action_ids.contains(&"focus:w2"));
+        assert!(!action_ids.contains(&"focus:w3"));
+    }
+
+    #[test]
+    fn start_menu_refresh_is_a_noop_outside_a_runtime() {
+        // With no tokio runtime, the background task is never spawned, so the
+        // bare service keeps computing `menu()` inline (what the tests rely on).
+        let svc = WorktreesService::new();
+        svc.start_menu_refresh();
+        assert!(svc.refresh.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_menu_refresh_populates_cache_and_shutdown_stops_it() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("repo-a"), "/tmp/a"))
+            .await
+            .unwrap();
+        // Before the task runs, `menu()` computes inline from an empty cache.
+        assert!(svc.menu_cache.lock().unwrap().is_none());
+
+        svc.start_menu_refresh();
+        // Idempotent: a second call does not start a second task.
+        svc.start_menu_refresh();
+
+        // The task fills the cache off the main thread; poll briefly for it.
+        let mut filled = false;
+        for _ in 0..100 {
+            if svc.menu_cache.lock().unwrap().is_some() {
+                filled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(filled, "background refresh should populate the menu cache");
+
+        // `menu()` now serves the cache: one clickable line for the window.
+        let menu = svc.menu();
+        assert_eq!(menu.title, "Worktrees");
+        assert!(menu
+            .items
+            .iter()
+            .any(|i| matches!(i, MenuItem::Action(a) if a.id == "focus:w1")));
+
+        // Shutdown cancels and joins the task, clearing the handle.
+        svc.shutdown().await;
+        assert!(svc.refresh.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -752,15 +990,30 @@ mod tests {
         assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(status.ahead, Some(1));
         assert_eq!(status.behind, Some(1));
+        // A normal checkout names itself and is not flagged a worktree.
+        assert_eq!(
+            status.main_repo.as_deref(),
+            dir.path().file_name().and_then(|n| n.to_str())
+        );
+        assert!(!status.is_worktree);
     }
 
     #[test]
     fn git_status_empty_repo_is_unborn() {
         // A repo with no commits has an unborn HEAD, so `head()` errors and the
-        // status degrades to empty rather than panicking.
+        // branch/sync fields stay empty rather than panicking — but the repo
+        // identity is still resolved from the common dir.
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
-        assert_eq!(git_status(dir.path()), GitStatus::default());
+        let status = git_status(dir.path());
+        assert_eq!(status.branch, None);
+        assert_eq!(status.ahead, None);
+        assert_eq!(status.behind, None);
+        assert_eq!(
+            status.main_repo.as_deref(),
+            dir.path().file_name().and_then(|n| n.to_str())
+        );
+        assert!(!status.is_worktree);
     }
 
     #[test]
@@ -777,17 +1030,26 @@ mod tests {
     }
 
     #[test]
-    fn git_status_non_repo_and_detached_are_empty() {
-        // A plain directory that is not a git repo.
+    fn git_status_non_repo_is_empty_detached_reports_repo_without_branch() {
+        // A plain directory that is not a git repo yields nothing at all.
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(git_status(plain.path()), GitStatus::default());
 
-        // A detached HEAD reports no branch (and thus no sync).
+        // A detached HEAD reports no branch (and thus no sync), but the repo
+        // identity is still resolved from the common dir.
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo(dir.path());
         let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
         repo.set_head_detached(a).unwrap();
-        assert_eq!(git_status(dir.path()), GitStatus::default());
+        let status = git_status(dir.path());
+        assert_eq!(status.branch, None);
+        assert_eq!(status.ahead, None);
+        assert_eq!(status.behind, None);
+        assert_eq!(
+            status.main_repo.as_deref(),
+            dir.path().file_name().and_then(|n| n.to_str())
+        );
+        assert!(!status.is_worktree);
     }
 
     #[test]
@@ -823,8 +1085,13 @@ mod tests {
         // No upstream configured → the ahead/behind keys are absent, not zero.
         assert!(windows[0].get("ahead").is_none());
         assert!(windows[0].get("behind").is_none());
+        // The main repo name is enriched onto the entry.
+        assert_eq!(
+            windows[0].get("main_repo").and_then(Value::as_str),
+            dir.path().file_name().and_then(|n| n.to_str())
+        );
 
-        // A non-repo folder is still listed, just without a branch.
+        // A non-repo folder is still listed, just without a branch or main repo.
         let plain = tempfile::tempdir().unwrap();
         svc.handle(
             "register",
@@ -838,6 +1105,7 @@ mod tests {
             .find(|w| w.get("key").and_then(Value::as_str) == Some("w2"))
             .unwrap();
         assert!(w2.get("branch").is_none());
+        assert!(w2.get("main_repo").is_none());
     }
 
     #[test]
@@ -846,17 +1114,19 @@ mod tests {
         let repo = init_repo(dir.path());
         empty_commit(&repo, Some("refs/heads/main"), &[], "A");
         repo.set_head("refs/heads/main").unwrap();
+        let repo_name = dir.path().file_name().unwrap().to_str().unwrap();
         let entry = WindowEntry {
             key: "k".to_string(),
             folders: vec![dir.path().to_path_buf()],
-            repo: Some("my-repo".to_string()),
+            // Both the companion `repo` and `title` are overridden by the
+            // git-derived main repo name and computed branch.
+            repo: Some("companion-repo".to_string()),
             title: Some("ignored title".to_string()),
             pid: None,
             last_seen: Utc::now(),
         };
-        // The computed branch wins over the reported title; with no upstream
-        // there is no sync suffix.
-        assert_eq!(window_label(&entry), "my-repo · main");
+        // Main checkout: `repo · branch`, and with no upstream there is no sync.
+        assert_eq!(window_label(&entry), format!("{repo_name} · main"));
     }
 
     #[tokio::test]
@@ -886,15 +1156,103 @@ mod tests {
     fn window_label_includes_sync_for_tracking_branch() {
         let dir = tempfile::tempdir().unwrap();
         let _repo = diverging_repo(dir.path());
+        let repo_name = dir.path().file_name().unwrap().to_str().unwrap();
         let entry = WindowEntry {
             key: "k".to_string(),
             folders: vec![dir.path().to_path_buf()],
-            repo: Some("my-repo".to_string()),
+            repo: Some("companion-repo".to_string()),
             title: None,
             pid: None,
             last_seen: Utc::now(),
         };
         // A tracking branch appends the `(+ahead -behind)` sync indicator.
-        assert_eq!(window_label(&entry), "my-repo · main (+1 -1)");
+        assert_eq!(window_label(&entry), format!("{repo_name} · main (+1 -1)"));
+    }
+
+    /// Adds a linked worktree of `repo` at `wt_path` checked out on a new
+    /// `branch` pointed at `base`, mirroring `git worktree add -b <branch>
+    /// <wt_path>`.
+    fn add_worktree(repo: &Repository, base: git2::Oid, wt_path: &Path, branch: &str) {
+        let commit = repo.find_commit(base).unwrap();
+        repo.branch(branch, &commit, false).unwrap();
+        let reference = repo
+            .find_reference(&format!("refs/heads/{branch}"))
+            .unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(branch, wt_path, Some(&opts)).unwrap();
+    }
+
+    #[test]
+    fn git_status_marks_linked_worktree_and_names_parent_repo() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        // A linked worktree checked out on a new `feature` branch, in a
+        // directory whose basename is deliberately *not* the repo name.
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+
+        let status = git_status(&wt_path);
+        assert!(status.is_worktree);
+        assert_eq!(status.branch.as_deref(), Some("feature"));
+        // The worktree names its *parent* repo, not its worktree-folder basename.
+        assert_eq!(
+            status.main_repo.as_deref(),
+            main_dir.path().file_name().and_then(|n| n.to_str())
+        );
+
+        // The main checkout resolves the same repo name and is not a worktree.
+        let main_status = git_status(main_dir.path());
+        assert!(!main_status.is_worktree);
+        assert_eq!(main_status.main_repo, status.main_repo);
+    }
+
+    #[test]
+    fn window_label_marks_worktree_with_fork_glyph() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+
+        let repo_name = main_dir.path().file_name().unwrap().to_str().unwrap();
+        let entry = WindowEntry {
+            key: "k".to_string(),
+            folders: vec![wt_path],
+            repo: Some("feature-wt".to_string()),
+            title: None,
+            pid: None,
+            last_seen: Utc::now(),
+        };
+        // A worktree line: parent repo, the fork glyph, then the branch (no
+        // upstream here, so no sync suffix).
+        assert_eq!(window_label(&entry), format!("{repo_name} ⑂ feature"));
+    }
+
+    #[test]
+    fn main_repo_name_derives_from_common_dir() {
+        // Normal layout: the repo is the directory that contains `.git`.
+        assert_eq!(
+            main_repo_name(Path::new("/home/me/omni-dev/.git")).as_deref(),
+            Some("omni-dev")
+        );
+        // A trailing slash on the common dir does not change the answer.
+        assert_eq!(
+            main_repo_name(Path::new("/home/me/omni-dev/.git/")).as_deref(),
+            Some("omni-dev")
+        );
+        // A bare repo: its own directory name, without the `.git` suffix.
+        assert_eq!(
+            main_repo_name(Path::new("/srv/git/omni-dev.git")).as_deref(),
+            Some("omni-dev")
+        );
+        // A `.git` at the filesystem root has no parent name to use.
+        assert_eq!(main_repo_name(Path::new("/.git")), None);
     }
 }
