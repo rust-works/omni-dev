@@ -5,6 +5,7 @@
 //! these subcommands only send `query`/`sessions`/`disconnect` ops to the
 //! `snowflake` service over the daemon's Unix control socket.
 
+use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,11 @@ pub enum OutputFormat {
     Json,
     /// YAML.
     Yaml,
+    /// Comma-separated values (RFC 4180 quoting), one header row plus one row
+    /// per result row.
+    Csv,
+    /// Tab-separated values (same quoting as CSV, tab delimiter).
+    Tsv,
 }
 
 /// Runs arbitrary SQL through the `(account, user)` session, authenticating it
@@ -97,6 +103,9 @@ pub struct QueryCommand {
     /// Deprecated: use `-o`/`--output` instead.
     #[arg(long = "format", hide = true)]
     pub format: Option<OutputFormat>,
+    /// Output file (writes to stdout if omitted).
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<String>,
     /// SQL to run. Read from stdin when omitted.
     pub sql: Option<String>,
 }
@@ -124,7 +133,8 @@ impl QueryCommand {
 
         let socket = server::resolve_socket(self.socket)?;
         let result = call(&socket, "query", payload).await?;
-        print_value(&result, self.output)
+        let text = format_output(&result, self.output)?;
+        write_output(&text, self.out_file.as_deref())
     }
 
     /// Builds the query request, filling each unset identity/context field from
@@ -339,23 +349,134 @@ fn read_stdin() -> Result<String> {
     Ok(buf)
 }
 
-/// Formats a JSON value in the requested output format.
-fn format_value(value: &Value, format: OutputFormat) -> Result<String> {
+/// Renders a query result in the requested output format, returning the complete
+/// text including its trailing newline so file and stdout writes are identical.
+///
+/// JSON/YAML serialize the whole `{columns, rows}` value; CSV/TSV instead consume
+/// that shape directly so column order comes from `columns` (see
+/// [`render_delimited`]).
+fn format_output(value: &Value, format: OutputFormat) -> Result<String> {
     Ok(match format {
-        OutputFormat::Json => serde_json::to_string_pretty(value)?,
+        // `to_string_pretty` has no trailing newline; add one for parity.
+        OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(value)?),
+        // `serde_yaml` already emits a trailing newline.
         OutputFormat::Yaml => serde_yaml::to_string(value)?,
+        OutputFormat::Csv => render_delimited(value, ','),
+        OutputFormat::Tsv => render_delimited(value, '\t'),
     })
 }
 
-/// Prints a JSON value in the requested format (JSON gets a trailing newline;
-/// `serde_yaml` already emits one).
-fn print_value(value: &Value, format: OutputFormat) -> Result<()> {
-    let text = format_value(value, format)?;
-    match format {
-        OutputFormat::Json => println!("{text}"),
-        OutputFormat::Yaml => print!("{text}"),
+/// Writes rendered output to `out_file`, or to stdout when it is `None`.
+fn write_output(text: &str, out_file: Option<&str>) -> Result<()> {
+    if let Some(path) = out_file {
+        fs::write(path, text).with_context(|| format!("failed to write to {path}"))
+    } else {
+        print!("{text}");
+        Ok(())
     }
-    Ok(())
+}
+
+/// Renders a `{columns, rows}` query payload as delimited text (`delim` is `,`
+/// for CSV, `\t` for TSV): a header row of column names followed by one row per
+/// result row, with RFC 4180 quoting and `\n` line terminators.
+///
+/// Column order and the header come from `columns[]`; each row's cells are fetched
+/// by the same `_<n>`-disambiguated keys `Row::to_json_object` produces, so
+/// repeated column names (e.g. `SELECT 1, 1`) are not collapsed. An empty result
+/// (`columns: []`, which is all Snowflake reports for a zero-row query) renders as
+/// an empty string.
+fn render_delimited(value: &Value, delim: char) -> String {
+    let names: Vec<&str> = value
+        .get("columns")
+        .and_then(Value::as_array)
+        .map(|cols| {
+            cols.iter()
+                .filter_map(|c| c.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return String::new();
+    }
+
+    // The lookup keys `to_json_object` used: the first occurrence of a name maps
+    // to the bare name, later occurrences to `<name>_<n>`.
+    let keys = disambiguated_keys(&names);
+
+    let mut out = String::new();
+    push_record(&mut out, names.iter().copied(), delim);
+
+    let empty = Vec::new();
+    let rows = value
+        .get("rows")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    for row in rows {
+        let fields = keys.iter().map(|key| {
+            row.get(key).map_or_else(String::new, |cell| {
+                escape_field(&json_to_field(cell), delim)
+            })
+        });
+        push_record(&mut out, fields, delim);
+    }
+    out
+}
+
+/// Reproduces `Row::to_json_object`'s duplicate-name disambiguation: the first
+/// occurrence of a name stays bare, the `n`-th (n ≥ 2) becomes `<name>_<n>`.
+fn disambiguated_keys(names: &[&str]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    names
+        .iter()
+        .map(|&name| {
+            let count = seen.entry(name).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                name.to_string()
+            } else {
+                format!("{name}_{count}")
+            }
+        })
+        .collect()
+}
+
+/// Pushes one already-escaped record (delimiter-joined) plus a `\n` terminator.
+/// Generic over `&str`/`String` fields so both the header and data rows share it.
+fn push_record(out: &mut String, fields: impl Iterator<Item = impl AsRef<str>>, delim: char) {
+    let mut first = true;
+    for field in fields {
+        if !first {
+            out.push(delim);
+        }
+        out.push_str(field.as_ref());
+        first = false;
+    }
+    out.push('\n');
+}
+
+/// Stringifies a JSON cell for a delimited field (before escaping): `null` → empty
+/// string, strings verbatim, scalars via their JSON text, and `variant`/`object`/
+/// `array` cells as compact JSON.
+fn json_to_field(cell: &Value) -> String {
+    match cell {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(_) | Value::Number(_) => cell.to_string(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string(cell).unwrap_or_else(|_| cell.to_string())
+        }
+    }
+}
+
+/// RFC 4180 field quoting: wrap in double quotes and double any embedded quotes
+/// when the field contains the delimiter, a quote, or a newline/carriage return;
+/// otherwise return it unchanged.
+fn escape_field(field: &str, delim: char) -> String {
+    if field.contains(delim) || field.contains(['"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +624,7 @@ mod tests {
             socket: Some(dir.path().join("absent.sock")),
             output: OutputFormat::Json,
             format: Some(OutputFormat::Yaml),
+            out_file: None,
             sql: Some("SELECT 1".to_string()),
         };
         assert!(cmd.execute().await.is_err());
@@ -592,14 +714,17 @@ mod tests {
     }
 
     #[test]
-    fn format_value_renders_json_and_yaml() {
+    fn format_output_renders_json_and_yaml() {
         let value = json!({ "a": 1 });
-        assert!(format_value(&value, OutputFormat::Json)
-            .unwrap()
-            .contains("\"a\": 1"));
-        assert!(format_value(&value, OutputFormat::Yaml)
-            .unwrap()
-            .contains("a: 1"));
+        let json = format_output(&value, OutputFormat::Json).unwrap();
+        assert!(json.contains("\"a\": 1"));
+        assert!(
+            json.ends_with("}\n"),
+            "JSON gets a trailing newline: {json:?}"
+        );
+        let yaml = format_output(&value, OutputFormat::Yaml).unwrap();
+        assert!(yaml.contains("a: 1"));
+        assert!(yaml.ends_with('\n'), "YAML ends in a newline: {yaml:?}");
     }
 
     #[test]
@@ -615,9 +740,141 @@ mod tests {
     }
 
     #[test]
-    fn print_value_emits_both_formats() {
-        // Exercises both arms; output goes to the test harness's captured stdout.
-        print_value(&json!({ "a": 1 }), OutputFormat::Json).unwrap();
-        print_value(&json!({ "a": 1 }), OutputFormat::Yaml).unwrap();
+    fn query_parses_csv_tsv_and_out_file() {
+        let SnowflakeSubcommands::Query(cmd) =
+            parse(&["query", "-o", "csv", "--out-file", "rows.csv", "SELECT 1"])
+        else {
+            panic!("expected query");
+        };
+        assert_eq!(cmd.output, OutputFormat::Csv);
+        assert_eq!(cmd.out_file.as_deref(), Some("rows.csv"));
+
+        let SnowflakeSubcommands::Query(cmd) = parse(&["query", "-o", "tsv", "SELECT 1"]) else {
+            panic!("expected query");
+        };
+        assert_eq!(cmd.output, OutputFormat::Tsv);
+        assert!(cmd.out_file.is_none());
+    }
+
+    /// A two-column, one-row payload in the daemon's self-describing shape.
+    fn sample_payload() -> Value {
+        json!({
+            "columns": [{ "name": "ID", "type": "fixed(38,0)" },
+                        { "name": "NAME", "type": "text(16777216)" }],
+            "rows": [{ "ID": 1, "NAME": "hello" }],
+        })
+    }
+
+    #[test]
+    fn render_delimited_writes_header_then_rows() {
+        assert_eq!(
+            render_delimited(&sample_payload(), ','),
+            "ID,NAME\n1,hello\n"
+        );
+        assert_eq!(
+            render_delimited(&sample_payload(), '\t'),
+            "ID\tNAME\n1\thello\n"
+        );
+    }
+
+    #[test]
+    fn render_delimited_orders_columns_from_columns_array() {
+        // Row object key order must not matter: `columns[]` drives order.
+        let payload = json!({
+            "columns": [{ "name": "B" }, { "name": "A" }],
+            "rows": [{ "A": 1, "B": 2 }],
+        });
+        assert_eq!(render_delimited(&payload, ','), "B,A\n2,1\n");
+    }
+
+    #[test]
+    fn render_delimited_quotes_per_rfc4180() {
+        let payload = json!({
+            "columns": [{ "name": "C" }],
+            "rows": [
+                { "C": "a,b" },
+                { "C": "he said \"hi\"" },
+                { "C": "line1\nline2" },
+                { "C": "plain" },
+            ],
+        });
+        assert_eq!(
+            render_delimited(&payload, ','),
+            "C\n\"a,b\"\n\"he said \"\"hi\"\"\"\n\"line1\nline2\"\nplain\n"
+        );
+        // A comma is not special in TSV, so `a,b` stays unquoted there…
+        assert!(render_delimited(&payload, '\t').contains("\na,b\n"));
+    }
+
+    #[test]
+    fn render_delimited_renders_null_variant_and_scalars() {
+        let payload = json!({
+            "columns": [{ "name": "N" }, { "name": "B" }, { "name": "V" }],
+            "rows": [{ "N": null, "B": true, "V": { "a": 1 } }],
+        });
+        // null → empty field; bool → literal; object → compact JSON (quoted for
+        // its embedded comma).
+        assert_eq!(
+            render_delimited(&payload, ','),
+            "N,B,V\n,true,\"{\"\"a\"\":1}\"\n"
+        );
+    }
+
+    #[test]
+    fn render_delimited_disambiguates_duplicate_columns() {
+        // `SELECT 1, 1` → columns [N, N]; row keys are N and N_2.
+        let payload = json!({
+            "columns": [{ "name": "N" }, { "name": "N" }],
+            "rows": [{ "N": 1, "N_2": 2 }],
+        });
+        // Header keeps the original names; both cells survive.
+        assert_eq!(render_delimited(&payload, ','), "N,N\n1,2\n");
+    }
+
+    #[test]
+    fn render_delimited_empty_result_is_empty() {
+        // A zero-row query reports `columns: []`; there is nothing to render.
+        assert_eq!(
+            render_delimited(&json!({ "columns": [], "rows": [] }), ','),
+            ""
+        );
+        assert_eq!(render_delimited(&json!({}), ','), "");
+    }
+
+    #[test]
+    fn format_output_dispatches_to_delimited() {
+        assert_eq!(
+            format_output(&sample_payload(), OutputFormat::Csv).unwrap(),
+            "ID,NAME\n1,hello\n"
+        );
+        assert_eq!(
+            format_output(&sample_payload(), OutputFormat::Tsv).unwrap(),
+            "ID\tNAME\n1\thello\n"
+        );
+    }
+
+    #[test]
+    fn escape_field_quotes_only_when_needed() {
+        assert_eq!(escape_field("plain", ','), "plain");
+        assert_eq!(escape_field("a,b", ','), "\"a,b\"");
+        assert_eq!(escape_field("a,b", '\t'), "a,b");
+        assert_eq!(escape_field("a\"b", ','), "\"a\"\"b\"");
+        assert_eq!(escape_field("a\nb", '\t'), "\"a\nb\"");
+    }
+
+    #[test]
+    fn write_output_to_file_and_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.csv");
+        write_output("ID\n1\n", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ID\n1\n");
+        // The stdout branch just needs to not error.
+        write_output("noop", None).unwrap();
+    }
+
+    #[test]
+    fn write_output_invalid_path_errors() {
+        let err = write_output("x", Some("/nonexistent_dir_for_test/out.csv")).unwrap_err();
+        assert!(err.to_string().contains("failed to write"));
     }
 }
