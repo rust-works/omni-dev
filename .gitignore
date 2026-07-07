@@ -55,3 +55,9 @@ cinema/
 
 # Git worktrees
 /.work/
+
+# VS Code companion extension (editors/vscode) build artifacts
+node_modules/
+dist/
+out/
+*.vsix

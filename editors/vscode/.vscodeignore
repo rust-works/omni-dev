@@ -1,0 +1,10 @@
+# Ship only the bundled extension, manifest, README, and license.
+.gitignore
+.vscode/**
+src/**
+out/**
+node_modules/**
+esbuild.js
+tsconfig.json
+**/*.ts
+**/*.map
