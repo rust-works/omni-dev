@@ -64,3 +64,4 @@ by Michael Nygard.
 | [ADR-0038](adr-0038.md)  | ✅ Accepted                              | 2026-06-13 | Voice Functionality Extracted to the omni-voice Repository                             |
 | [ADR-0039](adr-0039.md)  | ✅ Accepted                              | 2026-06-18 | Extensible omni-dev Daemon Hosting Pluggable Services over a Unix Control Socket       |
 | [ADR-0040](adr-0040.md)  | ✅ Accepted                              | 2026-06-23 | Cross-Window Worktrees Daemon Service Fed by a Companion VS Code Extension             |
+| [ADR-0041](adr-0041.md)  | ✅ Accepted                              | 2026-07-07 | Refuse to Amend Pushed Commits; Override Denied Only to Autonomous AI Rewrites         |
