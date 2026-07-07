@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock as Content},
     schemars, tool, tool_router, ErrorData as McpError,
 };
 use serde::Deserialize;

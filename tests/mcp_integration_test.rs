@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use git2::{Repository, Signature};
 use rmcp::{
-    model::{CallToolRequestParams, RawContent, ReadResourceRequestParams, ResourceContents},
+    model::{CallToolRequestParams, ContentBlock, ReadResourceRequestParams, ResourceContents},
     service::ServiceExt,
     ClientHandler, RoleClient,
 };
@@ -463,8 +463,8 @@ async fn jira_delete_without_confirm_returns_error() -> Result<()> {
             let text: String = result
                 .content
                 .iter()
-                .filter_map(|c| match &c.raw {
-                    RawContent::Text(t) => Some(t.text.as_str()),
+                .filter_map(|c| match c {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -583,8 +583,8 @@ fn tool_call_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect()
@@ -887,8 +887,8 @@ async fn atlassian_convert_to_adf_roundtrip() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -952,8 +952,8 @@ async fn git_view_commits_returns_yaml_for_temp_repo() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1158,8 +1158,8 @@ async fn git_branch_info_returns_yaml_for_temp_repo() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1184,8 +1184,8 @@ async fn config_models_show_returns_yaml() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1293,8 +1293,8 @@ async fn atlassian_auth_status_never_leaks_secrets() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1410,8 +1410,8 @@ async fn claude_skills_status_returns_yaml_report() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1662,8 +1662,8 @@ async fn git_view_commits_default_range_is_head() -> Result<()> {
     let text: String = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect();
@@ -1752,7 +1752,7 @@ async fn read_resource_omni_dev_specs_jfm_returns_markdown() -> Result<()> {
                 "spec body missing heading"
             );
         }
-        other @ ResourceContents::BlobResourceContents { .. } => {
+        other => {
             panic!("expected text resource, got {other:?}")
         }
     }
@@ -1811,8 +1811,8 @@ fn confluence_tool_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect()
