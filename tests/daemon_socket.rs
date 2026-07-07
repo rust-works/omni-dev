@@ -44,6 +44,7 @@ use omni_dev::daemon::service::{DaemonService, MenuSnapshot, ServiceStatus};
 use omni_dev::daemon::services::echo::EchoService;
 use omni_dev::daemon::services::worktrees::WorktreesService;
 use omni_dev::daemon::single_instance::{bind_or_reclaim, bind_private};
+use omni_dev::request_log;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -662,5 +663,86 @@ async fn stray_ping_fails_fast_while_draining() {
 
     // Let the drain complete and the server task return cleanly.
     release.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+/// A service that reports the request-log `invocation_id` its handler observes.
+///
+/// `record_http_with` stamps every HTTP record with `current_context().
+/// invocation_id`, so returning that same value is a faithful stand-in for
+/// "what id would the request this handler serves be logged under" — without
+/// touching the process-global log file.
+struct ContextProbeService;
+
+#[async_trait]
+impl DaemonService for ContextProbeService {
+    fn name(&self) -> &'static str {
+        "ctx-probe"
+    }
+    async fn handle(&self, _op: &str, _payload: Value) -> Result<Value> {
+        let ctx = request_log::current_context();
+        Ok(json!({ "seen_invocation_id": ctx.invocation_id }))
+    }
+    fn menu(&self) -> MenuSnapshot {
+        MenuSnapshot::default()
+    }
+    async fn menu_action(&self, _action_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn status(&self) -> ServiceStatus {
+        ServiceStatus {
+            name: self.name().to_string(),
+            healthy: true,
+            summary: "ready".to_string(),
+            detail: Value::Null,
+        }
+    }
+    async fn shutdown(&self) {}
+}
+
+/// End-to-end proof of #1198: an envelope's `origin_invocation_id` is threaded
+/// across the real control socket and scoped around the service dispatch, so the
+/// id a daemon-side HTTP record would inherit is the *caller's*, not the
+/// daemon's. Without the field, the handler falls back to the ambient context.
+#[tokio::test]
+async fn origin_invocation_id_is_scoped_around_dispatch() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(ContextProbeService));
+    let handle = tokio::spawn(run(
+        registry,
+        DaemonOptions {
+            socket_path: socket.clone(),
+        },
+    ));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // With an origin id, the handler sees exactly that id — the correlation key
+    // an HTTP record it issued would be logged under, matching `log --id`.
+    let reply = client
+        .request(DaemonEnvelope::service("ctx-probe", "probe", Value::Null).with_origin("cli-abc"))
+        .await
+        .unwrap();
+    assert!(reply.ok, "probe failed: {:?}", reply.error);
+    assert_eq!(reply.payload["seen_invocation_id"], json!("cli-abc"));
+
+    // Without an origin (an older client), the handler falls back to the ambient
+    // context — never the caller's id, since none was sent.
+    let reply = client
+        .request(DaemonEnvelope::service("ctx-probe", "probe", Value::Null))
+        .await
+        .unwrap();
+    assert_ne!(reply.payload["seen_invocation_id"], json!("cli-abc"));
+
+    client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
