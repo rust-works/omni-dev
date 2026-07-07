@@ -1,12 +1,17 @@
 //! Shared helper for the `dry_run` parameter on mutating Atlassian MCP tools.
 //!
-//! When a mutating tool (`jira_create`, `jira_write`, `jira_link`,
-//! `confluence_create`, `confluence_write`) is called with `dry_run: true`, it
-//! performs all local resolution and ADF validation but stops short of the
-//! network call, returning the **would-be HTTP request** (method, path, body)
-//! as YAML instead. This lets an AI agent validate required fields and JFM→ADF
-//! formatting before committing an irreversible mutation — the MCP-side mirror
-//! of the CLI's `--dry-run` flag (see issue #1048).
+//! When a mutating create/write/link tool such as `jira_create`, `jira_write`,
+//! `jira_edit`, `jira_link`, `confluence_create`, or `confluence_write` is
+//! called with `dry_run: true`, it performs all local resolution and ADF
+//! validation but stops short of the network call, returning the **would-be HTTP
+//! request** (method, path, body) as YAML instead. This lets an AI agent
+//! validate required fields and JFM→ADF formatting before committing an
+//! irreversible mutation — the MCP-side mirror of the CLI's `--dry-run` flag
+//! (see issue #1048).
+//!
+//! Other tools expose dry-run previews without this HTTP-request helper. For
+//! example, `confluence_comment_reanchor` computes a comment move preview, and
+//! `git_twiddle_commits` formats its own amendment preview.
 //!
 //! The preview is rendered as YAML (the AI-friendly default per ADR-0020 /
 //! ADR-0021) rather than printed, since the MCP server speaks JSON-RPC over
