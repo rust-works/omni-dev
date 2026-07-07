@@ -3259,7 +3259,7 @@ Usage: snowflake <COMMAND>
 Commands:
   query       Run SQL (from an argument or stdin) through a multiplexed session
   sessions    List active multiplexed sessions
-  disconnect  Disconnect (evict) one session
+  disconnect  Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or all pools
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3268,15 +3268,17 @@ Options:
 
 ================================================================================
 
-omni-dev snowflake disconnect - Disconnect (evict) one session
+omni-dev snowflake disconnect - Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or all pools
 
-Disconnect (evict) one session
+Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or all pools
 
-Usage: disconnect [OPTIONS] --account <ACCOUNT> --user <USER>
+Usage: disconnect [OPTIONS] <--account <ACCOUNT>|--id <ID>|--all>
 
 Options:
-      --account <ACCOUNT>  Account of the session to evict
-      --user <USER>        User of the session to evict
+      --account <ACCOUNT>  Account of the pool to evict (requires `--user`)
+      --user <USER>        User of the pool to evict (requires `--account`)
+      --id <ID>            Numeric id of the pool to evict (as shown by `sessions`)
+      --all                Evict every pool
       --socket <PATH>      Control-socket path. Defaults to the per-user runtime location
   -h, --help               Print help
 
