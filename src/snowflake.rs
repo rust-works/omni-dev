@@ -41,6 +41,10 @@ use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey};
 const ENV_ACCOUNT: &str = "SNOWFLAKE_ACCOUNT";
 /// Env var for the default user.
 const ENV_USER: &str = "SNOWFLAKE_USER";
+/// Env var overriding the API host (verbatim), instead of deriving
+/// `<account>.snowflakecomputing.com`. Needed for AWS/Azure PrivateLink
+/// endpoints and gov/custom hosts.
+const ENV_HOST: &str = "SNOWFLAKE_HOST";
 /// Env var for the default warehouse.
 const ENV_WAREHOUSE: &str = "SNOWFLAKE_WAREHOUSE";
 /// Env var for the default role.
@@ -102,6 +106,10 @@ pub struct SnowflakeEngineConfig {
     pub default_account: Option<String>,
     /// Default user when a request omits `--user`.
     pub default_user: Option<String>,
+    /// Override the API host (verbatim) instead of deriving
+    /// `<account>.snowflakecomputing.com`. Set for PrivateLink / gov / custom
+    /// hosts; applies to every session this engine creates.
+    pub default_host: Option<String>,
     /// Default warehouse applied at session creation.
     pub default_warehouse: Option<String>,
     /// Default role applied at session creation.
@@ -133,6 +141,7 @@ impl Default for SnowflakeEngineConfig {
         Self {
             default_account: None,
             default_user: None,
+            default_host: None,
             default_warehouse: None,
             default_role: None,
             default_database: None,
@@ -186,6 +195,7 @@ impl SnowflakeEngineConfig {
         Ok(Self {
             default_account: settings.get_env_var(ENV_ACCOUNT),
             default_user: settings.get_env_var(ENV_USER),
+            default_host: host_override_from(settings.get_env_var(ENV_HOST)),
             default_warehouse: settings.get_env_var(ENV_WAREHOUSE),
             default_role: settings.get_env_var(ENV_ROLE),
             default_database: settings.get_env_var(ENV_DATABASE),
@@ -200,6 +210,13 @@ impl SnowflakeEngineConfig {
             ),
         })
     }
+}
+
+/// Normalizes the `SNOWFLAKE_HOST` override: trims surrounding whitespace (e.g. a
+/// trailing newline from a `$(cat …)`-style value) and treats a blank value as
+/// unset, so an empty override never shadows the derived host.
+fn host_override_from(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Parses the heartbeat-interval setting: seconds, with `0` meaning disabled.
@@ -649,6 +666,7 @@ async fn create_session_with_base(
 ) -> client::Result<(SnowflakeSession, QueryContext)> {
     let mut cfg = SnowflakeClientConfig::external_browser(&key.account, &key.user);
     cfg.auth = config.auth.clone();
+    cfg.host = config.default_host.clone();
     cfg.warehouse = config.default_warehouse.clone();
     cfg.role = config.default_role.clone();
     cfg.database = config.default_database.clone();
@@ -826,6 +844,18 @@ mod tests {
         assert_eq!(
             heartbeat_interval_from(Some("garbage".to_string())),
             DEFAULT_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn host_override_from_trims_and_treats_blank_as_unset() {
+        assert_eq!(host_override_from(None), None);
+        assert_eq!(host_override_from(Some("   ".to_string())), None);
+        assert_eq!(
+            host_override_from(Some(
+                "  acct.privatelink.snowflakecomputing.com\n".to_string()
+            )),
+            Some("acct.privatelink.snowflakecomputing.com".to_string())
         );
     }
 
