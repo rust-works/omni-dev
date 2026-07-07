@@ -21,7 +21,7 @@ pub mod session;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,8 +29,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::env::EnvSource;
+use crate::utils::secret::Secret;
 use crate::utils::settings::Settings;
-use client::{Error as ClientError, Row, SnowflakeClient, SnowflakeClientConfig, SnowflakeSession};
+use client::{
+    AuthMethod, BrowserConfig, Error as ClientError, KeyPairConfig, Row, SnowflakeClient,
+    SnowflakeClientConfig, SnowflakeSession,
+};
 use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey};
 
 /// Env var (with `~/.omni-dev/settings.json` fallback) for the default account.
@@ -56,6 +60,19 @@ const ENV_QUERY_TIMEOUT: &str = "SNOWFLAKE_QUERY_TIMEOUT";
 /// Env var for the idle-session keep-alive heartbeat interval (seconds; `0`
 /// disables the heartbeat).
 const ENV_HEARTBEAT_INTERVAL: &str = "SNOWFLAKE_HEARTBEAT_INTERVAL";
+/// Env var selecting the auth method: `externalbrowser` (default; interactive
+/// SSO), `programmatic_access_token`, or `snowflake_jwt` (both non-interactive).
+const ENV_AUTHENTICATOR: &str = "SNOWFLAKE_AUTHENTICATOR";
+/// Env var for the programmatic access token (PAT auth).
+const ENV_TOKEN: &str = "SNOWFLAKE_TOKEN";
+/// Env var for the path to an unencrypted PKCS#8 PEM private key (JWT auth).
+const ENV_PRIVATE_KEY_PATH: &str = "SNOWFLAKE_PRIVATE_KEY_PATH";
+/// Env var for an inline unencrypted PKCS#8 PEM private key (alternative to the
+/// path).
+const ENV_PRIVATE_KEY: &str = "SNOWFLAKE_PRIVATE_KEY";
+/// Env var for an encrypted key's passphrase. Recognized but not yet supported;
+/// setting it with the JWT method is a clear error.
+const ENV_PRIVATE_KEY_PASSPHRASE: &str = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
 
 /// Default pool size when `SNOWFLAKE_POOL_SIZE` is unset: the max concurrent
 /// queries (and max browser auths) per `(account, user)`.
@@ -93,6 +110,10 @@ pub struct SnowflakeEngineConfig {
     pub default_database: Option<String>,
     /// Default schema applied at session creation.
     pub default_schema: Option<String>,
+    /// How sessions authenticate (SSO by default; PAT or key-pair JWT for
+    /// non-interactive/headless use). The credential is the same for every
+    /// session in every pool this engine creates.
+    pub auth: AuthMethod,
     /// Max concurrent sessions (and browser auths) per `(account, user)`.
     pub pool_size: usize,
     /// Per-request HTTP timeout for REST calls.
@@ -116,6 +137,7 @@ impl Default for SnowflakeEngineConfig {
             default_role: None,
             default_database: None,
             default_schema: None,
+            auth: AuthMethod::ExternalBrowser(BrowserConfig::default()),
             pool_size: DEFAULT_POOL_SIZE,
             http_timeout: client::config::DEFAULT_HTTP_TIMEOUT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
@@ -131,8 +153,9 @@ impl SnowflakeEngineConfig {
     ///
     /// # Errors
     ///
-    /// Currently infallible, but returns `Result` so the daemon registry wiring
-    /// can `?` it and future validation can surface errors.
+    /// If `SNOWFLAKE_AUTHENTICATOR` names an unknown method or a selected
+    /// non-interactive method is missing its credential (see
+    /// [`resolve_auth_method`]).
     pub fn from_env_and_settings() -> Result<Self> {
         let settings = Settings::load().unwrap_or_default();
         let pool_size = settings
@@ -147,6 +170,19 @@ impl SnowflakeEngineConfig {
                 .filter(|&n| n >= 1)
                 .map(Duration::from_secs)
         };
+        let private_key_pem = match settings.get_env_var(ENV_PRIVATE_KEY_PATH) {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {ENV_PRIVATE_KEY_PATH} '{path}'"))?,
+            ),
+            None => settings.get_env_var(ENV_PRIVATE_KEY),
+        };
+        let auth = resolve_auth_method(
+            settings.get_env_var(ENV_AUTHENTICATOR).as_deref(),
+            settings.get_env_var(ENV_TOKEN),
+            private_key_pem,
+            settings.get_env_var(ENV_PRIVATE_KEY_PASSPHRASE),
+        )?;
         Ok(Self {
             default_account: settings.get_env_var(ENV_ACCOUNT),
             default_user: settings.get_env_var(ENV_USER),
@@ -154,6 +190,7 @@ impl SnowflakeEngineConfig {
             default_role: settings.get_env_var(ENV_ROLE),
             default_database: settings.get_env_var(ENV_DATABASE),
             default_schema: settings.get_env_var(ENV_SCHEMA),
+            auth,
             pool_size,
             http_timeout: secs(ENV_HTTP_TIMEOUT).unwrap_or(client::config::DEFAULT_HTTP_TIMEOUT),
             auth_timeout: secs(ENV_AUTH_TIMEOUT).unwrap_or(DEFAULT_AUTH_TIMEOUT),
@@ -172,6 +209,65 @@ impl SnowflakeEngineConfig {
 fn heartbeat_interval_from(raw: Option<String>) -> Duration {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
         .map_or(DEFAULT_HEARTBEAT_INTERVAL, Duration::from_secs)
+}
+
+/// Resolves the [`AuthMethod`] from the `SNOWFLAKE_AUTHENTICATOR` selector and
+/// the method-specific credential vars (`private_key_pem` is the already-read
+/// key material, from a file or inline). An unset or blank selector keeps
+/// external-browser SSO, preserving the pre-#1108 default. The PAT secret is
+/// trimmed (dropping a stray trailing newline from `$(cat …)`-style values).
+///
+/// # Errors
+///
+/// If the selector is unknown, a non-interactive method is selected without its
+/// credential, or an encrypted key passphrase is set (unsupported).
+fn resolve_auth_method(
+    authenticator: Option<&str>,
+    token: Option<String>,
+    private_key_pem: Option<String>,
+    passphrase: Option<String>,
+) -> Result<AuthMethod> {
+    let selector = authenticator.unwrap_or("").trim().to_ascii_lowercase();
+    match selector.as_str() {
+        "" | "externalbrowser" | "external_browser" => {
+            Ok(AuthMethod::ExternalBrowser(BrowserConfig::default()))
+        }
+        "programmatic_access_token" | "pat" => {
+            let token = token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("{ENV_AUTHENTICATOR}={selector} requires {ENV_TOKEN} to be set")
+                })?;
+            Ok(AuthMethod::ProgrammaticAccessToken {
+                token: Secret::from(token),
+            })
+        }
+        "snowflake_jwt" | "keypair" | "key_pair" | "jwt" => {
+            if passphrase.is_some_and(|p| !p.trim().is_empty()) {
+                bail!(
+                    "{ENV_PRIVATE_KEY_PASSPHRASE} is set, but encrypted private keys are not yet \
+                     supported; decrypt the key with `openssl pkcs8 -in key.p8 -out \
+                     key_unencrypted.p8` and unset {ENV_PRIVATE_KEY_PASSPHRASE}"
+                );
+            }
+            let private_key_pem = private_key_pem
+                .filter(|k| !k.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{ENV_AUTHENTICATOR}={selector} requires {ENV_PRIVATE_KEY_PATH} or \
+                         {ENV_PRIVATE_KEY}"
+                    )
+                })?;
+            Ok(AuthMethod::KeyPairJwt(KeyPairConfig {
+                private_key_pem: Secret::from(private_key_pem),
+            }))
+        }
+        other => Err(anyhow!(
+            "unknown {ENV_AUTHENTICATOR} '{other}' \
+             (expected externalbrowser, programmatic_access_token, or snowflake_jwt)"
+        )),
+    }
 }
 
 /// A single arbitrary-SQL query request routed to the engine.
@@ -545,13 +641,14 @@ async fn keep_session_alive(session: &SnowflakeSession, interval: Duration) -> b
     }
 }
 
-/// Authenticates a session (external-browser SSO), enables keep-alive, and
-/// captures its base (account/user default) context.
+/// Authenticates a session (via the engine's configured auth method), enables
+/// keep-alive, and captures its base (account/user default) context.
 async fn create_session_with_base(
     key: &SessionKey,
     config: &SnowflakeEngineConfig,
 ) -> client::Result<(SnowflakeSession, QueryContext)> {
     let mut cfg = SnowflakeClientConfig::external_browser(&key.account, &key.user);
+    cfg.auth = config.auth.clone();
     cfg.warehouse = config.default_warehouse.clone();
     cfg.role = config.default_role.clone();
     cfg.database = config.default_database.clone();
@@ -730,6 +827,106 @@ mod tests {
             heartbeat_interval_from(Some("garbage".to_string())),
             DEFAULT_HEARTBEAT_INTERVAL
         );
+    }
+
+    #[test]
+    fn resolve_auth_method_defaults_to_external_browser() {
+        // Unset, blank, and the explicit name all keep interactive SSO.
+        for selector in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("externalbrowser"),
+            Some("EXTERNALBROWSER"),
+        ] {
+            assert!(matches!(
+                resolve_auth_method(selector, None, None, None).unwrap(),
+                AuthMethod::ExternalBrowser(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn resolve_auth_method_reads_pat_and_trims_it() {
+        let auth = resolve_auth_method(
+            Some("programmatic_access_token"),
+            Some("  tok-123\n".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        let AuthMethod::ProgrammaticAccessToken { token } = auth else {
+            panic!("expected a PAT auth method");
+        };
+        assert_eq!(token.expose_secret(), "tok-123");
+    }
+
+    #[test]
+    fn resolve_auth_method_accepts_the_pat_alias() {
+        assert!(matches!(
+            resolve_auth_method(Some("pat"), Some("t".to_string()), None, None).unwrap(),
+            AuthMethod::ProgrammaticAccessToken { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_auth_method_errors_when_pat_is_missing_or_blank() {
+        assert!(resolve_auth_method(Some("programmatic_access_token"), None, None, None).is_err());
+        assert!(resolve_auth_method(Some("pat"), Some("   ".to_string()), None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_auth_method_reads_key_pair_pem() {
+        let auth = resolve_auth_method(
+            Some("snowflake_jwt"),
+            None,
+            Some("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----".to_string()),
+            None,
+        )
+        .unwrap();
+        let AuthMethod::KeyPairJwt(cfg) = auth else {
+            panic!("expected a key-pair auth method");
+        };
+        assert!(cfg
+            .private_key_pem
+            .expose_secret()
+            .contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn resolve_auth_method_accepts_key_pair_aliases() {
+        for selector in ["snowflake_jwt", "keypair", "key_pair", "jwt"] {
+            assert!(matches!(
+                resolve_auth_method(Some(selector), None, Some("pem".to_string()), None).unwrap(),
+                AuthMethod::KeyPairJwt(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn resolve_auth_method_errors_when_key_is_missing() {
+        assert!(resolve_auth_method(Some("snowflake_jwt"), None, None, None).is_err());
+        assert!(
+            resolve_auth_method(Some("snowflake_jwt"), None, Some("  ".to_string()), None).is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_auth_method_rejects_an_encrypted_key_passphrase() {
+        let err = resolve_auth_method(
+            Some("snowflake_jwt"),
+            None,
+            Some("pem".to_string()),
+            Some("hunter2".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(ENV_PRIVATE_KEY_PASSPHRASE));
+    }
+
+    #[test]
+    fn resolve_auth_method_rejects_an_unknown_selector() {
+        let err = resolve_auth_method(Some("carrier-pigeon"), None, None, None).unwrap_err();
+        assert!(err.to_string().contains("carrier-pigeon"));
     }
 
     #[tokio::test]
