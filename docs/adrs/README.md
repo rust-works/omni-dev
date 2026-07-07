@@ -68,3 +68,4 @@ by Michael Nygard.
 | [ADR-0042](adr-0042.md)  | ✅ Accepted                              | 2026-07-07 | Local Append-Only Invocation and HTTP Request Log                                      |
 | [ADR-0043](adr-0043.md)  | ✅ Accepted                              | 2026-07-07 | Default-On Denylist Redaction of Credential Material in Persisted and Debug Output     |
 | [ADR-0044](adr-0044.md)  | ✅ Accepted                              | 2026-07-07 | Unified AI Backend and Model Resolution with a Single-Source-of-Truth Precedence Chain |
+| [ADR-0045](adr-0045.md)  | ✅ Accepted                              | 2026-07-07 | Isolated Named Credential Profiles for Multi-Tenant Configuration                      |
