@@ -695,6 +695,18 @@ mod tests {
     fn window_menu_items_merge_stats_and_focus_into_one_clickable_line() {
         let now = Utc::now();
         let entries = vec![
+            // A folderless window has nothing to focus, so it stays a plain
+            // Label; a title equal to the name collapses to just the name. It
+            // leads the list so the focus-action lookup below is exercised
+            // against a leading non-Action item it has to skip.
+            WindowEntry {
+                key: "k2".to_string(),
+                folders: vec![],
+                repo: Some("solo".to_string()),
+                title: Some("solo".to_string()),
+                pid: None,
+                last_seen: now,
+            },
             // A folder-bearing, non-repo window: one clickable Action whose label
             // is the stats line ("name · title", since /tmp is not a git repo).
             WindowEntry {
@@ -702,16 +714,6 @@ mod tests {
                 folders: vec![PathBuf::from("/tmp/a")],
                 repo: Some("repo".to_string()),
                 title: Some("a branch".to_string()),
-                pid: None,
-                last_seen: now,
-            },
-            // A folderless window has nothing to focus, so it stays a plain
-            // Label; a title equal to the name collapses to just the name.
-            WindowEntry {
-                key: "k2".to_string(),
-                folders: vec![],
-                repo: Some("solo".to_string()),
-                title: Some("solo".to_string()),
                 pid: None,
                 last_seen: now,
             },
@@ -759,19 +761,26 @@ mod tests {
         assert!(status.healthy);
         assert_eq!(status.summary, "0 window(s) across 0 repo(s)");
 
-        // With two windows in the same repo.
+        // Two folder-bearing windows in the same repo, plus one folderless
+        // window that shares the repo but has nothing for `code` to open.
         svc.handle("register", register_payload("w1", Some("repo-a"), "/tmp/a"))
             .await
             .unwrap();
         svc.handle("register", register_payload("w2", Some("repo-a"), "/tmp/b"))
             .await
             .unwrap();
+        svc.handle(
+            "register",
+            json!({ "key": "w3", "repo": "repo-a", "folders": [] }),
+        )
+        .await
+        .unwrap();
         let status = svc.status().await;
-        assert_eq!(status.summary, "2 window(s) across 1 repo(s)");
+        assert_eq!(status.summary, "3 window(s) across 1 repo(s)");
 
         let menu = svc.menu();
-        // One clickable item per window — no separator, no duplicate label.
-        assert_eq!(menu.items.len(), 2);
+        // One line per window — no separator, no duplicate label.
+        assert_eq!(menu.items.len(), 3);
         assert!(!menu.items.iter().any(|i| matches!(i, MenuItem::Separator)));
         let action_ids: Vec<&str> = menu
             .items
@@ -781,8 +790,11 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // The two folder-bearing windows are clickable; the folderless one is a
+        // plain Label, so it never yields a focus action.
         assert!(action_ids.contains(&"focus:w1"));
         assert!(action_ids.contains(&"focus:w2"));
+        assert!(!action_ids.contains(&"focus:w3"));
     }
 
     #[test]
