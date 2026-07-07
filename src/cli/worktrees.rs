@@ -118,7 +118,7 @@ fn render_windows(result: &Value) -> String {
         "REPO", "BRANCH", "SYNC", "FOLDER", "AGE"
     );
     for window in windows {
-        let repo = sanitize(window.get("repo").and_then(Value::as_str).unwrap_or("-"));
+        let repo = sanitize(repo_name(window));
         let branch = sanitize(window.get("branch").and_then(Value::as_str).unwrap_or("-"));
         let sync = sync_summary(window);
         let folder_disp = folder_summary(window);
@@ -128,6 +128,17 @@ fn render_windows(result: &Value) -> String {
         ));
     }
     out
+}
+
+/// The repo name to show for a window: the daemon-computed `main_repo` (which
+/// names the *parent* repository of a linked worktree, not its worktree-folder
+/// basename) when present, else the companion-reported `repo`, else `-`.
+fn repo_name(window: &Value) -> &str {
+    window
+        .get("main_repo")
+        .and_then(Value::as_str)
+        .or_else(|| window.get("repo").and_then(Value::as_str))
+        .unwrap_or("-")
 }
 
 /// A compact `+ahead -behind` divergence indicator for a window, or `-` when
@@ -243,6 +254,37 @@ mod tests {
         assert!(table.contains("/home/me/omni-dev (+1)"), "{table}");
         // A header line plus exactly one data row.
         assert_eq!(table.lines().count(), 2, "{table}");
+    }
+
+    #[test]
+    fn render_windows_prefers_main_repo_over_companion_repo() {
+        // A linked worktree: the companion reports the worktree-folder basename,
+        // but the daemon-computed `main_repo` names the parent repo, and that is
+        // what the REPO column shows.
+        let result = json!({ "windows": [{
+            "key": "w1",
+            "repo": "issue-1250",
+            "main_repo": "omni-dev",
+            "branch": "issue-1250",
+            "folders": ["/home/me/worktrees/issue-1250"],
+            "last_seen": "2000-01-01T00:00:00Z",
+        }]});
+        let table = render_windows(&result);
+        assert!(table.contains("omni-dev"), "{table}");
+        // The misleading worktree-folder basename does not appear in REPO (it is
+        // still visible in the FOLDER column path).
+        let data_row = table.lines().nth(1).unwrap();
+        assert!(data_row.starts_with("omni-dev"), "{data_row}");
+    }
+
+    #[test]
+    fn repo_name_falls_back_to_companion_repo_then_dash() {
+        assert_eq!(
+            repo_name(&json!({ "main_repo": "omni-dev", "repo": "wt" })),
+            "omni-dev"
+        );
+        assert_eq!(repo_name(&json!({ "repo": "wt" })), "wt");
+        assert_eq!(repo_name(&json!({})), "-");
     }
 
     #[test]
