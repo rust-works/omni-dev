@@ -90,6 +90,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 ### Development & Release
 
 - **[Contributing Guidelines](../CONTRIBUTING.md)** - How to contribute to the project
+- **[CI Path-Split](ci-path-split.md)** - Fast-path docs/skills-only PRs past the heavyweight required checks with a single path-aware gate, without weakening the gate for code PRs
 - **[Release Process](RELEASE.md)** - Complete release workflow and procedures
 
 ## 🚀 Quick Navigation
