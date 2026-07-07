@@ -2319,6 +2319,8 @@ Options:
           Fail (non-zero exit) when patch coverage is below this percentage
       --strip-prefix <PATH>
           Override the path prefix stripped from report file paths to make them repo-relative (default: the repository working directory)
+      --ignore-filename-regex <REGEX>
+          Exclude files whose repo-relative path matches any of these regexes from BOTH the head and baseline reports before computing the diff
       --collapse-ranges
           Collapse consecutive uncovered new lines into ranges (e.g. `9-11`)
       --all-files

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use git2::Repository;
+use regex::RegexSet;
 
 use crate::coverage::{
     analyze, default_base_ref, parse, render, DiffModel, DiffScope, Format, OutputFormat,
@@ -103,6 +104,19 @@ pub struct DiffCommand {
     #[arg(long, value_name = "PATH")]
     pub strip_prefix: Option<PathBuf>,
 
+    /// Exclude files whose repo-relative path matches any of these regexes
+    /// from BOTH the head and baseline reports before computing the diff.
+    ///
+    /// Repeatable, or comma-separated. Matching is unanchored (partial), the
+    /// same semantics as `cargo llvm-cov --ignore-filename-regex`, and is
+    /// applied after `--strip-prefix` normalisation so the pattern matches the
+    /// repo-relative path. Filtering both sides symmetrically keeps the total,
+    /// per-file deltas, patch coverage, and indirect-change list — and the
+    /// `--fail-under-patch` gate — computed over the same denominator, even
+    /// when the baseline predates the exclusion.
+    #[arg(long, value_name = "REGEX", value_delimiter = ',')]
+    pub ignore_filename_regex: Vec<String>,
+
     /// Collapse consecutive uncovered new lines into ranges (e.g. `9-11`).
     #[arg(long)]
     pub collapse_ranges: bool,
@@ -194,10 +208,15 @@ impl DiffCommand {
             .clone()
             .or_else(|| repo.workdir().map(std::path::Path::to_path_buf));
 
+        // Compiled once so an invalid pattern is a single up-front error rather
+        // than failing separately per report.
+        let ignore = self.compile_ignore()?;
+
         let head = self.load_report(
             &self.report,
             self.report_format,
             strip_prefix.as_deref(),
+            ignore.as_ref(),
             &repo_path,
         )?;
         let baseline = match &self.baseline_report {
@@ -205,6 +224,7 @@ impl DiffCommand {
                 path,
                 self.baseline_report_format,
                 strip_prefix.as_deref(),
+                ignore.as_ref(),
                 &repo_path,
             )?),
             None => None,
@@ -245,6 +265,7 @@ impl DiffCommand {
         path: &std::path::Path,
         format: ReportFormat,
         strip_prefix: Option<&std::path::Path>,
+        ignore: Option<&RegexSet>,
         repo_root: &Path,
     ) -> Result<crate::coverage::CoverageReport> {
         let path = if path.is_absolute() {
@@ -259,7 +280,33 @@ impl DiffCommand {
         if let Some(prefix) = strip_prefix {
             report.strip_prefix(prefix);
         }
+        // Match on the repo-relative path (post strip-prefix), so the same
+        // pattern applies identically to head and baseline.
+        if let Some(ignore) = ignore {
+            report.retain_paths(|path| !ignore.is_match(path));
+        }
         Ok(report)
+    }
+
+    /// Compiles `--ignore-filename-regex` into a [`RegexSet`], or `None` when it
+    /// was not supplied. A file is excluded when it matches *any* pattern.
+    ///
+    /// Empty patterns are dropped: comma-splitting a trailing or doubled comma
+    /// (`foo,` / `a,,b`) yields an empty element, and an empty regex matches
+    /// *every* path — which would silently exclude the whole report (and make a
+    /// `--fail-under-patch` gate pass vacuously). Treating it as a no-op is the
+    /// safe reading of an obvious typo.
+    fn compile_ignore(&self) -> Result<Option<RegexSet>> {
+        let patterns: Vec<&String> = self
+            .ignore_filename_regex
+            .iter()
+            .filter(|p| !p.is_empty())
+            .collect();
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        let set = RegexSet::new(patterns).context("invalid --ignore-filename-regex pattern")?;
+        Ok(Some(set))
     }
 
     /// Builds the render options, falling back to the `COVERAGE_*` environment
@@ -357,6 +404,7 @@ mod tests {
             format: None,
             fail_under_patch: None,
             strip_prefix: None,
+            ignore_filename_regex: Vec::new(),
             collapse_ranges: false,
             all_files: false,
             artifact_url: None,
@@ -502,6 +550,98 @@ mod tests {
             all_md.contains("`a.rs`"),
             "All scope must surface untouched a.rs"
         );
+    }
+
+    #[test]
+    fn ignore_filename_regex_excludes_file_from_patch() {
+        // The only diff-added file is `b.rs`; ignoring it removes it from the
+        // head report, so `head.hits` misses and no added lines remain to
+        // measure — patch coverage becomes undefined rather than 66.7%.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![r"b\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, None);
+        assert!(!outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn ignore_filename_regex_drops_file_from_both_reports() {
+        // `a.rs` is unchanged but has different coverage in head vs baseline, so
+        // `--all-files` would normally surface it in the delta table (it is read
+        // from both `head.files` and `baseline.files`). The regex must remove it
+        // from both sides symmetrically so it disappears entirely.
+        let (_dir, repo, base) = repo_with_added_file();
+        let head = format!(
+            "SF:{a}\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n\
+             SF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, head).unwrap();
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!(
+                "SF:{}\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+
+        let mut cmd = command(report, &base);
+        cmd.baseline_report = Some(baseline);
+        cmd.all_files = true;
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let md = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            !md.contains("`a.rs`"),
+            "ignored a.rs must not appear in the delta table"
+        );
+        // The un-ignored added file is still reported.
+        assert!(md.contains("`b.rs"));
+    }
+
+    #[test]
+    fn ignore_filename_regex_parses_repeatable_and_comma() {
+        use clap::Parser;
+        let cmd = DiffCommand::try_parse_from([
+            "diff",
+            "--report",
+            "r.lcov",
+            "--ignore-filename-regex",
+            "foo,bar",
+            "--ignore-filename-regex",
+            "baz",
+        ])
+        .unwrap();
+        assert_eq!(cmd.ignore_filename_regex, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn ignore_filename_regex_treats_empty_pattern_as_noop() {
+        // A trailing/doubled comma splits to an empty element; an empty regex
+        // matches every path and would silently wipe the whole report (and pass
+        // a --fail-under-patch gate vacuously). It must be dropped instead.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![String::new(), r"nomatch\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        // b.rs is still measured: 2/3, not wiped to nothing.
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn invalid_ignore_pattern_errors() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec!["(unclosed".to_string()];
+        assert!(cmd.run(Some(&repo)).is_err());
     }
 
     #[test]

@@ -149,6 +149,19 @@ impl CoverageReport {
         }
         self.files = remapped;
     }
+
+    /// Drops every file whose path does not satisfy `keep`.
+    ///
+    /// Used to apply `--ignore-filename-regex`: because it is called *after*
+    /// [`strip_prefix`](Self::strip_prefix), the predicate sees repo-relative
+    /// paths — the same space git diffs report in — so head and baseline
+    /// reports are filtered identically before any delta is computed.
+    pub fn retain_paths<F>(&mut self, keep: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.files.retain(|path, _| keep(path));
+    }
 }
 
 /// Strips `prefix_slash` (a trailing-slash directory prefix) from `path`, then
@@ -270,5 +283,19 @@ mod tests {
         report.insert(f);
         report.strip_prefix(Path::new("/some/other/root"));
         assert!(report.files.contains_key("src/a.rs"));
+    }
+
+    #[test]
+    fn retain_paths_drops_non_matching_files() {
+        let mut report = CoverageReport::new();
+        for path in ["src/a.rs", "src/gpu/mlx.rs", "src/b.rs"] {
+            let mut f = FileCoverage::new(path);
+            f.record(1, 1);
+            report.insert(f);
+        }
+        report.retain_paths(|path| !path.contains("gpu/"));
+        assert!(report.files.contains_key("src/a.rs"));
+        assert!(report.files.contains_key("src/b.rs"));
+        assert!(!report.files.contains_key("src/gpu/mlx.rs"));
     }
 }

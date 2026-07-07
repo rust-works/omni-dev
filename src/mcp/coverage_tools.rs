@@ -102,6 +102,12 @@ pub struct CoverageDiffParams {
     /// repo-relative (default: the repository working directory).
     #[serde(default)]
     pub strip_prefix: Option<String>,
+    /// Exclude files whose repo-relative path matches any of these regexes from
+    /// both the head and baseline reports before computing the diff. Matching is
+    /// unanchored, applied after `strip_prefix` (same semantics as
+    /// `cargo llvm-cov --ignore-filename-regex`).
+    #[serde(default)]
+    pub ignore_filename_regex: Vec<String>,
     /// Collapse consecutive uncovered new lines into ranges (e.g. `9-11`).
     #[serde(default)]
     pub collapse_ranges: bool,
@@ -162,6 +168,7 @@ impl OmniDevServer {
             format: None,
             fail_under_patch: params.fail_under_patch,
             strip_prefix: params.strip_prefix.map(PathBuf::from),
+            ignore_filename_regex: params.ignore_filename_regex,
             collapse_ranges: params.collapse_ranges,
             all_files: params.all_files,
             artifact_url: params.artifact_url,
@@ -299,6 +306,7 @@ mod tests {
             format: CoverageOutputFormat::Markdown,
             fail_under_patch: None,
             strip_prefix: None,
+            ignore_filename_regex: Vec::new(),
             collapse_ranges: false,
             all_files: false,
             artifact_url: None,
