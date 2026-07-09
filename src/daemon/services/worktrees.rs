@@ -1,8 +1,8 @@
 //! The worktrees daemon service.
 //!
 //! A thin adapter that hosts the cross-window [`WorktreesRegistry`] under the
-//! daemon's lifecycle and exposes register/heartbeat/unregister/list over the
-//! control socket, plus a tray submenu with a per-window "focus" action.
+//! daemon's lifecycle and exposes register/heartbeat/unregister/list/tree over
+//! the control socket, plus a tray submenu with a per-window "focus" action.
 //!
 //! All registry state and liveness logic (the `Mutex<HashMap>`, TTL reaping, the
 //! entry cap/eviction) lives in [`crate::worktrees`]; this adapter only routes
@@ -16,8 +16,17 @@
 //! of raw folder paths (ADR-0040). The engine stores only what the companion
 //! sends; disk I/O for the enrichment lives here, alongside the launcher, never
 //! under the registry lock.
+//!
+//! The `tree` op (#1265) inverts the data model for the companion's tree view:
+//! from the open windows the adapter derives the **distinct repositories**, then
+//! enumerates **all** of each repo's worktrees (main working tree +
+//! [`Repository::worktrees`]), enriches each (reusing [`git_status`]), tags the
+//! GitHub identity of `origin`, and joins the open windows back on by
+//! canonicalized path. The open-window registry stays the liveness source;
+//! "is a window open on it?" becomes a per-worktree attribute. All of this is
+//! git disk I/O, so it runs on a blocking thread, never under the registry lock.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -160,6 +169,16 @@ impl DaemonService for WorktreesService {
                 Ok(json!({ "removed": self.registry.unregister(key) }))
             }
             "list" => Ok(json!({ "windows": enriched_windows(self.registry.list()).await })),
+            "tree" => {
+                // Two cheap registry locks: the seed folders to derive repos
+                // from, and the live windows to join back on. The tree is
+                // best-effort, so minor skew between the two snapshots is
+                // immaterial; the git enumeration/enrichment runs off-lock on a
+                // blocking thread.
+                let folders = self.registry.open_folders();
+                let windows = self.registry.list();
+                Ok(json!({ "repos": tree_repos(folders, windows).await }))
+            }
             other => bail!("unknown worktrees op: {other}"),
         }
     }
@@ -383,6 +402,241 @@ async fn enriched_windows(entries: Vec<WindowEntry>) -> Vec<Value> {
     tokio::task::spawn_blocking(move || entries.iter().map(enriched_entry).collect())
         .await
         .unwrap_or_default()
+}
+
+// --- Repo/worktree tree (#1265) ----------------------------------------------
+
+/// A GitHub `owner/name` identity parsed from a repository's `origin` remote.
+/// Present on a repo in the `tree` payload only for `github.com` remotes; a
+/// non-GitHub (or remote-less) repo omits it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GithubIdentity {
+    /// The repository owner (user or org) — the first path segment.
+    owner: String,
+    /// The repository name, with any `.git` suffix stripped.
+    name: String,
+}
+
+/// One worktree of a repository in the `tree` payload: its path, live git state,
+/// whether it is the main working tree, and whether a VS Code window currently
+/// has it open (with that window's key, for the focus action). Optional git
+/// fields degrade independently, exactly like [`GitStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TreeWorktree {
+    /// Absolute path to the worktree's working directory.
+    path: String,
+    /// The checked-out branch, or `None` when detached or unborn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    /// Commits ahead of the branch's upstream (`None` without an upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ahead: Option<usize>,
+    /// Commits behind the branch's upstream (`None` without an upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<usize>,
+    /// Whether this is the repository's main working tree (vs a linked worktree).
+    is_main: bool,
+    /// Whether a live VS Code window currently has this worktree open.
+    open: bool,
+    /// The open window's registry key, when `open` — the handle a focus action
+    /// resolves. Absent for a worktree with no open window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_key: Option<String>,
+}
+
+/// One repository (with **all** its worktrees) in the `tree` payload. Repos are
+/// derived from the distinct open windows; a repo leaves the tree when its last
+/// window closes (the open-window-derived model, ADR-0040 / #1264).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TreeRepo {
+    /// The main repository's directory name (see [`main_repo_name`]).
+    main_repo: String,
+    /// The GitHub identity of `origin`, when it is a `github.com` remote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github: Option<GithubIdentity>,
+    /// Absolute path to the main working tree — the repo's root.
+    root: String,
+    /// Every worktree of the repo: the main working tree first, then linked
+    /// worktrees sorted by path.
+    worktrees: Vec<TreeWorktree>,
+}
+
+/// Parses a git remote URL into its GitHub `owner/name`, or `None` for any
+/// non-GitHub host. Handles the common forms: `https://github.com/o/r(.git)`,
+/// `http://…`, `ssh://git@github.com/o/r(.git)`, `git://github.com/o/r(.git)`,
+/// and the SCP-like `git@github.com:o/r(.git)`. A trailing `.git` and trailing
+/// slashes are stripped; anything with an empty or extra path segment is
+/// rejected (best-effort, never panics).
+fn github_identity(url: &str) -> Option<GithubIdentity> {
+    let url = url.trim();
+    // Reduce every supported form to the `owner/name…` tail after the host.
+    let rest = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git://github.com/",
+        "git@github.com:",
+    ]
+    .iter()
+    .find_map(|prefix| url.strip_prefix(prefix))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let rest = rest.trim_end_matches('/');
+    let mut parts = rest.splitn(2, '/');
+    let owner = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    // A well-formed identity has exactly two non-empty segments.
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(GithubIdentity {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// The GitHub identity of `repo`: `origin`'s URL first, else the first
+/// `github.com` remote found. `None` when no remote is a GitHub remote.
+fn remote_github_identity(repo: &Repository) -> Option<GithubIdentity> {
+    if let Ok(origin) = repo.find_remote("origin") {
+        if let Some(id) = origin.url().ok().and_then(github_identity) {
+            return Some(id);
+        }
+    }
+    // `remotes()` yields `Result<Option<&str>, _>` per name; the first flatten
+    // drops the (per-name) errors, the second the non-UTF-8 `None`s. `names` is
+    // bound so `iter()` can borrow it (only `&StringArray` is `IntoIterator`).
+    let names = repo.remotes().ok();
+    names
+        .iter()
+        .flat_map(|arr| arr.iter())
+        .flatten()
+        .flatten()
+        .filter_map(|name| repo.find_remote(name).ok())
+        .find_map(|remote| remote.url().ok().and_then(github_identity))
+}
+
+/// Canonicalizes a path for stable comparison (resolving symlinks and `..`),
+/// falling back to the path as-given when it cannot be canonicalized (e.g. it
+/// no longer exists) so the join still degrades gracefully.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Indexes the open windows by canonicalized workspace-folder path → window key,
+/// so a worktree path can be joined back to the window (if any) that has it open.
+/// The first window wins a shared folder; `entries` arrive in a deterministic
+/// (repo, key) order, so the choice is stable.
+fn open_window_index(entries: &[WindowEntry]) -> HashMap<PathBuf, String> {
+    let mut index = HashMap::new();
+    for entry in entries {
+        for folder in &entry.folders {
+            index
+                .entry(canonical(folder))
+                .or_insert_with(|| entry.key.clone());
+        }
+    }
+    index
+}
+
+/// Builds a [`TreeWorktree`] for `path`: reuses [`git_status`] for the live git
+/// state and joins the open-window index for `open`/`window_key`. `is_main` is
+/// set by the caller from the enumeration (main working tree vs linked).
+fn worktree_entry(
+    path: &Path,
+    is_main: bool,
+    open_index: &HashMap<PathBuf, String>,
+) -> TreeWorktree {
+    let status = git_status(path);
+    let window_key = open_index.get(&canonical(path)).cloned();
+    TreeWorktree {
+        path: path.display().to_string(),
+        branch: status.branch,
+        ahead: status.ahead,
+        behind: status.behind,
+        is_main,
+        open: window_key.is_some(),
+        window_key,
+    }
+}
+
+/// Enumerates a repository and all its worktrees into a [`TreeRepo`], given a
+/// handle discovered from one of its folders. Opens the **main** repo from the
+/// shared common dir's parent so the main working tree and every linked worktree
+/// are enumerated regardless of which one seeded the discovery. `None` for a
+/// bare or otherwise root-less repo (no working tree to show).
+fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> Option<TreeRepo> {
+    // The common dir (`…/<root>/.git`) is shared by the main checkout and all
+    // linked worktrees; its parent is the main working tree.
+    let commondir = canonical(discovered.commondir());
+    let main_root = commondir.parent()?.to_path_buf();
+    let main_repo = Repository::open(&main_root).ok()?;
+
+    // Main working tree first.
+    let mut worktrees = vec![worktree_entry(&main_root, true, open_index)];
+    // Then every linked worktree, sorted by path for deterministic output. The
+    // `StringArray` of names is bound so `iter()` can borrow it (only
+    // `&StringArray` is `IntoIterator`); a name that no longer resolves to a
+    // worktree is skipped.
+    let names = main_repo.worktrees().ok();
+    let mut linked: Vec<PathBuf> = names
+        .iter()
+        .flat_map(|arr| arr.iter())
+        .flatten() // Result<Option<&str>, _> → Option<&str> (drop per-name errors)
+        .flatten() // Option<&str> → &str (drop non-UTF-8 names)
+        .filter_map(|name| main_repo.find_worktree(name).ok())
+        .map(|wt| wt.path().to_path_buf())
+        .collect();
+    linked.sort();
+    worktrees.extend(
+        linked
+            .iter()
+            .map(|path| worktree_entry(path, false, open_index)),
+    );
+
+    Some(TreeRepo {
+        main_repo: main_repo_name(&commondir)?,
+        github: remote_github_identity(&main_repo),
+        root: main_root.display().to_string(),
+        worktrees,
+    })
+}
+
+/// Resolves the seed `folders` to their distinct repositories and enumerates
+/// each repo's worktrees. Dedupes repos by their common dir (shared across a
+/// repo's worktrees) via a `BTreeMap` for deterministic ordering; a folder that
+/// is not in a git repo is skipped. Pure blocking git I/O — call it via
+/// [`tree_repos`], never under the registry lock.
+fn build_tree(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<TreeRepo> {
+    let open_index = open_window_index(&windows);
+    let mut repos: BTreeMap<PathBuf, TreeRepo> = BTreeMap::new();
+    for folder in &folders {
+        let Ok(repo) = Repository::discover(folder) else {
+            continue;
+        };
+        let key = canonical(repo.commondir());
+        if repos.contains_key(&key) {
+            continue;
+        }
+        if let Some(tree) = repo_tree(&repo, &open_index) {
+            repos.insert(key, tree);
+        }
+    }
+    repos.into_values().collect()
+}
+
+/// Enumerates and enriches the repo/worktree tree on a blocking thread (`git2`
+/// does synchronous disk I/O and this runs inside the async control-socket
+/// handler), returning the serialized `repos` array. A join failure degrades to
+/// an empty list rather than erroring, matching [`enriched_windows`].
+async fn tree_repos(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<Value> {
+    tokio::task::spawn_blocking(move || {
+        build_tree(folders, windows)
+            .iter()
+            .map(|repo| serde_json::to_value(repo).unwrap_or_else(|_| json!({})))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,
@@ -1254,5 +1508,220 @@ mod tests {
         );
         // A `.git` at the filesystem root has no parent name to use.
         assert_eq!(main_repo_name(Path::new("/.git")), None);
+    }
+
+    // --- Repo/worktree tree (#1265) ----------------------------------------
+
+    /// Pulls the `repos` array out of a `tree` payload (owned, so it survives a
+    /// temporary payload).
+    fn repos_of(payload: &Value) -> Vec<Value> {
+        payload
+            .get("repos")
+            .and_then(Value::as_array)
+            .expect("repos array")
+            .clone()
+    }
+
+    fn github(owner: &str, name: &str) -> Option<GithubIdentity> {
+        Some(GithubIdentity {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    #[test]
+    fn github_identity_parses_supported_forms() {
+        // https / http, with and without the `.git` suffix.
+        assert_eq!(
+            github_identity("https://github.com/rust-works/omni-dev.git"),
+            github("rust-works", "omni-dev")
+        );
+        assert_eq!(
+            github_identity("https://github.com/rust-works/omni-dev"),
+            github("rust-works", "omni-dev")
+        );
+        assert_eq!(github_identity("http://github.com/o/r"), github("o", "r"));
+        // SCP-like and ssh:// / git:// forms.
+        assert_eq!(
+            github_identity("git@github.com:rust-works/omni-dev.git"),
+            github("rust-works", "omni-dev")
+        );
+        assert_eq!(
+            github_identity("ssh://git@github.com/o/r.git"),
+            github("o", "r")
+        );
+        assert_eq!(github_identity("git://github.com/o/r"), github("o", "r"));
+        // A trailing slash and surrounding whitespace are tolerated.
+        assert_eq!(
+            github_identity("  https://github.com/o/r/  "),
+            github("o", "r")
+        );
+    }
+
+    #[test]
+    fn github_identity_rejects_non_github_and_malformed() {
+        // Non-GitHub hosts.
+        assert_eq!(github_identity("https://gitlab.com/o/r.git"), None);
+        assert_eq!(github_identity("git@example.com:o/r.git"), None);
+        // Missing or extra path segments.
+        assert_eq!(github_identity("https://github.com/onlyowner"), None);
+        assert_eq!(github_identity("https://github.com/o/r/extra"), None);
+        assert_eq!(github_identity("https://github.com/"), None);
+        // Not a URL at all.
+        assert_eq!(github_identity("not a url"), None);
+    }
+
+    #[test]
+    fn remote_github_identity_reads_origin_then_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        // No remotes → None.
+        assert_eq!(remote_github_identity(&repo), None);
+        // A non-GitHub origin is not a match.
+        repo.remote("origin", "https://gitlab.com/o/r.git").unwrap();
+        assert_eq!(remote_github_identity(&repo), None);
+        // A GitHub origin resolves to its identity.
+        repo.remote_set_url("origin", "git@github.com:rust-works/omni-dev.git")
+            .unwrap();
+        assert_eq!(
+            remote_github_identity(&repo),
+            github("rust-works", "omni-dev")
+        );
+
+        // Origin non-GitHub but another remote is GitHub: the fallback loop over
+        // the remaining remotes finds it.
+        repo.remote_set_url("origin", "https://gitlab.com/o/r.git")
+            .unwrap();
+        repo.remote("upstream", "https://github.com/other/proj.git")
+            .unwrap();
+        assert_eq!(remote_github_identity(&repo), github("other", "proj"));
+    }
+
+    #[tokio::test]
+    async fn tree_is_empty_with_no_windows_and_skips_non_repos() {
+        let svc = WorktreesService::new();
+        // No windows → an empty repo set (not an error).
+        assert_eq!(
+            svc.handle("tree", Value::Null).await.unwrap(),
+            json!({ "repos": [] })
+        );
+        // A plain non-repo folder is skipped rather than sinking the op.
+        let plain = tempfile::tempdir().unwrap();
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [plain.path()], "repo": "plain" }),
+        )
+        .await
+        .unwrap();
+        assert!(repos_of(&svc.handle("tree", Value::Null).await.unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tree_enumerates_main_and_linked_with_open_join_and_github() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        // A GitHub origin so the repo carries an identity in the payload.
+        repo.remote("origin", "git@github.com:rust-works/omni-dev.git")
+            .unwrap();
+
+        // A linked worktree on a new `feature` branch, in a directory whose
+        // basename is deliberately not the repo name.
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+
+        let svc = WorktreesService::new();
+        // A window open on the main checkout and one on the linked worktree —
+        // two windows, but one repo (they must dedupe).
+        svc.handle(
+            "register",
+            json!({ "key": "wm", "folders": [main_dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.handle(
+            "register",
+            json!({ "key": "wf", "folders": [wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+
+        let repos = repos_of(&svc.handle("tree", Value::Null).await.unwrap());
+        assert_eq!(
+            repos.len(),
+            1,
+            "two worktrees of one repo dedupe: {repos:?}"
+        );
+        let repo0 = &repos[0];
+        // Repo identity is the parent-repo name (not a worktree-folder basename).
+        assert_eq!(
+            repo0.get("main_repo").and_then(Value::as_str),
+            main_dir.path().file_name().and_then(|n| n.to_str())
+        );
+        assert_eq!(
+            repo0.pointer("/github/owner").and_then(Value::as_str),
+            Some("rust-works")
+        );
+        assert_eq!(
+            repo0.pointer("/github/name").and_then(Value::as_str),
+            Some("omni-dev")
+        );
+        assert!(repo0.get("root").and_then(Value::as_str).is_some());
+
+        let worktrees = repo0.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(worktrees.len(), 2);
+        // Main working tree first: is_main, open, with the main window's key.
+        let main_wt = &worktrees[0];
+        assert_eq!(main_wt.get("is_main").and_then(Value::as_bool), Some(true));
+        assert_eq!(main_wt.get("open").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            main_wt.get("window_key").and_then(Value::as_str),
+            Some("wm")
+        );
+        assert_eq!(main_wt.get("branch").and_then(Value::as_str), Some("main"));
+        // Linked worktree: not main, open via the feature window.
+        let linked = &worktrees[1];
+        assert_eq!(linked.get("is_main").and_then(Value::as_bool), Some(false));
+        assert_eq!(linked.get("open").and_then(Value::as_bool), Some(true));
+        assert_eq!(linked.get("window_key").and_then(Value::as_str), Some("wf"));
+        assert_eq!(
+            linked.get("branch").and_then(Value::as_str),
+            Some("feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_marks_unopened_linked_worktree_closed_and_omits_github() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        // No remote at all → the repo carries no `github` identity.
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+
+        let svc = WorktreesService::new();
+        // Only the main checkout has a window; the linked worktree has none.
+        svc.handle(
+            "register",
+            json!({ "key": "wm", "folders": [main_dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        let repos = repos_of(&svc.handle("tree", Value::Null).await.unwrap());
+        assert_eq!(repos.len(), 1);
+        assert!(repos[0].get("github").is_none(), "no remote → no github");
+        let worktrees = repos[0].get("worktrees").and_then(Value::as_array).unwrap();
+        let linked = worktrees
+            .iter()
+            .find(|w| w.get("is_main").and_then(Value::as_bool) == Some(false))
+            .expect("the linked worktree");
+        // Enumerated even though no window has it open, and marked closed.
+        assert_eq!(linked.get("open").and_then(Value::as_bool), Some(false));
+        assert!(linked.get("window_key").is_none());
     }
 }

@@ -34,7 +34,7 @@ use tokio::sync::Notify;
 
 use clap::Parser as _;
 use omni_dev::cli::format::TableOrJson;
-use omni_dev::cli::worktrees::{ListCommand, WorktreesCommand, WorktreesSubcommands};
+use omni_dev::cli::worktrees::{ListCommand, TreeCommand, WorktreesCommand, WorktreesSubcommands};
 use omni_dev::cli::Cli;
 use omni_dev::daemon::client::DaemonClient;
 use omni_dev::daemon::protocol::{DaemonEnvelope, DaemonReply, MAX_LINE_BYTES};
@@ -333,6 +333,103 @@ async fn worktrees_cli_list_against_live_daemon() {
         socket: Some(missing),
         output: TableOrJson::Table,
         json: false,
+    }
+    .execute()
+    .await
+    .is_err());
+}
+
+/// Drives the real `omni-dev worktrees tree` CLI command struct against a live
+/// daemon: the table path, the JSON path, the subcommand wrapper, the top-level
+/// `Cli` dispatch, and the daemon-down error path. Like the `list` variant this
+/// is the only way to cover the `tree` command's socket-connecting code, which
+/// cannot run in the lib unit-test binary (it must not bind sockets). The
+/// registered folder is not a git repo, so `tree` returns an empty repo set —
+/// enough to exercise both render branches; populated rendering is unit-tested.
+#[tokio::test]
+async fn worktrees_cli_tree_against_live_daemon() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(WorktreesService::new()));
+    let handle = tokio::spawn(run(
+        registry,
+        DaemonOptions {
+            socket_path: socket.clone(),
+        },
+    ));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Seed a window so `tree` derives (and skips) a non-repo folder rather than
+    // taking the trivially-empty path.
+    client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "register",
+            json!({ "key": "k1", "folders": [dir.path()], "repo": "p" }),
+        ))
+        .await
+        .unwrap();
+
+    // Table path and JSON path.
+    TreeCommand {
+        socket: Some(socket.clone()),
+        output: TableOrJson::Table,
+    }
+    .execute()
+    .await
+    .unwrap();
+    TreeCommand {
+        socket: Some(socket.clone()),
+        output: TableOrJson::Json,
+    }
+    .execute()
+    .await
+    .unwrap();
+
+    // Through the subcommand wrapper (covers the `Tree` dispatch arm).
+    WorktreesCommand {
+        command: WorktreesSubcommands::Tree(TreeCommand {
+            socket: Some(socket.clone()),
+            output: TableOrJson::Table,
+        }),
+    }
+    .execute()
+    .await
+    .unwrap();
+
+    // Through the top-level CLI parse + dispatch.
+    let sock_str = socket.to_str().unwrap();
+    Cli::try_parse_from([
+        "omni-dev",
+        "worktrees",
+        "tree",
+        "--socket",
+        sock_str,
+        "-o",
+        "json",
+    ])
+    .unwrap()
+    .execute()
+    .await
+    .unwrap();
+
+    client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+    // With the daemon down, the CLI surfaces the connection failure.
+    let missing = dir.path().join("absent.sock");
+    assert!(TreeCommand {
+        socket: Some(missing),
+        output: TableOrJson::Table,
     }
     .execute()
     .await
