@@ -32,8 +32,8 @@ use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
 use crate::utils::settings::Settings;
 use client::{
-    AuthMethod, BrowserConfig, Error as ClientError, KeyPairConfig, Row, SnowflakeClient,
-    SnowflakeClientConfig, SnowflakeSession,
+    AuthMethod, BrowserConfig, BrowserLaunch, Error as ClientError, KeyPairConfig, Row,
+    SnowflakeClient, SnowflakeClientConfig, SnowflakeSession,
 };
 use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey};
 
@@ -77,6 +77,15 @@ const ENV_PRIVATE_KEY: &str = "SNOWFLAKE_PRIVATE_KEY";
 /// Env var for an encrypted key's passphrase. Recognized but not yet supported;
 /// setting it with the JWT method is a clear error.
 const ENV_PRIVATE_KEY_PASSPHRASE: &str = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
+/// Env var for the external-browser SSO launch command: a single command line
+/// with a `{url}` placeholder (or the URL is appended as a trailing arg when the
+/// placeholder is absent). Quote-aware (single/double quotes, backslash escapes)
+/// so program paths and argument values may contain spaces, e.g.
+/// `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+/// --profile-directory="Profile 1" --new-window {url}`. Blank/unset opens the OS
+/// default handler ([`BrowserLaunch::Auto`]). Ignored by the non-interactive
+/// auth methods (PAT / key-pair JWT), which open no browser.
+const ENV_BROWSER_COMMAND: &str = "SNOWFLAKE_BROWSER_COMMAND";
 
 /// Default pool size when `SNOWFLAKE_POOL_SIZE` is unset: the max concurrent
 /// queries (and max browser auths) per `(account, user)`.
@@ -188,6 +197,7 @@ impl SnowflakeEngineConfig {
         };
         let auth = resolve_auth_method(
             settings.get_env_var(ENV_AUTHENTICATOR).as_deref(),
+            settings.get_env_var(ENV_BROWSER_COMMAND),
             settings.get_env_var(ENV_TOKEN),
             private_key_pem,
             settings.get_env_var(ENV_PRIVATE_KEY_PASSPHRASE),
@@ -234,12 +244,20 @@ fn heartbeat_interval_from(raw: Option<String>) -> Duration {
 /// external-browser SSO, preserving the pre-#1108 default. The PAT secret is
 /// trimmed (dropping a stray trailing newline from `$(cat …)`-style values).
 ///
+/// `browser_command` (the raw `SNOWFLAKE_BROWSER_COMMAND` value) configures how
+/// external-browser SSO opens the sign-in URL: a non-blank value becomes a
+/// [`BrowserLaunch::Command`] (parsed by [`split_browser_command`]); blank/unset
+/// keeps [`BrowserLaunch::Auto`]. It is ignored by the non-interactive methods,
+/// which open no browser.
+///
 /// # Errors
 ///
 /// If the selector is unknown, a non-interactive method is selected without its
-/// credential, or an encrypted key passphrase is set (unsupported).
+/// credential, an encrypted key passphrase is set (unsupported), or (for
+/// external-browser) `browser_command` is present but cannot be tokenized.
 fn resolve_auth_method(
     authenticator: Option<&str>,
+    browser_command: Option<String>,
     token: Option<String>,
     private_key_pem: Option<String>,
     passphrase: Option<String>,
@@ -247,7 +265,17 @@ fn resolve_auth_method(
     let selector = authenticator.unwrap_or("").trim().to_ascii_lowercase();
     match selector.as_str() {
         "" | "externalbrowser" | "external_browser" => {
-            Ok(AuthMethod::ExternalBrowser(BrowserConfig::default()))
+            let launch = match browser_command
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+            {
+                Some(cmd) => BrowserLaunch::Command(split_browser_command(&cmd)?),
+                None => BrowserLaunch::Auto,
+            };
+            Ok(AuthMethod::ExternalBrowser(BrowserConfig {
+                launch,
+                ..BrowserConfig::default()
+            }))
         }
         "programmatic_access_token" | "pat" => {
             let token = token
@@ -285,6 +313,93 @@ fn resolve_auth_method(
              (expected externalbrowser, programmatic_access_token, or snowflake_jwt)"
         )),
     }
+}
+
+/// Tokenizes a `SNOWFLAKE_BROWSER_COMMAND` value into program + args with
+/// POSIX-style quoting so a program path or an argument value may contain
+/// spaces (`Google Chrome.app`, `--profile-directory="Profile 1"`):
+///
+/// - unquoted whitespace separates tokens;
+/// - single quotes take their contents literally;
+/// - double quotes group while a backslash escapes only `"` or `\` (so
+///   Windows-style paths keep their other backslashes);
+/// - an unquoted backslash escapes the next character.
+///
+/// The `{url}` placeholder is left intact here; the client's `open_browser`
+/// substitutes it (or appends the URL) at launch time.
+///
+/// # Errors
+///
+/// If a quote is left unterminated, or the value tokenizes to zero words.
+fn split_browser_command(raw: &str) -> Result<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // Distinguishes an empty quoted arg (`""`) from "no arg accumulated yet".
+    let mut has_word = false;
+    let mut chars = raw.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if has_word {
+                    words.push(std::mem::take(&mut current));
+                    has_word = false;
+                }
+            }
+            '\'' => {
+                has_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(ch) => current.push(ch),
+                        None => {
+                            bail!("{ENV_BROWSER_COMMAND} has an unterminated single quote: {raw}")
+                        }
+                    }
+                }
+            }
+            '"' => {
+                has_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(ch @ ('"' | '\\')) => current.push(ch),
+                            Some(ch) => {
+                                current.push('\\');
+                                current.push(ch);
+                            }
+                            None => bail!(
+                                "{ENV_BROWSER_COMMAND} has an unterminated double quote: {raw}"
+                            ),
+                        },
+                        Some(ch) => current.push(ch),
+                        None => {
+                            bail!("{ENV_BROWSER_COMMAND} has an unterminated double quote: {raw}")
+                        }
+                    }
+                }
+            }
+            '\\' => {
+                has_word = true;
+                match chars.next() {
+                    Some(ch) => current.push(ch),
+                    None => current.push('\\'),
+                }
+            }
+            ch => {
+                has_word = true;
+                current.push(ch);
+            }
+        }
+    }
+    if has_word {
+        words.push(current);
+    }
+    if words.is_empty() {
+        bail!("{ENV_BROWSER_COMMAND} is set but contains no command");
+    }
+    Ok(words)
 }
 
 /// A single arbitrary-SQL query request routed to the engine.
@@ -860,6 +975,55 @@ mod tests {
     }
 
     #[test]
+    fn split_browser_command_splits_on_unquoted_whitespace() {
+        assert_eq!(
+            split_browser_command("chrome --new-window {url}").unwrap(),
+            vec!["chrome", "--new-window", "{url}"]
+        );
+    }
+
+    #[test]
+    fn split_browser_command_keeps_quoted_spaces_together() {
+        // The motivating case: a program path and an argument value both with
+        // spaces, plus the `{url}` placeholder left intact for later substitution.
+        assert_eq!(
+            split_browser_command(
+                "'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+                 --profile-directory=\"Profile 1\" --new-window {url}"
+            )
+            .unwrap(),
+            vec![
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "--profile-directory=Profile 1",
+                "--new-window",
+                "{url}",
+            ]
+        );
+    }
+
+    #[test]
+    fn split_browser_command_handles_backslash_escapes() {
+        // An unquoted backslash escapes the next char; inside double quotes only
+        // `\"` and `\\` are escapes, so other backslashes (Windows paths) survive.
+        assert_eq!(
+            split_browser_command(r#"chrome a\ b "c\"d" "e\\f" "g\h""#).unwrap(),
+            vec!["chrome", "a b", "c\"d", "e\\f", "g\\h"]
+        );
+    }
+
+    #[test]
+    fn split_browser_command_rejects_unterminated_quotes() {
+        assert!(split_browser_command("chrome \"--flag").is_err());
+        assert!(split_browser_command("chrome '--flag").is_err());
+    }
+
+    #[test]
+    fn split_browser_command_rejects_an_empty_command() {
+        assert!(split_browser_command("   ").is_err());
+        assert!(split_browser_command("").is_err());
+    }
+
+    #[test]
     fn resolve_auth_method_defaults_to_external_browser() {
         // Unset, blank, and the explicit name all keep interactive SSO.
         for selector in [
@@ -870,16 +1034,98 @@ mod tests {
             Some("EXTERNALBROWSER"),
         ] {
             assert!(matches!(
-                resolve_auth_method(selector, None, None, None).unwrap(),
-                AuthMethod::ExternalBrowser(_)
+                resolve_auth_method(selector, None, None, None, None).unwrap(),
+                AuthMethod::ExternalBrowser(BrowserConfig {
+                    launch: BrowserLaunch::Auto,
+                    ..
+                })
             ));
         }
+    }
+
+    #[test]
+    fn resolve_auth_method_threads_browser_command() {
+        let auth = resolve_auth_method(
+            Some("externalbrowser"),
+            Some(
+                "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" \
+                 --profile-directory=\"Profile 1\" --new-window {url}"
+                    .to_string(),
+            ),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let AuthMethod::ExternalBrowser(BrowserConfig {
+            launch: BrowserLaunch::Command(args),
+            ..
+        }) = auth
+        else {
+            panic!("expected an external-browser Command launch");
+        };
+        assert_eq!(
+            args,
+            vec![
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+                "--profile-directory=Profile 1".to_string(),
+                "--new-window".to_string(),
+                "{url}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_auth_method_blank_browser_command_is_auto() {
+        // A blank/whitespace command is treated as unset, not a parse error.
+        assert!(matches!(
+            resolve_auth_method(None, Some("   ".to_string()), None, None, None).unwrap(),
+            AuthMethod::ExternalBrowser(BrowserConfig {
+                launch: BrowserLaunch::Auto,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_auth_method_rejects_a_malformed_browser_command() {
+        let err = resolve_auth_method(None, Some("chrome \"--flag".to_string()), None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains(ENV_BROWSER_COMMAND));
+    }
+
+    #[test]
+    fn resolve_auth_method_ignores_browser_command_for_non_interactive_methods() {
+        // PAT and JWT open no browser, so a set command is harmlessly ignored.
+        assert!(matches!(
+            resolve_auth_method(
+                Some("pat"),
+                Some("chrome {url}".to_string()),
+                Some("tok".to_string()),
+                None,
+                None,
+            )
+            .unwrap(),
+            AuthMethod::ProgrammaticAccessToken { .. }
+        ));
+        assert!(matches!(
+            resolve_auth_method(
+                Some("snowflake_jwt"),
+                Some("chrome {url}".to_string()),
+                None,
+                Some("pem".to_string()),
+                None,
+            )
+            .unwrap(),
+            AuthMethod::KeyPairJwt(_)
+        ));
     }
 
     #[test]
     fn resolve_auth_method_reads_pat_and_trims_it() {
         let auth = resolve_auth_method(
             Some("programmatic_access_token"),
+            None,
             Some("  tok-123\n".to_string()),
             None,
             None,
@@ -894,21 +1140,26 @@ mod tests {
     #[test]
     fn resolve_auth_method_accepts_the_pat_alias() {
         assert!(matches!(
-            resolve_auth_method(Some("pat"), Some("t".to_string()), None, None).unwrap(),
+            resolve_auth_method(Some("pat"), None, Some("t".to_string()), None, None).unwrap(),
             AuthMethod::ProgrammaticAccessToken { .. }
         ));
     }
 
     #[test]
     fn resolve_auth_method_errors_when_pat_is_missing_or_blank() {
-        assert!(resolve_auth_method(Some("programmatic_access_token"), None, None, None).is_err());
-        assert!(resolve_auth_method(Some("pat"), Some("   ".to_string()), None, None).is_err());
+        assert!(
+            resolve_auth_method(Some("programmatic_access_token"), None, None, None, None).is_err()
+        );
+        assert!(
+            resolve_auth_method(Some("pat"), None, Some("   ".to_string()), None, None).is_err()
+        );
     }
 
     #[test]
     fn resolve_auth_method_reads_key_pair_pem() {
         let auth = resolve_auth_method(
             Some("snowflake_jwt"),
+            None,
             None,
             Some("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----".to_string()),
             None,
@@ -927,7 +1178,8 @@ mod tests {
     fn resolve_auth_method_accepts_key_pair_aliases() {
         for selector in ["snowflake_jwt", "keypair", "key_pair", "jwt"] {
             assert!(matches!(
-                resolve_auth_method(Some(selector), None, Some("pem".to_string()), None).unwrap(),
+                resolve_auth_method(Some(selector), None, None, Some("pem".to_string()), None)
+                    .unwrap(),
                 AuthMethod::KeyPairJwt(_)
             ));
         }
@@ -935,16 +1187,22 @@ mod tests {
 
     #[test]
     fn resolve_auth_method_errors_when_key_is_missing() {
-        assert!(resolve_auth_method(Some("snowflake_jwt"), None, None, None).is_err());
-        assert!(
-            resolve_auth_method(Some("snowflake_jwt"), None, Some("  ".to_string()), None).is_err()
-        );
+        assert!(resolve_auth_method(Some("snowflake_jwt"), None, None, None, None).is_err());
+        assert!(resolve_auth_method(
+            Some("snowflake_jwt"),
+            None,
+            None,
+            Some("  ".to_string()),
+            None
+        )
+        .is_err());
     }
 
     #[test]
     fn resolve_auth_method_rejects_an_encrypted_key_passphrase() {
         let err = resolve_auth_method(
             Some("snowflake_jwt"),
+            None,
             None,
             Some("pem".to_string()),
             Some("hunter2".to_string()),
@@ -955,7 +1213,7 @@ mod tests {
 
     #[test]
     fn resolve_auth_method_rejects_an_unknown_selector() {
-        let err = resolve_auth_method(Some("carrier-pigeon"), None, None, None).unwrap_err();
+        let err = resolve_auth_method(Some("carrier-pigeon"), None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("carrier-pigeon"));
     }
 
