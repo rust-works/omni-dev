@@ -102,7 +102,7 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `jira_bulk_create` | Create many issues and (optionally) wire dependency links between them in one call — for epic decomposition. See [Bulk create + link](#bulk-create--link-jira_bulk_create) |
 | `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary raw-id `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool; prefer `jira_edit` for name-resolved field updates.) |
 | `jira_edit` | Set arbitrary fields on an existing issue by display name or canonical id — labels, selects, story points, rich-text custom fields, parent. Values are coerced to the API shape; rich-text strings are JFM→ADF converted (or pass a raw ADF object). Mirrors `omni-dev atlassian jira write --set-field` |
-| `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
+| `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names). Supply `resolution`, `custom_fields`, and/or `comment` for transitions whose screen requires input; a comment rides in the transition when the screen accepts one, else it is posted separately |
 | `jira_comment` | Add a comment to an issue |
 | `jira_dev` | Fetch development info (commits, branches, PRs) attached to an issue |
 | `jira_user_search` | Resolve a display name or email substring to an Atlassian `accountId` (call before `jira_write` for assignee/reporter) |
