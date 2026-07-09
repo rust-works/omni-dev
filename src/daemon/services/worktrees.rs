@@ -506,14 +506,13 @@ fn remote_github_identity(repo: &Repository) -> Option<GithubIdentity> {
     // drops the (per-name) errors, the second the non-UTF-8 `None`s. `names` is
     // bound so `iter()` can borrow it (only `&StringArray` is `IntoIterator`).
     let names = repo.remotes().ok();
-    for name in names.iter().flat_map(|arr| arr.iter()).flatten().flatten() {
-        if let Ok(remote) = repo.find_remote(name) {
-            if let Some(id) = remote.url().ok().and_then(github_identity) {
-                return Some(id);
-            }
-        }
-    }
-    None
+    names
+        .iter()
+        .flat_map(|arr| arr.iter())
+        .flatten()
+        .flatten()
+        .filter_map(|name| repo.find_remote(name).ok())
+        .find_map(|remote| remote.url().ok().and_then(github_identity))
 }
 
 /// Canonicalizes a path for stable comparison (resolving symlinks and `..`),
@@ -1588,6 +1587,14 @@ mod tests {
             remote_github_identity(&repo),
             github("rust-works", "omni-dev")
         );
+
+        // Origin non-GitHub but another remote is GitHub: the fallback loop over
+        // the remaining remotes finds it.
+        repo.remote_set_url("origin", "https://gitlab.com/o/r.git")
+            .unwrap();
+        repo.remote("upstream", "https://github.com/other/proj.git")
+            .unwrap();
+        assert_eq!(remote_github_identity(&repo), github("other", "proj"));
     }
 
     #[tokio::test]

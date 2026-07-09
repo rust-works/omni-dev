@@ -176,9 +176,10 @@ fn render_tree(result: &Value) -> String {
     }
     let mut out = String::new();
     for (i, repo) in repos.iter().enumerate() {
-        // A blank line separates repositories (but not before the first).
+        // A blank line separates repositories (but not before the first): the
+        // previous worktree row has no trailing newline, so two are needed.
         if i > 0 {
-            out.push('\n');
+            out.push_str("\n\n");
         }
         out.push_str(&repo_header(repo));
         for worktree in repo
@@ -312,28 +313,18 @@ mod tests {
         Wrapper::try_parse_from(full).unwrap().cmd
     }
 
-    fn parse_list(args: &[&str]) -> ListCommand {
-        match parse(args) {
-            WorktreesSubcommands::List(cmd) => cmd,
-            WorktreesSubcommands::Tree(_) => panic!("expected the list subcommand"),
-        }
-    }
-
-    fn parse_tree(args: &[&str]) -> TreeCommand {
-        match parse(args) {
-            WorktreesSubcommands::Tree(cmd) => cmd,
-            WorktreesSubcommands::List(_) => panic!("expected the tree subcommand"),
-        }
-    }
-
     #[test]
     fn list_parses_flags_and_defaults() {
-        let cmd = parse_list(&["list"]);
+        // Routing: `worktrees list` maps to the List variant.
+        assert!(matches!(parse(&["list"]), WorktreesSubcommands::List(_)));
+        // Flags, via the leaf parser (clap treats argv[0] as the command name).
+        let cmd = ListCommand::try_parse_from(["list"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Table);
         assert!(!cmd.json);
         assert!(cmd.socket.is_none());
 
-        let cmd = parse_list(&["list", "-o", "json", "--socket", "/tmp/d.sock"]);
+        let cmd =
+            ListCommand::try_parse_from(["list", "-o", "json", "--socket", "/tmp/d.sock"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Json);
         assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
     }
@@ -341,18 +332,21 @@ mod tests {
     #[test]
     fn list_deprecated_json_flag_still_parses() {
         // `--json` is captured separately; `execute` folds it into `output`.
-        let cmd = parse_list(&["list", "--json"]);
+        let cmd = ListCommand::try_parse_from(["list", "--json"]).unwrap();
         assert!(cmd.json);
         assert_eq!(cmd.output, TableOrJson::Table);
     }
 
     #[test]
     fn tree_parses_flags_and_defaults() {
-        let cmd = parse_tree(&["tree"]);
+        // Routing: `worktrees tree` maps to the Tree variant.
+        assert!(matches!(parse(&["tree"]), WorktreesSubcommands::Tree(_)));
+        let cmd = TreeCommand::try_parse_from(["tree"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Table);
         assert!(cmd.socket.is_none());
 
-        let cmd = parse_tree(&["tree", "-o", "json", "--socket", "/tmp/d.sock"]);
+        let cmd =
+            TreeCommand::try_parse_from(["tree", "-o", "json", "--socket", "/tmp/d.sock"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Json);
         assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
     }
@@ -521,6 +515,36 @@ mod tests {
         assert!(linked.contains("+1 -3"), "{linked}");
         // Header + two worktree rows.
         assert_eq!(out.lines().count(), 3, "{out}");
+    }
+
+    #[test]
+    fn render_tree_separates_multiple_repos_with_blank_line() {
+        let result = json!({ "repos": [
+            {
+                "main_repo": "alpha",
+                "root": "/r/alpha",
+                "worktrees": [
+                    { "path": "/r/alpha", "branch": "main", "is_main": true, "open": false },
+                ],
+            },
+            {
+                "main_repo": "beta",
+                "root": "/r/beta",
+                "worktrees": [
+                    { "path": "/r/beta", "branch": "main", "is_main": true, "open": false },
+                ],
+            },
+        ]});
+        let out = render_tree(&result);
+        // Two headers, two worktree rows, and one blank separator between repos.
+        assert!(
+            out.contains("\n\nbeta"),
+            "repos not blank-separated: {out:?}"
+        );
+        let alpha = out.find("alpha").unwrap();
+        let beta = out.find("beta").unwrap();
+        assert!(alpha < beta, "repo order not preserved: {out}");
+        assert_eq!(out.lines().count(), 5, "{out:?}");
     }
 
     #[test]
