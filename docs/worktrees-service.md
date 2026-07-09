@@ -166,9 +166,13 @@ extension never runs git.
 daemon's existing `0600` Unix control socket in its `0700` directory; no secret is
 persisted; everything is loopback/filesystem-local. The residual exposure is
 bounded by socket ownership — reading the socket reveals your open repo *paths*,
-and writing it (already requiring the owning local user) could inject entries or
-trigger a focus. The focus action additionally requires the target to be an
-existing absolute directory before spawning `code`. Registry strings
+and writing it (already requiring the owning local user) could inject entries or,
+via the **`open` op** (#1266), spawn `code` on a supplied path. That op is a
+small, deliberate escalation: before it, only the human clicking the tray could
+spawn `code`; now a socket *writer* can too — but still only as the owning local
+user, and only on an **existing absolute directory** (which also blocks a
+`-`-leading path from being parsed by `code` as a flag). The focus action and the
+`open` op share that same guard before spawning `code`. Registry strings
 (`repo`/`folders`, and the companion `title`) are writer-influenced metadata, so
 the `worktrees list` table strips control characters (C0, DEL, C1) from the
 strings it renders before writing to the terminal — a registered entry cannot
@@ -200,6 +204,7 @@ Ops:
 | `heartbeat`  | `{ key }`                                         | `{ known: <bool> }`            |
 | `unregister` | `{ key }`                                         | `{ removed: <bool> }`          |
 | `list`       | `null`                                            | `{ windows: [entry, …] }`      |
+| `open`       | `{ path }`                                       | `{ ok: true }`                 |
 
 Where:
 
@@ -210,6 +215,12 @@ Where:
   it evicts the longest-silent entry rather than rejecting, so the companion
   needs no retry logic (an evicted window re-registers off its next heartbeat).
 - `folders` — absolute workspace-folder paths.
+- `open` — `path` must be an existing **absolute** directory; the daemon then
+  spawns `code <path>`, which focuses the already-open window for that folder or
+  opens a new one. It shares the tray focus action's launcher resolution and
+  guard (#1266), so a client (the companion, on double-click) never duplicates
+  that logic. A relative or non-existent `path` is rejected with a clear error
+  before anything is spawned (see [Security](#security)).
 - A `list` `entry` is
   `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
   is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
