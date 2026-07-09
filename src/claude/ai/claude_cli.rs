@@ -36,7 +36,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
+use super::{
+    AiClient, AiClientCapabilities, AiClientMetadata, AiResponse, InvocationMetrics, RequestOptions,
+};
 use crate::claude::error::ClaudeError;
 use crate::request_log;
 use crate::utils::settings::EnvValueSource;
@@ -523,7 +525,7 @@ impl ClaudeCliAiClient {
         }
     }
 
-    async fn run(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    async fn run(&self, system_prompt: &str, user_prompt: &str) -> Result<(String, Option<f64>)> {
         self.run_with_options(system_prompt, user_prompt, &RequestOptions::default())
             .await
     }
@@ -533,12 +535,15 @@ impl ClaudeCliAiClient {
     /// Times the whole subprocess run and appends one `service = claude-cli`
     /// record (a non-HTTP entry: the subprocess makes its own API calls) so the
     /// `claude-cli` backend appears in the request log alongside the HTTP ones.
+    ///
+    /// Returns the response text plus the `total_cost_usd` reported by
+    /// `claude -p` (`None` when the CLI did not report one).
     async fn run_with_options(
         &self,
         system_prompt: &str,
         user_prompt: &str,
         options: &RequestOptions,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<f64>)> {
         let started = Instant::now();
         let result = self
             .run_with_options_inner(system_prompt, user_prompt, options)
@@ -568,7 +573,7 @@ impl ClaudeCliAiClient {
         system_prompt: &str,
         user_prompt: &str,
         options: &RequestOptions,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<f64>)> {
         let combined_system = format!("{system_prompt}{TOOL_SUPPRESSION_SUFFIX}");
 
         let temp_dir = tempfile::TempDir::new()
@@ -756,7 +761,7 @@ impl ClaudeCliAiClient {
 
         let result = strip_wrapping_code_fence(&envelope.result);
         super::log_response_success("Claude CLI", &Ok(result.clone()));
-        Ok(result)
+        Ok((result, envelope.total_cost_usd))
     }
 }
 
@@ -805,7 +810,8 @@ impl AiClient for ClaudeCliAiClient {
                 model = %self.model,
                 "Preparing claude -p subprocess request"
             );
-            self.run(system_prompt, user_prompt).await
+            let (text, _cost) = self.run(system_prompt, user_prompt).await?;
+            Ok(text)
         })
     }
 
@@ -829,8 +835,36 @@ impl AiClient for ClaudeCliAiClient {
                 model = %self.model,
                 "Preparing claude -p subprocess request (with options)"
             );
-            self.run_with_options(system_prompt, user_prompt, &options)
-                .await
+            let (text, _cost) = self
+                .run_with_options(system_prompt, user_prompt, &options)
+                .await?;
+            Ok(text)
+        })
+    }
+
+    fn send_request_with_metrics<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<AiResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            debug!(
+                system_prompt_len = system_prompt.len(),
+                user_prompt_len = user_prompt.len(),
+                has_schema = options.response_schema.is_some(),
+                model = %self.model,
+                "Preparing claude -p subprocess request (with metrics)"
+            );
+            // `claude -p` reports the billed cost directly, so surface it
+            // as-is rather than re-deriving it from token usage.
+            let (text, cost_usd) = self
+                .run_with_options(system_prompt, user_prompt, &options)
+                .await?;
+            Ok(AiResponse {
+                text,
+                metrics: InvocationMetrics { cost_usd },
+            })
         })
     }
 
@@ -1863,8 +1897,8 @@ mod tests {
     #[cfg(unix)]
     async fn cost_is_extracted_from_json_envelope_and_run_succeeds() {
         let _guard = shim_lock();
-        // Verifies the JSON envelope's total_cost_usd is parsed without
-        // error and the happy path still returns the result.
+        // Verifies the JSON envelope's total_cost_usd is parsed and surfaced
+        // as the run's cost, and the happy path still returns the result.
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1872,8 +1906,22 @@ mod tests {
             0,
         );
         let cli = client_with_shim(shim).with_max_budget_usd(Some(1.0));
-        let out = cli.run("sys", "user").await.unwrap();
+        let (out, cost) = cli.run("sys", "user").await.unwrap();
         assert_eq!(out, "ok");
+        assert_eq!(cost, Some(0.0123));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_reports_none_cost_when_envelope_omits_total_cost_usd() {
+        let _guard = shim_lock();
+        // Older `claude -p` builds may not emit total_cost_usd; the run still
+        // succeeds and reports the cost as unknown (`None`).
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(&tmp, r#"{"is_error":false,"result":"ok"}"#, 0);
+        let (out, cost) = client_with_shim(shim).run("sys", "user").await.unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(cost, None);
     }
 
     #[test]
@@ -1989,7 +2037,7 @@ mod tests {
             "properties": {"title": {"type": "string"}}
         });
         let opts = RequestOptions::default().with_response_schema(schema);
-        let out = cli
+        let (out, _cost) = cli
             .run_with_options("sys", "user", &opts)
             .await
             .expect("run_with_options should succeed");
@@ -2013,7 +2061,7 @@ mod tests {
             "properties": {"answer": {"type": "string"}}
         });
         let opts = RequestOptions::default().with_response_schema(schema.clone());
-        let out = cli
+        let (out, _cost) = cli
             .run_with_options("sys", "user", &opts)
             .await
             .expect("run_with_options should succeed");
@@ -2274,7 +2322,7 @@ mod tests {
         let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(&tmp, r#"{"is_error":false,"result":"hello from shim"}"#, 0);
-        let out = client_with_shim(shim).run("sys", "user").await.unwrap();
+        let (out, _cost) = client_with_shim(shim).run("sys", "user").await.unwrap();
         assert_eq!(out, "hello from shim");
     }
 
@@ -2290,7 +2338,7 @@ mod tests {
             r#"{"is_error":false,"result":"```yaml\namendments: []\n```"}"#,
             0,
         );
-        let out = client_with_shim(shim).run("sys", "user").await.unwrap();
+        let (out, _cost) = client_with_shim(shim).run("sys", "user").await.unwrap();
         assert_eq!(out, "amendments: []");
     }
 
@@ -2470,7 +2518,7 @@ mod tests {
             drop(blocker);
         });
 
-        let out = client_with_shim(shim).run("sys", "user").await.unwrap();
+        let (out, _cost) = client_with_shim(shim).run("sys", "user").await.unwrap();
         release.await.unwrap();
         assert_eq!(out, "late");
     }

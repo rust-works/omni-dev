@@ -127,6 +127,61 @@ pub(crate) fn registry_model_limits(
     }
 }
 
+/// Returns the `(input, output)` USD prices *per million tokens* for a model
+/// from the registry, or `None` when the model is unknown or unpriced.
+///
+/// Backed by [`crate::claude::model_config::ModelSpec::input_token_price`] /
+/// [`output_token_price`](crate::claude::model_config::ModelSpec::output_token_price),
+/// so it inherits the same identifier normalization as the other registry
+/// lookups (Bedrock/region prefixes, version suffixes). Both prices must be
+/// present for a `Some` result — a half-priced entry is treated as unpriced.
+#[must_use]
+pub(crate) fn registry_token_prices(model: &str) -> Option<(f64, f64)> {
+    let registry = get_model_registry();
+    let spec = registry.get_model_spec(model)?;
+    match (spec.input_token_price, spec.output_token_price) {
+        (Some(input), Some(output)) => Some((input, output)),
+        _ => None,
+    }
+}
+
+/// Computes USD cost from token counts and *per-million-token* prices.
+///
+/// Pure arithmetic split out from [`compute_cost_usd`] so it can be tested
+/// against a fixture price table independent of the model registry.
+#[must_use]
+pub(crate) fn cost_from_prices(
+    input_tokens: u64,
+    output_tokens: u64,
+    input_price: f64,
+    output_price: f64,
+) -> f64 {
+    (output_tokens as f64 / 1_000_000.0).mul_add(
+        output_price,
+        (input_tokens as f64 / 1_000_000.0) * input_price,
+    )
+}
+
+/// Computes the USD cost of an invocation from token counts and the model's
+/// registry prices, or `None` (with a `warn`) when the model is unpriced so
+/// unpriced usage is noticed rather than silently zeroed.
+#[must_use]
+pub(crate) fn compute_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+    let Some((input_price, output_price)) = registry_token_prices(model) else {
+        tracing::warn!(
+            model = %model,
+            "no price table entry for model; cost_usd will be reported as unknown"
+        );
+        return None;
+    };
+    Some(cost_from_prices(
+        input_tokens,
+        output_tokens,
+        input_price,
+        output_price,
+    ))
+}
+
 /// Checks an HTTP response for error status and returns a structured error
 /// if non-success.
 ///
@@ -233,6 +288,34 @@ impl RequestOptions {
     }
 }
 
+/// Per-invocation telemetry returned alongside an AI response.
+///
+/// Decouples call telemetry from the response payload so more fields (token
+/// counts, cache hits, …) can be added without touching every backend's
+/// return type. `cost_usd` is `None` when the backend cannot determine a
+/// price (missing usage data, an unpriced model, or a backend that does not
+/// yet populate it) — callers fall back to reporting the cost as unknown.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InvocationMetrics {
+    /// Total billed cost of the invocation in USD, if known.
+    pub cost_usd: Option<f64>,
+}
+
+/// An AI response paired with its per-invocation [`InvocationMetrics`].
+///
+/// Returned by [`AiClient::send_request_with_metrics`]. The plain
+/// [`send_request`](AiClient::send_request) /
+/// [`send_request_with_options`](AiClient::send_request_with_options) paths
+/// keep returning a bare `String`, so existing call sites are unaffected;
+/// telemetry-aware callers opt in via the metrics method.
+#[derive(Clone, Debug)]
+pub struct AiResponse {
+    /// The model's text response.
+    pub text: String,
+    /// Per-invocation telemetry (cost, …).
+    pub metrics: InvocationMetrics,
+}
+
 /// Trait for AI service clients.
 pub trait AiClient: Send + Sync {
     /// Sends a request to the AI service and returns the raw response.
@@ -270,6 +353,32 @@ pub trait AiClient: Send + Sync {
         _options: RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         self.send_request(system_prompt, user_prompt)
+    }
+
+    /// Sends a request and returns the response text plus per-invocation
+    /// [`InvocationMetrics`] (cost, …).
+    ///
+    /// The default implementation dispatches via
+    /// [`Self::send_request_with_options`] and reports empty metrics
+    /// (`cost_usd: None`), so backends that cannot surface a cost — including
+    /// `bedrock` and `openai` — need no change. Backends that can determine a
+    /// cost (the direct Anthropic API from token usage, `claude-cli` from its
+    /// reported `total_cost_usd`) override this method to populate the field.
+    fn send_request_with_metrics<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<AiResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let text = self
+                .send_request_with_options(system_prompt, user_prompt, options)
+                .await?;
+            Ok(AiResponse {
+                text,
+                metrics: InvocationMetrics::default(),
+            })
+        })
     }
 }
 
@@ -365,5 +474,49 @@ mod tests {
     fn request_options_default_has_no_schema() {
         let opts = RequestOptions::default();
         assert!(opts.response_schema.is_none());
+    }
+
+    #[test]
+    fn invocation_metrics_default_has_no_cost() {
+        assert_eq!(InvocationMetrics::default().cost_usd, None);
+    }
+
+    /// Cost arithmetic against a fixture price table and fixture token counts.
+    /// $3 / MTok input, $15 / MTok output; 1M input + 1M output → $18.
+    #[test]
+    fn cost_from_prices_uses_per_million_token_rates() {
+        assert!((cost_from_prices(1_000_000, 1_000_000, 3.0, 15.0) - 18.0).abs() < 1e-9);
+        // 500k input + 200k output at $3 / $15 → 1.5 + 3.0 = 4.5.
+        assert!((cost_from_prices(500_000, 200_000, 3.0, 15.0) - 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_from_prices_zero_tokens_is_zero() {
+        assert!(cost_from_prices(0, 0, 3.0, 15.0).abs() < 1e-12);
+    }
+
+    /// A priced model in the registry yields a `Some` cost via the full
+    /// registry-backed path.
+    #[test]
+    fn compute_cost_usd_priced_model_is_some() {
+        // claude-sonnet-4-6 is priced at $3 / $15 per MTok in models.yaml.
+        let cost = compute_cost_usd("claude-sonnet-4-6", 1_000_000, 1_000_000);
+        assert_eq!(cost, Some(18.0));
+    }
+
+    /// An unpriced / unknown model yields `None` (the unknown-cost fallback).
+    #[test]
+    fn compute_cost_usd_unknown_model_is_none() {
+        assert_eq!(
+            compute_cost_usd("totally-unknown-vendor-x", 1_000, 1_000),
+            None
+        );
+    }
+
+    /// OpenAI/Gemini entries are intentionally unpriced (out of scope), so
+    /// they surface cost as unknown rather than a bogus zero.
+    #[test]
+    fn registry_token_prices_none_for_unpriced_entry() {
+        assert_eq!(registry_token_prices("gpt-5"), None);
     }
 }
