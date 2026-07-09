@@ -180,6 +180,28 @@ impl WorktreesRegistry {
         let windows = self.lock();
         windows.get(key).and_then(|e| e.folders.first().cloned())
     }
+
+    /// Snapshots the distinct workspace folders across all live windows — the
+    /// seed set the adapter resolves to repositories (each folder → its git
+    /// common dir → repo root) to enumerate every worktree per repo (#1265).
+    ///
+    /// Reaps stale entries first, then returns the folders sorted and
+    /// deduplicated. Like [`list`](Self::list) it is pure CPU under the lock:
+    /// the git resolution the "distinct repos" derivation needs is disk I/O and
+    /// stays in the adapter, off the registry lock, honouring the
+    /// `Mutex`-never-across-`.await` invariant.
+    pub fn open_folders(&self) -> Vec<PathBuf> {
+        let now = Utc::now();
+        let mut windows = self.lock();
+        reap(&mut windows, self.ttl, now);
+        let mut folders: Vec<PathBuf> = windows
+            .values()
+            .flat_map(|e| e.folders.iter().cloned())
+            .collect();
+        folders.sort();
+        folders.dedup();
+        folders
+    }
 }
 
 impl Default for WorktreesRegistry {
@@ -297,6 +319,63 @@ mod tests {
             pid: None,
         });
         assert!(reg.first_folder("w2").is_none());
+    }
+
+    #[test]
+    fn open_folders_dedups_and_sorts_across_windows() {
+        let reg = WorktreesRegistry::new();
+        assert!(reg.open_folders().is_empty());
+        // Two windows sharing a folder, plus a multi-folder window: the shared
+        // path collapses and the result is sorted.
+        reg.register(register_request("w1", Some("repo-a"), "/tmp/shared"));
+        reg.register(RegisterRequest {
+            key: "w2".to_string(),
+            folders: vec![PathBuf::from("/tmp/shared"), PathBuf::from("/tmp/b")],
+            repo: Some("repo-a".to_string()),
+            title: None,
+            pid: None,
+        });
+        reg.register(register_request("w3", Some("repo-b"), "/tmp/a"));
+        assert_eq!(
+            reg.open_folders(),
+            vec![
+                PathBuf::from("/tmp/a"),
+                PathBuf::from("/tmp/b"),
+                PathBuf::from("/tmp/shared"),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_folders_reaps_stale_windows() {
+        let reg = WorktreesRegistry::new();
+        {
+            let mut windows = reg.lock();
+            windows.insert(
+                "fresh".to_string(),
+                WindowEntry {
+                    key: "fresh".to_string(),
+                    folders: vec![PathBuf::from("/tmp/fresh")],
+                    repo: None,
+                    title: None,
+                    pid: None,
+                    last_seen: Utc::now(),
+                },
+            );
+            windows.insert(
+                "stale".to_string(),
+                WindowEntry {
+                    key: "stale".to_string(),
+                    folders: vec![PathBuf::from("/tmp/stale")],
+                    repo: None,
+                    title: None,
+                    pid: None,
+                    last_seen: Utc::now() - chrono::Duration::seconds(120),
+                },
+            );
+        }
+        // The stale window's folder is reaped out of the snapshot.
+        assert_eq!(reg.open_folders(), vec![PathBuf::from("/tmp/fresh")]);
     }
 
     #[test]
