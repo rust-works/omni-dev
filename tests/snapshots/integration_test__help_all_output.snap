@@ -3476,6 +3476,7 @@ Usage: worktrees <COMMAND>
 
 Commands:
   list  List the repos/worktrees currently open across all windows
+  tree  Show every repository and all its worktrees, grouped by repository
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3489,6 +3490,20 @@ omni-dev worktrees list - List the repos/worktrees currently open across all win
 List the repos/worktrees currently open across all windows
 
 Usage: list [OPTIONS]
+
+Options:
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev worktrees tree - Show every repository and all its worktrees, grouped by repository
+
+Show every repository and all its worktrees, grouped by repository
+
+Usage: tree [OPTIONS]
 
 Options:
       --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
