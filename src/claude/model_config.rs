@@ -460,9 +460,28 @@ impl ModelRegistry {
     }
 
     /// Infers the provider from a model identifier.
+    ///
+    /// Consulted only as a fallback when an identifier does not match any
+    /// known [`ModelSpec`]: the inferred provider selects which provider's
+    /// [`DefaultConfig`] (from [`ProviderConfig::defaults`]) supplies the
+    /// fallback limits. Recognised identifier shapes:
+    ///
+    /// - `claude`: starts with `claude`, or contains `anthropic` (covers the
+    ///   Bedrock/AWS region-prefixed forms).
+    /// - `openai`: starts with `gpt` or `chatgpt`, or is an `o<N>` reasoning
+    ///   identifier (`o1-mini`, `o3`, `o4-mini`, …).
+    /// - `gemini`: starts with `gemini`.
+    ///
+    /// Returns `None` when the provider cannot be inferred, in which case the
+    /// caller applies the ultimate hard-coded fallback.
     fn infer_provider(&self, api_identifier: &str) -> Option<String> {
-        if api_identifier.starts_with("claude") || api_identifier.contains("anthropic") {
+        let id = api_identifier;
+        if id.starts_with("claude") || id.contains("anthropic") {
             Some("claude".to_string())
+        } else if id.starts_with("gpt") || id.starts_with("chatgpt") || is_openai_reasoning_id(id) {
+            Some("openai".to_string())
+        } else if id.starts_with("gemini") {
+            Some("gemini".to_string())
         } else {
             None
         }
@@ -591,6 +610,16 @@ impl ModelRegistry {
         }
         self.get_input_context(api_identifier)
     }
+}
+
+/// Returns `true` for OpenAI reasoning-series identifiers: a leading `o`
+/// immediately followed by a digit (`o1-mini`, `o3`, `o4-mini`, and any
+/// future `o<N>` variant). Kept separate from the `gpt`/`chatgpt` prefixes so
+/// the reasoning family is matched without also swallowing unrelated
+/// identifiers that merely begin with `o`.
+fn is_openai_reasoning_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Default project-local catalog path: `<cwd>/.omni-dev/models.yaml`.
@@ -875,6 +904,39 @@ mod tests {
             registry.get_input_context("totally-unknown-vendor-x"),
             FALLBACK_INPUT_CONTEXT
         );
+    }
+
+    #[test]
+    fn unknown_openai_model_uses_openai_provider_defaults() {
+        let registry = embedded_only();
+
+        // Brand-new OpenAI identifiers the embedded catalog has not caught up
+        // to yet resolve to the `openai` provider defaults (16384/128000), not
+        // the ultimate hard-coded fallback. Covers the gpt-, chatgpt-, and
+        // o<N>-reasoning identifier shapes.
+        for id in ["gpt-6-ultra", "chatgpt-6-latest", "o5-preview"] {
+            assert_eq!(
+                registry.get_max_output_tokens(id),
+                16384,
+                "max_output_tokens for {id}"
+            );
+            assert_eq!(
+                registry.get_input_context(id),
+                128_000,
+                "input_context for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_gemini_model_uses_gemini_provider_defaults() {
+        let registry = embedded_only();
+
+        // Unknown Gemini identifier resolves to the `gemini` provider defaults
+        // (8192/1048576) rather than the ultimate hard-coded fallback.
+        let id = "gemini-9-pro";
+        assert_eq!(registry.get_max_output_tokens(id), 8192);
+        assert_eq!(registry.get_input_context(id), 1_048_576);
     }
 
     #[test]
