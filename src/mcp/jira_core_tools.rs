@@ -22,8 +22,9 @@ use crate::atlassian::custom_fields::{
 };
 use crate::atlassian::document::{issue_to_jfm_document, CustomFieldSection, JfmDocument};
 use crate::atlassian::jira_types::{
-    JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
+    EditMeta, JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
+use crate::atlassian::transition_fields::resolve_transition_fields;
 use crate::cli::atlassian::helpers::create_client;
 
 use super::catalogue_cache::CatalogueCache;
@@ -330,9 +331,23 @@ pub struct JiraTransitionParams {
     /// or `"31"`. Required unless `list` is true.
     #[serde(default)]
     pub transition: Option<String>,
-    /// Optional comment to add after the transition.
+    /// Optional comment (JFM markdown). Delivered in the transition itself when
+    /// the transition screen accepts a comment (atomic, satisfies a
+    /// mandatory-comment screen); otherwise posted as a separate comment after
+    /// the transition succeeds.
     #[serde(default)]
     pub comment: Option<String>,
+    /// Optional resolution to set on the transition, e.g. `"Fixed"`. Sent as
+    /// `{"name": ...}`; the transition screen must accept a resolution.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Optional transition-screen fields, as a map of field name (or canonical
+    /// id) → value. Values are coerced to the API shape the same way
+    /// `jira_write`'s `fields` are (select/option → option string, arrays a
+    /// string array, number/date the bare scalar). Names resolve against the
+    /// transition's screen fields.
+    #[serde(default)]
+    pub custom_fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// If true, returns the available transitions without applying one.
     #[serde(default)]
     pub list: Option<bool>,
@@ -1014,18 +1029,38 @@ async fn run_jira_transition(
     key: &str,
     transition: Option<&str>,
     comment: Option<&str>,
+    resolution: Option<&str>,
+    custom_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     list: bool,
 ) -> Result<String> {
-    let transitions = client.get_transitions(key).await?;
-
+    // The list path stays lean; only the execute path needs screen fields.
     if list || transition.is_none() {
+        let transitions = client.get_transitions(key).await?;
         return yaml_result(&transitions);
     }
 
+    let (transitions, metas) = client.get_transitions_with_fields(key).await?;
     let target = transition.unwrap_or_default();
     let matched = resolve_transition(target, &transitions)?.clone();
+
+    // Resolve `custom_fields` / `resolution` against this transition's screen.
+    let scalars = custom_fields
+        .map(json_fields_to_yaml_scalars)
+        .unwrap_or_default();
+    let default_meta = EditMeta::default();
+    let editmeta = metas.get(&matched.id).unwrap_or(&default_meta);
+    let resolved = resolve_transition_fields(&scalars, resolution, editmeta)?;
+
+    // Convert the comment (if any) to ADF once; route it into the transition
+    // body when the screen accepts a comment, else post it separately after.
+    let comment_adf = comment
+        .filter(|s| !s.is_empty())
+        .map(markdown_to_validated_adf)
+        .transpose()?;
+    let in_body_comment = comment_adf.as_ref().filter(|_| resolved.comment_on_screen);
+
     client
-        .do_transition(key, &matched.id)
+        .do_transition_with_fields(key, &matched.id, &resolved.fields, in_body_comment)
         .await
         .with_context(|| {
             format!(
@@ -1037,9 +1072,10 @@ async fn run_jira_transition(
             )
         })?;
 
-    if let Some(body) = comment.filter(|s| !s.is_empty()) {
-        let adf = markdown_to_validated_adf(body)?;
-        client.add_comment(key, &adf).await?;
+    if !resolved.comment_on_screen {
+        if let Some(adf) = comment_adf.as_ref() {
+            client.add_comment(key, adf).await?;
+        }
     }
 
     Ok(format!(
@@ -1413,7 +1449,11 @@ impl OmniDevServer {
                        case-insensitively. If unsure which transitions are valid from the issue's \
                        current status, call this tool first with `list = true` (or omit `transition`) \
                        to get the available `{id, name}` pairs as YAML, then call again with one of \
-                       those names. Optionally posts `comment` (JFM markdown) after the transition succeeds."
+                       those names. For transitions whose screen requires input, pass `resolution` \
+                       (e.g. \"Fixed\") and/or `custom_fields` (a name→value map). Optionally pass \
+                       `comment` (JFM markdown): it rides in the transition when the screen accepts \
+                       a comment (satisfying a mandatory-comment screen), otherwise it is posted \
+                       separately after the transition succeeds."
     )]
     pub async fn jira_transition(
         &self,
@@ -1426,6 +1466,8 @@ impl OmniDevServer {
             &params.key,
             params.transition.as_deref(),
             params.comment.as_deref(),
+            params.resolution.as_deref(),
+            params.custom_fields.as_ref(),
             list,
         )
         .await
@@ -1583,7 +1625,7 @@ impl OmniDevServer {
 mod tests {
     use super::*;
     use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
-    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::matchers::{body_json, body_partial_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -3548,7 +3590,7 @@ mod tests {
         .await;
 
         let client = mock_client(&server.uri());
-        let yaml = run_jira_transition(&client, "PROJ-1", None, None, true)
+        let yaml = run_jira_transition(&client, "PROJ-1", None, None, None, None, true)
             .await
             .unwrap();
         assert!(yaml.contains("In Progress"));
@@ -3566,7 +3608,7 @@ mod tests {
         .await;
 
         let client = mock_client(&server.uri());
-        let yaml = run_jira_transition(&client, "PROJ-1", None, None, false)
+        let yaml = run_jira_transition(&client, "PROJ-1", None, None, None, None, false)
             .await
             .unwrap();
         assert!(yaml.contains("In Progress"));
@@ -3595,7 +3637,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let result = run_jira_transition(&client, "PROJ-1", Some("Done"), None, false)
+        let result = run_jira_transition(&client, "PROJ-1", Some("Done"), None, None, None, false)
             .await
             .unwrap();
         assert!(result.contains("Transitioned"));
@@ -3621,9 +3663,17 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let err = run_jira_transition(&client, "PROJ-1", Some("Done"), Some(BAD_ADF_JFM), false)
-            .await
-            .unwrap_err();
+        let err = run_jira_transition(
+            &client,
+            "PROJ-1",
+            Some("Done"),
+            Some(BAD_ADF_JFM),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));
@@ -3651,9 +3701,17 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        run_jira_transition(&client, "PROJ-1", Some("Done"), Some("nice"), false)
-            .await
-            .unwrap();
+        run_jira_transition(
+            &client,
+            "PROJ-1",
+            Some("Done"),
+            Some("nice"),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3665,7 +3723,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_transition(&client, "PROJ-1", None, None, true)
+        let err = run_jira_transition(&client, "PROJ-1", None, None, None, None, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
@@ -3686,7 +3744,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_transition(&client, "PROJ-1", Some("Done"), None, false)
+        let err = run_jira_transition(&client, "PROJ-1", Some("Done"), None, None, None, false)
             .await
             .unwrap_err();
         let chain = format!("{err:#}");
@@ -3724,9 +3782,17 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_transition(&client, "PROJ-1", Some("Done"), Some("nice"), false)
-            .await
-            .unwrap_err();
+        let err = run_jira_transition(
+            &client,
+            "PROJ-1",
+            Some("Done"),
+            Some("nice"),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
@@ -3740,10 +3806,108 @@ mod tests {
         )
         .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_transition(&client, "PROJ-1", Some("Nope"), None, false)
+        let err = run_jira_transition(&client, "PROJ-1", Some("Nope"), None, None, None, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("No transition matching"));
+    }
+
+    /// Mounts an expanded-transitions GET whose "Resolve" transition (id 21)
+    /// carries the given screen `fields`.
+    async fn mount_expanded_transitions(server: &MockServer, fields: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .and(query_param("expand", "transitions.fields"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transitions": [
+                    {"id": "21", "name": "Resolve", "hasScreen": true, "fields": fields}
+                ]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_jira_transition_sends_resolution_and_custom_fields() {
+        let server = MockServer::start().await;
+        mount_expanded_transitions(
+            &server,
+            serde_json::json!({
+                "resolution": {"name": "Resolution", "schema": {"type": "resolution"}},
+                "customfield_100": {
+                    "name": "Severity",
+                    "schema": {"type": "option"},
+                    "allowedValues": [{"value": "High"}]
+                }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .and(body_partial_json(serde_json::json!({
+                "transition": {"id": "21"},
+                "fields": {
+                    "resolution": {"name": "Fixed"},
+                    "customfield_100": {"value": "High"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut custom_fields = std::collections::BTreeMap::new();
+        custom_fields.insert("Severity".to_string(), serde_json::json!("High"));
+        let result = run_jira_transition(
+            &client,
+            "PROJ-1",
+            Some("Resolve"),
+            None,
+            Some("Fixed"),
+            Some(&custom_fields),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("Transitioned"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_transition_comment_rides_in_body_when_screen_accepts_it() {
+        let server = MockServer::start().await;
+        mount_expanded_transitions(
+            &server,
+            serde_json::json!({
+                "comment": {"name": "Comment", "schema": {"type": "comment"}}
+            }),
+        )
+        .await;
+        // Comment rides in the transition body; no separate /comment mock, so a
+        // fallback post would 404 and fail the test.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .and(body_partial_json(serde_json::json!({
+                "transition": {"id": "21"},
+                "update": {"comment": [{"add": {"body": {"type": "doc"}}}]}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        run_jira_transition(
+            &client,
+            "PROJ-1",
+            Some("Resolve"),
+            Some("done"),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
     }
 
     // ── run_jira_transition_list ───────────────────────────────────────────
