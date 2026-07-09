@@ -1,8 +1,12 @@
 //! The worktrees daemon service.
 //!
 //! A thin adapter that hosts the cross-window [`WorktreesRegistry`] under the
-//! daemon's lifecycle and exposes register/heartbeat/unregister/list/tree over
-//! the control socket, plus a tray submenu with a per-window "focus" action.
+//! daemon's lifecycle and exposes register/heartbeat/unregister/list/tree/open
+//! over the control socket, plus a tray submenu with a per-window "focus" action.
+//! The `open` op (#1266) focuses/opens an arbitrary worktree folder in VS Code
+//! through the **same** launcher path the tray uses, so a socket client (the
+//! companion's double-click) shares the tested guard and launcher resolution
+//! rather than duplicating them.
 //!
 //! All registry state and liveness logic (the `Mutex<HashMap>`, TTL reaping, the
 //! entry cap/eviction) lives in [`crate::worktrees`]; this adapter only routes
@@ -161,11 +165,11 @@ impl DaemonService for WorktreesService {
                 Ok(json!({ "ok": true }))
             }
             "heartbeat" => {
-                let key = require_key(&payload, "heartbeat")?;
+                let key = require_str(&payload, "key", "heartbeat")?;
                 Ok(json!({ "known": self.registry.heartbeat(key) }))
             }
             "unregister" => {
-                let key = require_key(&payload, "unregister")?;
+                let key = require_str(&payload, "key", "unregister")?;
                 Ok(json!({ "removed": self.registry.unregister(key) }))
             }
             "list" => Ok(json!({ "windows": enriched_windows(self.registry.list()).await })),
@@ -178,6 +182,19 @@ impl DaemonService for WorktreesService {
                 let folders = self.registry.open_folders();
                 let windows = self.registry.list();
                 Ok(json!({ "repos": tree_repos(folders, windows).await }))
+            }
+            "open" => {
+                // Focus (or open — VS Code reuses an already-open window) an
+                // arbitrary worktree folder supplied by a socket client, reusing
+                // the tray's launcher path: `focus_window` resolves the launcher
+                // (`OMNI_DEV_VSCODE_BIN` → well-known paths → `code`) and applies
+                // the absolute-existing-directory guard (which also blocks a
+                // `-`-leading path being parsed by `code` as a flag). This is the
+                // one op a socket *writer* can use to spawn `code`; see the
+                // ADR-0040 threat model (#1266).
+                let path = require_str(&payload, "path", "open")?;
+                focus_window(Path::new(path))?;
+                Ok(json!({ "ok": true }))
             }
             other => bail!("unknown worktrees op: {other}"),
         }
@@ -243,13 +260,14 @@ impl DaemonService for WorktreesService {
     }
 }
 
-/// Extracts a required string `key` from an op payload, erroring with the op
-/// name when it is absent or not a string.
-fn require_key<'a>(payload: &'a Value, op: &str) -> Result<&'a str> {
+/// Extracts a required string `field` from an op payload, erroring with the op
+/// name when it is absent or not a string. Shared by `heartbeat`/`unregister`
+/// (`key`) and `open` (`path`).
+fn require_str<'a>(payload: &'a Value, field: &str, op: &str) -> Result<&'a str> {
     payload
-        .get("key")
+        .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("`{op}` requires `key`"))
+        .ok_or_else(|| anyhow!("`{op}` requires `{field}`"))
 }
 
 /// The live git state of a worktree folder: the checked-out branch and how far
@@ -762,8 +780,10 @@ fn focus_window(folder: &Path) -> Result<()> {
 /// Best-effort and non-blocking: the spawned child is reaped on a detached
 /// thread so a long-lived daemon does not accumulate zombies one per focus.
 fn focus_window_with(program: &Path, folder: &Path) -> Result<()> {
-    // Workspace-folder paths are absolute; requiring it also rules out a path
-    // that begins with `-` being parsed by `code` as a flag.
+    // The tray path passes an absolute workspace folder, but the socket `open`
+    // op (#1266) passes an arbitrary client-supplied path, so this guard is a
+    // real check there, not just an assertion: requiring an absolute path also
+    // rules out a `-`-leading path being parsed by `code` as a flag.
     if !folder.is_absolute() {
         bail!(
             "refusing to focus a non-absolute folder path: {}",
@@ -905,7 +925,7 @@ mod tests {
             .handle("register", json!({ "key": "  " }))
             .await
             .is_err());
-        // heartbeat/unregister require the key via `require_key`.
+        // heartbeat/unregister require the key via `require_str`.
         assert!(svc.handle("heartbeat", json!({})).await.is_err());
         assert!(svc.handle("unregister", json!({})).await.is_err());
     }
@@ -1113,9 +1133,12 @@ mod tests {
         svc.shutdown().await;
     }
 
-    /// Restores `OMNI_DEV_VSCODE_BIN` on drop. Only this test reads the variable
-    /// (via `resolve_code_binary` → `focus_window`), so there is no cross-test
-    /// race despite the process-global mutation.
+    /// Restores `OMNI_DEV_VSCODE_BIN` on drop. The two spawn tests that read the
+    /// variable (via `resolve_code_binary` → `focus_window`) —
+    /// `menu_action_focus_resolves_folder_and_spawns` and
+    /// `open_focuses_an_existing_absolute_dir` — both point the launcher at the
+    /// same harmless `/bin/sh`, and no test asserts the variable is *unset*, so a
+    /// transient overlap under the harness's test parallelism is benign.
     struct VscodeBinGuard(Option<std::ffi::OsString>);
     impl Drop for VscodeBinGuard {
         fn drop(&mut self) {
@@ -1142,6 +1165,49 @@ mod tests {
         let _g = VscodeBinGuard(std::env::var_os(VSCODE_BIN_ENV));
         std::env::set_var(VSCODE_BIN_ENV, "/bin/sh");
         svc.menu_action("focus:w1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_rejects_missing_relative_or_nonexistent_path() {
+        let svc = WorktreesService::new();
+        // A missing `path` is a payload error.
+        assert!(svc.handle("open", json!({})).await.is_err());
+        assert!(svc.handle("open", json!({ "path": 42 })).await.is_err());
+        // A relative path is rejected before any spawn — this is also what
+        // blocks a `-`-leading argument from reaching `code` as a flag.
+        assert!(svc
+            .handle("open", json!({ "path": "relative/dir" }))
+            .await
+            .is_err());
+        assert!(svc
+            .handle("open", json!({ "path": "-flag" }))
+            .await
+            .is_err());
+        // An absolute path that does not exist is rejected before any spawn, so
+        // no launcher is needed for these guard cases.
+        assert!(svc
+            .handle("open", json!({ "path": "/no/such/abs/dir/xyzzy" }))
+            .await
+            .is_err());
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_focuses_an_existing_absolute_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = WorktreesService::new();
+        // Pin the launcher to a harmless binary so the spawn deterministically
+        // succeeds whether or not `code` is installed. Unlike the tray `focus`
+        // path, `open` takes the folder straight from the payload — no prior
+        // `register` is required.
+        let _g = VscodeBinGuard(std::env::var_os(VSCODE_BIN_ENV));
+        std::env::set_var(VSCODE_BIN_ENV, "/bin/sh");
+        let reply = svc
+            .handle("open", json!({ "path": dir.path() }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "ok": true }));
+        svc.shutdown().await;
     }
 
     #[test]
