@@ -1924,6 +1924,58 @@ mod tests {
         assert_eq!(cost, None);
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_request_trait_returns_result_text() {
+        let _guard = shim_lock();
+        // The plain trait `send_request` discards the cost and returns text.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(
+            &tmp,
+            r#"{"is_error":false,"result":"hi","total_cost_usd":0.01}"#,
+            0,
+        );
+        let out = client_with_shim(shim)
+            .send_request("sys", "user")
+            .await
+            .unwrap();
+        assert_eq!(out, "hi");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_request_with_metrics_surfaces_reported_cost() {
+        let _guard = shim_lock();
+        // The trait metrics method surfaces the CLI's total_cost_usd verbatim.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(
+            &tmp,
+            r#"{"is_error":false,"result":"ok","total_cost_usd":0.0456}"#,
+            0,
+        );
+        let response = client_with_shim(shim)
+            .send_request_with_metrics("sys", "user", RequestOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(response.text, "ok");
+        assert_eq!(response.metrics.cost_usd, Some(0.0456));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_request_with_metrics_reports_none_cost_without_total_cost_usd() {
+        let _guard = shim_lock();
+        // No total_cost_usd in the envelope → the metrics method reports None.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(&tmp, r#"{"is_error":false,"result":"ok"}"#, 0);
+        let response = client_with_shim(shim)
+            .send_request_with_metrics("sys", "user", RequestOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(response.text, "ok");
+        assert_eq!(response.metrics.cost_usd, None);
+    }
+
     #[test]
     fn resolve_alias_known() {
         assert_eq!(resolve_alias("haiku"), "claude-haiku-4-5-20251001");
