@@ -155,6 +155,18 @@ pub struct ModelSpec {
     /// Whether this is a legacy model that may be deprecated.
     #[serde(default)]
     pub legacy: bool,
+    /// Price per million *input* tokens in USD, if known.
+    ///
+    /// Used to compute per-invocation cost for backends that report token
+    /// usage (currently the direct Anthropic API — see
+    /// [`crate::claude::ai::compute_cost_usd`]). `None` for unpriced models
+    /// (e.g. the OpenAI/Gemini entries), which surface cost as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_price: Option<f64>,
+    /// Price per million *output* tokens in USD, if known. See
+    /// [`Self::input_token_price`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_price: Option<f64>,
     /// Beta headers that unlock enhanced limits for this model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_headers: Vec<BetaHeader>,
