@@ -156,6 +156,7 @@ directly without resolving defaults themselves):
 | Sign-in deadline (s) | `SNOWFLAKE_AUTH_TIMEOUT` | — (config only) |
 | Query deadline (s) | `SNOWFLAKE_QUERY_TIMEOUT` | — (config only) |
 | Keep-alive interval (s) | `SNOWFLAKE_HEARTBEAT_INTERVAL` | — (config only) |
+| Browser command | `SNOWFLAKE_BROWSER_COMMAND` | — (config only) |
 
 `SNOWFLAKE_POOL_SIZE` (default 4) caps the concurrent sessions — and therefore the
 browser auths — per `(account, user)`. A burst of more than that many concurrent
@@ -178,10 +179,10 @@ to reach an AWS/Azure **PrivateLink** endpoint
 default derivation can't produce. It applies to every session this daemon
 creates; leave it unset for the standard public host.
 
-The host override, the pool size, the timeouts, and the heartbeat interval are
-operational (config-only) settings read from the **daemon's** environment once
-at startup — restart the daemon (`omni-dev daemon restart`) to change them. They
-are not affected by the client's `--profile`.
+The host override, the pool size, the timeouts, the heartbeat interval, and the
+browser command are operational (config-only) settings read from the **daemon's**
+environment once at startup — restart the daemon (`omni-dev daemon restart`) to
+change them. They are not affected by the client's `--profile`.
 
 `settings.json` fallback example:
 
@@ -244,14 +245,39 @@ session for each `(account, user)` is established.
 ### External-browser SSO (default)
 
 The client's external-browser flow auto-opens a browser and binds an ephemeral
-localhost callback — no TTY needed, suitable for the resident daemon. (The browser
-launch is configurable, so it can target a specific profile in a new window;
-threading that from settings is a follow-up.) The first query for a new
-`(account, user)` triggers the popup; reuse is silent. On a session-expiry error
-the session is evicted and the next query re-authenticates (so the popup is always
-tied to a user action). If browser launch is unreliable under a background launchd
-daemon, run the first auth from a foreground context
+localhost callback — no TTY needed, suitable for the resident daemon. The first
+query for a new `(account, user)` triggers the popup; reuse is silent. On a
+session-expiry error the session is evicted and the next query re-authenticates
+(so the popup is always tied to a user action). If browser launch is unreliable
+under a background launchd daemon, run the first auth from a foreground context
 (`omni-dev daemon start --foreground`).
+
+By default the SSO URL opens with the OS default handler (`open` / `xdg-open` /
+`explorer`). Set **`SNOWFLAKE_BROWSER_COMMAND`** to launch a specific browser or
+Chrome profile instead — the value is a single command line with a `{url}`
+placeholder (or the URL is appended as a trailing argument when the placeholder
+is absent):
+
+```json
+{
+  "env": {
+    "SNOWFLAKE_BROWSER_COMMAND": "\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --profile-directory=\"Profile 1\" --new-window {url}"
+  }
+}
+```
+
+The command is split with POSIX-style quoting (single quotes, double quotes, and
+backslash escapes), so a program path or an argument value may contain spaces
+(`Google Chrome.app`, `--profile-directory="Profile 1"`). A value that is present
+but malformed (an unterminated quote, or one that tokenizes to no words) is a hard
+error at daemon startup rather than a silent fall back to the default handler.
+Leave it unset for the default handler. It applies only to external-browser SSO;
+the non-interactive methods below open no browser and ignore it.
+
+> **macOS note:** to open a *specific* Chrome profile you must exec the Chrome
+> binary directly (as above). `open -a "Google Chrome" --args
+> --profile-directory=…` is ignored when Chrome is already running — `open`
+> just focuses the existing process without applying the profile flag.
 
 ### Programmatic access token (PAT)
 
