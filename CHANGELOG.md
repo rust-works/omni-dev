@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **ADF schema snapshot bumped to `@atlaskit/adf-schema` 56.1.1** ([#1231](https://github.com/rust-works/omni-dev/issues/1231)): Refreshes the pinned upstream snapshot from `56.0.9` to `56.1.1` after the weekly `adf-schema-drift` job detected an upstream release. This is a **version bump only** — and another inert one: the upstream `dist/json-schema/v1/full.json` is **byte-for-byte identical** across all of these releases (same `full_json_sha256`), so the vendored `assets/adf-schema/full.json` is unchanged and the regenerated `generated.rs` carries the same `UPSTREAM_ENTRIES` and `UPSTREAM_FULL_JSON_SHA256` as before. The only changes are the provenance constants that pin *which release* the snapshot was taken from: `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` in `src/atlassian/adf_schema.rs`, the mirrored `UPSTREAM_VERSION` / `UPSTREAM_TARBALL_SHA256` in `generated.rs`, `assets/adf-schema/provenance.json`, and the JFM spec + README version references. No validation behaviour changes. (The drift job flagged `56.0.15`; `56.1.1` was the current `latest` at refresh time and is also content-identical, so the snapshot is pinned to it to keep the drift job green.)
+
 ## [0.33.0] - 2026-07-08
 
 ### Added
