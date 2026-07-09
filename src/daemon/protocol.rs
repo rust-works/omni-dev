@@ -4,6 +4,25 @@
 //! [`DaemonEnvelope`] request per line, one [`DaemonReply`] response per line.
 //! New optional fields use `#[serde(default, skip_serializing_if = ...)]` so
 //! older peers stay byte-compatible on the wire.
+//!
+//! ## Subscriptions (streaming replies)
+//!
+//! Most ops are strictly request→one-reply. A **subscription** op is the one
+//! exception (#1267): when a service recognises the op as streaming (via
+//! [`DaemonService::subscribe`](super::service::DaemonService::subscribe)) the
+//! server switches that connection to push mode and emits **many**
+//! [`DaemonReply`] lines on the same connection — an initial snapshot, then a
+//! fresh snapshot each time the service's state changes (coalesced, and diffed
+//! so two identical frames are never sent in a row). Each pushed line is an
+//! ordinary `DaemonReply::ok(payload)`; there is **no** new wire type, so a
+//! reader distinguishes a subscription only by continuing to read lines instead
+//! of stopping after one. The stream ends when the client sends any further line
+//! (an explicit cancel), disconnects, or the daemon shuts down.
+//!
+//! The only subscription today is `worktrees` / `subscribe`, whose payload is
+//! the `{ "repos": [...] }` tree snapshot. Back-compat is total: an older client
+//! never sends a subscription op, so it only ever sees the classic one-reply
+//! exchange.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

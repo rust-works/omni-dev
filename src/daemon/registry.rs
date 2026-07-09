@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use super::service::{DaemonService, ServiceStatus};
+use super::service::{DaemonService, ServiceStatus, ServiceStream};
 
 /// Holds the daemon's registered services and routes control-socket envelopes
 /// to them by [`name`](DaemonService::name).
@@ -50,6 +50,19 @@ impl ServiceRegistry {
             .get(service)
             .ok_or_else(|| anyhow!("unknown service: {service}"))?;
         svc.handle(op, payload).await
+    }
+
+    /// Opens a push subscription on the named service for a streaming `op`, or
+    /// `None` when the service is unknown or does not stream that op — in which
+    /// case the caller falls back to the normal [`dispatch`](Self::dispatch)
+    /// request→reply path (#1267).
+    pub fn subscribe(
+        &self,
+        service: &str,
+        op: &str,
+        payload: &Value,
+    ) -> Option<Box<dyn ServiceStream>> {
+        self.get(service)?.subscribe(op, payload)
     }
 
     /// Collects status from every service, in registration order.

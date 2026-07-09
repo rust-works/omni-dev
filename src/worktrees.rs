@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 /// How long a window may go silent before it ages out of the registry. Three
 /// missed ~10s heartbeats; a window that crashed without firing `unregister`
@@ -93,6 +94,20 @@ pub struct WorktreesRegistry {
     windows: Mutex<HashMap<String, WindowEntry>>,
     /// How long an entry survives without a heartbeat.
     ttl: Duration,
+    /// A monotonically-bumped version counter, incremented whenever the visible
+    /// set of windows changes (a `register`, a removing `unregister`, or a
+    /// mutation-driven reap that drops a stale entry). A push-subscription
+    /// consumer holds a [`watch::Receiver`] from
+    /// [`subscribe_changes`](Self::subscribe_changes) and wakes on each bump to
+    /// re-snapshot (#1267). The counter's *value* is immaterial —
+    /// only that it changed — so a burst coalesces into one wake and the
+    /// subscriber diffs the resulting snapshot to suppress duplicate frames.
+    ///
+    /// `watch` needs no runtime and never blocks, so it fits this engine's
+    /// no-async-setup posture; every [`bump`](Self::bump) happens *after* the map
+    /// guard is dropped, so the `std::Mutex`-never-across-`.await` rule is intact
+    /// (and the watch's own internal lock is never nested under the map lock).
+    changes: watch::Sender<u64>,
 }
 
 impl WorktreesRegistry {
@@ -102,7 +117,31 @@ impl WorktreesRegistry {
         Self {
             windows: Mutex::new(HashMap::new()),
             ttl: DEFAULT_TTL,
+            changes: watch::channel(0).0,
         }
+    }
+
+    /// A change-notification receiver for the push subscription: it observes a
+    /// new value each time the visible window set changes (see [`changes`] and
+    /// [`bump`]). Created with the current version already marked seen, so the
+    /// first [`watch::Receiver::changed`] resolves on the *next* change — the
+    /// subscriber sends its own initial snapshot up front and then waits for
+    /// deltas (#1267).
+    ///
+    /// [`changes`]: Self::changes
+    /// [`bump`]: Self::bump
+    #[must_use]
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Signals subscribers that the visible window set changed. Non-blocking and
+    /// runtime-free; called only *after* the map guard is released so the two
+    /// locks never nest. A send never fails here (the sender is owned by the
+    /// registry, which outlives every receiver, and `send_modify` bumps even
+    /// with no receivers).
+    fn bump(&self) {
+        self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Locks the registry, recovering from a poisoned mutex (a panic in a prior
@@ -117,24 +156,31 @@ impl WorktreesRegistry {
     /// callers validate the `key` before reaching here.
     pub fn register(&self, req: RegisterRequest) {
         let now = Utc::now();
-        let mut windows = self.lock();
-        reap(&mut windows, self.ttl, now);
-        // Upserts never evict; only a genuinely new key can grow the map, and
-        // never past MAX_WINDOWS.
-        if !windows.contains_key(&req.key) && windows.len() >= MAX_WINDOWS {
-            evict_oldest(&mut windows);
+        {
+            let mut windows = self.lock();
+            reap(&mut windows, self.ttl, now);
+            // Upserts never evict; only a genuinely new key can grow the map, and
+            // never past MAX_WINDOWS.
+            if !windows.contains_key(&req.key) && windows.len() >= MAX_WINDOWS {
+                evict_oldest(&mut windows);
+            }
+            windows.insert(
+                req.key.clone(),
+                WindowEntry {
+                    key: req.key,
+                    folders: req.folders,
+                    repo: req.repo,
+                    title: req.title,
+                    pid: req.pid,
+                    last_seen: now,
+                },
+            );
         }
-        windows.insert(
-            req.key.clone(),
-            WindowEntry {
-                key: req.key,
-                folders: req.folders,
-                repo: req.repo,
-                title: req.title,
-                pid: req.pid,
-                last_seen: now,
-            },
-        );
+        // Always bump: a register is infrequent (once per companion `activate()`,
+        // not per heartbeat) and may add or alter a window's folders/repo. A
+        // no-op re-register with identical data is harmless — the subscriber
+        // diffs the snapshot and suppresses the duplicate frame.
+        self.bump();
     }
 
     /// Refreshes a window's liveness. Returns whether the key was known: a
@@ -143,28 +189,51 @@ impl WorktreesRegistry {
     /// has no record of it.
     pub fn heartbeat(&self, key: &str) -> bool {
         let now = Utc::now();
-        let mut windows = self.lock();
-        reap(&mut windows, self.ttl, now);
-        match windows.get_mut(key) {
-            Some(entry) => {
-                entry.last_seen = now;
-                true
-            }
-            None => false,
+        let (known, reaped) = {
+            let mut windows = self.lock();
+            let reaped = reap(&mut windows, self.ttl, now);
+            let known = match windows.get_mut(key) {
+                Some(entry) => {
+                    entry.last_seen = now;
+                    true
+                }
+                None => false,
+            };
+            (known, reaped)
+        };
+        // A heartbeat is frequent (~every 10 s per window); a pure liveness
+        // refresh does not change the visible set, so bump *only* when this
+        // heartbeat's inline reap actually aged a stale sibling out.
+        if reaped > 0 {
+            self.bump();
         }
+        known
     }
 
     /// Drops a window's registration. Returns whether an entry was present.
     pub fn unregister(&self, key: &str) -> bool {
         let now = Utc::now();
-        let mut windows = self.lock();
-        let removed = windows.remove(key).is_some();
-        reap(&mut windows, self.ttl, now);
+        let (removed, reaped) = {
+            let mut windows = self.lock();
+            let removed = windows.remove(key).is_some();
+            let reaped = reap(&mut windows, self.ttl, now);
+            (removed, reaped)
+        };
+        if removed || reaped > 0 {
+            self.bump();
+        }
         removed
     }
 
     /// Reaps stale entries, then returns the live set sorted for deterministic
     /// output. Holds the lock only for pure-CPU work.
+    ///
+    /// Like the other reads ([`open_folders`](Self::open_folders),
+    /// [`first_folder`](Self::first_folder)) this reaps but never
+    /// [`bump`](Self::bump)s: the only observer of a read-path reap is the push
+    /// subscription's own re-snapshot (or `status`/`menu`), and the
+    /// subscription's periodic tick already re-samples read-only staleness — so
+    /// bumping here would only make the subscription wake itself (#1267).
     pub fn list(&self) -> Vec<WindowEntry> {
         let now = Utc::now();
         let mut windows = self.lock();
@@ -210,11 +279,17 @@ impl Default for WorktreesRegistry {
     }
 }
 
-/// Removes entries last seen longer than `ttl` ago. Pure CPU; the caller holds
-/// the registry lock but never `.await`s while holding it.
-fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, now: DateTime<Utc>) {
+/// Removes entries last seen longer than `ttl` ago, returning how many were
+/// dropped. Pure CPU; the caller holds the registry lock but never `.await`s
+/// while holding it. The count lets a *mutation* path
+/// ([`register`](WorktreesRegistry::register) et al.) decide whether to
+/// [`bump`](WorktreesRegistry::bump) the change-notify; read paths ignore it (see
+/// [`list`](WorktreesRegistry::list)).
+fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, now: DateTime<Utc>) -> usize {
     let max_age = ttl.as_secs() as i64;
+    let before = windows.len();
     windows.retain(|_, e| (now - e.last_seen).num_seconds() <= max_age);
+    before - windows.len()
 }
 
 /// Removes the entry with the oldest `last_seen` (ties broken by lowest key
@@ -528,5 +603,64 @@ mod tests {
     fn default_constructs_an_empty_registry() {
         let reg = WorktreesRegistry::default();
         assert!(reg.lock().is_empty());
+    }
+
+    // --- Change-notify for the push subscription (#1267) --------------------
+
+    #[test]
+    fn subscribe_changes_starts_seen_and_register_bumps() {
+        let reg = WorktreesRegistry::new();
+        let mut rx = reg.subscribe_changes();
+        // A fresh receiver has the current version already marked seen.
+        assert!(!rx.has_changed().unwrap());
+        // A register changes the visible set → the receiver observes a new value.
+        reg.register(register_request("w1", None, "/tmp/a"));
+        assert!(rx.has_changed().unwrap(), "register should bump");
+        // Marking it seen clears the pending change.
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn unregister_bumps_only_when_it_removes() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        // Subscribe *after* the register so its bump is already seen.
+        let rx = reg.subscribe_changes();
+        // Removing a missing key changes nothing (and reaps nothing) → no bump.
+        assert!(!reg.unregister("ghost"));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a no-op unregister must not bump"
+        );
+        // Removing a present key bumps.
+        assert!(reg.unregister("w1"));
+        assert!(
+            rx.has_changed().unwrap(),
+            "a removing unregister should bump"
+        );
+    }
+
+    #[test]
+    fn heartbeat_bumps_only_when_it_reaps() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        let rx = reg.subscribe_changes();
+        // A plain heartbeat refreshes liveness but changes no visible state.
+        assert!(reg.heartbeat("w1"));
+        assert!(!rx.has_changed().unwrap(), "a pure heartbeat must not bump");
+        // Seed a stale sibling directly; a heartbeat that reaps it *does* bump.
+        {
+            let mut windows = reg.lock();
+            windows.insert(
+                "stale".to_string(),
+                entry_at("stale", Utc::now() - chrono::Duration::seconds(120)),
+            );
+        }
+        assert!(reg.heartbeat("w1"));
+        assert!(
+            rx.has_changed().unwrap(),
+            "a heartbeat that reaps a stale sibling should bump"
+        );
     }
 }

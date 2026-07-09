@@ -41,10 +41,13 @@ use async_trait::async_trait;
 use git2::Repository;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
+use crate::daemon::service::{
+    DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus, ServiceStream,
+};
 use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
 
 /// The worktrees service name (the control-socket routing key).
@@ -198,6 +201,20 @@ impl DaemonService for WorktreesService {
             }
             other => bail!("unknown worktrees op: {other}"),
         }
+    }
+
+    fn subscribe(&self, op: &str, _payload: &Value) -> Option<Box<dyn ServiceStream>> {
+        // The single streaming op: a live push of the repo/worktree `tree`
+        // snapshot. Every other op falls through to the request→reply `handle`.
+        if op != "subscribe" {
+            return None;
+        }
+        Some(Box::new(WorktreesStream {
+            registry: self.registry.clone(),
+            // Capture the change source *now* — before the server takes its
+            // initial snapshot — so a change racing that snapshot still wakes us.
+            changes: self.registry.subscribe_changes(),
+        }))
     }
 
     fn menu(&self) -> MenuSnapshot {
@@ -655,6 +672,46 @@ async fn tree_repos(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<Val
     })
     .await
     .unwrap_or_default()
+}
+
+// --- Push subscription (#1267) -----------------------------------------------
+
+/// The [`ServiceStream`] backing the worktrees `subscribe` op: a live push of
+/// the same `{ repos: [...] }` snapshot the `tree` op returns (#1265). The
+/// server drives it — awaiting [`changed`](ServiceStream::changed) plus its own
+/// periodic tick, then diffing [`snapshot`](ServiceStream::snapshot) — so this
+/// type only has to (a) relay the registry's change-notify and (b) recompute the
+/// tree on demand.
+struct WorktreesStream {
+    /// The cross-window registry the snapshot is computed from.
+    registry: Arc<WorktreesRegistry>,
+    /// Wakes on each visible-set change (a `register`, a removing `unregister`,
+    /// or a mutation-driven reap). A burst coalesces into one wakeup; the
+    /// server's diff drops any snapshot that ends up identical.
+    changes: watch::Receiver<u64>,
+}
+
+#[async_trait]
+impl ServiceStream for WorktreesStream {
+    async fn changed(&mut self) {
+        // `watch::Receiver::changed` marks the newest version seen, so a burst of
+        // bumps collapses into a single wakeup. If every sender is gone (the
+        // registry — and thus the daemon — is tearing down) it returns `Err`;
+        // park instead of returning, so this arm can never spin the server's
+        // `select!` (the tick and shutdown arms still drive teardown).
+        if self.changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn snapshot(&self) -> Value {
+        // Identical to the `tree` op: two cheap registry locks (the seed folders
+        // to derive repos from, and the live windows to join on), then the git
+        // enumeration/enrichment off the lock on a blocking thread.
+        let folders = self.registry.open_folders();
+        let windows = self.registry.list();
+        json!({ "repos": tree_repos(folders, windows).await })
+    }
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,
@@ -1122,6 +1179,70 @@ mod tests {
         let svc = WorktreesService::default();
         let payload = svc.handle("list", Value::Null).await.unwrap();
         assert_eq!(payload, json!({ "windows": [] }));
+    }
+
+    // --- Push subscription (#1267) -----------------------------------------
+
+    #[tokio::test]
+    async fn subscribe_streams_only_for_the_subscribe_op() {
+        let svc = WorktreesService::new();
+        // The one streaming op yields a stream; every other op (including the
+        // request/reply worktrees ops) declines, so the server dispatches them
+        // normally.
+        assert!(svc.subscribe("subscribe", &Value::Null).is_some());
+        assert!(svc.subscribe("list", &Value::Null).is_none());
+        assert!(svc.subscribe("register", &Value::Null).is_none());
+        assert!(svc.subscribe("bogus", &Value::Null).is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_snapshot_matches_the_tree_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        let svc = WorktreesService::new();
+        let stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // No windows yet → no repos derived.
+        assert_eq!(stream.snapshot().await, json!({ "repos": [] }));
+
+        // A window opens on the repo → the snapshot carries it, byte-identical to
+        // what the `tree` op returns for the same registry state.
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [dir.path()], "repo": "r" }),
+        )
+        .await
+        .unwrap();
+        let snap = stream.snapshot().await;
+        let tree = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(snap, tree);
+        let repos = snap["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["worktrees"][0]["branch"], json!("main"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_changed_wakes_on_register() {
+        let svc = WorktreesService::new();
+        let mut stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // Idle: `changed()` must not resolve without a registry change.
+        tokio::select! {
+            () = stream.changed() => panic!("changed resolved with no registry change"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // A register bumps the change-notify → `changed()` resolves promptly.
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stream.changed())
+            .await
+            .expect("changed should resolve after a register");
     }
 
     #[tokio::test]
