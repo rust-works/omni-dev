@@ -14,6 +14,8 @@ models:
   - provider: "claude"
     model: "Claude Opus 4.6"
     api_identifier: "claude-opus-4-6"
+    input_token_price: 5.0
+    output_token_price: 25.0
     max_output_tokens: 128000
     input_context: 200000
     generation: 4.6
@@ -26,6 +28,8 @@ models:
   - provider: "claude"
     model: "Claude Sonnet 4.6"
     api_identifier: "claude-sonnet-4-6"
+    input_token_price: 3.0
+    output_token_price: 15.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 4.6
@@ -39,6 +43,8 @@ models:
   - provider: "claude"
     model: "Claude Sonnet 4.5"
     api_identifier: "claude-sonnet-4-5-20250929"
+    input_token_price: 3.0
+    output_token_price: 15.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 4.5
@@ -51,6 +57,8 @@ models:
   - provider: "claude"
     model: "Claude Haiku 4.5"
     api_identifier: "claude-haiku-4-5-20251001"
+    input_token_price: 1.0
+    output_token_price: 5.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 4.5
@@ -59,6 +67,8 @@ models:
   - provider: "claude"
     model: "Claude Opus 4.5"
     api_identifier: "claude-opus-4-5-20251101"
+    input_token_price: 5.0
+    output_token_price: 25.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 4.5
@@ -69,6 +79,8 @@ models:
   - provider: "claude"
     model: "Claude Opus 4.1"
     api_identifier: "claude-opus-4-1-20250805"
+    input_token_price: 15.0
+    output_token_price: 75.0
     max_output_tokens: 32000
     input_context: 200000
     generation: 4.1
@@ -78,6 +90,8 @@ models:
   - provider: "claude"
     model: "Claude Opus 4"
     api_identifier: "claude-opus-4-20250514"
+    input_token_price: 15.0
+    output_token_price: 75.0
     max_output_tokens: 32000
     input_context: 200000
     generation: 4
@@ -87,6 +101,8 @@ models:
   - provider: "claude"
     model: "Claude Sonnet 4"
     api_identifier: "claude-sonnet-4-20250514"
+    input_token_price: 3.0
+    output_token_price: 15.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 4
@@ -101,6 +117,8 @@ models:
   - provider: "claude"
     model: "Claude Sonnet 3.7"
     api_identifier: "claude-3-7-sonnet-20250219"
+    input_token_price: 3.0
+    output_token_price: 15.0
     max_output_tokens: 64000
     input_context: 200000
     generation: 3.7
@@ -117,6 +135,8 @@ models:
   - provider: "claude"
     model: "Claude Haiku 3.5"
     api_identifier: "claude-3-5-haiku-20241022"
+    input_token_price: 0.8
+    output_token_price: 4.0
     max_output_tokens: 8192
     input_context: 200000
     generation: 3.5
@@ -126,6 +146,8 @@ models:
   - provider: "claude"
     model: "Claude Haiku 3"
     api_identifier: "claude-3-haiku-20240307"
+    input_token_price: 0.25
+    output_token_price: 1.25
     max_output_tokens: 4096
     input_context: 200000
     generation: 3
@@ -136,6 +158,8 @@ models:
   - provider: "claude"
     model: "Claude Opus 3"
     api_identifier: "claude-3-opus-20240229"
+    input_token_price: 15.0
+    output_token_price: 75.0
     max_output_tokens: 4096
     input_context: 200000
     generation: 3
@@ -145,6 +169,8 @@ models:
   - provider: "claude"
     model: "Claude Sonnet 3.5"
     api_identifier: "claude-3-5-sonnet-20241022"
+    input_token_price: 3.0
+    output_token_price: 15.0
     max_output_tokens: 8192
     input_context: 200000
     generation: 3.5

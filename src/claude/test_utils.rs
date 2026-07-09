@@ -175,4 +175,20 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0], ("sys".to_string(), "user".to_string()));
     }
+
+    /// The default `send_request_with_metrics` returns the delegated text with
+    /// empty metrics (`cost_usd: None`) — the behaviour `bedrock`/`openai`
+    /// inherit unchanged.
+    #[tokio::test]
+    async fn default_send_request_with_metrics_reports_no_cost() {
+        let client = ConfigurableMockAiClient::new(vec![Ok("hello".to_string())]);
+
+        let response = client
+            .send_request_with_metrics("sys", "user", RequestOptions::default())
+            .await
+            .expect("default send_request_with_metrics should succeed");
+
+        assert_eq!(response.text, "hello");
+        assert_eq!(response.metrics.cost_usd, None);
+    }
 }
