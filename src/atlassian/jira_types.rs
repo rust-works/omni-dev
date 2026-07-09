@@ -1157,6 +1157,11 @@ pub(crate) struct JiraTransitionEntry {
     pub(crate) to: Option<JiraTransitionToEntry>,
     #[serde(rename = "hasScreen", default)]
     pub(crate) has_screen: Option<bool>,
+    /// Transition-screen field metadata, populated only when the request adds
+    /// `expand=transitions.fields`. Same shape as the editmeta fields map, so it
+    /// reuses [`JiraEditMetaField`]. Empty for the lean list path.
+    #[serde(default)]
+    pub(crate) fields: std::collections::BTreeMap<String, JiraEditMetaField>,
 }
 
 #[derive(Deserialize)]

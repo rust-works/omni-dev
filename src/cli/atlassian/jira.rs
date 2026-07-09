@@ -192,6 +192,9 @@ mod tests {
                 command: transition::TransitionSubcommands::Execute(transition::ExecuteCommand {
                     key: "PROJ-1".to_string(),
                     transition: "Done".to_string(),
+                    set_fields: vec![],
+                    resolution: None,
+                    comment: None,
                 }),
             }),
         };

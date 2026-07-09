@@ -30,15 +30,16 @@ use crate::atlassian::jira_types::{
     JiraCreateMetaFullResponse, JiraCreateMetaResponse, JiraCreateMetaSchemaRaw,
     JiraCreateResponse, JiraCreatedIssue, JiraDevBranch, JiraDevCommit, JiraDevProvider,
     JiraDevPullRequest, JiraDevRepository, JiraDevStatus, JiraDevStatusCount, JiraDevStatusSummary,
-    JiraEditMetaResponse, JiraField, JiraFieldContextsResponse, JiraFieldEntry, JiraFieldOption,
-    JiraFieldOptionsResponse, JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse, JiraIssueLink,
-    JiraIssueLinksResponse, JiraLinkType, JiraLinkTypesResponse, JiraProject, JiraProjectList,
-    JiraProjectSearchResponse, JiraProjectVersion, JiraProjectVersionEntry, JiraProjectVersionList,
-    JiraRemoteIssueLink, JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon,
+    JiraEditMetaField, JiraEditMetaResponse, JiraField, JiraFieldContextsResponse, JiraFieldEntry,
+    JiraFieldOption, JiraFieldOptionsResponse, JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse,
+    JiraIssueLink, JiraIssueLinksResponse, JiraLinkType, JiraLinkTypesResponse, JiraProject,
+    JiraProjectList, JiraProjectSearchResponse, JiraProjectVersion, JiraProjectVersionEntry,
+    JiraProjectVersionList, JiraRemoteIssueLink, JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon,
     JiraRemoteIssueLinkObject, JiraSearchResponse, JiraSearchResult, JiraTransition,
-    JiraTransitionToStatus, JiraTransitionsResponse, JiraUser, JiraUserGetResults, JiraUserRecord,
-    JiraUserSearchEntry, JiraUserSearchResult, JiraUserSearchResults, JiraVisibility,
-    JiraWatcherList, JiraWorklog, JiraWorklogList, JiraWorklogResponse, TEXTAREA_CUSTOM_TYPE,
+    JiraTransitionEntry, JiraTransitionToStatus, JiraTransitionsResponse, JiraUser,
+    JiraUserGetResults, JiraUserRecord, JiraUserSearchEntry, JiraUserSearchResult,
+    JiraUserSearchResults, JiraVisibility, JiraWatcherList, JiraWorklog, JiraWorklogList,
+    JiraWorklogResponse, TEXTAREA_CUSTOM_TYPE,
 };
 use crate::request_log;
 use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
@@ -121,6 +122,47 @@ fn map_schema_type(raw_type: Option<String>, raw_custom: Option<&str>) -> Option
         return Some("richtext".to_string());
     }
     raw_type
+}
+
+/// Builds an [`EditMeta`] from a raw JIRA field-metadata map.
+///
+/// The editmeta, createmeta, and `expand=transitions.fields` transitions
+/// responses all carry fields in the same [`JiraEditMetaField`] shape, so this
+/// is the single normalization point for all three.
+fn edit_meta_from_raw_fields(
+    raw: std::collections::BTreeMap<String, JiraEditMetaField>,
+) -> EditMeta {
+    let fields = raw
+        .into_iter()
+        .map(|(id, field)| {
+            let allowed_values = field.allowed_value_strings();
+            (
+                id,
+                EditMetaField {
+                    name: field.name.unwrap_or_default(),
+                    schema: field.schema.into(),
+                    allowed_values,
+                },
+            )
+        })
+        .collect();
+    EditMeta { fields }
+}
+
+/// Maps a raw transitions-response entry to the public [`JiraTransition`],
+/// dropping any expanded screen-field metadata (captured separately by
+/// [`AtlassianClient::get_transitions_with_fields`]).
+fn transition_from_entry(t: JiraTransitionEntry) -> JiraTransition {
+    JiraTransition {
+        id: t.id,
+        name: t.name,
+        to_status: t.to.map(|to| JiraTransitionToStatus {
+            id: to.id,
+            name: to.name,
+            category: to.status_category.and_then(|sc| sc.key),
+        }),
+        has_screen: t.has_screen,
+    }
 }
 
 /// Validates that a date string is `YYYY-MM-DD`.
@@ -2213,6 +2255,118 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let err = client.do_transition("PROJ-1", "999").await.unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn get_transitions_with_fields_parses_screen_metadata() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .and(wiremock::matchers::query_param(
+                "expand",
+                "transitions.fields",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [
+                        {"id": "11", "name": "In Progress"},
+                        {
+                            "id": "21",
+                            "name": "Resolve",
+                            "hasScreen": true,
+                            "fields": {
+                                "resolution": {
+                                    "name": "Resolution",
+                                    "schema": {"type": "resolution"}
+                                },
+                                "comment": {
+                                    "name": "Comment",
+                                    "schema": {"type": "comment"}
+                                }
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let (transitions, metas) = client.get_transitions_with_fields("PROJ-1").await.unwrap();
+
+        assert_eq!(transitions.len(), 2);
+        // Screenless transition has no metadata entry.
+        assert!(!metas.contains_key("11"));
+        // The "Resolve" transition's screen fields are captured.
+        let resolve_meta = metas.get("21").unwrap();
+        assert!(resolve_meta.fields.contains_key("resolution"));
+        assert_eq!(
+            resolve_meta.fields.get("comment").map(|f| f.name.as_str()),
+            Some("Comment")
+        );
+    }
+
+    #[tokio::test]
+    async fn do_transition_with_fields_posts_fields_and_comment() {
+        let server = wiremock::MockServer::start().await;
+
+        // Serialize the comment ADF the same way the client will, so the
+        // expected body matches exactly without hardcoding the ADF shape.
+        let comment = crate::atlassian::adf_validated::markdown_to_validated_adf("done").unwrap();
+        let comment_json = serde_json::to_value(&comment).unwrap();
+        let expected = serde_json::json!({
+            "transition": {"id": "21"},
+            "fields": {"resolution": {"name": "Fixed"}},
+            "update": { "comment": [ { "add": { "body": comment_json } } ] }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .and(wiremock::matchers::body_json(expected))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "resolution".to_string(),
+            serde_json::json!({ "name": "Fixed" }),
+        );
+        let result = client
+            .do_transition_with_fields("PROJ-1", "21", &fields, Some(&comment))
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn do_transition_with_fields_bare_body_when_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "transition": {"id": "21"}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .do_transition_with_fields("PROJ-1", "21", &std::collections::BTreeMap::new(), None)
+            .await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
@@ -6121,22 +6275,7 @@ impl AtlassianClient {
         )
         .await?;
 
-        let fields = raw
-            .fields
-            .into_iter()
-            .map(|(id, field)| {
-                let allowed_values = field.allowed_value_strings();
-                (
-                    id,
-                    EditMetaField {
-                        name: field.name.unwrap_or_default(),
-                        schema: field.schema.into(),
-                        allowed_values,
-                    },
-                )
-            })
-            .collect();
-        Ok(EditMeta { fields })
+        Ok(edit_meta_from_raw_fields(raw.fields))
     }
 
     /// Creates a new JIRA issue.
@@ -6269,22 +6408,7 @@ impl AtlassianClient {
             return Ok(EditMeta::default());
         };
 
-        let fields = issuetype
-            .fields
-            .into_iter()
-            .map(|(id, field)| {
-                let allowed_values = field.allowed_value_strings();
-                (
-                    id,
-                    EditMetaField {
-                        name: field.name.unwrap_or_default(),
-                        schema: field.schema.into(),
-                        allowed_values,
-                    },
-                )
-            })
-            .collect();
-        Ok(EditMeta { fields })
+        Ok(edit_meta_from_raw_fields(issuetype.fields))
     }
 
     /// Introspects the create screen for a project + issue type, returning each
@@ -6589,26 +6713,90 @@ impl AtlassianClient {
         Ok(resp
             .transitions
             .into_iter()
-            .map(|t| JiraTransition {
-                id: t.id,
-                name: t.name,
-                to_status: t.to.map(|to| JiraTransitionToStatus {
-                    id: to.id,
-                    name: to.name,
-                    category: to.status_category.and_then(|sc| sc.key),
-                }),
-                has_screen: t.has_screen,
-            })
+            .map(transition_from_entry)
             .collect())
     }
 
+    /// Lists available transitions for a JIRA issue together with each
+    /// transition's screen-field metadata.
+    ///
+    /// Requests `expand=transitions.fields` so screen fields can be resolved
+    /// for `execute --set-field`/`--resolution` and so a mandatory-comment
+    /// screen can be detected. Returns the same [`JiraTransition`] list as
+    /// [`Self::get_transitions`] plus a map keyed by transition id holding the
+    /// screen [`EditMeta`]; screenless transitions have no entry.
+    pub async fn get_transitions_with_fields(
+        &self,
+        key: &str,
+    ) -> Result<(
+        Vec<JiraTransition>,
+        std::collections::BTreeMap<String, EditMeta>,
+    )> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/transitions?expand=transitions.fields",
+            self.instance_url, key
+        );
+
+        let response = self.get_json(&url).await?;
+
+        let resp: JiraTransitionsResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse transitions response",
+        )
+        .await?;
+
+        let mut metas: std::collections::BTreeMap<String, EditMeta> =
+            std::collections::BTreeMap::new();
+        let mut transitions = Vec::with_capacity(resp.transitions.len());
+        for mut t in resp.transitions {
+            if !t.fields.is_empty() {
+                let fields = std::mem::take(&mut t.fields);
+                metas.insert(t.id.clone(), edit_meta_from_raw_fields(fields));
+            }
+            transitions.push(transition_from_entry(t));
+        }
+
+        Ok((transitions, metas))
+    }
+
     /// Executes a transition on a JIRA issue.
+    ///
+    /// Thin shim over [`Self::do_transition_with_fields`] that sends no screen
+    /// fields and no transition comment.
     pub async fn do_transition(&self, key: &str, transition_id: &str) -> Result<()> {
+        self.do_transition_with_fields(key, transition_id, &std::collections::BTreeMap::new(), None)
+            .await
+    }
+
+    /// Executes a transition, optionally setting transition-screen `fields` and
+    /// adding a comment in the same request.
+    ///
+    /// `fields` is a map of stable JIRA field id → API-shaped value (e.g.
+    /// `resolution` → `{"name": "Fixed"}`); it is omitted from the body when
+    /// empty. When `comment` is `Some`, it is added via the transition
+    /// `update.comment` operation so it lands atomically with the transition —
+    /// the only way to satisfy a transition screen that mandates a comment.
+    pub async fn do_transition_with_fields(
+        &self,
+        key: &str,
+        transition_id: &str,
+        fields: &std::collections::BTreeMap<String, serde_json::Value>,
+        comment: Option<&ValidatedAdfDocument>,
+    ) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}/transitions", self.instance_url, key);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "transition": { "id": transition_id }
         });
+        if !fields.is_empty() {
+            body["fields"] = serde_json::to_value(fields)
+                .context("Failed to serialize transition fields payload")?;
+        }
+        if let Some(adf) = comment {
+            body["update"] = serde_json::json!({
+                "comment": [ { "add": { "body": adf } } ]
+            });
+        }
 
         let response = self.post_json(&url, &body).await?;
 
