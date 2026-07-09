@@ -349,6 +349,63 @@ mod tests {
         assert_eq!(response.metrics.cost_usd, None);
     }
 
+    #[tokio::test]
+    async fn send_request_sends_configured_beta_header() {
+        // When an active beta is configured, its header is attached to the
+        // outbound request (exercises the beta-header branch of the send path).
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("anthropic-beta", "context-1m-2025-08-07"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"hi"}]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let beta = Some((
+            "anthropic-beta".to_string(),
+            "context-1m-2025-08-07".to_string(),
+        ));
+        let mut client =
+            ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), beta).unwrap();
+        client.api_url = format!("{}/v1/messages", server.uri());
+
+        let out = client.send_request("system", "user").await.unwrap();
+        assert_eq!(out, "hi");
+    }
+
+    #[tokio::test]
+    async fn send_request_errors_when_no_text_content() {
+        // A response with no text content block yields a typed error rather
+        // than an empty string.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"content":[]}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client =
+            ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), None).unwrap();
+        client.api_url = format!("{}/v1/messages", server.uri());
+
+        let err = client.send_request("system", "user").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("No text content"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     #[test]
     fn claude_client_with_beta() {
         let beta = Some((
