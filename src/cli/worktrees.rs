@@ -2,7 +2,8 @@
 //! registry.
 //!
 //! Lifecycle stays on `omni-dev daemon` (`start`/`stop`/`status`/`restart`);
-//! this command only sends the `worktrees` service's read op (`list`) over the
+//! this command only sends the `worktrees` service's read ops (`list` for the
+//! open windows, `tree` for the repos-and-all-their-worktrees view) over the
 //! daemon's Unix control socket. The companion VS Code extension is what *feeds*
 //! the registry (`register`/`heartbeat`/`unregister`), talking to the same
 //! socket directly from each window.
@@ -36,6 +37,8 @@ pub struct WorktreesCommand {
 pub enum WorktreesSubcommands {
     /// List the repos/worktrees currently open across all windows.
     List(ListCommand),
+    /// Show every repository and all its worktrees, grouped by repository.
+    Tree(TreeCommand),
 }
 
 impl WorktreesCommand {
@@ -43,6 +46,7 @@ impl WorktreesCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
         }
     }
 }
@@ -73,6 +77,32 @@ impl ListCommand {
         match self.output {
             TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
             TableOrJson::Table => println!("{}", render_windows(&result)),
+        }
+        Ok(())
+    }
+}
+
+/// Shows every repository and all of its worktrees (open or not), grouped by
+/// repository — the daemon's `tree` op, which derives the repos from the open
+/// windows and enumerates each repo's worktrees.
+#[derive(Parser)]
+pub struct TreeCommand {
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+}
+
+impl TreeCommand {
+    /// Executes the tree command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let result = call(&socket, "tree", Value::Null).await?;
+        match self.output {
+            TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            TableOrJson::Table => println!("{}", render_tree(&result)),
         }
         Ok(())
     }
@@ -128,6 +158,85 @@ fn render_windows(result: &Value) -> String {
         ));
     }
     out
+}
+
+/// Renders a `tree` reply as a repo-grouped view: a header line per repository
+/// (its name, GitHub `owner/name` when present, and root path), then one indented
+/// row per worktree — a `*` marks the main working tree, followed by the branch,
+/// its `+ahead -behind` sync state, an `open` flag when a live window has it open,
+/// and the worktree path. Returns a placeholder when no repository is open.
+fn render_tree(result: &Value) -> String {
+    let repos = result
+        .get("repos")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if repos.is_empty() {
+        return "No repositories open.".to_string();
+    }
+    let mut out = String::new();
+    for (i, repo) in repos.iter().enumerate() {
+        // A blank line separates repositories (but not before the first): the
+        // previous worktree row has no trailing newline, so two are needed.
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        out.push_str(&repo_header(repo));
+        for worktree in repo
+            .get("worktrees")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            out.push('\n');
+            out.push_str(&worktree_row(worktree));
+        }
+    }
+    out
+}
+
+/// The header line for one repo in the tree view: `<name>  (github: owner/name)
+/// <root>`, with the GitHub clause omitted for a non-GitHub repo.
+fn repo_header(repo: &Value) -> String {
+    let name = sanitize(repo.get("main_repo").and_then(Value::as_str).unwrap_or("-"));
+    let root = sanitize(repo.get("root").and_then(Value::as_str).unwrap_or(""));
+    match github_summary(repo) {
+        Some(github) => format!("{name}  ({github})  {root}"),
+        None => format!("{name}  {root}"),
+    }
+}
+
+/// A `github: owner/name` summary for a repo, or `None` when it has no GitHub
+/// identity (a non-GitHub or remote-less repo).
+fn github_summary(repo: &Value) -> Option<String> {
+    let owner = repo.pointer("/github/owner").and_then(Value::as_str)?;
+    let name = repo.pointer("/github/name").and_then(Value::as_str)?;
+    Some(format!("github: {}/{}", sanitize(owner), sanitize(name)))
+}
+
+/// One indented worktree row: a `*` for the main working tree, the branch, the
+/// `+ahead -behind` sync state, an `open` flag when a window has it open, and the
+/// worktree path.
+fn worktree_row(worktree: &Value) -> String {
+    let marker = if worktree.get("is_main").and_then(Value::as_bool) == Some(true) {
+        '*'
+    } else {
+        ' '
+    };
+    let branch = sanitize(
+        worktree
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+    );
+    let sync = sync_summary(worktree);
+    let open = if worktree.get("open").and_then(Value::as_bool) == Some(true) {
+        "open"
+    } else {
+        ""
+    };
+    let path = sanitize(worktree.get("path").and_then(Value::as_str).unwrap_or(""));
+    format!("  {marker} {branch:<24} {sync:<9} {open:<5} {path}")
 }
 
 /// The repo name to show for a window: the daemon-computed `main_repo` (which
@@ -206,13 +315,16 @@ mod tests {
 
     #[test]
     fn list_parses_flags_and_defaults() {
-        let WorktreesSubcommands::List(cmd) = parse(&["list"]);
+        // Routing: `worktrees list` maps to the List variant.
+        assert!(matches!(parse(&["list"]), WorktreesSubcommands::List(_)));
+        // Flags, via the leaf parser (clap treats argv[0] as the command name).
+        let cmd = ListCommand::try_parse_from(["list"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Table);
         assert!(!cmd.json);
         assert!(cmd.socket.is_none());
 
-        let WorktreesSubcommands::List(cmd) =
-            parse(&["list", "-o", "json", "--socket", "/tmp/d.sock"]);
+        let cmd =
+            ListCommand::try_parse_from(["list", "-o", "json", "--socket", "/tmp/d.sock"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Json);
         assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
     }
@@ -220,9 +332,23 @@ mod tests {
     #[test]
     fn list_deprecated_json_flag_still_parses() {
         // `--json` is captured separately; `execute` folds it into `output`.
-        let WorktreesSubcommands::List(cmd) = parse(&["list", "--json"]);
+        let cmd = ListCommand::try_parse_from(["list", "--json"]).unwrap();
         assert!(cmd.json);
         assert_eq!(cmd.output, TableOrJson::Table);
+    }
+
+    #[test]
+    fn tree_parses_flags_and_defaults() {
+        // Routing: `worktrees tree` maps to the Tree variant.
+        assert!(matches!(parse(&["tree"]), WorktreesSubcommands::Tree(_)));
+        let cmd = TreeCommand::try_parse_from(["tree"]).unwrap();
+        assert_eq!(cmd.output, TableOrJson::Table);
+        assert!(cmd.socket.is_none());
+
+        let cmd =
+            TreeCommand::try_parse_from(["tree", "-o", "json", "--socket", "/tmp/d.sock"]).unwrap();
+        assert_eq!(cmd.output, TableOrJson::Json);
+        assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
     }
 
     #[test]
@@ -343,6 +469,127 @@ mod tests {
         assert_eq!(age_secs(None), 0);
         assert_eq!(age_secs(Some("not-a-timestamp")), 0);
         assert!(age_secs(Some("2000-01-01T00:00:00Z")) > 0);
+    }
+
+    #[test]
+    fn render_tree_handles_empty_replies() {
+        assert_eq!(
+            render_tree(&json!({ "repos": [] })),
+            "No repositories open."
+        );
+        assert_eq!(render_tree(&json!({})), "No repositories open.");
+    }
+
+    #[test]
+    fn render_tree_groups_repos_and_worktrees() {
+        let result = json!({ "repos": [{
+            "main_repo": "omni-dev",
+            "github": { "owner": "rust-works", "name": "omni-dev" },
+            "root": "/home/me/omni-dev",
+            "worktrees": [
+                { "path": "/home/me/omni-dev", "branch": "main", "ahead": 2, "behind": 0,
+                  "is_main": true, "open": true, "window_key": "w1" },
+                { "path": "/home/me/wt/issue-1300", "branch": "issue-1300", "ahead": 1, "behind": 3,
+                  "is_main": false, "open": false },
+            ],
+        }]});
+        let out = render_tree(&result);
+        // Repo header carries the GitHub identity and root.
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("omni-dev"), "{out}");
+        assert!(header.contains("github: rust-works/omni-dev"), "{out}");
+        assert!(header.contains("/home/me/omni-dev"), "{out}");
+        // The main working tree is marked with `*`, its sync, and `open`.
+        assert!(
+            out.lines()
+                .any(|l| l.contains("* main") && l.contains("+2 -0") && l.contains("open")),
+            "{out}"
+        );
+        // The linked worktree is unmarked and not flagged open.
+        let linked = out
+            .lines()
+            .find(|l| l.contains("issue-1300"))
+            .unwrap_or_default();
+        assert!(!linked.contains('*'), "{linked}");
+        assert!(!linked.contains("open"), "{linked}");
+        assert!(linked.contains("+1 -3"), "{linked}");
+        // Header + two worktree rows.
+        assert_eq!(out.lines().count(), 3, "{out}");
+    }
+
+    #[test]
+    fn render_tree_separates_multiple_repos_with_blank_line() {
+        let result = json!({ "repos": [
+            {
+                "main_repo": "alpha",
+                "root": "/r/alpha",
+                "worktrees": [
+                    { "path": "/r/alpha", "branch": "main", "is_main": true, "open": false },
+                ],
+            },
+            {
+                "main_repo": "beta",
+                "root": "/r/beta",
+                "worktrees": [
+                    { "path": "/r/beta", "branch": "main", "is_main": true, "open": false },
+                ],
+            },
+        ]});
+        let out = render_tree(&result);
+        // Two headers, two worktree rows, and one blank separator between repos.
+        assert!(
+            out.contains("\n\nbeta"),
+            "repos not blank-separated: {out:?}"
+        );
+        let alpha = out.find("alpha").unwrap();
+        let beta = out.find("beta").unwrap();
+        assert!(alpha < beta, "repo order not preserved: {out}");
+        assert_eq!(out.lines().count(), 5, "{out:?}");
+    }
+
+    #[test]
+    fn render_tree_omits_github_for_non_github_repo() {
+        let result = json!({ "repos": [{
+            "main_repo": "internal",
+            "root": "/srv/internal",
+            "worktrees": [
+                { "path": "/srv/internal", "branch": "main", "is_main": true, "open": false },
+            ],
+        }]});
+        let out = render_tree(&result);
+        assert!(!out.contains("github:"), "{out}");
+        assert!(out.lines().next().unwrap().contains("internal"), "{out}");
+    }
+
+    #[test]
+    fn render_tree_strips_control_bytes() {
+        // Control bytes in the repo name, github identity, branch, and path must
+        // not reach the terminal (#1137), matching the `list` renderer.
+        let result = json!({ "repos": [{
+            "main_repo": "evil\x1b[31mrepo",
+            "github": { "owner": "ow\x07ner", "name": "na\u{9b}2Jme" },
+            "root": "/tmp/r\x1b]0;x\x07oot",
+            "worktrees": [
+                { "path": "/tmp/w\rt", "branch": "br\x1b[2Janch", "is_main": true, "open": true },
+            ],
+        }]});
+        let out = render_tree(&result);
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        // Embedded CR/LF cannot forge extra lines: header plus one worktree row.
+        assert_eq!(out.lines().count(), 2, "{out:?}");
+    }
+
+    #[test]
+    fn github_summary_needs_both_owner_and_name() {
+        assert_eq!(
+            github_summary(&json!({ "github": { "owner": "o", "name": "n" } })).as_deref(),
+            Some("github: o/n")
+        );
+        assert_eq!(github_summary(&json!({ "github": { "owner": "o" } })), None);
+        assert_eq!(github_summary(&json!({})), None);
     }
 
     #[test]
