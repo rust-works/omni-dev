@@ -1763,14 +1763,17 @@ omni-dev atlassian jira transition execute - Executes a workflow transition on a
 
 Executes a workflow transition on a JIRA issue (mirrors the `jira_transition` MCP tool)
 
-Usage: execute <KEY> <TRANSITION>
+Usage: execute [OPTIONS] <KEY> <TRANSITION>
 
 Arguments:
   <KEY>         JIRA issue key (e.g., PROJ-123)
   <TRANSITION>  Transition name or ID to execute
 
 Options:
-  -h, --help  Print help
+      --set-field <NAME=VALUE>  Set a transition-screen field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Array fields accept comma-separated values (`Labels=a,b,c`) or a YAML list (`Labels=[a, b]`). Names resolve against the transition's screen fields
+      --resolution <NAME>       Set the resolution on the transition, e.g. `--resolution Fixed`. Sent as `{"name": "..."}`; the transition screen must accept a resolution
+      --comment <JFM>           Add a comment (JFM markdown) with the transition. Delivered in the transition itself when the screen accepts a comment (atomic, satisfies a mandatory-comment screen); otherwise posted as a separate comment
+  -h, --help                    Print help
 
 
 ================================================================================

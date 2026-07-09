@@ -27,3 +27,4 @@ pub mod error;
 pub mod inline_comment;
 pub mod jira_api;
 pub mod jira_types;
+pub mod transition_fields;

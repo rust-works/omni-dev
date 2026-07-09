@@ -845,14 +845,33 @@ List and execute workflow transitions:
 
 ```bash
 # List available transitions
-omni-dev atlassian jira transition PROJ-123
+omni-dev atlassian jira transition list PROJ-123
 
 # Execute a transition by name (case-insensitive)
-omni-dev atlassian jira transition PROJ-123 "In Progress"
+omni-dev atlassian jira transition execute PROJ-123 "In Progress"
 
 # Execute by ID
-omni-dev atlassian jira transition PROJ-123 21
+omni-dev atlassian jira transition execute PROJ-123 21
 ```
+
+Transitions whose screen requires input can supply it in the same request:
+
+```bash
+# Resolve an issue, setting the resolution and an atomic comment
+omni-dev atlassian jira transition execute PROJ-123 Resolve \
+  --resolution Fixed --comment "Resolved via CI"
+
+# Set an arbitrary transition-screen field (same NAME=VALUE syntax as
+# `jira write --set-field`); repeat for multiple fields
+omni-dev atlassian jira transition execute PROJ-123 Resolve \
+  --set-field "Severity=High"
+```
+
+`--resolution NAME` sets the resolution (sent as `{"name": …}`); `--set-field
+"NAME=VALUE"` resolves against the transition's screen fields; and `--comment`
+(JFM markdown) rides in the transition itself when the screen accepts a comment
+— satisfying a mandatory-comment screen — otherwise it is posted as a separate
+comment after the transition.
 
 #### JIRA: Comments
 

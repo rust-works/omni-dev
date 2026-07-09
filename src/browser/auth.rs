@@ -506,10 +506,7 @@ mod tests {
             normalize_request_path("/loki/api/v1/labels").as_deref(),
             Some("/loki/api/v1/labels")
         );
-        assert_eq!(
-            normalize_request_path("/a/%2e%2e/b"),
-            Some("/a/../b".to_string()).filter(|_| false).or(None)
-        );
+        assert_eq!(normalize_request_path("/a/%2e%2e/b"), None::<String>);
         assert!(normalize_request_path("/a/../b").is_none());
         assert!(normalize_request_path("/a/%2e%2e/b").is_none());
         assert!(normalize_request_path("/a/%00/b").is_none());
