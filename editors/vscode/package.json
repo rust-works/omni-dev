@@ -2,6 +2,7 @@
   "name": "omni-dev-worktrees",
   "displayName": "omni-dev Worktrees",
   "description": "A live tree view of every repository and git worktree open across all your VS Code windows, fed by the omni-dev daemon; double-click to focus or open a worktree's window.",
+  "icon": "media/icon.png",
   "version": "0.2.0",
   "publisher": "rust-works",
   "license": "BSD-3-Clause",

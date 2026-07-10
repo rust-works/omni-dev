@@ -8,3 +8,7 @@ esbuild.js
 tsconfig.json
 **/*.ts
 **/*.map
+# media/icon.svg is only the build source for the gallery icon; ship the raster
+# media/icon.png (the manifest "icon"), not the source. media/worktrees.svg is a
+# runtime asset (the activity-bar container icon) and must keep shipping.
+media/icon.svg
