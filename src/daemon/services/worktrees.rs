@@ -1241,8 +1241,9 @@ fn git_safety(path: &Path) -> Result<GitSafety> {
 
 /// Counts a worktree's `(dirty tracked, untracked)` files. Tracked covers any
 /// staged or unstaged modification (including conflicts and deletions);
-/// untracked is `WT_NEW`. `.gitignore`d files are excluded from both — they are
-/// regenerable and must not force a prompt. A failed status read degrades to
+/// untracked is `WT_NEW`. `.gitignore`d files are excluded — they are
+/// regenerable and must not force a prompt — via `include_ignored(false)`, so no
+/// status entry ever carries the `IGNORED` bit. A failed status read degrades to
 /// `(0, 0)` rather than sinking the whole safety check.
 fn count_dirty_untracked(repo: &Repository) -> (usize, usize) {
     let mut opts = StatusOptions::new();
@@ -1269,9 +1270,6 @@ fn count_dirty_untracked(repo: &Repository) -> (usize, usize) {
     let mut untracked = 0;
     for entry in statuses.iter() {
         let s = entry.status();
-        if s.contains(Status::IGNORED) {
-            continue;
-        }
         if s.contains(Status::WT_NEW) {
             untracked += 1;
         }
@@ -1874,6 +1872,31 @@ mod tests {
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
             .unwrap();
         repo.commit(refname, &sig, &sig, msg, &tree, parents)
+            .unwrap()
+    }
+
+    /// Commits `content` as file `name` onto `refname`, chaining off its current
+    /// tip (if any). Unlike [`empty_commit`], the tree carries a real blob, so
+    /// the file is checked out into a worktree and can then be modified to
+    /// produce a dirty (tracked) status.
+    fn commit_file(
+        repo: &Repository,
+        refname: &str,
+        name: &str,
+        content: &[u8],
+        msg: &str,
+    ) -> git2::Oid {
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let blob = repo.blob(content).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert(name, blob, 0o100_644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let parent = repo
+            .refname_to_id(refname)
+            .ok()
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repo.commit(Some(refname), &sig, &sig, msg, &tree, &parents)
             .unwrap()
     }
 
@@ -2778,5 +2801,197 @@ mod tests {
             .unwrap();
         assert_eq!(reply, json!({ "closed": true }));
         assert!(main.path().exists());
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_flags_modified_tracked_files() {
+        // A tracked file, checked out into the linked worktree, then modified —
+        // its content is lost on removal, so it is a `dirty` risk (distinct from
+        // the untracked case).
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = commit_file(&repo, "refs/heads/trunk", "tracked.txt", b"original\n", "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        std::fs::write(wt_path.join("tracked.txt"), b"uncommitted change\n").unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("dirty")),
+            "expected a dirty risk: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_flags_an_in_progress_operation() {
+        // Plant a MERGE_HEAD in the worktree's gitdir so `repo.state()` reports a
+        // non-Clean (interrupted merge) state — its progress is lost on removal.
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        let head = wt_repo.head().unwrap().target().unwrap();
+        std::fs::write(wt_repo.path().join("MERGE_HEAD"), format!("{head}\n")).unwrap();
+        assert_ne!(wt_repo.state(), RepositoryState::Clean);
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("in-progress")),
+            "expected an in-progress risk: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_reports_unpushed_commits_as_info_not_a_risk() {
+        // A linked worktree on `feature`, which tracks `origin/feature` and is one
+        // commit ahead. The unpushed commit is INFO (the branch — and thus the
+        // commit — survives removal), never a blocking risk.
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let a_commit = repo.find_commit(a).unwrap();
+        repo.branch("feature", &a_commit, false).unwrap();
+        repo.reference("refs/remotes/origin/feature", a, true, "origin feature")
+            .unwrap();
+        // `feature` advances one commit past `origin/feature`.
+        empty_commit(&repo, Some("refs/heads/feature"), &[&a_commit], "B");
+        drop(a_commit);
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/x.git")
+            .unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.feature.remote", "origin").unwrap();
+        cfg.set_str("branch.feature.merge", "refs/heads/feature")
+            .unwrap();
+        // A worktree on the existing `feature` branch (not created fresh, so it
+        // keeps the ahead-of-upstream divergence).
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        let reference = repo.find_reference("refs/heads/feature").unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree("feature", &wt_path, Some(&opts)).unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        // Unpushed commits appear as `info`, and the worktree is still cleanly
+        // removable with no blocking risks.
+        let info = report.get("info").and_then(Value::as_array).unwrap();
+        assert!(
+            info.iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("unpushed")),
+            "expected an unpushed info note: {report}"
+        );
+        assert!(
+            report
+                .get("risks")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty(),
+            "unpushed commits alone must not block: {report}"
+        );
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_ignores_gitignored_files() {
+        // With `.gitignore` committed, an ignored artifact is the only worktree
+        // change — it must not count as untracked (it is regenerable), so the
+        // worktree stays cleanly removable with no risks.
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = commit_file(&repo, "refs/heads/trunk", ".gitignore", b"build/\n", "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        std::fs::create_dir(wt_path.join("build")).unwrap();
+        std::fs::write(wt_path.join("build/artifact.o"), b"junk").unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        assert!(
+            report
+                .get("risks")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty(),
+            "a gitignored file must not create a risk: {report}"
+        );
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_treats_a_missing_path_as_already_removed() {
+        // The phase-1 check on a path that no longer exists reports it removable
+        // with no risks (so the idempotent execute proceeds with no dialog).
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle(
+                "close",
+                json!({ "path": "/no/such/worktree/xyzzy", "remove": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+        assert_eq!(report.get("is_main").and_then(Value::as_bool), Some(false));
+        assert!(report
+            .get("risks")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+        let info = report.get("info").and_then(Value::as_array).unwrap();
+        assert!(info
+            .iter()
+            .any(|r| r.get("kind").and_then(Value::as_str) == Some("already-removed")));
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_locked_worktree() {
+        // A locked worktree (git worktree lock) must be refused, not forced past
+        // (failure mode #6), and left on disk.
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let main_repo = Repository::open(main.path()).unwrap();
+        main_repo
+            .find_worktree("feature")
+            .unwrap()
+            .lock(Some("under test"))
+            .unwrap();
+
+        let svc = WorktreesService::new();
+        let err = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("locked"),
+            "expected a locked error: {err}"
+        );
+        assert!(wt_path.exists(), "a locked worktree must not be removed");
     }
 }
