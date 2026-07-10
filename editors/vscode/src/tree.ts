@@ -75,6 +75,17 @@ export function repoLabel(repo: TreeRepoPayload): string {
 }
 
 /**
+ * Whether this worktree is the one open in **the current** VS Code window — the
+ * leaf whose registry `window_key` matches this window's own `windowKey`. Used to
+ * mark it distinctly (a blue tick) from worktrees open in *other* windows. Stays
+ * `vscode`-free so it is unit-testable. An absent `windowKey` (or a worktree with
+ * no live window) never matches.
+ */
+export function isCurrentWindow(wt: TreeWorktreePayload, windowKey?: string): boolean {
+  return wt.open && windowKey !== undefined && wt.window_key === windowKey;
+}
+
+/**
  * A worktree's primary label: its branch, or the folder basename when detached
  * or unborn (no branch reported).
  */
@@ -98,22 +109,38 @@ export function worktreeDescription(wt: TreeWorktreePayload): string {
   return parts.join(" ");
 }
 
-/** A multi-line hover tooltip: path, main/linked, branch+sync, parent repo, open state. */
-export function worktreeTooltip(wt: TreeWorktreePayload, repo: TreeRepoPayload): string {
+/**
+ * A multi-line hover tooltip: path, main/linked, branch+sync, parent repo, open
+ * state. The open line distinguishes the current window (`● this window`) from a
+ * worktree merely open elsewhere (`● window open`) when `windowKey` is supplied.
+ */
+export function worktreeTooltip(
+  wt: TreeWorktreePayload,
+  repo: TreeRepoPayload,
+  windowKey?: string,
+): string {
   const kind = wt.is_main ? "main working tree" : "linked worktree";
   const branch = wt.branch ?? "(detached)";
   const sync = worktreeDescription(wt);
   const branchLine = sync ? `${branch}  ${sync}` : branch;
-  const openLine = wt.open ? "● window open" : "no window open";
+  const openLine = isCurrentWindow(wt, windowKey)
+    ? "● this window"
+    : wt.open
+      ? "● window open"
+      : "no window open";
   return [wt.path, `${kind} of ${repoLabel(repo)}`, branchLine, openLine].join("\n");
 }
 
 /**
  * The `contextValue` used to gate context-menu items and mark the open badge.
- * Both start with `worktree` so a single `viewItem =~ /worktree/` menu `when`
- * matches open and closed alike.
+ * All three start with `worktree` so a single `viewItem =~ /worktree/` menu
+ * `when` matches current, other-window, and closed alike; `worktree.current`
+ * additionally gates any current-window-only menu items.
  */
-export function worktreeContextValue(wt: TreeWorktreePayload): string {
+export function worktreeContextValue(wt: TreeWorktreePayload, windowKey?: string): string {
+  if (isCurrentWindow(wt, windowKey)) {
+    return "worktree.current";
+  }
   return wt.open ? "worktree.open" : "worktree";
 }
 
