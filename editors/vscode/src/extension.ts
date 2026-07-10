@@ -145,7 +145,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  * pushed onto `context.subscriptions` so it tears down cleanly on deactivate.
  */
 function setupTreeView(context: vscode.ExtensionContext): void {
-  const treeProvider = new WorktreesTreeDataProvider();
+  // `windowKey` is assigned in `activate()` before this runs, so the provider can
+  // mark this window's own worktree distinctly from those open in other windows.
+  const treeProvider = new WorktreesTreeDataProvider(windowKey);
   provider = treeProvider;
   const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
