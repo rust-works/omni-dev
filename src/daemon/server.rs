@@ -17,6 +17,7 @@ use super::lifecycle;
 use super::paths;
 use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport, DAEMON_SERVICE, MAX_LINE_BYTES};
 use super::registry::ServiceRegistry;
+use super::service::ServiceStream;
 use super::single_instance;
 
 /// How long to wait for accepted-but-unfinished connections to drain on
@@ -24,6 +25,12 @@ use super::single_instance;
 /// in-flight dispatch+reply, bounded so a stuck or idle client cannot hang
 /// shutdown indefinitely (a service manager would `SIGKILL` us eventually).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a push subscription re-samples and diffs its snapshot even without
+/// a change notification, so purely on-disk state changes (a branch switch, new
+/// commits) — which fire **no** registry event — are still reflected within the
+/// interval. Kept in the issue's 2–5 s band (#1267).
+const STREAM_TICK: Duration = Duration::from_secs(3);
 
 /// Configuration for a [`run`] invocation.
 #[derive(Debug, Clone)]
@@ -201,10 +208,14 @@ async fn drain_connections(conns: &mut JoinSet<()>, timeout: Duration) {
 /// Serves one client connection: decode each NDJSON line, dispatch it, and
 /// write back one reply line, until the client hangs up or a read/write error.
 ///
-/// There is deliberately no `shutdown.cancelled()` arm here: an accepted line
-/// always finishes its dispatch+reply, and shutdown is handled by the server
-/// draining these tasks (see [`drain_connections`]). `shutdown` is still
-/// threaded through for the built-in `shutdown` op (see [`handle_builtin`]).
+/// The normal request→one-reply path has deliberately no `shutdown.cancelled()`
+/// arm: an accepted line always finishes its dispatch+reply, and shutdown is
+/// handled by the server draining these tasks (see [`drain_connections`]). A
+/// **subscription** op is the exception — it takes over the connection via
+/// [`run_stream`], which *does* select on `shutdown` so a long-lived stream is
+/// torn down promptly on drain rather than waiting out [`DRAIN_TIMEOUT`].
+/// `shutdown` is threaded through for both (also the built-in `shutdown` op, see
+/// [`handle_builtin`]).
 async fn handle_connection(
     stream: UnixStream,
     registry: Arc<ServiceRegistry>,
@@ -212,13 +223,8 @@ async fn handle_connection(
 ) {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
     while let Some(line) = framed.next().await {
-        match line {
-            Ok(line) => {
-                let reply = dispatch_line(&line, &registry, &shutdown).await;
-                if !send_reply(&mut framed, reply).await {
-                    break;
-                }
-            }
+        let line = match line {
+            Ok(line) => line,
             Err(e) => {
                 // A decode error ends the `Framed` stream (the next poll yields
                 // `None`), so there is nothing more to serve on this connection:
@@ -235,6 +241,93 @@ async fn handle_connection(
                 let _ = send_reply(&mut framed, DaemonReply::err(msg)).await;
                 break;
             }
+        };
+
+        // Parse once, so a subscription op can be detected before it is
+        // dispatched as a normal one-reply op. A malformed envelope replies with
+        // an error but keeps the connection open, matching the pre-#1267 path.
+        let envelope: DaemonEnvelope = match serde_json::from_str(&line) {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                if !send_reply(
+                    &mut framed,
+                    DaemonReply::err(format!("invalid envelope: {e}")),
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // A streaming op takes over the connection for its whole lifetime: it
+        // never returns a single reply, so once `run_stream` finishes (client
+        // gone or daemon shutting down) the connection is done.
+        if let Some(name) = envelope.service.as_deref() {
+            if name != DAEMON_SERVICE {
+                if let Some(stream) = registry.subscribe(name, &envelope.op, &envelope.payload) {
+                    run_stream(&mut framed, stream, &shutdown).await;
+                    return;
+                }
+            }
+        }
+
+        let reply = dispatch_envelope(envelope, &registry, &shutdown).await;
+        if !send_reply(&mut framed, reply).await {
+            break;
+        }
+    }
+}
+
+/// Drives a push subscription over `framed` until the client goes away or the
+/// daemon shuts down. Sends an initial snapshot, then re-samples the stream on
+/// each change notification and on a periodic [`STREAM_TICK`], pushing **only**
+/// snapshots that differ from the last one sent — so identical frames are never
+/// duplicated (the acceptance criterion). Mirrors the browser bridge's
+/// `start_stream` coalescing shape, but on the control socket.
+///
+/// The subscription owns the connection for its lifetime: any further inbound
+/// line is treated as an explicit cancel and ends the stream, matching the
+/// one-op-per-connection the companion uses (a dedicated subscribe socket).
+async fn run_stream(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    mut stream: Box<dyn ServiceStream>,
+    shutdown: &CancellationToken,
+) {
+    // Initial snapshot up front. The stream's change source was captured when it
+    // was built (before this snapshot), so the loop below only pushes deltas —
+    // and any change racing this initial sample is caught by the first wakeup.
+    let mut last = stream.snapshot().await;
+    if !send_reply(framed, DaemonReply::ok(last.clone())).await {
+        return;
+    }
+
+    // `interval` fires immediately on the first `tick()`; consume that so the
+    // periodic re-sample starts one full interval out.
+    let mut tick = tokio::time::interval(STREAM_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            () = stream.changed() => {}
+            _ = tick.tick() => {}
+            // Reading `framed` serves double duty and every outcome ends the
+            // stream: an inbound line is an explicit cancel, `None` is the client
+            // hanging up, and an `Err` is a read/decode error. `Framed`'s decode
+            // buffer lives in the codec, not this future, so cancelling this arm
+            // mid-poll loses no buffered bytes.
+            _ = framed.next() => break,
+            () = shutdown.cancelled() => break,
+        }
+        // Any wakeup means "maybe changed": re-sample and push only a real delta.
+        let snap = stream.snapshot().await;
+        if snap != last {
+            if !send_reply(framed, DaemonReply::ok(snap.clone())).await {
+                break;
+            }
+            last = snap;
         }
     }
 }
@@ -256,16 +349,14 @@ async fn send_reply(framed: &mut Framed<UnixStream, LinesCodec>, reply: DaemonRe
     true
 }
 
-/// Parses one NDJSON request line and produces its reply.
-async fn dispatch_line(
-    line: &str,
+/// Produces the one-reply response for a (already-parsed, non-streaming)
+/// request envelope. Streaming ops are peeled off earlier in
+/// [`handle_connection`]; everything else routes here.
+async fn dispatch_envelope(
+    envelope: DaemonEnvelope,
     registry: &ServiceRegistry,
     shutdown: &CancellationToken,
 ) -> DaemonReply {
-    let envelope: DaemonEnvelope = match serde_json::from_str(line) {
-        Ok(envelope) => envelope,
-        Err(e) => return DaemonReply::err(format!("invalid envelope: {e}")),
-    };
     match envelope.service.as_deref() {
         None | Some(DAEMON_SERVICE) => handle_builtin(&envelope.op, registry, shutdown).await,
         Some(name) => {
@@ -373,5 +464,228 @@ mod tests {
         let result = js.join_next().await.unwrap();
         assert!(result.is_err());
         note_reaped(result);
+    }
+
+    // --- Push-subscription streaming (#1267) --------------------------------
+    //
+    // `UnixStream::pair()` is an unbound, connected socket pair — no `bind`, so
+    // no umask mutation — so these `run_stream` tests stay here (in-process)
+    // rather than in the socket-binding `tests/daemon_socket.rs` binary.
+
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::sync::watch;
+
+    /// A controllable [`ServiceStream`] for driving `run_stream` directly: the
+    /// test bumps `tx` to wake it and swaps `snap` to change what it reports.
+    struct FakeStream {
+        rx: watch::Receiver<u64>,
+        snap: Arc<StdMutex<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStream for FakeStream {
+        async fn changed(&mut self) {
+            // Mirror the real impl: park (rather than spin) once the sender drops.
+            if self.rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn snapshot(&self) -> serde_json::Value {
+            self.snap.lock().unwrap().clone()
+        }
+    }
+
+    /// Reads one NDJSON reply line from the client end, asserting it is not EOF.
+    /// Generic over the reader so it works on both an owned `BufReader<UnixStream>`
+    /// and one wrapping a `&mut UnixStream` (test 2 keeps the stream to write to).
+    async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> DaemonReply {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap();
+        assert!(n > 0, "expected a reply line, got EOF");
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_stream_pushes_initial_then_deltas_and_dedupes() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = watch::channel(0u64);
+        let snap = Arc::new(StdMutex::new(json!({ "n": 0 })));
+        let fake = FakeStream {
+            rx,
+            snap: snap.clone(),
+        };
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+            run_stream(&mut framed, Box::new(fake), &server_shutdown).await;
+        });
+
+        let mut reader = BufReader::new(client);
+
+        // 1) The initial snapshot is pushed up front.
+        let initial = read_reply(&mut reader).await;
+        assert!(initial.ok);
+        assert_eq!(initial.payload, json!({ "n": 0 }));
+
+        // 2) A wake whose snapshot is unchanged is NOT re-sent (the diff dedupes).
+        //    Then a real change is. Because the next frame we read is the changed
+        //    one, a spurious duplicate of `{n:0}` would fail this assertion.
+        tx.send(1).unwrap(); // wake; snapshot still {n:0} → suppressed
+        *snap.lock().unwrap() = json!({ "n": 1 });
+        tx.send(2).unwrap(); // wake; snapshot now {n:1} → pushed
+        let delta = read_reply(&mut reader).await;
+        assert_eq!(delta.payload, json!({ "n": 1 }));
+
+        // 3) Shutdown tears the stream down cleanly: the client hits EOF.
+        shutdown.cancel();
+        let mut tail = String::new();
+        let n = reader.read_line(&mut tail).await.unwrap();
+        assert_eq!(n, 0, "stream should close cleanly on shutdown");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_stream_ends_when_client_sends_a_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (_tx, rx) = watch::channel(0u64);
+        let snap = Arc::new(StdMutex::new(json!({ "n": 0 })));
+        let fake = FakeStream { rx, snap };
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+            run_stream(&mut framed, Box::new(fake), &server_shutdown).await;
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let _initial = read_reply(&mut reader).await;
+        // Release the borrow of `client` so it can be written to below.
+        drop(reader);
+
+        // Any inbound line is a cancel: the stream ends and the task completes
+        // even though shutdown was never signalled.
+        client.write_all(b"cancel\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("run_stream should end after a client line")
+            .unwrap();
+    }
+
+    /// `handle_connection`'s parse/route path: a malformed envelope replies with
+    /// an error but keeps the connection open, and a well-formed non-subscribe op
+    /// then falls through the streaming check to the normal one-reply dispatch.
+    #[tokio::test]
+    async fn handle_connection_rejects_bad_envelope_then_serves_normal_op() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(
+            crate::daemon::services::worktrees::WorktreesService::new(),
+        ));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(handle_connection(server, Arc::new(registry), shutdown));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // 1) A syntactically invalid line → error reply; the connection stays up.
+        write_half.write_all(b"not json\n").await.unwrap();
+        let bad = read_reply(&mut reader).await;
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("invalid envelope"));
+
+        // 2) A well-formed non-subscribe op is served on the same connection
+        //    (the streaming check declines `list`, so it dispatches normally).
+        let env = serde_json::to_string(&DaemonEnvelope::service(
+            "worktrees",
+            "list",
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        write_half.write_all(env.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        let listed = read_reply(&mut reader).await;
+        assert!(listed.ok);
+        assert!(listed.payload.get("windows").is_some());
+
+        // Client hangs up → the handler task ends cleanly.
+        drop(write_half);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("handler should end after the client hangs up")
+            .unwrap();
+    }
+
+    /// `handle_connection` routes a `subscribe` op into streaming mode: the
+    /// client gets the pushed initial snapshot, and daemon shutdown ends both the
+    /// stream and the handler task.
+    #[tokio::test]
+    async fn handle_connection_enters_streaming_for_subscribe() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(
+            crate::daemon::services::worktrees::WorktreesService::new(),
+        ));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(handle_connection(
+            server,
+            Arc::new(registry),
+            shutdown.clone(),
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        let env = serde_json::to_string(&DaemonEnvelope::service(
+            "worktrees",
+            "subscribe",
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        write_half.write_all(env.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+
+        // The subscription pushes an initial snapshot (no windows → empty repos).
+        let initial = read_reply(&mut reader).await;
+        assert!(initial.ok);
+        assert_eq!(initial.payload, json!({ "repos": [] }));
+
+        // Shutdown ends the stream and the handler task.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown should end the streaming handler")
+            .unwrap();
+    }
+
+    /// `run_stream` returns immediately when even the initial snapshot cannot be
+    /// sent (the client is already gone) rather than entering the select loop.
+    #[tokio::test]
+    async fn run_stream_returns_when_initial_send_fails() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // Close the peer before `run_stream` writes, so the first send fails.
+        drop(client);
+        let (_tx, rx) = watch::channel(0u64);
+        let fake = FakeStream {
+            rx,
+            snap: Arc::new(StdMutex::new(json!({ "n": 0 }))),
+        };
+        let shutdown = CancellationToken::new();
+        let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_stream(&mut framed, Box::new(fake), &shutdown),
+        )
+        .await
+        .expect("run_stream should return promptly when the initial send fails");
     }
 }
