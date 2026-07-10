@@ -436,6 +436,128 @@ async fn worktrees_cli_tree_against_live_daemon() {
     .is_err());
 }
 
+/// Initializes a bare-minimum git repository at `path` (no commit needed: an
+/// unborn HEAD is still a repo, so the `tree`/`subscribe` snapshot lists it), so
+/// registering a window on it changes the pushed snapshot.
+fn init_git_repo(path: &std::path::Path) {
+    git2::Repository::init(path).unwrap();
+}
+
+/// Reads one pushed NDJSON [`DaemonReply`] frame from a subscription reader,
+/// asserting it is not EOF.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> DaemonReply {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).await.unwrap();
+    assert!(n > 0, "expected a pushed frame, got EOF");
+    serde_json::from_str(line.trim_end()).unwrap()
+}
+
+/// End-to-end acceptance for the push subscription (#1267): a `subscribe` client
+/// gets an initial snapshot, a fresh one after a `register` and after an
+/// `unregister`, no duplicate identical frame on an idempotent re-register, and
+/// a clean EOF when the daemon shuts down. Uses a raw socket because
+/// `DaemonClient` is one-shot request/reply; the subscription is many replies on
+/// one connection.
+#[tokio::test]
+async fn worktrees_subscribe_pushes_initial_and_updates() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(WorktreesService::new()));
+    let handle = tokio::spawn(run(
+        registry,
+        DaemonOptions {
+            socket_path: socket.clone(),
+        },
+    ));
+
+    // A one-shot client for control ops (register/unregister/shutdown), plus the
+    // readiness probe.
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A dedicated subscription connection: send `subscribe`, then read frames.
+    let sub = UnixStream::connect(&socket).await.unwrap();
+    let (read_half, mut write_half) = sub.into_split();
+    let mut reader = BufReader::new(read_half);
+    let subscribe_line = serde_json::to_string(&DaemonEnvelope::service(
+        "worktrees",
+        "subscribe",
+        Value::Null,
+    ))
+    .unwrap();
+    write_half
+        .write_all(subscribe_line.as_bytes())
+        .await
+        .unwrap();
+    write_half.write_all(b"\n").await.unwrap();
+
+    // 1) Initial snapshot: no windows registered yet → empty repo set.
+    let initial = read_frame(&mut reader).await;
+    assert!(initial.ok, "initial frame errored: {:?}", initial.error);
+    assert_eq!(initial.payload, json!({ "repos": [] }));
+
+    // 2) A window opens on a real git repo → a fresh snapshot carrying it.
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "register",
+            json!({ "key": "k1", "folders": [repo_dir.path()], "repo": "r" }),
+        ))
+        .await
+        .unwrap();
+    let updated = read_frame(&mut reader).await;
+    let repos = updated.payload["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1, "register should push the newly-opened repo");
+    assert_eq!(repos[0]["worktrees"][0]["open"], json!(true));
+
+    // 3) No duplicate identical frames + fresh frame on unregister: an idempotent
+    //    re-register bumps the change-notify but yields the *same* snapshot, so
+    //    the server's diff suppresses it. The `unregister` that follows removes
+    //    the window, so the next frame we read must be the empty set — if the
+    //    duplicate had (wrongly) been sent, we'd read the non-empty frame here.
+    client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "register",
+            json!({ "key": "k1", "folders": [repo_dir.path()], "repo": "r" }),
+        ))
+        .await
+        .unwrap();
+    client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "unregister",
+            json!({ "key": "k1" }),
+        ))
+        .await
+        .unwrap();
+    let removed = read_frame(&mut reader).await;
+    assert_eq!(
+        removed.payload,
+        json!({ "repos": [] }),
+        "expected the post-unregister empty frame, not a duplicate of the repo frame"
+    );
+
+    // 4) Daemon shutdown tears the stream down cleanly: the reader hits EOF.
+    client.shutdown().await.ok();
+    let mut tail = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut tail))
+        .await
+        .expect("shutdown should close the subscription within the timeout")
+        .unwrap();
+    assert_eq!(n, 0, "subscription should close cleanly on daemon shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
 #[tokio::test]
 async fn second_bind_is_refused_while_first_is_live() {
     let _gate = UMASK_GATE.lock().await;
