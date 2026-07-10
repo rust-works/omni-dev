@@ -191,18 +191,29 @@ impl WorktreesService {
             .unwrap_or_else(|_| json!({})));
         }
 
-        // Phase 2: execute. The requester (if it owns the target) closes itself
-        // on our `ok:true` reply, avoiding the ext-host-dies-mid-op race. Any
-        // *other* owning window can only be closed cross-window, which is a
-        // follow-up — refuse rather than delete a worktree still open elsewhere.
-        let has_other_window = open_windows
+        // Phase 2: execute. Signal every owning window *other than the
+        // requester* (which closes itself on our `ok:true` reply, avoiding the
+        // ext-host-dies-mid-op race) and wait for each to unregister before
+        // touching the worktree. The directive reaches a cross-window target via
+        // its heartbeat reply — the only channel the daemon has to a window it
+        // can reply to but never call.
+        let others: Vec<String> = open_windows
             .iter()
-            .any(|(k, _)| req.requester_key.as_deref() != Some(k));
-        if has_other_window {
-            bail!(
-                "worktree is open in another window; close that window first \
-                 (cross-window close arrives in a follow-up)"
-            );
+            .map(|(k, _)| k.clone())
+            .filter(|k| req.requester_key.as_deref() != Some(k))
+            .collect();
+        for key in &others {
+            self.registry.mark_close_pending(key);
+        }
+        if !others.is_empty() {
+            await_windows_closed(
+                &self.registry,
+                &req.path,
+                req.requester_key.as_deref(),
+                CLOSE_WAIT_TIMEOUT,
+                CLOSE_WAIT_POLL,
+            )
+            .await?;
         }
 
         if req.remove {
@@ -244,7 +255,16 @@ impl DaemonService for WorktreesService {
             }
             "heartbeat" => {
                 let key = require_str(&payload, "key", "heartbeat")?;
-                Ok(json!({ "known": self.registry.heartbeat(key) }))
+                let known = self.registry.heartbeat(key);
+                // A pending close directive (#1277) rides the reply as an
+                // additive `close` field, taken-and-cleared here so it fires
+                // exactly once. Omitted when false to keep older windows — which
+                // read only `known` — byte-identical on the wire.
+                let mut reply = json!({ "known": known });
+                if self.registry.take_close_pending(key) {
+                    reply["close"] = Value::Bool(true);
+                }
+                Ok(reply)
             }
             "unregister" => {
                 let key = require_str(&payload, "key", "unregister")?;
@@ -1076,6 +1096,59 @@ fn windows_with_path(entries: &[WindowEntry], path: &Path) -> Vec<(String, usize
         .filter(|e| e.folders.iter().any(|f| canonical(f) == target))
         .map(|e| (e.key.clone(), e.folders.len()))
         .collect()
+}
+
+/// How long the execute phase waits for a signalled window to close
+/// (`unregister`) before giving up. Deliberately generous against the ~10s
+/// heartbeat interval the close directive rides — a window may have just
+/// heartbeated, so the directive is only picked up on the *next* one — plus the
+/// window's own close/save latency. The keyed-push responsiveness upgrade
+/// (#1277 fast-follow) removes this wait entirely.
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often the execute phase re-checks whether the signalled windows have
+/// unregistered.
+const CLOSE_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// Waits up to `timeout` for every window *other than* `requester` that has
+/// `path` open to unregister (close), polling the live registry every `poll`.
+/// A window whose `last_seen` has already gone stale is reaped by `list()` and
+/// so counts as closed. Returns an error naming the still-open windows on
+/// timeout, so the caller can surface "window did not close" and leave the
+/// worktree untouched (failure modes #4/#5).
+async fn await_windows_closed(
+    registry: &WorktreesRegistry,
+    path: &Path,
+    requester: Option<&str>,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // The registry read is cheap CPU, but the path canonicalization in
+        // `windows_with_path` is disk I/O — do the whole check on a blocking
+        // thread, never on the async worker.
+        let entries = registry.list();
+        let path = path.to_path_buf();
+        let requester = requester.map(str::to_string);
+        let remaining: Vec<String> = tokio::task::spawn_blocking(move || {
+            windows_with_path(&entries, &path)
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| requester.as_deref() != Some(k))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("window(s) did not close in time: {}", remaining.join(", "));
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Computes the [`GitSafety`] of a worktree at `path`: whether it is the main
@@ -2551,32 +2624,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_refuses_when_the_target_is_open_in_another_window() {
+    async fn close_safety_check_surfaces_the_owning_window() {
         let (_main, _wtp, wt_path) = repo_with_linked_worktree();
         let svc = WorktreesService::new();
-        // Another window (not the requester) owns the target: the destructive
-        // path must not be taken blind (cross-window close is a follow-up).
+        // A multi-root window owns the target: the report surfaces its key and
+        // folder count so the extension can warn "all N folders will close".
         svc.handle(
             "register",
-            json!({ "key": "w2", "folders": [wt_path], "repo": "feature-wt" }),
+            json!({ "key": "w2", "folders": [&wt_path, "/tmp/other"], "repo": "feature-wt" }),
         )
         .await
         .unwrap();
-        assert!(svc
-            .handle(
-                "close",
-                json!({
-                    "path": wt_path,
-                    "remove": true,
-                    "confirmed": true,
-                    "requester_key": "w1",
-                }),
-            )
-            .await
-            .is_err());
-        // Refused → the worktree is untouched.
-        assert!(wt_path.exists());
-        // The safety report still surfaces the owning window for the UI.
         let report = svc
             .handle("close", json!({ "path": wt_path, "remove": true }))
             .await
@@ -2585,8 +2643,128 @@ mod tests {
         assert_eq!(report.get("window_key").and_then(Value::as_str), Some("w2"));
         assert_eq!(
             report.get("window_folder_count").and_then(Value::as_u64),
-            Some(1)
+            Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_op_surfaces_a_pending_close_directive_once() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        // No directive → a plain `{ known: true }`, byte-identical to before.
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+        // Marked → the next heartbeat carries `close: true`, exactly once.
+        svc.registry.mark_close_pending("w1");
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true, "close": true })
+        );
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn close_signals_a_cross_window_target_then_removes_after_it_closes() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = Arc::new(WorktreesService::new());
+        // A *different* window (not the requester) owns the target.
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [&wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+
+        // Drive the destructive close concurrently: it marks w2 to close and
+        // waits for it to unregister before removing.
+        let svc2 = svc.clone();
+        let path = wt_path.clone();
+        let close = tokio::spawn(async move {
+            svc2.handle(
+                "close",
+                json!({
+                    "path": path,
+                    "remove": true,
+                    "confirmed": true,
+                    "requester_key": "w1",
+                }),
+            )
+            .await
+        });
+
+        // Simulate w2's extension: its next heartbeat sees `close: true`, so it
+        // closes its window and unregisters. Poll until the directive appears.
+        let mut saw_close = false;
+        for _ in 0..200 {
+            let hb = svc
+                .handle("heartbeat", json!({ "key": "w2" }))
+                .await
+                .unwrap();
+            if hb.get("close").and_then(Value::as_bool) == Some(true) {
+                saw_close = true;
+                svc.handle("unregister", json!({ "key": "w2" }))
+                    .await
+                    .unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_close, "w2 should have been told to close");
+
+        // Once w2 has unregistered, the close op removes the worktree.
+        let reply = close.await.unwrap().unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn await_windows_closed_times_out_when_a_window_never_closes() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [&wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+        // The owning window never unregisters: the wait gives up (with a short
+        // timeout here) rather than block, and names the still-open window.
+        let err = await_windows_closed(
+            &svc.registry,
+            &wt_path,
+            Some("w1"),
+            Duration::from_millis(150),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("w2"),
+            "error names the window: {err}"
+        );
+        // The requester itself is excluded, so a self-only owner returns at once.
+        await_windows_closed(
+            &svc.registry,
+            &wt_path,
+            Some("w2"),
+            Duration::from_millis(150),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
