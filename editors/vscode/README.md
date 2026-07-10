@@ -98,9 +98,14 @@ To cut a release:
 3. Tag the merge commit `vscode-v<version>` (e.g. `vscode-v0.2.1`) and push the
    tag. The release workflow verifies the tag matches `package.json`, re-runs
    typecheck/build/test/package, then publishes the same `.vsix` to both
-   registries.
+   registries (Open VSX is skipped when `OVSX_PAT` is unset — see below).
 
-A one-time account + secrets setup is required before the first publish (an
-Azure DevOps publisher whose id matches `"publisher": "rust-works"`, the
-`rust-works` Open VSX namespace, and the repo secrets `VSCE_PAT` + `OVSX_PAT`) —
-see [#1279](https://github.com/rust-works/omni-dev/issues/1279).
+A one-time account + secrets setup is required before the first publish:
+
+- **VS Code Marketplace (required):** an Azure DevOps publisher whose id matches
+  `"publisher": "rust-works"` and the repo secret `VSCE_PAT`.
+- **Open VSX (optional):** the `rust-works` Open VSX namespace and the repo secret
+  `OVSX_PAT`. If `OVSX_PAT` is unset the workflow publishes to the Marketplace only
+  and skips Open VSX (rather than failing), so you can add it later.
+
+See [#1279](https://github.com/rust-works/omni-dev/issues/1279).
