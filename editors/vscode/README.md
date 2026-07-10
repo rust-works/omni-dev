@@ -48,16 +48,12 @@ never surfaces an error or blocks the window.
 ## Development
 
 ```bash
-npm install         # no committed lockfile yet — see note below
+npm ci              # reproducible install from the committed package-lock.json
 npm run typecheck   # tsc --noEmit
 npm run build       # esbuild → dist/extension.js
 npm test            # tsc → out/, then node --test
 npm run package     # vsce package → omni-dev-worktrees-<version>.vsix
 ```
-
-> No `package-lock.json` is committed yet, so CI and local builds use
-> `npm install`. Run `npm install` once and commit the generated lockfile to
-> switch to reproducible `npm ci` builds (and enable the npm cache in CI).
 
 Install a local build with:
 
@@ -65,5 +61,23 @@ Install a local build with:
 code --install-extension omni-dev-worktrees-*.vsix
 ```
 
-Publishing to the VS Code Marketplace / Open VSX is not yet wired up (it needs a
-publisher account and CI secrets) — see the tracking issue for that follow-up.
+## Releasing
+
+The extension is published to the **VS Code Marketplace** (Microsoft VS Code)
+and **Open VSX** (VSCodium / Cursor / Windsurf / Gitpod / code-server) by
+[`.github/workflows/vscode-extension-release.yml`](../../.github/workflows/vscode-extension-release.yml).
+Its `version` is independent of the Rust crate's `Cargo.toml`.
+
+To cut a release:
+
+1. Bump `version` in [`package.json`](package.json) and run `npm install` to
+   refresh `package-lock.json`; commit both.
+2. Tag the merge commit `vscode-v<version>` (e.g. `vscode-v0.2.1`) and push the
+   tag. The release workflow verifies the tag matches `package.json`, re-runs
+   typecheck/build/test/package, then publishes the same `.vsix` to both
+   registries.
+
+A one-time account + secrets setup is required before the first publish (an
+Azure DevOps publisher whose id matches `"publisher": "rust-works"`, the
+`rust-works` Open VSX namespace, and the repo secrets `VSCE_PAT` + `OVSX_PAT`) —
+see [#1279](https://github.com/rust-works/omni-dev/issues/1279).

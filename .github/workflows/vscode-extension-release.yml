@@ -1,0 +1,122 @@
+name: VS Code extension release
+
+# Publishes the companion extension in editors/vscode/ to the VS Code
+# Marketplace (vsce) and Open VSX (ovsx). Deliberately kept separate from
+# vscode-extension.yml (which runs the PR/main checks): this file only ever
+# runs on a dedicated `vscode-v*` tag or a manual dispatch — NEVER on a `main`
+# push — so a routine merge can never publish.
+#
+# Release flow (extension version is independent of the Rust crate):
+#   1. bump `version` in editors/vscode/package.json (and package-lock.json)
+#   2. commit, then tag the merge commit `vscode-v<version>` (e.g. vscode-v0.2.1)
+#   3. push the tag — this workflow verifies tag == package.json version,
+#      re-runs typecheck/build/test/package, then publishes the same .vsix to
+#      both registries.
+#
+# One-time prerequisites (maintainer, not code): an Azure DevOps publisher whose
+# id matches `"publisher": "rust-works"`, the `rust-works` Open VSX namespace,
+# and the repo secrets VSCE_PAT + OVSX_PAT. See editors/vscode/README.md.
+on:
+  push:
+    tags:
+      - 'vscode-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two publishes race for the same version.
+concurrency:
+  group: vscode-extension-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      # Fail loudly and early if either PAT is absent, rather than getting most
+      # of the way through a publish and dying (or, worse, silently skipping).
+      - name: Verify required secrets are present
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          missing=()
+          [ -z "$VSCE_PAT" ] && missing+=("VSCE_PAT")
+          [ -z "$OVSX_PAT" ] && missing+=("OVSX_PAT")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing required repo secret(s): ${missing[*]}. Add them under Settings → Secrets and variables → Actions before releasing. See editors/vscode/README.md."
+            exit 1
+          fi
+
+      # On a tag push, the tag is the source of truth for what we intend to
+      # ship; refuse to publish if package.json disagrees. Skipped for a manual
+      # dispatch (no tag), which publishes whatever version is on the ref.
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/vscode-v')
+        run: |
+          tag_version="${GITHUB_REF#refs/tags/vscode-v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag vscode-v${tag_version} does not match editors/vscode/package.json version ${pkg_version}. Bump the version and retag."
+            exit 1
+          fi
+          echo "Releasing omni-dev-worktrees ${pkg_version} (tag vscode-v${tag_version})"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Package .vsix
+        run: npm run package
+
+      # Resolve the single packaged artifact so both registries get the exact
+      # same bytes (rather than each re-packaging independently).
+      - name: Resolve packaged .vsix
+        id: vsix
+        run: |
+          shopt -s nullglob
+          files=(*.vsix)
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "::error::Expected exactly one .vsix, found ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+          echo "Packaged ${files[0]}"
+
+      - name: Publish to VS Code Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npm run publish:vsce -- --packagePath "${{ steps.vsix.outputs.path }}"
+
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npm run publish:ovsx -- "${{ steps.vsix.outputs.path }}"
+
+      # Keep the exact published artifact for provenance / manual re-install.
+      - name: Upload published .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-dev-worktrees-vsix-${{ github.ref_name }}
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
