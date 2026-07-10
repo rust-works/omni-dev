@@ -8,6 +8,8 @@ import * as path from "path";
 import {
   MAX_SOCKET_PATH_LEN,
   checkSocketPathLen,
+  closeCheckEnvelope,
+  closeEnvelope,
   defaultDataDir,
   defaultSocketPath,
   heartbeatEnvelope,
@@ -83,5 +85,29 @@ test("tree/subscribe/open envelope builders match the worktrees wire contract", 
     service: "worktrees",
     op: "open",
     payload: { path: "/home/me/wt/issue-1300" },
+  });
+});
+
+test("close envelope builders match the two-phase worktrees wire contract", () => {
+  // Phase 1: a safety check is `remove:true` with no `confirmed`.
+  assert.deepEqual(closeCheckEnvelope("/wt/issue-1300", "k1"), {
+    service: "worktrees",
+    op: "close",
+    payload: { path: "/wt/issue-1300", remove: true, requester_key: "k1" },
+  });
+  // Phase 2 (delete a linked worktree): `remove:true`, `confirmed:true`.
+  assert.deepEqual(
+    closeEnvelope("/wt/issue-1300", { remove: true, requesterKey: "k1", confirmed: true }),
+    {
+      service: "worktrees",
+      op: "close",
+      payload: { path: "/wt/issue-1300", remove: true, requester_key: "k1", confirmed: true },
+    },
+  );
+  // "Close Window" (main tree): `remove:false`; `confirmed` is omitted when unset.
+  assert.deepEqual(closeEnvelope("/repo", { remove: false, requesterKey: "k1" }), {
+    service: "worktrees",
+    op: "close",
+    payload: { path: "/repo", remove: false, requester_key: "k1" },
   });
 });

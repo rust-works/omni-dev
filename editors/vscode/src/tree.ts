@@ -133,15 +133,26 @@ export function worktreeTooltip(
 
 /**
  * The `contextValue` used to gate context-menu items and mark the open badge.
- * All three start with `worktree` so a single `viewItem =~ /worktree/` menu
- * `when` matches current, other-window, and closed alike; `worktree.current`
- * additionally gates any current-window-only menu items.
+ * Encodes two orthogonal facts as dotted segments:
+ *
+ *  - **open state** — `worktree.current` (this window), `worktree.open`
+ *    (another window), or bare `worktree` (no window);
+ *  - **structural role** — a trailing `.main` (the repository's main working
+ *    tree) or `.linked` (a linked worktree), which the daemon reports as
+ *    `is_main` and which decides deletability (never the branch name).
+ *
+ * So every value starts with `worktree` — the existing `viewItem =~ /worktree/`
+ * "open" menu still matches all six variants — while the close menus gate on the
+ * role: **Close Window** on `/worktree\.(current|open)\.main/` (a main tree with
+ * a window) and **Close Worktree** on `/worktree\..*linked/` (any linked
+ * worktree). A main tree with no window matches neither, so nothing is offered.
  */
 export function worktreeContextValue(wt: TreeWorktreePayload, windowKey?: string): string {
+  const role = wt.is_main ? "main" : "linked";
   if (isCurrentWindow(wt, windowKey)) {
-    return "worktree.current";
+    return `worktree.current.${role}`;
   }
-  return wt.open ? "worktree.open" : "worktree";
+  return wt.open ? `worktree.open.${role}` : `worktree.${role}`;
 }
 
 /**

@@ -59,6 +59,16 @@
         "command": "omniDevWorktrees.itemClicked",
         "title": "Open Worktree (internal)",
         "category": "omni-dev Worktrees"
+      },
+      {
+        "command": "omniDevWorktrees.closeWorktree",
+        "title": "Close Worktree",
+        "category": "omni-dev Worktrees"
+      },
+      {
+        "command": "omniDevWorktrees.closeWindow",
+        "title": "Close Window",
+        "category": "omni-dev Worktrees"
       }
     ],
     "menus": {
@@ -69,6 +79,14 @@
         },
         {
           "command": "omniDevWorktrees.open",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.closeWorktree",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.closeWindow",
           "when": "false"
         }
       ],
@@ -84,6 +102,16 @@
           "command": "omniDevWorktrees.open",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
           "group": "inline"
+        },
+        {
+          "command": "omniDevWorktrees.closeWindow",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.(current|open)\\.main/",
+          "group": "9_close@1"
+        },
+        {
+          "command": "omniDevWorktrees.closeWorktree",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
+          "group": "9_close@1"
         }
       ]
     },

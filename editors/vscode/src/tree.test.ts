@@ -104,15 +104,24 @@ test("isCurrentWindow matches only the open worktree whose key is this window's"
   assert.equal(isCurrentWindow({ path: "/x", is_main: true, open: true }, undefined), false);
 });
 
-test("worktreeContextValue marks current, other-window, and closed under a shared `worktree` prefix", () => {
-  // This window's own worktree gets the distinct `worktree.current`.
-  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w1"), "worktree.current");
-  // Open elsewhere → `worktree.open`; closed → `worktree`.
-  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w2"), "worktree.open");
-  assert.equal(worktreeContextValue(REPOS[0].worktrees[1], "w1"), "worktree");
-  // Without a window key, an open worktree is still just `worktree.open`.
-  assert.equal(worktreeContextValue(REPOS[0].worktrees[0]), "worktree.open");
-  assert.equal(worktreeContextValue(REPOS[0].worktrees[1]), "worktree");
+test("worktreeContextValue encodes open state and structural role under a shared `worktree` prefix", () => {
+  // The main working tree (is_main) → a trailing `.main`, across open states.
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w1"), "worktree.current.main");
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w2"), "worktree.open.main");
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0]), "worktree.open.main");
+  // A linked worktree → a trailing `.linked`. The fixture's linked one is closed.
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[1], "w1"), "worktree.linked");
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[1]), "worktree.linked");
+
+  // The current/open linked variants (not in the fixture) round out the six.
+  const linkedHere = { path: "/wt/x", is_main: false, open: true, window_key: "w1" };
+  const linkedElsewhere = { path: "/wt/y", is_main: false, open: true, window_key: "w9" };
+  assert.equal(worktreeContextValue(linkedHere, "w1"), "worktree.current.linked");
+  assert.equal(worktreeContextValue(linkedElsewhere, "w1"), "worktree.open.linked");
+
+  // A closed main tree matches neither close menu (nothing to close or delete).
+  const closedMain = { path: "/repo", is_main: true, open: false };
+  assert.equal(worktreeContextValue(closedMain), "worktree.main");
 });
 
 test("nodeId is stable and distinguishes repos from worktrees", () => {
