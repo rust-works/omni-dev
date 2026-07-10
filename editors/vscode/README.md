@@ -1,4 +1,4 @@
-# omni-dev Worktrees Reporter
+# omni-dev
 
 A tiny VS Code companion extension for the [omni-dev](https://github.com/rust-works/omni-dev)
 daemon's **worktrees service**. It reports each VS Code window's open worktrees
@@ -52,7 +52,7 @@ npm ci              # reproducible install from the committed package-lock.json
 npm run typecheck   # tsc --noEmit
 npm run build       # esbuild → dist/extension.js
 npm test            # tsc → out/, then node --test
-npm run package     # vsce package → omni-dev-worktrees-<version>.vsix
+npm run package     # vsce package → omni-dev-<version>.vsix
 ```
 
 The Marketplace / Open VSX gallery icon is the top-level `"icon"` in
@@ -72,7 +72,7 @@ only the `.png` ships.
 Install a local build with:
 
 ```bash
-code --install-extension omni-dev-worktrees-*.vsix
+code --install-extension omni-dev-*.vsix
 ```
 
 ## Releasing
@@ -80,13 +80,22 @@ code --install-extension omni-dev-worktrees-*.vsix
 The extension is published to the **VS Code Marketplace** (Microsoft VS Code)
 and **Open VSX** (VSCodium / Cursor / Windsurf / Gitpod / code-server) by
 [`.github/workflows/vscode-extension-release.yml`](../../.github/workflows/vscode-extension-release.yml).
-Its `version` is independent of the Rust crate's `Cargo.toml`.
+Its `version` and release notes are independent of the Rust crate: the version
+lives in [`package.json`](package.json) (not `Cargo.toml`) and the notes in
+[`CHANGELOG.md`](CHANGELOG.md) (not the [repository-root
+changelog](../../CHANGELOG.md), which tracks the crate). Both registries render a
+**Changelog** tab from that file in the packaged `.vsix`, so every published
+version needs an entry.
 
 To cut a release:
 
 1. Bump `version` in [`package.json`](package.json) and run `npm install` to
    refresh `package-lock.json`; commit both.
-2. Tag the merge commit `vscode-v<version>` (e.g. `vscode-v0.2.1`) and push the
+2. In [`CHANGELOG.md`](CHANGELOG.md), move the `[Unreleased]` items into a new
+   `## [X.Y.Z] - YYYY-MM-DD` section (add one if `[Unreleased]` is empty), grouped
+   under Keep a Changelog headings (Added / Changed / Fixed / …). Add entries to
+   `[Unreleased]` as changes land, not all at once here.
+3. Tag the merge commit `vscode-v<version>` (e.g. `vscode-v0.2.1`) and push the
    tag. The release workflow verifies the tag matches `package.json`, re-runs
    typecheck/build/test/package, then publishes the same `.vsix` to both
    registries.
