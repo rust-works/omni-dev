@@ -38,8 +38,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use git2::Repository;
-use serde::Serialize;
+use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -142,6 +142,92 @@ impl WorktreesService {
         });
         *guard = Some(RefreshTask { token, handle });
     }
+
+    /// Handles the `close` op: close a worktree's window and, for a **linked**
+    /// worktree, delete it. The flow has two phases keyed off `confirmed`:
+    ///
+    /// - **Phase 1** (`remove:true`, `confirmed:false`) — a pure, side-effect-free
+    ///   [`git_safety`] check returning the risks of deleting, so the extension can
+    ///   show a modal confirm only when something would actually be lost.
+    /// - **Phase 2** (`confirmed:true`, or any `remove:false`) — execute: signal
+    ///   the owning window(s) to close, then (for `remove:true`) `git2`-prune the
+    ///   worktree. The main working tree is refused defensively.
+    ///
+    /// Cross-window signalling (another window has the target open) is a
+    /// fast-follow: this core handles the **no-window** and **self-close**
+    /// (`requester_key == target_key`) cases, and errors clearly when another
+    /// window owns the target so the destructive path is never taken blind.
+    async fn close(&self, req: CloseRequest) -> Result<Value> {
+        // Which live windows currently have the target open. The canonical-path
+        // compare is disk I/O, so run it (with the safety check below) on a
+        // blocking thread, never under the registry lock or on the async worker.
+        let entries = self.registry.list();
+        let scan_path = req.path.clone();
+        let open_windows =
+            tokio::task::spawn_blocking(move || windows_with_path(&entries, &scan_path))
+                .await
+                .unwrap_or_default();
+        let open = !open_windows.is_empty();
+        let window_key = open_windows.first().map(|(k, _)| k.clone());
+        let window_folder_count = open_windows.first().map_or(0, |(_, c)| *c);
+
+        // Phase 1: the safety check runs only for a delete request awaiting
+        // confirmation. A "Close Window" (remove:false) never inspects git and
+        // has nothing to confirm, so it skips straight to execute.
+        if req.remove && !req.confirmed {
+            let path = req.path.clone();
+            let git = tokio::task::spawn_blocking(move || git_safety(&path))
+                .await
+                .map_err(|e| anyhow!("safety check task panicked: {e}"))??;
+            return Ok(serde_json::to_value(SafetyReport {
+                removable: git.removable,
+                is_main: git.is_main,
+                open,
+                window_key,
+                window_folder_count,
+                risks: git.risks,
+                info: git.info,
+            })
+            .unwrap_or_else(|_| json!({})));
+        }
+
+        // Phase 2: execute. Signal every owning window *other than the
+        // requester* (which closes itself on our `ok:true` reply, avoiding the
+        // ext-host-dies-mid-op race) and wait for each to unregister before
+        // touching the worktree. The directive reaches a cross-window target via
+        // its heartbeat reply — the only channel the daemon has to a window it
+        // can reply to but never call.
+        let others: Vec<String> = open_windows
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| req.requester_key.as_deref() != Some(k))
+            .collect();
+        for key in &others {
+            self.registry.mark_close_pending(key);
+        }
+        if !others.is_empty() {
+            await_windows_closed(
+                &self.registry,
+                &req.path,
+                req.requester_key.as_deref(),
+                CLOSE_WAIT_TIMEOUT,
+                CLOSE_WAIT_POLL,
+            )
+            .await?;
+        }
+
+        if req.remove {
+            let path = req.path.clone();
+            tokio::task::spawn_blocking(move || remove_worktree(&path))
+                .await
+                .map_err(|e| anyhow!("worktree removal task panicked: {e}"))??;
+            Ok(json!({ "removed": true }))
+        } else {
+            // "Close Window" with no owning window is a no-op success; a
+            // self-close replies and the extension closes its own window.
+            Ok(json!({ "closed": true }))
+        }
+    }
 }
 
 impl Default for WorktreesService {
@@ -169,7 +255,16 @@ impl DaemonService for WorktreesService {
             }
             "heartbeat" => {
                 let key = require_str(&payload, "key", "heartbeat")?;
-                Ok(json!({ "known": self.registry.heartbeat(key) }))
+                let known = self.registry.heartbeat(key);
+                // A pending close directive (#1277) rides the reply as an
+                // additive `close` field, taken-and-cleared here so it fires
+                // exactly once. Omitted when false to keep older windows — which
+                // read only `known` — byte-identical on the wire.
+                let mut reply = json!({ "known": known });
+                if self.registry.take_close_pending(key) {
+                    reply["close"] = Value::Bool(true);
+                }
+                Ok(reply)
             }
             "unregister" => {
                 let key = require_str(&payload, "key", "unregister")?;
@@ -198,6 +293,16 @@ impl DaemonService for WorktreesService {
                 let path = require_str(&payload, "path", "open")?;
                 focus_window(Path::new(path))?;
                 Ok(json!({ "ok": true }))
+            }
+            "close" => {
+                // Close a worktree's window and (for a linked worktree)
+                // **delete** it. Destructive, so all git logic stays in the
+                // daemon (git2, never a shell) and the main working tree is
+                // refused defensively — the UI gating is not the only guard.
+                // See ADR-0049 and docs/worktrees-service.md.
+                let req: CloseRequest =
+                    serde_json::from_value(payload).context("invalid `close` payload")?;
+                self.close(req).await
             }
             other => bail!("unknown worktrees op: {other}"),
         }
@@ -899,6 +1004,393 @@ fn resolve_code_binary_from(
     PathBuf::from("code")
 }
 
+// --- Close op (#1277) --------------------------------------------------------
+
+/// The `close` op payload: close a worktree's window and (for a linked worktree)
+/// delete it. Symmetric to `open`, but destructive, so it carries the
+/// two-phase-confirm and self-close routing fields.
+#[derive(Debug, Clone, Deserialize)]
+struct CloseRequest {
+    /// Absolute path of the target worktree's working directory.
+    path: PathBuf,
+    /// The requesting window's key, so a self-close (`requester_key` owns the
+    /// target) removes-then-replies and lets the extension close its own window,
+    /// rather than waiting on a window that is blocked awaiting this reply.
+    #[serde(default)]
+    requester_key: Option<String>,
+    /// Whether to **delete** the worktree (linked "Close Worktree") rather than
+    /// only close its window (main "Close Window"). A delete is refused on the
+    /// main working tree regardless of this flag.
+    #[serde(default)]
+    remove: bool,
+    /// Set on the phase-2 execute call. Absent/false with `remove:true` is the
+    /// phase-1, side-effect-free safety check; ignored for `remove:false`.
+    #[serde(default)]
+    confirmed: bool,
+}
+
+/// One risk or informational note in a [`SafetyReport`]: a machine-readable
+/// `kind` and a human-readable `detail`. Shared by both the blocking `risks`
+/// (data would be lost) and the non-blocking `info` (context, e.g. unpushed
+/// commits that survive because the branch is kept).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Note {
+    /// A stable machine slug for the condition (e.g. `dirty`, `untracked`).
+    kind: String,
+    /// A human-readable one-line explanation for the confirm dialog.
+    detail: String,
+}
+
+impl Note {
+    fn new(kind: &str, detail: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The phase-1 safety report the extension reads to decide whether to prompt.
+/// `removable && risks.is_empty()` → proceed with **no** dialog; any `risks`
+/// entry → show a modal confirm listing them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SafetyReport {
+    /// Whether the target is a deletable (linked) worktree at all — `false` for
+    /// the main working tree, which the daemon never removes.
+    removable: bool,
+    /// Whether the target is the repository's main working tree.
+    is_main: bool,
+    /// Whether a live VS Code window currently has the target open.
+    open: bool,
+    /// The owning window's key, when `open` (the first, for the wait/close).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_key: Option<String>,
+    /// How many workspace folders the owning window has — so the extension can
+    /// warn "this window has N folders open; all will close" (failure mode #10).
+    window_folder_count: usize,
+    /// Conditions that would lose data on removal; a non-empty list forces a
+    /// confirm dialog.
+    risks: Vec<Note>,
+    /// Non-blocking context shown for awareness (e.g. unpushed commits that
+    /// survive because the branch is kept).
+    info: Vec<Note>,
+}
+
+/// The git-only half of the safety check, before the registry's open-window
+/// facts are folded in. Pure disk I/O; computed on a blocking thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitSafety {
+    is_main: bool,
+    removable: bool,
+    risks: Vec<Note>,
+    info: Vec<Note>,
+}
+
+/// Live windows (key, workspace-folder count) that currently have `path` open,
+/// matched by canonicalized path so a symlinked or `..`-laden report still
+/// joins. Disk I/O (canonicalization), so it runs on a blocking thread.
+fn windows_with_path(entries: &[WindowEntry], path: &Path) -> Vec<(String, usize)> {
+    let target = canonical(path);
+    entries
+        .iter()
+        .filter(|e| e.folders.iter().any(|f| canonical(f) == target))
+        .map(|e| (e.key.clone(), e.folders.len()))
+        .collect()
+}
+
+/// How long the execute phase waits for a signalled window to close
+/// (`unregister`) before giving up. Deliberately generous against the ~10s
+/// heartbeat interval the close directive rides — a window may have just
+/// heartbeated, so the directive is only picked up on the *next* one — plus the
+/// window's own close/save latency. The keyed-push responsiveness upgrade
+/// (#1277 fast-follow) removes this wait entirely.
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often the execute phase re-checks whether the signalled windows have
+/// unregistered.
+const CLOSE_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// Waits up to `timeout` for every window *other than* `requester` that has
+/// `path` open to unregister (close), polling the live registry every `poll`.
+/// A window whose `last_seen` has already gone stale is reaped by `list()` and
+/// so counts as closed. Returns an error naming the still-open windows on
+/// timeout, so the caller can surface "window did not close" and leave the
+/// worktree untouched (failure modes #4/#5).
+async fn await_windows_closed(
+    registry: &WorktreesRegistry,
+    path: &Path,
+    requester: Option<&str>,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // The registry read is cheap CPU, but the path canonicalization in
+        // `windows_with_path` is disk I/O — do the whole check on a blocking
+        // thread, never on the async worker.
+        let entries = registry.list();
+        let path = path.to_path_buf();
+        let requester = requester.map(str::to_string);
+        let remaining: Vec<String> = tokio::task::spawn_blocking(move || {
+            windows_with_path(&entries, &path)
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| requester.as_deref() != Some(k))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("window(s) did not close in time: {}", remaining.join(", "));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Computes the [`GitSafety`] of a worktree at `path`: whether it is the main
+/// working tree (never removable) and, for a linked worktree, what a removal
+/// would lose. Best-effort per-check but the overall open must succeed — a path
+/// that is not a git worktree is a hard error (we refuse to delete an unknown
+/// directory). A path that no longer exists is treated as an already-removed
+/// linked worktree so the idempotent execute path can proceed with no dialog.
+fn git_safety(path: &Path) -> Result<GitSafety> {
+    if !path.exists() {
+        return Ok(GitSafety {
+            is_main: false,
+            removable: true,
+            risks: vec![],
+            info: vec![Note::new("already-removed", "worktree no longer exists")],
+        });
+    }
+    let repo = Repository::open(path)
+        .with_context(|| format!("not a git worktree: {}", path.display()))?;
+    // The one structural fact deletability keys off — never the branch name.
+    if !repo.is_worktree() {
+        return Ok(GitSafety {
+            is_main: true,
+            removable: false,
+            risks: vec![],
+            info: vec![Note::new(
+                "main-working-tree",
+                "the repository's main working tree is never deleted",
+            )],
+        });
+    }
+
+    let mut risks = Vec::new();
+    let mut info = Vec::new();
+
+    let (dirty, untracked) = count_dirty_untracked(&repo);
+    if dirty > 0 {
+        risks.push(Note::new(
+            "dirty",
+            format!("{dirty} modified tracked file(s) would be lost"),
+        ));
+    }
+    if untracked > 0 {
+        risks.push(Note::new(
+            "untracked",
+            format!("{untracked} untracked file(s) would be lost"),
+        ));
+    }
+
+    // An in-progress rebase/merge/cherry-pick etc. is lost on removal.
+    let state = repo.state();
+    if state != RepositoryState::Clean {
+        risks.push(Note::new(
+            "in-progress",
+            format!("an in-progress {state:?} operation would be lost"),
+        ));
+    }
+
+    // Commits reachable only from a detached HEAD are GC'd once the worktree —
+    // and its HEAD ref — are gone. A HEAD still reachable from any ref (a branch
+    // or tag) loses nothing, so it is not flagged.
+    if repo.head_detached().unwrap_or(false) {
+        let lost = unreachable_commit_count(&repo).unwrap_or(0);
+        if lost > 0 {
+            risks.push(Note::new(
+                "unreachable-commits",
+                format!("{lost} commit(s) on a detached HEAD will be permanently lost"),
+            ));
+        }
+    }
+
+    // Unpushed commits on a *named* branch survive: removal never deletes the
+    // branch. Informational only — it must not block or prompt.
+    if let Some(ahead) = current_branch_ahead(&repo) {
+        if ahead > 0 {
+            info.push(Note::new(
+                "unpushed",
+                format!("{ahead} unpushed commit(s) on the branch (kept — the branch survives)"),
+            ));
+        }
+    }
+
+    Ok(GitSafety {
+        is_main: false,
+        removable: true,
+        risks,
+        info,
+    })
+}
+
+/// Counts a worktree's `(dirty tracked, untracked)` files. Tracked covers any
+/// staged or unstaged modification (including conflicts and deletions);
+/// untracked is `WT_NEW`. `.gitignore`d files are excluded — they are
+/// regenerable and must not force a prompt — via `include_ignored(false)`, so no
+/// status entry ever carries the `IGNORED` bit. A failed status read degrades to
+/// `(0, 0)` rather than sinking the whole safety check.
+fn count_dirty_untracked(repo: &Repository) -> (usize, usize) {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return (0, 0);
+    };
+    // Any staged or unstaged change to a tracked path (WT_NEW is untracked, so
+    // it is deliberately excluded from this mask).
+    let tracked = Status::INDEX_NEW
+        | Status::INDEX_MODIFIED
+        | Status::INDEX_DELETED
+        | Status::INDEX_RENAMED
+        | Status::INDEX_TYPECHANGE
+        | Status::WT_MODIFIED
+        | Status::WT_DELETED
+        | Status::WT_TYPECHANGE
+        | Status::WT_RENAMED
+        | Status::CONFLICTED;
+    let mut dirty = 0;
+    let mut untracked = 0;
+    for entry in statuses.iter() {
+        let s = entry.status();
+        if s.contains(Status::WT_NEW) {
+            untracked += 1;
+        }
+        if s.intersects(tracked) {
+            dirty += 1;
+        }
+    }
+    (dirty, untracked)
+}
+
+/// Counts commits reachable from the (detached) HEAD but from no other ref —
+/// the commits git would garbage-collect once the worktree's HEAD is gone.
+/// `None` if HEAD or the revwalk cannot be resolved. The literal `HEAD` ref is
+/// skipped (hiding it would hide the very commits we are counting); every real
+/// branch/tag/remote ref is hidden, so a tip that any branch also points at
+/// yields `0` (nothing is actually lost).
+fn unreachable_commit_count(repo: &Repository) -> Option<usize> {
+    let head_oid = repo.head().ok()?.target()?;
+    let mut walk = repo.revwalk().ok()?;
+    walk.push(head_oid).ok()?;
+    for reference in repo.references().ok()? {
+        let Ok(reference) = reference else { continue };
+        // Skip the literal HEAD ref — hiding it would hide the very commits we
+        // are counting; every real branch/tag/remote ref is hidden below.
+        if matches!(reference.name(), Ok("HEAD")) {
+            continue;
+        }
+        if let Some(oid) = reference.target() {
+            let _ = walk.hide(oid);
+        }
+    }
+    Some(walk.flatten().count())
+}
+
+/// Commits the worktree's current branch is ahead of its upstream, or `None`
+/// when HEAD is detached or the branch tracks no upstream. Reuses
+/// [`upstream_ahead_behind`]; only the ahead count matters here (unpushed work).
+fn current_branch_ahead(repo: &Repository) -> Option<usize> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = git2::Branch::wrap(head);
+    upstream_ahead_behind(repo, &branch).map(|(ahead, _behind)| ahead)
+}
+
+/// Resolves the linked worktree whose working directory canonicalizes to
+/// `target` to its registered name in `main_repo`. Errors when `target` is not
+/// one of the repo's worktrees — the defensive guard against removing a path
+/// that opened as a worktree but is not enumerated. Split out so that guard is
+/// unit-testable without corrupting git's worktree admin state.
+fn worktree_name_for_path(main_repo: &Repository, target: &Path) -> Result<String> {
+    let names = main_repo.worktrees()?;
+    names
+        .iter()
+        .flatten() // Result<Option<&str>, _> → Option<&str> (drop per-name errors)
+        .flatten() // Option<&str> → &str (drop non-UTF-8 names)
+        .find(|name| {
+            main_repo
+                .find_worktree(name)
+                .is_ok_and(|wt| canonical(wt.path()) == target)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "worktree {} is not registered in {}",
+                target.display(),
+                main_repo.path().display()
+            )
+        })
+}
+
+/// Removes a **linked** worktree at `path` via `git2` (no shell — avoiding the
+/// daemon-`PATH` problem the launcher fights): deletes both the admin files and
+/// the checked-out directory. Refuses the main working tree (the defensive
+/// backstop behind the UI gating) and a locked worktree (surfacing "unlock
+/// first" rather than forcing past the lock). Idempotent: an already-removed
+/// path is a success.
+fn remove_worktree(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let repo = Repository::open(path)
+        .with_context(|| format!("not a git worktree: {}", path.display()))?;
+    if !repo.is_worktree() {
+        bail!(
+            "refusing to delete the main working tree: {}",
+            path.display()
+        );
+    }
+    // The Worktree handle lives on the *main* repo (the common dir's parent),
+    // keyed by name; find it by matching the target path.
+    let commondir = canonical(repo.commondir());
+    let main_root = commondir
+        .parent()
+        .ok_or_else(|| anyhow!("no repository root for {}", path.display()))?
+        .to_path_buf();
+    // Drop the worktree-scoped handle before pruning deletes its directory.
+    drop(repo);
+    let main_repo = Repository::open(&main_root)
+        .with_context(|| format!("failed to open repository at {}", main_root.display()))?;
+    let name = worktree_name_for_path(&main_repo, &canonical(path))?;
+    let worktree = main_repo.find_worktree(&name)?;
+
+    // Never silently force past a lock (failure mode #6).
+    if let WorktreeLockStatus::Locked(reason) = worktree.is_locked()? {
+        let because = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+        bail!("worktree is locked{because}; unlock it first (git worktree unlock)");
+    }
+
+    // valid(true): prune even though the worktree still exists on disk;
+    // working_tree(true): also recursively delete the checked-out directory.
+    // locked stays false, so a lock (re-checked above) is never forced.
+    let mut opts = git2::WorktreePruneOptions::new();
+    opts.valid(true).working_tree(true);
+    worktree
+        .prune(Some(&mut opts))
+        .with_context(|| format!("failed to remove worktree {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1393,6 +1885,31 @@ mod tests {
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
             .unwrap();
         repo.commit(refname, &sig, &sig, msg, &tree, parents)
+            .unwrap()
+    }
+
+    /// Commits `content` as file `name` onto `refname`, chaining off its current
+    /// tip (if any). Unlike [`empty_commit`], the tree carries a real blob, so
+    /// the file is checked out into a worktree and can then be modified to
+    /// produce a dirty (tracked) status.
+    fn commit_file(
+        repo: &Repository,
+        refname: &str,
+        name: &str,
+        content: &[u8],
+        msg: &str,
+    ) -> git2::Oid {
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let blob = repo.blob(content).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert(name, blob, 0o100_644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let parent = repo
+            .refname_to_id(refname)
+            .ok()
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repo.commit(Some(refname), &sig, &sig, msg, &tree, &parents)
             .unwrap()
     }
 
@@ -1910,5 +2427,646 @@ mod tests {
         // Enumerated even though no window has it open, and marked closed.
         assert_eq!(linked.get("open").and_then(Value::as_bool), Some(false));
         assert!(linked.get("window_key").is_none());
+    }
+
+    // --- Close op (#1277) --------------------------------------------------
+
+    /// Builds a repo whose main working tree is on `trunk` with one **clean**
+    /// linked worktree on `feature`, returning the temp dirs (kept alive so the
+    /// paths stay valid) and the linked worktree path.
+    fn repo_with_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        (main_dir, wt_parent, wt_path)
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_reports_clean_linked_as_removable_with_no_risks() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // Phase 1 (confirmed absent) on a clean linked worktree: removable, not
+        // main, no risks → the extension proceeds with no dialog.
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+        assert_eq!(report.get("is_main").and_then(Value::as_bool), Some(false));
+        assert_eq!(report.get("open").and_then(Value::as_bool), Some(false));
+        assert!(report
+            .get("risks")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+        // No side effects: the worktree still exists.
+        assert!(wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn close_removes_a_clean_linked_worktree() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        let reply = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(
+            !wt_path.exists(),
+            "the worktree directory should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_flags_untracked_and_does_not_remove_without_confirmation() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        // An untracked file in the worktree would be lost on removal.
+        std::fs::write(wt_path.join("scratch.txt"), b"work in progress").unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("untracked")),
+            "expected an untracked risk: {report}"
+        );
+        // Still removable — the risk only means "confirm first", not "refuse".
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+        // The unconfirmed check has no side effects.
+        assert!(wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn close_confirmed_removes_a_dirty_worktree() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        std::fs::write(wt_path.join("scratch.txt"), b"discard me").unwrap();
+        let svc = WorktreesService::new();
+        // With confirmation, the risks are overridden and removal proceeds.
+        let reply = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn close_refuses_to_remove_the_main_working_tree() {
+        let (main, _wtp, _wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // Phase 1: the main tree reports not-removable, marked main.
+        let report = svc
+            .handle("close", json!({ "path": main.path(), "remove": true }))
+            .await
+            .unwrap();
+        assert_eq!(report.get("is_main").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            report.get("removable").and_then(Value::as_bool),
+            Some(false)
+        );
+        // Phase 2: even a confirmed delete of the main tree is refused
+        // defensively, and the directory is untouched.
+        assert!(svc
+            .handle(
+                "close",
+                json!({ "path": main.path(), "remove": true, "confirmed": true }),
+            )
+            .await
+            .is_err());
+        assert!(main.path().exists());
+    }
+
+    #[tokio::test]
+    async fn close_removes_a_linked_worktree_on_the_default_branch_and_keeps_the_branch() {
+        // The case a naive impl would wrongly protect: a linked worktree checked
+        // out on `main` (the default branch) is *still a linked worktree*, so it
+        // is fully deletable — and `main` survives (removal never deletes a branch).
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("main-wt");
+        add_worktree(&repo, a, &wt_path, "main");
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(!wt_path.exists());
+        // The `main` branch is untouched by the worktree removal.
+        assert!(
+            repo.find_branch("main", git2::BranchType::Local).is_ok(),
+            "the default branch must survive worktree removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent_when_the_worktree_is_already_gone() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // First removal succeeds.
+        svc.handle(
+            "close",
+            json!({ "path": wt_path, "remove": true, "confirmed": true }),
+        )
+        .await
+        .unwrap();
+        // A second confirmed close of the now-missing path is a clean success,
+        // not an error (a stale snapshot must not crash).
+        let reply = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_detects_detached_head_unreachable_commits() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        // In the worktree, commit onto a detached HEAD so the new commit is
+        // reachable from no ref — it would be GC'd on removal.
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        let parent_oid = wt_repo.head().unwrap().target().unwrap();
+        let parent = wt_repo.find_commit(parent_oid).unwrap();
+        let orphan = empty_commit(&wt_repo, None, &[&parent], "orphan");
+        wt_repo.set_head_detached(orphan).unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("unreachable-commits")),
+            "expected an unreachable-commits risk: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_self_close_removes_when_the_requester_owns_the_target() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // The requesting window itself has the worktree open: it is the only
+        // owning window, so there is nothing to wait on — remove and reply, and
+        // the extension closes its own window on `ok`.
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+        let reply = svc
+            .handle(
+                "close",
+                json!({
+                    "path": wt_path,
+                    "remove": true,
+                    "confirmed": true,
+                    "requester_key": "w1",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_surfaces_the_owning_window() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // A multi-root window owns the target: the report surfaces its key and
+        // folder count so the extension can warn "all N folders will close".
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [&wt_path, "/tmp/other"], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        assert_eq!(report.get("open").and_then(Value::as_bool), Some(true));
+        assert_eq!(report.get("window_key").and_then(Value::as_str), Some("w2"));
+        assert_eq!(
+            report.get("window_folder_count").and_then(Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_op_surfaces_a_pending_close_directive_once() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        // No directive → a plain `{ known: true }`, byte-identical to before.
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+        // Marked → the next heartbeat carries `close: true`, exactly once.
+        svc.registry.mark_close_pending("w1");
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true, "close": true })
+        );
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn close_signals_a_cross_window_target_then_removes_after_it_closes() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = Arc::new(WorktreesService::new());
+        // A *different* window (not the requester) owns the target.
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [&wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+
+        // Drive the destructive close concurrently: it marks w2 to close and
+        // waits for it to unregister before removing.
+        let svc2 = svc.clone();
+        let path = wt_path.clone();
+        let close = tokio::spawn(async move {
+            svc2.handle(
+                "close",
+                json!({
+                    "path": path,
+                    "remove": true,
+                    "confirmed": true,
+                    "requester_key": "w1",
+                }),
+            )
+            .await
+        });
+
+        // Simulate w2's extension: its next heartbeat sees `close: true`, so it
+        // closes its window and unregisters. Poll until the directive appears.
+        let mut saw_close = false;
+        for _ in 0..200 {
+            let hb = svc
+                .handle("heartbeat", json!({ "key": "w2" }))
+                .await
+                .unwrap();
+            if hb.get("close").and_then(Value::as_bool) == Some(true) {
+                saw_close = true;
+                svc.handle("unregister", json!({ "key": "w2" }))
+                    .await
+                    .unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_close, "w2 should have been told to close");
+
+        // Once w2 has unregistered, the close op removes the worktree.
+        let reply = close.await.unwrap().unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn await_windows_closed_times_out_when_a_window_never_closes() {
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [&wt_path], "repo": "feature-wt" }),
+        )
+        .await
+        .unwrap();
+        // The owning window never unregisters: the wait gives up (with a short
+        // timeout here) rather than block, and names the still-open window.
+        let err = await_windows_closed(
+            &svc.registry,
+            &wt_path,
+            Some("w1"),
+            Duration::from_millis(150),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("w2"),
+            "error names the window: {err}"
+        );
+        // The requester itself is excluded, so a self-only owner returns at once.
+        await_windows_closed(
+            &svc.registry,
+            &wt_path,
+            Some("w2"),
+            Duration::from_millis(150),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_window_without_remove_replies_closed_and_never_deletes() {
+        let (main, _wtp, _wt_path) = repo_with_linked_worktree();
+        let svc = WorktreesService::new();
+        // "Close Window" on the main tree: no git inspection, no removal.
+        let reply = svc
+            .handle("close", json!({ "path": main.path(), "remove": false }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "closed": true }));
+        assert!(main.path().exists());
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_flags_modified_tracked_files() {
+        // A tracked file, checked out into the linked worktree, then modified —
+        // its content is lost on removal, so it is a `dirty` risk (distinct from
+        // the untracked case).
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = commit_file(&repo, "refs/heads/trunk", "tracked.txt", b"original\n", "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        std::fs::write(wt_path.join("tracked.txt"), b"uncommitted change\n").unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("dirty")),
+            "expected a dirty risk: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_flags_an_in_progress_operation() {
+        // Plant a MERGE_HEAD in the worktree's gitdir so `repo.state()` reports a
+        // non-Clean (interrupted merge) state — its progress is lost on removal.
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        let head = wt_repo.head().unwrap().target().unwrap();
+        std::fs::write(wt_repo.path().join("MERGE_HEAD"), format!("{head}\n")).unwrap();
+        assert_ne!(wt_repo.state(), RepositoryState::Clean);
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("in-progress")),
+            "expected an in-progress risk: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_reports_unpushed_commits_as_info_not_a_risk() {
+        // A linked worktree on `feature`, which tracks `origin/feature` and is one
+        // commit ahead. The unpushed commit is INFO (the branch — and thus the
+        // commit — survives removal), never a blocking risk.
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let a_commit = repo.find_commit(a).unwrap();
+        repo.branch("feature", &a_commit, false).unwrap();
+        repo.reference("refs/remotes/origin/feature", a, true, "origin feature")
+            .unwrap();
+        // `feature` advances one commit past `origin/feature`.
+        empty_commit(&repo, Some("refs/heads/feature"), &[&a_commit], "B");
+        drop(a_commit);
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/x.git")
+            .unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.feature.remote", "origin").unwrap();
+        cfg.set_str("branch.feature.merge", "refs/heads/feature")
+            .unwrap();
+        // A worktree on the existing `feature` branch (not created fresh, so it
+        // keeps the ahead-of-upstream divergence).
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        let reference = repo.find_reference("refs/heads/feature").unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree("feature", &wt_path, Some(&opts)).unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        // Unpushed commits appear as `info`, and the worktree is still cleanly
+        // removable with no blocking risks.
+        let info = report.get("info").and_then(Value::as_array).unwrap();
+        assert!(
+            info.iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("unpushed")),
+            "expected an unpushed info note: {report}"
+        );
+        assert!(
+            report
+                .get("risks")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty(),
+            "unpushed commits alone must not block: {report}"
+        );
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_ignores_gitignored_files() {
+        // With `.gitignore` committed, an ignored artifact is the only worktree
+        // change — it must not count as untracked (it is regenerable), so the
+        // worktree stays cleanly removable with no risks.
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = commit_file(&repo, "refs/heads/trunk", ".gitignore", b"build/\n", "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        std::fs::create_dir(wt_path.join("build")).unwrap();
+        std::fs::write(wt_path.join("build/artifact.o"), b"junk").unwrap();
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        assert!(
+            report
+                .get("risks")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty(),
+            "a gitignored file must not create a risk: {report}"
+        );
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_treats_a_missing_path_as_already_removed() {
+        // The phase-1 check on a path that no longer exists reports it removable
+        // with no risks (so the idempotent execute proceeds with no dialog).
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle(
+                "close",
+                json!({ "path": "/no/such/worktree/xyzzy", "remove": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.get("removable").and_then(Value::as_bool), Some(true));
+        assert_eq!(report.get("is_main").and_then(Value::as_bool), Some(false));
+        assert!(report
+            .get("risks")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+        let info = report.get("info").and_then(Value::as_array).unwrap();
+        assert!(info
+            .iter()
+            .any(|r| r.get("kind").and_then(Value::as_str) == Some("already-removed")));
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_locked_worktree() {
+        // A locked worktree (git worktree lock) must be refused, not forced past
+        // (failure mode #6), and left on disk.
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let main_repo = Repository::open(main.path()).unwrap();
+        main_repo
+            .find_worktree("feature")
+            .unwrap()
+            .lock(Some("under test"))
+            .unwrap();
+
+        let svc = WorktreesService::new();
+        let err = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("locked"),
+            "expected a locked error: {err}"
+        );
+        assert!(wt_path.exists(), "a locked worktree must not be removed");
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_does_not_flag_a_detached_head_reachable_from_a_branch() {
+        // A detached HEAD that still sits on a commit a branch points to loses
+        // nothing on removal, so it must NOT produce an unreachable-commits risk
+        // (the false-positive the reachability walk guards against).
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        // The worktree is on `feature`; detach HEAD onto its current tip, which
+        // the `feature` branch still references.
+        let tip = wt_repo.head().unwrap().target().unwrap();
+        wt_repo.set_head_detached(tip).unwrap();
+        assert!(wt_repo.head_detached().unwrap());
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            !risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("unreachable-commits")),
+            "a detached HEAD reachable from a branch must not be flagged: {report}"
+        );
+    }
+
+    #[test]
+    fn worktree_name_for_path_resolves_a_real_worktree_and_errors_otherwise() {
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let main_repo = Repository::open(main.path()).unwrap();
+        // The real linked worktree resolves to its registered name.
+        assert_eq!(
+            worktree_name_for_path(&main_repo, &canonical(&wt_path)).unwrap(),
+            "feature"
+        );
+        // A path that is not one of this repo's worktrees is the defensive
+        // "not registered" error (the guard behind removal).
+        let err =
+            worktree_name_for_path(&main_repo, Path::new("/no/such/worktree/xyzzy")).unwrap_err();
+        assert!(
+            err.to_string().contains("not registered"),
+            "expected a not-registered error: {err}"
+        );
+    }
+
+    #[test]
+    fn count_dirty_untracked_degrades_to_zero_on_an_unreadable_index() {
+        // A corrupt index makes `statuses()` fail; the count degrades to (0, 0)
+        // rather than sinking the whole safety check.
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let repo = Repository::open(&wt_path).unwrap();
+        std::fs::write(repo.path().join("index"), b"not a valid git index").unwrap();
+        // Confirm the corruption actually breaks status enumeration, so the
+        // count is exercising the error-degradation branch (not an empty repo).
+        assert!(
+            repo.statuses(Some(&mut StatusOptions::new())).is_err(),
+            "a corrupt index should make statuses() fail"
+        );
+        assert_eq!(count_dirty_untracked(&repo), (0, 0));
     }
 }

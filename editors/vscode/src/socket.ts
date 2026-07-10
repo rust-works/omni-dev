@@ -134,6 +134,54 @@ export function openEnvelope(path: string): Envelope {
 }
 
 /**
+ * The fields the extension sends on a `close` op — mirrors the daemon's
+ * `CloseRequest` (`src/daemon/services/worktrees.rs`). `remove` selects delete
+ * (linked "Close Worktree") vs close-only (main "Close Window"); `requester_key`
+ * is this window's key, so the daemon can tell a self-close from a cross-window
+ * one; `confirmed` promotes the phase-1 safety check to the phase-2 execute.
+ */
+export interface ClosePayload {
+  path: string;
+  remove: boolean;
+  requester_key: string;
+  confirmed?: boolean;
+}
+
+/**
+ * Builds a `close` **phase-1** safety-check envelope: `remove:true` with no
+ * confirmation, so the daemon inspects the worktree and reports what a removal
+ * would lose without touching anything.
+ */
+export function closeCheckEnvelope(path: string, requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "close",
+    payload: { path, remove: true, requester_key: requesterKey },
+  };
+}
+
+/**
+ * Builds a `close` **execute** envelope. With `remove:true` it deletes the
+ * (linked) worktree after closing its window; with `remove:false` it only
+ * closes the window ("Close Window", never a delete). A `remove:true` execute
+ * carries `confirmed:true` so the daemon proceeds past any risks.
+ */
+export function closeEnvelope(
+  path: string,
+  opts: { remove: boolean; requesterKey: string; confirmed?: boolean },
+): Envelope {
+  const payload: ClosePayload = {
+    path,
+    remove: opts.remove,
+    requester_key: opts.requesterKey,
+  };
+  if (opts.confirmed) {
+    payload.confirmed = true;
+  }
+  return { service: WORKTREES_SERVICE, op: "close", payload };
+}
+
+/**
  * Sends one request envelope to the daemon and resolves with its reply.
  *
  * Opens a fresh connection, writes one `\n`-terminated JSON line, reads one

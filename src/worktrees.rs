@@ -18,7 +18,7 @@
 //! under the lock, so liveness reaping happens inline on each read rather than
 //! from a background task.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -108,6 +108,15 @@ pub struct WorktreesRegistry {
     /// guard is dropped, so the `std::Mutex`-never-across-`.await` rule is intact
     /// (and the watch's own internal lock is never nested under the map lock).
     changes: watch::Sender<u64>,
+    /// Window keys with a pending "close yourself" directive, set by the
+    /// `close` op (#1277) when a cross-window close must reach a window the
+    /// daemon can only *reply* to, never call. Each key is surfaced — and
+    /// cleared — on that window's next `heartbeat` (the `known:false →
+    /// re-register` precedent, riding the same reply). In-memory only, like the
+    /// window map: a daemon restart drops any pending directive (the close op
+    /// aborts and the user retries — an accepted failure mode). Behind its own
+    /// `Mutex`, taken independently of the window map's, so neither nests.
+    close_pending: Mutex<HashSet<String>>,
 }
 
 impl WorktreesRegistry {
@@ -118,6 +127,7 @@ impl WorktreesRegistry {
             windows: Mutex::new(HashMap::new()),
             ttl: DEFAULT_TTL,
             changes: watch::channel(0).0,
+            close_pending: Mutex::new(HashSet::new()),
         }
     }
 
@@ -219,10 +229,34 @@ impl WorktreesRegistry {
             let reaped = reap(&mut windows, self.ttl, now);
             (removed, reaped)
         };
+        // The window is gone; any close directive for it is fulfilled or moot.
+        // (Keys are per-`activate()` UUIDs, never reused, so a stale directive
+        // would only ever leak a little memory — but clearing keeps it tidy.)
+        self.take_close_pending(key);
         if removed || reaped > 0 {
             self.bump();
         }
         removed
+    }
+
+    /// Records a pending "close yourself" directive for `key`, to be surfaced on
+    /// that window's next `heartbeat`. Set by the `close` op when signalling a
+    /// window it can only reply to. Idempotent; infallible.
+    pub fn mark_close_pending(&self, key: &str) {
+        self.close_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_string());
+    }
+
+    /// Takes (returns and clears) `key`'s pending close directive. Called on
+    /// each `heartbeat` so the directive fires exactly once; a `false` means no
+    /// close is pending.
+    pub fn take_close_pending(&self, key: &str) -> bool {
+        self.close_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key)
     }
 
     /// Reaps stale entries, then returns the live set sorted for deterministic
@@ -662,5 +696,28 @@ mod tests {
             rx.has_changed().unwrap(),
             "a heartbeat that reaps a stale sibling should bump"
         );
+    }
+
+    // --- Close-pending directive (#1277) -----------------------------------
+
+    #[test]
+    fn close_pending_is_taken_once_then_cleared() {
+        let reg = WorktreesRegistry::new();
+        // No directive by default.
+        assert!(!reg.take_close_pending("w1"));
+        // Marked → the first take observes it, the next does not (fires once).
+        reg.mark_close_pending("w1");
+        assert!(reg.take_close_pending("w1"));
+        assert!(!reg.take_close_pending("w1"));
+    }
+
+    #[test]
+    fn unregister_clears_a_pending_close_directive() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.mark_close_pending("w1");
+        // Unregistering the window drops any pending directive with it.
+        assert!(reg.unregister("w1"));
+        assert!(!reg.take_close_pending("w1"));
     }
 }
