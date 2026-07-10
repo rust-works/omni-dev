@@ -285,9 +285,23 @@ already has windows open on, and reveals repo/worktree *paths* and the GitHub
 nothing a repeated `tree` poll would not. The stream is bounded and self-limiting:
 it lives on one `0600` connection, coalesces bursts, diffs to suppress duplicate
 frames, and is torn down on client disconnect, an explicit cancel line, or daemon
-shutdown. So the only capability the whole expansion adds to a socket *writer* is
-the `open` spawn described above; see [ADR-0048](adrs/adr-0048.md) for the full
-threat-model note.
+shutdown.
+
+The **`close`** op is the one **destructive** capability, and a real escalation of
+this threat model ([ADR-0049](adrs/adr-0049.md)): a socket *writer* can delete a
+linked worktree's files and close windows. It stays same-user-bounded — the `0600`
+socket already requires the owning local user, so no new principal gains anything —
+and deletion is confined by a **`git2`-enforced guard in the daemon** (not the UI):
+the target must be a real **linked** worktree of a discoverable repository, and the
+daemon **refuses to remove the main working tree** even if a malformed client asks.
+It never shells out (`git2` prune, avoiding the launcher's `PATH` problem) and
+refuses a locked worktree rather than forcing past it. No secret and no state is
+persisted: the per-window close directive is in-memory and lost on a daemon
+restart, so an in-flight close simply aborts and the user retries. So the two
+capabilities the whole expansion adds to a socket *writer* are the `open` spawn and
+the `close` deletion, both same-user-bounded and guarded; see
+[ADR-0048](adrs/adr-0048.md) and [ADR-0049](adrs/adr-0049.md) for the full
+threat-model notes.
 
 ## Companion contract (for the extension and other clients)
 
@@ -306,17 +320,18 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op           | payload                                    | success payload            |
-|--------------|--------------------------------------------|----------------------------|
-| `register`   | `{ key, folders[], repo?, title?, pid? }`  | `{ ok: true }`             |
-| `heartbeat`  | `{ key }`                                  | `{ known: <bool> }`        |
-| `unregister` | `{ key }`                                  | `{ removed: <bool> }`      |
-| `list`       | `null`                                     | `{ windows: [entry, …] }`  |
-| `tree`       | `null`                                     | `{ repos: [repo, …] }`     |
-| `open`       | `{ path }`                                 | `{ ok: true }`             |
-| `subscribe`  | `null`                                     | *(stream — see below)*     |
+| op           | payload                                        | success payload                            |
+|--------------|------------------------------------------------|--------------------------------------------|
+| `register`   | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
+| `heartbeat`  | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
+| `unregister` | `{ key }`                                      | `{ removed: <bool> }`                      |
+| `list`       | `null`                                         | `{ windows: [entry, …] }`                  |
+| `tree`       | `null`                                         | `{ repos: [repo, …] }`                     |
+| `open`       | `{ path }`                                     | `{ ok: true }`                             |
+| `close`      | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
+| `subscribe`  | `null`                                         | *(stream — see below)*                     |
 
-The first six ops are strictly **request → one reply**. `subscribe` is the one
+The first seven ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: … } }` lines on the same connection —
 an initial snapshot, then a fresh one each time the view changes — not a single
@@ -338,6 +353,36 @@ Where:
   guard (#1266), so a client (the companion, on double-click) never duplicates
   that logic. A relative or non-existent `path` is rejected with a clear error
   before anything is spawned (see [Security](#security)).
+- `close` — closes a worktree's window and, for a **linked** worktree, deletes it
+  ([ADR-0049](adrs/adr-0049.md)). It is **two-phase**, keyed off `confirmed`:
+    - **Phase 1** (`remove:true`, `confirmed` absent) is a side-effect-free
+      **safety check**. The success payload is a report
+      `{ removable, is_main, open, window_key?, window_folder_count, risks:[{kind,
+      detail}], info:[…] }`. `risks` lists what removal would lose — modified
+      tracked files, untracked files (ignoring `.gitignore`d), an in-progress
+      rebase/merge/cherry-pick, and commits reachable only from a detached HEAD;
+      unpushed commits on a **named** branch are `info` only (the branch survives).
+      `removable && risks == []` → the client deletes with no prompt; any risk →
+      confirm first.
+    - **Phase 2** (`confirmed:true`, or any `remove:false`) executes. With
+      `remove:true` it deletes the (linked) worktree via `git2` prune after
+      closing the owning window(s); the reply is `{ removed: true }`. With
+      `remove:false` ("Close Window", the main working tree) it only closes the
+      window; the reply is `{ closed: true }`.
+  Deletability keys **solely on `is_main`** (structural), never the branch name: a
+  linked worktree on the default branch is fully deletable and its branch is kept.
+  The daemon **refuses `remove:true` on a main working tree** regardless of the
+  request — the defensive backstop behind the UI gating (see
+  [Security](#security)). `requester_key` is the calling window's `key`, so a
+  self-close (the requester owns the target) removes-then-replies and lets the
+  extension close its own window, while a cross-window close signals the *other*
+  window(s) and waits for them to `unregister` first.
+- `heartbeat` may carry an additive `close: true` when the daemon needs a specific
+  window to close itself (a cross-window `close`) — the only channel it has to a
+  window it can reply to but never call. It rides the reply exactly like the
+  `{ known:false } → re-register` precedent, is taken-and-cleared so it fires once,
+  and is omitted (older windows read only `known`) when no close is pending. The
+  companion runs `workbench.action.closeWindow` on seeing it.
 - A `tree` `repo` is
   `{ main_repo, github?, root, worktrees: [worktree, …] }`, where `github` is
   `{ owner, name }` present only when `origin` (or the first `github.com` remote)
@@ -382,7 +427,7 @@ unregister) is unchanged from ADR-0040; the tree-view half opens one long-lived
 activate():    connect(socket) → {service:"worktrees", op:"register",
                                    payload:{key, folders, repo, title, pid}}
                connect(socket) → {service:"worktrees", op:"subscribe"}   // long-lived, reads pushed snapshots
-heartbeat:     every ~10s → {op:"heartbeat", key}     // re-register if {known:false}
+heartbeat:     every ~10s → {op:"heartbeat", key}     // close self if {close:true}; else re-register if {known:false}
 deactivate():  {op:"unregister", key}   + close the subscribe socket
 ```
 
