@@ -1,8 +1,8 @@
 {
   "name": "omni-dev-worktrees",
-  "displayName": "omni-dev Worktrees Reporter",
-  "description": "Reports each VS Code window's open worktrees to the omni-dev daemon so `omni-dev worktrees list` and the tray can show every window.",
-  "version": "0.1.0",
+  "displayName": "omni-dev Worktrees",
+  "description": "A live tree view of every repository and git worktree open across all your VS Code windows, fed by the omni-dev daemon; double-click to focus or open a worktree's window.",
+  "version": "0.2.0",
   "publisher": "rust-works",
   "license": "BSD-3-Clause",
   "repository": {
@@ -25,6 +25,68 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omniDevWorktrees",
+          "title": "Worktrees",
+          "icon": "media/worktrees.svg"
+        }
+      ]
+    },
+    "views": {
+      "omniDevWorktrees": [
+        {
+          "id": "omniDevWorktrees.tree",
+          "name": "Worktrees",
+          "contextualTitle": "omni-dev Worktrees"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "omniDevWorktrees.refresh",
+        "title": "Refresh",
+        "category": "omni-dev Worktrees",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "omniDevWorktrees.open",
+        "title": "Open in VS Code",
+        "category": "omni-dev Worktrees"
+      },
+      {
+        "command": "omniDevWorktrees.itemClicked",
+        "title": "Open Worktree (internal)",
+        "category": "omni-dev Worktrees"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "omniDevWorktrees.itemClicked",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.open",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "omniDevWorktrees.refresh",
+          "when": "view == omniDevWorktrees.tree",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "omniDevWorktrees.open",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
+          "group": "inline"
+        }
+      ]
+    },
     "configuration": {
       "title": "omni-dev Worktrees",
       "properties": {

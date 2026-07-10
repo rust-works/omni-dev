@@ -11,7 +11,10 @@ import {
   defaultDataDir,
   defaultSocketPath,
   heartbeatEnvelope,
+  openEnvelope,
   registerEnvelope,
+  subscribeEnvelope,
+  treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
 
@@ -70,5 +73,15 @@ test("envelope builders match the worktrees wire contract", () => {
     service: "worktrees",
     op: "unregister",
     payload: { key: "k1" },
+  });
+});
+
+test("tree/subscribe/open envelope builders match the worktrees wire contract", () => {
+  assert.deepEqual(treeEnvelope(), { service: "worktrees", op: "tree" });
+  assert.deepEqual(subscribeEnvelope(), { service: "worktrees", op: "subscribe" });
+  assert.deepEqual(openEnvelope("/home/me/wt/issue-1300"), {
+    service: "worktrees",
+    op: "open",
+    payload: { path: "/home/me/wt/issue-1300" },
   });
 });
