@@ -478,9 +478,12 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
 - The companion extension lives in [`editors/vscode/`](../editors/vscode/): a
   TypeScript reporter **and** tree-view UI that speaks the contract above, bundled
   with esbuild and packaged as a `.vsix` by its own path-filtered CI workflow.
-  Publishing to the VS Code Marketplace / Open VSX is a follow-up (it needs a
-  publisher account and CI secrets); until then, install the `.vsix` built by CI
-  with `code --install-extension`.
+  A sibling
+  [`vscode-extension-release.yml`](../.github/workflows/vscode-extension-release.yml)
+  publishes it to the VS Code Marketplace and Open VSX on a `vscode-v*` tag
+  (#1279); it needs a one-time publisher/namespace + `VSCE_PAT`/`OVSX_PAT`
+  secrets setup before the first publish. Until published, install the `.vsix`
+  built by CI with `code --install-extension`.
 - Git enrichment lives in Rust (#1186): the companion reports raw folder paths
   and the daemon computes per-worktree branch and ahead/behind state with `git2`
   (see [Git enrichment](#git-enrichment)), keeping the companion thin.
