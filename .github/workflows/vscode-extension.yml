@@ -1,8 +1,10 @@
 name: VS Code extension
 
 # Scoped to the companion extension only — the Rust CI in ci.yml is untouched
-# and never descends into editors/. No committed lockfile yet, so this uses
-# `npm install` and does not enable the npm cache (which needs a lock file).
+# and never descends into editors/. A committed package-lock.json backs a
+# reproducible `npm ci` build with the npm cache enabled. Publishing to the
+# Marketplace / Open VSX lives in the sibling vscode-extension-release.yml,
+# which only runs on a `vscode-v*` tag — never on this file's push/PR triggers.
 on:
   push:
     branches: [main]
@@ -31,9 +33,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Type-check
         run: npm run typecheck
