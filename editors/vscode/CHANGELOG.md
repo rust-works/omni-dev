@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the **omni-dev Worktrees** VS Code extension are
+All notable changes to the **omni-dev** VS Code extension are
 documented in this file. The extension versions independently of the omni-dev
 Rust crate — the crate's own changelog lives in the
 [repository root](https://github.com/rust-works/omni-dev/blob/main/CHANGELOG.md).

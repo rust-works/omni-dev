@@ -128,7 +128,7 @@ async function heartbeat(): Promise<void> {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   windowKey = randomUUID();
-  output = vscode.window.createOutputChannel("omni-dev Worktrees");
+  output = vscode.window.createOutputChannel("omni-dev");
   context.subscriptions.push(output);
 
   await register();

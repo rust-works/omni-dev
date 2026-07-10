@@ -1,6 +1,6 @@
 {
-  "name": "omni-dev-worktrees",
-  "displayName": "omni-dev Worktrees",
+  "name": "omni-dev",
+  "displayName": "omni-dev",
   "description": "A live tree view of every repository and git worktree open across all your VS Code windows, fed by the omni-dev daemon; double-click to focus or open a worktree's window.",
   "icon": "media/icon.png",
   "version": "0.2.0",
@@ -40,7 +40,7 @@
         {
           "id": "omniDevWorktrees.tree",
           "name": "Worktrees",
-          "contextualTitle": "omni-dev Worktrees"
+          "contextualTitle": "omni-dev"
         }
       ]
     },
@@ -48,28 +48,28 @@
       {
         "command": "omniDevWorktrees.refresh",
         "title": "Refresh",
-        "category": "omni-dev Worktrees",
+        "category": "omni-dev",
         "icon": "$(refresh)"
       },
       {
         "command": "omniDevWorktrees.open",
         "title": "Open in VS Code",
-        "category": "omni-dev Worktrees"
+        "category": "omni-dev"
       },
       {
         "command": "omniDevWorktrees.itemClicked",
         "title": "Open Worktree (internal)",
-        "category": "omni-dev Worktrees"
+        "category": "omni-dev"
       },
       {
         "command": "omniDevWorktrees.closeWorktree",
         "title": "Close Worktree",
-        "category": "omni-dev Worktrees"
+        "category": "omni-dev"
       },
       {
         "command": "omniDevWorktrees.closeWindow",
         "title": "Close Window",
-        "category": "omni-dev Worktrees"
+        "category": "omni-dev"
       }
     ],
     "menus": {
@@ -117,7 +117,7 @@
       ]
     },
     "configuration": {
-      "title": "omni-dev Worktrees",
+      "title": "omni-dev",
       "properties": {
         "omniDevWorktrees.socketPath": {
           "type": "string",

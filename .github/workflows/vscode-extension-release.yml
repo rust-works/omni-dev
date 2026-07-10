@@ -72,7 +72,7 @@ jobs:
             echo "::error::Tag vscode-v${tag_version} does not match editors/vscode/package.json version ${pkg_version}. Bump the version and retag."
             exit 1
           fi
-          echo "Releasing omni-dev-worktrees ${pkg_version} (tag vscode-v${tag_version})"
+          echo "Releasing omni-dev ${pkg_version} (tag vscode-v${tag_version})"
 
       - name: Install dependencies
         run: npm ci
@@ -117,6 +117,6 @@ jobs:
       - name: Upload published .vsix artifact
         uses: actions/upload-artifact@v4
         with:
-          name: omni-dev-worktrees-vsix-${{ github.ref_name }}
+          name: omni-dev-vsix-${{ github.ref_name }}
           path: editors/vscode/*.vsix
           if-no-files-found: error

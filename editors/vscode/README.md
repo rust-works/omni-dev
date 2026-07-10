@@ -1,4 +1,4 @@
-# omni-dev Worktrees Reporter
+# omni-dev
 
 A tiny VS Code companion extension for the [omni-dev](https://github.com/rust-works/omni-dev)
 daemon's **worktrees service**. It reports each VS Code window's open worktrees
@@ -52,7 +52,7 @@ npm ci              # reproducible install from the committed package-lock.json
 npm run typecheck   # tsc --noEmit
 npm run build       # esbuild → dist/extension.js
 npm test            # tsc → out/, then node --test
-npm run package     # vsce package → omni-dev-worktrees-<version>.vsix
+npm run package     # vsce package → omni-dev-<version>.vsix
 ```
 
 The Marketplace / Open VSX gallery icon is the top-level `"icon"` in
@@ -72,7 +72,7 @@ only the `.png` ships.
 Install a local build with:
 
 ```bash
-code --install-extension omni-dev-worktrees-*.vsix
+code --install-extension omni-dev-*.vsix
 ```
 
 ## Releasing
