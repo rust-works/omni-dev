@@ -3,7 +3,11 @@ name: Release
 on:
   push:
     tags:
+      # Crate releases only. The '!vscode-*' exclusion keeps the extension's own
+      # `vscode-v*` tags (handled by vscode-extension-release.yml) from also
+      # matching 'v*' and misfiring a crate release + cargo publish.
       - 'v*'
+      - '!vscode-*'
 
 permissions:
   contents: write
