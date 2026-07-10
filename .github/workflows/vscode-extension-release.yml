@@ -14,8 +14,10 @@ name: VS Code extension release
 #      both registries.
 #
 # One-time prerequisites (maintainer, not code): an Azure DevOps publisher whose
-# id matches `"publisher": "rust-works"`, the `rust-works` Open VSX namespace,
-# and the repo secrets VSCE_PAT + OVSX_PAT. See editors/vscode/README.md.
+# id matches `"publisher": "rust-works"` and the repo secret VSCE_PAT (required).
+# OVSX_PAT and the `rust-works` Open VSX namespace are optional — set them to also
+# publish to Open VSX; without OVSX_PAT that publish is skipped, not failed. See
+# editors/vscode/README.md.
 on:
   push:
     tags:
@@ -45,19 +47,25 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
-      # Fail loudly and early if either PAT is absent, rather than getting most
-      # of the way through a publish and dying (or, worse, silently skipping).
+      # Require the Marketplace token up front (fail fast if absent) rather than
+      # dying most of the way through a publish. The Open VSX token is optional:
+      # when unset we skip that publish (see the step's `if`) so a Marketplace-only
+      # release is still green; the boolean output gates it.
       - name: Verify required secrets are present
+        id: secrets
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          missing=()
-          [ -z "$VSCE_PAT" ] && missing+=("VSCE_PAT")
-          [ -z "$OVSX_PAT" ] && missing+=("OVSX_PAT")
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::Missing required repo secret(s): ${missing[*]}. Add them under Settings → Secrets and variables → Actions before releasing. See editors/vscode/README.md."
+          if [ -z "$VSCE_PAT" ]; then
+            echo "::error::Missing required repo secret VSCE_PAT. Add it under Settings → Secrets and variables → Actions before releasing. See editors/vscode/README.md."
             exit 1
+          fi
+          if [ -n "$OVSX_PAT" ]; then
+            echo "has_ovsx=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ovsx=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OVSX_PAT is not set — skipping the Open VSX publish. Set it to also publish to Open VSX. See editors/vscode/README.md."
           fi
 
       # On a tag push, the tag is the source of truth for what we intend to
@@ -109,6 +117,7 @@ jobs:
         run: npm run publish:vsce -- --packagePath "${{ steps.vsix.outputs.path }}"
 
       - name: Publish to Open VSX
+        if: steps.secrets.outputs.has_ovsx == 'true'
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: npm run publish:ovsx -- "${{ steps.vsix.outputs.path }}"
