@@ -108,6 +108,32 @@ export function unregisterEnvelope(key: string): Envelope {
 }
 
 /**
+ * Builds a `tree` envelope — the one-shot repo/worktree snapshot request (used
+ * by the manual "refresh" command; the live view uses `subscribe` instead).
+ */
+export function treeEnvelope(): Envelope {
+  return { service: WORKTREES_SERVICE, op: "tree" };
+}
+
+/**
+ * Builds a `subscribe` envelope — opens the push subscription. The daemon then
+ * streams `tree` snapshots on the same connection until the client writes any
+ * further line (a cancel) or closes the socket. See `TreeSubscription`.
+ */
+export function subscribeEnvelope(): Envelope {
+  return { service: WORKTREES_SERVICE, op: "subscribe" };
+}
+
+/**
+ * Builds an `open` envelope — focuses (or opens) a worktree folder in VS Code
+ * via the daemon's launcher. The daemon guards `path` to an absolute, existing
+ * directory, so a relative/nonexistent path comes back as `{ ok: false }`.
+ */
+export function openEnvelope(path: string): Envelope {
+  return { service: WORKTREES_SERVICE, op: "open", payload: { path } };
+}
+
+/**
  * Sends one request envelope to the daemon and resolves with its reply.
  *
  * Opens a fresh connection, writes one `\n`-terminated JSON line, reads one
