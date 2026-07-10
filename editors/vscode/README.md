@@ -55,6 +55,20 @@ npm test            # tsc → out/, then node --test
 npm run package     # vsce package → omni-dev-worktrees-<version>.vsix
 ```
 
+The Marketplace / Open VSX gallery icon is the top-level `"icon"` in
+`package.json` (`media/icon.png`) — a 128×128 raster, since the Marketplace
+rejects SVG there. Its source is [`media/icon.svg`](media/icon.svg) (the
+[`media/worktrees.svg`](media/worktrees.svg) glyph on a gradient tile);
+regenerate the PNG after editing it with:
+
+```bash
+sips -s format png media/icon.svg --out media/icon.png   # macOS
+# or: rsvg-convert -w 128 -h 128 media/icon.svg -o media/icon.png
+```
+
+The `.svg` source is excluded from the packaged `.vsix` (see `.vscodeignore`);
+only the `.png` ships.
+
 Install a local build with:
 
 ```bash
