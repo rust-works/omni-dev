@@ -5,6 +5,15 @@ authoritative set of repositories and git worktrees open across **every** VS Cod
 window, fed by a small first-party companion extension that reports from each
 window. It is the daemon's third service, after the browser bridge and Snowflake.
 
+Beyond the open-window `list`, the service exposes a **`tree`** view — every
+repository and **all** of its git worktrees (open in a window or not), grouped by
+repo and enriched with GitHub identity — and pushes it live to subscribers over
+the control socket (the **`subscribe`** op). The companion extension renders that
+tree in a Git Worktree Manager–style activity-bar view where **double-clicking** a
+worktree focuses (or opens) its VS Code window via the **`open`** op. See
+[ADR-0040](adrs/adr-0040.md) for the original service and
+[ADR-0048](adrs/adr-0048.md) for the tree/subscription/UI expansion.
+
 ## Why a resident service
 
 A VS Code extension host is **sandboxed per window**: each window's extension can
@@ -26,25 +35,47 @@ the view correct over time. See [ADR-0040](adrs/adr-0040.md).
 - `src/worktrees.rs` — the `WorktreesRegistry` engine: the in-memory `HashMap`
   of open windows behind a `std::sync::Mutex` (never held across an `.await`),
   the TTL reaping and entry cap/eviction, and the
-  register/heartbeat/unregister/list/first-folder operations. A standalone
-  `crate::worktrees` module, matching the browser bridge (`src/browser/`) and
-  Snowflake (`src/snowflake/`) engine/adapter split.
+  register/heartbeat/unregister/list/first-folder operations. It also snapshots
+  the distinct open **folders** (`open_folders`, the seed the `tree` op resolves
+  to repos) and carries a `tokio::sync::watch` **change-notify** counter
+  (`subscribe_changes`) bumped whenever the visible set changes, which drives the
+  push subscription. A standalone `crate::worktrees` module, matching the browser
+  bridge (`src/browser/`) and Snowflake (`src/snowflake/`) engine/adapter split.
 - `src/daemon/services/worktrees.rs` — `WorktreesService`, a thin `DaemonService`
-  adapter over that engine: it routes control-socket ops to the registry,
-  renders the tray menu/status, and drives the VS Code launcher. Cheap to
-  construct; persists nothing.
-- `src/cli/worktrees.rs` — the read-only `omni-dev worktrees list` client.
+  adapter over that engine: it routes control-socket ops to the registry, renders
+  the tray menu/status, drives the VS Code launcher, computes the git enrichment,
+  builds the repo/worktree **`tree`** (enumerating each repo's worktrees with
+  `git2` and tagging its GitHub identity), and backs the **`subscribe`** stream.
+  Cheap to construct; persists nothing. All the git disk I/O runs on a blocking
+  thread, never under the registry lock.
+- `src/daemon/service.rs` + `src/daemon/server.rs` — the streaming machinery
+  shared by all services: the `ServiceStream` trait capability (an optional
+  `subscribe` on `DaemonService`) and the server's `run_stream` drive loop that
+  pushes an initial snapshot, then a fresh one on each change-notify or periodic
+  tick, diffing so identical frames are never re-sent.
+- `src/cli/worktrees.rs` — the read-only `omni-dev worktrees list` and
+  `omni-dev worktrees tree` clients.
 - The companion VS Code extension in [`editors/vscode/`](../editors/vscode/) —
-  the **writer**: it `register`s on activation, `heartbeat`s every ~10 s, and
-  `unregister`s on deactivation, talking to the daemon socket directly from each
-  window.
+  both a **writer** and a **reader**. As a writer it `register`s on activation,
+  `heartbeat`s every ~10 s, and `unregister`s on deactivation. As a reader it
+  holds a long-lived `subscribe` connection and renders the pushed `tree`
+  snapshots as an activity-bar tree view (see [Tree view](#tree-view-companion-ui)),
+  talking to the daemon socket directly from each window.
 
 ### Data flow
 
+The open-window registrations are the liveness source; the `tree` view is derived
+from them (each open folder → its repo → all that repo's worktrees) and pushed live
+to subscribers:
+
 ```
-VS Code window A ─┐
-VS Code window B ─┼─►  omni-dev daemon (worktrees service)  ──►  CLI / tray / extension UI
-VS Code window C ─┘     live registry, keyed by per-window key
+                         registrations                         list / tree (pull)
+VS Code window A ─┐  (register/heartbeat/    ┌─────────────────────────►  CLI / tray
+VS Code window B ─┼──── unregister) ────────►│ omni-dev daemon         │
+VS Code window C ─┘                          │ (worktrees service)     ├── subscribe ──►  companion
+                                             │ registry + git2 enrich  │   (push tree)    tree view
+      ▲                                      └─────────────────────────┘                     │
+      └──────────────────  open op: focus/open a worktree's window (code <path>)  ◄──────────┘
 ```
 
 ### Liveness
@@ -94,6 +125,27 @@ The companion extension feeds the registry; the CLI only reads it. If the daemon
 is not running, `worktrees list` reports the connection failure (the companion, by
 contrast, no-ops silently).
 
+`worktrees tree` shows the same live data inverted into the repo/worktree view —
+every repository derived from the open windows, and **all** of each repo's
+worktrees (open or not):
+
+```bash
+# Every repository and all its worktrees, grouped by repository.
+omni-dev worktrees tree
+
+# Machine-readable JSON (byte-identical to the on-socket `tree` payload).
+omni-dev worktrees tree -o json
+```
+
+The table prints a header line per repository — its **main-repo name**, its GitHub
+`owner/name` (when `origin` is a `github.com` remote), and its root path — then one
+indented row per worktree: a `*` marks the **main working tree**, followed by the
+branch, its `+ahead -behind` sync state, an `open` flag when a live window has that
+worktree open, and the worktree path. A repo with no open window contributes no
+rows, so the tree lists exactly the repos currently in play (the open-window-derived
+v1 model — [ADR-0048](adrs/adr-0048.md)). `-o json` is the raw `tree` payload
+described under [the contract](#companion-contract-for-the-extension-and-other-clients).
+
 ## Tray
 
 On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:
@@ -123,6 +175,46 @@ Focusing is **best-effort**. The launcher is resolved in this order:
 
 If none works, the failure is logged and the rest of the tray keeps working.
 
+## Tree view (companion UI)
+
+The companion extension contributes a **"Worktrees" activity-bar view** — a
+*Git Worktree Manager*–style tree, but fed live by the daemon and consistent across
+every window (no per-window curation). It renders the `tree` payload:
+
+```
+▸ omni-dev            (github: rust-works/omni-dev)
+    ● main            ↑2 ↓0        ← window open (badge), main working tree
+      issue-1300      ↑1 ↓3        ← linked worktree, no window open
+    ● issue-1250      ↑0 ↓0
+▸ some-other-repo
+      main
+```
+
+- **Top level: repositories.** A GitHub repo shows a GitHub icon and its
+  `owner/repo`; a non-GitHub repo is still listed by its main-repo name.
+- **Children: worktrees.** Every worktree of that repo (main + linked), labelled
+  by its branch with `↑ahead ↓behind` as the row description, and a three-way
+  **open badge** icon (#1274): a **blue tick** on the worktree open in *this*
+  window, a **green dot** on one open in *another* window, and the plain branch
+  glyph on a worktree with no live window. The current-window distinction comes
+  from matching a worktree's `window_key` against this window's own key.
+- **Double-click to focus/open.** Because the VS Code TreeView API has **no** native
+  double-click event (a single click only selects), the companion implements it with
+  a manual click-timer: a second click on the same worktree within ~400 ms sends the
+  daemon `open` op, which runs `code <path>` — focusing the already-open window or
+  opening a new one. Uniform for open and not-open worktrees.
+- **Live.** The view updates itself as windows open and close and as branches or
+  commits change, driven by the [push subscription](#push-subscription) — no manual
+  refresh. A **Refresh** title-bar action does a one-shot `tree` fetch as a fallback
+  when the subscription is momentarily down.
+- **Daemon-down degrades gracefully.** When the daemon is not running, the view
+  shows a hint ("start it with `omni-dev daemon start`") rather than an error dialog,
+  and the subscription reconnects with exponential backoff (500 ms → 10 s) once the
+  daemon returns. An empty-but-connected daemon shows "No worktrees are open…".
+
+The tree view runs **alongside** the reporter lifecycle (register/heartbeat/
+unregister): every window is both a reporter and, if it has the view open, a reader.
+
 ## Status
 
 `omni-dev daemon status` includes the service:
@@ -146,12 +238,15 @@ companion's thin-reporter contract ([ADR-0040](adrs/adr-0040.md)): the ~50-line
 extension never runs git.
 
 - **Computed on read.** Enrichment happens each time the registry is read
-  (`list`, `status`, and the tray menu), from the worktree on disk, so the branch
-  shown is always current — not a snapshot frozen at registration. `list` and
-  `status` run it on a blocking thread (`git2` is synchronous disk I/O) and never
-  under the registry lock.
-- **Primary folder only.** Only the first workspace folder of each window is
-  enriched — it is the one the table shows and the "Focus" action opens.
+  (`list`, `status`, the tray menu, and every `tree` / `subscribe` snapshot), from
+  the worktree on disk, so the branch shown is always current — not a snapshot
+  frozen at registration. Every path but the sync tray `menu` runs it on a blocking
+  thread (`git2` is synchronous disk I/O) and never under the registry lock.
+- **`list` enriches the primary folder; `tree` enriches every worktree.** For a
+  window entry (`list`/`status`), only the first workspace folder is enriched — it
+  is the one the table shows and the "Focus" action opens. For the `tree` view the
+  same building blocks are applied to **every** worktree the daemon enumerates for
+  each repository, whether or not a window has it open.
 - **Best-effort and degrading.** Discovery tolerates a folder inside a
   subdirectory or a linked worktree. A folder that is not a git repo, a detached
   HEAD, or a branch with no upstream is still listed — just without the fields it
@@ -174,12 +269,25 @@ user, and only on an **existing absolute directory** (which also blocks a
 `-`-leading path from being parsed by `code` as a flag). The focus action and the
 `open` op share that same guard before spawning `code`. Registry strings
 (`repo`/`folders`, and the companion `title`) are writer-influenced metadata, so
-the `worktrees list` table strips control characters (C0, DEL, C1) from the
-strings it renders before writing to the terminal — a registered entry cannot
-inject ANSI escape sequences into the operator's TTY (#1137). The daemon-computed
-`branch` is a git ref name (which cannot contain control bytes) but is sanitized
-on the same path as defense-in-depth. Native tray menus do not interpret ANSI,
-and the `-o json` output escapes control bytes via JSON encoding.
+the `worktrees list` and `worktrees tree` tables strip control characters (C0,
+DEL, C1) from the strings they render before writing to the terminal — a
+registered entry (or a worktree path / GitHub identity) cannot inject ANSI escape
+sequences into the operator's TTY (#1137). The daemon-computed `branch` is a git
+ref name (which cannot contain control bytes) but is sanitized on the same path as
+defense-in-depth. Native tray menus do not interpret ANSI, and the `-o json`
+output escapes control bytes via JSON encoding.
+
+The **`tree`** op and the **`subscribe`** stream add **no new exposure** beyond the
+existing reads. `tree` enumerates the worktrees of repositories the socket owner
+already has windows open on, and reveals repo/worktree *paths* and the GitHub
+`owner/name` of `origin` — all derivable by the same owner from those open folders.
+`subscribe` streams exactly that same snapshot on a schedule; a subscriber learns
+nothing a repeated `tree` poll would not. The stream is bounded and self-limiting:
+it lives on one `0600` connection, coalesces bursts, diffs to suppress duplicate
+frames, and is torn down on client disconnect, an explicit cancel line, or daemon
+shutdown. So the only capability the whole expansion adds to a socket *writer* is
+the `open` spawn described above; see [ADR-0048](adrs/adr-0048.md) for the full
+threat-model note.
 
 ## Companion contract (for the extension and other clients)
 
@@ -198,13 +306,22 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op           | payload                                          | success payload                |
-|--------------|--------------------------------------------------|--------------------------------|
-| `register`   | `{ key, folders[], repo?, title?, pid? }`        | `{ ok: true }`                 |
-| `heartbeat`  | `{ key }`                                         | `{ known: <bool> }`            |
-| `unregister` | `{ key }`                                         | `{ removed: <bool> }`          |
-| `list`       | `null`                                            | `{ windows: [entry, …] }`      |
-| `open`       | `{ path }`                                       | `{ ok: true }`                 |
+| op           | payload                                    | success payload            |
+|--------------|--------------------------------------------|----------------------------|
+| `register`   | `{ key, folders[], repo?, title?, pid? }`  | `{ ok: true }`             |
+| `heartbeat`  | `{ key }`                                  | `{ known: <bool> }`        |
+| `unregister` | `{ key }`                                  | `{ removed: <bool> }`      |
+| `list`       | `null`                                     | `{ windows: [entry, …] }`  |
+| `tree`       | `null`                                     | `{ repos: [repo, …] }`     |
+| `open`       | `{ path }`                                 | `{ ok: true }`             |
+| `subscribe`  | `null`                                     | *(stream — see below)*     |
+
+The first six ops are strictly **request → one reply**. `subscribe` is the one
+**streaming** op (see [Push subscription](#push-subscription)): the reply is a
+sequence of `{ ok: true, payload: { repos: … } }` lines on the same connection —
+an initial snapshot, then a fresh one each time the view changes — not a single
+reply. It uses no new wire type, so a client that only ever sends the other ops is
+wire-identical to the ADR-0040 contract.
 
 Where:
 
@@ -221,6 +338,24 @@ Where:
   guard (#1266), so a client (the companion, on double-click) never duplicates
   that logic. A relative or non-existent `path` is rejected with a clear error
   before anything is spawned (see [Security](#security)).
+- A `tree` `repo` is
+  `{ main_repo, github?, root, worktrees: [worktree, …] }`, where `github` is
+  `{ owner, name }` present only when `origin` (or the first `github.com` remote)
+  is a GitHub URL, and `root` is the absolute path of the main working tree. Repos
+  are **derived from the open windows** (each open folder → its git common dir →
+  repo root) and deduped, so a repo appears only while at least one of its windows
+  is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
+- A `tree` `worktree` is
+  `{ path, branch?, ahead?, behind?, is_main, open, window_key? }`. The main
+  working tree comes first (`is_main: true`), then linked worktrees sorted by path.
+  `open` is `true` when a live window currently has that worktree open, and
+  `window_key` (the open window's registry `key`, the handle a focus action
+  resolves) is present only then. `branch`/`ahead`/`behind` are the same
+  daemon-computed, independently-degrading git fields as on a `list` entry (see
+  [Git enrichment](#git-enrichment)).
+- `subscribe` streams the `tree` payload live; see
+  [Push subscription](#push-subscription) for the framing, coalescing, and
+  teardown semantics.
 - A `list` `entry` is
   `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
   is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
@@ -239,13 +374,16 @@ Where:
   optional fields like these follow the protocol's `#[serde(skip_serializing_if)]`
   convention, so an older client simply ignores them.
 
-Companion lifecycle, per window:
+Companion lifecycle, per window. The reporter half (register/heartbeat/
+unregister) is unchanged from ADR-0040; the tree-view half opens one long-lived
+`subscribe` connection alongside it:
 
 ```text
 activate():    connect(socket) → {service:"worktrees", op:"register",
                                    payload:{key, folders, repo, title, pid}}
+               connect(socket) → {service:"worktrees", op:"subscribe"}   // long-lived, reads pushed snapshots
 heartbeat:     every ~10s → {op:"heartbeat", key}     // re-register if {known:false}
-deactivate():  {op:"unregister", key}
+deactivate():  {op:"unregister", key}   + close the subscribe socket
 ```
 
 Example exchange:
@@ -255,21 +393,61 @@ Example exchange:
 ← {"ok":true,"payload":{"ok":true}}
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
+→ {"service":"worktrees","op":"tree"}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","ahead":2,"behind":0,"is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","ahead":1,"behind":3,"is_main":false,"open":false}]}]}}
 ```
 
 The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
-them to `list`/`status` replies.
+them to `list`/`status`/`tree` replies.
+
+### Push subscription
+
+A client that sends `{ "service": "worktrees", "op": "subscribe" }` switches that
+connection to **push mode**: the daemon replies with an initial `tree` snapshot,
+then pushes a fresh `{ ok: true, payload: { repos: … } }` line each time the view
+changes — a window registers or unregisters, an entry ages out, or (via a periodic
+~3 s re-sample) an on-disk branch/commit change that fires no registry event. The
+semantics a client can rely on:
+
+- **No new wire type.** Every pushed line is an ordinary `DaemonReply::ok(payload)`.
+  A reader tells a subscription apart from a one-shot op only by continuing to read
+  lines rather than stopping after the first.
+- **Coalesced and de-duplicated.** A burst of changes collapses into one wake, and
+  the daemon diffs each snapshot against the last one it sent, so **two identical
+  frames are never pushed in a row**. Treat each line as the current full state, not
+  a delta.
+- **Teardown.** The stream ends when the client sends **any** further line (an
+  explicit cancel), disconnects, or the daemon shuts down — all three close the
+  connection cleanly. Use a **dedicated** connection for `subscribe`; do not
+  multiplex other ops onto it.
+- **Reconnect is the client's job.** The daemon does not persist subscriptions;
+  after a daemon restart or a dropped socket the client reconnects and re-subscribes.
+  The companion does this with exponential backoff + jitter (500 ms → 10 s) and
+  treats an absent daemon as a silent no-op, never an error dialog.
+
+Back-compat is total: a client that never sends `subscribe` only ever sees the
+classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
 
 ## Scope and follow-ups
 
 - The companion extension lives in [`editors/vscode/`](../editors/vscode/): a
-  small TypeScript reporter that speaks the contract above, bundled with esbuild
-  and packaged as a `.vsix` by its own path-filtered CI workflow. Publishing to
-  the VS Code Marketplace / Open VSX is a follow-up (it needs a publisher account
-  and CI secrets); until then, install the `.vsix` built by CI with
-  `code --install-extension`.
+  TypeScript reporter **and** tree-view UI that speaks the contract above, bundled
+  with esbuild and packaged as a `.vsix` by its own path-filtered CI workflow.
+  Publishing to the VS Code Marketplace / Open VSX is a follow-up (it needs a
+  publisher account and CI secrets); until then, install the `.vsix` built by CI
+  with `code --install-extension`.
 - Git enrichment lives in Rust (#1186): the companion reports raw folder paths
   and the daemon computes per-worktree branch and ahead/behind state with `git2`
   (see [Git enrichment](#git-enrichment)), keeping the companion thin.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
   Windows support is tracked with the broader daemon work (#1237).
+- **Open-window-derived repos (v1):** a repository appears in the `tree` only while
+  at least one of its windows is open. **Configured repo roots** — so a repo shows
+  with zero windows open — are a deliberate follow-up ([ADR-0048](adrs/adr-0048.md),
+  #1264); they would be the first state the service persists.
+- **Push, not poll:** live updates use the change-notify plus a ~3 s safety tick
+  for on-disk changes, so a branch move is reflected within the tick rather than
+  instantly. A polling fallback and a filesystem watcher were both considered and
+  deferred.
+- The tree view is **view + focus only**; worktree *management* actions
+  (add/remove/prune) are out of scope for this iteration.

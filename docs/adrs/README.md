@@ -71,3 +71,4 @@ by Michael Nygard.
 | [ADR-0045](adr-0045.md)  | ✅ Accepted                              | 2026-07-07 | Isolated Named Credential Profiles for Multi-Tenant Configuration                           |
 | [ADR-0046](adr-0046.md)  | ✅ Accepted                              | 2026-07-07 | Unified `-o/--output <format>` Convention with Dedicated `--out-file` for File Destinations |
 | [ADR-0047](adr-0047.md)  | ✅ Accepted                              | 2026-07-07 | Remote-First Default Base-Branch Resolution That Fails Closed                               |
+| [ADR-0048](adr-0048.md)  | ✅ Accepted                              | 2026-07-10 | Repo/Worktree Tree View Fed by a Daemon Push Subscription                                   |
