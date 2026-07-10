@@ -1208,15 +1208,15 @@ fn git_safety(path: &Path) -> Result<GitSafety> {
     }
 
     // Commits reachable only from a detached HEAD are GC'd once the worktree —
-    // and its HEAD ref — are gone.
+    // and its HEAD ref — are gone. A HEAD still reachable from any ref (a branch
+    // or tag) loses nothing, so it is not flagged.
     if repo.head_detached().unwrap_or(false) {
-        if let Some(n) = unreachable_commit_count(&repo) {
-            if n > 0 {
-                risks.push(Note::new(
-                    "unreachable-commits",
-                    format!("{n} commit(s) on a detached HEAD will be permanently lost"),
-                ));
-            }
+        let lost = unreachable_commit_count(&repo).unwrap_or(0);
+        if lost > 0 {
+            risks.push(Note::new(
+                "unreachable-commits",
+                format!("{lost} commit(s) on a detached HEAD will be permanently lost"),
+            ));
         }
     }
 
@@ -1316,6 +1316,32 @@ fn current_branch_ahead(repo: &Repository) -> Option<usize> {
     upstream_ahead_behind(repo, &branch).map(|(ahead, _behind)| ahead)
 }
 
+/// Resolves the linked worktree whose working directory canonicalizes to
+/// `target` to its registered name in `main_repo`. Errors when `target` is not
+/// one of the repo's worktrees — the defensive guard against removing a path
+/// that opened as a worktree but is not enumerated. Split out so that guard is
+/// unit-testable without corrupting git's worktree admin state.
+fn worktree_name_for_path(main_repo: &Repository, target: &Path) -> Result<String> {
+    let names = main_repo.worktrees()?;
+    names
+        .iter()
+        .flatten() // Result<Option<&str>, _> → Option<&str> (drop per-name errors)
+        .flatten() // Option<&str> → &str (drop non-UTF-8 names)
+        .find(|name| {
+            main_repo
+                .find_worktree(name)
+                .is_ok_and(|wt| canonical(wt.path()) == target)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "worktree {} is not registered in {}",
+                target.display(),
+                main_repo.path().display()
+            )
+        })
+}
+
 /// Removes a **linked** worktree at `path` via `git2` (no shell — avoiding the
 /// daemon-`PATH` problem the launcher fights): deletes both the admin files and
 /// the checked-out directory. Refuses the main working tree (the defensive
@@ -1345,21 +1371,8 @@ fn remove_worktree(path: &Path) -> Result<()> {
     drop(repo);
     let main_repo = Repository::open(&main_root)
         .with_context(|| format!("failed to open repository at {}", main_root.display()))?;
-    let target = canonical(path);
-    let names = main_repo.worktrees()?;
-    let worktree = names
-        .iter()
-        .flatten() // Result<Option<&str>, _> → Option<&str> (drop per-name errors)
-        .flatten() // Option<&str> → &str (drop non-UTF-8 names)
-        .filter_map(|name| main_repo.find_worktree(name).ok())
-        .find(|wt| canonical(wt.path()) == target)
-        .ok_or_else(|| {
-            anyhow!(
-                "worktree {} is not registered in {}",
-                path.display(),
-                main_root.display()
-            )
-        })?;
+    let name = worktree_name_for_path(&main_repo, &canonical(path))?;
+    let worktree = main_repo.find_worktree(&name)?;
 
     // Never silently force past a lock (failure mode #6).
     if let WorktreeLockStatus::Locked(reason) = worktree.is_locked()? {
@@ -2993,5 +3006,67 @@ mod tests {
             "expected a locked error: {err}"
         );
         assert!(wt_path.exists(), "a locked worktree must not be removed");
+    }
+
+    #[tokio::test]
+    async fn close_safety_check_does_not_flag_a_detached_head_reachable_from_a_branch() {
+        // A detached HEAD that still sits on a commit a branch points to loses
+        // nothing on removal, so it must NOT produce an unreachable-commits risk
+        // (the false-positive the reachability walk guards against).
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        // The worktree is on `feature`; detach HEAD onto its current tip, which
+        // the `feature` branch still references.
+        let tip = wt_repo.head().unwrap().target().unwrap();
+        wt_repo.set_head_detached(tip).unwrap();
+        assert!(wt_repo.head_detached().unwrap());
+
+        let svc = WorktreesService::new();
+        let report = svc
+            .handle("close", json!({ "path": wt_path, "remove": true }))
+            .await
+            .unwrap();
+        let risks = report.get("risks").and_then(Value::as_array).unwrap();
+        assert!(
+            !risks
+                .iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("unreachable-commits")),
+            "a detached HEAD reachable from a branch must not be flagged: {report}"
+        );
+    }
+
+    #[test]
+    fn worktree_name_for_path_resolves_a_real_worktree_and_errors_otherwise() {
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let main_repo = Repository::open(main.path()).unwrap();
+        // The real linked worktree resolves to its registered name.
+        assert_eq!(
+            worktree_name_for_path(&main_repo, &canonical(&wt_path)).unwrap(),
+            "feature"
+        );
+        // A path that is not one of this repo's worktrees is the defensive
+        // "not registered" error (the guard behind removal).
+        let err =
+            worktree_name_for_path(&main_repo, Path::new("/no/such/worktree/xyzzy")).unwrap_err();
+        assert!(
+            err.to_string().contains("not registered"),
+            "expected a not-registered error: {err}"
+        );
+    }
+
+    #[test]
+    fn count_dirty_untracked_degrades_to_zero_on_an_unreadable_index() {
+        // A corrupt index makes `statuses()` fail; the count degrades to (0, 0)
+        // rather than sinking the whole safety check.
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let repo = Repository::open(&wt_path).unwrap();
+        std::fs::write(repo.path().join("index"), b"not a valid git index").unwrap();
+        // Confirm the corruption actually breaks status enumeration, so the
+        // count is exercising the error-degradation branch (not an empty repo).
+        assert!(
+            repo.statuses(Some(&mut StatusOptions::new())).is_err(),
+            "a corrupt index should make statuses() fail"
+        );
+        assert_eq!(count_dirty_untracked(&repo), (0, 0));
     }
 }
