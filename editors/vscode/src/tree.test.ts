@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   TreeRepoPayload,
+  isCurrentWindow,
   nodeId,
   repoLabel,
   reposToNodes,
@@ -90,7 +91,26 @@ test("worktreeDescription formats the sync counts, omitting absent sides", () =>
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, behind: 5 }), "↓5");
 });
 
-test("worktreeContextValue marks the open badge under a shared `worktree` prefix", () => {
+test("isCurrentWindow matches only the open worktree whose key is this window's", () => {
+  // Open here: the open worktree's key equals this window's key.
+  assert.equal(isCurrentWindow(REPOS[0].worktrees[0], "w1"), true);
+  // Open, but in another window (keys differ).
+  assert.equal(isCurrentWindow(REPOS[0].worktrees[0], "w2"), false);
+  // Closed worktree never matches, whatever the key.
+  assert.equal(isCurrentWindow(REPOS[0].worktrees[1], "w1"), false);
+  // An unknown window key (e.g. before assignment) never matches an open worktree.
+  assert.equal(isCurrentWindow(REPOS[0].worktrees[0], undefined), false);
+  // Degenerate: open with no key and an absent window key must not match.
+  assert.equal(isCurrentWindow({ path: "/x", is_main: true, open: true }, undefined), false);
+});
+
+test("worktreeContextValue marks current, other-window, and closed under a shared `worktree` prefix", () => {
+  // This window's own worktree gets the distinct `worktree.current`.
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w1"), "worktree.current");
+  // Open elsewhere → `worktree.open`; closed → `worktree`.
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w2"), "worktree.open");
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[1], "w1"), "worktree");
+  // Without a window key, an open worktree is still just `worktree.open`.
   assert.equal(worktreeContextValue(REPOS[0].worktrees[0]), "worktree.open");
   assert.equal(worktreeContextValue(REPOS[0].worktrees[1]), "worktree");
 });
@@ -108,9 +128,22 @@ test("worktreeTooltip carries path, kind, parent repo, sync, and open state", ()
   assert.match(tip, /\/home\/me\/omni-dev/);
   assert.match(tip, /main working tree of rust-works\/omni-dev/);
   assert.match(tip, /main {2}↑2 ↓0/);
+  // No window key supplied → the generic open line, not the current-window one.
   assert.match(tip, /● window open/);
 
   const closed = worktreeTooltip(REPOS[0].worktrees[1], REPOS[0]);
   assert.match(closed, /linked worktree of rust-works\/omni-dev/);
   assert.match(closed, /no window open/);
+});
+
+test("worktreeTooltip distinguishes the current window's open line", () => {
+  // Matching key → `● this window`.
+  const here = worktreeTooltip(REPOS[0].worktrees[0], REPOS[0], "w1");
+  assert.match(here, /● this window/);
+  assert.doesNotMatch(here, /● window open/);
+
+  // Non-matching key → the generic `● window open`.
+  const elsewhere = worktreeTooltip(REPOS[0].worktrees[0], REPOS[0], "w2");
+  assert.match(elsewhere, /● window open/);
+  assert.doesNotMatch(elsewhere, /● this window/);
 });

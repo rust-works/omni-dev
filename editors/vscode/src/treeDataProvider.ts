@@ -8,6 +8,7 @@ import * as vscode from "vscode";
 import {
   Node,
   TreeRepoPayload,
+  isCurrentWindow,
   nodeId,
   repoLabel,
   reposToNodes,
@@ -30,6 +31,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   private repos: TreeRepoPayload[] = [];
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
+
+  /**
+   * @param windowKey this window's own registry key, so the leaf whose
+   * `window_key` matches can be marked distinctly from worktrees open elsewhere.
+   */
+  constructor(private readonly windowKey?: string) {}
 
   /** Replaces the snapshot and refreshes the whole tree. */
   update(repos: TreeRepoPayload[]): void {
@@ -63,13 +70,16 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     );
     item.id = nodeId(node);
     item.description = worktreeDescription(node.wt);
-    item.tooltip = worktreeTooltip(node.wt, node.repo);
-    item.contextValue = worktreeContextValue(node.wt);
-    // The open badge: a green dot for a worktree with a live window, else the
-    // plain branch glyph.
-    item.iconPath = node.wt.open
-      ? new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"))
-      : new vscode.ThemeIcon("git-branch");
+    item.tooltip = worktreeTooltip(node.wt, node.repo, this.windowKey);
+    item.contextValue = worktreeContextValue(node.wt, this.windowKey);
+    // The open badge, three-way: a blue tick for the worktree open in *this*
+    // window, a green dot for one open in another window, else the plain branch
+    // glyph for a worktree with no live window.
+    item.iconPath = isCurrentWindow(node.wt, this.windowKey)
+      ? new vscode.ThemeIcon("check", new vscode.ThemeColor("charts.blue"))
+      : node.wt.open
+        ? new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"))
+        : new vscode.ThemeIcon("git-branch");
     item.command = {
       command: ITEM_CLICKED_COMMAND,
       title: "Open Worktree",
