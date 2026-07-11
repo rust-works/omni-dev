@@ -3,7 +3,7 @@
   "displayName": "omni-dev",
   "description": "A live tree view of every repository and git worktree open across all your VS Code windows, fed by the omni-dev daemon; double-click to focus or open a worktree's window.",
   "icon": "media/icon.png",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "rust-works",
   "license": "BSD-3-Clause",
   "repository": {
@@ -70,6 +70,18 @@
         "command": "omniDevWorktrees.closeWindow",
         "title": "Close Window",
         "category": "omni-dev"
+      },
+      {
+        "command": "omniDevWorktrees.hideClosedWorktrees",
+        "title": "Hide Worktrees Without a Window",
+        "category": "omni-dev",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "omniDevWorktrees.showClosedWorktrees",
+        "title": "Show Worktrees Without a Window",
+        "category": "omni-dev",
+        "icon": "$(eye-closed)"
       }
     ],
     "menus": {
@@ -89,13 +101,31 @@
         {
           "command": "omniDevWorktrees.closeWindow",
           "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.hideClosedWorktrees",
+          "when": "omniDevWorktrees.showClosed"
+        },
+        {
+          "command": "omniDevWorktrees.showClosedWorktrees",
+          "when": "!omniDevWorktrees.showClosed"
         }
       ],
       "view/title": [
         {
           "command": "omniDevWorktrees.refresh",
           "when": "view == omniDevWorktrees.tree",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "omniDevWorktrees.hideClosedWorktrees",
+          "when": "view == omniDevWorktrees.tree && omniDevWorktrees.showClosed",
+          "group": "navigation@2"
+        },
+        {
+          "command": "omniDevWorktrees.showClosedWorktrees",
+          "when": "view == omniDevWorktrees.tree && !omniDevWorktrees.showClosed",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
