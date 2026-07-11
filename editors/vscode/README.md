@@ -31,6 +31,21 @@ it never runs git.
 If the daemon is **not running**, every call is a silent no-op: the extension
 never surfaces an error or blocks the window.
 
+## Worktrees view
+
+The **Worktrees** activity-bar view lists every repository and git worktree open
+across all your windows, fed live by the daemon. Each leaf shows the branch and
+ahead/behind counts and an open badge; double-click to focus an already-open
+window or open a worktree's folder. Two title-bar actions:
+
+- **Refresh** — a one-shot re-fetch, a fallback for when the live subscription is
+  momentarily down.
+- **Hide / Show Worktrees Without a Window** — one toggle button (an *eye* icon
+  when showing all, an *eye-closed* icon when hiding) that collapses the list to
+  just the worktrees a window currently has open, and back. The default shows all
+  worktrees. The setting is stored per-machine (`globalState`), so it reads the
+  same in every window and survives a reload.
+
 ## Requirements
 
 - The omni-dev daemon running locally (`omni-dev daemon start`).

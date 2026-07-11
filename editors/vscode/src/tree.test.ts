@@ -71,6 +71,27 @@ test("worktreeNodes yields child nodes carrying their parent repo", () => {
   }
 });
 
+test("worktreeNodes hides no-window worktrees when showClosed is false", () => {
+  // Default / explicit-true: every worktree, byte-for-byte the current behavior.
+  assert.equal(worktreeNodes(REPOS[0]).length, 2);
+  assert.equal(worktreeNodes(REPOS[0], true).length, 2);
+
+  // showClosed false: the closed linked worktree is dropped, the open one stays.
+  const visible = worktreeNodes(REPOS[0], false);
+  assert.equal(visible.length, 1);
+  const node = visible[0];
+  assert.equal(node.kind, "worktree");
+  if (node.kind === "worktree") {
+    assert.equal(node.wt.branch, "main");
+    assert.equal(node.wt.open, true);
+  }
+
+  // A repo whose only worktree has no window keeps ≥1 open in practice (repos are
+  // derived from open windows); as a pure function it can return an empty list,
+  // but the daemon's invariant means the filter never empties a real repo.
+  assert.equal(worktreeNodes(REPOS[1], false).length, 0);
+});
+
 test("repoLabel prefers the GitHub owner/name, else the main repo name", () => {
   assert.equal(repoLabel(REPOS[0]), "rust-works/omni-dev");
   assert.equal(repoLabel(REPOS[1]), "scratch");
