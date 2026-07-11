@@ -3,7 +3,14 @@ name: CI
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
+    # Crate release tags only. GitHub's `*` matches everything except `/`, so a
+    # bare `v*` also matches the extension's own `vscode-v*` tags — pushing one
+    # would fire the full crate CI, whose Coverage job then 404s on the in-flight
+    # crate release's binary (#1289). The `!vscode-*` exclusion mirrors #1288's
+    # release.yml fix; those tags stay owned by vscode-extension-release.yml.
+    tags:
+      - 'v*'
+      - '!vscode-*'
   pull_request:
     branches: [ main ]
 
@@ -168,7 +175,13 @@ jobs:
   coverage:
     name: Coverage
     needs: gate
-    if: needs.gate.outputs.code == 'true'
+    # Skip on tag pushes (#1289). A release-tag Coverage run resolves the
+    # coverage tool's `version: latest` to the very release being published and
+    # 404s on its not-yet-uploaded binary (release.yml creates the release object
+    # minutes before its ~18 MB assets finish uploading). Coverage is meaningful
+    # on PRs (diff comment) and main pushes (baseline publish); a tag has no PR
+    # and its commit was already validated on main, so skipping loses nothing.
+    if: needs.gate.outputs.code == 'true' && github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
