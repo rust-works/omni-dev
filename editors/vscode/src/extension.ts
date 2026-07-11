@@ -30,6 +30,15 @@ const CONFIG_SECTION = "omniDevWorktrees";
 const TREE_VIEW_ID = "omniDevWorktrees.tree";
 
 /**
+ * The key under which the show/hide-closed toggle is both persisted (in
+ * `context.globalState`, so it reads the same in every window and survives a
+ * reload) and exposed as a `when`-clause context key (via `setContext`, so the
+ * title-bar button swaps between its Hide/Show forms). Defaults to `true` —
+ * show all worktrees, the original behavior.
+ */
+const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
+
+/**
  * How close (ms) two clicks on the same item must be to count as a double-click.
  * The TreeView API has no native double-click event (single click only selects),
  * so `onItemClicked` implements this manually.
@@ -162,6 +171,14 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // mark this window's own worktree distinctly from those open in other windows.
   const treeProvider = new WorktreesTreeDataProvider(windowKey);
   provider = treeProvider;
+
+  // Seed the show/hide-closed toggle from cross-window persisted state before the
+  // first render: prime the `when`-clause context key so the correct title-bar
+  // button shows, and the provider's filter so the initial tree already reflects it.
+  const showClosed = context.globalState.get<boolean>(SHOW_CLOSED_KEY, true);
+  void vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
+  treeProvider.setShowClosed(showClosed);
+
   const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
     showCollapseAll: true,
@@ -199,7 +216,33 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.closeWindow",
       (node?: Node) => void closeWindow(node),
     ),
+    // The two halves of the one title-bar toggle: exactly one is contributed at a
+    // time (gated on the context key), so clicking the visible button flips the
+    // state to the other.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.hideClosedWorktrees",
+      () => void setShowClosed(context, false),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.showClosedWorktrees",
+      () => void setShowClosed(context, true),
+    ),
   );
+}
+
+/**
+ * Flips the show/hide-closed toggle. Persists it to `context.globalState` (so it
+ * reads the same in every window and survives a reload), updates the
+ * `when`-clause context key so the title-bar button swaps to its other form, and
+ * re-filters the live tree — a fresh daemon snapshot then keeps this filter.
+ */
+async function setShowClosed(
+  context: vscode.ExtensionContext,
+  showClosed: boolean,
+): Promise<void> {
+  await context.globalState.update(SHOW_CLOSED_KEY, showClosed);
+  await vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
+  provider?.setShowClosed(showClosed);
 }
 
 /**

@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Hide worktrees without a window** ([#1290](https://github.com/rust-works/omni-dev/issues/1290)): a title-bar toggle in the **Worktrees** view collapses the list to just the worktrees a VS Code window currently has open, and back — one button that swaps between an *eye* icon (showing all) and an *eye-closed* icon (hiding).
+  - The default is unchanged — **all** worktrees are shown until you toggle.
+  - The filter is entirely client-side (the daemon already reports each worktree's open state); its state is persisted in `globalState`, so it reads the same in every window and survives a reload, and a live snapshot keeps it applied.
+  - Repos are derived from open windows (each keeps ≥1 open worktree), so hiding only trims closed rows and never empties a repo or the tree.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

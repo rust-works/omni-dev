@@ -29,6 +29,8 @@ export const ITEM_CLICKED_COMMAND = "omniDevWorktrees.itemClicked";
 /** Serves the repo→worktree tree from the latest daemon `tree` snapshot. */
 export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> {
   private repos: TreeRepoPayload[] = [];
+  /** Whether worktrees with no open window are shown; false hides them. */
+  private showClosed = true;
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -44,11 +46,20 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     this.emitter.fire(undefined);
   }
 
+  /**
+   * Sets whether worktrees with no open window are shown, then refreshes the
+   * tree so the new filter applies. A no-op change still re-fires harmlessly.
+   */
+  setShowClosed(showClosed: boolean): void {
+    this.showClosed = showClosed;
+    this.emitter.fire(undefined);
+  }
+
   getChildren(element?: Node): Node[] {
     if (!element) {
       return reposToNodes(this.repos);
     }
-    return element.kind === "repo" ? worktreeNodes(element.repo) : [];
+    return element.kind === "repo" ? worktreeNodes(element.repo, this.showClosed) : [];
   }
 
   getTreeItem(node: Node): vscode.TreeItem {
