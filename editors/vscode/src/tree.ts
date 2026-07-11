@@ -64,9 +64,18 @@ export function reposToNodes(repos: TreeRepoPayload[]): Node[] {
   return repos.map((repo) => ({ kind: "repo", repo }));
 }
 
-/** The worktree child nodes of a repository, in the daemon's order (main first). */
-export function worktreeNodes(repo: TreeRepoPayload): Node[] {
-  return repo.worktrees.map((wt) => ({ kind: "worktree", repo, wt }));
+/**
+ * The worktree child nodes of a repository, in the daemon's order (main first).
+ *
+ * When `showClosed` is false, worktrees with no open window (`open === false`)
+ * are dropped so the view collapses to just what is actually open. The daemon
+ * derives repos from open windows, so every repo keeps ≥1 open worktree — the
+ * filter can never empty a repo or the tree. `showClosed` defaults to `true`
+ * (the current, unfiltered behavior).
+ */
+export function worktreeNodes(repo: TreeRepoPayload, showClosed = true): Node[] {
+  const worktrees = showClosed ? repo.worktrees : repo.worktrees.filter((wt) => wt.open);
+  return worktrees.map((wt) => ({ kind: "worktree", repo, wt }));
 }
 
 /** A repo's display label: `owner/name` for GitHub repos, else its `main_repo`. */

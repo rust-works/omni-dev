@@ -207,6 +207,14 @@ every window (no per-window curation). It renders the `tree` payload:
   commits change, driven by the [push subscription](#push-subscription) — no manual
   refresh. A **Refresh** title-bar action does a one-shot `tree` fetch as a fallback
   when the subscription is momentarily down.
+- **Hide worktrees without a window.** A second title-bar action toggles the view
+  between showing **all** worktrees (the default — an *eye* icon that hides) and
+  showing only those a VS Code window currently has open (an *eye-closed* icon that
+  reveals). The filter is entirely client-side — the `tree` / `subscribe` payload is
+  unchanged — and its state lives in the extension's `globalState`, so it reads the
+  same in every window and survives a reload; a fresh snapshot keeps it applied.
+  Because repos are derived from open windows (each has ≥1 open worktree), hiding
+  only trims closed children and never empties a repo or the tree.
 - **Daemon-down degrades gracefully.** When the daemon is not running, the view
   shows a hint ("start it with `omni-dev daemon start`") rather than an error dialog,
   and the subscription reconnects with exponential backoff (500 ms → 10 s) once the
