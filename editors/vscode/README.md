@@ -43,8 +43,10 @@ window or open a worktree's folder. Two title-bar actions:
 - **Hide / Show Worktrees Without a Window** — one toggle button (an *eye* icon
   when showing all, an *eye-closed* icon when hiding) that collapses the list to
   just the worktrees a window currently has open, and back. The default shows all
-  worktrees. The setting is stored per-machine (`globalState`), so it reads the
-  same in every window and survives a reload.
+  worktrees. The toggle **syncs live across every window** through the daemon:
+  flip it in one window and the others update within a beat, no reload. Its value
+  is also stored per-machine (`globalState`) as a durable fallback, so it survives
+  a reload and still works locally when the daemon is stopped.
 
 ## Requirements
 

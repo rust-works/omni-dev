@@ -328,23 +328,28 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op           | payload                                        | success payload                            |
-|--------------|------------------------------------------------|--------------------------------------------|
-| `register`   | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
-| `heartbeat`  | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
-| `unregister` | `{ key }`                                      | `{ removed: <bool> }`                      |
-| `list`       | `null`                                         | `{ windows: [entry, …] }`                  |
-| `tree`       | `null`                                         | `{ repos: [repo, …] }`                     |
-| `open`       | `{ path }`                                     | `{ ok: true }`                             |
-| `close`      | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
-| `subscribe`  | `null`                                         | *(stream — see below)*                     |
+| op                     | payload                                        | success payload                            |
+|------------------------|------------------------------------------------|--------------------------------------------|
+| `register`             | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
+| `heartbeat`            | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
+| `unregister`           | `{ key }`                                      | `{ removed: <bool> }`                      |
+| `list`                 | `null`                                         | `{ windows: [entry, …] }`                  |
+| `tree`                 | `null`                                         | `{ repos: [repo, …] }`                     |
+| `open`                 | `{ path }`                                     | `{ ok: true }`                             |
+| `close`                | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
+| `set-view-state`       | `{ show_closed }`                              | `{ ok: true }`                             |
+| `subscribe`            | `null`                                         | *(stream — see below)*                     |
+| `subscribe-view-state` | `null`                                         | *(stream — see below)*                     |
 
-The first seven ops are strictly **request → one reply**. `subscribe` is the one
-**streaming** op (see [Push subscription](#push-subscription)): the reply is a
-sequence of `{ ok: true, payload: { repos: … } }` lines on the same connection —
-an initial snapshot, then a fresh one each time the view changes — not a single
-reply. It uses no new wire type, so a client that only ever sends the other ops is
-wire-identical to the ADR-0040 contract.
+The eight request/reply ops are strictly **request → one reply**. `subscribe` and
+`subscribe-view-state` are the two **streaming** ops (see
+[Push subscription](#push-subscription)): each reply is a sequence of
+`{ ok: true, payload: … }` lines on the same connection — an initial snapshot,
+then a fresh one each time that channel changes — not a single reply. The two
+streams ride **independent** change-notifies, so a view-state toggle never wakes
+the tree stream (no git re-enumeration) and a tree change never re-pushes
+view-state. They use no new wire type, so a client that only ever sends the
+original ops is wire-identical to the ADR-0040 contract.
 
 Where:
 
@@ -409,6 +414,17 @@ Where:
 - `subscribe` streams the `tree` payload live; see
   [Push subscription](#push-subscription) for the framing, coalescing, and
   teardown semantics.
+- `set-view-state` writes the shared, cross-window **view preferences** (#1293) —
+  today just `{ show_closed: <bool> }`, the Worktrees view's "hide worktrees
+  without a window" toggle. It is **last-write-wins**: the daemon stores the value
+  in memory (never on disk) and pushes it to every `subscribe-view-state`
+  subscriber, including the setter, which reconciles to the pushed frame. A
+  malformed payload (missing/non-boolean `show_closed`) is a clear error.
+- `subscribe-view-state` streams the shared view preferences live; see
+  [Push subscription](#push-subscription). Its frame is
+  `{ view_state: null | { show_closed } }`, where `null` means the daemon is
+  **unseeded** — fresh, or restarted (it persists nothing) — the signal a client
+  uses to re-seed it via `set-view-state` from its own durable copy.
 - A `list` `entry` is
   `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
   is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
@@ -428,15 +444,17 @@ Where:
   convention, so an older client simply ignores them.
 
 Companion lifecycle, per window. The reporter half (register/heartbeat/
-unregister) is unchanged from ADR-0040; the tree-view half opens one long-lived
-`subscribe` connection alongside it:
+unregister) is unchanged from ADR-0040; the tree-view half opens two long-lived
+subscribe connections alongside it — one for the tree, one for view-state:
 
 ```text
 activate():    connect(socket) → {service:"worktrees", op:"register",
                                    payload:{key, folders, repo, title, pid}}
-               connect(socket) → {service:"worktrees", op:"subscribe"}   // long-lived, reads pushed snapshots
+               connect(socket) → {service:"worktrees", op:"subscribe"}              // long-lived, reads pushed tree snapshots
+               connect(socket) → {service:"worktrees", op:"subscribe-view-state"}   // long-lived, reads pushed view-state; re-seed on a null frame
 heartbeat:     every ~10s → {op:"heartbeat", key}     // close self if {close:true}; else re-register if {known:false}
-deactivate():  {op:"unregister", key}   + close the subscribe socket
+toggle:        {op:"set-view-state", payload:{show_closed}}   // the pushed frame is what flips every window's UI
+deactivate():  {op:"unregister", key}   + close the subscribe sockets
 ```
 
 Example exchange:
@@ -448,6 +466,8 @@ Example exchange:
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
 ← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","ahead":2,"behind":0,"is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","ahead":1,"behind":3,"is_main":false,"open":false}]}]}}
+→ {"service":"worktrees","op":"set-view-state","payload":{"show_closed":false}}
+← {"ok":true,"payload":{"ok":true}}
 ```
 
 The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
@@ -480,6 +500,37 @@ semantics a client can rely on:
 
 Back-compat is total: a client that never sends `subscribe` only ever sees the
 classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
+
+#### The view-state stream (#1293)
+
+`subscribe-view-state` is a **second** push stream, identical in framing to the
+`tree` stream above (same `DaemonReply::ok` lines, same coalescing and
+de-duplication, same "reconnect is the client's job" contract), with two
+differences:
+
+- **Its own change-notify.** The daemon bumps a separate version counter only on a
+  `set-view-state`, so a toggle pushes *only* on this stream — it never triggers a
+  git tree re-enumeration — and a tree change never re-pushes view-state. Run it on
+  a **dedicated** connection, separate from the `tree` `subscribe`.
+- **An "unseeded" frame.** Each frame is
+  `{ view_state: null | { show_closed: <bool> } }`. `null` means the daemon holds
+  no value yet — it starts unseeded and, because it **persists nothing**, is
+  unseeded again after a restart. A client treats a `null` frame as the cue to
+  re-seed via `set-view-state` from its own durable copy (for the companion, the
+  extension's `globalState`) — the view-state analogue of the
+  `{ known:false } → re-register` resync. With multiple windows this is
+  last-write-wins; because every window mirrors each pushed value into its durable
+  copy, the copies stay current and the first window to reconnect re-seeds the last
+  converged value.
+
+The pushed frame is the **single source of truth**: a `set-view-state` writer also
+applies the value locally for instant feedback, but every window (the writer
+included) converges on whatever the daemon pushes back. When the daemon is down the
+companion falls back to a purely-local toggle (its pre-#1293 behaviour) and
+reconverges once the daemon returns. State is **in-memory only** — no
+`daemon.sock`-adjacent file, nothing on disk — so [ADR-0040](adrs/adr-0040.md) /
+[ADR-0048](adrs/adr-0048.md)'s "the daemon persists no state" invariant holds and
+no new ADR is needed.
 
 ## Scope and follow-ups
 

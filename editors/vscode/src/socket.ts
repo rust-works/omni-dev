@@ -125,6 +125,39 @@ export function subscribeEnvelope(): Envelope {
 }
 
 /**
+ * The shared, cross-window view preferences the daemon brokers (#1293) —
+ * mirrors the daemon's `ViewState` (`src/worktrees.rs`). Today only the
+ * "hide worktrees without a window" toggle.
+ */
+export interface ViewState {
+  show_closed: boolean;
+}
+
+/**
+ * Builds a `set-view-state` envelope — a last-write-wins write of the shared
+ * view preferences. The daemon pushes the new value to every window (including
+ * this one) over the separate `subscribe-view-state` stream, so all windows
+ * converge; the pushed frame is what actually flips each window's UI.
+ */
+export function setViewStateEnvelope(showClosed: boolean): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "set-view-state",
+    payload: { show_closed: showClosed },
+  };
+}
+
+/**
+ * Builds a `subscribe-view-state` envelope — opens the view-state push stream,
+ * separate from the `tree` stream so a toggle never triggers a git tree
+ * re-enumeration. The daemon streams `{ view_state: … }` frames (`null` until a
+ * window seeds it) until the client cancels or closes. See `ViewStateSubscription`.
+ */
+export function subscribeViewStateEnvelope(): Envelope {
+  return { service: WORKTREES_SERVICE, op: "subscribe-view-state" };
+}
+
+/**
  * Builds an `open` envelope — focuses (or opens) a worktree folder in VS Code
  * via the daemon's launcher. The daemon guards `path` to an absolute, existing
  * directory, so a relative/nonexistent path comes back as `{ ok: false }`.

@@ -17,11 +17,12 @@ import {
   openEnvelope,
   registerEnvelope,
   sendEnvelope,
+  setViewStateEnvelope,
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
 import { Node, TreeRepoPayload, isCurrentWindow, nodeId, worktreeLabel } from "./tree";
-import { TreeSubscription } from "./subscription";
+import { TreeSubscription, ViewStateSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
 
 const CONFIG_SECTION = "omniDevWorktrees";
@@ -172,12 +173,11 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   const treeProvider = new WorktreesTreeDataProvider(windowKey);
   provider = treeProvider;
 
-  // Seed the show/hide-closed toggle from cross-window persisted state before the
-  // first render: prime the `when`-clause context key so the correct title-bar
-  // button shows, and the provider's filter so the initial tree already reflects it.
-  const showClosed = context.globalState.get<boolean>(SHOW_CLOSED_KEY, true);
-  void vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
-  treeProvider.setShowClosed(showClosed);
+  // Seed the show/hide-closed toggle from the durable `globalState` copy before
+  // the first render, so the correct title-bar button and initial filter show
+  // immediately even if the daemon is down. The view-state subscription below
+  // then reconciles to the daemon's shared value once connected.
+  applyShowClosed(context.globalState.get<boolean>(SHOW_CLOSED_KEY, true));
 
   const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
@@ -203,6 +203,28 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   });
   sub.start();
   context.subscriptions.push({ dispose: () => sub.close() });
+
+  // The view-state stream keeps the show/hide-closed toggle in sync across every
+  // window (#1293). A pushed frame is the single source of truth that flips this
+  // window's UI; a `null` frame means the daemon is unseeded (fresh or restarted),
+  // our cue to re-seed it from the durable `globalState` copy — the same
+  // `known:false → re-register` resync the heartbeat uses.
+  const viewSub = new ViewStateSubscription(socketPath(), {
+    onSnapshot: (viewState) => {
+      if (viewState === null) {
+        void send(setViewStateEnvelope(context.globalState.get<boolean>(SHOW_CLOSED_KEY, true)));
+        return;
+      }
+      // Mirror the shared value into `globalState` so every window's durable copy
+      // tracks the daemon — whichever window re-seeds first after a restart then
+      // re-seeds the last converged value — and flip the UI to match.
+      void context.globalState.update(SHOW_CLOSED_KEY, viewState.show_closed);
+      applyShowClosed(viewState.show_closed);
+    },
+    onError: (message) => output?.appendLine(`view-state subscription: ${message}`),
+  });
+  viewSub.start();
+  context.subscriptions.push({ dispose: () => viewSub.close() });
 
   context.subscriptions.push(
     vscode.commands.registerCommand("omniDevWorktrees.refresh", () => void refreshTree()),
@@ -231,18 +253,31 @@ function setupTreeView(context: vscode.ExtensionContext): void {
 }
 
 /**
- * Flips the show/hide-closed toggle. Persists it to `context.globalState` (so it
- * reads the same in every window and survives a reload), updates the
- * `when`-clause context key so the title-bar button swaps to its other form, and
- * re-filters the live tree — a fresh daemon snapshot then keeps this filter.
+ * Applies a show/hide-closed value to *this* window's UI: primes the
+ * `when`-clause context key (so the title-bar button swaps between its Hide/Show
+ * forms) and re-filters the live tree. Purely local — it does not touch
+ * `globalState` or the daemon; callers own persistence and broadcast.
+ */
+function applyShowClosed(showClosed: boolean): void {
+  void vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
+  provider?.setShowClosed(showClosed);
+}
+
+/**
+ * Flips the show/hide-closed toggle. Persists the value to `context.globalState`
+ * (the durable, daemon-down fallback that survives a reload), applies it locally
+ * for instant feedback, and broadcasts it to the daemon so **every** window
+ * converges (#1293). When the daemon is up its pushed frame re-applies the same
+ * value idempotently; when it is down, the local apply is the whole effect — the
+ * original per-window behavior.
  */
 async function setShowClosed(
   context: vscode.ExtensionContext,
   showClosed: boolean,
 ): Promise<void> {
   await context.globalState.update(SHOW_CLOSED_KEY, showClosed);
-  await vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
-  provider?.setShowClosed(showClosed);
+  applyShowClosed(showClosed);
+  await send(setViewStateEnvelope(showClosed));
 }
 
 /**

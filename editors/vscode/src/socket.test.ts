@@ -15,7 +15,9 @@ import {
   heartbeatEnvelope,
   openEnvelope,
   registerEnvelope,
+  setViewStateEnvelope,
   subscribeEnvelope,
+  subscribeViewStateEnvelope,
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
@@ -85,6 +87,23 @@ test("tree/subscribe/open envelope builders match the worktrees wire contract", 
     service: "worktrees",
     op: "open",
     payload: { path: "/home/me/wt/issue-1300" },
+  });
+});
+
+test("view-state envelope builders match the worktrees wire contract", () => {
+  assert.deepEqual(setViewStateEnvelope(false), {
+    service: "worktrees",
+    op: "set-view-state",
+    payload: { show_closed: false },
+  });
+  assert.deepEqual(setViewStateEnvelope(true), {
+    service: "worktrees",
+    op: "set-view-state",
+    payload: { show_closed: true },
+  });
+  assert.deepEqual(subscribeViewStateEnvelope(), {
+    service: "worktrees",
+    op: "subscribe-view-state",
   });
 });
 

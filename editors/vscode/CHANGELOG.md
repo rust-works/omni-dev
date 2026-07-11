@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Hide worktrees without a window** ([#1290](https://github.com/rust-works/omni-dev/issues/1290)): a title-bar toggle in the **Worktrees** view collapses the list to just the worktrees a VS Code window currently has open, and back — one button that swaps between an *eye* icon (showing all) and an *eye-closed* icon (hiding).
   - The default is unchanged — **all** worktrees are shown until you toggle.
-  - The filter is entirely client-side (the daemon already reports each worktree's open state); its state is persisted in `globalState`, so it reads the same in every window and survives a reload, and a live snapshot keeps it applied.
+  - The filter is entirely client-side (the daemon already reports each worktree's open state); its state is persisted in `globalState` and, since [#1293](https://github.com/rust-works/omni-dev/issues/1293), synced live across every window through the daemon.
   - Repos are derived from open windows (each keeps ≥1 open worktree), so hiding only trims closed rows and never empties a repo or the tree.
+- **Cross-window toggle sync** ([#1293](https://github.com/rust-works/omni-dev/issues/1293)): flip the "hide worktrees without a window" toggle in one window and **every** other open window updates within a beat, no reload — the shared filter now reads the same everywhere the view is open.
+  - The toggle's value is brokered through the omni-dev daemon over a dedicated view-state push stream, separate from the tree stream, so a toggle never triggers a git re-enumeration.
+  - Each window keeps its `globalState` copy as a durable fallback: with the daemon **stopped** the toggle still works locally (today's per-window behaviour), and the first window to reconnect re-seeds a restarted daemon from it — so the last state is never lost.
 
 ## [0.2.0] - 2026-07-10
 
