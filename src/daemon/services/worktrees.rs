@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::daemon::service::{
     DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus, ServiceStream,
 };
-use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
+use crate::worktrees::{RegisterRequest, ViewState, WindowEntry, WorktreesRegistry};
 
 /// The worktrees service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "worktrees";
@@ -304,22 +304,40 @@ impl DaemonService for WorktreesService {
                     serde_json::from_value(payload).context("invalid `close` payload")?;
                 self.close(req).await
             }
+            "set-view-state" => {
+                // Cross-window view-preference write (#1293): last-write-wins,
+                // pushed to every window (including this one) via the separate
+                // `subscribe-view-state` stream. In-memory only — the daemon
+                // persists nothing; the companion's `globalState` is the durable
+                // copy that re-seeds a restarted daemon.
+                let vs: ViewState =
+                    serde_json::from_value(payload).context("invalid `set-view-state` payload")?;
+                self.registry.set_view_state(vs);
+                Ok(json!({ "ok": true }))
+            }
             other => bail!("unknown worktrees op: {other}"),
         }
     }
 
     fn subscribe(&self, op: &str, _payload: &Value) -> Option<Box<dyn ServiceStream>> {
-        // The single streaming op: a live push of the repo/worktree `tree`
-        // snapshot. Every other op falls through to the request→reply `handle`.
-        if op != "subscribe" {
-            return None;
+        // Two streaming ops, each on its own change-notify so a toggle never
+        // wakes the tree stream (and a tree change never wakes view-state):
+        // `subscribe` pushes the repo/worktree `tree`, `subscribe-view-state`
+        // pushes the shared view preferences (#1293). Every other op falls
+        // through to the request→reply `handle`. Each captures its change source
+        // *now* — before the server takes its initial snapshot — so a change
+        // racing that snapshot still wakes us.
+        match op {
+            "subscribe" => Some(Box::new(WorktreesStream {
+                registry: self.registry.clone(),
+                changes: self.registry.subscribe_changes(),
+            })),
+            "subscribe-view-state" => Some(Box::new(ViewStateStream {
+                registry: self.registry.clone(),
+                changes: self.registry.subscribe_view_changes(),
+            })),
+            _ => None,
         }
-        Some(Box::new(WorktreesStream {
-            registry: self.registry.clone(),
-            // Capture the change source *now* — before the server takes its
-            // initial snapshot — so a change racing that snapshot still wakes us.
-            changes: self.registry.subscribe_changes(),
-        }))
     }
 
     fn menu(&self) -> MenuSnapshot {
@@ -816,6 +834,38 @@ impl ServiceStream for WorktreesStream {
         let folders = self.registry.open_folders();
         let windows = self.registry.list();
         json!({ "repos": tree_repos(folders, windows).await })
+    }
+}
+
+/// The `subscribe-view-state` stream (#1293): a live push of the shared
+/// cross-window view preferences, on the registry's **separate** `view_changes`
+/// notify so it is never woken by a tree change (nor wakes the tree stream). The
+/// snapshot is a trivial scalar — no git, no window join — so a toggle costs
+/// nothing beyond serialising a bool.
+struct ViewStateStream {
+    /// The registry the view-state is read from.
+    registry: Arc<WorktreesRegistry>,
+    /// Wakes on each `set-view-state`; a burst coalesces into one wakeup and the
+    /// server's diff drops any snapshot that ends up identical.
+    changes: watch::Receiver<u64>,
+}
+
+#[async_trait]
+impl ServiceStream for ViewStateStream {
+    async fn changed(&mut self) {
+        // Same teardown-safe park as `WorktreesStream`: if every sender is gone
+        // (the daemon is tearing down) never resolve, so this arm can't spin the
+        // server's `select!`.
+        if self.changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn snapshot(&self) -> Value {
+        // `Some(vs)` -> `{ view_state: { show_closed } }`; `None` (the daemon is
+        // unseeded — fresh or restarted) -> `{ view_state: null }`, the signal a
+        // window uses to re-seed from its durable `globalState`.
+        json!({ "view_state": self.registry.view_state() })
     }
 }
 
@@ -1676,14 +1726,18 @@ mod tests {
     // --- Push subscription (#1267) -----------------------------------------
 
     #[tokio::test]
-    async fn subscribe_streams_only_for_the_subscribe_op() {
+    async fn subscribe_streams_only_for_the_subscribe_ops() {
         let svc = WorktreesService::new();
-        // The one streaming op yields a stream; every other op (including the
+        // The two streaming ops each yield a stream; every other op (including the
         // request/reply worktrees ops) declines, so the server dispatches them
         // normally.
         assert!(svc.subscribe("subscribe", &Value::Null).is_some());
+        assert!(svc
+            .subscribe("subscribe-view-state", &Value::Null)
+            .is_some());
         assert!(svc.subscribe("list", &Value::Null).is_none());
         assert!(svc.subscribe("register", &Value::Null).is_none());
+        assert!(svc.subscribe("set-view-state", &Value::Null).is_none());
         assert!(svc.subscribe("bogus", &Value::Null).is_none());
     }
 
@@ -1735,6 +1789,89 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stream.changed())
             .await
             .expect("changed should resolve after a register");
+    }
+
+    // --- View-state channel (#1293) ----------------------------------------
+
+    #[tokio::test]
+    async fn set_view_state_routes_and_reads_back() {
+        let svc = WorktreesService::new();
+        // Unseeded until a window sets it.
+        assert_eq!(svc.registry.view_state(), None);
+
+        let reply = svc
+            .handle("set-view-state", json!({ "show_closed": false }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "ok": true }));
+        assert_eq!(
+            svc.registry.view_state(),
+            Some(ViewState { show_closed: false })
+        );
+
+        // A later set overwrites (last-write-wins).
+        svc.handle("set-view-state", json!({ "show_closed": true }))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.registry.view_state(),
+            Some(ViewState { show_closed: true })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_view_state_rejects_malformed_payload() {
+        let svc = WorktreesService::new();
+        // Missing / wrong-typed `show_closed` is a hard error, like the other
+        // structured-payload ops.
+        assert!(svc.handle("set-view-state", json!({})).await.is_err());
+        assert!(svc
+            .handle("set-view-state", json!({ "show_closed": "yes" }))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn view_state_stream_snapshot_reflects_the_registry() {
+        let svc = WorktreesService::new();
+        let stream = svc
+            .subscribe("subscribe-view-state", &Value::Null)
+            .expect("view-state stream");
+        // Unseeded → `null`, the re-seed signal.
+        assert_eq!(stream.snapshot().await, json!({ "view_state": null }));
+
+        svc.handle("set-view-state", json!({ "show_closed": false }))
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.snapshot().await,
+            json!({ "view_state": { "show_closed": false } })
+        );
+    }
+
+    #[tokio::test]
+    async fn view_state_stream_wakes_on_set_but_not_on_register() {
+        let svc = WorktreesService::new();
+        let mut stream = svc
+            .subscribe("subscribe-view-state", &Value::Null)
+            .expect("view-state stream");
+        // A tree-visible change (register) must NOT wake the view-state stream —
+        // the two channels are decoupled so a toggle never re-enumerates git and
+        // a window opening never re-pushes view-state.
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        tokio::select! {
+            () = stream.changed() => panic!("view-state changed resolved on a register"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // A `set-view-state` wakes it promptly.
+        svc.handle("set-view-state", json!({ "show_closed": false }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stream.changed())
+            .await
+            .expect("changed should resolve after a set-view-state");
     }
 
     #[tokio::test]

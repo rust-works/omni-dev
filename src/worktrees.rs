@@ -86,6 +86,23 @@ pub struct WindowEntry {
     pub last_seen: DateTime<Utc>,
 }
 
+/// Shared, cross-window **view preferences** for the Worktrees tree view (#1293).
+///
+/// The scalar the daemon brokers so a control the view presents once reads the
+/// same in every window. Today that is only the "hide worktrees without a window"
+/// toggle; it is the coherent home for any future shared scalar view-preference.
+///
+/// Held in memory only (like [`close_pending`](WorktreesRegistry) — never
+/// persisted), so a daemon restart forgets it and the first window to reconnect
+/// re-seeds it from its own durable `globalState` (the `known:false →
+/// re-register` resync, applied to view-state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewState {
+    /// Whether worktrees with no open window are shown (`true`, the default) or
+    /// hidden (`false`).
+    pub show_closed: bool,
+}
+
 /// The cross-window worktree registry: the in-memory, TTL-reaped set of open
 /// windows. Hosted by
 /// [`WorktreesService`](crate::daemon::services::worktrees::WorktreesService).
@@ -117,6 +134,21 @@ pub struct WorktreesRegistry {
     /// aborts and the user retries — an accepted failure mode). Behind its own
     /// `Mutex`, taken independently of the window map's, so neither nests.
     close_pending: Mutex<HashSet<String>>,
+    /// Shared cross-window view preferences (#1293), `None` until the first
+    /// window seeds it. In-memory only, like `close_pending`: a daemon restart
+    /// drops it and the first reconnecting window re-seeds it from its durable
+    /// `globalState`. Behind its **own** `Mutex`, never nested under the window
+    /// map's (nor `close_pending`'s).
+    view_state: Mutex<Option<ViewState>>,
+    /// A second change-notify counter, bumped only on a [`set_view_state`] and
+    /// **decoupled** from [`changes`] so a view-state push never wakes the tree
+    /// stream (and vice versa) — a toggle must not force a git tree
+    /// re-enumeration. Drives the `subscribe-view-state` stream; same coalescing
+    /// contract as `changes`.
+    ///
+    /// [`set_view_state`]: Self::set_view_state
+    /// [`changes`]: Self::changes
+    view_changes: watch::Sender<u64>,
 }
 
 impl WorktreesRegistry {
@@ -128,6 +160,8 @@ impl WorktreesRegistry {
             ttl: DEFAULT_TTL,
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
+            view_state: Mutex::new(None),
+            view_changes: watch::channel(0).0,
         }
     }
 
@@ -257,6 +291,52 @@ impl WorktreesRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)
+    }
+
+    /// Reads the current shared view preferences (#1293), or `None` while the
+    /// daemon is still unseeded — the signal a window uses to re-seed from its
+    /// durable `globalState`. Poison-recovering, like the other reads.
+    #[must_use]
+    pub fn view_state(&self) -> Option<ViewState> {
+        *self
+            .view_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces the shared view preferences and notifies the view-state stream.
+    /// Last-write-wins: it always [`bump_view`](Self::bump_view)s, even on an
+    /// identical value, so the setter's own window reconciles to the pushed
+    /// frame; the stream's `snap != last` diff suppresses a duplicate frame when
+    /// nothing actually changed. The guard is dropped **before** the bump, so the
+    /// view-state lock never nests under (or is held across) anything.
+    pub fn set_view_state(&self, next: ViewState) {
+        {
+            let mut guard = self
+                .view_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *guard = Some(next);
+        }
+        self.bump_view();
+    }
+
+    /// A change-notification receiver for the view-state push subscription. Like
+    /// [`subscribe_changes`](Self::subscribe_changes) it starts with the current
+    /// version marked seen, so the first `changed()` resolves on the next
+    /// [`set_view_state`](Self::set_view_state); the stream sends its own initial
+    /// snapshot up front.
+    #[must_use]
+    pub fn subscribe_view_changes(&self) -> watch::Receiver<u64> {
+        self.view_changes.subscribe()
+    }
+
+    /// Signals view-state subscribers, mirroring [`bump`](Self::bump) but on the
+    /// separate `view_changes` counter so tree and view-state pushes never wake
+    /// each other. Non-blocking, runtime-free, called only after the view-state
+    /// guard is released.
+    fn bump_view(&self) {
+        self.view_changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Reaps stale entries, then returns the live set sorted for deterministic
@@ -719,5 +799,61 @@ mod tests {
         // Unregistering the window drops any pending directive with it.
         assert!(reg.unregister("w1"));
         assert!(!reg.take_close_pending("w1"));
+    }
+
+    // --- Shared view-state (#1293) -----------------------------------------
+
+    #[test]
+    fn view_state_starts_unseeded_and_round_trips() {
+        let reg = WorktreesRegistry::new();
+        // A fresh (or restarted) daemon is unseeded — the re-seed signal.
+        assert_eq!(reg.view_state(), None);
+        reg.set_view_state(ViewState { show_closed: false });
+        assert_eq!(reg.view_state(), Some(ViewState { show_closed: false }));
+        reg.set_view_state(ViewState { show_closed: true });
+        assert_eq!(reg.view_state(), Some(ViewState { show_closed: true }));
+    }
+
+    #[test]
+    fn set_view_state_bumps_view_changes() {
+        let reg = WorktreesRegistry::new();
+        let mut rx = reg.subscribe_view_changes();
+        // A fresh receiver has the current version already marked seen.
+        assert!(!rx.has_changed().unwrap());
+        reg.set_view_state(ViewState { show_closed: false });
+        assert!(rx.has_changed().unwrap(), "set_view_state should bump");
+        rx.borrow_and_update();
+        // Last-write-wins always bumps, even on an identical value, so the
+        // setter's own window reconciles to the pushed frame.
+        reg.set_view_state(ViewState { show_closed: false });
+        assert!(
+            rx.has_changed().unwrap(),
+            "an identical set still bumps (the stream diff suppresses the frame)"
+        );
+    }
+
+    #[test]
+    fn view_state_and_tree_change_notifies_are_decoupled() {
+        let reg = WorktreesRegistry::new();
+        let tree_rx = reg.subscribe_changes();
+        let view_rx = reg.subscribe_view_changes();
+        // A view-state write wakes only the view-state stream.
+        reg.set_view_state(ViewState { show_closed: false });
+        assert!(view_rx.has_changed().unwrap(), "set_view_state bumps view");
+        assert!(
+            !tree_rx.has_changed().unwrap(),
+            "a toggle must not wake the tree stream (no git re-enumeration)"
+        );
+        // A tree-visible change wakes only the tree stream.
+        reg.register(register_request("w1", None, "/tmp/a"));
+        assert!(tree_rx.has_changed().unwrap(), "register bumps tree");
+        // (view_rx already has a pending change from the set above; mark it seen
+        // first, then confirm the register did not add another.)
+        let mut view_rx = view_rx;
+        view_rx.borrow_and_update();
+        assert!(
+            !view_rx.has_changed().unwrap(),
+            "a tree change must not wake the view-state stream"
+        );
     }
 }
