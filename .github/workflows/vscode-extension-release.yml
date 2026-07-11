@@ -13,10 +13,13 @@ name: VS Code extension release
 #      re-runs typecheck/build/test/package, then publishes the same .vsix to
 #      both registries.
 #
-# One-time prerequisites (maintainer, not code): an Azure DevOps publisher whose
-# id matches `"publisher": "rust-works"` and the repo secret VSCE_PAT (required).
-# OVSX_PAT and the `rust-works` Open VSX namespace are optional — set them to also
-# publish to Open VSX; without OVSX_PAT that publish is skipped, not failed. See
+# One-time prerequisites (maintainer, not code): at least one publish token must
+# be set. VSCE_PAT publishes to the VS Code Marketplace (needs an Azure DevOps
+# publisher whose id matches `"publisher"` in package.json); OVSX_PAT publishes to
+# Open VSX (needs the matching Open VSX namespace). Each registry is published to
+# only if its token is present — a missing token skips that registry (a notice,
+# not a failure) — so Marketplace-only, Open-VSX-only, and both are all valid,
+# green outcomes. The run fails only if neither token is set. See
 # editors/vscode/README.md.
 on:
   push:
@@ -47,25 +50,31 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
-      # Require the Marketplace token up front (fail fast if absent) rather than
-      # dying most of the way through a publish. The Open VSX token is optional:
-      # when unset we skip that publish (see the step's `if`) so a Marketplace-only
-      # release is still green; the boolean output gates it.
-      - name: Verify required secrets are present
+      # Each registry is optional and gated on its own token; at least one must be
+      # present or there is nothing to publish. A missing token skips that registry
+      # (a notice, not a failure), so Marketplace-only, Open-VSX-only, and both are
+      # all valid, green outcomes.
+      - name: Verify at least one publish token is present
         id: secrets
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          if [ -z "$VSCE_PAT" ]; then
-            echo "::error::Missing required repo secret VSCE_PAT. Add it under Settings → Secrets and variables → Actions before releasing. See editors/vscode/README.md."
+          if [ -z "$VSCE_PAT" ] && [ -z "$OVSX_PAT" ]; then
+            echo "::error::No publish token set. Add VSCE_PAT (VS Code Marketplace) and/or OVSX_PAT (Open VSX) under Settings → Secrets and variables → Actions before releasing. See editors/vscode/README.md."
             exit 1
+          fi
+          if [ -n "$VSCE_PAT" ]; then
+            echo "has_vsce=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_vsce=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::VSCE_PAT is not set — skipping the VS Code Marketplace publish."
           fi
           if [ -n "$OVSX_PAT" ]; then
             echo "has_ovsx=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_ovsx=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::OVSX_PAT is not set — skipping the Open VSX publish. Set it to also publish to Open VSX. See editors/vscode/README.md."
+            echo "::notice::OVSX_PAT is not set — skipping the Open VSX publish."
           fi
 
       # On a tag push, the tag is the source of truth for what we intend to
@@ -112,6 +121,7 @@ jobs:
           echo "Packaged ${files[0]}"
 
       - name: Publish to VS Code Marketplace
+        if: steps.secrets.outputs.has_vsce == 'true'
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: npm run publish:vsce -- --packagePath "${{ steps.vsix.outputs.path }}"

@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-11
+
 ### Added
 - **Hide worktrees without a window** ([#1290](https://github.com/rust-works/omni-dev/issues/1290)): a title-bar toggle in the **Worktrees** view collapses the list to just the worktrees a VS Code window currently has open, and back — one button that swaps between an *eye* icon (showing all) and an *eye-closed* icon (hiding).
   - The default is unchanged — **all** worktrees are shown until you toggle.
