@@ -145,8 +145,12 @@ indented row per worktree: a `*` marks the **main working tree**, followed by th
 branch, its `+ahead -behind` sync state, an `open` flag when a live window has that
 worktree open, and the worktree path. A repo with no open window contributes no
 rows, so the tree lists exactly the repos currently in play (the open-window-derived
-v1 model — [ADR-0048](adrs/adr-0048.md)). `-o json` is the raw `tree` payload
-described under [the contract](#companion-contract-for-the-extension-and-other-clients).
+v1 model — [ADR-0048](adrs/adr-0048.md)). The `+ahead -behind` state is **not** in
+the (cheap) `tree` payload — `worktrees tree` fetches it on demand via the
+`ahead-behind` op and folds it in (#1306), for both the table and `-o json`; so
+`-o json` is the `tree` payload described under
+[the contract](#companion-contract-for-the-extension-and-other-clients) with
+`ahead`/`behind` merged back onto each worktree.
 
 ## Tray
 
@@ -199,16 +203,23 @@ every window (no per-window curation). It renders the `tree` payload:
   **open badge** icon (#1274): a **blue tick** on the worktree open in *this*
   window, a **green dot** on one open in *another* window, and the plain branch
   glyph on a worktree with no live window. The current-window distinction comes
-  from matching a worktree's `window_key` against this window's own key.
+  from matching a worktree's `window_key` against this window's own key. The
+  `↑ahead ↓behind` counts are **not** in the streamed snapshot — the extension
+  fetches them **lazily when a repo is expanded** via the `ahead-behind` op (#1306),
+  so only the worktrees you actually look at pay the divergence walk.
 - **Double-click to focus/open.** Because the VS Code TreeView API has **no** native
   double-click event (a single click only selects), the companion implements it with
   a manual click-timer: a second click on the same worktree within ~400 ms sends the
   daemon `open` op, which runs `code <path>` — focusing the already-open window or
   opening a new one. Uniform for open and not-open worktrees.
-- **Live.** The view updates itself as windows open and close and as branches or
-  commits change, driven by the [push subscription](#push-subscription) — no manual
-  refresh. A **Refresh** title-bar action does a one-shot `tree` fetch as a fallback
-  when the subscription is momentarily down.
+- **Live.** The view updates itself as windows open and close and as branches
+  change, driven by the [push subscription](#push-subscription) — no manual
+  refresh. `↑ahead ↓behind` is re-fetched each time a repo's children are rendered
+  (on expand, and on any snapshot that re-renders it), so it tracks the visible
+  worktrees; a commit that moves a tip without otherwise changing the snapshot
+  refreshes the counts on the next expand/render rather than instantly (#1306). A
+  **Refresh** title-bar action does a one-shot `tree` fetch as a fallback when the
+  subscription is momentarily down.
 - **Hide worktrees without a window.** A second title-bar action toggles the view
   between showing **all** worktrees (the default — an *eye* icon that hides) and
   showing only those a VS Code window currently has open (an *eye-closed* icon that
@@ -257,18 +268,30 @@ extension never runs git.
   the worktree on disk, so the branch shown is always current — not a snapshot
   frozen at registration. Every path but the sync tray `menu` runs it on a blocking
   thread (`git2` is synchronous disk I/O) and never under the registry lock.
+- **Ahead/behind is lazy for the tree (#1306).** The `graph_ahead_behind` upstream
+  revwalk is the dominant per-worktree cost, and the `tree` / `subscribe` snapshot
+  is rebuilt for **every** worktree of **every** repo on **every** tick — so that
+  snapshot computes only the *cheap* state (branch, `main_repo`, `is_worktree`) and
+  **omits** `ahead`/`behind`. Divergence is instead fetched on demand through the
+  **`ahead-behind`** op, batched by path, for just the worktrees a client is about
+  to show (the extension does this when a repo is expanded; `worktrees tree` does it
+  once for the whole tree). The bounded, non-streamed surfaces — `list`/`status`
+  (the primary folder of each open window) and the tray `menu` (open windows only)
+  — still compute `ahead`/`behind` inline, since the walk cost there is negligible.
 - **`list` enriches the primary folder; `tree` enriches every worktree.** For a
   window entry (`list`/`status`), only the first workspace folder is enriched — it
   is the one the table shows and the "Focus" action opens. For the `tree` view the
-  same building blocks are applied to **every** worktree the daemon enumerates for
-  each repository, whether or not a window has it open.
+  same building blocks (minus the lazy `ahead`/`behind`) are applied to **every**
+  worktree the daemon enumerates for each repository, whether or not a window has it
+  open.
 - **Best-effort and degrading.** Discovery tolerates a folder inside a
   subdirectory or a linked worktree. A folder that is not a git repo, a detached
   HEAD, or a branch with no upstream is still listed — just without the fields it
   cannot supply (no `branch`, or `branch` with no `ahead`/`behind`). The
   `main_repo` name and `is_worktree` flag are resolved from the repository itself,
   so they are present even for an unborn or detached HEAD (only a non-repo folder
-  omits them). The enrichment never fails a `list`.
+  omits them). The `ahead-behind` op degrades the same way: a path with no upstream
+  is simply omitted from its `results`. The enrichment never fails a `list`.
 
 ## Security
 
@@ -292,12 +315,15 @@ ref name (which cannot contain control bytes) but is sanitized on the same path 
 defense-in-depth. Native tray menus do not interpret ANSI, and the `-o json`
 output escapes control bytes via JSON encoding.
 
-The **`tree`** op and the **`subscribe`** stream add **no new exposure** beyond the
-existing reads. `tree` enumerates the worktrees of repositories the socket owner
-already has windows open on, and reveals repo/worktree *paths* and the GitHub
-`owner/name` of `origin` — all derivable by the same owner from those open folders.
-`subscribe` streams exactly that same snapshot on a schedule; a subscriber learns
-nothing a repeated `tree` poll would not. The stream is bounded and self-limiting:
+The **`tree`** op, the **`subscribe`** stream, and the **`ahead-behind`** op add
+**no new exposure** beyond the existing reads. `tree` enumerates the worktrees of
+repositories the socket owner already has windows open on, and reveals
+repo/worktree *paths* and the GitHub `owner/name` of `origin` — all derivable by the
+same owner from those open folders. `subscribe` streams exactly that same snapshot
+on a schedule; a subscriber learns nothing a repeated `tree` poll would not.
+`ahead-behind` only computes local commit-graph divergence for paths the caller
+supplies (in practice the same worktrees `tree` already returned), so it reveals
+nothing the owner could not read from those repos directly. The stream is bounded and self-limiting:
 it lives on one `0600` connection, coalesces bursts, diffs to suppress duplicate
 frames, and is torn down on client disconnect, an explicit cancel line, or daemon
 shutdown.
@@ -342,12 +368,13 @@ Ops:
 | `unregister`      | `{ key }`                                      | `{ removed: <bool> }`                      |
 | `list`            | `null`                                         | `{ windows: [entry, …] }`                  |
 | `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
+| `ahead-behind`    | `{ paths: [path, …] }`                         | `{ results: { "<path>": { ahead, behind } } }` |
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first eight ops are strictly **request → one reply**. `subscribe` is the one
+The first nine ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
@@ -407,13 +434,23 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, ahead?, behind?, is_main, open, window_key? }`. The main
-  working tree comes first (`is_main: true`), then linked worktrees sorted by path.
-  `open` is `true` when a live window currently has that worktree open, and
-  `window_key` (the open window's registry `key`, the handle a focus action
-  resolves) is present only then. `branch`/`ahead`/`behind` are the same
-  daemon-computed, independently-degrading git fields as on a `list` entry (see
+  `{ path, branch?, is_main, open, window_key? }`. The main working tree comes
+  first (`is_main: true`), then linked worktrees sorted by path. `open` is `true`
+  when a live window currently has that worktree open, and `window_key` (the open
+  window's registry `key`, the handle a focus action resolves) is present only then.
+  `branch` is a daemon-computed, independently-degrading git field. **`ahead`/
+  `behind` are deliberately absent** from this snapshot — they are the expensive
+  part and are fetched on demand via the `ahead-behind` op (#1306; see
   [Git enrichment](#git-enrichment)).
+- `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
+  `{ paths: [<worktree path>, …] }`, it returns
+  `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
+  path that is not a repo, is on a detached/unborn HEAD, or tracks no upstream is
+  **omitted** from `results` (the client renders it with no sync indicator). It
+  exists so the streamed `tree`/`subscribe` snapshot can stay cheap: a client
+  fetches divergence only for the worktrees it shows (the extension when a repo is
+  expanded; `worktrees tree` once for the whole tree), rather than the daemon
+  walking every worktree's commit graph on every tick.
 - `subscribe` streams the `tree` payload live; see
   [Push subscription](#push-subscription) for the framing, coalescing, and
   teardown semantics.
@@ -468,11 +505,15 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","ahead":2,"behind":0,"is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","ahead":1,"behind":3,"is_main":false,"open":false}]}],"show_closed":true}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","is_main":false,"open":false}]}],"show_closed":true}}
+→ {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
+← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
 ```
 
-The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
-them to `list`/`status`/`tree` replies.
+The `tree` snapshot carries `branch` but not `ahead`/`behind` — those are the
+expensive part, fetched on demand via the `ahead-behind` op (#1306). The companion
+sends no `branch`/`ahead`/`behind` on `register`; the daemon derives `branch` (and,
+for `list`/`status`, `ahead`/`behind`) on read.
 
 ### Push subscription
 
