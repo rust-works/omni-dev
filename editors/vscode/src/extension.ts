@@ -20,6 +20,7 @@ import {
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
+import { openPullRequest } from "./prCommands";
 import { Node, TreeRepoPayload, isCurrentWindow, nodeId, worktreeLabel } from "./tree";
 import { TreeSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
@@ -215,6 +216,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWindow",
       (node?: Node) => void closeWindow(node),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.openPullRequest",
+      (node?: Node) => void openPullRequest(node),
     ),
     // The two halves of the one title-bar toggle: exactly one is contributed at a
     // time (gated on the context key), so clicking the visible button flips the

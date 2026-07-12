@@ -72,6 +72,12 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.openPullRequest",
+        "title": "Open Pull Request…",
+        "category": "omni-dev",
+        "icon": "$(git-pull-request)"
+      },
+      {
         "command": "omniDevWorktrees.hideClosedWorktrees",
         "title": "Hide Worktrees Without a Window",
         "category": "omni-dev",
@@ -100,6 +106,10 @@
         },
         {
           "command": "omniDevWorktrees.closeWindow",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.openPullRequest",
           "when": "false"
         },
         {
@@ -133,6 +143,11 @@
           "command": "omniDevWorktrees.open",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
           "group": "inline"
+        },
+        {
+          "command": "omniDevWorktrees.openPullRequest",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",
+          "group": "1_pr@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",
