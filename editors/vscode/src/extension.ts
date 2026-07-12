@@ -10,6 +10,7 @@ import {
   Envelope,
   RegisterPayload,
   Reply,
+  aheadBehindEnvelope,
   closeCheckEnvelope,
   closeEnvelope,
   defaultSocketPath,
@@ -22,7 +23,14 @@ import {
   unregisterEnvelope,
 } from "./socket";
 import { openPullRequest } from "./prCommands";
-import { Node, TreeRepoPayload, isCurrentWindow, nodeId, worktreeLabel } from "./tree";
+import {
+  AheadBehindMap,
+  Node,
+  TreeRepoPayload,
+  isCurrentWindow,
+  nodeId,
+  worktreeLabel,
+} from "./tree";
 import { TreeSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
 
@@ -116,6 +124,18 @@ async function send(envelope: Envelope, timeoutMs?: number): Promise<Reply | und
   }
 }
 
+/**
+ * Fetches ahead/behind divergence for a batch of worktree paths via the daemon's
+ * `ahead-behind` op (#1306) — the lazy replacement for the sync counts the tree
+ * snapshot no longer carries. A missing daemon (or older one without the op)
+ * resolves to an empty map, so the tree simply renders without sync indicators.
+ */
+async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
+  const reply = await send(aheadBehindEnvelope(paths));
+  const results = reply?.ok ? (reply.payload?.results as AheadBehindMap | undefined) : undefined;
+  return results ?? {};
+}
+
 async function register(): Promise<void> {
   await send(registerEnvelope(registerPayload()));
 }
@@ -173,7 +193,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 function setupTreeView(context: vscode.ExtensionContext): void {
   // `windowKey` is assigned in `activate()` before this runs, so the provider can
   // mark this window's own worktree distinctly from those open in other windows.
-  const treeProvider = new WorktreesTreeDataProvider(windowKey);
+  // The provider fetches ahead/behind lazily on expand (#1306) via `fetchAheadBehind`.
+  const treeProvider = new WorktreesTreeDataProvider(windowKey, fetchAheadBehind);
   provider = treeProvider;
 
   // Seed the button/filter to the default (show all) before the first render;
