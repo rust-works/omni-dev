@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Open Pull Request…** ([#1299](https://github.com/rust-works/omni-dev/issues/1299)): a context-menu action on the **Worktrees** view opens a repo's or worktree's pull request(s) **as a tab inside VS Code**, never a browser.
+  - On a **worktree** node it finds the PR(s) whose head branch is that worktree's checked-out branch; on a **repository** node it fans out to all the repo's open PRs. No PR shows a friendly info message, one PR opens directly, and several offer a multi-select quick-pick to open any or all at once.
+  - PRs are discovered with the `gh` CLI (reusing its existing auth) and open through the **GitHub Pull Requests** extension's (`GitHub.vscode-pull-request-github`) documented URI handler. When that extension is not installed, a single warning offers **Install** or **Copy PR URL** — it never silently falls back to a browser.
+  - Only repos with a `github.com` origin get the action (the daemon reports `owner/name` for those); it requires the `gh` CLI and the GitHub Pull Requests extension. `gh` is resolved from your `PATH`, the usual install locations (Homebrew, `~/.local/bin`, …), or the `OMNI_DEV_GH_BIN` override, so a GUI-launched editor with a minimal `PATH` still finds it.
+
 ## [0.3.0] - 2026-07-11
 
 ### Added

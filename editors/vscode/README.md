@@ -46,12 +46,38 @@ window or open a worktree's folder. Two title-bar actions:
   worktrees. The setting is stored per-machine (`globalState`), so it reads the
   same in every window and survives a reload.
 
+Right-click a leaf or repo for context-menu actions: **Close Worktree** /
+**Close Window**, and — for a `github.com` repo — **Open Pull Request…**.
+
+### Open Pull Request…
+
+Right-click a repository or worktree with a `github.com` origin and choose **Open
+Pull Request…** to open its pull request(s) **as a tab inside VS Code** (never a
+browser):
+
+- a **worktree** node opens the PR(s) whose head branch matches its checked-out
+  branch; a **repository** node fans out to all the repo's open PRs;
+- **no PR** shows a friendly info message; **one** opens directly; **several**
+  offer a multi-select quick-pick so you can open any of them or all at once.
+
+PRs are discovered with the `gh` CLI (reusing its existing auth) and opened
+through the **GitHub Pull Requests** extension's URI handler. If that extension
+is not installed, a single warning offers **Install** or **Copy PR URL** — it
+never silently falls back to a browser.
+
 ## Requirements
 
 - The omni-dev daemon running locally (`omni-dev daemon start`).
 - **macOS or Linux only** — like the daemon, the companion is Unix-only; on
   Windows there is no daemon socket to talk to (tracked in
   [#1237](https://github.com/rust-works/omni-dev/issues/1237)).
+- For **Open Pull Request…** only: the [`gh` CLI](https://cli.github.com/)
+  installed and authenticated (`gh auth login`), and the [**GitHub Pull
+  Requests**](https://marketplace.visualstudio.com/items?itemName=GitHub.vscode-pull-request-github)
+  extension (`GitHub.vscode-pull-request-github`) to render the PR in a tab.
+  `gh` is found on your `PATH` or in the usual install locations (Homebrew,
+  `~/.local/bin`, …); if a GUI-launched editor inherits a minimal `PATH` and
+  can't find it, set `OMNI_DEV_GH_BIN` to its full path.
 
 ## Settings
 
