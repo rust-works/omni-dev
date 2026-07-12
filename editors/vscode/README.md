@@ -71,10 +71,13 @@ never silently falls back to a browser.
 - **macOS or Linux only** — like the daemon, the companion is Unix-only; on
   Windows there is no daemon socket to talk to (tracked in
   [#1237](https://github.com/rust-works/omni-dev/issues/1237)).
-- For **Open Pull Request…** only: the [`gh` CLI](https://cli.github.com/) on your
-  PATH and authenticated (`gh auth login`), and the [**GitHub Pull
+- For **Open Pull Request…** only: the [`gh` CLI](https://cli.github.com/)
+  installed and authenticated (`gh auth login`), and the [**GitHub Pull
   Requests**](https://marketplace.visualstudio.com/items?itemName=GitHub.vscode-pull-request-github)
   extension (`GitHub.vscode-pull-request-github`) to render the PR in a tab.
+  `gh` is found on your `PATH` or in the usual install locations (Homebrew,
+  `~/.local/bin`, …); if a GUI-launched editor inherits a minimal `PATH` and
+  can't find it, set `OMNI_DEV_GH_BIN` to its full path.
 
 ## Settings
 
