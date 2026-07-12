@@ -13,12 +13,16 @@
 import * as net from "net";
 
 import { Reply, checkSocketPathLen, subscribeEnvelope } from "./socket";
-import { TreeRepoPayload } from "./tree";
+import { TreeSnapshot } from "./tree";
 
 /** Injectable collaborators + backoff tuning (defaults wire real timers). */
 export interface TreeSubscriptionOptions {
-  /** Called with the repos of every pushed snapshot. */
-  onSnapshot: (repos: TreeRepoPayload[]) => void;
+  /**
+   * Called with every pushed snapshot: its `repos` and the daemon-backed
+   * `show_closed` toggle (#1301), so the reader drives both the tree and the
+   * show/hide-closed filter from the same authoritative frame.
+   */
+  onSnapshot: (snapshot: TreeSnapshot) => void;
   /** Called on connect↔disconnect transitions (drives the daemon-down hint). */
   onStatus?: (connected: boolean) => void;
   /** Called with a human-readable message on each recoverable drop. */
@@ -43,7 +47,7 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
  * safe to hand to `context.subscriptions`).
  */
 export class TreeSubscription {
-  private readonly onSnapshot: (repos: TreeRepoPayload[]) => void;
+  private readonly onSnapshot: (snapshot: TreeSnapshot) => void;
   private readonly onStatus?: (connected: boolean) => void;
   private readonly onError?: (message: string) => void;
   private readonly initialBackoffMs: number;
@@ -166,7 +170,7 @@ export class TreeSubscription {
         this.connected = true;
         this.onStatus?.(true);
       }
-      this.onSnapshot(reply.payload.repos as TreeRepoPayload[]);
+      this.onSnapshot(reply.payload as TreeSnapshot);
     }
   }
 

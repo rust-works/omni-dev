@@ -134,6 +134,21 @@ export function openEnvelope(path: string): Envelope {
 }
 
 /**
+ * Builds a `set-show-closed` envelope — sets the daemon-backed show/hide-closed
+ * toggle (#1301). The daemon holds this single cross-window value and re-pushes
+ * a `tree` snapshot (carrying the new `show_closed`) to every subscribed window,
+ * so the toggle syncs live everywhere instead of living in per-window
+ * `globalState`.
+ */
+export function setShowClosedEnvelope(showClosed: boolean): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "set-show-closed",
+    payload: { show_closed: showClosed },
+  };
+}
+
+/**
  * The fields the extension sends on a `close` op — mirrors the daemon's
  * `CloseRequest` (`src/daemon/services/worktrees.rs`). `remove` selects delete
  * (linked "Close Worktree") vs close-only (main "Close Window"); `requester_key`

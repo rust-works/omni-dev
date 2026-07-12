@@ -17,6 +17,7 @@ import {
   openEnvelope,
   registerEnvelope,
   sendEnvelope,
+  setShowClosedEnvelope,
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
@@ -31,11 +32,13 @@ const CONFIG_SECTION = "omniDevWorktrees";
 const TREE_VIEW_ID = "omniDevWorktrees.tree";
 
 /**
- * The key under which the show/hide-closed toggle is both persisted (in
- * `context.globalState`, so it reads the same in every window and survives a
- * reload) and exposed as a `when`-clause context key (via `setContext`, so the
- * title-bar button swaps between its Hide/Show forms). Defaults to `true` —
- * show all worktrees, the original behavior.
+ * The `when`-clause context key (set via `setContext`) that swaps the title-bar
+ * button between its Hide/Show forms. The toggle's **state** is no longer stored
+ * per-window in `context.globalState` — that was read-once at activation, had no
+ * cross-window change event, and raced a newly-opened window (#1301). It now
+ * lives in the daemon and rides every pushed `tree` snapshot's `show_closed`, so
+ * this key is driven from that snapshot (see {@link applyShowClosed}). Defaults
+ * to `true` — show all worktrees — until the first snapshot lands.
  */
 const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
 
@@ -173,12 +176,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   const treeProvider = new WorktreesTreeDataProvider(windowKey);
   provider = treeProvider;
 
-  // Seed the show/hide-closed toggle from cross-window persisted state before the
-  // first render: prime the `when`-clause context key so the correct title-bar
-  // button shows, and the provider's filter so the initial tree already reflects it.
-  const showClosed = context.globalState.get<boolean>(SHOW_CLOSED_KEY, true);
-  void vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
-  treeProvider.setShowClosed(showClosed);
+  // Seed the button/filter to the default (show all) before the first render;
+  // the daemon's pushed `show_closed` is authoritative and updates both the
+  // moment the first snapshot lands (#1301) — no per-window `globalState`.
+  applyShowClosed(true);
 
   const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
@@ -190,9 +191,12 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   context.subscriptions.push(view, treeProvider);
 
   const sub = new TreeSubscription(socketPath(), {
-    onSnapshot: (repos) => {
-      view.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
-      treeProvider.update(repos);
+    onSnapshot: (snapshot) => {
+      view.message = snapshot.repos.length === 0 ? EMPTY_MESSAGE : undefined;
+      treeProvider.update(snapshot.repos);
+      // The daemon-backed toggle rides every snapshot, so a flip in any window
+      // re-renders this one and a fresh window initializes on its first frame.
+      applyShowClosed(snapshot.show_closed);
     },
     onStatus: (connected) => {
       // A drop re-shows the hint; a (re)connect's message is set by the snapshot.
@@ -226,28 +230,39 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     // state to the other.
     vscode.commands.registerCommand(
       "omniDevWorktrees.hideClosedWorktrees",
-      () => void setShowClosed(context, false),
+      () => void setShowClosed(false),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.showClosedWorktrees",
-      () => void setShowClosed(context, true),
+      () => void setShowClosed(true),
     ),
   );
 }
 
 /**
- * Flips the show/hide-closed toggle. Persists it to `context.globalState` (so it
- * reads the same in every window and survives a reload), updates the
- * `when`-clause context key so the title-bar button swaps to its other form, and
- * re-filters the live tree — a fresh daemon snapshot then keeps this filter.
+ * Applies an authoritative show/hide-closed value — from a daemon snapshot or
+ * the pre-snapshot default — to this window's UI: flips the `when`-clause
+ * context key so the title-bar button shows the right form, and re-filters the
+ * tree. It never persists or sends anything; the daemon owns the state (#1301).
+ * A `show_closed` omitted by an older daemon degrades to `true` (show all).
  */
-async function setShowClosed(
-  context: vscode.ExtensionContext,
-  showClosed: boolean,
-): Promise<void> {
-  await context.globalState.update(SHOW_CLOSED_KEY, showClosed);
-  await vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
+function applyShowClosed(showClosed = true): void {
+  void vscode.commands.executeCommand("setContext", SHOW_CLOSED_KEY, showClosed);
   provider?.setShowClosed(showClosed);
+}
+
+/**
+ * Flips the show/hide-closed toggle by sending the daemon `set-show-closed` op.
+ * The daemon holds the single cross-window value and pushes a fresh `tree`
+ * snapshot (carrying the new `show_closed`) to **every** window — including this
+ * one, whose `onSnapshot` then drives the button and the tree via
+ * {@link applyShowClosed}. So the UI reconciles from the snapshot, not from a
+ * per-window write, giving live cross-window sync `context.globalState` could
+ * not (#1301). A missing daemon is a silent no-op (the shared `send` logs it),
+ * like the rest of the reporter.
+ */
+async function setShowClosed(showClosed: boolean): Promise<void> {
+  await send(setShowClosedEnvelope(showClosed));
 }
 
 /**
@@ -439,6 +454,9 @@ async function refreshTree(): Promise<void> {
   if (reply?.ok && Array.isArray(reply.payload?.repos)) {
     const repos = reply.payload.repos as TreeRepoPayload[];
     provider?.update(repos);
+    // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
+    // (subscription momentarily down) keeps the toggle applied (#1301).
+    applyShowClosed(reply.payload.show_closed);
     if (treeView) {
       treeView.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
     }
