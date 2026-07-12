@@ -80,15 +80,17 @@ test("parsePrList throws an actionable error on malformed or non-array output", 
   assert.throws(() => parsePrList('{"number":1}'), /expected a JSON array/);
 });
 
-test("prOverviewUri builds the GitHub PR extension webview URI", () => {
+test("prOverviewUri builds the webview URI with the PR url as the `uri` param", () => {
+  // The handler wants a single `uri` param holding the full github.com PR URL,
+  // URL-encoded; owner/repo/number are parsed out of it by the extension.
   assert.equal(
-    prOverviewUri("vscode", "rust-works", "omni-dev", 1299),
-    "vscode://github.vscode-pull-request-github/open-pull-request-webview?owner=rust-works&repo=omni-dev&pullRequestNumber=1299",
+    prOverviewUri("vscode", "https://github.com/rust-works/omni-dev/pull/1299"),
+    "vscode://github.vscode-pull-request-github/open-pull-request-webview?uri=https%3A%2F%2Fgithub.com%2Frust-works%2Fomni-dev%2Fpull%2F1299",
   );
   // The scheme is the running product's, so the handler is reached in forks too.
   assert.match(
-    prOverviewUri("cursor", "rust-works", "omni-dev", 42),
-    /^cursor:\/\/github\.vscode-pull-request-github\/open-pull-request-webview\?/,
+    prOverviewUri("cursor", "https://github.com/o/r/pull/42"),
+    /^cursor:\/\/github\.vscode-pull-request-github\/open-pull-request-webview\?uri=/,
   );
 });
 

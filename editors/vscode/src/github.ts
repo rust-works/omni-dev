@@ -159,24 +159,21 @@ export function prQuickPickDescription(pr: PullRequest): string {
  * (`GitHub.vscode-pull-request-github`) to open a PR's overview as a tab:
  *
  * ```
- * <scheme>://github.vscode-pull-request-github/open-pull-request-webview?owner=…&repo=…&pullRequestNumber=…
+ * <scheme>://github.vscode-pull-request-github/open-pull-request-webview?uri=<pr web url>
  * ```
+ *
+ * The handler (verified against v0.156.0) takes a **single** `uri` query
+ * parameter holding the PR's full `github.com` web URL and matches it against
+ * `^https?://github.com/<owner>/<repo>/pull/<n>$` — so we pass the PR's `url`
+ * verbatim (exactly that shape, straight from `gh pr list --json url`) rather
+ * than separate owner/repo/number params, which this handler does not accept.
  *
  * `scheme` is the running product's URI scheme (`vscode.env.uriScheme` —
  * `vscode`, `vscode-insiders`, `cursor`, …) so the handler is reached in every
  * VS Code-family editor. Siblings not used here: `open-pull-request-changes`
  * (diff tab) and `checkout-pull-request`.
  */
-export function prOverviewUri(
-  scheme: string,
-  owner: string,
-  name: string,
-  number: number,
-): string {
-  const query = new URLSearchParams({
-    owner,
-    repo: name,
-    pullRequestNumber: String(number),
-  }).toString();
+export function prOverviewUri(scheme: string, prWebUrl: string): string {
+  const query = new URLSearchParams({ uri: prWebUrl }).toString();
   return `${scheme}://github.vscode-pull-request-github/open-pull-request-webview?${query}`;
 }
