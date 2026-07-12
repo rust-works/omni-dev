@@ -145,6 +145,34 @@ test("worktreeContextValue encodes open state and structural role under a shared
   assert.equal(worktreeContextValue(closedMain), "worktree.main");
 });
 
+test("worktreeContextValue appends `.github` only when the parent repo is on GitHub", () => {
+  // hasGithub defaults to false → the existing values are byte-for-byte unchanged.
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[0], "w1", false), "worktree.current.main");
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[1], "w1", false), "worktree.linked");
+
+  // hasGithub true → a trailing `.github` segment on top of the existing value.
+  assert.equal(
+    worktreeContextValue(REPOS[0].worktrees[0], "w1", true),
+    "worktree.current.main.github",
+  );
+  assert.equal(
+    worktreeContextValue(REPOS[0].worktrees[0], "w2", true),
+    "worktree.open.main.github",
+  );
+  assert.equal(worktreeContextValue(REPOS[0].worktrees[1], "w1", true), "worktree.linked.github");
+
+  const closedMain = { path: "/repo", is_main: true, open: false };
+  assert.equal(worktreeContextValue(closedMain, undefined, true), "worktree.main.github");
+
+  // The `.github` suffix leaves the (unanchored) close-menu regexes matching: a
+  // main tree with a window still matches Close Window, a linked one Close Worktree.
+  assert.match(worktreeContextValue(REPOS[0].worktrees[0], "w1", true), /worktree\.(current|open)\.main/);
+  assert.match(worktreeContextValue(REPOS[0].worktrees[1], "w1", true), /worktree\..*linked/);
+  // …and both GitHub variants match the new Open-PR menu's `/github/` gate.
+  assert.match(worktreeContextValue(REPOS[0].worktrees[0], "w1", true), /github/);
+  assert.match(worktreeContextValue(REPOS[0].worktrees[1], "w1", true), /github/);
+});
+
 test("nodeId is stable and distinguishes repos from worktrees", () => {
   assert.equal(nodeId({ kind: "repo", repo: REPOS[0] }), "repo:/home/me/omni-dev");
   assert.equal(
