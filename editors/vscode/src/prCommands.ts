@@ -74,9 +74,7 @@ export async function openPullRequest(node?: Node): Promise<void> {
   }
 
   for (const pr of selected) {
-    const uri = vscode.Uri.parse(
-      prOverviewUri(vscode.env.uriScheme, scope.repo.owner, scope.repo.name, pr.number),
-    );
+    const uri = vscode.Uri.parse(prOverviewUri(vscode.env.uriScheme, pr.url));
     await vscode.env.openExternal(uri);
   }
 }
