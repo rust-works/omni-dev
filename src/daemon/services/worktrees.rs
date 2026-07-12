@@ -272,14 +272,23 @@ impl DaemonService for WorktreesService {
             }
             "list" => Ok(json!({ "windows": enriched_windows(self.registry.list()).await })),
             "tree" => {
-                // Two cheap registry locks: the seed folders to derive repos
-                // from, and the live windows to join back on. The tree is
-                // best-effort, so minor skew between the two snapshots is
-                // immaterial; the git enumeration/enrichment runs off-lock on a
-                // blocking thread.
-                let folders = self.registry.open_folders();
-                let windows = self.registry.list();
-                Ok(json!({ "repos": tree_repos(folders, windows).await }))
+                // The same `{ repos, show_closed }` snapshot the `subscribe`
+                // stream pushes, so a one-shot `tree` fetch and the live stream
+                // agree byte-for-byte (the git enumeration runs off-lock on a
+                // blocking thread inside the helper).
+                Ok(tree_snapshot(&self.registry).await)
+            }
+            "set-show-closed" => {
+                // The daemon-backed show/hide-closed toggle (#1301). Setting it
+                // bumps the change-notify, so every subscribed window re-pushes a
+                // snapshot carrying the new `show_closed` — reliable cross-window
+                // sync `context.globalState` could not do.
+                let show_closed = payload
+                    .get("show_closed")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| anyhow!("`set-show-closed` requires a boolean `show_closed`"))?;
+                self.registry.set_show_closed(show_closed);
+                Ok(json!({ "ok": true }))
             }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
@@ -810,13 +819,22 @@ impl ServiceStream for WorktreesStream {
     }
 
     async fn snapshot(&self) -> Value {
-        // Identical to the `tree` op: two cheap registry locks (the seed folders
-        // to derive repos from, and the live windows to join on), then the git
-        // enumeration/enrichment off the lock on a blocking thread.
-        let folders = self.registry.open_folders();
-        let windows = self.registry.list();
-        json!({ "repos": tree_repos(folders, windows).await })
+        // Identical to the `tree` op — both go through `tree_snapshot`, so a
+        // one-shot fetch and this live push agree byte-for-byte.
+        tree_snapshot(&self.registry).await
     }
+}
+
+/// Builds the `{ repos, show_closed }` snapshot shared by the `tree` op and the
+/// `subscribe` stream, so the two never drift (#1301). Two cheap registry locks
+/// (the seed folders to derive repos from, and the live windows to join on) and
+/// a lock-free read of the toggle, then the git enumeration/enrichment off the
+/// lock on a blocking thread inside [`tree_repos`].
+async fn tree_snapshot(registry: &WorktreesRegistry) -> Value {
+    let folders = registry.open_folders();
+    let windows = registry.list();
+    let show_closed = registry.show_closed();
+    json!({ "repos": tree_repos(folders, windows).await, "show_closed": show_closed })
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,
@@ -1698,8 +1716,12 @@ mod tests {
         let stream = svc
             .subscribe("subscribe", &Value::Null)
             .expect("subscribe stream");
-        // No windows yet → no repos derived.
-        assert_eq!(stream.snapshot().await, json!({ "repos": [] }));
+        // No windows yet → no repos derived; the toggle rides along at its
+        // default (show all).
+        assert_eq!(
+            stream.snapshot().await,
+            json!({ "repos": [], "show_closed": true })
+        );
 
         // A window opens on the repo → the snapshot carries it, byte-identical to
         // what the `tree` op returns for the same registry state.
@@ -1735,6 +1757,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stream.changed())
             .await
             .expect("changed should resolve after a register");
+    }
+
+    // --- Show/hide-closed toggle (#1301) -----------------------------------
+
+    #[tokio::test]
+    async fn set_show_closed_toggles_the_snapshot_field() {
+        let svc = WorktreesService::new();
+        // The snapshot carries the toggle; it defaults to show-all.
+        assert_eq!(
+            svc.handle("tree", Value::Null).await.unwrap()["show_closed"],
+            json!(true)
+        );
+        // Setting it flips the field the next snapshot reports.
+        let reply = svc
+            .handle("set-show-closed", json!({ "show_closed": false }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "ok": true }));
+        assert_eq!(
+            svc.handle("tree", Value::Null).await.unwrap()["show_closed"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_show_closed_rejects_a_non_boolean_payload() {
+        let svc = WorktreesService::new();
+        assert!(svc.handle("set-show-closed", json!({})).await.is_err());
+        assert!(svc
+            .handle("set-show-closed", json!({ "show_closed": "yes" }))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_show_closed_wakes_the_subscription() {
+        let svc = WorktreesService::new();
+        let mut stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // A real flip bumps the change-notify → `changed()` resolves promptly.
+        svc.handle("set-show-closed", json!({ "show_closed": false }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stream.changed())
+            .await
+            .expect("changed should resolve after a toggle flip");
+        // The pushed snapshot now reflects the new toggle.
+        assert_eq!(stream.snapshot().await["show_closed"], json!(false));
     }
 
     #[tokio::test]
@@ -2304,10 +2375,10 @@ mod tests {
     #[tokio::test]
     async fn tree_is_empty_with_no_windows_and_skips_non_repos() {
         let svc = WorktreesService::new();
-        // No windows → an empty repo set (not an error).
+        // No windows → an empty repo set (not an error), toggle at its default.
         assert_eq!(
             svc.handle("tree", Value::Null).await.unwrap(),
-            json!({ "repos": [] })
+            json!({ "repos": [], "show_closed": true })
         );
         // A plain non-repo folder is skipped rather than sinking the op.
         let plain = tempfile::tempdir().unwrap();
