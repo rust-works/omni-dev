@@ -5,10 +5,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   TreeRepoPayload,
+  TreeWorktreePayload,
   isCurrentWindow,
   nodeId,
   repoLabel,
   reposToNodes,
+  withAheadBehind,
   worktreeContextValue,
   worktreeDescription,
   worktreeLabel,
@@ -110,6 +112,23 @@ test("worktreeDescription formats the sync counts, omitting absent sides", () =>
   // One-sided (defensive): only the present side is shown.
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, ahead: 4 }), "↑4");
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, behind: 5 }), "↓5");
+});
+
+test("withAheadBehind folds lazily-fetched counts in, and no-ops when absent", () => {
+  const base: TreeWorktreePayload = { path: "/x", branch: "main", is_main: true, open: true };
+  // Counts fetched via the ahead-behind op → a new payload carrying them, so the
+  // description renders exactly as an eager snapshot would have (#1306).
+  const merged = withAheadBehind(base, { ahead: 2, behind: 1 });
+  assert.equal(worktreeDescription(merged), "↑2 ↓1");
+  // The original is not mutated (a fresh object is returned).
+  assert.equal(base.ahead, undefined);
+  // No entry (undefined) or an empty entry (no upstream) leaves the worktree
+  // untouched — same reference, renders without a sync indicator.
+  assert.equal(withAheadBehind(base, undefined), base);
+  assert.equal(withAheadBehind(base, {}), base);
+  assert.equal(worktreeDescription(withAheadBehind(base, {})), "");
+  // A one-sided result is still applied.
+  assert.equal(worktreeDescription(withAheadBehind(base, { ahead: 4 })), "↑4");
 });
 
 test("isCurrentWindow matches only the open worktree whose key is this window's", () => {
