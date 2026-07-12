@@ -15,6 +15,7 @@ import {
   heartbeatEnvelope,
   openEnvelope,
   registerEnvelope,
+  setShowClosedEnvelope,
   subscribeEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -85,6 +86,19 @@ test("tree/subscribe/open envelope builders match the worktrees wire contract", 
     service: "worktrees",
     op: "open",
     payload: { path: "/home/me/wt/issue-1300" },
+  });
+});
+
+test("set-show-closed envelope carries the toggle as snake_case `show_closed`", () => {
+  assert.deepEqual(setShowClosedEnvelope(false), {
+    service: "worktrees",
+    op: "set-show-closed",
+    payload: { show_closed: false },
+  });
+  assert.deepEqual(setShowClosedEnvelope(true), {
+    service: "worktrees",
+    op: "set-show-closed",
+    payload: { show_closed: true },
   });
 });
 

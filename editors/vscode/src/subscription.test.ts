@@ -10,7 +10,7 @@ import * as os from "os";
 import * as path from "path";
 
 import { TreeSubscription } from "./subscription";
-import { TreeRepoPayload } from "./tree";
+import { TreeRepoPayload, TreeSnapshot } from "./tree";
 
 /** A short unix-socket path under the OS temp dir (well under the 104-byte cap). */
 function tempSocketPath(): string {
@@ -18,9 +18,13 @@ function tempSocketPath(): string {
   return path.join(dir, "d.sock");
 }
 
-/** One pushed `tree` snapshot line, matching the daemon's `DaemonReply::ok`. */
-function snapshotLine(repos: TreeRepoPayload[]): string {
-  return JSON.stringify({ ok: true, payload: { repos } }) + "\n";
+/**
+ * One pushed `tree` snapshot line, matching the daemon's `DaemonReply::ok`. The
+ * daemon always carries the `show_closed` toggle (#1301); `showClosed` sets it
+ * (defaults to `true`, the show-all default).
+ */
+function snapshotLine(repos: TreeRepoPayload[], showClosed = true): string {
+  return JSON.stringify({ ok: true, payload: { repos, show_closed: showClosed } }) + "\n";
 }
 
 /** Polls `pred` until true, or rejects after `timeoutMs`. */
@@ -63,16 +67,16 @@ test("subscribe: sends a subscribe line and delivers pushed snapshots", async (t
   const srv = trackingServer((conn) => {
     conn.on("data", (chunk: Buffer) => {
       requestLine += chunk.toString("utf8");
-      conn.write(snapshotLine([{ main_repo: "a", root: "/a", worktrees: [] }]));
-      conn.write(snapshotLine([{ main_repo: "b", root: "/b", worktrees: [] }]));
+      conn.write(snapshotLine([{ main_repo: "a", root: "/a", worktrees: [] }], true));
+      conn.write(snapshotLine([{ main_repo: "b", root: "/b", worktrees: [] }], false));
     });
   });
   await srv.listen(socketPath);
 
-  const received: TreeRepoPayload[][] = [];
+  const received: TreeSnapshot[] = [];
   const statuses: boolean[] = [];
   const sub = new TreeSubscription(socketPath, {
-    onSnapshot: (repos) => received.push(repos),
+    onSnapshot: (snapshot) => received.push(snapshot),
     onStatus: (c) => statuses.push(c),
   });
   t.after(() => {
@@ -85,8 +89,12 @@ test("subscribe: sends a subscribe line and delivers pushed snapshots", async (t
 
   assert.match(requestLine, /"op":"subscribe"/);
   assert.match(requestLine, /"service":"worktrees"/);
-  assert.equal(received[0][0].main_repo, "a");
-  assert.equal(received[1][0].main_repo, "b");
+  assert.equal(received[0].repos[0].main_repo, "a");
+  assert.equal(received[1].repos[0].main_repo, "b");
+  // The daemon-backed toggle rides each snapshot, so the reader can drive the
+  // show/hide-closed filter from the same frame (#1301).
+  assert.equal(received[0].show_closed, true);
+  assert.equal(received[1].show_closed, false);
   // The first successful snapshot announces the connection exactly once.
   assert.deepEqual(statuses, [true]);
 });
@@ -104,10 +112,10 @@ test("subscribe: reconnects after the daemon drops the connection", async (t: Te
   });
   await srv.listen(socketPath);
 
-  const received: TreeRepoPayload[][] = [];
+  const received: TreeSnapshot[] = [];
   const statuses: boolean[] = [];
   const sub = new TreeSubscription(socketPath, {
-    onSnapshot: (repos) => received.push(repos),
+    onSnapshot: (snapshot) => received.push(snapshot),
     onStatus: (c) => statuses.push(c),
     initialBackoffMs: 1,
     maxBackoffMs: 1,

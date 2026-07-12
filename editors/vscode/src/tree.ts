@@ -48,6 +48,14 @@ export interface TreeRepoPayload {
 /** The full `tree` op / subscription snapshot payload. */
 export interface TreeSnapshot {
   repos: TreeRepoPayload[];
+  /**
+   * The daemon-backed show/hide-closed toggle (#1301): whether the tree shows
+   * worktrees with no open window. A single cross-window value the daemon
+   * carries in every snapshot so all windows render — and live-sync — the same
+   * state. Optional for forward-compatibility: an older daemon that omits it is
+   * read as `true` (show all, the original behavior).
+   */
+  show_closed?: boolean;
 }
 
 /**
