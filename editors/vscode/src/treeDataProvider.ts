@@ -70,7 +70,9 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       );
       item.id = nodeId(node);
       item.iconPath = new vscode.ThemeIcon(node.repo.github ? "github" : "repo");
-      item.contextValue = "repo";
+      // `.github` gates the "Open Pull Request…" menu; the plain `repo` value is
+      // unchanged for non-GitHub repos.
+      item.contextValue = node.repo.github ? "repo.github" : "repo";
       item.tooltip = node.repo.root;
       return item;
     }
@@ -82,7 +84,7 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     item.id = nodeId(node);
     item.description = worktreeDescription(node.wt);
     item.tooltip = worktreeTooltip(node.wt, node.repo, this.windowKey);
-    item.contextValue = worktreeContextValue(node.wt, this.windowKey);
+    item.contextValue = worktreeContextValue(node.wt, this.windowKey, !!node.repo.github);
     // The open badge, three-way: a blue tick for the worktree open in *this*
     // window, a green dot for one open in another window, else the plain branch
     // glyph for a worktree with no live window.

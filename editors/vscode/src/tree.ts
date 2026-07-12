@@ -142,26 +142,38 @@ export function worktreeTooltip(
 
 /**
  * The `contextValue` used to gate context-menu items and mark the open badge.
- * Encodes two orthogonal facts as dotted segments:
+ * Encodes three orthogonal facts as dotted segments:
  *
  *  - **open state** — `worktree.current` (this window), `worktree.open`
  *    (another window), or bare `worktree` (no window);
- *  - **structural role** — a trailing `.main` (the repository's main working
- *    tree) or `.linked` (a linked worktree), which the daemon reports as
- *    `is_main` and which decides deletability (never the branch name).
+ *  - **structural role** — a `.main` (the repository's main working tree) or
+ *    `.linked` (a linked worktree), which the daemon reports as `is_main` and
+ *    which decides deletability (never the branch name);
+ *  - **GitHub identity** — a trailing `.github` when the parent repo has a
+ *    `github.com` origin (so the "Open Pull Request…" menu can gate on it),
+ *    appended only when `hasGithub` is set.
  *
  * So every value starts with `worktree` — the existing `viewItem =~ /worktree/`
- * "open" menu still matches all six variants — while the close menus gate on the
+ * "open" menu still matches all variants — while the close menus gate on the
  * role: **Close Window** on `/worktree\.(current|open)\.main/` (a main tree with
  * a window) and **Close Worktree** on `/worktree\..*linked/` (any linked
  * worktree). A main tree with no window matches neither, so nothing is offered.
+ * The trailing `.github` is appended last so those (unanchored) role regexes are
+ * unaffected, and `hasGithub` defaults to `false` so a non-GitHub repo's values
+ * stay byte-for-byte as before.
  */
-export function worktreeContextValue(wt: TreeWorktreePayload, windowKey?: string): string {
+export function worktreeContextValue(
+  wt: TreeWorktreePayload,
+  windowKey?: string,
+  hasGithub = false,
+): string {
   const role = wt.is_main ? "main" : "linked";
-  if (isCurrentWindow(wt, windowKey)) {
-    return `worktree.current.${role}`;
-  }
-  return wt.open ? `worktree.open.${role}` : `worktree.${role}`;
+  const base = isCurrentWindow(wt, windowKey)
+    ? `worktree.current.${role}`
+    : wt.open
+      ? `worktree.open.${role}`
+      : `worktree.${role}`;
+  return hasGithub ? `${base}.github` : base;
 }
 
 /**
