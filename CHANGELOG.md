@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-13
+
+### Added
+- **Worktrees daemon backs the show/hide-closed toggle so it syncs across windows** ([#1301](https://github.com/rust-works/omni-dev/issues/1301)): the VS Code companion's show/hide-closed toggle lived in per-window `context.globalState` — read once at activation with no cross-window change event — so a flip in one window never re-rendered another, and a newly-opened window could race the persisted value and fall back to the default. The toggle's source of truth moves into the daemon's `WorktreesRegistry` (a lock-free `AtomicBool`, default `show_closed = true`), so the existing push `subscribe` stream carries it to every window for reliable new-window initialization and live cross-window sync. A new `set-show-closed` op flips it (bumping the change-notify so subscribers re-push), and both the one-shot `tree` op and the `subscribe` stream now share one `tree_snapshot` helper returning `{ repos, show_closed }`, so a manual fetch and the live stream agree byte-for-byte. Like the rest of the registry it is in-memory: a daemon restart resets it to the default, which the next snapshot propagates to every window. Wire-compatible — the toggle rides the existing snapshot frame. See [docs/worktrees-service.md](docs/worktrees-service.md).
+
 ### Fixed
 - **Worktrees daemon: coalesce the per-window tree computation into one shared build** ([#1303](https://github.com/rust-works/omni-dev/issues/1303)): every open VS Code window holds a persistent `subscribe` stream, and the daemon re-sampled each one independently on its ~3 s tick and on every registry change — so with N windows the *identical* global worktree tree (a full `git2` enumeration: discover + HEAD + ahead/behind revwalk over every repo and worktree) was rebuilt N times per tick. With ~20 windows this burned ~1.6 cores sustained. The worktrees service now builds the snapshot through a shared, single-flight cache: it computes **once per tick (or change) and fans the byte-identical result out to every subscriber**, so daemon CPU scales with the worktree count rather than `windows × worktrees`. Freshness is unchanged — a `register`/`unregister`/`show_closed` flip bumps a change-generation that forces an immediate rebuild, and a short TTL (the stream tick) still surfaces on-disk branch/commit changes within one tick. The one-shot `tree` op (a manual refresh) deliberately bypasses the cache and computes fresh. See [docs/worktrees-service.md](docs/worktrees-service.md).
+
+### CI/CD
+- **Exclude VS Code extension tags from the crate release CI to fix a tag-push race** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): the bare `v*` tag filter in `ci.yml` matched both crate release tags (`v1.0.0`) and extension tags (`vscode-v1.0.0`), so the crate's full CI suite ran on extension releases and its Coverage job 404'd fetching the not-yet-uploaded binary from the in-flight crate release. Adds a `!vscode-*` exclusion to the tag filter (mirroring the `release.yml` fix in [#1288](https://github.com/rust-works/omni-dev/issues/1288)) and skips the Coverage job on tag pushes, since validation already occurred on `main` (Coverage is only meaningful for PRs and `main` pushes).
 
 ## [0.34.0] - 2026-07-11
 
@@ -1244,7 +1252,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/rust-works/omni-dev/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/rust-works/omni-dev/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/rust-works/omni-dev/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/rust-works/omni-dev/compare/v0.31.0...v0.32.0
