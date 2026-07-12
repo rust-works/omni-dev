@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Worktrees daemon: coalesce the per-window tree computation into one shared build** ([#1303](https://github.com/rust-works/omni-dev/issues/1303)): every open VS Code window holds a persistent `subscribe` stream, and the daemon re-sampled each one independently on its ~3 s tick and on every registry change — so with N windows the *identical* global worktree tree (a full `git2` enumeration: discover + HEAD + ahead/behind revwalk over every repo and worktree) was rebuilt N times per tick. With ~20 windows this burned ~1.6 cores sustained. The worktrees service now builds the snapshot through a shared, single-flight cache: it computes **once per tick (or change) and fans the byte-identical result out to every subscriber**, so daemon CPU scales with the worktree count rather than `windows × worktrees`. Freshness is unchanged — a `register`/`unregister`/`show_closed` flip bumps a change-generation that forces an immediate rebuild, and a short TTL (the stream tick) still surfaces on-disk branch/commit changes within one tick. The one-shot `tree` op (a manual refresh) deliberately bypasses the cache and computes fresh. See [docs/worktrees-service.md](docs/worktrees-service.md).
+
 ## [0.34.0] - 2026-07-11
 
 ### Added
