@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -117,6 +118,17 @@ pub struct WorktreesRegistry {
     /// aborts and the user retries — an accepted failure mode). Behind its own
     /// `Mutex`, taken independently of the window map's, so neither nests.
     close_pending: Mutex<HashSet<String>>,
+    /// The daemon-backed **show/hide-closed** toggle (#1301): whether the
+    /// companion's tree view shows worktrees with no open window. A single
+    /// cross-window value carried in every `tree`/`subscribe` snapshot so all
+    /// windows read (and live-sync) the same state — `context.globalState` could
+    /// not, being read-once with no cross-window change event. Defaults to `true`
+    /// (show all, the original behavior). A lock-free [`AtomicBool`] rather than a
+    /// `Mutex`, so it is never a `.await`-holding-a-lock hazard; a flip
+    /// [`bump`](Self::bump)s the change-notify so subscribers re-push. In-memory
+    /// like the window map: a daemon restart resets it to the default, which the
+    /// next snapshot propagates to every window.
+    show_closed: AtomicBool,
 }
 
 impl WorktreesRegistry {
@@ -128,6 +140,7 @@ impl WorktreesRegistry {
             ttl: DEFAULT_TTL,
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
+            show_closed: AtomicBool::new(true),
         }
     }
 
@@ -257,6 +270,27 @@ impl WorktreesRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)
+    }
+
+    /// The current show/hide-closed toggle: whether the tree view shows
+    /// worktrees with no open window (#1301). Read into every `tree`/`subscribe`
+    /// snapshot so every window renders the same, live-synced state.
+    #[must_use]
+    pub fn show_closed(&self) -> bool {
+        self.show_closed.load(Ordering::Relaxed)
+    }
+
+    /// Sets the show/hide-closed toggle, returning whether the value actually
+    /// changed. A real change [`bump`](Self::bump)s the change-notify so every
+    /// subscriber re-pushes a snapshot carrying the new value — the reliable
+    /// cross-window sync `context.globalState` could not provide. A no-op set
+    /// (same value) neither bumps nor wakes anyone.
+    pub fn set_show_closed(&self, show_closed: bool) -> bool {
+        let changed = self.show_closed.swap(show_closed, Ordering::Relaxed) != show_closed;
+        if changed {
+            self.bump();
+        }
+        changed
     }
 
     /// Reaps stale entries, then returns the live set sorted for deterministic
@@ -719,5 +753,44 @@ mod tests {
         // Unregistering the window drops any pending directive with it.
         assert!(reg.unregister("w1"));
         assert!(!reg.take_close_pending("w1"));
+    }
+
+    // --- Show/hide-closed toggle (#1301) -----------------------------------
+
+    #[test]
+    fn show_closed_defaults_to_true() {
+        let reg = WorktreesRegistry::new();
+        assert!(reg.show_closed(), "default is show all");
+    }
+
+    #[test]
+    fn set_show_closed_reports_change_and_is_idempotent() {
+        let reg = WorktreesRegistry::new();
+        // Flipping to a new value reports a change and is observable.
+        assert!(reg.set_show_closed(false));
+        assert!(!reg.show_closed());
+        // Setting the same value again is a no-op (no change reported).
+        assert!(!reg.set_show_closed(false));
+        // Flipping back reports a change again.
+        assert!(reg.set_show_closed(true));
+        assert!(reg.show_closed());
+    }
+
+    #[test]
+    fn set_show_closed_bumps_only_on_change() {
+        let reg = WorktreesRegistry::new();
+        let rx = reg.subscribe_changes();
+        // A no-op set (already the default) does not wake subscribers.
+        assert!(!reg.set_show_closed(true));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a no-op toggle must not bump the change-notify"
+        );
+        // A real flip bumps so subscribers re-push a snapshot with the new value.
+        assert!(reg.set_show_closed(false));
+        assert!(
+            rx.has_changed().unwrap(),
+            "flipping the toggle should bump the change-notify"
+        );
     }
 }
