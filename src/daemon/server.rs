@@ -30,7 +30,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// a change notification, so purely on-disk state changes (a branch switch, new
 /// commits) — which fire **no** registry event — are still reflected within the
 /// interval. Kept in the issue's 2–5 s band (#1267).
-const STREAM_TICK: Duration = Duration::from_secs(3);
+///
+/// The worktrees service sizes its coalescing snapshot cache to this same tick
+/// (#1303), so the shared `build_tree` runs at most once per tick regardless of
+/// how many windows are subscribed; keep the two in step if this is retuned.
+pub(crate) const STREAM_TICK: Duration = Duration::from_secs(3);
 
 /// Configuration for a [`run`] invocation.
 #[derive(Debug, Clone)]

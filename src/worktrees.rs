@@ -167,6 +167,17 @@ impl WorktreesRegistry {
         self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
+    /// The current change-notify generation — the counter [`bump`](Self::bump)
+    /// increments on every visible-set change. Read (never subscribed) so a
+    /// coalescing consumer — the service's shared tree-snapshot cache (#1303) —
+    /// can tell whether the registry has changed since it last computed and
+    /// rebuild only then. The value itself is immaterial; only whether it
+    /// differs between two reads matters, so `wrapping_add` overflow is benign.
+    #[must_use]
+    pub fn change_generation(&self) -> u64 {
+        *self.changes.borrow()
+    }
+
     /// Locks the registry, recovering from a poisoned mutex (a panic in a prior
     /// critical section must not wedge the whole registry).
     fn lock(&self) -> MutexGuard<'_, HashMap<String, WindowEntry>> {
@@ -706,6 +717,27 @@ mod tests {
         assert!(
             rx.has_changed().unwrap(),
             "a removing unregister should bump"
+        );
+    }
+
+    #[test]
+    fn change_generation_advances_only_on_a_visible_change() {
+        let reg = WorktreesRegistry::new();
+        let g0 = reg.change_generation();
+        // A no-op (heartbeat of an unknown key) leaves the generation untouched.
+        assert!(!reg.heartbeat("ghost"));
+        assert_eq!(
+            reg.change_generation(),
+            g0,
+            "a no-op must not advance the generation"
+        );
+        // A register changes the visible set → the generation advances, so a
+        // cache keyed on it rebuilds.
+        reg.register(register_request("w1", None, "/tmp/a"));
+        assert_ne!(
+            reg.change_generation(),
+            g0,
+            "a register should advance the generation"
         );
     }
 
