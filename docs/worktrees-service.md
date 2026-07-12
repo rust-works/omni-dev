@@ -37,10 +37,12 @@ the view correct over time. See [ADR-0040](adrs/adr-0040.md).
   the TTL reaping and entry cap/eviction, and the
   register/heartbeat/unregister/list/first-folder operations. It also snapshots
   the distinct open **folders** (`open_folders`, the seed the `tree` op resolves
-  to repos) and carries a `tokio::sync::watch` **change-notify** counter
-  (`subscribe_changes`) bumped whenever the visible set changes, which drives the
-  push subscription. A standalone `crate::worktrees` module, matching the browser
-  bridge (`src/browser/`) and Snowflake (`src/snowflake/`) engine/adapter split.
+  to repos), holds the cross-window **`show_closed`** toggle (a lock-free
+  `AtomicBool`, #1301), and carries a `tokio::sync::watch` **change-notify**
+  counter (`subscribe_changes`) bumped whenever the visible set — or the toggle —
+  changes, which drives the push subscription. A standalone `crate::worktrees`
+  module, matching the browser bridge (`src/browser/`) and Snowflake
+  (`src/snowflake/`) engine/adapter split.
 - `src/daemon/services/worktrees.rs` — `WorktreesService`, a thin `DaemonService`
   adapter over that engine: it routes control-socket ops to the registry, renders
   the tray menu/status, drives the VS Code launcher, computes the git enrichment,
@@ -210,11 +212,16 @@ every window (no per-window curation). It renders the `tree` payload:
 - **Hide worktrees without a window.** A second title-bar action toggles the view
   between showing **all** worktrees (the default — an *eye* icon that hides) and
   showing only those a VS Code window currently has open (an *eye-closed* icon that
-  reveals). The filter is entirely client-side — the `tree` / `subscribe` payload is
-  unchanged — and its state lives in the extension's `globalState`, so it reads the
-  same in every window and survives a reload; a fresh snapshot keeps it applied.
-  Because repos are derived from open windows (each has ≥1 open worktree), hiding
-  only trims closed children and never empties a repo or the tree.
+  reveals). The filter is entirely client-side — the `repos` payload is unchanged —
+  but its **state is daemon-backed** (#1301): the toggle command sends
+  `set-show-closed`, the daemon holds the single cross-window value and carries it
+  as `show_closed` on every `tree`/`subscribe` snapshot, and each window drives its
+  button and filter from that snapshot. So a flip in one window **live-syncs to all
+  the others** and a newly-opened window initializes correctly on its first frame —
+  neither of which the earlier per-window `globalState` (read-once, no cross-window
+  change event) could do. Because the value is in-memory, a daemon restart resets
+  it to *show all*. Because repos are derived from open windows (each has ≥1 open
+  worktree), hiding only trims closed children and never empties a repo or the tree.
 - **Daemon-down degrades gracefully.** When the daemon is not running, the view
   shows a hint ("start it with `omni-dev daemon start`") rather than an error dialog,
   and the subscription reconnects with exponential backoff (500 ms → 10 s) once the
@@ -328,23 +335,24 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op           | payload                                        | success payload                            |
-|--------------|------------------------------------------------|--------------------------------------------|
-| `register`   | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
-| `heartbeat`  | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
-| `unregister` | `{ key }`                                      | `{ removed: <bool> }`                      |
-| `list`       | `null`                                         | `{ windows: [entry, …] }`                  |
-| `tree`       | `null`                                         | `{ repos: [repo, …] }`                     |
-| `open`       | `{ path }`                                     | `{ ok: true }`                             |
-| `close`      | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
-| `subscribe`  | `null`                                         | *(stream — see below)*                     |
+| op                | payload                                        | success payload                            |
+|-------------------|------------------------------------------------|--------------------------------------------|
+| `register`        | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
+| `heartbeat`       | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
+| `unregister`      | `{ key }`                                      | `{ removed: <bool> }`                      |
+| `list`            | `null`                                         | `{ windows: [entry, …] }`                  |
+| `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
+| `open`            | `{ path }`                                     | `{ ok: true }`                             |
+| `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
+| `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
+| `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first seven ops are strictly **request → one reply**. `subscribe` is the one
+The first eight ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
-sequence of `{ ok: true, payload: { repos: … } }` lines on the same connection —
-an initial snapshot, then a fresh one each time the view changes — not a single
-reply. It uses no new wire type, so a client that only ever sends the other ops is
-wire-identical to the ADR-0040 contract.
+sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
+connection — an initial snapshot, then a fresh one each time the view changes —
+not a single reply. It uses no new wire type, so a client that only ever sends the
+other ops is wire-identical to the ADR-0040 contract.
 
 Where:
 
@@ -409,6 +417,19 @@ Where:
 - `subscribe` streams the `tree` payload live; see
   [Push subscription](#push-subscription) for the framing, coalescing, and
   teardown semantics.
+- `show_closed` — the daemon-backed **show/hide-closed toggle** (#1301): a single
+  cross-window boolean carried in every `tree`/`subscribe` snapshot, `true` = show
+  worktrees with no open window (the default). `set-show-closed` (payload
+  `{ show_closed }`) sets it; a real change re-pushes a snapshot to **every**
+  subscriber, so all windows re-render together and a newly-opened window
+  initializes from its first snapshot. It lives in the daemon precisely because
+  the per-window `context.globalState` it replaced was read-once with no
+  cross-window change event and raced a new window's first read. In-memory like
+  the rest of the registry, so a **daemon restart resets it to the default**
+  (`true`); the next snapshot propagates that reset to every window. The tree-view
+  filter itself is client-side — `show_closed` only tells each window which way to
+  filter, so the `repos` payload is unchanged (a repo, derived from open windows,
+  always keeps ≥1 open worktree, so hiding never empties it).
 - A `list` `entry` is
   `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
   is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
@@ -447,7 +468,7 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","ahead":2,"behind":0,"is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","ahead":1,"behind":3,"is_main":false,"open":false}]}]}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","ahead":2,"behind":0,"is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","ahead":1,"behind":3,"is_main":false,"open":false}]}],"show_closed":true}}
 ```
 
 The companion sends no `branch`/`ahead`/`behind` on `register`; the daemon adds
@@ -457,10 +478,11 @@ them to `list`/`status`/`tree` replies.
 
 A client that sends `{ "service": "worktrees", "op": "subscribe" }` switches that
 connection to **push mode**: the daemon replies with an initial `tree` snapshot,
-then pushes a fresh `{ ok: true, payload: { repos: … } }` line each time the view
-changes — a window registers or unregisters, an entry ages out, or (via a periodic
-~3 s re-sample) an on-disk branch/commit change that fires no registry event. The
-semantics a client can rely on:
+then pushes a fresh `{ ok: true, payload: { repos: …, show_closed } }` line each
+time the view changes — a window registers or unregisters, an entry ages out, the
+[`show_closed` toggle](#companion-contract-for-the-extension-and-other-clients)
+flips, or (via a periodic ~3 s re-sample) an on-disk branch/commit change that
+fires no registry event. The semantics a client can rely on:
 
 - **No new wire type.** Every pushed line is an ordinary `DaemonReply::ok(payload)`.
   A reader tells a subscription apart from a one-shot op only by continuing to read
