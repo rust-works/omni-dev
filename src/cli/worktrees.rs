@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
@@ -99,12 +99,102 @@ impl TreeCommand {
     /// Executes the tree command.
     pub async fn execute(self) -> Result<()> {
         let socket = server::resolve_socket(self.socket)?;
-        let result = call(&socket, "tree", Value::Null).await?;
+        let mut result = call(&socket, "tree", Value::Null).await?;
+        // Ahead/behind is no longer part of the (cheap) streamed `tree` snapshot
+        // (#1306); fetch it on demand for the worktrees we are about to render and
+        // fold it back in, so `worktrees tree` shows the same `+ahead -behind` sync
+        // state as before. Best-effort: an older daemon without the `ahead-behind`
+        // op just renders `-`.
+        enrich_ahead_behind(&socket, &mut result).await;
         match self.output {
             TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
             TableOrJson::Table => println!("{}", render_tree(&result)),
         }
         Ok(())
+    }
+}
+
+/// Fetches ahead/behind on demand for every worktree in a `tree` reply and folds
+/// the counts back into each worktree object, so `worktrees tree` renders the same
+/// `+ahead -behind` sync state the cheap snapshot no longer carries (#1306). A
+/// best-effort enrichment: if there are no worktrees, the daemon lacks the
+/// `ahead-behind` op (older daemon), or the call fails, `result` is left as-is and
+/// the tree still renders — just with `-` for sync.
+async fn enrich_ahead_behind(socket: &Path, result: &mut Value) {
+    let paths = worktree_paths(result);
+    if paths.is_empty() {
+        return;
+    }
+    let Ok(reply) = call(socket, "ahead-behind", json!({ "paths": paths })).await else {
+        return;
+    };
+    if let Some(results) = reply.get("results").and_then(Value::as_object) {
+        merge_ahead_behind(result, results);
+    }
+}
+
+/// Every worktree path in a `tree` reply, in render order — the batch the
+/// on-demand `ahead-behind` op is asked about.
+fn worktree_paths(result: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for repo in result
+        .get("repos")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        for worktree in repo
+            .get("worktrees")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            if let Some(path) = worktree.get("path").and_then(Value::as_str) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// Folds `{ ahead, behind }` counts (keyed by worktree path) from an `ahead-behind`
+/// reply back into a `tree` reply's worktree objects. A worktree whose path is
+/// absent from `results` (no upstream) is left untouched. Pure, so the merge is
+/// unit-testable without a socket.
+fn merge_ahead_behind(result: &mut Value, results: &serde_json::Map<String, Value>) {
+    for repo in result
+        .get_mut("repos")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        for worktree in repo
+            .get_mut("worktrees")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            // Take the worktree object up front so the insert reuses this handle
+            // rather than a second, always-succeeding `as_object_mut` (a non-object
+            // element in the array is skipped here).
+            let Some(obj) = worktree.as_object_mut() else {
+                continue;
+            };
+            let Some(path) = obj.get("path").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let Some(counts) = results.get(&path) else {
+                continue;
+            };
+            // Fold both counts in together, or neither — a malformed entry missing
+            // a side is left as no-sync rather than half-applied.
+            if let (Some(ahead), Some(behind)) =
+                (counts.get("ahead").cloned(), counts.get("behind").cloned())
+            {
+                obj.insert("ahead".to_string(), ahead);
+                obj.insert("behind".to_string(), behind);
+            }
+        }
     }
 }
 
@@ -478,6 +568,145 @@ mod tests {
             "No repositories open."
         );
         assert_eq!(render_tree(&json!({})), "No repositories open.");
+    }
+
+    #[test]
+    fn worktree_paths_collects_every_worktree_in_render_order() {
+        let result = json!({ "repos": [
+            // The middle worktree has no `path` and is skipped, not collected.
+            { "worktrees": [ { "path": "/a" }, { "branch": "detached" }, { "path": "/b" } ] },
+            { "worktrees": [ { "path": "/c" } ] },
+        ]});
+        assert_eq!(worktree_paths(&result), vec!["/a", "/b", "/c"]);
+        // No repos / no worktrees → an empty batch (nothing to fetch).
+        assert!(worktree_paths(&json!({})).is_empty());
+        assert!(worktree_paths(&json!({ "repos": [{ "worktrees": [] }] })).is_empty());
+    }
+
+    #[test]
+    fn merge_ahead_behind_folds_counts_by_path_and_leaves_others() {
+        // The on-demand `ahead-behind` op reports one worktree diverging and omits
+        // the other (no upstream). The merge folds the counts onto the matching
+        // path and leaves the untracked worktree without sync fields.
+        let mut result = json!({ "repos": [{ "worktrees": [
+            { "path": "/a", "branch": "main" },
+            { "path": "/b", "branch": "feature" },
+        ]}]});
+        let results = json!({ "/a": { "ahead": 2, "behind": 1 } });
+        merge_ahead_behind(&mut result, results.as_object().unwrap());
+
+        let worktrees = result.pointer("/repos/0/worktrees").unwrap();
+        let a = &worktrees[0];
+        assert_eq!(a.get("ahead").and_then(Value::as_u64), Some(2));
+        assert_eq!(a.get("behind").and_then(Value::as_u64), Some(1));
+        // And it renders exactly as an eager snapshot would have.
+        assert_eq!(sync_summary(a), "+2 -1");
+        let b = &worktrees[1];
+        assert!(b.get("ahead").is_none(), "{b:?}");
+        assert!(b.get("behind").is_none(), "{b:?}");
+        assert_eq!(sync_summary(b), "-");
+    }
+
+    #[test]
+    fn merge_ahead_behind_skips_malformed_worktrees_and_counts() {
+        // Every defensive guard, on malformed input that never comes from a real
+        // daemon: a non-object array element, a worktree with no `path`, and a
+        // results entry missing a side. None panics; none is half-applied.
+        let mut result = json!({ "repos": [{ "worktrees": [
+            "not-an-object",                       // non-object element → skipped
+            { "branch": "detached" },              // object, but no path → skipped
+            { "path": "/a", "branch": "main" },    // matched, but counts malformed
+        ]}]});
+        let results = json!({ "/a": { "ahead": 2 } }); // missing `behind`
+        merge_ahead_behind(&mut result, results.as_object().unwrap());
+
+        let worktrees = result.pointer("/repos/0/worktrees").unwrap();
+        // Non-object element is untouched.
+        assert_eq!(worktrees[0], json!("not-an-object"));
+        // Pathless worktree: no sync fields inserted.
+        assert!(worktrees[1].get("ahead").is_none(), "{:?}", worktrees[1]);
+        // Malformed counts: neither side folded in (both-or-nothing).
+        assert!(worktrees[2].get("ahead").is_none(), "{:?}", worktrees[2]);
+        assert!(worktrees[2].get("behind").is_none(), "{:?}", worktrees[2]);
+    }
+
+    #[tokio::test]
+    async fn enrich_ahead_behind_is_a_noop_when_there_are_no_worktrees() {
+        // No worktrees → no batch to fetch → early return before any socket call,
+        // so even a nonexistent socket leaves the tree untouched.
+        let mut result = json!({ "repos": [] });
+        let before = result.clone();
+        enrich_ahead_behind(Path::new("/nonexistent/omni-dev-ab.sock"), &mut result).await;
+        assert_eq!(result, before);
+    }
+
+    #[tokio::test]
+    async fn enrich_ahead_behind_leaves_the_tree_when_the_daemon_is_unreachable() {
+        // A real worktree but no daemon at the socket → the call fails and the tree
+        // is returned as-is (rendered with `-` for sync), never erroring.
+        let mut result =
+            json!({ "repos": [{ "worktrees": [{ "path": "/x", "branch": "main" }] }] });
+        enrich_ahead_behind(Path::new("/nonexistent/omni-dev-ab.sock"), &mut result).await;
+        let wt = result.pointer("/repos/0/worktrees/0").unwrap();
+        assert!(wt.get("ahead").is_none(), "{wt:?}");
+        assert!(wt.get("behind").is_none(), "{wt:?}");
+    }
+
+    /// Spawns a minimal fake daemon on a short-path Unix socket that answers the
+    /// one `ahead-behind` request with `reply` (the daemon's NDJSON reply shape).
+    /// Returns the temp dir (kept alive for the socket's lifetime), the socket
+    /// path, and the server task.
+    fn fake_daemon_reply(
+        reply: Value,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        // A short base path keeps the socket under the 104-byte `sockaddr_un` limit.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let _req = framed.next().await.unwrap().unwrap();
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+        });
+        (dir, sock, server)
+    }
+
+    #[tokio::test]
+    async fn enrich_ahead_behind_folds_counts_from_a_live_socket() {
+        let (_dir, sock, server) = fake_daemon_reply(
+            json!({ "ok": true, "payload": { "results": { "/x": { "ahead": 3, "behind": 4 } } } }),
+        );
+        let mut result =
+            json!({ "repos": [{ "worktrees": [{ "path": "/x", "branch": "main" }] }] });
+        enrich_ahead_behind(&sock, &mut result).await;
+        server.await.unwrap();
+
+        let wt = result.pointer("/repos/0/worktrees/0").unwrap();
+        assert_eq!(wt.get("ahead").and_then(Value::as_u64), Some(3));
+        assert_eq!(wt.get("behind").and_then(Value::as_u64), Some(4));
+    }
+
+    #[tokio::test]
+    async fn enrich_ahead_behind_ignores_a_reply_without_results() {
+        // An `ok` reply carrying no `results` object (an older/oddly-shaped daemon)
+        // leaves the tree unchanged rather than erroring.
+        let (_dir, sock, server) = fake_daemon_reply(json!({ "ok": true, "payload": {} }));
+        let mut result =
+            json!({ "repos": [{ "worktrees": [{ "path": "/x", "branch": "main" }] }] });
+        enrich_ahead_behind(&sock, &mut result).await;
+        server.await.unwrap();
+
+        let wt = result.pointer("/repos/0/worktrees/0").unwrap();
+        assert!(wt.get("ahead").is_none(), "{wt:?}");
+        assert!(wt.get("behind").is_none(), "{wt:?}");
     }
 
     #[test]

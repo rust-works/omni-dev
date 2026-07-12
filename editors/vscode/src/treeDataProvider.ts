@@ -6,18 +6,28 @@
 import * as vscode from "vscode";
 
 import {
+  AheadBehindMap,
   Node,
   TreeRepoPayload,
   isCurrentWindow,
   nodeId,
   repoLabel,
   reposToNodes,
+  withAheadBehind,
   worktreeContextValue,
   worktreeDescription,
   worktreeLabel,
   worktreeNodes,
   worktreeTooltip,
 } from "./tree";
+
+/**
+ * Fetches ahead/behind divergence for a batch of worktree paths on demand — the
+ * `ahead-behind` op (#1306). Injected so the provider stays `vscode`-testable and
+ * decoupled from the socket. Resolves to an empty map when the daemon is
+ * unreachable or has no such op, in which case the tree renders without sync.
+ */
+export type AheadBehindFetcher = (paths: string[]) => Promise<AheadBehindMap>;
 
 /**
  * The command every worktree item fires on a (single) click. The TreeView API
@@ -37,8 +47,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   /**
    * @param windowKey this window's own registry key, so the leaf whose
    * `window_key` matches can be marked distinctly from worktrees open elsewhere.
+   * @param fetchAheadBehind fetches per-worktree divergence on demand (#1306); when
+   * omitted (tests, or the daemon lacking the op) the tree renders without sync.
    */
-  constructor(private readonly windowKey?: string) {}
+  constructor(
+    private readonly windowKey?: string,
+    private readonly fetchAheadBehind?: AheadBehindFetcher,
+  ) {}
 
   /** Replaces the snapshot and refreshes the whole tree. */
   update(repos: TreeRepoPayload[]): void {
@@ -55,11 +70,30 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     this.emitter.fire(undefined);
   }
 
-  getChildren(element?: Node): Node[] {
+  async getChildren(element?: Node): Promise<Node[]> {
     if (!element) {
       return reposToNodes(this.repos);
     }
-    return element.kind === "repo" ? worktreeNodes(element.repo, this.showClosed) : [];
+    if (element.kind !== "repo") {
+      return [];
+    }
+    const nodes = worktreeNodes(element.repo, this.showClosed);
+    // Lazily fetch ahead/behind for just this repo's worktrees, on expand — the
+    // streamed snapshot no longer carries it (#1306). One batched op per expand;
+    // a re-render (a new snapshot) re-runs this and re-fetches, keeping it fresh.
+    if (!this.fetchAheadBehind || nodes.length === 0) {
+      return nodes;
+    }
+    const paths = nodes.map((n) => (n.kind === "worktree" ? n.wt.path : ""));
+    let ab: AheadBehindMap;
+    try {
+      ab = await this.fetchAheadBehind(paths);
+    } catch {
+      return nodes; // Daemon unreachable / no op → render without sync.
+    }
+    return nodes.map((n) =>
+      n.kind === "worktree" ? { ...n, wt: withAheadBehind(n.wt, ab[n.wt.path]) } : n,
+    );
   }
 
   getTreeItem(node: Node): vscode.TreeItem {

@@ -21,9 +21,14 @@ export interface TreeWorktreePayload {
   path: string;
   /** The checked-out branch, or absent when detached/unborn. */
   branch?: string;
-  /** Commits ahead of upstream (absent without an upstream). */
+  /**
+   * Commits ahead of upstream. **Not** carried by the streamed `tree`/`subscribe`
+   * snapshot — it is fetched lazily via the `ahead-behind` op on expand and folded
+   * in by {@link withAheadBehind} (#1306). Absent without an upstream, or until
+   * fetched.
+   */
   ahead?: number;
-  /** Commits behind upstream (absent without an upstream). */
+  /** Commits behind upstream. Lazily fetched like {@link TreeWorktreePayload.ahead}. */
   behind?: number;
   /** Whether this is the repo's main working tree (vs a linked worktree). */
   is_main: boolean;
@@ -31,6 +36,34 @@ export interface TreeWorktreePayload {
   open: boolean;
   /** The open window's registry key, present only when `open`. */
   window_key?: string;
+}
+
+/**
+ * Ahead/behind divergence of one worktree, as returned by the `ahead-behind` op
+ * (#1306). Both counts are absent when the branch tracks no upstream.
+ */
+export interface AheadBehind {
+  ahead?: number;
+  behind?: number;
+}
+
+/** The `ahead-behind` op's `results`: divergence keyed by worktree path. */
+export type AheadBehindMap = Record<string, AheadBehind>;
+
+/**
+ * Folds a lazily-fetched {@link AheadBehind} into a worktree payload, returning a
+ * new payload with the counts applied (#1306). An absent entry — no upstream, or
+ * not yet fetched — leaves the worktree unchanged, so it renders with no sync
+ * indicator, exactly as an eager snapshot did for a branch with no upstream.
+ */
+export function withAheadBehind(
+  wt: TreeWorktreePayload,
+  ab?: AheadBehind,
+): TreeWorktreePayload {
+  if (ab === undefined || (ab.ahead === undefined && ab.behind === undefined)) {
+    return wt;
+  }
+  return { ...wt, ahead: ab.ahead, behind: ab.behind };
 }
 
 /** One repository with **all** its worktrees, as it appears in the `tree` payload. */
