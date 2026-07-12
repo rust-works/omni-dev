@@ -20,9 +20,9 @@
 //! (an explicit cancel), disconnects, or the daemon shuts down.
 //!
 //! The only subscription today is `worktrees` / `subscribe`, whose payload is
-//! the `{ "repos": [...] }` tree snapshot. Back-compat is total: an older client
-//! never sends a subscription op, so it only ever sees the classic one-reply
-//! exchange.
+//! the `{ "repos": [...], "show_closed": <bool> }` tree snapshot. Back-compat is
+//! total: an older client never sends a subscription op, so it only ever sees the
+//! classic one-reply exchange.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -654,10 +654,11 @@ mod tests {
         write_half.write_all(env.as_bytes()).await.unwrap();
         write_half.write_all(b"\n").await.unwrap();
 
-        // The subscription pushes an initial snapshot (no windows → empty repos).
+        // The subscription pushes an initial snapshot (no windows → empty repos),
+        // with the show/hide-closed toggle at its default (show all).
         let initial = read_reply(&mut reader).await;
         assert!(initial.ok);
-        assert_eq!(initial.payload, json!({ "repos": [] }));
+        assert_eq!(initial.payload, json!({ "repos": [], "show_closed": true }));
 
         // Shutdown ends the stream and the handler task.
         shutdown.cancel();
