@@ -291,6 +291,25 @@ impl DaemonService for WorktreesService {
                 // (#1303).
                 Ok(tree_snapshot(&self.registry).await)
             }
+            "ahead-behind" => {
+                // Lazy per-worktree divergence (#1306). The `tree`/`subscribe`
+                // snapshot no longer carries ahead/behind — the dominant
+                // per-worktree cost when computed eagerly every tick — so a client
+                // (the extension on expand, `worktrees tree`) asks for it here only
+                // for the worktrees it is about to show. Batched by path, one op per
+                // repo expand; the git walks run on a blocking thread.
+                let paths = payload
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(json!({ "results": ahead_behind_results(paths).await }))
+            }
             "set-show-closed" => {
                 // The daemon-backed show/hide-closed toggle (#1301). Setting it
                 // bumps the change-notify, so every subscribed window re-pushes a
@@ -457,11 +476,32 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Computes the [`GitStatus`] of `folder` by discovering the repository that
-/// contains it — so a subdirectory or a linked worktree both resolve — and
-/// reading HEAD. Every failure mode degrades to an empty status rather than
-/// erroring: the enrichment is best-effort and must never sink a `list`.
+/// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
+/// the ahead/behind divergence from upstream. Used by the one-shot `list`/`status`
+/// op and the tray menu, both bounded to the (few) open windows, where the extra
+/// `graph_ahead_behind` walk is negligible. The streamed `tree` snapshot uses the
+/// cheaper [`git_status_cheap`] instead and fetches divergence on demand (#1306).
 fn git_status(folder: &Path) -> GitStatus {
+    git_status_impl(folder, true)
+}
+
+/// Computes the **cheap** [`GitStatus`] of `folder` — branch and repo identity
+/// only, skipping the (expensive) `graph_ahead_behind` upstream revwalk. Used by
+/// the `tree`/`subscribe` snapshot, which is rebuilt for **every** worktree on
+/// **every** tick: divergence there is computed lazily via the `ahead-behind` op
+/// only for the worktrees a client actually looks at (#1306). The `ahead`/`behind`
+/// fields stay `None`, so they are omitted on the wire exactly as for a branch
+/// with no upstream.
+fn git_status_cheap(folder: &Path) -> GitStatus {
+    git_status_impl(folder, false)
+}
+
+/// The shared body of [`git_status`] / [`git_status_cheap`]: discovers the
+/// repository that contains `folder` — so a subdirectory or a linked worktree both
+/// resolve — reads HEAD, and (only when `with_ahead_behind`) walks the upstream
+/// divergence. Every failure mode degrades to an empty status rather than
+/// erroring: the enrichment is best-effort and must never sink a `list` or a tree.
+fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     let Ok(repo) = Repository::discover(folder) else {
         return GitStatus::default();
     };
@@ -487,10 +527,16 @@ fn git_status(folder: &Path) -> GitStatus {
     else {
         return base;
     };
-    let branch = git2::Branch::wrap(head);
-    let (ahead, behind) = match upstream_ahead_behind(&repo, &branch) {
-        Some((ahead, behind)) => (Some(ahead), Some(behind)),
-        None => (None, None),
+    // The divergence walk is the dominant per-worktree cost, so the cheap path
+    // skips it and leaves ahead/behind absent.
+    let (ahead, behind) = if with_ahead_behind {
+        let branch = git2::Branch::wrap(head);
+        match upstream_ahead_behind(&repo, &branch) {
+            Some((ahead, behind)) => (Some(ahead), Some(behind)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
     };
     GitStatus {
         branch: Some(name),
@@ -498,6 +544,22 @@ fn git_status(folder: &Path) -> GitStatus {
         behind,
         ..base
     }
+}
+
+/// The ahead/behind divergence of `folder`'s checked-out branch versus its
+/// upstream, computed on demand for the lazy `ahead-behind` op (#1306). Mirrors the
+/// branch resolution in [`git_status_impl`] but does **only** the upstream walk
+/// [`git_status_cheap`] omits. `None` when `folder` is not a repo, is on a detached
+/// or unborn HEAD, or tracks no upstream — every case the tree renders without a
+/// sync indicator.
+fn folder_ahead_behind(folder: &Path) -> Option<(usize, usize)> {
+    let repo = Repository::discover(folder).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = git2::Branch::wrap(head);
+    upstream_ahead_behind(&repo, &branch)
 }
 
 /// The main repository's directory name from git's common dir. For the usual
@@ -585,6 +647,11 @@ struct GithubIdentity {
 /// whether it is the main working tree, and whether a VS Code window currently
 /// has it open (with that window's key, for the focus action). Optional git
 /// fields degrade independently, exactly like [`GitStatus`].
+///
+/// Ahead/behind divergence is deliberately **absent** from this snapshot: it was
+/// the dominant per-worktree cost when computed eagerly for every worktree on
+/// every tick, so it is now fetched lazily via the `ahead-behind` op only for the
+/// worktrees a client actually shows (#1306).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TreeWorktree {
     /// Absolute path to the worktree's working directory.
@@ -592,12 +659,6 @@ struct TreeWorktree {
     /// The checked-out branch, or `None` when detached or unborn.
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
-    /// Commits ahead of the branch's upstream (`None` without an upstream).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ahead: Option<usize>,
-    /// Commits behind the branch's upstream (`None` without an upstream).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    behind: Option<usize>,
     /// Whether this is the repository's main working tree (vs a linked worktree).
     is_main: bool,
     /// Whether a live VS Code window currently has this worktree open.
@@ -702,21 +763,20 @@ fn open_window_index(entries: &[WindowEntry]) -> HashMap<PathBuf, String> {
     index
 }
 
-/// Builds a [`TreeWorktree`] for `path`: reuses [`git_status`] for the live git
-/// state and joins the open-window index for `open`/`window_key`. `is_main` is
-/// set by the caller from the enumeration (main working tree vs linked).
+/// Builds a [`TreeWorktree`] for `path`: reuses [`git_status_cheap`] for the live
+/// git state (branch + repo identity, **no** ahead/behind walk — that is lazy per
+/// #1306) and joins the open-window index for `open`/`window_key`. `is_main` is set
+/// by the caller from the enumeration (main working tree vs linked).
 fn worktree_entry(
     path: &Path,
     is_main: bool,
     open_index: &HashMap<PathBuf, String>,
 ) -> TreeWorktree {
-    let status = git_status(path);
+    let status = git_status_cheap(path);
     let window_key = open_index.get(&canonical(path)).cloned();
     TreeWorktree {
         path: path.display().to_string(),
         branch: status.branch,
-        ahead: status.ahead,
-        behind: status.behind,
         is_main,
         open: window_key.is_some(),
         window_key,
@@ -801,6 +861,36 @@ async fn tree_repos(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<Val
     })
     .await
     .unwrap_or_default()
+}
+
+// --- Lazy ahead/behind (#1306) -----------------------------------------------
+
+/// Computes the ahead/behind divergence for a batch of worktree `paths` on demand,
+/// returning a JSON object keyed by the **requested** path string:
+/// `{ "<path>": { "ahead": n, "behind": m }, … }`. A path with no upstream (or that
+/// is not a repo / is detached) is **omitted** — the client renders it without a
+/// sync indicator, exactly as the tree does for an absent `ahead`/`behind`.
+///
+/// Backs the `ahead-behind` op, which exists precisely so the streamed `tree`
+/// snapshot can stay cheap: a client fetches divergence only for the worktrees it
+/// shows (the extension on expand), not for every worktree on every tick. The git
+/// walks are blocking disk I/O, so they run on a blocking thread; a join failure
+/// degrades to an empty object rather than erroring.
+async fn ahead_behind_results(paths: Vec<PathBuf>) -> Value {
+    tokio::task::spawn_blocking(move || {
+        let mut results = serde_json::Map::new();
+        for path in paths {
+            if let Some((ahead, behind)) = folder_ahead_behind(&path) {
+                results.insert(
+                    path.display().to_string(),
+                    json!({ "ahead": ahead, "behind": behind }),
+                );
+            }
+        }
+        Value::Object(results)
+    })
+    .await
+    .unwrap_or_else(|_| json!({}))
 }
 
 // --- Push subscription (#1267) -----------------------------------------------
@@ -2320,6 +2410,104 @@ mod tests {
             dir.path().file_name().and_then(|n| n.to_str())
         );
         assert!(!status.is_worktree);
+    }
+
+    // --- Lazy ahead/behind (#1306) -----------------------------------------
+
+    #[test]
+    fn git_status_cheap_reads_branch_but_skips_the_divergence_walk() {
+        // The same repo `git_status` reports 1/1 for. The cheap variant used by
+        // the streamed tree snapshot still reads the branch and repo identity, but
+        // leaves ahead/behind absent — divergence is now lazy (#1306).
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        let status = git_status_cheap(dir.path());
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.ahead, None);
+        assert_eq!(status.behind, None);
+        assert_eq!(
+            status.main_repo.as_deref(),
+            dir.path().file_name().and_then(|n| n.to_str())
+        );
+    }
+
+    #[test]
+    fn folder_ahead_behind_computes_divergence_and_degrades() {
+        // A diverging tracking branch → the on-demand walk reports (ahead, behind).
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        assert_eq!(folder_ahead_behind(dir.path()), Some((1, 1)));
+
+        // A branch with no upstream → None (the tree renders no sync indicator).
+        let no_up = tempfile::tempdir().unwrap();
+        let repo = init_repo(no_up.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        assert_eq!(folder_ahead_behind(no_up.path()), None);
+
+        // A detached HEAD and a plain (non-repo) directory → None.
+        let detached = tempfile::tempdir().unwrap();
+        let drepo = init_repo(detached.path());
+        let a = empty_commit(&drepo, Some("refs/heads/main"), &[], "A");
+        drepo.set_head_detached(a).unwrap();
+        assert_eq!(folder_ahead_behind(detached.path()), None);
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(folder_ahead_behind(plain.path()), None);
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_op_returns_divergence_keyed_by_path_and_omits_no_upstream() {
+        let diverging = tempfile::tempdir().unwrap();
+        let _d = diverging_repo(diverging.path());
+        let no_up = tempfile::tempdir().unwrap();
+        let repo = init_repo(no_up.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        let svc = WorktreesService::new();
+        let diverging_path = diverging.path().display().to_string();
+        let no_up_path = no_up.path().display().to_string();
+        let reply = svc
+            .handle(
+                "ahead-behind",
+                json!({ "paths": [&diverging_path, &no_up_path] }),
+            )
+            .await
+            .unwrap();
+        let results = reply.get("results").unwrap();
+        // The diverging worktree carries its counts, keyed by the requested path.
+        let d = results.get(diverging_path.as_str()).unwrap();
+        assert_eq!(d.get("ahead").and_then(Value::as_u64), Some(1));
+        assert_eq!(d.get("behind").and_then(Value::as_u64), Some(1));
+        // The no-upstream worktree is omitted entirely, not reported as zero.
+        assert!(results.get(no_up_path.as_str()).is_none(), "{results:?}");
+
+        // A missing/empty `paths` list yields an empty results object, not an error.
+        let empty = svc.handle("ahead-behind", json!({})).await.unwrap();
+        assert_eq!(empty.get("results"), Some(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_ahead_behind_for_a_diverging_worktree() {
+        // A window on a repo whose branch is 1 ahead of / 1 behind its upstream.
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        let repos = repos_of(&svc.handle("tree", Value::Null).await.unwrap());
+        let worktrees = repos[0].get("worktrees").and_then(Value::as_array).unwrap();
+        let main_wt = &worktrees[0];
+        // The cheap parts are present, but divergence is not — it is fetched
+        // lazily via the `ahead-behind` op (#1306).
+        assert_eq!(main_wt.get("branch").and_then(Value::as_str), Some("main"));
+        assert!(main_wt.get("ahead").is_none(), "{main_wt:?}");
+        assert!(main_wt.get("behind").is_none(), "{main_wt:?}");
     }
 
     #[test]
