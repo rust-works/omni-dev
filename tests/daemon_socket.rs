@@ -498,10 +498,11 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
         .unwrap();
     write_half.write_all(b"\n").await.unwrap();
 
-    // 1) Initial snapshot: no windows registered yet → empty repo set.
+    // 1) Initial snapshot: no windows registered yet → empty repo set, with the
+    //    show/hide-closed toggle at its default (show all).
     let initial = read_frame(&mut reader).await;
     assert!(initial.ok, "initial frame errored: {:?}", initial.error);
-    assert_eq!(initial.payload, json!({ "repos": [] }));
+    assert_eq!(initial.payload, json!({ "repos": [], "show_closed": true }));
 
     // 2) A window opens on a real git repo → a fresh snapshot carrying it.
     let repo_dir = tempfile::tempdir().unwrap();
@@ -543,7 +544,7 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
     let removed = read_frame(&mut reader).await;
     assert_eq!(
         removed.payload,
-        json!({ "repos": [] }),
+        json!({ "repos": [], "show_closed": true }),
         "expected the post-unregister empty frame, not a duplicate of the repo frame"
     );
 
@@ -555,6 +556,108 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
         .expect("shutdown should close the subscription within the timeout")
         .unwrap();
     assert_eq!(n, 0, "subscription should close cleanly on daemon shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+/// End-to-end acceptance for the daemon-backed show/hide-closed toggle (#1301):
+/// a `set-show-closed` from one client live-syncs to **every** subscriber
+/// (criterion #1), and a subscriber that connects *after* the flip sees the new
+/// value on its very first snapshot (criterion #2) — the two things per-window
+/// `context.globalState` could not do. Uses raw sockets for the two long-lived
+/// subscriptions (the many-replies-on-one-connection shape) plus a one-shot
+/// `DaemonClient` to send the toggle.
+#[tokio::test]
+async fn set_show_closed_live_syncs_across_subscribers() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(WorktreesService::new()));
+    let handle = tokio::spawn(run(
+        registry,
+        DaemonOptions {
+            socket_path: socket.clone(),
+        },
+    ));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Opens a subscription connection, returning its reader **and** write half —
+    // the caller must keep the write half alive, since dropping it shuts down the
+    // connection (the daemon then reads EOF and ends the stream).
+    async fn open_subscription(
+        socket: &std::path::Path,
+    ) -> (
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
+        let sub = UnixStream::connect(socket).await.unwrap();
+        let (read_half, mut write_half) = sub.into_split();
+        let line = serde_json::to_string(&DaemonEnvelope::service(
+            "worktrees",
+            "subscribe",
+            Value::Null,
+        ))
+        .unwrap();
+        write_half.write_all(line.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        (BufReader::new(read_half), write_half)
+    }
+
+    // Two "windows" A and B, each with its own subscription; both start at the
+    // default (show all). Keep each write half alive for the test's duration.
+    let (mut a, _a_w) = open_subscription(&socket).await;
+    let (mut b, _b_w) = open_subscription(&socket).await;
+    assert_eq!(
+        read_frame(&mut a).await.payload,
+        json!({ "repos": [], "show_closed": true })
+    );
+    assert_eq!(
+        read_frame(&mut b).await.payload,
+        json!({ "repos": [], "show_closed": true })
+    );
+
+    // A third client flips the toggle. The daemon holds the single cross-window
+    // value and re-pushes to *every* subscriber.
+    let reply = client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "set-show-closed",
+            json!({ "show_closed": false }),
+        ))
+        .await
+        .unwrap();
+    assert!(reply.ok, "set-show-closed errored: {:?}", reply.error);
+
+    // Criterion #1: both existing subscribers re-render with the new value —
+    // neither had to reload, and neither is the one that sent the op.
+    assert_eq!(
+        read_frame(&mut a).await.payload,
+        json!({ "repos": [], "show_closed": false }),
+        "window A should live-sync the toggle flip"
+    );
+    assert_eq!(
+        read_frame(&mut b).await.payload,
+        json!({ "repos": [], "show_closed": false }),
+        "window B should live-sync the toggle flip"
+    );
+
+    // Criterion #2: a window opened *after* the flip initializes from its first
+    // snapshot — no race, no fallback to the default.
+    let (mut c, _c_w) = open_subscription(&socket).await;
+    assert_eq!(
+        read_frame(&mut c).await.payload,
+        json!({ "repos": [], "show_closed": false }),
+        "a newly-opened window should see the current toggle on its first frame"
+    );
+
+    client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
 
