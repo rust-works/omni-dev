@@ -33,8 +33,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -42,6 +43,7 @@ use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatu
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::watch;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -87,6 +89,12 @@ pub struct WorktreesService {
     menu_cache: Arc<Mutex<Option<Vec<MenuItem>>>>,
     /// The background refresh task, once started (`None` in tests / no runtime).
     refresh: Mutex<Option<RefreshTask>>,
+    /// The shared, coalescing tree-snapshot cache every `subscribe` stream reads
+    /// through, so N open windows perform **one** `build_tree` per tick instead
+    /// of N (#1303). Behind an `Arc` so each stream holds a cheap handle to the
+    /// one cache. The one-shot `tree` op deliberately bypasses it and computes
+    /// fresh (it is a rare manual refresh, not part of the per-tick fan-out).
+    tree_cache: Arc<TreeSnapshotCache>,
 }
 
 impl WorktreesService {
@@ -96,10 +104,12 @@ impl WorktreesService {
     /// inline on demand).
     #[must_use]
     pub fn new() -> Self {
+        let registry = Arc::new(WorktreesRegistry::new());
         Self {
-            registry: Arc::new(WorktreesRegistry::new()),
+            registry: registry.clone(),
             menu_cache: Arc::new(Mutex::new(None)),
             refresh: Mutex::new(None),
+            tree_cache: Arc::new(TreeSnapshotCache::new(registry)),
         }
     }
 
@@ -275,7 +285,10 @@ impl DaemonService for WorktreesService {
                 // The same `{ repos, show_closed }` snapshot the `subscribe`
                 // stream pushes, so a one-shot `tree` fetch and the live stream
                 // agree byte-for-byte (the git enumeration runs off-lock on a
-                // blocking thread inside the helper).
+                // blocking thread inside the helper). Computed fresh here — the
+                // `tree` op is a rare manual refresh, deliberately bypassing the
+                // stream's coalescing cache so it never returns a stale view
+                // (#1303).
                 Ok(tree_snapshot(&self.registry).await)
             }
             "set-show-closed" => {
@@ -324,7 +337,9 @@ impl DaemonService for WorktreesService {
             return None;
         }
         Some(Box::new(WorktreesStream {
-            registry: self.registry.clone(),
+            // Every stream reads through the one shared cache, so N windows
+            // sampling the same tick build the tree once, not N times (#1303).
+            cache: self.tree_cache.clone(),
             // Capture the change source *now* — before the server takes its
             // initial snapshot — so a change racing that snapshot still wakes us.
             changes: self.registry.subscribe_changes(),
@@ -794,11 +809,17 @@ async fn tree_repos(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<Val
 /// the same `{ repos: [...] }` snapshot the `tree` op returns (#1265). The
 /// server drives it — awaiting [`changed`](ServiceStream::changed) plus its own
 /// periodic tick, then diffing [`snapshot`](ServiceStream::snapshot) — so this
-/// type only has to (a) relay the registry's change-notify and (b) recompute the
-/// tree on demand.
+/// type only has to (a) relay the registry's change-notify and (b) read the
+/// tree snapshot on demand.
+///
+/// Every window's stream shares one [`TreeSnapshotCache`] (#1303): the snapshot
+/// is built at most once per tick and fanned out, rather than each stream
+/// rebuilding the identical tree. This type holds only cheap handles — a clone
+/// of the shared cache and its own change-notify receiver.
 struct WorktreesStream {
-    /// The cross-window registry the snapshot is computed from.
-    registry: Arc<WorktreesRegistry>,
+    /// The shared coalescing cache the snapshot is read through, so every
+    /// stream's tick/change re-sample hits one shared `build_tree` (#1303).
+    cache: Arc<TreeSnapshotCache>,
     /// Wakes on each visible-set change (a `register`, a removing `unregister`,
     /// or a mutation-driven reap). A burst coalesces into one wakeup; the
     /// server's diff drops any snapshot that ends up identical.
@@ -819,9 +840,127 @@ impl ServiceStream for WorktreesStream {
     }
 
     async fn snapshot(&self) -> Value {
-        // Identical to the `tree` op — both go through `tree_snapshot`, so a
-        // one-shot fetch and this live push agree byte-for-byte.
-        tree_snapshot(&self.registry).await
+        // Read through the shared coalescing cache. The value is built by the
+        // same `tree_snapshot` the `tree` op runs, so a one-shot fetch and this
+        // live push agree byte-for-byte — but here it is built once per tick and
+        // shared across every subscriber rather than rebuilt per stream (#1303).
+        self.cache.snapshot().await
+    }
+}
+
+/// A coalescing cache for the global tree snapshot (#1303).
+///
+/// Every open VS Code window holds one persistent [`WorktreesStream`], and the
+/// server re-samples each on its own `STREAM_TICK` and on every registry change
+/// — so with N windows the *identical* global tree was being built N times per
+/// tick. This cache collapses that to **one** build: all streams share it, and
+/// it rebuilds at most once per `ttl` (the stream tick) per registry
+/// change-generation.
+///
+/// Two conditions gate reuse, and **both** must hold, so freshness is preserved
+/// exactly as before:
+/// - the registry's [`change_generation`](WorktreesRegistry::change_generation)
+///   still matches — a `register`/`unregister`/toggle bumps it and forces a
+///   fresh build, so subscribers never see a stale visible set; and
+/// - the cached value is younger than `ttl` — so a pure on-disk git change (a
+///   branch switch, new commits), which fires no registry event, still surfaces
+///   within one tick.
+///
+/// Concurrency is single-flight: the `.await`-held [`AsyncMutex`] serializes
+/// callers, so a burst of N streams waking on the same tick/change performs one
+/// build while the rest wait and read the shared result. The one-shot `tree` op
+/// bypasses this and computes fresh — it is a rare manual refresh, not part of
+/// the per-tick fan-out.
+struct TreeSnapshotCache {
+    /// The registry every snapshot is built from, and whose change-generation
+    /// gates cache reuse.
+    registry: Arc<WorktreesRegistry>,
+    /// How long a built snapshot stays fresh before a tick-driven read rebuilds
+    /// it. Defaults to the server's `STREAM_TICK` (via [`new`](Self::new)) so the
+    /// coalesced build runs at most once per tick; tests inject a shorter value.
+    ttl: Duration,
+    /// The single-flight guard and cached result. A `tokio` mutex (not `std`)
+    /// because it is deliberately held across the `.await` of the git
+    /// enumeration, so concurrent callers serialize onto one build rather than
+    /// each computing their own.
+    state: AsyncMutex<Option<CachedTree>>,
+    /// How many times the tree was actually (re)built — so tests can assert the
+    /// coalescing collapses an N-stream burst into one build. Cheap and always
+    /// maintained; only read under `#[cfg(test)]`.
+    computes: AtomicU64,
+}
+
+/// One cached tree snapshot: the shared value plus the two freshness stamps
+/// [`TreeSnapshotCache`] checks before reusing it.
+struct CachedTree {
+    /// The registry change-generation captured *before* the build, so a change
+    /// racing the build advances the generation and the next read rebuilds
+    /// (conservative: it may rebuild once needlessly, but never serves stale).
+    generation: u64,
+    /// When the value was built, for the `ttl` staleness check.
+    computed_at: Instant,
+    /// The already-built `{ repos, show_closed }` snapshot, fanned out to every
+    /// subscriber by cloning the `Arc`'s inner value.
+    value: Arc<Value>,
+}
+
+impl TreeSnapshotCache {
+    /// Creates a cache over `registry` with the default TTL — the server's
+    /// [`STREAM_TICK`](crate::daemon::server), so the coalesced build runs at
+    /// most once per tick.
+    fn new(registry: Arc<WorktreesRegistry>) -> Self {
+        Self::with_ttl(registry, crate::daemon::server::STREAM_TICK)
+    }
+
+    /// Creates a cache with an explicit `ttl`, for tests that need a short (or
+    /// long) freshness window without waiting a real tick.
+    fn with_ttl(registry: Arc<WorktreesRegistry>, ttl: Duration) -> Self {
+        Self {
+            registry,
+            ttl,
+            state: AsyncMutex::new(None),
+            computes: AtomicU64::new(0),
+        }
+    }
+
+    /// The current tree snapshot, built at most once per `ttl` per registry
+    /// change-generation and shared across all callers. See the type docs for
+    /// the freshness and single-flight semantics.
+    async fn snapshot(&self) -> Value {
+        // Hold the lock across the whole check-and-build so concurrent callers
+        // serialize onto one build (single-flight); reading the generation here
+        // (before the build) means a change racing the build forces the *next*
+        // read to rebuild rather than serving this now-stale value.
+        let mut state = self.state.lock().await;
+        let generation = self.registry.change_generation();
+        // Reuse the cached value only while it matches the current generation
+        // *and* is within the TTL; either failing forces a rebuild.
+        let fresh = state.as_ref().and_then(|cached| {
+            (cached.generation == generation && cached.computed_at.elapsed() < self.ttl)
+                .then(|| Arc::clone(&cached.value))
+        });
+        let value = if let Some(value) = fresh {
+            value
+        } else {
+            let value = Arc::new(tree_snapshot(&self.registry).await);
+            self.computes.fetch_add(1, Ordering::Relaxed);
+            *state = Some(CachedTree {
+                generation,
+                computed_at: Instant::now(),
+                value: Arc::clone(&value),
+            });
+            value
+        };
+        // Release the lock before the (deeper) clone of the shared value out.
+        drop(state);
+        (*value).clone()
+    }
+
+    /// How many times the tree was actually built — the coalescing assertion in
+    /// tests (N reads within one tick/generation should build once).
+    #[cfg(test)]
+    fn compute_count(&self) -> u64 {
+        self.computes.load(Ordering::Relaxed)
     }
 }
 
@@ -1757,6 +1896,108 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stream.changed())
             .await
             .expect("changed should resolve after a register");
+    }
+
+    // --- Coalesced tree-snapshot cache (#1303) -----------------------------
+
+    #[tokio::test]
+    async fn tree_cache_coalesces_reads_within_ttl_and_generation() {
+        let reg = Arc::new(WorktreesRegistry::new());
+        // A long TTL so only the generation gate is exercised here.
+        let cache = TreeSnapshotCache::with_ttl(reg, Duration::from_secs(60));
+        // The first read builds once.
+        let first = cache.snapshot().await;
+        assert_eq!(cache.compute_count(), 1);
+        // Further reads with no registry change and within the TTL reuse the
+        // cached value — no extra build, byte-identical result.
+        let second = cache.snapshot().await;
+        assert_eq!(
+            cache.compute_count(),
+            1,
+            "an unchanged read must not rebuild"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn tree_cache_single_flights_a_read_burst() {
+        let reg = Arc::new(WorktreesRegistry::new());
+        let cache = Arc::new(TreeSnapshotCache::with_ttl(reg, Duration::from_secs(60)));
+        // A burst of concurrent readers — as N subscriber streams would wake
+        // together on a change/tick — collapses to exactly one build; the rest
+        // read the shared result (the acceptance criterion).
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move { cache.snapshot().await }));
+        }
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+        assert_eq!(
+            cache.compute_count(),
+            1,
+            "a concurrent read burst must build the tree once"
+        );
+        assert!(
+            results.windows(2).all(|w| w[0] == w[1]),
+            "every reader must observe the identical snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_cache_rebuilds_on_registry_change() {
+        let reg = Arc::new(WorktreesRegistry::new());
+        let cache = TreeSnapshotCache::with_ttl(reg.clone(), Duration::from_secs(60));
+        cache.snapshot().await;
+        assert_eq!(cache.compute_count(), 1);
+        // A registry change bumps the generation, so the next read rebuilds even
+        // though the (long) TTL has not expired — subscribers never see a stale
+        // visible set.
+        assert!(reg.set_show_closed(false));
+        cache.snapshot().await;
+        assert_eq!(
+            cache.compute_count(),
+            2,
+            "a generation bump must force a rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_cache_rebuilds_after_ttl_expiry() {
+        let reg = Arc::new(WorktreesRegistry::new());
+        // A zero TTL: every read is already past it, so a pure on-disk git change
+        // still surfaces on the next tick with no registry bump needed.
+        let cache = TreeSnapshotCache::with_ttl(reg, Duration::ZERO);
+        cache.snapshot().await;
+        cache.snapshot().await;
+        assert_eq!(
+            cache.compute_count(),
+            2,
+            "an expired TTL must force a rebuild each read"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_share_one_build_per_generation() {
+        let svc = WorktreesService::new();
+        let s1 = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        let s2 = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // Two windows' streams sampling the same registry state build the tree
+        // once, not once per stream (#1303) — they share the service's cache.
+        let a = s1.snapshot().await;
+        let b = s2.snapshot().await;
+        assert_eq!(a, b);
+        assert_eq!(
+            svc.tree_cache.compute_count(),
+            1,
+            "N streams on one generation must share a single build"
+        );
     }
 
     // --- Show/hide-closed toggle (#1301) -----------------------------------
