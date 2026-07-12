@@ -7,6 +7,7 @@ import { test } from "node:test";
 import * as path from "path";
 import {
   MAX_SOCKET_PATH_LEN,
+  aheadBehindEnvelope,
   checkSocketPathLen,
   closeCheckEnvelope,
   closeEnvelope,
@@ -86,6 +87,21 @@ test("tree/subscribe/open envelope builders match the worktrees wire contract", 
     service: "worktrees",
     op: "open",
     payload: { path: "/home/me/wt/issue-1300" },
+  });
+});
+
+test("ahead-behind envelope batches worktree paths for the lazy divergence op", () => {
+  assert.deepEqual(aheadBehindEnvelope(["/home/me/omni-dev", "/home/me/wt/issue-1300"]), {
+    service: "worktrees",
+    op: "ahead-behind",
+    payload: { paths: ["/home/me/omni-dev", "/home/me/wt/issue-1300"] },
+  });
+  // An empty batch is still well-formed (the caller skips the fetch, but the
+  // builder never assumes non-empty).
+  assert.deepEqual(aheadBehindEnvelope([]), {
+    service: "worktrees",
+    op: "ahead-behind",
+    payload: { paths: [] },
   });
 });
 

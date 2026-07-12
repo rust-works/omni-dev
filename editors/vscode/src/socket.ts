@@ -125,6 +125,18 @@ export function subscribeEnvelope(): Envelope {
 }
 
 /**
+ * Builds an `ahead-behind` envelope — the lazy per-worktree divergence op (#1306).
+ * The streamed `tree`/`subscribe` snapshot no longer carries ahead/behind (it was
+ * the dominant per-worktree cost when computed for every worktree on every tick),
+ * so the tree view requests it on demand — batched by path, one call per repo
+ * expand. The reply payload is `{ results: { "<path>": { ahead, behind } } }`,
+ * omitting any path that tracks no upstream.
+ */
+export function aheadBehindEnvelope(paths: string[]): Envelope {
+  return { service: WORKTREES_SERVICE, op: "ahead-behind", payload: { paths } };
+}
+
+/**
  * Builds an `open` envelope — focuses (or opens) a worktree folder in VS Code
  * via the daemon's launcher. The daemon guards `path` to an absolute, existing
  * directory, so a relative/nonexistent path comes back as `{ ok: false }`.
