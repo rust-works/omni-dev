@@ -491,6 +491,12 @@ fires no registry event. The semantics a client can rely on:
   the daemon diffs each snapshot against the last one it sent, so **two identical
   frames are never pushed in a row**. Treat each line as the current full state, not
   a delta.
+- **One shared computation across subscribers.** The `tree` snapshot every
+  subscriber receives is byte-identical, so the daemon builds it **once per ~3 s
+  tick (or change) and fans the same result out to all open windows**, rather than
+  re-walking every repo per subscriber (#1303). Daemon CPU therefore scales with
+  the worktree count, not `windows × worktrees`. (The one-shot `tree` op is a rare
+  manual refresh and computes fresh, bypassing this cache.)
 - **Teardown.** The stream ends when the client sends **any** further line (an
   explicit cancel), disconnects, or the daemon shuts down — all three close the
   connection cleanly. Use a **dedicated** connection for `subscribe`; do not
