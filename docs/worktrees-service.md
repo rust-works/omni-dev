@@ -189,12 +189,15 @@ every window (no per-window curation). It renders the `tree` payload:
 
 ```
 ▸ omni-dev            (github: rust-works/omni-dev)
-    ● main            ↑2 ↓0                 ← window open (badge), main working tree
-      issue-1300      ↑1 ↓3  #1300 ✗        ← linked worktree; open PR, checks failing
-    ● issue-1250      ↑0 ↓0  #1250 draft ●  ← draft PR, checks running
+    ● main            ↑2 ↓0                     ← window open (badge), main working tree
+      issue-1300      ↑1 ↓3  #1300         ✗   ← linked worktree; open PR, checks failing (red ✗)
+    ● issue-1250      ↑0 ↓0  #1250 draft   ●   ← draft PR, checks running (yellow ●)
 ▸ some-other-repo
       main
 ```
+
+The `✓`/`✗`/`●` at the right of each row is a **colored** check badge (a VS Code
+file decoration, not description text), which also tints that row's branch label.
 
 - **Top level: repositories.** A GitHub repo shows a GitHub icon and its
   `owner/repo`; a non-GitHub repo is still listed by its main-repo name.
@@ -244,11 +247,16 @@ unregister): every window is both a reporter and, if it has the view open, a rea
 ### Pull requests
 
 For a worktree on a **GitHub** repo whose branch has an **open pull request**, the
-row shows a muted PR badge after the sync counts — `#<number>`, a `draft` marker
-for drafts, and a CI-checks glyph (`✓` passing, `✗` failing, `●` still running;
-nothing when a PR has no checks). The badge appears on **every** worktree in the
-view — the one open in this window and those open in others (and closed worktrees
-when shown) — and the hover tooltip adds a `PR #<n> · open/draft · checks …` line.
+row shows a muted PR badge after the sync counts — `#<number>` and a `draft` marker
+for drafts — and, when the PR has CI checks, a **colored check badge** at the right
+of the row: a **green `✓`** (passing), **red `✗`** (failing), or **yellow `●`**
+(still running); nothing when a PR has no checks (#1324). The check badge is a
+theme-aware file decoration (it adapts to light/dark and also tints the branch
+label), not a monochrome glyph in the description — so a passing and a failing PR
+are distinguishable at a glance rather than by reading the glyph shape. The badge
+appears on **every** worktree in the view — the one open in this window and those
+open in others (and closed worktrees when shown) — and the hover tooltip adds a
+`PR #<n> · open/draft · checks …` line.
 
 A right-click **"Open Pull Request…"** action on any GitHub worktree (or repo)
 opens its PR **as a tab inside the editor** — never a browser. It discovers the
@@ -269,6 +277,13 @@ is absent it offers to install it or copy the PR URL.
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
   action still surfaces the real `gh` error).
+- **The check state is colored, not monochrome (#1324).** The `✓`/`✗`/`●` is a VS
+  Code `FileDecoration` (the same mechanism git status uses to color `M`/`U`
+  badges), painted from a custom `omnidev-worktree:` `resourceUri` the extension
+  puts on each row — a custom scheme, so it never collides with git's own folder
+  decorations. The color uses the theme `charts.{green,red,yellow}` palette, and the
+  check state is encoded in the URI so a state change re-colors on its own. Purely
+  extension-side: no daemon, wire, or trust-boundary change.
 - **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) gates
   the badge and its `gh` lookups entirely.
 

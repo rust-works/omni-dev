@@ -52,11 +52,6 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "omniDevWorktrees.open",
-        "title": "Open in VS Code",
-        "category": "omni-dev"
-      },
-      {
         "command": "omniDevWorktrees.itemClicked",
         "title": "Open Worktree (internal)",
         "category": "omni-dev"
@@ -94,10 +89,6 @@
       "commandPalette": [
         {
           "command": "omniDevWorktrees.itemClicked",
-          "when": "false"
-        },
-        {
-          "command": "omniDevWorktrees.open",
           "when": "false"
         },
         {
@@ -139,11 +130,6 @@
         }
       ],
       "view/item/context": [
-        {
-          "command": "omniDevWorktrees.open",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
-          "group": "inline"
-        },
         {
           "command": "omniDevWorktrees.openPullRequest",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",

@@ -201,25 +201,12 @@ function syncCounts(wt: TreeWorktreePayload): string {
   return parts.join(" ");
 }
 
-/** The glyph for a rolled-up checks state, or `""` when there are no checks. */
-function prCheckGlyph(checks: PrCheckState): string {
-  switch (checks) {
-    case "success":
-      return "✓";
-    case "failure":
-      return "✗";
-    case "pending":
-      return "●";
-    case "none":
-      return "";
-  }
-}
-
 /**
- * The muted PR badge, e.g. `#65`, `#65 ✓`, `#65 draft`, `#65 draft ✗` (#1296).
- * Empty when the worktree carries no {@link PrBadge}, so a worktree with no open
- * PR renders no PR indicator. The checks glyph is appended only when the PR has
- * checks configured (`none` → no glyph).
+ * The muted PR badge, e.g. `#65` or `#65 draft` (#1296). Empty when the worktree
+ * carries no {@link PrBadge}, so a worktree with no open PR renders no PR
+ * indicator. The CI-checks verdict is **not** in the badge text: since #1324 it is
+ * rendered separately as a colored file decoration (see
+ * {@link worktreeCheckDecoration}), so the glyph is never shown twice.
  */
 export function worktreePrBadge(wt: TreeWorktreePayload): string {
   const pr = wt.pr;
@@ -229,10 +216,6 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
   const parts = [`#${pr.number}`];
   if (pr.isDraft) {
     parts.push("draft");
-  }
-  const glyph = prCheckGlyph(pr.checks);
-  if (glyph) {
-    parts.push(glyph);
   }
   return parts.join(" ");
 }
@@ -244,6 +227,54 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
  */
 export function worktreeDescription(wt: TreeWorktreePayload): string {
   return [syncCounts(wt), worktreePrBadge(wt)].filter(Boolean).join("  ");
+}
+
+/**
+ * A worktree row's colored PR-check badge (#1324): the glyph, its theme color id,
+ * and a hover tooltip. The `vscode`-facing `FileDecorationProvider`
+ * (`decorations.ts`) maps these fields onto a `vscode.FileDecoration`, so
+ * pass/fail/pending reads at a glance instead of from the monochrome glyph the
+ * description used to carry.
+ */
+export interface CheckDecoration {
+  /** The single-character badge glyph (`✓` / `✗` / `●`). */
+  badge: string;
+  /** A `ThemeColor` id from the `charts.*` palette, so the badge is theme-aware. */
+  colorId: string;
+  /** The decoration's hover tooltip, e.g. `checks passing`. */
+  tooltip: string;
+}
+
+/**
+ * Maps a rolled-up PR {@link PrCheckState} to its colored badge decoration (#1324):
+ * a green `✓` (passing), red `✗` (failing), or yellow `●` (pending). A PR with no
+ * checks configured (`none`) gets `undefined` — no badge. The `charts.{green,red,
+ * yellow}` color ids match the palette the open-state icon already uses
+ * (`treeDataProvider.ts`), so the badge adapts to light/dark themes. This is the
+ * state-facing half, used by the decoration provider on the `checks=<state>` it
+ * reads back from a row's `resourceUri`.
+ */
+export function checkStateDecoration(checks: PrCheckState): CheckDecoration | undefined {
+  switch (checks) {
+    case "success":
+      return { badge: "✓", colorId: "charts.green", tooltip: "checks passing" };
+    case "failure":
+      return { badge: "✗", colorId: "charts.red", tooltip: "checks failing" };
+    case "pending":
+      return { badge: "●", colorId: "charts.yellow", tooltip: "checks pending" };
+    case "none":
+      return undefined;
+  }
+}
+
+/**
+ * The check decoration for a worktree row (#1324), or `undefined` when it has no
+ * PR — or a PR with no checks — the cases that render no badge. The worktree-facing
+ * half of {@link checkStateDecoration}: the tree provider uses it to decide whether
+ * a row gets a decoratable `resourceUri`.
+ */
+export function worktreeCheckDecoration(wt: TreeWorktreePayload): CheckDecoration | undefined {
+  return wt.pr ? checkStateDecoration(wt.pr.checks) : undefined;
 }
 
 /** The word for a rolled-up checks state, or `""` when there are no checks. */
