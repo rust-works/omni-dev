@@ -9,11 +9,15 @@
 use std::process;
 
 use omni_dev::mcp;
+use omni_dev::utils::settings::Settings;
 use rmcp::transport::stdio;
 
 #[tokio::main]
 async fn main() {
-    let _ = mcp::try_init_tracing();
+    // MCP defaults from `settings.json` (issue #620): the log level seeds the
+    // tracing filter's fallback, but `RUST_LOG` still wins when set.
+    let mcp_settings = Settings::load_mcp();
+    let _ = mcp::try_init_tracing(mcp_settings.log_level.as_deref());
     mcp::log_startup_event();
     if let Err(e) = mcp::serve_with(stdio()).await {
         let mut stderr = std::io::stderr().lock();
