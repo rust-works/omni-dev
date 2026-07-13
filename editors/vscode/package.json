@@ -83,6 +83,12 @@
         "title": "Show Worktrees Without a Window",
         "category": "omni-dev",
         "icon": "$(eye-closed)"
+      },
+      {
+        "command": "omniDevWorktrees.openClaude",
+        "title": "Open Claude Code",
+        "category": "omni-dev",
+        "icon": "media/claude.svg"
       }
     ],
     "menus": {
@@ -145,6 +151,12 @@
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
           "group": "9_close@1"
         }
+      ],
+      "editor/title": [
+        {
+          "command": "omniDevWorktrees.openClaude",
+          "group": "navigation@9"
+        }
       ]
     },
     "configuration": {
@@ -165,6 +177,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show each worktree's open GitHub pull request (number, draft, and CI-checks status) in the tree. Resolved via the GitHub CLI (`gh`) on repo-expand, so it needs `gh` installed and `gh auth login`; without it, badges are silently omitted. Disable to skip the lookup entirely."
+        },
+        "omniDevWorktrees.claudeCommand": {
+          "type": "string",
+          "default": "claude",
+          "markdownDescription": "Command run in the terminal opened by the **Open Claude Code** title-bar button (default `claude`). A shell prefix is allowed, e.g. `proxy && claude`."
         }
       }
     }

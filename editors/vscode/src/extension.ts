@@ -25,6 +25,7 @@ import {
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prBadgeForBranch, prBadgeListArgs } from "./github";
 import { openPullRequest } from "./prCommands";
+import { CLAUDE_TERMINAL_NAME, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import {
   AheadBehindMap,
   Node,
@@ -84,6 +85,15 @@ let provider: WorktreesTreeDataProvider | undefined;
 let decorationProvider: WorktreeDecorationProvider | undefined;
 /** The last worktree click, for the manual double-click timer in `onItemClicked`. */
 let lastClick: { id: string; at: number } | undefined;
+
+/**
+ * The single editor-area terminal opened by the "Open Claude Code" title-bar
+ * button (#1322), tracked so a second click focuses it instead of spawning a
+ * duplicate. Cleared when the user closes it — VS Code's terminal API is
+ * write-only, so an open/closed terminal is all we can observe; we cannot tell
+ * whether `claude` itself is still running inside it.
+ */
+let claudeTerminal: vscode.Terminal | undefined;
 
 function config(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -257,6 +267,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.onDidChangeWorkspaceFolders(() => void register()),
   );
 
+  // The window-level "Open Claude Code" title-bar button (#1322) is independent of
+  // the tree view below, so it is wired here and works regardless of tree state.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("omniDevWorktrees.openClaude", () => openClaude()),
+    vscode.window.onDidCloseTerminal((terminal) => {
+      if (terminal === claudeTerminal) {
+        claudeTerminal = undefined;
+      }
+    }),
+  );
+
   // The reporter above runs regardless; the tree view is the new UI layer.
   setupTreeView(context);
 }
@@ -411,6 +432,39 @@ async function openNode(node?: Node): Promise<void> {
       `omni-dev: could not open worktree — ${reply.error ?? "unknown error"}`,
     );
   }
+}
+
+/**
+ * The "Open Claude Code" title-bar button (#1322). Opens — or, if one is already
+ * open, focuses — a terminal docked as an **editor tab** (not the bottom panel)
+ * running the Claude Code CLI. The cwd is the active window's workspace folder
+ * (falling back to the first folder); the launch command is
+ * `omniDevWorktrees.claudeCommand` (default `claude`). This is window-level and
+ * daemon-independent — a plain `createTerminal`, no socket involved.
+ */
+function openClaude(): void {
+  if (claudeTerminal) {
+    claudeTerminal.show();
+    return;
+  }
+  const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  const activeFolder =
+    activeUri && activeUri.scheme === "file"
+      ? vscode.workspace.getWorkspaceFolder(activeUri)?.uri.fsPath
+      : undefined;
+  const cwd = resolveClaudeCwd(folders, activeFolder);
+  const command = resolveClaudeCommand(config().get<string>("claudeCommand"));
+
+  const terminal = vscode.window.createTerminal({
+    name: CLAUDE_TERMINAL_NAME,
+    cwd,
+    location: vscode.TerminalLocation.Editor,
+    iconPath: new vscode.ThemeIcon("sparkle"),
+  });
+  claudeTerminal = terminal;
+  terminal.show();
+  terminal.sendText(command, true);
 }
 
 /**
@@ -586,5 +640,6 @@ export async function deactivate(): Promise<void> {
   decorationProvider = undefined;
   treeView = undefined;
   lastClick = undefined;
+  claudeTerminal = undefined;
   await send(unregisterEnvelope(windowKey));
 }
