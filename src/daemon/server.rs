@@ -65,6 +65,13 @@ pub async fn run_with_shutdown(
     if let Some(parent) = opts.socket_path.parent() {
         paths::ensure_dir_0700(parent)?;
     }
+    // macOS launchd creates the `StandardErrorPath`/`StandardOutPath` log sink
+    // (`daemon.log` beside the socket) under its own umask, not `0600`. Tighten it
+    // to owner-only before anything is written, matching the socket/token posture
+    // — launchd opens the file at spawn, so it already exists and is empty here.
+    // No-op when absent (the systemd-journal path, or a fresh self-bound run) or
+    // already tight (the detached-spawn launcher created it `0600`). See #1316.
+    tighten_daemon_log(&opts.socket_path);
     paths::check_socket_path_len(&opts.socket_path)?;
 
     let (listener, socket_activated) = acquire_listener(&opts.socket_path).await?;
@@ -158,6 +165,25 @@ async fn acquire_listener(socket_path: &Path) -> Result<(UnixListener, bool)> {
     }
     let listener = single_instance::bind_or_reclaim(socket_path).await?;
     Ok((listener, false))
+}
+
+/// Tightens the daemon log co-located with the socket (`daemon.log`) to
+/// owner-only (`0600`) if it exists.
+///
+/// The launchd-spawned daemon inherits its stdout/stderr from a
+/// `StandardErrorPath`/`StandardOutPath` sink launchd creates under its own umask
+/// (not `0600`), so the daemon re-tightens it to match the socket/token posture
+/// (#1316). Best-effort and idempotent: absent on the systemd-journal path and a
+/// no-op where the detached-spawn launcher already created it `0600`. A failure
+/// is logged, never fatal — the daemon must still come up.
+fn tighten_daemon_log(socket_path: &Path) {
+    let log_path = paths::log_path_for_socket(socket_path);
+    if !log_path.exists() {
+        return;
+    }
+    if let Err(e) = paths::set_file_0600(&log_path) {
+        tracing::warn!("failed to tighten {} to 0600: {e}", log_path.display());
+    }
 }
 
 /// Removes the control-socket file, tolerating its absence (a replacement
@@ -427,6 +453,27 @@ pub fn resolve_socket(socket: Option<PathBuf>) -> Result<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tighten_daemon_log_sets_0600_and_tolerates_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+
+        // No log yet → best-effort no-op, no panic.
+        tighten_daemon_log(&socket);
+
+        // A launchd-created log lands with a looser umask mode; tighten it to 0600.
+        let log = paths::log_path_for_socket(&socket);
+        std::fs::write(&log, b"daemon listening on ...\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        tighten_daemon_log(&socket);
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[tokio::test]
     async fn drain_connections_returns_immediately_when_empty() {
