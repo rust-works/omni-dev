@@ -62,11 +62,31 @@ const SUBMENU_TITLE: &str = "Worktrees";
 /// action, for when the daemon runs under launchd with a minimal `PATH`.
 const VSCODE_BIN_ENV: &str = "OMNI_DEV_VSCODE_BIN";
 
-/// How often the background task recomputes the tray menu snapshot off the main
-/// thread. The macOS tray polls `menu()` ~1 Hz; caching a couple of seconds keeps
-/// the displayed branch/sync state fresh without ever doing git I/O on the GUI
-/// thread (which would peg a core and stall shutdown — the #1186 regression).
-const MENU_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Environment override for [`menu_refresh_interval`] (whole seconds; a blank,
+/// non-numeric, or `0` value falls back to [`DEFAULT_MENU_REFRESH_INTERVAL`]).
+const ENV_MENU_REFRESH_INTERVAL: &str = "OMNI_DEV_DAEMON_MENU_REFRESH";
+
+/// Default cadence at which the background task recomputes the tray menu snapshot
+/// off the main thread when `OMNI_DEV_DAEMON_MENU_REFRESH` is unset. The macOS
+/// tray polls `menu()` ~1 Hz and always serves this cache, never doing git I/O on
+/// the GUI thread (which would peg a core and stall shutdown — the #1186
+/// regression); the interval only governs how stale that cached branch/sync state
+/// may be when the menu is opened.
+///
+/// Raised from 2 s to 10 s (#1305): this refresh is an independent per-window git
+/// walk that the subscription-stream coalescing (#1303) never touched — it was
+/// the dominant idle-CPU cost — so relaxing it cuts that cost ~5× while leaving
+/// menu open-latency unchanged (the cache still serves instantly).
+const DEFAULT_MENU_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The resolved tray menu-refresh cadence: `OMNI_DEV_DAEMON_MENU_REFRESH` (whole
+/// seconds) when valid, else [`DEFAULT_MENU_REFRESH_INTERVAL`].
+fn menu_refresh_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(
+        ENV_MENU_REFRESH_INTERVAL,
+        DEFAULT_MENU_REFRESH_INTERVAL,
+    )
+}
 
 /// A running background menu-refresh task and the token that stops it.
 struct RefreshTask {
@@ -114,7 +134,7 @@ impl WorktreesService {
     }
 
     /// Starts the background task that recomputes the tray menu snapshot every
-    /// [`MENU_REFRESH_INTERVAL`] **off the main thread** — git enrichment is
+    /// [`menu_refresh_interval`] **off the main thread** — git enrichment is
     /// blocking disk I/O — and stores it in [`menu_cache`](Self::menu_cache), so
     /// the macOS tray's `menu()` serves a cache instead of running git on the GUI
     /// event loop. Idempotent, and a no-op outside a tokio runtime (mirroring the
@@ -133,6 +153,9 @@ impl WorktreesService {
         let loop_token = token.clone();
         let registry = self.registry.clone();
         let cache = self.menu_cache.clone();
+        // Resolved once at spawn: the interval is process-stable env config, and
+        // re-reading it every loop would be wasted work.
+        let interval = menu_refresh_interval();
         let handle = tokio::spawn(async move {
             loop {
                 // Snapshot the registry (a cheap lock), then build the menu —
@@ -146,7 +169,7 @@ impl WorktreesService {
                 }
                 tokio::select! {
                     () = loop_token.cancelled() => break,
-                    () = tokio::time::sleep(MENU_REFRESH_INTERVAL) => {}
+                    () = tokio::time::sleep(interval) => {}
                 }
             }
         });
@@ -996,10 +1019,10 @@ struct CachedTree {
 
 impl TreeSnapshotCache {
     /// Creates a cache over `registry` with the default TTL — the server's
-    /// [`STREAM_TICK`](crate::daemon::server), so the coalesced build runs at
-    /// most once per tick.
+    /// [`stream_tick`](crate::daemon::server::stream_tick), so the coalesced
+    /// build runs at most once per tick.
     fn new(registry: Arc<WorktreesRegistry>) -> Self {
-        Self::with_ttl(registry, crate::daemon::server::STREAM_TICK)
+        Self::with_ttl(registry, crate::daemon::server::stream_tick())
     }
 
     /// Creates a cache with an explicit `ttl`, for tests that need a short (or
