@@ -50,6 +50,14 @@ pub fn plist_path() -> Result<PathBuf> {
 /// owner-private from birth, the privacy `bind_private` enforced via umask on the
 /// self-bound fallback path.
 ///
+/// `StandardOutPath`/`StandardErrorPath` both point at the `daemon.log`
+/// co-located with the socket ([`paths::log_path_for_socket`]), giving the
+/// launchd-spawned daemon the same durable stdout/stderr sink the non-launchd
+/// detached spawn already writes to; without it launchd sends the daemon's
+/// lifecycle log lines to `/dev/null` (#1316). launchd creates that file under
+/// its own umask, so the daemon tightens it to `0600` on startup
+/// ([`super::server::run_with_shutdown`]).
+///
 /// Paths are XML-escaped before interpolation: `&`, `<`, `>` are all legal in
 /// filenames (a home or `--socket` dir named `A&B`), and unescaped they would
 /// produce malformed plist XML that `launchctl bootstrap` rejects with an opaque
@@ -57,12 +65,19 @@ pub fn plist_path() -> Result<PathBuf> {
 /// plist, so it is rejected here rather than silently corrupted by
 /// `Path::display()`. See issue #991.
 fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
+    // The log path is derived from the socket's parent, so it is UTF-8 whenever
+    // the socket is; validate it explicitly all the same to keep the plist
+    // strictly UTF-8. Computed before `socket` is shadowed to `&str` below.
+    let log = paths::log_path_for_socket(socket);
     let exe = exe
         .to_str()
         .with_context(|| format!("executable path is not valid UTF-8: {}", exe.display()))?;
     let socket = socket
         .to_str()
         .with_context(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
+    let log = log
+        .to_str()
+        .with_context(|| format!("log path is not valid UTF-8: {}", log.display()))?;
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,6 +107,10 @@ fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
             <string>stream</string>
         </dict>
     </dict>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
     <key>ProcessType</key>
     <string>Interactive</string>
 </dict>
@@ -102,6 +121,7 @@ fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
         label = LAUNCHD_LABEL,
         exe = quick_xml::escape::escape(exe),
         socket = quick_xml::escape::escape(socket),
+        log = quick_xml::escape::escape(log),
     ))
 }
 
@@ -399,6 +419,38 @@ mod tests {
         assert!(!plist.contains("RunAtLoad"), "{plist}");
         assert!(!plist.contains("KeepAlive"), "{plist}");
 
+        assert_well_formed(&plist);
+    }
+
+    #[test]
+    fn sinks_stdio_to_the_daemon_log_beside_the_socket() {
+        // Without a std-stream sink launchd discards the daemon's stdout/stderr to
+        // /dev/null, so its lifecycle log lines never reach an operator (#1316).
+        // Both streams point at the `daemon.log` co-located with the socket — the
+        // exact path the non-launchd detached-spawn launcher already writes.
+        let plist = render_plist(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+        )
+        .expect("ASCII paths render");
+
+        assert!(
+            plist.contains(
+                "<key>StandardOutPath</key>\n    <string>/tmp/omni-dev/daemon.log</string>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "<key>StandardErrorPath</key>\n    <string>/tmp/omni-dev/daemon.log</string>"
+            ),
+            "{plist}"
+        );
+        assert_eq!(
+            paths::log_path_for_socket(Path::new("/tmp/omni-dev/daemon.sock")),
+            Path::new("/tmp/omni-dev/daemon.log"),
+            "the sink must match the launcher's log path"
+        );
         assert_well_formed(&plist);
     }
 
