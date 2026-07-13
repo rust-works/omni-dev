@@ -15,6 +15,27 @@ export interface TreeGithubIdentity {
   name: string;
 }
 
+/**
+ * The rolled-up CI state of a pull request's head commit, reduced from `gh`'s
+ * `statusCheckRollup` to a single verdict (#1296): `success` (all checks passed),
+ * `failure` (at least one failed/errored/cancelled), `pending` (some still
+ * running, none failed), or `none` (no checks configured).
+ */
+export type PrCheckState = "success" | "failure" | "pending" | "none";
+
+/**
+ * The pull-request badge folded onto a worktree node (#1296). Derived
+ * extension-side from `gh pr list` (see `github.ts`), it is the minimum needed to
+ * render `#<number>` plus a draft marker and a checks glyph, with `url` kept for
+ * the tooltip and any future open-on-click.
+ */
+export interface PrBadge {
+  number: number;
+  isDraft: boolean;
+  checks: PrCheckState;
+  url: string;
+}
+
 /** One worktree of a repository, as it appears in the `tree` payload. */
 export interface TreeWorktreePayload {
   /** Absolute path to the worktree's working directory. */
@@ -36,6 +57,14 @@ export interface TreeWorktreePayload {
   open: boolean;
   /** The open window's registry key, present only when `open`. */
   window_key?: string;
+  /**
+   * The open pull request whose head is this worktree's branch (#1296). Like
+   * {@link TreeWorktreePayload.ahead}, it is **not** on the daemon wire — it is
+   * resolved extension-side via `gh` on repo-expand and folded in by
+   * {@link withPr}. Absent for a detached/non-GitHub worktree, or one with no
+   * open PR (or until fetched).
+   */
+  pr?: PrBadge;
 }
 
 /**
@@ -64,6 +93,19 @@ export function withAheadBehind(
     return wt;
   }
   return { ...wt, ahead: ab.ahead, behind: ab.behind };
+}
+
+/**
+ * Folds a lazily-resolved {@link PrBadge} into a worktree payload, returning a new
+ * payload carrying it (#1296) — the PR counterpart of {@link withAheadBehind}. An
+ * absent badge (no GitHub identity, no matching PR, or not yet fetched) leaves the
+ * worktree unchanged, so it renders with no PR indicator.
+ */
+export function withPr(wt: TreeWorktreePayload, pr?: PrBadge): TreeWorktreePayload {
+  if (pr === undefined) {
+    return wt;
+  }
+  return { ...wt, pr };
 }
 
 /** One repository with **all** its worktrees, as it appears in the `tree` payload. */
@@ -144,11 +186,11 @@ export function worktreeLabel(wt: TreeWorktreePayload): string {
 }
 
 /**
- * The muted sync description, e.g. `↑2 ↓0`. Each side is shown only when its
- * count is present (both are absent together when the branch has no upstream),
- * so a no-upstream worktree yields an empty description.
+ * The muted sync counts, e.g. `↑2 ↓0`. Each side is shown only when its count is
+ * present (both are absent together when the branch has no upstream), so a
+ * no-upstream worktree yields an empty string.
  */
-export function worktreeDescription(wt: TreeWorktreePayload): string {
+function syncCounts(wt: TreeWorktreePayload): string {
   const parts: string[] = [];
   if (wt.ahead !== undefined) {
     parts.push(`↑${wt.ahead}`);
@@ -159,10 +201,84 @@ export function worktreeDescription(wt: TreeWorktreePayload): string {
   return parts.join(" ");
 }
 
+/** The glyph for a rolled-up checks state, or `""` when there are no checks. */
+function prCheckGlyph(checks: PrCheckState): string {
+  switch (checks) {
+    case "success":
+      return "✓";
+    case "failure":
+      return "✗";
+    case "pending":
+      return "●";
+    case "none":
+      return "";
+  }
+}
+
 /**
- * A multi-line hover tooltip: path, main/linked, branch+sync, parent repo, open
- * state. The open line distinguishes the current window (`● this window`) from a
- * worktree merely open elsewhere (`● window open`) when `windowKey` is supplied.
+ * The muted PR badge, e.g. `#65`, `#65 ✓`, `#65 draft`, `#65 draft ✗` (#1296).
+ * Empty when the worktree carries no {@link PrBadge}, so a worktree with no open
+ * PR renders no PR indicator. The checks glyph is appended only when the PR has
+ * checks configured (`none` → no glyph).
+ */
+export function worktreePrBadge(wt: TreeWorktreePayload): string {
+  const pr = wt.pr;
+  if (pr === undefined) {
+    return "";
+  }
+  const parts = [`#${pr.number}`];
+  if (pr.isDraft) {
+    parts.push("draft");
+  }
+  const glyph = prCheckGlyph(pr.checks);
+  if (glyph) {
+    parts.push(glyph);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The muted row description: the sync counts and the PR badge, each shown only
+ * when present, separated by a gap. A worktree with neither (no upstream, no PR)
+ * yields an empty description — byte-for-byte the pre-#1296 behavior.
+ */
+export function worktreeDescription(wt: TreeWorktreePayload): string {
+  return [syncCounts(wt), worktreePrBadge(wt)].filter(Boolean).join("  ");
+}
+
+/** The word for a rolled-up checks state, or `""` when there are no checks. */
+function prChecksWord(checks: PrCheckState): string {
+  switch (checks) {
+    case "success":
+      return "checks passing";
+    case "failure":
+      return "checks failing";
+    case "pending":
+      return "checks pending";
+    case "none":
+      return "";
+  }
+}
+
+/** The tooltip's PR line, e.g. `PR #65 · open · checks passing`, or `undefined`. */
+function worktreePrTooltipLine(wt: TreeWorktreePayload): string | undefined {
+  const pr = wt.pr;
+  if (pr === undefined) {
+    return undefined;
+  }
+  const parts = [`PR #${pr.number}`, pr.isDraft ? "draft" : "open"];
+  const checks = prChecksWord(pr.checks);
+  if (checks) {
+    parts.push(checks);
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * A multi-line hover tooltip: path, main/linked, branch+sync, the PR (when one is
+ * resolved), parent repo, open state. The open line distinguishes the current
+ * window (`● this window`) from a worktree merely open elsewhere (`● window open`)
+ * when `windowKey` is supplied.
  */
 export function worktreeTooltip(
   wt: TreeWorktreePayload,
@@ -171,14 +287,20 @@ export function worktreeTooltip(
 ): string {
   const kind = wt.is_main ? "main working tree" : "linked worktree";
   const branch = wt.branch ?? "(detached)";
-  const sync = worktreeDescription(wt);
+  const sync = syncCounts(wt);
   const branchLine = sync ? `${branch}  ${sync}` : branch;
   const openLine = isCurrentWindow(wt, windowKey)
     ? "● this window"
     : wt.open
       ? "● window open"
       : "no window open";
-  return [wt.path, `${kind} of ${repoLabel(repo)}`, branchLine, openLine].join("\n");
+  const lines = [wt.path, `${kind} of ${repoLabel(repo)}`, branchLine];
+  const prLine = worktreePrTooltipLine(wt);
+  if (prLine) {
+    lines.push(prLine);
+  }
+  lines.push(openLine);
+  return lines.join("\n");
 }
 
 /**

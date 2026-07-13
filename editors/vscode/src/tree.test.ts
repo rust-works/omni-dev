@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  PrBadge,
   TreeRepoPayload,
   TreeWorktreePayload,
   isCurrentWindow,
@@ -11,10 +12,12 @@ import {
   repoLabel,
   reposToNodes,
   withAheadBehind,
+  withPr,
   worktreeContextValue,
   worktreeDescription,
   worktreeLabel,
   worktreeNodes,
+  worktreePrBadge,
   worktreeTooltip,
 } from "./tree";
 
@@ -190,6 +193,80 @@ test("worktreeContextValue appends `.github` only when the parent repo is on Git
   // …and both GitHub variants match the new Open-PR menu's `/github/` gate.
   assert.match(worktreeContextValue(REPOS[0].worktrees[0], "w1", true), /github/);
   assert.match(worktreeContextValue(REPOS[0].worktrees[1], "w1", true), /github/);
+});
+
+// --- PR badge (#1296) --------------------------------------------------------
+
+const OPEN_PR: PrBadge = {
+  number: 65,
+  isDraft: false,
+  checks: "success",
+  url: "https://github.com/rust-works/omni-dev/pull/65",
+};
+
+test("worktreePrBadge formats the number, draft marker, and a checks glyph", () => {
+  const wt = REPOS[0].worktrees[0];
+  assert.equal(worktreePrBadge({ ...wt, pr: OPEN_PR }), "#65 ✓");
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "failure" } }), "#65 ✗");
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), "#65 ●");
+  // No checks configured → just the number.
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "none" } }), "#65");
+  // Draft → a `draft` marker, with the checks glyph after it.
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true } }), "#65 draft ✓");
+  assert.equal(
+    worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true, checks: "none" } }),
+    "#65 draft",
+  );
+  // No PR → empty.
+  assert.equal(worktreePrBadge(wt), "");
+});
+
+test("withPr folds a badge in, and no-ops when absent", () => {
+  const base = REPOS[0].worktrees[0]; // carries no pr
+  const merged = withPr(base, OPEN_PR);
+  assert.deepEqual(merged.pr, OPEN_PR);
+  // The original is not mutated (a fresh object is returned).
+  assert.equal(base.pr, undefined);
+  // An absent badge leaves the worktree untouched — same reference.
+  assert.equal(withPr(base, undefined), base);
+});
+
+test("worktreeDescription shows sync and PR together, each only when present", () => {
+  // Sync only (no PR) — byte-for-byte the pre-#1296 behavior.
+  assert.equal(worktreeDescription(REPOS[0].worktrees[0]), "↑2 ↓0");
+  // Sync + PR, separated by a gap.
+  assert.equal(worktreeDescription({ ...REPOS[0].worktrees[0], pr: OPEN_PR }), "↑2 ↓0  #65 ✓");
+  // PR only (no upstream counts).
+  assert.equal(
+    worktreeDescription({ path: "/x", is_main: true, open: false, pr: OPEN_PR }),
+    "#65 ✓",
+  );
+  // Neither → empty.
+  assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }), "");
+});
+
+test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
+  const withPrTip = worktreeTooltip({ ...REPOS[0].worktrees[0], pr: OPEN_PR }, REPOS[0], "w1");
+  assert.match(withPrTip, /PR #65 · open · checks passing/);
+  // The branch line keeps only the sync counts — the PR is not duplicated there.
+  assert.match(withPrTip, /main {2}↑2 ↓0/);
+
+  const draftFailing = worktreeTooltip(
+    { ...REPOS[0].worktrees[0], pr: { ...OPEN_PR, isDraft: true, checks: "failure" } },
+    REPOS[0],
+  );
+  assert.match(draftFailing, /PR #65 · draft · checks failing/);
+
+  // A PR with no checks omits the checks clause.
+  const noChecks = worktreeTooltip(
+    { ...REPOS[0].worktrees[0], pr: { ...OPEN_PR, checks: "none" } },
+    REPOS[0],
+  );
+  assert.match(noChecks, /PR #65 · open$/m);
+  assert.doesNotMatch(noChecks, /checks/);
+
+  // No PR → no PR line at all.
+  assert.doesNotMatch(worktreeTooltip(REPOS[0].worktrees[0], REPOS[0]), /PR #/);
 });
 
 test("nodeId is stable and distinguishes repos from worktrees", () => {
