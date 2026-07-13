@@ -322,7 +322,6 @@ function setupTreeView(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("omniDevWorktrees.refresh", () => void refreshTree()),
-    vscode.commands.registerCommand("omniDevWorktrees.open", (node?: Node) => void openNode(node)),
     vscode.commands.registerCommand(ITEM_CLICKED_COMMAND, (node?: Node) => onItemClicked(node)),
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWorktree",
