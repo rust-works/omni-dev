@@ -123,31 +123,68 @@ impl Transport {
                 .data
                 .get("getResultUrl")
                 .and_then(Value::as_str)
-                .ok_or_else(|| Error::Protocol("async query response missing getResultUrl".into()))?
-                .to_string();
+                .ok_or_else(|| {
+                    Error::Protocol("async query response missing getResultUrl".into())
+                })?;
+            let url = Url::parse(result_url)
+                .or_else(|_| self.base_url.join(result_url))
+                .map_err(|e| Error::Protocol(format!("invalid result URL '{result_url}': {e}")))?;
             raw = self
-                .poll_result(&result_url, token, deadline, poll_interval)
+                .poll_until_ready(&url, token, deadline, poll_interval)
                 .await?;
         }
         finalize(raw)
     }
 
-    /// Polls a result URL until the query is no longer in progress.
-    async fn poll_result(
+    /// Fetches one child statement's result by its query id, polling until it is
+    /// no longer in progress. Used by the multi-statement path, where the parent
+    /// submission returns a list of child `resultIds` rather than inline rows;
+    /// each is retrieved from the `/queries/{id}/result` monitoring endpoint.
+    ///
+    /// # Errors
+    ///
+    /// As [`post_statement`](Self::post_statement).
+    pub(crate) async fn get_statement_result(
         &self,
-        result_url: &str,
+        query_id: &str,
+        token: &str,
+        deadline: Duration,
+        poll_interval: Duration,
+    ) -> Result<Value> {
+        let rid = request_id();
+        let url = self.resolve(
+            &format!("queries/{query_id}/result"),
+            &[("requestId", rid.as_str())],
+        )?;
+        let mut raw = self
+            .send_with_retry("GET", &url, || self.get_request(url.clone(), Some(token)))
+            .await?;
+        if SESSION_EXPIRED_CODES.contains(&raw.code.as_str()) {
+            return Err(Error::SessionExpired);
+        }
+        if IN_PROGRESS_CODES.contains(&raw.code.as_str()) {
+            raw = self
+                .poll_until_ready(&url, token, deadline, poll_interval)
+                .await?;
+        }
+        finalize(raw)
+    }
+
+    /// Polls `url` (GET) until the query is no longer in progress, or `deadline`
+    /// elapses. Sleeps before each poll so the caller's initial request is not
+    /// re-issued immediately.
+    async fn poll_until_ready(
+        &self,
+        url: &Url,
         token: &str,
         deadline: Duration,
         poll_interval: Duration,
     ) -> Result<RawResponse> {
-        let url = Url::parse(result_url)
-            .or_else(|_| self.base_url.join(result_url))
-            .map_err(|e| Error::Protocol(format!("invalid result URL '{result_url}': {e}")))?;
         let start = Instant::now();
         loop {
             tokio::time::sleep(poll_interval).await;
             let raw = self
-                .send_with_retry("GET", &url, || self.get_request(url.clone(), Some(token)))
+                .send_with_retry("GET", url, || self.get_request(url.clone(), Some(token)))
                 .await?;
             if !IN_PROGRESS_CODES.contains(&raw.code.as_str()) {
                 return Ok(raw);
@@ -553,5 +590,69 @@ mod tests {
             Error::Server { code, .. } => assert_eq!(code, "timeout"),
             other => panic!("expected timeout, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn get_statement_result_fetches_a_child_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/queries/01ab-cdef/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": { "rowtype": [{ "name": "N", "type": "fixed" }], "rowset": [["7"]] }
+            })))
+            .mount(&server)
+            .await;
+
+        let data = transport(&server)
+            .get_statement_result(
+                "01ab-cdef",
+                "tok",
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data["rowset"][0][0], "7");
+        // A single GET, no polling.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_statement_result_polls_an_in_progress_child() {
+        let server = MockServer::start().await;
+        // First GET: still running.
+        Mock::given(method("GET"))
+            .and(path("/queries/qid/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "code": "333333", "data": {}
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Then the result.
+        Mock::given(method("GET"))
+            .and(path("/queries/qid/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": { "rowtype": [{ "name": "N", "type": "fixed" }], "rowset": [["1"]] }
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let data = transport(&server)
+            .get_statement_result(
+                "qid",
+                "tok",
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data["rowset"][0][0], "1");
+        // initial + one poll.
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 pub use config::{AuthMethod, BrowserConfig, BrowserLaunch, KeyPairConfig, SnowflakeClientConfig};
 pub use error::{Error, Result};
-pub use row::{rows_to_payload, value_to_json, Column, Row};
+pub use row::{rows_to_multi_payload, rows_to_payload, value_to_json, Column, Row};
 pub use session::{AbortHandle, SnowflakeSession};
 
 use transport::Transport;

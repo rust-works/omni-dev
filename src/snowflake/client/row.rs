@@ -130,6 +130,19 @@ pub fn rows_to_payload(rows: &[Row]) -> Value {
     json!({ "columns": columns, "rows": out })
 }
 
+/// Builds the uniform multi-statement payload from one row set per statement.
+///
+/// The shape is `{ statements: [ {columns, rows}, … ] }`; a single-statement
+/// query is a one-element `statements` array, so every query result is uniform.
+#[must_use]
+pub fn rows_to_multi_payload(statements: &[Vec<Row>]) -> Value {
+    let statements: Vec<Value> = statements
+        .iter()
+        .map(|rows| rows_to_payload(rows))
+        .collect();
+    json!({ "statements": statements })
+}
+
 /// Maps a single raw cell to JSON according to its column type. Total: any
 /// decode failure falls back to the raw string (or `null`).
 #[must_use]
@@ -419,5 +432,30 @@ mod tests {
         assert_eq!(obj.get("N"), Some(&json!(1)));
         assert_eq!(obj.get("N_2"), Some(&json!(2)), "second N is not dropped");
         assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn rows_to_multi_payload_wraps_each_statement() {
+        let columns = Arc::new(vec![Column {
+            name: "N".to_string(),
+            ty: "fixed".to_string(),
+            nullable: false,
+            length: None,
+            precision: Some(38),
+            scale: Some(0),
+        }]);
+        let index = Arc::new(HashMap::from([("N".to_string(), 0)]));
+        let row = Row::new(vec![Some("1".to_string())], columns, index);
+
+        // Even a single statement is a one-element `statements` array.
+        let one = rows_to_multi_payload(&[vec![row.clone()]]);
+        assert_eq!(one["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(one["statements"][0]["rows"][0]["N"], json!(1));
+
+        // Two statements → two entries, with an empty result set preserved.
+        let two = rows_to_multi_payload(&[vec![row], vec![]]);
+        let stmts = two["statements"].as_array().unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[1], json!({ "columns": [], "rows": [] }));
     }
 }
