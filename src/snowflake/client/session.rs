@@ -224,12 +224,85 @@ impl SnowflakeSession {
             .await;
         self.clear_in_flight();
         let data = result?;
+        self.rows_from_data(&data).await
+    }
 
-        let (columns, index, mut rows) = parse_result(&data)?;
-        // Large results stream the tail as external blob chunks; download and
-        // append each (gzip-compressed JSON arrays).
+    /// Runs SQL that may contain **multiple** `;`-separated statements, returning
+    /// one row set per statement (in submission order).
+    ///
+    /// A single-statement submission takes the same path as [`query`](Self::query)
+    /// and yields a one-element vector. When the SQL parses to more than one
+    /// statement it is submitted with `MULTI_STATEMENT_COUNT = 0` ("any count"):
+    /// the server then returns a comma-separated list of child `resultIds` in
+    /// place of inline rows, and each child result is fetched from the
+    /// `/queries/{id}/result` endpoint.
+    ///
+    /// # Errors
+    ///
+    /// As [`query`](Self::query).
+    pub async fn query_multi(&self, sql: &str) -> Result<Vec<Vec<Row>>> {
+        // A single statement keeps the exact, cheaper single-result path — no
+        // `MULTI_STATEMENT_COUNT`, no child-result round trips.
+        if count_statements(sql) <= 1 {
+            return Ok(vec![self.query(sql).await?]);
+        }
+
+        let token = self.lock().session_token.clone();
+        let rid = request_id();
+        // 0 = "any count": the server runs however many statements are actually
+        // present, so this does not depend on `count_statements` agreeing exactly
+        // with the server's own parse.
+        let body = json!({ "sqlText": sql, "parameters": { "MULTI_STATEMENT_COUNT": 0 } });
+        // Publish the submission so an `AbortHandle` can cancel it — as `query`
+        // does — then clear it once submission + polling returns. The whole
+        // script runs under this one request id, so this is the cancellable part;
+        // the child-result fetches below are reads of finished statements.
+        self.set_in_flight(InFlight {
+            request_id: rid.clone(),
+            sql: sql.to_string(),
+            session_token: token.clone(),
+        });
+        let result = self
+            .transport
+            .post_statement(
+                &[("requestId", rid.as_str())],
+                &body,
+                token.expose_secret(),
+                self.query_timeout,
+                POLL_INTERVAL,
+            )
+            .await;
+        self.clear_in_flight();
+        let data = result?;
+
+        // A multi-statement submission returns child query ids (comma-separated)
+        // rather than inline rows; fetch each child's result set. If the server
+        // collapsed it to an inline result (no `resultIds`), return that one set.
+        let Some(ids) = data
+            .get("resultIds")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(vec![self.rows_from_data(&data).await?]);
+        };
+
+        let mut results = Vec::new();
+        for id in ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let child = self
+                .transport
+                .get_statement_result(id, token.expose_secret(), self.query_timeout, POLL_INTERVAL)
+                .await?;
+            results.push(self.rows_from_data(&child).await?);
+        }
+        Ok(results)
+    }
+
+    /// Parses a query-request `data` payload into rows, downloading and appending
+    /// any external result chunks (gzip-compressed JSON arrays).
+    async fn rows_from_data(&self, data: &Value) -> Result<Vec<Row>> {
+        let (columns, index, mut rows) = parse_result(data)?;
         if let Some(chunks) = data.get("chunks").and_then(Value::as_array) {
-            let headers = parse_chunk_headers(&data);
+            let headers = parse_chunk_headers(data);
             for chunk in chunks {
                 if let Some(url) = chunk.get("url").and_then(Value::as_str) {
                     let bytes = self.transport.get_bytes(url, &headers).await?;
@@ -478,6 +551,124 @@ fn cell_to_string(value: &Value) -> Option<String> {
         Value::String(s) => Some(s.clone()),
         other => Some(other.to_string()),
     }
+}
+
+/// Lexer state while scanning SQL for top-level statement separators.
+#[derive(PartialEq, Eq)]
+enum ScanState {
+    /// Ordinary SQL text.
+    Normal,
+    /// Inside a `'…'` string literal (`''` escapes a quote; `\` escapes a char).
+    Single,
+    /// Inside a `"…"` quoted identifier (`""` escapes a quote).
+    Double,
+    /// Inside a `-- …` line comment (ends at newline).
+    Line,
+    /// Inside a `/* … */` block comment.
+    Block,
+    /// Inside a `$$ … $$` dollar-quoted block (stored-proc / anonymous block body).
+    Dollar,
+}
+
+/// Counts the non-empty top-level SQL statements in `sql`, ignoring `;` that
+/// appear inside string / quoted-identifier literals, line and block comments,
+/// and `$$`-delimited blocks.
+///
+/// Used only to decide **whether** to submit with `MULTI_STATEMENT_COUNT` — the
+/// count actually sent is `0` (any count), so this is a routing hint, not a
+/// contract. It is deliberately conservative: a genuine separator between two
+/// statements is always counted, so a real multi-statement script is never
+/// mis-submitted as a single statement.
+fn count_statements(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut state = ScanState::Normal;
+    let mut count = 0usize;
+    // Whether the statement currently being scanned has any non-whitespace,
+    // non-comment content (so trailing `;` and blank/`;`-only input count as 0).
+    let mut has_content = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match state {
+            ScanState::Normal => match c {
+                b'\'' => {
+                    state = ScanState::Single;
+                    has_content = true;
+                }
+                b'"' => {
+                    state = ScanState::Double;
+                    has_content = true;
+                }
+                b'-' if next == Some(b'-') => {
+                    state = ScanState::Line;
+                    i += 1;
+                }
+                b'/' if next == Some(b'*') => {
+                    state = ScanState::Block;
+                    i += 1;
+                }
+                b'$' if next == Some(b'$') => {
+                    state = ScanState::Dollar;
+                    has_content = true;
+                    i += 1;
+                }
+                b';' => {
+                    if has_content {
+                        count += 1;
+                    }
+                    has_content = false;
+                }
+                _ => {
+                    if !c.is_ascii_whitespace() {
+                        has_content = true;
+                    }
+                }
+            },
+            ScanState::Single => match c {
+                b'\'' => {
+                    if next == Some(b'\'') {
+                        i += 1; // '' — an escaped quote; stay in the string.
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+                b'\\' => i += 1, // backslash escape (e.g. \'); skip the next char.
+                _ => {}
+            },
+            ScanState::Double => {
+                if c == b'"' {
+                    if next == Some(b'"') {
+                        i += 1; // "" — an escaped quote; stay in the identifier.
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+            ScanState::Line => {
+                if c == b'\n' {
+                    state = ScanState::Normal;
+                }
+            }
+            ScanState::Block => {
+                if c == b'*' && next == Some(b'/') {
+                    state = ScanState::Normal;
+                    i += 1;
+                }
+            }
+            ScanState::Dollar => {
+                if c == b'$' && next == Some(b'$') {
+                    state = ScanState::Normal;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    if has_content {
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -877,5 +1068,110 @@ mod tests {
                 "AES256".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn count_statements_counts_top_level_separators() {
+        assert_eq!(count_statements(""), 0);
+        assert_eq!(count_statements("   \n  "), 0);
+        assert_eq!(count_statements(";;;"), 0, "empty statements don't count");
+        assert_eq!(count_statements("SELECT 1"), 1);
+        assert_eq!(count_statements("SELECT 1;"), 1, "trailing ; is not a stmt");
+        assert_eq!(count_statements("SELECT 1; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT 1; SELECT 2;"), 2);
+        assert_eq!(
+            count_statements("USE WAREHOUSE WH; USE ROLE R; SELECT 1"),
+            3
+        );
+    }
+
+    #[test]
+    fn count_statements_ignores_separators_in_literals_and_comments() {
+        // `;` inside a single-quoted string is not a separator.
+        assert_eq!(count_statements("SELECT ';'"), 1);
+        assert_eq!(count_statements("SELECT ';'; SELECT 2"), 2);
+        // Escaped quotes (both doubling and backslash) keep the string open.
+        assert_eq!(count_statements("SELECT 'it''s; ok'"), 1);
+        assert_eq!(count_statements("SELECT 'it\\'s; ok'; SELECT 2"), 2);
+        // Quoted identifiers.
+        assert_eq!(count_statements("SELECT 1 AS \"a;b\""), 1);
+        // Line and block comments.
+        assert_eq!(count_statements("SELECT 1 -- a; b\n; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT 1 /* a; b */; SELECT 2"), 2);
+        // Dollar-quoted proc body: internal `;` are part of one statement.
+        assert_eq!(
+            count_statements("CREATE PROC p() AS $$ BEGIN a; b; END $$; SELECT 1"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn query_multi_single_statement_returns_one_result_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "queryResultFormat": "json",
+                    "rowtype": [{ "name": "N", "type": "fixed", "precision": 38, "scale": 0 }],
+                    "rowset": [["1"], ["2"]],
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let results = live_session(&server, 3600)
+            .query_multi("SELECT 1")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "one statement → one result set");
+        assert_eq!(results[0].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_multi_follows_result_ids_for_each_statement() {
+        let server = MockServer::start().await;
+        // The multi-statement submission returns child ids, not inline rows.
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": { "resultIds": "id-a,id-b", "resultTypes": "1,1" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/queries/id-a/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "queryResultFormat": "json",
+                    "rowtype": [{ "name": "A", "type": "text" }],
+                    "rowset": [["x"]],
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/queries/id-b/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "queryResultFormat": "json",
+                    "rowtype": [{ "name": "B", "type": "fixed", "precision": 38, "scale": 0 }],
+                    "rowset": [["1"], ["2"]],
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let results = live_session(&server, 3600)
+            .query_multi("USE ROLE R; SELECT 2")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2, "two statements → two result sets");
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[1].len(), 2);
     }
 }
