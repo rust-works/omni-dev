@@ -105,7 +105,12 @@ impl OmniDevServer {
             "message",
         )
         .map_err(tool_error)?;
-        let response = ai::run_chat(&message, params.model, params.system_prompt)
+        // Fall back to `settings.mcp.default_model` when the caller omits `model`
+        // (issue #620); the tool parameter still takes precedence when supplied.
+        let model = params
+            .model
+            .or_else(|| crate::utils::settings::Settings::load_mcp().default_model);
+        let response = ai::run_chat(&message, model, params.system_prompt)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(response)]))
@@ -376,6 +381,124 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.to_lowercase().contains("not found"));
+
+        restore_ai_env(snap);
+    }
+
+    /// Writes `settings.json` under the given (tempdir) home so `load_mcp()`
+    /// picks it up, with the supplied `mcp.default_model`.
+    fn write_mcp_default_model(home: &std::path::Path, model: &str) {
+        let dir = home.join(".omni-dev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{"mcp":{{"default_model":"{model}"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Mounts a stub chat-completions endpoint and returns the running server;
+    /// the model actually sent is asserted afterwards via `received_requests`.
+    async fn mount_chat_stub() -> wiremock::MockServer {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "test",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+            )
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    async fn model_sent_on_wire(mock: &wiremock::MockServer) -> String {
+        // The Ollama backend also issues context-length probe requests, so pick
+        // the chat-completions request out of the recorded set by its `messages`
+        // field rather than assuming a single request.
+        let received = mock.received_requests().await.expect("recorded requests");
+        let chat = received
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .find(|b| b.get("messages").is_some())
+            .expect("a chat-completions request carrying messages");
+        chat["model"].as_str().expect("model on wire").to_string()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ai_chat_uses_settings_default_model_when_param_absent() {
+        // issue #620: `mcp.default_model` supplies the model when the tool's
+        // `model` parameter is omitted.
+        let _guard = AI_CHAT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snap = snapshot_ai_env();
+        let home = tempdir();
+        std::env::set_var("HOME", home.path());
+        for k in AI_CHAT_KEYS.iter().filter(|k| **k != "HOME") {
+            std::env::remove_var(k);
+        }
+        write_mcp_default_model(home.path(), "settings-model");
+
+        let mock = mount_chat_stub().await;
+        std::env::set_var("USE_OLLAMA", "true");
+        std::env::set_var("OLLAMA_BASE_URL", mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .ai_chat(Parameters(AiChatParams {
+                message: Some("hi".to_string()),
+                message_path: None,
+                model: None,
+                system_prompt: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert_eq!(model_sent_on_wire(&mock).await, "settings-model");
+
+        restore_ai_env(snap);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ai_chat_tool_model_param_overrides_settings_default() {
+        // The tool's explicit `model` still wins over `mcp.default_model`.
+        let _guard = AI_CHAT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snap = snapshot_ai_env();
+        let home = tempdir();
+        std::env::set_var("HOME", home.path());
+        for k in AI_CHAT_KEYS.iter().filter(|k| **k != "HOME") {
+            std::env::remove_var(k);
+        }
+        write_mcp_default_model(home.path(), "settings-model");
+
+        let mock = mount_chat_stub().await;
+        std::env::set_var("USE_OLLAMA", "true");
+        std::env::set_var("OLLAMA_BASE_URL", mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .ai_chat(Parameters(AiChatParams {
+                message: Some("hi".to_string()),
+                message_path: None,
+                model: Some("param-model".to_string()),
+                system_prompt: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert_eq!(model_sent_on_wire(&mock).await, "param-model");
 
         restore_ai_env(snap);
     }

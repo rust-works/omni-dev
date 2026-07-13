@@ -104,6 +104,32 @@ pub struct Profile {
     pub env: HashMap<String, String>,
 }
 
+/// The `mcp` section of `settings.json` — defaults for the `omni-dev-mcp`
+/// server (issue #620).
+///
+/// Every field is optional; an unset field falls back to the built-in default,
+/// so an absent `mcp` block preserves the server's behaviour byte-for-byte. See
+/// [`Settings::load_mcp`] for the loader and `crate::mcp` for the wiring.
+#[derive(Debug, Default, Deserialize)]
+pub struct McpSettings {
+    /// Default AI model for the `ai_chat` tool, used when the tool's own
+    /// `model` parameter is absent. Falls back to the model registry default.
+    #[serde(default)]
+    pub default_model: Option<String>,
+
+    /// Default tracing directive for the server (e.g. `"info"`,
+    /// `"omni_dev::mcp=debug"`). `RUST_LOG` overrides this when set; the
+    /// built-in fallback is `"warn"`.
+    #[serde(default)]
+    pub log_level: Option<String>,
+
+    /// Default cap, in bytes, on an MCP tool response before it is truncated.
+    /// Falls back to the server's built-in `DEFAULT_MAX_RESPONSE_BYTES`
+    /// (100 KB). A value of `0` disables truncation.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+}
+
 /// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
@@ -116,6 +142,11 @@ pub struct Settings {
     /// chain (isolated / AWS-faithful); see [`Settings::resolve_with`].
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+
+    /// MCP server defaults (issue #620); an absent block yields
+    /// [`McpSettings::default`].
+    #[serde(default)]
+    pub mcp: McpSettings,
 }
 
 /// Returns the active profile name from `raw` (the process environment), or
@@ -182,6 +213,14 @@ impl Settings {
     pub fn load() -> Result<Self> {
         let settings_path = Self::get_settings_path()?;
         Self::load_from_path(&settings_path)
+    }
+
+    /// Loads just the [`mcp`](McpSettings) section, falling back to its defaults
+    /// when the settings file is absent or unreadable — so the MCP server always
+    /// boots even with a malformed `settings.json` (issue #620). Mirrors the
+    /// graceful `unwrap_or_default` of [`SettingsEnv::load`].
+    pub fn load_mcp() -> McpSettings {
+        Self::load().map(|s| s.mcp).unwrap_or_default()
     }
 
     /// Loads settings from a specific path.
@@ -563,6 +602,7 @@ mod tests {
         Settings {
             env: base,
             profiles,
+            ..Settings::default()
         }
     }
 
@@ -825,6 +865,44 @@ mod tests {
     fn settings_without_profiles_key_defaults_empty() {
         let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
         assert!(settings.profiles.is_empty());
+    }
+
+    #[test]
+    fn settings_parse_mcp_section_from_json() {
+        let json = r#"{
+            "mcp": {
+                "default_model": "claude-sonnet-4-6",
+                "log_level": "info",
+                "max_response_bytes": 204800
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.mcp.default_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(settings.mcp.log_level.as_deref(), Some("info"));
+        assert_eq!(settings.mcp.max_response_bytes, Some(204_800));
+    }
+
+    #[test]
+    fn settings_without_mcp_key_defaults_all_none() {
+        // An absent `mcp` block must leave every field unset so callers fall
+        // back to the built-in defaults (byte-for-byte behaviour, issue #620).
+        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
+        assert!(settings.mcp.default_model.is_none());
+        assert!(settings.mcp.log_level.is_none());
+        assert!(settings.mcp.max_response_bytes.is_none());
+    }
+
+    #[test]
+    fn settings_mcp_partial_section_leaves_others_none() {
+        // A block that sets only one field leaves the rest at their defaults.
+        let settings: Settings =
+            serde_json::from_str(r#"{ "mcp": { "log_level": "debug" } }"#).unwrap();
+        assert_eq!(settings.mcp.log_level.as_deref(), Some("debug"));
+        assert!(settings.mcp.default_model.is_none());
+        assert!(settings.mcp.max_response_bytes.is_none());
     }
 
     // ── free get_env_var seam (pure: injected raw env + lazy settings loader) ──

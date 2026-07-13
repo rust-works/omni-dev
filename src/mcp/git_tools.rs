@@ -356,21 +356,33 @@ impl OmniDevServer {
     }
 }
 
-/// Wraps a text result in a `CallToolResult`, applying the default response
+/// Wraps a text result in a `CallToolResult`, applying the configured response
 /// cap and emitting a second `Content::text` payload carrying a JSON
 /// `{"truncated": bool, "original_bytes": usize}` marker when truncation
 /// happened.
 ///
 /// Shared by every tool that can produce large output so the truncation
-/// contract is consistent across the MCP surface.
+/// contract is consistent across the MCP surface. The cap is
+/// `settings.mcp.max_response_bytes` when set, else
+/// [`DEFAULT_MAX_RESPONSE_BYTES`] (issue #620).
 pub(crate) fn build_truncated_result(text: String) -> CallToolResult {
+    let limit = crate::utils::settings::Settings::load_mcp()
+        .max_response_bytes
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+    build_truncated_result_with(text, limit)
+}
+
+/// Cap-parameterised core of [`build_truncated_result`], split out so the
+/// truncation contract can be unit-tested against an explicit `limit` without
+/// reading `settings.json` from the caller's real home directory.
+fn build_truncated_result_with(text: String, limit: usize) -> CallToolResult {
     let original_bytes = text.len();
-    let (body, truncated) = truncate_response(text, DEFAULT_MAX_RESPONSE_BYTES);
+    let (body, truncated) = truncate_response(text, limit);
     if truncated {
         let marker = json!({
             "truncated": true,
             "original_bytes": original_bytes,
-            "limit_bytes": DEFAULT_MAX_RESPONSE_BYTES,
+            "limit_bytes": limit,
         });
         CallToolResult::success(vec![Content::text(body), Content::text(marker.to_string())])
     } else {
@@ -442,8 +454,10 @@ mod tests {
 
     #[test]
     fn build_truncated_result_appends_marker_when_over_cap() {
+        // Use the cap-parameterised core so the assertion is independent of any
+        // `settings.json` in the test runner's real home directory.
         let big = "x".repeat(DEFAULT_MAX_RESPONSE_BYTES + 1024);
-        let result = build_truncated_result(big);
+        let result = build_truncated_result_with(big, DEFAULT_MAX_RESPONSE_BYTES);
         assert_eq!(result.content.len(), 2, "expected body + truncation marker");
         let marker_raw = result.content[1]
             .as_text()
@@ -455,6 +469,32 @@ mod tests {
         let original = parsed["original_bytes"].as_u64().unwrap();
         let limit = parsed["limit_bytes"].as_u64().unwrap();
         assert!(original > limit);
+        assert_eq!(limit, DEFAULT_MAX_RESPONSE_BYTES as u64);
+    }
+
+    #[test]
+    fn build_truncated_result_with_honours_custom_cap() {
+        // A settings-provided `max_response_bytes` (issue #620) truncates at the
+        // configured limit and reports it in the marker.
+        let custom_limit = 32usize;
+        let result = build_truncated_result_with("y".repeat(1024), custom_limit);
+        assert_eq!(result.content.len(), 2, "expected body + truncation marker");
+        let marker_raw = result.content[1]
+            .as_text()
+            .expect("second payload should be text")
+            .text
+            .clone();
+        let parsed: serde_json::Value = serde_json::from_str(&marker_raw).expect("marker is JSON");
+        assert_eq!(parsed["limit_bytes"].as_u64().unwrap(), custom_limit as u64);
+        assert_eq!(parsed["original_bytes"].as_u64().unwrap(), 1024);
+    }
+
+    #[test]
+    fn build_truncated_result_with_zero_cap_disables_truncation() {
+        // `0` means "no limit" (matching `truncate_response`), so a large body
+        // passes through untouched with no marker.
+        let result = build_truncated_result_with("z".repeat(DEFAULT_MAX_RESPONSE_BYTES + 1), 0);
+        assert_eq!(result.content.len(), 1, "no truncation marker expected");
     }
 
     #[test]
