@@ -644,6 +644,29 @@ The Inspector opens a browser UI where you can list tools and resources,
 call any tool interactively, and fetch resources against the current working
 directory.
 
+#### Configuration (`settings.json`)
+
+Three server defaults can be set once in the `mcp` section of
+`~/.omni-dev/settings.json` instead of per-invocation env vars or flags. All
+three fields are optional; an absent `mcp` block leaves the built-in
+behaviour unchanged.
+
+```json
+{
+  "mcp": {
+    "default_model": "claude-sonnet-4-6",
+    "log_level": "info",
+    "max_response_bytes": 102400
+  }
+}
+```
+
+| Field | Effect | Fallback |
+|-------|--------|----------|
+| `default_model` | Model for `ai_chat` when its `model` param is omitted | model registry default |
+| `log_level` | Tracing filter directive for the server | `warn` (env `RUST_LOG` overrides) |
+| `max_response_bytes` | Cap on a tool response before truncation (`0` disables) | 100 KB |
+
 For troubleshooting (stderr logs, `RUST_LOG=debug`, "failed to open git
 repository"), see [docs/mcp.md#troubleshooting](docs/mcp.md#troubleshooting).
 

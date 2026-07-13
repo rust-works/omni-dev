@@ -14,20 +14,44 @@ use rmcp::{
 use tracing_subscriber::EnvFilter;
 
 use super::OmniDevServer;
+use crate::utils::env::{EnvSource, SystemEnv};
+
+/// Resolves the tracing filter directive for the MCP server, honouring the
+/// precedence `RUST_LOG` (process env) > `settings.mcp.log_level` > `"warn"`
+/// (issue #620).
+///
+/// Pure over an injected [`EnvSource`] so the precedence is unit-testable
+/// without mutating the process environment. Empty values at either layer are
+/// ignored so a blank `RUST_LOG` or `log_level` does not mask the next tier.
+fn resolve_log_directive(env: &impl EnvSource, settings_log_level: Option<&str>) -> String {
+    env.var("RUST_LOG")
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            settings_log_level
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "warn".to_string())
+}
 
 /// Initialises the MCP server's tracing subscriber.
+///
+/// The filter directive is resolved via [`resolve_log_directive`]: `RUST_LOG`
+/// wins when set, otherwise the caller-supplied `settings_log_level` (from
+/// `settings.mcp.log_level`), otherwise `"warn"`. Directives are parsed
+/// leniently, so an unrecognised fragment is dropped rather than aborting
+/// startup.
 ///
 /// Returns `Ok(())` when the global subscriber was set, and `Err` when one
 /// was already installed (typical in tests where multiple cases initialise
 /// tracing). Returning a `Result` instead of panicking matches the rest of
 /// the codebase's STYLE-0003 stance.
-pub fn try_init_tracing() -> Result<()> {
+pub fn try_init_tracing(settings_log_level: Option<&str>) -> Result<()> {
+    let directive = resolve_log_directive(&SystemEnv, settings_log_level);
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
+        .with_env_filter(EnvFilter::new(directive))
         .try_init()
         .map_err(|e| anyhow::anyhow!("tracing subscriber already set: {e}"))?;
     Ok(())
@@ -87,6 +111,7 @@ pub fn write_error_chain<W: Write>(writer: &mut W, err: &anyhow::Error) -> std::
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
     use anyhow::{anyhow, Context};
 
     #[test]
@@ -145,9 +170,38 @@ mod tests {
     fn try_init_tracing_is_idempotent_or_errors() {
         // The global subscriber may already be set by another test; both
         // outcomes are acceptable. The point is to execute the function body.
-        let _ = try_init_tracing();
+        let _ = try_init_tracing(None);
         // A second call must not panic; it should just return `Err`.
-        let second = try_init_tracing();
+        let second = try_init_tracing(Some("info"));
         assert!(second.is_err(), "second init should report already-set");
+    }
+
+    #[test]
+    fn resolve_log_directive_rust_log_beats_settings() {
+        // Env-var precedence (issue #620): a set `RUST_LOG` wins over the
+        // settings-provided level.
+        let env = MapEnv::new().with("RUST_LOG", "debug");
+        assert_eq!(resolve_log_directive(&env, Some("info")), "debug");
+    }
+
+    #[test]
+    fn resolve_log_directive_settings_used_when_rust_log_unset() {
+        let env = MapEnv::new();
+        assert_eq!(resolve_log_directive(&env, Some("info")), "info");
+    }
+
+    #[test]
+    fn resolve_log_directive_defaults_to_warn() {
+        let env = MapEnv::new();
+        assert_eq!(resolve_log_directive(&env, None), "warn");
+    }
+
+    #[test]
+    fn resolve_log_directive_ignores_empty_values() {
+        // A blank `RUST_LOG` falls through to settings; a blank settings level
+        // falls through to the built-in default.
+        let env = MapEnv::new().with("RUST_LOG", "");
+        assert_eq!(resolve_log_directive(&env, Some("trace")), "trace");
+        assert_eq!(resolve_log_directive(&env, Some("")), "warn");
     }
 }
