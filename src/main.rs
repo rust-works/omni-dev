@@ -6,11 +6,19 @@ use omni_dev::request_log::{self, InvocationOutcome, RequestLogContext, Source};
 use omni_dev::Cli;
 
 fn main() {
-    init_tracing();
-
     // Capture argv before clap consumes it, so the invocation record can log the
-    // full command line and the resolved subcommand path.
+    // full command line and the resolved subcommand path — and so tracing can be
+    // initialized at the right default level for the resolved command *before* any
+    // log line is emitted.
     let argv: Vec<String> = std::env::args().collect();
+    let command = resolve_command_path(&argv);
+    let daemon_run = is_daemon_run(&command);
+
+    // The long-lived `daemon run` defaults to `info` so its lifecycle events reach
+    // the log sink; short-lived CLI invocations stay at `warn`. `RUST_LOG` still
+    // overrides either. See #1316.
+    init_tracing(daemon_run);
+
     let cli = Cli::parse();
 
     // The macOS menu-bar daemon needs the GUI event loop on the main thread,
@@ -43,8 +51,7 @@ fn main() {
     // Stash the per-invocation context so HTTP records can correlate to this
     // run, then time the whole command and append one invocation record after
     // it returns. Logging is best-effort and never affects the exit code.
-    let command = resolve_command_path(&argv);
-    let source = if is_daemon_run(&command) {
+    let source = if daemon_run {
         Source::Daemon
     } else {
         Source::Cli
@@ -97,14 +104,26 @@ fn is_daemon_run(command: &[String]) -> bool {
         && command.get(1).map(String::as_str) == Some("run")
 }
 
-/// Initializes the tracing subscriber (stderr, `RUST_LOG`-driven, default
-/// `warn`), keeping daemon/debug logs off stdout.
-fn init_tracing() {
+/// The default tracing filter for a resolved command when `RUST_LOG` is unset:
+/// `info` for the long-lived `daemon run` (so its lifecycle events — start/stop,
+/// signals — reach the log sink), `warn` for every short-lived CLI invocation.
+fn default_filter(daemon_run: bool) -> &'static str {
+    if daemon_run {
+        "info"
+    } else {
+        "warn"
+    }
+}
+
+/// Initializes the tracing subscriber (stderr, `RUST_LOG`-driven), keeping
+/// daemon/debug logs off stdout. The default level when `RUST_LOG` is unset is
+/// [`default_filter`]; `RUST_LOG` still overrides it.
+fn init_tracing(daemon_run: bool) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(daemon_run))),
         )
         .init();
 }
@@ -118,4 +137,38 @@ fn die(e: &anyhow::Error) -> ! {
         source = err.source();
     }
     process::exit(1);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn path(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn is_daemon_run_matches_only_daemon_run() {
+        assert!(is_daemon_run(&path(&["daemon", "run"])));
+        // Trailing flags after `daemon run` still count (only the path prefix matters).
+        assert!(is_daemon_run(&path(&[
+            "daemon",
+            "run",
+            "--socket",
+            "/tmp/d.sock"
+        ])));
+        // Other daemon subcommands are short-lived clients, not the daemon.
+        assert!(!is_daemon_run(&path(&["daemon", "status"])));
+        assert!(!is_daemon_run(&path(&["daemon", "start"])));
+        assert!(!is_daemon_run(&path(&["daemon"])));
+        assert!(!is_daemon_run(&path(&["jira", "read"])));
+        assert!(!is_daemon_run(&[]));
+    }
+
+    #[test]
+    fn default_filter_is_info_only_for_daemon_run() {
+        assert_eq!(default_filter(true), "info");
+        assert_eq!(default_filter(false), "warn");
+    }
 }
