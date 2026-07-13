@@ -7,12 +7,14 @@ import {
   PrBadge,
   TreeRepoPayload,
   TreeWorktreePayload,
+  checkStateDecoration,
   isCurrentWindow,
   nodeId,
   repoLabel,
   reposToNodes,
   withAheadBehind,
   withPr,
+  worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
   worktreeLabel,
@@ -204,21 +206,57 @@ const OPEN_PR: PrBadge = {
   url: "https://github.com/rust-works/omni-dev/pull/65",
 };
 
-test("worktreePrBadge formats the number, draft marker, and a checks glyph", () => {
+test("worktreePrBadge formats the number and draft marker, without a checks glyph", () => {
   const wt = REPOS[0].worktrees[0];
-  assert.equal(worktreePrBadge({ ...wt, pr: OPEN_PR }), "#65 ✓");
-  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "failure" } }), "#65 ✗");
-  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), "#65 ●");
-  // No checks configured → just the number.
+  // The check verdict no longer appears in the badge text — it is a colored file
+  // decoration since #1324 — so every check state renders the same badge.
+  assert.equal(worktreePrBadge({ ...wt, pr: OPEN_PR }), "#65");
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "failure" } }), "#65");
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), "#65");
   assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, checks: "none" } }), "#65");
-  // Draft → a `draft` marker, with the checks glyph after it.
-  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true } }), "#65 draft ✓");
+  // Draft → a `draft` marker, still with no glyph, whatever the check state.
+  assert.equal(worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true } }), "#65 draft");
   assert.equal(
-    worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true, checks: "none" } }),
+    worktreePrBadge({ ...wt, pr: { ...OPEN_PR, isDraft: true, checks: "failure" } }),
     "#65 draft",
   );
   // No PR → empty.
   assert.equal(worktreePrBadge(wt), "");
+});
+
+test("worktreeCheckDecoration maps each PR check state to a colored badge (#1324)", () => {
+  const wt = REPOS[0].worktrees[0];
+  assert.deepEqual(worktreeCheckDecoration({ ...wt, pr: OPEN_PR }), {
+    badge: "✓",
+    colorId: "charts.green",
+    tooltip: "checks passing",
+  });
+  assert.deepEqual(worktreeCheckDecoration({ ...wt, pr: { ...OPEN_PR, checks: "failure" } }), {
+    badge: "✗",
+    colorId: "charts.red",
+    tooltip: "checks failing",
+  });
+  assert.deepEqual(worktreeCheckDecoration({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), {
+    badge: "●",
+    colorId: "charts.yellow",
+    tooltip: "checks pending",
+  });
+  // A PR with no checks configured → no badge.
+  assert.equal(worktreeCheckDecoration({ ...wt, pr: { ...OPEN_PR, checks: "none" } }), undefined);
+  // No PR at all → no badge.
+  assert.equal(worktreeCheckDecoration(wt), undefined);
+});
+
+test("checkStateDecoration maps a bare check state, undefined for none", () => {
+  assert.deepEqual(checkStateDecoration("success"), {
+    badge: "✓",
+    colorId: "charts.green",
+    tooltip: "checks passing",
+  });
+  assert.equal(checkStateDecoration("failure")?.badge, "✗");
+  assert.equal(checkStateDecoration("failure")?.colorId, "charts.red");
+  assert.equal(checkStateDecoration("pending")?.tooltip, "checks pending");
+  assert.equal(checkStateDecoration("none"), undefined);
 });
 
 test("withPr folds a badge in, and no-ops when absent", () => {
@@ -234,12 +272,13 @@ test("withPr folds a badge in, and no-ops when absent", () => {
 test("worktreeDescription shows sync and PR together, each only when present", () => {
   // Sync only (no PR) — byte-for-byte the pre-#1296 behavior.
   assert.equal(worktreeDescription(REPOS[0].worktrees[0]), "↑2 ↓0");
-  // Sync + PR, separated by a gap.
-  assert.equal(worktreeDescription({ ...REPOS[0].worktrees[0], pr: OPEN_PR }), "↑2 ↓0  #65 ✓");
+  // Sync + PR, separated by a gap. The check verdict is a colored badge (#1324),
+  // not part of the description text.
+  assert.equal(worktreeDescription({ ...REPOS[0].worktrees[0], pr: OPEN_PR }), "↑2 ↓0  #65");
   // PR only (no upstream counts).
   assert.equal(
     worktreeDescription({ path: "/x", is_main: true, open: false, pr: OPEN_PR }),
-    "#65 ✓",
+    "#65",
   );
   // Neither → empty.
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }), "");

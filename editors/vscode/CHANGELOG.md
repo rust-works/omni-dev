@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Colored PR check badge** ([#1324](https://github.com/rust-works/omni-dev/issues/1324)): a worktree's CI-check state now renders as a **colored** badge on the row — a green `✓` (passing), red `✗` (failing), or yellow `●` (pending) — instead of a monochrome glyph tucked into the muted description, so a passing and a failing PR are distinguishable at a glance.
+  - The badge is a theme-aware `FileDecoration` (using the `charts.{green,red,yellow}` palette) painted from a custom `omnidev-worktree:` `resourceUri`, a custom scheme so it never collides with git's own folder decorations; the color also tints the row's branch label, matching how git status colors its badges.
+  - The check glyph is removed from the description text (no duplicate); the row now reads just `#1319 draft`, with the color badge carrying the check state. A PR with no checks, and a worktree with no PR, show no badge as before.
+  - Extension-only — no daemon, protocol, or trust-boundary change.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added
