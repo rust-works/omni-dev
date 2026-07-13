@@ -39,6 +39,9 @@ pub mod services;
 #[cfg(unix)]
 pub mod single_instance;
 
+#[cfg(all(unix, test))]
+pub(crate) mod testutil;
+
 #[cfg(target_os = "macos")]
 pub mod launchd;
 

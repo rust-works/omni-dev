@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -39,6 +39,8 @@ pub enum WorktreesSubcommands {
     List(ListCommand),
     /// Show every repository and all its worktrees, grouped by repository.
     Tree(TreeCommand),
+    /// Focus (raise) the VS Code window for a worktree folder.
+    Focus(FocusCommand),
 }
 
 impl WorktreesCommand {
@@ -47,6 +49,7 @@ impl WorktreesCommand {
         match self.command {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
             WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
         }
     }
 }
@@ -110,6 +113,37 @@ impl TreeCommand {
             TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
             TableOrJson::Table => println!("{}", render_tree(&result)),
         }
+        Ok(())
+    }
+}
+
+/// Focuses (raises) the VS Code window for a worktree folder.
+///
+/// Reuses the daemon's `open` op — the same launcher path the macOS tray's
+/// per-window "focus" action drives (`OMNI_DEV_VSCODE_BIN` → well-known paths →
+/// `code`), which VS Code uses to reuse an already-open window. This makes that
+/// tray-only capability reachable from the CLI on Linux/headless too (#1113).
+#[derive(Parser)]
+pub struct FocusCommand {
+    /// Worktree folder whose window to focus. Shown by `worktrees tree`/`list`.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl FocusCommand {
+    /// Executes the focus command.
+    pub async fn execute(self) -> Result<()> {
+        // Resolve to an absolute path client-side: the daemon runs in a different
+        // cwd and guards the `open` path as absolute-and-existing, so a relative
+        // path would be meaningless there. A clear error here beats the daemon's.
+        let path = std::fs::canonicalize(&self.path)
+            .with_context(|| format!("cannot resolve worktree path: {}", self.path.display()))?;
+        let socket = server::resolve_socket(self.socket)?;
+        call(&socket, "open", json!({ "path": path.to_string_lossy() })).await?;
+        println!("Focused {}", path.display());
         Ok(())
     }
 }
@@ -439,6 +473,59 @@ mod tests {
             TreeCommand::try_parse_from(["tree", "-o", "json", "--socket", "/tmp/d.sock"]).unwrap();
         assert_eq!(cmd.output, TableOrJson::Json);
         assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
+    }
+
+    #[test]
+    fn focus_parses_path_and_socket() {
+        // Routing: `worktrees focus` maps to the Focus variant.
+        assert!(matches!(
+            parse(&["focus", "/home/me/wt"]),
+            WorktreesSubcommands::Focus(_)
+        ));
+        // The path is a required positional; `--socket` is optional.
+        let cmd = FocusCommand::try_parse_from(["focus", "/home/me/wt"]).unwrap();
+        assert_eq!(cmd.path, Path::new("/home/me/wt"));
+        assert!(cmd.socket.is_none());
+
+        let cmd = FocusCommand::try_parse_from(["focus", "/home/me/wt", "--socket", "/tmp/d.sock"])
+            .unwrap();
+        assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
+
+        // The path is required.
+        assert!(FocusCommand::try_parse_from(["focus"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn focus_errors_on_a_nonexistent_path_before_any_socket_call() {
+        // Canonicalisation fails for a path that does not exist, so `focus`
+        // reports a clear error without needing a daemon.
+        let cmd = FocusCommand {
+            path: PathBuf::from("/nonexistent/omni-dev-focus-xyz"),
+            socket: Some(PathBuf::from("/nonexistent/omni-dev-focus.sock")),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve worktree path"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_sends_the_open_op_for_an_existing_folder() {
+        // A real (temp) folder canonicalises, so `focus` sends the `open` op to
+        // the daemon; the fake daemon acknowledges it. Routed through the top-level
+        // `WorktreesCommand::execute` so its `Focus` dispatch arm is exercised too.
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "ok": true } }));
+        let target = tempfile::tempdir().unwrap();
+        let cmd = WorktreesCommand {
+            command: WorktreesSubcommands::Focus(FocusCommand {
+                path: target.path().to_path_buf(),
+                socket: Some(sock),
+            }),
+        };
+        cmd.execute().await.unwrap();
+        server.await.unwrap();
     }
 
     #[test]
