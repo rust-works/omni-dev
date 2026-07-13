@@ -37,6 +37,7 @@ import {
 } from "./tree";
 import { TreeSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
+import { WorktreeDecorationProvider } from "./decorations";
 
 const CONFIG_SECTION = "omniDevWorktrees";
 
@@ -79,6 +80,8 @@ let output: vscode.OutputChannel | undefined;
 // --- Tree-view UI state ------------------------------------------------------
 let treeView: vscode.TreeView<Node> | undefined;
 let provider: WorktreesTreeDataProvider | undefined;
+/** Paints each worktree row's colored PR-check badge (#1324); pulsed on snapshots. */
+let decorationProvider: WorktreeDecorationProvider | undefined;
 /** The last worktree click, for the manual double-click timer in `onItemClicked`. */
 let lastClick: { id: string; at: number } | undefined;
 
@@ -285,6 +288,16 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   view.message = DAEMON_DOWN_MESSAGE;
   context.subscriptions.push(view, treeProvider);
 
+  // The colored PR-check badge (#1324): a file-decoration provider paints each
+  // worktree row off the custom-scheme `resourceUri` the tree items carry. It is
+  // `refresh()`ed on every snapshot so colours track the lazily-fetched PR state.
+  const decorations = new WorktreeDecorationProvider();
+  decorationProvider = decorations;
+  context.subscriptions.push(
+    decorations,
+    vscode.window.registerFileDecorationProvider(decorations),
+  );
+
   const sub = new TreeSubscription(socketPath(), {
     onSnapshot: (snapshot) => {
       view.message = snapshot.repos.length === 0 ? EMPTY_MESSAGE : undefined;
@@ -292,6 +305,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
       applyShowClosed(snapshot.show_closed);
+      // A new snapshot re-runs the lazy PR-badge fetch, so re-evaluate every row's
+      // check colour (state-keyed URIs already re-decorate; this covers the rest).
+      decorations.refresh();
     },
     onStatus: (connected) => {
       // A drop re-shows the hint; a (re)connect's message is set by the snapshot.
@@ -552,6 +568,8 @@ async function refreshTree(): Promise<void> {
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
     applyShowClosed(reply.payload.show_closed);
+    // Re-evaluate the PR-check colours for the freshly-fetched rows (#1324).
+    decorationProvider?.refresh();
     if (treeView) {
       treeView.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
     }
@@ -563,9 +581,10 @@ export async function deactivate(): Promise<void> {
     clearInterval(heartbeatTimer);
     heartbeatTimer = undefined;
   }
-  // The tree view, provider, and subscription are torn down via
-  // `context.subscriptions`; drop our references so a reactivation starts fresh.
+  // The tree view, provider, decoration provider, and subscription are torn down
+  // via `context.subscriptions`; drop our references so a reactivation starts fresh.
   provider = undefined;
+  decorationProvider = undefined;
   treeView = undefined;
   lastClick = undefined;
   await send(unregisterEnvelope(windowKey));
