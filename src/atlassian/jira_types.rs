@@ -551,6 +551,29 @@ pub struct JiraProjectVersionList {
     pub total: u32,
 }
 
+/// A project component (`GET /rest/api/3/project/{key}/components`,
+/// `POST /rest/api/3/component`).
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraComponent {
+    /// Component ID.
+    pub id: String,
+    /// Component name.
+    pub name: String,
+    /// Component description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Wire shape for a component (`GET`/`POST`/`PUT` component responses).
+#[derive(Deserialize)]
+pub(crate) struct JiraComponentEntry {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+}
+
 /// A JIRA issue changelog entry, returned in the `changelog.histories` array
 /// of `GET /rest/api/3/issue/{key}?expand=changelog`.
 #[derive(Debug, Clone, Serialize)]
@@ -1383,6 +1406,13 @@ pub(crate) struct JiraRemoteIssueLinkIconEntry {
     pub(crate) url: Option<String>,
     #[serde(default)]
     pub(crate) title: Option<String>,
+}
+
+/// Response body of `POST /rest/api/3/issue/{key}/remotelink`. JIRA returns the
+/// new link id as a number; kept as a `Value` and normalized by the caller.
+#[derive(Deserialize)]
+pub(crate) struct JiraRemoteLinkCreateResponse {
+    pub(crate) id: serde_json::Value,
 }
 
 #[derive(Deserialize)]

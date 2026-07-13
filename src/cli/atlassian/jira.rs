@@ -4,11 +4,13 @@ pub(crate) mod attachment;
 pub(crate) mod board;
 pub(crate) mod changelog;
 pub(crate) mod comment;
+pub(crate) mod component;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod dev;
 pub(crate) mod edit;
 pub(crate) mod field;
+pub(crate) mod label;
 pub(crate) mod link;
 pub(crate) mod project;
 pub(crate) mod read;
@@ -63,6 +65,8 @@ pub enum JiraSubcommands {
     Sprint(sprint::SprintCommand),
     /// Manages JIRA issue links.
     Link(link::LinkCommand),
+    /// Adds or removes labels on a JIRA issue incrementally.
+    Label(label::LabelCommand),
     /// Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool).
     Changelog(changelog::ChangelogCommand),
     /// Downloads JIRA issue attachments.
@@ -75,6 +79,8 @@ pub enum JiraSubcommands {
     User(user::UserCommand),
     /// Manages JIRA project versions (release versions).
     Version(version::VersionCommand),
+    /// Manages JIRA project components.
+    Component(component::ComponentCommand),
 }
 
 impl JiraCommand {
@@ -95,12 +101,14 @@ impl JiraCommand {
             JiraSubcommands::Board(cmd) => cmd.execute().await,
             JiraSubcommands::Sprint(cmd) => cmd.execute().await,
             JiraSubcommands::Link(cmd) => cmd.execute().await,
+            JiraSubcommands::Label(cmd) => cmd.execute().await,
             JiraSubcommands::Changelog(cmd) => cmd.execute().await,
             JiraSubcommands::Attachment(cmd) => cmd.execute().await,
             JiraSubcommands::Watcher(cmd) => cmd.execute().await,
             JiraSubcommands::Worklog(cmd) => cmd.execute().await,
             JiraSubcommands::User(cmd) => cmd.execute().await,
             JiraSubcommands::Version(cmd) => cmd.execute().await,
+            JiraSubcommands::Component(cmd) => cmd.execute().await,
         }
     }
 }
@@ -159,7 +167,6 @@ mod tests {
             command: JiraSubcommands::Create(create::CreateCommand {
                 file: None,
                 format: ContentFormat::Jfm,
-                instance: None,
                 project: Some("PROJ".to_string()),
                 r#type: None,
                 summary: Some("Test".to_string()),
