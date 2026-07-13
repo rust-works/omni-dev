@@ -293,6 +293,24 @@ extension never runs git.
   omits them). The `ahead-behind` op degrades the same way: a path with no upstream
   is simply omitted from its `results`. The enrichment never fails a `list`.
 
+### Tuning the refresh cadence
+
+Two periodic timers drive this git enrichment; both are whole-seconds
+environment knobs (#1305), so a git-heavy tree can trade a little freshness for
+lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
+
+| Env var | Default | What it governs |
+| --- | --- | --- |
+| `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
+| `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
+
+Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
+of a user action: a window open/close or show-closed toggle still pushes
+promptly via the change-notify, and the tray menu still opens instantly from its
+cache. The only thing that grows staler is *passively observed* on-disk git state
+(branch, `ahead`/`behind`, dirty status), which now surfaces within the interval
+rather than every 2–3 s. Set a lower value if you want tighter freshness.
+
 ## Security
 
 **No new trust boundary** ([ADR-0040](adrs/adr-0040.md)). Requests ride the
