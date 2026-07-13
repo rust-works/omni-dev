@@ -8,14 +8,41 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use super::{AiClient, AiClientMetadata, AiResponse, InvocationMetrics, RequestOptions};
+use serde_json::Value;
+
+use super::{
+    AiClient, AiClientCapabilities, AiClientMetadata, AiResponse, InvocationMetrics, RequestOptions,
+};
 use crate::claude::error::ClaudeError;
+use crate::claude::model_config::get_model_registry;
 
 /// Claude API request message.
 #[derive(Serialize)]
 struct Message {
     role: String,
     content: String,
+}
+
+/// Structured-output request envelope for the Anthropic Messages API.
+///
+/// Serialises to `{"output_config": {"format": {"type": "json_schema",
+/// "schema": {...}}}}`. This is the GA structured-outputs surface (no beta
+/// header required), so the API re-prompts the model until it emits a JSON
+/// object validating against `schema`. Only attached for models the registry
+/// flags via [`ModelRegistry::supports_structured_output`](crate::claude::model_config::ModelRegistry::supports_structured_output);
+/// unsupported models `400` on the field, so they keep the YAML path.
+#[derive(Serialize)]
+struct OutputConfig {
+    format: OutputFormat,
+}
+
+/// Inner `format` block of an [`OutputConfig`]. `kind` is always the literal
+/// `"json_schema"`; `schema` is the JSON Schema the response must satisfy.
+#[derive(Serialize)]
+struct OutputFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    schema: Value,
 }
 
 /// Claude API request body.
@@ -25,6 +52,11 @@ struct ClaudeRequest {
     max_tokens: i32,
     system: String,
     messages: Vec<Message>,
+    /// Optional structured-output constraint. Omitted from the wire body when
+    /// `None` (`skip_serializing_if`) so the default request stays
+    /// byte-identical to the pre-#1119 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
 }
 
 /// Claude API response content.
@@ -100,17 +132,24 @@ impl ClaudeAiClient {
     /// Sends the request and returns the response text plus reported token
     /// usage (`None` when the response carried no `usage` object).
     ///
-    /// Shared by [`AiClient::send_request`] (which discards the usage) and
+    /// Shared by [`AiClient::send_request`] (which discards the usage),
+    /// [`AiClient::send_request_with_options`], and
     /// [`AiClient::send_request_with_metrics`] (which turns it into a cost).
+    /// When `schema` is `Some`, it is attached as `output_config.format` so
+    /// the API constrains the response to a JSON object matching the schema;
+    /// the returned text is that JSON object (which downstream parses as YAML,
+    /// a JSON superset).
     async fn send_and_parse(
         &self,
         system_prompt: &str,
         user_prompt: &str,
+        schema: Option<&Value>,
     ) -> Result<(String, Option<Usage>)> {
         debug!(
             system_prompt_len = system_prompt.len(),
             user_prompt_len = user_prompt.len(),
             model = %self.model,
+            has_schema = schema.is_some(),
             "Preparing Claude API request"
         );
 
@@ -129,6 +168,12 @@ impl ClaudeAiClient {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
             }],
+            output_config: schema.map(|schema| OutputConfig {
+                format: OutputFormat {
+                    kind: "json_schema",
+                    schema: schema.clone(),
+                },
+            }),
         };
 
         info!(
@@ -192,7 +237,32 @@ impl AiClient for ClaudeAiClient {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         // Use Box::pin to wrap the async block in a Pin<Box<...>>
         Box::pin(async move {
-            let (text, _usage) = self.send_and_parse(system_prompt, user_prompt).await?;
+            let (text, _usage) = self
+                .send_and_parse(system_prompt, user_prompt, None)
+                .await?;
+            Ok(text)
+        })
+    }
+
+    fn capabilities(&self) -> AiClientCapabilities {
+        // The Anthropic Messages API exposes GA structured output via
+        // `output_config.format`, but only on recent models — the registry
+        // gate keeps older models (which `400` on the field) on the YAML path.
+        AiClientCapabilities {
+            supports_response_schema: get_model_registry().supports_structured_output(&self.model),
+        }
+    }
+
+    fn send_request_with_options<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (text, _usage) = self
+                .send_and_parse(system_prompt, user_prompt, options.response_schema.as_ref())
+                .await?;
             Ok(text)
         })
     }
@@ -201,14 +271,15 @@ impl AiClient for ClaudeAiClient {
         &'a self,
         system_prompt: &'a str,
         user_prompt: &'a str,
-        _options: RequestOptions,
+        options: RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<AiResponse>> + Send + 'a>> {
-        // The direct Anthropic backend ignores request options (it advertises
-        // no schema support), so `_options` is dropped just as `send_request`
-        // drops it. Cost is derived from the response's token usage and the
-        // model's registry prices.
+        // Honours the request schema (when the caller attached one and the
+        // model supports it) and derives cost from the response's token usage
+        // and the model's registry prices.
         Box::pin(async move {
-            let (text, usage) = self.send_and_parse(system_prompt, user_prompt).await?;
+            let (text, usage) = self
+                .send_and_parse(system_prompt, user_prompt, options.response_schema.as_ref())
+                .await?;
             let cost_usd = usage.and_then(|u| {
                 super::compute_cost_usd(&self.model, u.input_tokens, u.output_tokens)
             });
@@ -479,12 +550,97 @@ mod tests {
         assert!(metadata.active_beta.is_some());
     }
 
-    /// Anthropic backend doesn't expose JSON Schema enforcement (only
-    /// claude-cli does today), so capabilities must report `false`.
+    /// Structured-output capability is gated on the model registry (#1119):
+    /// a flagged model advertises schema support; an older model that would
+    /// `400` on `output_config` does not.
     #[test]
-    fn capabilities_default_to_no_schema_support() {
-        let client =
+    fn capabilities_gate_on_model_support() {
+        let supported =
             ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), None).unwrap();
-        assert!(!client.capabilities().supports_response_schema);
+        assert!(supported.capabilities().supports_response_schema);
+
+        let unsupported = ClaudeAiClient::new(
+            "claude-3-opus-20240229".to_string(),
+            "key".to_string(),
+            None,
+        )
+        .unwrap();
+        assert!(!unsupported.capabilities().supports_response_schema);
+    }
+
+    /// A schema-bearing request serialises `output_config.format` on the wire
+    /// and the returned JSON object is surfaced verbatim as the response text.
+    #[tokio::test]
+    async fn send_request_with_options_serializes_output_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"content":[{"type":"text","text":"{\"answer\":\"ok\"}"}]}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client =
+            ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), None).unwrap();
+        client.api_url = format!("{}/v1/messages", server.uri());
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let options = RequestOptions::default().with_response_schema(schema.clone());
+        let out = client
+            .send_request_with_options("system", "user", options)
+            .await
+            .unwrap();
+        assert_eq!(out, r#"{"answer":"ok"}"#);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
+    }
+
+    /// The no-schema path must not emit `output_config` on the wire — the
+    /// default request body stays byte-identical to the pre-#1119 shape.
+    #[tokio::test]
+    async fn send_request_omits_output_config_without_schema() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"hi"}]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client =
+            ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), None).unwrap();
+        client.api_url = format!("{}/v1/messages", server.uri());
+
+        let _ = client.send_request("system", "user").await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            body.get("output_config").is_none(),
+            "expected output_config to be omitted, got: {body}"
+        );
     }
 }
