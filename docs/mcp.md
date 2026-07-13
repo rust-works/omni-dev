@@ -65,6 +65,51 @@ npx @modelcontextprotocol/inspector omni-dev-mcp
 The Inspector opens a browser UI where you can list tools and resources, call
 any tool interactively, and fetch resources against the working directory.
 
+## Configuration (`settings.json`)
+
+Server defaults can be set once in the `mcp` section of
+`~/.omni-dev/settings.json` rather than through per-invocation env vars or the
+MCP client's `env` block. All three fields are optional, and an absent `mcp`
+block preserves the default behaviour byte-for-byte:
+
+```json
+{
+  "mcp": {
+    "default_model": "claude-sonnet-4-6",
+    "log_level": "info",
+    "max_response_bytes": 102400
+  }
+}
+```
+
+| Field | Effect | Precedence / fallback |
+|-------|--------|-----------------------|
+| `default_model` | Model used by `ai_chat` when its own `model` parameter is omitted. | The tool's `model` parameter wins when supplied; otherwise this value; otherwise the model registry default. |
+| `log_level` | Tracing filter directive for the server (e.g. `info`, `omni_dev::mcp=debug`). | `RUST_LOG` wins when set; otherwise this value; otherwise `warn`. |
+| `max_response_bytes` | Byte cap applied to a tool response before truncation (see [Response size cap](#response-size-cap)). `0` disables truncation. | This value; otherwise 100 KB. |
+
+The block is loaded once at process start for `log_level`, and per call for
+`default_model` and `max_response_bytes` — so credential-style changes take
+effect without restarting the server, but a new `log_level` needs a restart
+(the tracing subscriber is installed once).
+
+Because the file can carry credentials in its `env` map, place it inside a
+`0700` `~/.omni-dev/` (the `auth login` flows already harden it to `0600`).
+
+It can also be combined with an MCP client `env` block — e.g. setting
+`RUST_LOG` in Claude Desktop's config still overrides `settings.mcp.log_level`.
+
+```json
+{
+  "mcpServers": {
+    "omni-dev": {
+      "command": "omni-dev-mcp",
+      "env": { "RUST_LOG": "debug" }
+    }
+  }
+}
+```
+
 ## Tool catalog
 
 All tools serialise responses as YAML to match the CLI's `-o yaml` output.
@@ -368,6 +413,19 @@ JIRA, Confluence, and Datadog tools build a fresh client per invocation, so
 credential changes (e.g. `omni-dev datadog auth login`) take effect without
 restarting the MCP server.
 
+### Response size cap
+
+Tools that can emit large output (git analyses, log searches, coverage, JIRA
+bodies, …) cap their response so a multi-megabyte payload cannot blow out the
+assistant's context window. When a response exceeds the cap it is truncated on
+a UTF-8 boundary, a `\n\n[output truncated]` marker is appended, and a second
+JSON payload — `{"truncated": true, "original_bytes": N, "limit_bytes": L}` —
+is returned so the caller can react (narrow the range, page via `output_file`).
+
+The cap defaults to 100 KB and is configurable via
+`settings.mcp.max_response_bytes` (see [Configuration](#configuration-settingsjson));
+a value of `0` disables truncation entirely.
+
 ## Troubleshooting
 
 - **Logs go to stderr.** MCP uses stdin/stdout for protocol framing, so
@@ -375,7 +433,9 @@ restarting the MCP server.
   run the binary in a terminal to see it.
 - **Verbose tracing:** `RUST_LOG=debug omni-dev-mcp` turns on debug-level
   logs. Module-scoped filters work too, e.g.
-  `RUST_LOG=omni_dev::mcp=trace`.
+  `RUST_LOG=omni_dev::mcp=trace`. To set a persistent default without exporting
+  `RUST_LOG`, use `settings.mcp.log_level` (see
+  [Configuration](#configuration-settingsjson)); `RUST_LOG` still wins when set.
 - **"Failed to open git repository":** the assistant runs `omni-dev-mcp` with
   its own working directory. Tools that open a git repository use that
   directory unless an explicit `repo_path` parameter overrides it. Confirm the
