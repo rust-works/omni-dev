@@ -71,9 +71,17 @@ backends: an exported `CLAUDE_MODEL` can never leak a Claude model id into
 the OpenAI or Ollama backends.
 
 **Beta headers.** The global `--beta-header key:value` flag (equivalent to
-`OMNI_DEV_BETA_HEADER`) attaches a beta header to API requests when the
-model registry lists it as supported. It is ignored (with a warning) by the
-`claude-cli` backend.
+`OMNI_DEV_BETA_HEADER`) attaches an `anthropic-beta` header to requests on the
+Anthropic backends (Claude API and Bedrock) when the model registry lists it
+as supported. Beta headers are Anthropic-specific, so the non-Anthropic
+backends ignore the flag with a warning rather than sending or validating it:
+the `claude-cli`, `openai`, and `ollama` backends all warn-and-ignore.
+
+**Request timeout.** The HTTP backends (Claude API, Bedrock, OpenAI, Ollama)
+use a 5-minute (300s) request timeout. Override it in whole seconds with
+`OMNI_DEV_AI_TIMEOUT_SECS` (a zero or non-numeric value falls back to the
+default). The `claude-cli` subprocess backend has its own, separate
+`OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS` (default 600s).
 
 See the [Model Registry](#model-registry) section below for how to list,
 override, or extend the catalogue.
@@ -102,6 +110,14 @@ Get a key from [console.anthropic.com](https://console.anthropic.com/).
 ```bash
 omni-dev --model claude-opus-4-6 git commit message twiddle 'origin/main..HEAD' --use-context
 ```
+
+**Structured output.** For structured calls, omni-dev asks the model for a
+JSON object matching a schema via the Messages API `output_config.format`
+(GA — no beta header) on models that support it. Support is per-model in the
+registry (`supports_structured_output`); the default `claude-sonnet-4-6` and
+the other recent models are flagged, while older models transparently fall
+back to the YAML response path rather than risking an API error. See the
+[Model Registry](#model-registry) for how to flag additional models.
 
 **Verification.**
 
@@ -289,6 +305,11 @@ Set whichever form your Bedrock deployment expects:
 ```bash
 export ANTHROPIC_MODEL="us.anthropic.claude-sonnet-4-6-v1:0"
 ```
+
+**Structured output.** Like the direct Claude API, the Bedrock backend
+requests structured output via `output_config.format` on models the registry
+flags as supporting it (regional / provider prefixes normalise to the same
+entry). Unflagged models fall back to the YAML response path.
 
 **Limitations.**
 
@@ -494,6 +515,12 @@ omni-dev config models show --embedded-only   # just the built-in entries
 (`us.anthropic.…`), provider prefixes (`anthropic.…`), and version suffixes
 (`…-v1:0`) are stripped so the same registry entry serves every form your
 Bedrock deployment might emit.
+
+**Structured-output capability** is a per-model `supports_structured_output`
+flag (default `false`). It gates whether the Anthropic and Bedrock backends
+request `output_config.format` for that model — set it `true` in a user or
+project `models.yaml` entry to opt a newer model into the schema path, or
+leave it unset to keep a model on the YAML response path.
 
 **Architectural background:**
 [ADR-0011](adrs/adr-0011.md) (superseded) and
