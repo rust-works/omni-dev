@@ -73,3 +73,4 @@ by Michael Nygard.
 | [ADR-0047](adr-0047.md)  | ✅ Accepted                              | 2026-07-07 | Remote-First Default Base-Branch Resolution That Fails Closed                               |
 | [ADR-0048](adr-0048.md)  | ✅ Accepted                              | 2026-07-10 | Repo/Worktree Tree View Fed by a Daemon Push Subscription                                   |
 | [ADR-0049](adr-0049.md)  | ✅ Accepted                              | 2026-07-10 | Destructive Worktree Close over the Daemon, Guarded by Structural `is_main`                 |
+| [ADR-0050](adr-0050.md)  | ✅ Accepted                              | 2026-07-13 | Worktree PR Badges Resolved Extension-Side via `gh`, Not the Daemon                         |

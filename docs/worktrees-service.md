@@ -189,9 +189,9 @@ every window (no per-window curation). It renders the `tree` payload:
 
 ```
 ▸ omni-dev            (github: rust-works/omni-dev)
-    ● main            ↑2 ↓0        ← window open (badge), main working tree
-      issue-1300      ↑1 ↓3        ← linked worktree, no window open
-    ● issue-1250      ↑0 ↓0
+    ● main            ↑2 ↓0                 ← window open (badge), main working tree
+      issue-1300      ↑1 ↓3  #1300 ✗        ← linked worktree; open PR, checks failing
+    ● issue-1250      ↑0 ↓0  #1250 draft ●  ← draft PR, checks running
 ▸ some-other-repo
       main
 ```
@@ -240,6 +240,37 @@ every window (no per-window curation). It renders the `tree` payload:
 
 The tree view runs **alongside** the reporter lifecycle (register/heartbeat/
 unregister): every window is both a reporter and, if it has the view open, a reader.
+
+### Pull requests
+
+For a worktree on a **GitHub** repo whose branch has an **open pull request**, the
+row shows a muted PR badge after the sync counts — `#<number>`, a `draft` marker
+for drafts, and a CI-checks glyph (`✓` passing, `✗` failing, `●` still running;
+nothing when a PR has no checks). The badge appears on **every** worktree in the
+view — the one open in this window and those open in others (and closed worktrees
+when shown) — and the hover tooltip adds a `PR #<n> · open/draft · checks …` line.
+
+A right-click **"Open Pull Request…"** action on any GitHub worktree (or repo)
+opens its PR **as a tab inside the editor** — never a browser. It discovers the
+PR(s) via `gh` (a quick-pick when several match) and hands off to the **GitHub
+Pull Requests** extension (`GitHub.vscode-pull-request-github`); if that extension
+is absent it offers to install it or copy the PR URL.
+
+- **Resolved extension-side via `gh`, not the daemon.** Like `↑ahead ↓behind`, PR
+  state is **not** on the `tree` wire payload. The extension resolves it lazily
+  **on repo-expand** with one `gh pr list --state open --json …,statusCheckRollup`
+  per repo, matches each PR to a worktree by head branch, and caches the result
+  per repo for ~60 s so a re-render never re-spawns `gh`. This keeps the daemon's
+  **"persists nothing / no secret"** posture intact
+  ([ADR-0040](adrs/adr-0040.md), [ADR-0050](adrs/adr-0050.md)): the GitHub
+  credential lives inside `gh`, the daemon never sees a token, and the wire
+  contract is unchanged. It needs `gh` installed and `gh auth login`.
+- **Best-effort, silent.** A worktree with no branch, no matching PR, or on a
+  non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
+  badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
+  action still surfaces the real `gh` error).
+- **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) gates
+  the badge and its `gh` lookups entirely.
 
 ## Status
 
@@ -593,4 +624,11 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   instantly. A polling fallback and a filesystem watcher were both considered and
   deferred.
 - The tree view is **view + focus only**; worktree *management* actions
-  (add/remove/prune) are out of scope for this iteration.
+  (add/remove/prune) are out of scope for this iteration (except the destructive
+  **close** in [ADR-0049](adrs/adr-0049.md)).
+- **PR badges are `gh`-based and GitHub-only (#1296):** the tree resolves open PRs
+  via the GitHub CLI on repo-expand ([ADR-0050](adrs/adr-0050.md)). Other forges
+  (GitLab/Bitbucket) and PR *creation/review/merge* are out of scope — the latter
+  defers to the GitHub Pull Requests extension. A daemon-side, cross-window PR
+  cache was considered and rejected: it would put a GitHub token in the daemon,
+  breaking its no-secret posture.
