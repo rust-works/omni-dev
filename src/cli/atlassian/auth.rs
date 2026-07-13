@@ -23,6 +23,8 @@ pub struct AuthCommand {
 pub enum AuthSubcommands {
     /// Configures Atlassian Cloud credentials interactively.
     Login(LoginCommand),
+    /// Removes Atlassian Cloud credentials from settings.json.
+    Logout(LogoutCommand),
     /// Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool).
     Status(StatusCommand),
 }
@@ -32,6 +34,7 @@ impl AuthCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             AuthSubcommands::Login(cmd) => cmd.execute(),
+            AuthSubcommands::Logout(cmd) => cmd.execute(),
             AuthSubcommands::Status(cmd) => cmd.execute().await,
         }
     }
@@ -106,6 +109,37 @@ fn run_login_to(
     Ok(())
 }
 
+/// Removes Atlassian Cloud credentials.
+#[derive(Parser)]
+pub struct LogoutCommand;
+
+impl LogoutCommand {
+    /// Removes Atlassian credential keys from settings.json — from the active
+    /// profile's `env` map when a profile is selected (issue #1116).
+    pub fn execute(self) -> Result<()> {
+        run_logout(
+            &Settings::get_settings_path()?,
+            active_profile_from(&SystemEnv).as_deref(),
+        )
+    }
+}
+
+/// Removes Atlassian credential keys from an explicit settings-file path and
+/// profile so tests inject both instead of mutating `HOME` /
+/// `OMNI_DEV_PROFILE` (issue #1030).
+fn run_logout(settings_path: &std::path::Path, profile: Option<&str>) -> Result<()> {
+    let removed = auth::remove_credentials_at(settings_path, profile)?;
+    if removed {
+        println!(
+            "Atlassian credentials removed from ~/.omni-dev/settings.json{}",
+            profile_suffix(profile)
+        );
+    } else {
+        println!("No Atlassian credentials were configured.");
+    }
+    Ok(())
+}
+
 /// Shows the current authentication status.
 #[derive(Parser)]
 pub struct StatusCommand;
@@ -159,6 +193,14 @@ mod tests {
             command: AuthSubcommands::Login(LoginCommand),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Login(_)));
+    }
+
+    #[test]
+    fn auth_command_logout_dispatch() {
+        let cmd = AuthCommand {
+            command: AuthSubcommands::Logout(LogoutCommand),
+        };
+        assert!(matches!(cmd.command, AuthSubcommands::Logout(_)));
     }
 
     #[test]
@@ -239,6 +281,91 @@ mod tests {
             "me@work.com"
         );
         assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
+    }
+
+    // ── run_logout ─────────────────────────────────────────────────
+
+    #[test]
+    fn run_logout_removes_credentials_when_present() {
+        use crate::atlassian::auth::{
+            ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
+        };
+        let (dir, settings_path) = temp_settings();
+        std::fs::create_dir_all(dir.path().join(".omni-dev")).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {
+                "ATLASSIAN_INSTANCE_URL": "https://org.atlassian.net",
+                "ATLASSIAN_EMAIL": "me@test.com",
+                "ATLASSIAN_API_TOKEN": "tok",
+                "OTHER": "keep"
+            }}"#,
+        )
+        .unwrap();
+
+        run_logout(&settings_path, None).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(ATLASSIAN_INSTANCE_URL).is_none());
+        assert!(val["env"].get(ATLASSIAN_EMAIL).is_none());
+        assert!(val["env"].get(ATLASSIAN_API_TOKEN).is_none());
+        assert_eq!(val["env"]["OTHER"], "keep");
+    }
+
+    #[test]
+    fn run_logout_is_idempotent_when_no_credentials() {
+        let (_dir, settings_path) = temp_settings();
+        run_logout(&settings_path, None).unwrap();
+    }
+
+    #[test]
+    fn run_logout_with_profile_removes_profile_credentials_and_keeps_base() {
+        use crate::atlassian::auth::ATLASSIAN_EMAIL;
+        let (dir, settings_path) = temp_settings();
+        std::fs::create_dir_all(dir.path().join(".omni-dev")).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{
+                "env": {"ATLASSIAN_EMAIL": "base@test.com"},
+                "profiles": {"work": {"env": {"ATLASSIAN_EMAIL": "work@test.com"}}}
+            }"#,
+        )
+        .unwrap();
+
+        run_logout(&settings_path, Some("work")).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["profiles"]["work"]["env"]
+            .get(ATLASSIAN_EMAIL)
+            .is_none());
+        assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "base@test.com");
+    }
+
+    /// `LogoutCommand::execute` resolves the settings path from `HOME` and the
+    /// profile from `OMNI_DEV_PROFILE`, so this one test redirects both under
+    /// the shared [`crate::atlassian::auth::test_util::EnvGuard`]; every other
+    /// logout test injects them into `run_logout` (issue #1030).
+    #[test]
+    fn logout_command_execute_resolves_default_settings_path() {
+        use crate::atlassian::auth::ATLASSIAN_EMAIL;
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let omni_dir = dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {"ATLASSIAN_EMAIL": "me@test.com"}}"#,
+        )
+        .unwrap();
+
+        LogoutCommand.execute().unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(ATLASSIAN_EMAIL).is_none());
     }
 
     // ── run_auth_status ────────────────────────────────────────────

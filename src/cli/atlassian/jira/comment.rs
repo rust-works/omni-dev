@@ -9,6 +9,7 @@ use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
 use crate::atlassian::jira_types::{JiraComment, JiraVisibility, JiraVisibilityType};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
 
@@ -29,6 +30,8 @@ pub enum CommentSubcommands {
     Add(AddCommand),
     /// Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool).
     Edit(EditCommand),
+    /// Deletes a comment from a JIRA issue (mirrors the `jira_comment_delete` MCP tool).
+    Delete(DeleteCommand),
 }
 
 impl CommentCommand {
@@ -38,6 +41,7 @@ impl CommentCommand {
             CommentSubcommands::List(cmd) => cmd.execute().await,
             CommentSubcommands::Add(cmd) => cmd.execute().await,
             CommentSubcommands::Edit(cmd) => cmd.execute().await,
+            CommentSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -156,6 +160,74 @@ impl EditCommand {
             visibility.as_ref(),
         )
         .await
+    }
+}
+
+/// Deletes a comment from a JIRA issue.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Comment ID to delete.
+    pub comment_id: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Executes the delete command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        let mut writer = std::io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn std::io::BufRead + Send),
+        writer: &mut (dyn std::io::Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format!("Delete comment {} on {}? [y/N] ", self.comment_id, self.key);
+            let dry_run_message =
+                format!("Would delete comment {} on {}.", self.comment_id, self.key);
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
+        client.delete_comment(&self.key, &self.comment_id).await?;
+        writeln!(
+            writer,
+            "Deleted comment {} on {}.",
+            self.comment_id, self.key
+        )?;
+
+        Ok(())
     }
 }
 
@@ -502,6 +574,19 @@ mod tests {
     }
 
     #[test]
+    fn comment_command_delete_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Delete(DeleteCommand {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                force: false,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Delete(_)));
+    }
+
+    #[test]
     fn cli_visibility_type_into_group() {
         let mapped: JiraVisibilityType = CliVisibilityType::Group.into();
         assert!(matches!(mapped, JiraVisibilityType::Group));
@@ -752,5 +837,131 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("404"));
         assert!(msg.contains("Comment not found"));
+    }
+
+    // ── DeleteCommand ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_comment_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Deleted comment 100 on PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_dry_run_makes_no_api_call() {
+        // No mock mounted: any HTTP call would fail the connection.
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete comment 100 on PROJ-1."));
+        assert!(!out.contains("Deleted comment"));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete comment 100 on PROJ-1?"));
+        assert!(out.contains("Deleted comment 100 on PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_prompt_no_makes_no_delete() {
+        // No mock mounted: a DELETE would fail the connection.
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Deleted comment"));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_force_propagates_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }

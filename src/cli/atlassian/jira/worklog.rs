@@ -3,7 +3,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::jira_types::JiraWorklogList;
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -22,6 +24,10 @@ pub enum WorklogSubcommands {
     List(ListCommand),
     /// Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool).
     Add(AddCommand),
+    /// Edits a worklog entry on a JIRA issue (mirrors the `jira_worklog_update` MCP tool).
+    Edit(EditCommand),
+    /// Deletes a worklog entry from a JIRA issue (mirrors the `jira_worklog_delete` MCP tool).
+    Delete(DeleteCommand),
 }
 
 impl WorklogCommand {
@@ -30,6 +36,8 @@ impl WorklogCommand {
         match self.command {
             WorklogSubcommands::List(cmd) => cmd.execute().await,
             WorklogSubcommands::Add(cmd) => cmd.execute().await,
+            WorklogSubcommands::Edit(cmd) => cmd.execute().await,
+            WorklogSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -95,6 +103,120 @@ impl AddCommand {
             .await?;
 
         println!("Worklog added to {} ({}).", self.key, self.time_spent);
+        Ok(())
+    }
+}
+
+/// Edits an existing worklog entry on a JIRA issue.
+#[derive(Parser)]
+pub struct EditCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Worklog ID to edit (from `worklog list`).
+    pub worklog_id: String,
+
+    /// New time spent in JIRA duration format (e.g., "2h 30m").
+    #[arg(long)]
+    pub time_spent: Option<String>,
+
+    /// New start time (ISO 8601, e.g., "2026-04-16T09:00:00.000+0000").
+    #[arg(long)]
+    pub started: Option<String>,
+
+    /// New comment describing the work performed.
+    #[arg(long)]
+    pub comment: Option<String>,
+}
+
+impl EditCommand {
+    /// Updates the worklog entry.
+    pub async fn execute(self) -> Result<()> {
+        if self.time_spent.is_none() && self.started.is_none() && self.comment.is_none() {
+            anyhow::bail!(
+                "Nothing to update: pass at least one of --time-spent, --started, or --comment."
+            );
+        }
+        let (client, _instance_url) = create_client()?;
+        client
+            .update_worklog(
+                &self.key,
+                &self.worklog_id,
+                self.time_spent.as_deref(),
+                self.started.as_deref(),
+                self.comment.as_deref(),
+            )
+            .await?;
+
+        println!("Worklog {} updated on {}.", self.worklog_id, self.key);
+        Ok(())
+    }
+}
+
+/// Deletes a worklog entry from a JIRA issue.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Worklog ID to delete (from `worklog list`).
+    pub worklog_id: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Executes the delete command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        let mut writer = std::io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn std::io::BufRead + Send),
+        writer: &mut (dyn std::io::Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format!("Delete worklog {} on {}? [y/N] ", self.worklog_id, self.key);
+            let dry_run_message =
+                format!("Would delete worklog {} on {}.", self.worklog_id, self.key);
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
+        client.delete_worklog(&self.key, &self.worklog_id).await?;
+        writeln!(
+            writer,
+            "Deleted worklog {} on {}.",
+            self.worklog_id, self.key
+        )?;
+
         Ok(())
     }
 }
@@ -330,5 +452,121 @@ mod tests {
             output: OutputFormat::Table,
         };
         assert_eq!(cmd.limit, 10);
+    }
+
+    #[test]
+    fn worklog_command_edit_variant() {
+        let cmd = WorklogCommand {
+            command: WorklogSubcommands::Edit(EditCommand {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                time_spent: Some("3h".to_string()),
+                started: None,
+                comment: None,
+            }),
+        };
+        assert!(matches!(cmd.command, WorklogSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn worklog_command_delete_variant() {
+        let cmd = WorklogCommand {
+            command: WorklogSubcommands::Delete(DeleteCommand {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                force: false,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, WorklogSubcommands::Delete(_)));
+    }
+
+    // ── EditCommand ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn edit_without_any_field_errors_before_client() {
+        // All fields None → bail before create_client()/network.
+        let cmd = EditCommand {
+            key: "PROJ-1".to_string(),
+            worklog_id: "100".to_string(),
+            time_spent: None,
+            started: None,
+            comment: None,
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("Nothing to update"));
+    }
+
+    // ── DeleteCommand ──────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_worklog_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            worklog_id: "100".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted worklog 100 on PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn delete_worklog_dry_run_makes_no_api_call() {
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            worklog_id: "100".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete worklog 100 on PROJ-1."));
+        assert!(!out.contains("Deleted worklog"));
+    }
+
+    #[tokio::test]
+    async fn delete_worklog_prompt_no_makes_no_delete() {
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            worklog_id: "100".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted worklog"));
     }
 }

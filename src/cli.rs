@@ -130,6 +130,17 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
+    /// Overrides the Atlassian instance URL (e.g.
+    /// `https://org.atlassian.net`) for every JIRA and Confluence command.
+    ///
+    /// Takes precedence over `ATLASSIAN_INSTANCE_URL` / settings.json (email
+    /// and API token still come from the environment/settings). Lets a
+    /// multi-site user target a specific tenant per invocation. Equivalent to
+    /// setting `OMNI_DEV_ATLASSIAN_INSTANCE`. Ignored by non-Atlassian
+    /// commands.
+    #[arg(long, global = true, value_name = "URL")]
+    pub instance: Option<String>,
+
     /// Run as if omni-dev was started in `<PATH>` instead of the current
     /// working directory.
     ///
@@ -239,6 +250,17 @@ impl Cli {
         // OMNI_DEV_PROFILE untouched, so the env-var path still works.
         if let Some(profile) = &self.profile {
             std::env::set_var(crate::utils::settings::PROFILE_ENV_VAR, profile);
+        }
+
+        // The global `--instance` flag overrides the configured Atlassian
+        // instance for every JIRA/Confluence command. Propagated to the env var
+        // that `atlassian::auth::load_credentials` reads (#1117). When absent we
+        // leave any existing value untouched so the env-var path still works.
+        if let Some(instance) = &self.instance {
+            std::env::set_var(
+                crate::atlassian::auth::ATLASSIAN_INSTANCE_OVERRIDE_ENV,
+                instance,
+            );
         }
     }
 
@@ -527,12 +549,13 @@ mod tests {
     const MAX_BUDGET_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
     const MODELS_YAML_VAR: &str = "OMNI_DEV_MODELS_YAML";
     const PROFILE_VAR: &str = "OMNI_DEV_PROFILE";
+    const INSTANCE_VAR: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
 
     /// Locks the shared mutex and snapshots/restores every env var
     /// `propagate_global_flags` may touch.
     struct GlobalFlagsEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 8],
+        saved: [(&'static str, Option<String>); 9],
     }
 
     impl GlobalFlagsEnvGuard {
@@ -549,6 +572,7 @@ mod tests {
                 MAX_BUDGET_VAR,
                 MODELS_YAML_VAR,
                 PROFILE_VAR,
+                INSTANCE_VAR,
             ];
             let saved = names.map(|n| (n, std::env::var(n).ok()));
             for (n, _) in &saved {
@@ -585,6 +609,19 @@ mod tests {
         assert!(std::env::var(MAX_BUDGET_VAR).is_err());
         assert!(std::env::var(MODELS_YAML_VAR).is_err());
         assert!(std::env::var(PROFILE_VAR).is_err());
+        assert!(std::env::var(INSTANCE_VAR).is_err());
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_instance() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.instance = Some("https://org.atlassian.net".to_string());
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(INSTANCE_VAR).ok().as_deref(),
+            Some("https://org.atlassian.net")
+        );
     }
 
     #[test]
