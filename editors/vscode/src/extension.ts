@@ -22,10 +22,14 @@ import {
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
+import { runGh } from "./gh";
+import { PullRequest, parsePrList, prBadgeForBranch, prBadgeListArgs } from "./github";
 import { openPullRequest } from "./prCommands";
 import {
   AheadBehindMap,
   Node,
+  PrBadge,
+  TreeGithubIdentity,
   TreeRepoPayload,
   isCurrentWindow,
   nodeId,
@@ -92,6 +96,11 @@ function heartbeatMs(): number {
   return Math.max(1, seconds) * 1000;
 }
 
+/** Whether to resolve and show each worktree's GitHub PR badge via `gh` (#1296). */
+function showPullRequests(): boolean {
+  return config().get<boolean>("showPullRequests") ?? true;
+}
+
 /** Snapshots this window's open folders for a `register`. */
 function registerPayload(): RegisterPayload {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
@@ -134,6 +143,70 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
   const reply = await send(aheadBehindEnvelope(paths));
   const results = reply?.ok ? (reply.payload?.results as AheadBehindMap | undefined) : undefined;
   return results ?? {};
+}
+
+/** How long a repo's open-PR list is reused before a fresh `gh` fetch (#1296). */
+const PR_CACHE_TTL_MS = 60_000;
+
+interface PrCacheEntry {
+  /** When this repo's PRs were fetched (`Date.now()`). */
+  at: number;
+  /** The repo's open PRs, or `[]` (also cached on a `gh` failure — see below). */
+  prs: PullRequest[];
+}
+
+/** Per-repo (`owner/name`) cache of the last `gh pr list`, TTL'd by {@link PR_CACHE_TTL_MS}. */
+const prCache = new Map<string, PrCacheEntry>();
+
+/**
+ * The repo's open PRs, from cache when fresh, else one `gh pr list` (with the
+ * checks rollup). A `gh` failure — missing binary, not authed, unknown repo — is
+ * **cached as an empty list** for the TTL and logged once, so a missing `gh` is
+ * not re-spawned on every pushed snapshot; the explicit "Open Pull Request…"
+ * action still surfaces the real error.
+ */
+async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
+  const key = `${repo.owner}/${repo.name}`;
+  const now = Date.now();
+  const hit = prCache.get(key);
+  if (hit && now - hit.at < PR_CACHE_TTL_MS) {
+    return hit.prs;
+  }
+  try {
+    const prs = parsePrList(await runGh(prBadgeListArgs(repo)));
+    prCache.set(key, { at: now, prs });
+    return prs;
+  } catch (err) {
+    prCache.set(key, { at: now, prs: [] });
+    output?.appendLine(
+      `pr badges skipped for ${key}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * Resolves the open PR badge for each of a GitHub repo's branches on repo-expand
+ * (#1296) — the {@link PrBadgeFetcher} injected into the tree provider. One
+ * `gh pr list` per repo (TTL-cached), matched to each branch by head. A no-op
+ * (empty map, no `gh` call) when the `showPullRequests` setting is off.
+ */
+async function fetchPrBadges(
+  repo: TreeGithubIdentity,
+  branches: string[],
+): Promise<Record<string, PrBadge>> {
+  if (!showPullRequests()) {
+    return {};
+  }
+  const prs = await cachedRepoPrs(repo);
+  const badges: Record<string, PrBadge> = {};
+  for (const branch of branches) {
+    const badge = prBadgeForBranch(prs, branch);
+    if (badge) {
+      badges[branch] = badge;
+    }
+  }
+  return badges;
 }
 
 async function register(): Promise<void> {
@@ -193,8 +266,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 function setupTreeView(context: vscode.ExtensionContext): void {
   // `windowKey` is assigned in `activate()` before this runs, so the provider can
   // mark this window's own worktree distinctly from those open in other windows.
-  // The provider fetches ahead/behind lazily on expand (#1306) via `fetchAheadBehind`.
-  const treeProvider = new WorktreesTreeDataProvider(windowKey, fetchAheadBehind);
+  // The provider fetches ahead/behind (#1306) and PR badges (#1296) lazily on
+  // expand via the injected `fetchAheadBehind` / `fetchPrBadges`.
+  const treeProvider = new WorktreesTreeDataProvider(windowKey, fetchAheadBehind, fetchPrBadges);
   provider = treeProvider;
 
   // Seed the button/filter to the default (show all) before the first render;
