@@ -26,15 +26,50 @@ use super::single_instance;
 /// shutdown indefinitely (a service manager would `SIGKILL` us eventually).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often a push subscription re-samples and diffs its snapshot even without
-/// a change notification, so purely on-disk state changes (a branch switch, new
-/// commits) — which fire **no** registry event — are still reflected within the
-/// interval. Kept in the issue's 2–5 s band (#1267).
+/// Environment override for [`stream_tick`] (whole seconds; a blank,
+/// non-numeric, or `0` value falls back to [`DEFAULT_STREAM_TICK`]).
+const ENV_STREAM_TICK: &str = "OMNI_DEV_DAEMON_STREAM_TICK";
+
+/// Default push-subscription re-sample interval when `OMNI_DEV_DAEMON_STREAM_TICK`
+/// is unset: how often a subscription re-samples and diffs its snapshot even
+/// without a change notification, so purely on-disk state changes (a branch
+/// switch, new commits) — which fire **no** registry event — are still reflected
+/// within the interval.
+///
+/// Raised from 3 s to 10 s (#1305): registry changes (a window open/close, a
+/// show-closed toggle) still push promptly via the change-notify, so only the
+/// periodic re-sample of on-disk git state slows — a modest, tunable freshness
+/// cost for a background tree view.
+const DEFAULT_STREAM_TICK: Duration = Duration::from_secs(10);
+
+/// The resolved push-subscription re-sample interval: `OMNI_DEV_DAEMON_STREAM_TICK`
+/// (whole seconds) when valid, else [`DEFAULT_STREAM_TICK`].
 ///
 /// The worktrees service sizes its coalescing snapshot cache to this same tick
-/// (#1303), so the shared `build_tree` runs at most once per tick regardless of
-/// how many windows are subscribed; keep the two in step if this is retuned.
-pub(crate) const STREAM_TICK: Duration = Duration::from_secs(3);
+/// (#1303) by calling straight through here, so the shared `build_tree` runs at
+/// most once per tick regardless of how many windows are subscribed and the two
+/// can never drift.
+pub(crate) fn stream_tick() -> Duration {
+    duration_secs_from_env(ENV_STREAM_TICK, DEFAULT_STREAM_TICK)
+}
+
+/// Reads a whole-seconds [`Duration`] from environment variable `var`, falling
+/// back to `default` when the value is unset, blank, non-numeric, or `0` (a
+/// zero interval would busy-spin the timer loops that consume it). Shared by the
+/// daemon's interval knobs so they parse identically. Delegates to
+/// [`duration_secs_from_raw`] so the parse is unit-tested without touching the
+/// process environment (the Snowflake `heartbeat_interval_from` pattern).
+pub(crate) fn duration_secs_from_env(var: &str, default: Duration) -> Duration {
+    duration_secs_from_raw(std::env::var(var).ok(), default)
+}
+
+/// Parses a whole-seconds [`Duration`] from a raw env value, falling back to
+/// `default` when it is absent, blank, non-numeric, or `0`.
+fn duration_secs_from_raw(raw: Option<String>, default: Duration) -> Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(default, Duration::from_secs)
+}
 
 /// Configuration for a [`run`] invocation.
 #[derive(Debug, Clone)]
@@ -312,7 +347,7 @@ async fn handle_connection(
 
 /// Drives a push subscription over `framed` until the client goes away or the
 /// daemon shuts down. Sends an initial snapshot, then re-samples the stream on
-/// each change notification and on a periodic [`STREAM_TICK`], pushing **only**
+/// each change notification and on a periodic [`stream_tick`], pushing **only**
 /// snapshots that differ from the last one sent — so identical frames are never
 /// duplicated (the acceptance criterion). Mirrors the browser bridge's
 /// `start_stream` coalescing shape, but on the control socket.
@@ -335,7 +370,7 @@ async fn run_stream(
 
     // `interval` fires immediately on the first `tick()`; consume that so the
     // periodic re-sample starts one full interval out.
-    let mut tick = tokio::time::interval(STREAM_TICK);
+    let mut tick = tokio::time::interval(stream_tick());
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await;
 
@@ -515,6 +550,35 @@ mod tests {
         let result = js.join_next().await.unwrap();
         assert!(result.is_err());
         note_reaped(result);
+    }
+
+    #[test]
+    fn duration_secs_from_raw_parses_seconds_and_falls_back_on_junk() {
+        let default = Duration::from_secs(10);
+        // Absent / blank / non-numeric / zero all fall back to the default;
+        // `0` must not slip through — it would busy-spin the timer loops.
+        assert_eq!(duration_secs_from_raw(None, default), default);
+        assert_eq!(
+            duration_secs_from_raw(Some(String::new()), default),
+            default
+        );
+        assert_eq!(
+            duration_secs_from_raw(Some("garbage".to_string()), default),
+            default
+        );
+        assert_eq!(
+            duration_secs_from_raw(Some(" 0 ".to_string()), default),
+            default
+        );
+        // A valid whole-seconds value wins over the default, trimming whitespace.
+        assert_eq!(
+            duration_secs_from_raw(Some("30".to_string()), default),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            duration_secs_from_raw(Some("  5\n".to_string()), default),
+            Duration::from_secs(5)
+        );
     }
 
     // --- Push-subscription streaming (#1267) --------------------------------
