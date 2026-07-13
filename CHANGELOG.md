@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Worktrees daemon: relax and env-tune the tree/tray refresh intervals** ([#1305](https://github.com/rust-works/omni-dev/issues/1305)): two periodic timers drive the worktrees service's `git2` enumeration — the push-`subscribe` re-sample (`STREAM_TICK`, 3 s) and the tray menu recompute (`MENU_REFRESH_INTERVAL`, 2 s) — both aggressive for a git-heavy full-tree walk over dozens of worktrees. With the per-window coalescing ([#1303](https://github.com/rust-works/omni-dev/issues/1303)) and lazy tree ahead/behind ([#1306](https://github.com/rust-works/omni-dev/issues/1306)) already landed, profiling a ~10-window daemon showed the residual idle CPU was **almost entirely the 2 s tray refresh** — an independent per-window walk that reads neither the coalescing cache nor the lazy path and still computes `ahead`/`behind` inline. Both defaults are raised to **10 s** and made overridable via new whole-seconds env knobs **`OMNI_DEV_DAEMON_STREAM_TICK`** and **`OMNI_DEV_DAEMON_MENU_REFRESH`** (blank/non-numeric/`0` → default; parsed by a shared helper), cutting the dominant enumeration rate ~5×. No user action gets slower: a window open/close or show-closed toggle still pushes promptly via the change-notify, and the tray menu still opens instantly from its cache — only *passively observed* on-disk git state (branch, `ahead`/`behind`, dirty status) surfaces within the interval rather than every 2–3 s, and a lower value restores tighter freshness. The coalescing snapshot cache stays sized to `STREAM_TICK` by reading the same resolver, so the two can never drift. See [docs/worktrees-service.md](docs/worktrees-service.md#tuning-the-refresh-cadence).
+
 ## [0.35.0] - 2026-07-13
 
 ### Added
