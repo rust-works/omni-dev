@@ -155,6 +155,18 @@ pub struct ModelSpec {
     /// Whether this is a legacy model that may be deprecated.
     #[serde(default)]
     pub legacy: bool,
+    /// Whether this model supports structured JSON-schema output via the
+    /// Anthropic Messages API `output_config.format` (and the equivalent on
+    /// Bedrock).
+    ///
+    /// Gates the direct-API / Bedrock schema path (#1119): only models
+    /// flagged here advertise
+    /// [`AiClientCapabilities::supports_response_schema`](crate::claude::ai::AiClientCapabilities::supports_response_schema),
+    /// so a caller on an older model — which would `400` on
+    /// `output_config` — transparently keeps the YAML fallback. Defaults to
+    /// `false`, so unmarked and unknown models are never sent the field.
+    #[serde(default)]
+    pub supports_structured_output: bool,
     /// Price per million *input* tokens in USD, if known.
     ///
     /// Used to compute per-invocation cost for backends that report token
@@ -469,6 +481,21 @@ impl ModelRegistry {
 
         // Ultimate fallback
         FALLBACK_INPUT_CONTEXT
+    }
+
+    /// Returns whether the model supports structured JSON-schema output
+    /// (`output_config.format`).
+    ///
+    /// Backs the schema-capability gate for the direct Anthropic and Bedrock
+    /// backends (#1119). Resolves through the same identifier normalization as
+    /// the other lookups, so Bedrock/region-prefixed forms map to the same
+    /// [`ModelSpec`]. Any model not present in the catalog — or present but not
+    /// flagged — returns `false`, keeping it on the YAML path rather than
+    /// risking a `400` from an unsupported `output_config`.
+    #[must_use]
+    pub fn supports_structured_output(&self, api_identifier: &str) -> bool {
+        self.get_model_spec(api_identifier)
+            .is_some_and(|spec| spec.supports_structured_output)
     }
 
     /// Infers the provider from a model identifier.
@@ -1026,6 +1053,33 @@ mod tests {
         let spec = registry.get_model_spec(exact_sonnet4);
         assert!(spec.is_some());
         assert_eq!(spec.unwrap().max_output_tokens, 64000);
+    }
+
+    /// Structured-output support is flagged per-model in the catalog (#1119):
+    /// recent models (the default `claude-sonnet-4-6` included) advertise it,
+    /// while older models and unknown identifiers do not — so the schema path
+    /// never risks a `400` on a model that can't honour `output_config`.
+    #[test]
+    fn supports_structured_output_gates_by_model() {
+        let registry = embedded_only();
+
+        // Flagged models — including the default and a Bedrock-style prefix.
+        assert!(registry.supports_structured_output("claude-sonnet-4-6"));
+        assert!(registry.supports_structured_output("claude-opus-4-6"));
+        assert!(registry.supports_structured_output("claude-haiku-4-5-20251001"));
+        assert!(registry.supports_structured_output("claude-opus-4-5-20251101"));
+        assert!(
+            registry.supports_structured_output("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "Bedrock/region-prefixed forms must normalize to the flagged spec"
+        );
+
+        // Older models that would 400 on output_config keep the YAML path.
+        assert!(!registry.supports_structured_output("claude-opus-4-1-20250805"));
+        assert!(!registry.supports_structured_output("claude-3-opus-20240229"));
+        assert!(!registry.supports_structured_output("claude-sonnet-4-20250514"));
+
+        // Unknown identifiers are conservatively unsupported.
+        assert!(!registry.supports_structured_output("totally-unknown-model"));
     }
 
     #[test]
