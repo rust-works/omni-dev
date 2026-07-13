@@ -4,16 +4,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  PR_BADGE_JSON_FIELDS,
   PR_JSON_FIELDS,
   PR_LIST_LIMIT,
   PullRequest,
   discoverPullRequests,
   parsePrList,
+  prBadgeForBranch,
+  prBadgeListArgs,
   prListArgsForBranch,
   prListArgsForRepo,
   prOverviewUri,
   prQuickPickDescription,
   prQuickPickLabel,
+  rollupCheckState,
 } from "./github";
 import { TreeGithubIdentity } from "./tree";
 
@@ -147,4 +151,108 @@ test("discoverPullRequests returns [] for a detached worktree without calling gh
   const prs = await discoverPullRequests({ kind: "worktree", repo: REPO }, runner);
   assert.deepEqual(prs, []);
   assert.equal(called, false);
+});
+
+// --- PR badge (#1296): checks rollup + branch matching -----------------------
+
+test("prBadgeListArgs lists all open PRs with the statusCheckRollup field", () => {
+  assert.deepEqual(prBadgeListArgs(REPO), [
+    "pr",
+    "list",
+    "--repo",
+    "rust-works/omni-dev",
+    "--state",
+    "open",
+    "--json",
+    PR_BADGE_JSON_FIELDS,
+    "--limit",
+    PR_LIST_LIMIT,
+  ]);
+  // The badge field set is the base set plus the checks rollup.
+  assert.ok(PR_BADGE_JSON_FIELDS.startsWith(`${PR_JSON_FIELDS},`));
+  assert.match(PR_BADGE_JSON_FIELDS, /statusCheckRollup/);
+});
+
+test("rollupCheckState reports none for an empty or absent rollup", () => {
+  assert.equal(rollupCheckState(undefined), "none");
+  assert.equal(rollupCheckState([]), "none");
+});
+
+test("rollupCheckState maps a completed CheckRun's conclusion", () => {
+  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "SUCCESS" }]), "success");
+  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "FAILURE" }]), "failure");
+  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "CANCELLED" }]), "failure");
+  // Neutral/skipped are non-blocking → success.
+  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "NEUTRAL" }]), "success");
+  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "SKIPPED" }]), "success");
+});
+
+test("rollupCheckState treats an incomplete CheckRun as pending", () => {
+  assert.equal(rollupCheckState([{ status: "IN_PROGRESS" }]), "pending");
+  assert.equal(rollupCheckState([{ status: "QUEUED" }]), "pending");
+});
+
+test("rollupCheckState reads a StatusContext's state", () => {
+  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "SUCCESS" }]), "success");
+  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "FAILURE" }]), "failure");
+  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "ERROR" }]), "failure");
+  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "PENDING" }]), "pending");
+});
+
+test("rollupCheckState precedence: any failure dominates, else any pending, else success", () => {
+  assert.equal(
+    rollupCheckState([
+      { status: "COMPLETED", conclusion: "SUCCESS" },
+      { status: "IN_PROGRESS" },
+      { status: "COMPLETED", conclusion: "FAILURE" },
+    ]),
+    "failure",
+  );
+  assert.equal(
+    rollupCheckState([{ status: "COMPLETED", conclusion: "SUCCESS" }, { status: "IN_PROGRESS" }]),
+    "pending",
+  );
+  assert.equal(
+    rollupCheckState([
+      { status: "COMPLETED", conclusion: "SUCCESS" },
+      { __typename: "StatusContext", state: "SUCCESS" },
+    ]),
+    "success",
+  );
+});
+
+test("prBadgeForBranch matches the head branch and rolls up its checks", () => {
+  const prs: PullRequest[] = [
+    {
+      ...PR,
+      number: 1300,
+      headRefName: "issue-1300",
+      isDraft: true,
+      url: "https://github.com/rust-works/omni-dev/pull/1300",
+      statusCheckRollup: [{ status: "COMPLETED", conclusion: "FAILURE" }],
+    },
+    { ...PR },
+  ];
+  assert.deepEqual(prBadgeForBranch(prs, "issue-1300"), {
+    number: 1300,
+    isDraft: true,
+    checks: "failure",
+    url: "https://github.com/rust-works/omni-dev/pull/1300",
+  });
+});
+
+test("prBadgeForBranch returns undefined for no branch or no head match", () => {
+  assert.equal(prBadgeForBranch([PR], undefined), undefined);
+  assert.equal(prBadgeForBranch([PR], ""), undefined);
+  assert.equal(prBadgeForBranch([PR], "no-such-branch"), undefined);
+});
+
+test("prBadgeForBranch takes the first head match and defaults absent checks to none", () => {
+  // The PR fixture carries no statusCheckRollup → checks resolve to `none`.
+  assert.deepEqual(prBadgeForBranch([PR], PR.headRefName), {
+    number: PR.number,
+    isDraft: false,
+    checks: "none",
+    url: PR.url,
+  });
 });
