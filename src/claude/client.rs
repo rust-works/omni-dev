@@ -1737,6 +1737,28 @@ fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> 
     Ok(())
 }
 
+/// Warns that `--beta-header` is ignored for a non-Anthropic backend.
+///
+/// Beta headers are an Anthropic-specific mechanism (`anthropic-beta`); the
+/// OpenAI-compatible backends never transmit them. Rather than validate the
+/// value against the Claude registry — which could hard-fail (`Model 'X' does
+/// not support any beta headers`) for a header that would never be sent
+/// (#1119) — these backends warn once and ignore it, matching the `claude-cli`
+/// backend's warn-and-ignore behaviour so the flag has one consistent shape
+/// across every non-Anthropic backend.
+fn warn_beta_header_ignored(
+    backend: crate::claude::backend::AiBackend,
+    beta_header: Option<&(String, String)>,
+) {
+    if let Some((key, value)) = beta_header {
+        warn!(
+            "--beta-header '{key}:{value}' is ignored when OMNI_DEV_AI_BACKEND={} \
+             (beta headers are Anthropic-specific and are not sent to this backend)",
+            backend.env_value()
+        );
+    }
+}
+
 /// Creates a default Claude client using environment variables and settings.
 ///
 /// Async because the Ollama branch probes the local server for its
@@ -1798,9 +1820,9 @@ pub(crate) async fn create_default_claude_client_with(
             Ok(ClaudeClient::new(Box::new(ai_client)))
         }
         AiBackend::Ollama => {
-            validate_beta_header(&model, &beta_header)?;
+            warn_beta_header_ignored(AiBackend::Ollama, beta_header.as_ref());
             let base_url = env.var("OLLAMA_BASE_URL");
-            let mut ai_client = OpenAiAiClient::new_ollama(model, base_url, beta_header)?;
+            let mut ai_client = OpenAiAiClient::new_ollama(model, base_url, None)?;
             match ai_client.probe_loaded_context_length().await {
                 Some(source) => {
                     info!(
@@ -1821,7 +1843,7 @@ pub(crate) async fn create_default_claude_client_with(
         }
         AiBackend::OpenAi => {
             debug!("Creating OpenAI client");
-            validate_beta_header(&model, &beta_header)?;
+            warn_beta_header_ignored(AiBackend::OpenAi, beta_header.as_ref());
 
             let api_key = env
                 .var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
@@ -1831,7 +1853,7 @@ pub(crate) async fn create_default_claude_client_with(
                 })?;
             debug!("OpenAI API key found");
 
-            let ai_client = OpenAiAiClient::new_openai(model, api_key, beta_header)?;
+            let ai_client = OpenAiAiClient::new_openai(model, api_key, None)?;
             debug!("OpenAI client created successfully");
             Ok(ClaudeClient::new(Box::new(ai_client)))
         }
@@ -4835,5 +4857,46 @@ mod tests {
             .map(|_| ())
             .expect_err("malformed beta header must error");
         assert!(format!("{err:#}").contains("no-colon-here"));
+    }
+
+    /// `--beta-header` is Anthropic-specific; the OpenAI backend must warn and
+    /// ignore it rather than validate it against the Claude registry (which
+    /// would hard-fail for a header that is never sent — #1119).
+    #[tokio::test]
+    async fn factory_openai_backend_ignores_beta_header_without_validation() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("OPENAI_API_KEY", "sk-openai")
+            .with("OPENAI_MODEL", "gpt-4o")
+            .with("OMNI_DEV_BETA_HEADER", "anthropic-beta:not-a-real-beta");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("openai backend must ignore --beta-header, not validate it");
+        assert_eq!(
+            client.get_ai_client_metadata().active_beta,
+            None,
+            "beta header must not reach the OpenAI client"
+        );
+    }
+
+    /// Ollama mirrors the OpenAI arm: warn and ignore, never validate. Points
+    /// at a closed port so the context-length probe fails fast and non-fatally.
+    #[tokio::test]
+    async fn factory_ollama_backend_ignores_beta_header_without_validation() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "ollama")
+            .with("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+            .with("OLLAMA_MODEL", "llama2")
+            .with("OMNI_DEV_BETA_HEADER", "anthropic-beta:not-a-real-beta");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("ollama backend must ignore --beta-header, not validate it");
+        assert_eq!(
+            client.get_ai_client_metadata().active_beta,
+            None,
+            "beta header must not reach the Ollama client"
+        );
     }
 }
