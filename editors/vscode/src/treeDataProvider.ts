@@ -17,12 +17,14 @@ import {
   reposToNodes,
   withAheadBehind,
   withPr,
+  worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
   worktreeLabel,
   worktreeNodes,
   worktreeTooltip,
 } from "./tree";
+import { worktreeResourceUri } from "./decorations";
 
 /**
  * Fetches ahead/behind divergence for a batch of worktree paths on demand — the
@@ -153,6 +155,15 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     item.description = worktreeDescription(node.wt);
     item.tooltip = worktreeTooltip(node.wt, node.repo, this.windowKey);
     item.contextValue = worktreeContextValue(node.wt, this.windowKey, !!node.repo.github);
+    // A colored ✓/✗/● file decoration carries the PR CI-check state (#1324). Rows
+    // whose PR has a pass/fail/pending verdict get a custom-scheme `resourceUri`
+    // keyed by that state, which the `WorktreeDecorationProvider` paints (and which
+    // re-decorates on its own when the state — and so the URI — changes). Rows with
+    // no PR, or a PR with no checks, get none. `item.id` still keys row identity.
+    const pr = node.wt.pr;
+    if (pr && worktreeCheckDecoration(node.wt)) {
+      item.resourceUri = worktreeResourceUri(node.wt.path, pr.checks);
+    }
     // The open badge, three-way: a blue tick for the worktree open in *this*
     // window, a green dot for one open in another window, else the plain branch
     // glyph for a worktree with no live window.
