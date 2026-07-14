@@ -18,12 +18,15 @@ import {
   openEnvelope,
   registerEnvelope,
   sendEnvelope,
+  sessionWindowEnvelope,
+  sessionWindowUnregisterEnvelope,
   setShowClosedEnvelope,
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prBadgeForBranch, prBadgeListArgs } from "./github";
+import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
 import { openPullRequest } from "./prCommands";
 import { CLAUDE_TERMINAL_NAME, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
@@ -227,6 +230,42 @@ async function register(): Promise<void> {
   await send(registerEnvelope(registerPayload()));
 }
 
+/**
+ * Counts this window's embedded Claude Code sessions: editor webview tabs (their
+ * mangled `viewType` contains the Claude marker) and integrated terminals (named
+ * like a Claude terminal, honouring `$CLAUDE_CODE_TERMINAL_TITLE`). The
+ * extension host is sandboxed per window, so this only ever sees *this* window's
+ * tabs/terminals — which is exactly the per-window fact the daemon aggregates.
+ */
+function claudeEmbeddings(): { tabs: number; terminals: number } {
+  const viewTypes: string[] = [];
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input;
+      if (input instanceof vscode.TabInputWebview) {
+        viewTypes.push(input.viewType);
+      }
+    }
+  }
+  const terminalNames = vscode.window.terminals.map((t) => t.name);
+  return {
+    tabs: countClaudeTabs(viewTypes),
+    terminals: countClaudeTerminals(terminalNames, process.env.CLAUDE_CODE_TERMINAL_TITLE),
+  };
+}
+
+/**
+ * Reports this window's Claude embeddings to the daemon's sessions service so it
+ * can tag a session's source as VS Code (by joining a session `cwd` against this
+ * window's folders). Refreshes the report's liveness on the same cadence as the
+ * worktrees heartbeat; a missing daemon is a silent no-op like everything else.
+ */
+async function reportSessionWindow(): Promise<void> {
+  const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+  const { tabs, terminals } = claudeEmbeddings();
+  await send(sessionWindowEnvelope({ key: windowKey, folders, tabs, terminals }));
+}
+
 async function heartbeat(): Promise<void> {
   const reply = await send(heartbeatEnvelope(windowKey));
   if (!reply?.ok) {
@@ -252,8 +291,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(output);
 
   await register();
+  await reportSessionWindow();
 
-  heartbeatTimer = setInterval(() => void heartbeat(), heartbeatMs());
+  // One tick refreshes both the worktrees window registration and the sessions
+  // Claude-embedding report, so a single ~10s cadence keeps both live.
+  heartbeatTimer = setInterval(() => {
+    void heartbeat();
+    void reportSessionWindow();
+  }, heartbeatMs());
   context.subscriptions.push({
     dispose: () => {
       if (heartbeatTimer) {
@@ -263,9 +308,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   });
 
-  // Workspace folders can change without a reactivation; report the new set.
+  // Workspace folders can change without a reactivation; report the new set to
+  // both services.
   context.subscriptions.push(
-    vscode.workspace.onDidChangeWorkspaceFolders(() => void register()),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void register();
+      void reportSessionWindow();
+    }),
+  );
+
+  // A Claude tab or terminal opening/closing changes this window's embedding
+  // count; push a fresh report immediately rather than waiting for the next tick.
+  context.subscriptions.push(
+    vscode.window.tabGroups.onDidChangeTabGroups(() => void reportSessionWindow()),
+    vscode.window.onDidOpenTerminal(() => void reportSessionWindow()),
+    vscode.window.onDidCloseTerminal(() => void reportSessionWindow()),
   );
 
   // The window-level "Open Claude Code" title-bar button (#1322) is independent of
@@ -647,4 +704,5 @@ export async function deactivate(): Promise<void> {
   lastClick = undefined;
   claudeTerminal = undefined;
   await send(unregisterEnvelope(windowKey));
+  await send(sessionWindowUnregisterEnvelope(windowKey));
 }
