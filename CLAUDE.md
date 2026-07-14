@@ -135,13 +135,15 @@ Backend selection: if `OMNI_DEV_AI_BACKEND` is set (directly or via the global `
 
 Model selection stops at the first non-empty value: explicit param (MCP/`run_*` callers) → `OMNI_DEV_MODEL` (global `--model`) → per-family vars (Claude family: `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL`; OpenAI: `OPENAI_MODEL`; Ollama: `OLLAMA_MODEL`) → registry default. `--model` and `--beta-header` are **global** flags (propagated as `OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER` in `Cli::propagate_global_flags`); the per-subcommand copies were removed in #1118. Adding a backend = new enum variant + resolver arms + one factory arm + one preflight arm.
 
+Structured JSON-schema output (#1119): all four HTTP backends now advertise `supports_response_schema` and take the schema path. OpenAI/Ollama use `response_format: json_schema` (`openai.rs`); the direct Anthropic (`claude.rs`) and Bedrock (`bedrock.rs`) backends use the GA Messages-API `output_config.format` — but **model-gated** via the registry's `supports_structured_output` flag (`ModelRegistry::supports_structured_output`, populated from `src/templates/models.yaml`), since `output_config` `400`s on older models. Unflagged/unknown models fall back to YAML. `claude-cli` keeps its `--json-schema` path. The shared HTTP request timeout is 300s, overridable via `OMNI_DEV_AI_TIMEOUT_SECS` (parity with the subprocess backend's separate `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS`).
+
 User-facing details — required env vars, model selection, Claude CLI sandbox semantics, the `--claude-cli-allow-tools` / `--claude-cli-allow-mcp` escape hatches, the `--claude-cli-max-budget-usd` spending cap, and per-backend troubleshooting — live in [docs/ai-backends.md](docs/ai-backends.md). Keep it in sync when changing any of those surfaces.
 
 Architectural rationale for the sandboxed `claude-cli` subprocess backend — threat model, sandbox flag choices, escape-hatch design, budget-cap enforcement — lives in [ADR-0028](docs/adrs/adr-0028.md).
 
 Dev-only notes:
 - `ClaudeCliAiClient::run` is the warn site for both escape hatches, the INFO-level `total_cost_usd` log, and the post-response WARN when reported cost exceeds the configured cap. `ClaudeCliAiClient::max_budget_from_value` is the warn site for a set-but-invalid cap value (#1135).
-- `--beta-header` is ignored for the `claude-cli` backend (`claude`'s `--betas` flag has different semantics).
+- `--beta-header` is Anthropic-specific and only sent on the Anthropic backends (direct API + Bedrock, validated against the registry). The non-Anthropic backends warn-and-ignore it via `client.rs::warn_beta_header_ignored`: `claude-cli` (`claude`'s `--betas` flag has different semantics), plus `openai`/`ollama` (they never transmit it; #1119 stopped them validating a header they'd never send).
 
 ### Browser Bridge
 The `omni-dev browser bridge` command tree drives HTTP requests **through an authenticated browser tab** (Grafana/Loki, SSO-gated dashboards) without exfiltrating the browser's cookies/tokens — a *confused deputy by design*. It is a two-plane local server joined by an `id`-keyed correlator:
