@@ -137,7 +137,7 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `git_amend_commits` | Apply commit-message amendments deterministically from inline YAML (the apply counterpart to `git_twiddle_commits`) | `omni-dev git commit message amend` |
 | `git_create_pr` | AI-drafted PR title + body, optionally pushed | `omni-dev git branch create pr` |
 
-### JIRA — core (11 tools)
+### JIRA — core (12 tools)
 
 | Tool | Purpose |
 |------|---------|
@@ -148,29 +148,33 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary raw-id `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool; prefer `jira_edit` for name-resolved field updates.) |
 | `jira_edit` | Set arbitrary fields on an existing issue by display name or canonical id — labels, selects, story points, rich-text custom fields, parent. Values are coerced to the API shape; rich-text strings are JFM→ADF converted (or pass a raw ADF object). Mirrors `omni-dev atlassian jira write --set-field` |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names). Supply `resolution`, `custom_fields`, and/or `comment` for transitions whose screen requires input; a comment rides in the transition when the screen accepts one, else it is posted separately |
-| `jira_comment` | Add a comment to an issue |
+| `jira_comment` | List or add a comment on an issue (`action: list` / `add`); edit an existing one with `jira_comment_edit` |
+| `jira_comment_delete` | Permanently delete a comment (by `key` + `comment_id`). Requires `confirm: true` |
 | `jira_dev` | Fetch development info (commits, branches, PRs) attached to an issue |
 | `jira_user_search` | Resolve a display name or email substring to an Atlassian `accountId` (call before `jira_write` for assignee/reporter) |
 | `jira_delete` | Permanently delete an issue. Requires `confirm: true` |
 
-### JIRA — extensions (27 tools)
+### JIRA — extensions (44 tools)
 
 Sprints, boards, watchers, worklogs, links, field metadata, attachments,
 project listing and create-screen introspection, and changelog history.
 
 | Family | Tools |
 |--------|-------|
-| Sprints | `jira_sprint_list`, `jira_sprint_issues`, `jira_sprint_add`, `jira_sprint_create`, `jira_sprint_update` |
+| Sprints | `jira_sprint_list`, `jira_sprint_issues`, `jira_sprint_add`, `jira_sprint_create`, `jira_sprint_update`, `jira_sprint_delete` (requires `confirm: true`) |
 | Boards | `jira_board_list`, `jira_board_issues` |
 | Watchers | `jira_watcher_list`, `jira_watcher_add`, `jira_watcher_remove` (requires `confirm: true`) |
-| Worklogs | `jira_worklog_list`, `jira_worklog_add` |
-| Links | `jira_link_list`, `jira_link_types`, `jira_link_create`, `jira_link_parent`, `jira_link_remove` (requires `confirm: true`), `jira_link_remote_list` — one tool per `omni-dev atlassian jira link` subcommand |
+| Worklogs | `jira_worklog_list`, `jira_worklog_add`, `jira_worklog_update`, `jira_worklog_delete` (requires `confirm: true`) |
+| Versions | `jira_version_list`, `jira_version_create`, `jira_version_release`, `jira_version_archive`, `jira_version_rename`, `jira_version_delete` (requires `confirm: true`) |
+| Components | `jira_component_list`, `jira_component_create`, `jira_component_update`, `jira_component_delete` (requires `confirm: true`) |
+| Links | `jira_link_list`, `jira_link_types`, `jira_link_create`, `jira_link_parent`, `jira_link_remove` (requires `confirm: true`), `jira_link_remote_list`, `jira_link_remote_create`, `jira_link_remote_delete` (requires `confirm: true`) — one tool per `omni-dev atlassian jira link` subcommand |
+| Labels | `jira_label_add`, `jira_label_remove` (incremental — leave other labels untouched, unlike a full `labels` array via `jira_edit`) |
 | Fields | `jira_field_list`, `jira_field_options` (custom-field discovery — see [user guide](user-guide.md#jira-fields)) |
 | Attachments | `jira_attachment_upload`, `jira_attachment_download`, `jira_attachment_images`, `jira_attachment_delete` (requires `confirm: true`) |
 | Projects | `jira_project_list`, `jira_project_create_meta` (pre-flight required/allowed fields — see [user guide](user-guide.md#jira-fields)) |
 | History | `jira_changelog` |
 
-### Confluence (13 tools)
+### Confluence (17 tools)
 
 | Tool | Purpose |
 |------|---------|
@@ -182,7 +186,10 @@ project listing and create-screen introspection, and changelog history.
 | `confluence_download` | Recursive download of a page tree to disk |
 | `confluence_children` | List direct children of a page |
 | `confluence_comment_list` | List comments on a page |
-| `confluence_comment_add` | Add a comment to a page |
+| `confluence_comment_add` | Add a comment to a page (inline variant: `confluence_comment_add_inline`) |
+| `confluence_comment_edit` | Edit a comment's body (by `comment_id` + `kind`) |
+| `confluence_comment_delete` | Delete a comment (by `comment_id` + `kind`). Requires `confirm: true` |
+| `confluence_comment_resolve` / `confluence_comment_reopen` | Resolve or reopen an inline comment |
 | `confluence_label_list` | List labels on a page |
 | `confluence_label_add` | Add one or more labels to a page |
 | `confluence_label_remove` | Remove a label from a page. Requires `confirm: true` |
