@@ -51,6 +51,7 @@ pub mod git;
 pub mod mcp;
 pub mod request_log;
 pub mod resources;
+pub mod sessions;
 pub mod snowflake;
 pub mod transcript;
 pub mod utils;
