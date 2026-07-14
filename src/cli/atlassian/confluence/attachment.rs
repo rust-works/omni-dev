@@ -26,6 +26,8 @@ pub struct AttachmentCommand {
 pub enum AttachmentSubcommands {
     /// Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool).
     Upload(UploadCommand),
+    /// Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool).
+    Update(UpdateCommand),
     /// Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool).
     List(ListCommand),
     /// Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool).
@@ -39,10 +41,63 @@ impl AttachmentCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             AttachmentSubcommands::Upload(cmd) => cmd.execute().await,
+            AttachmentSubcommands::Update(cmd) => cmd.execute().await,
             AttachmentSubcommands::List(cmd) => cmd.execute().await,
             AttachmentSubcommands::Download(cmd) => cmd.execute().await,
             AttachmentSubcommands::Delete(cmd) => cmd.execute().await,
         }
+    }
+}
+
+/// Uploads a new binary version of an existing attachment.
+#[derive(Parser)]
+pub struct UpdateCommand {
+    /// Confluence page ID (e.g., 12345678).
+    pub page_id: String,
+
+    /// Attachment ID to update (from `attachment list`).
+    pub attachment_id: String,
+
+    /// Path to the local file whose contents become the new version.
+    pub file: PathBuf,
+
+    /// Override the filename used in Confluence (defaults to the local basename).
+    #[arg(long)]
+    pub filename: Option<String>,
+
+    /// Optional version comment recorded with the new version.
+    #[arg(long)]
+    pub comment: Option<String>,
+
+    /// Marks the new version as a minor edit.
+    #[arg(long)]
+    pub minor_edit: bool,
+}
+
+impl UpdateCommand {
+    /// Executes the update command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let attachment = api
+            .update_attachment(
+                &self.page_id,
+                &self.attachment_id,
+                &self.file,
+                self.filename.as_deref(),
+                self.comment.as_deref(),
+                self.minor_edit,
+            )
+            .await?;
+        println!(
+            "Updated attachment {} on page {} to version {}.",
+            attachment.id,
+            self.page_id,
+            attachment
+                .version
+                .map_or("?".to_string(), |v| v.to_string()),
+        );
+        Ok(())
     }
 }
 
@@ -703,6 +758,45 @@ mod tests {
                 file: path,
                 filename: None,
                 comment: Some("v1".to_string()),
+                minor_edit: true,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_command_execute_runs_through_dispatch() {
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1", "title": "x.txt", "version": {"number": 2}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        tokio::fs::write(&path, b"hi again").await.unwrap();
+
+        set_atlassian_env(&server.uri());
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Update(UpdateCommand {
+                page_id: "12345".to_string(),
+                attachment_id: "att-1".to_string(),
+                file: path,
+                filename: None,
+                comment: Some("v2".to_string()),
                 minor_edit: true,
             }),
         };
