@@ -75,3 +75,4 @@ by Michael Nygard.
 | [ADR-0049](adr-0049.md)  | ✅ Accepted                              | 2026-07-10 | Destructive Worktree Close over the Daemon, Guarded by Structural `is_main`                 |
 | [ADR-0050](adr-0050.md)  | ✅ Accepted                              | 2026-07-13 | Worktree PR Badges Resolved Extension-Side via `gh`, Not the Daemon                         |
 | [ADR-0051](adr-0051.md)  | ✅ Accepted                              | 2026-07-14 | Do Not Pre-Trust Daemon-Opened Worktree Windows; Recommend Parent-Folder Trust              |
+| [ADR-0052](adr-0052.md)  | ✅ Accepted                              | 2026-07-15 | Cross-Window Claude Code Sessions Tracker as a Daemon Service Fed by Three Feeds            |
