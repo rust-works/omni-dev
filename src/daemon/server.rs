@@ -452,10 +452,13 @@ async fn handle_builtin(
     shutdown: &CancellationToken,
 ) -> DaemonReply {
     match op {
-        "ping" => DaemonReply::ok(json!({ "pong": true })),
+        // Carry the daemon binary's version so a client can detect it is talking
+        // to a stale resident daemon after a binary upgrade (#1113).
+        "ping" => DaemonReply::ok(json!({ "pong": true, "version": crate::VERSION })),
         "status" => {
             let report = StatusReport {
                 services: registry.statuses().await,
+                version: Some(crate::VERSION.to_string()),
             };
             match serde_json::to_value(report) {
                 Ok(payload) => DaemonReply::ok(payload),

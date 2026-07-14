@@ -88,10 +88,13 @@ use is invisible to the `request` / `harvest` thin clients.
 | Command | What it does |
 |---|---|
 | `omni-dev daemon run` | **Becomes** the daemon in the foreground: acquires the control socket (the service-manager-activated fd when socket-activated — launchd on macOS, systemd on Linux — otherwise a self-bound socket that doubles as the single-instance lock), starts the bridge on its planes, and blocks until `SIGTERM`/`SIGINT`/`SIGHUP` or `daemon stop`. This is what the service manager demand-spawns (or a launcher execs). |
-| `omni-dev daemon start` | Installs the daemon in the background and returns once it is ready. On macOS it bootstraps a launchd LaunchAgent, and on Linux (with a systemd user manager) it enables a systemd **user** socket unit, that **owns** the control socket and spawns the daemon on the first client connect (so it also activates at login); `start` warms it with one ping. Without a service manager (other Unix, or Linux without a user manager) it spawns `daemon run` in its own session (`setsid`, so it survives the launching terminal) with stdout/stderr appended to a `0600` `daemon.log` beside the socket — with no auto-start at login. You normally run this once — after that any CLI call re-activates the daemon on demand (socket activation on macOS/Linux; with the detached-spawn fallback, re-run `daemon start` after a reboot). |
+| `omni-dev daemon start` | Installs the daemon in the background and returns once it is ready. On macOS it bootstraps a launchd LaunchAgent, and on Linux (with a systemd user manager) it enables a systemd **user** socket unit, that **owns** the control socket and spawns the daemon on the first client connect (so it also activates at login); `start` warms it with one ping. Without a service manager (other Unix, or Linux without a user manager) it spawns `daemon run` in its own session (`setsid`, so it survives the launching terminal) with stdout/stderr appended to a `0600` `daemon.log` beside the socket (see [Logs](#logs)) — and no auto-start at login. You normally run this once — after that any CLI call re-activates the daemon on demand (socket activation on macOS/Linux; with the detached-spawn fallback, re-run `daemon start` after a reboot). |
 | `omni-dev daemon stop` | Stops the daemon and, on macOS, boots out the LaunchAgent, or on Linux stops and disables the systemd socket unit — removing/disarming the demand socket — so it is not re-activated until the next `daemon start` or login. |
-| `omni-dev daemon restart` | `stop` then `start`. On macOS, the only step needed after upgrading from an older `RunAtLoad` daemon to pick up the socket-activated agent. |
-| `omni-dev daemon status` | Reports the daemon and each hosted service (`-o json` for machines). Under socket activation, "running" means a process is currently spawned; "not running" means none is resident right now, not that the daemon is unavailable (it re-activates on the next connect) — unless it was `stop`ped. |
+| `omni-dev daemon restart` | `stop` then `start`. On macOS, the only step needed after upgrading from an older `RunAtLoad` daemon to pick up the socket-activated agent. Also how you pick up a new binary after an upgrade — the resident daemon keeps running the old code until restarted. |
+| `omni-dev daemon status` | Reports the daemon and each hosted service (`-o json` for machines). The header line shows the resident daemon's version; when it differs from the CLI you ran, a warning tells you to `daemon restart` to pick up the new binary. Under socket activation, "running" means a process is currently spawned; "not running" means none is resident right now, not that the daemon is unavailable (it re-activates on the next connect) — unless it was `stop`ped. |
+| `omni-dev daemon logs` | Reads the daemon's `daemon.log` (see [Logs](#logs)); `-n <N>` bounds the trailing window (default 200), `-f`/`--follow` tails it. Reads the file directly, so it works whether or not a daemon is currently resident. |
+| `omni-dev daemon bridge <op>` | Controls the hosted browser bridge without the macOS tray: `status`, `restart`, `disconnect-tab <ID>`, `snippet`, `token`, `request-command`. The recovery path on Linux/headless. |
+| `omni-dev daemon service <SVC> <OP>` | Low-level escape hatch: sends an arbitrary op (optional `--payload <JSON>`) to any service and prints the raw reply. `daemon status` lists the service names. |
 
 `daemon run` accepts the bridge's port/scope flags as `--bridge-ws-port`,
 `--bridge-control-port`, `--bridge-allow-origin`, and `--bridge-token-file`
@@ -121,13 +124,38 @@ constant time, and the file is still required to be `0600` — see the
 
 ```bash
 omni-dev daemon status
-# daemon: running
+# daemon: running (v0.35.0)
 #   browser-bridge   ok         1 tab(s), 0 pending (control :9998, ws :9999)
 ```
 
 Before any tab connects the line reads `no tab connected (control :9998, ws
 :9999)`; `omni-dev daemon status -o json` emits the structured per-service report.
-The `GET /__bridge/status` endpoint is unchanged and still feeds this view.
+The `GET /__bridge/status` endpoint is unchanged and still feeds this view. The
+`(v…)` on the header line is the **resident daemon's** version; if it differs from
+the CLI you invoked, `status` prints a warning — a binary upgrade doesn't replace a
+running daemon, so `omni-dev daemon restart` is needed to pick up the new code.
+
+### Logs
+
+The daemon's stdout/stderr is sunk to a `0600` `daemon.log` beside the control
+socket (`<socket dir>/daemon.log`; the default is `<data>/omni-dev/daemon.log`)
+so an operator can read it after the fact (#1316). On macOS the launchd
+LaunchAgent points `StandardOutPath`/`StandardErrorPath` there; the off-macOS
+detached-spawn launcher appends there. Under a **systemd** user unit the daemon
+logs to the journal instead (`journalctl --user`), and no `daemon.log` is written
+on that path.
+
+Read the file with:
+
+```bash
+omni-dev daemon logs             # last 200 lines
+omni-dev daemon logs -n 50       # last 50 lines
+omni-dev daemon logs -f          # follow (Ctrl-C to stop)
+```
+
+`daemon run` defaults its tracing filter to `info` (so lifecycle events —
+start/stop, signals, accept errors — are actually emitted), while short-lived CLI
+invocations stay at `warn`; `RUST_LOG` overrides either.
 
 ### Menu bar (macOS, `menu-bar` feature)
 
@@ -146,6 +174,26 @@ with actions:
 
 The menu is compiled out on non-macOS builds and when the `menu-bar` feature is
 off; those builds (and `daemon run --no-menu`) are headless.
+
+### Controlling the bridge from the CLI
+
+Every tray action above is also reachable from the CLI, so the bridge is fully
+operable on Linux/headless (previously the tray was the only trigger):
+
+```bash
+omni-dev daemon bridge status              # connection line, ports (-o json for the raw payload)
+omni-dev daemon bridge restart             # relaunch the planes with the same token
+omni-dev daemon bridge disconnect-tab 3    # drop tab #3 (see the ids in `status -o json`)
+omni-dev daemon bridge token               # the raw session key
+omni-dev daemon bridge snippet             # the DevTools console snippet
+omni-dev daemon bridge request-command     # a ready-to-run `browser bridge request …` line
+```
+
+These send ops to the daemon's `browser-bridge` service over the `0600` control
+socket (owner-only, same trust as the token file) — distinct from `omni-dev browser
+bridge request`, which drives the bridge's own loopback-TCP plane. The generic
+`omni-dev daemon service browser-bridge <op>` reaches the same ops (and any other
+service's) if you need a raw passthrough.
 
 ## Talking to the control plane
 
