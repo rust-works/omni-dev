@@ -339,23 +339,26 @@ Confluence page management, search, and more
 Usage: confluence <COMMAND>
 
 Commands:
-  comment     Manages comments on a Confluence page
-  read        Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
-  write       Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
-  edit        Interactive fetch-edit-push cycle for a Confluence page
-  search      Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
-  create      Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
-  delete      Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
-  move        Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
-  label       Manages labels on Confluence pages
-  attachment  Manages attachments on Confluence pages
-  download    Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
-  children    Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
-  history     Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
-  compare     Compares two versions of a Confluence page (structural diff)
-  user        Confluence user operations
-  space       Confluence space operations
-  help        Print this message or the help of the given subcommand(s)
+  comment      Manages comments on a Confluence page
+  read         Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
+  write        Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
+  edit         Interactive fetch-edit-push cycle for a Confluence page
+  search       Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
+  create       Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
+  delete       Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
+  move         Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
+  copy         Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+  label        Manages labels on Confluence pages
+  attachment   Manages attachments on Confluence pages
+  download     Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
+  children     Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
+  history      Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
+  compare      Compares two versions of a Confluence page (structural diff)
+  user         Confluence user operations
+  space        Confluence space operations
+  watcher      Manages watchers on Confluence pages
+  restriction  Manages read/update restrictions on Confluence pages
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -371,6 +374,7 @@ Usage: attachment <COMMAND>
 
 Commands:
   upload    Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
+  update    Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
   list      Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool)
   download  Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool)
   delete    Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool)
@@ -434,6 +438,26 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence attachment update - Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
+
+Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
+
+Usage: update [OPTIONS] <PAGE_ID> <ATTACHMENT_ID> <FILE>
+
+Arguments:
+  <PAGE_ID>        Confluence page ID (e.g., 12345678)
+  <ATTACHMENT_ID>  Attachment ID to update (from `attachment list`)
+  <FILE>           Path to the local file whose contents become the new version
+
+Options:
+      --filename <FILENAME>  Override the filename used in Confluence (defaults to the local basename)
+      --comment <COMMENT>    Optional version comment recorded with the new version
+      --minor-edit           Marks the new version as a minor edit
+  -h, --help                 Print help
+
+
+================================================================================
+
 omni-dev atlassian confluence attachment upload - Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
 
 Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
@@ -485,6 +509,10 @@ Commands:
   replies     Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
   audit       Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool)
   reanchor    Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool)
+  edit        Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+  delete      Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+  resolve     Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+  reopen      Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -545,6 +573,42 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment delete - Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+
+Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+
+Usage: delete [OPTIONS] --kind <KIND> <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Comment ID to delete (from `comment list`)
+
+Options:
+      --kind <KIND>  Whether the target is a footer or inline comment (the v2 API uses separate endpoints) [possible values: footer, inline]
+      --force        Skips the confirmation prompt
+      --dry-run      Prints what would be deleted without making any API calls
+  -h, --help         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment edit - Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+
+Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+
+Usage: edit [OPTIONS] --kind <KIND> <COMMENT_ID> [FILE]
+
+Arguments:
+  <COMMENT_ID>  Comment ID to edit (from `comment list`)
+  [FILE]        Input file (reads from stdin if omitted or "-")
+
+Options:
+      --kind <KIND>      Whether the target is a footer or inline comment (the v2 API uses separate endpoints) [possible values: footer, inline]
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence comment list - Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
 
 Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
@@ -583,6 +647,21 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment reopen - Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
+
+Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
+
+Usage: reopen <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Inline comment ID to reopen (from `comment list`)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
 omni-dev atlassian confluence comment replies - Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
 
 Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
@@ -597,6 +676,21 @@ Options:
       --limit <LIMIT>    Maximum number of replies to display [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment resolve - Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+
+Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+
+Usage: resolve <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Inline comment ID to resolve (from `comment list`)
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================
@@ -662,6 +756,23 @@ Options:
       --cursor <CURSOR>  Cursor returned by an outline-mode `confluence compare` call
       --format <FORMAT>  Output text format [default: unified] [possible values: unified, side-by-side, markdown-inline]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence copy - Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+
+Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+
+Usage: copy --parent <PARENT> --title <TITLE> <ID>
+
+Arguments:
+  <ID>  Source Confluence page ID to copy
+
+Options:
+      --parent <PARENT>  Destination parent page ID the copy is placed under
+      --title <TITLE>    Title for the new copied page
+  -h, --help             Print help
 
 
 ================================================================================
@@ -864,6 +975,75 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence restriction - Manages read/update restrictions on Confluence pages
+
+Manages read/update restrictions on Confluence pages
+
+Usage: restriction <COMMAND>
+
+Commands:
+  get     Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+  grant   Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+  revoke  Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction get - Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+
+Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+
+Usage: get <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction grant - Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+
+Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+
+Usage: grant [OPTIONS] --operation <OPERATION> <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --operation <OPERATION>    Operation the restriction applies to [possible values: read, update]
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Mutually exclusive with `--group`
+      --group <GROUP>            Group name. Mutually exclusive with `--account-id`
+  -h, --help                     Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction revoke - Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+
+Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+
+Usage: revoke [OPTIONS] --operation <OPERATION> <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --operation <OPERATION>    Operation the restriction applies to [possible values: read, update]
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Mutually exclusive with `--group`
+      --group <GROUP>            Group name. Mutually exclusive with `--account-id`
+  -h, --help                     Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence search - Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
 
 Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
@@ -978,6 +1158,72 @@ Options:
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher - Manages watchers on Confluence pages
+
+Manages watchers on Confluence pages
+
+Usage: watcher <COMMAND>
+
+Commands:
+  status  Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+  add     Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+  remove  Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher add - Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+
+Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+
+Usage: add [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher remove - Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+
+Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+
+Usage: remove [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher status - Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+
+Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+
+Usage: status [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
 
 
 ================================================================================

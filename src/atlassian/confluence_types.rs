@@ -527,6 +527,10 @@ pub(crate) struct ConfluenceCommentVersion {
     pub(crate) author_id: Option<String>,
     #[serde(rename = "createdAt", default)]
     pub(crate) created_at: Option<String>,
+    /// Monotonic version number. Absent from list responses we ignore it on;
+    /// present when a single comment is fetched to bump for an update.
+    #[serde(default)]
+    pub(crate) number: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -558,6 +562,40 @@ pub(crate) struct InlineCommentProperties {
     pub(crate) text_selection_match_count: usize,
     #[serde(rename = "textSelectionMatchIndex")]
     pub(crate) text_selection_match_index: usize,
+}
+
+/// Request body for `PUT /wiki/api/v2/{footer|inline}-comments/{id}` — used by
+/// both comment edit and inline-comment resolve/reopen. `resolved` is only sent
+/// for inline comments (footer comments cannot be resolved), so it is omitted
+/// when `None`.
+#[derive(Serialize)]
+pub(crate) struct ConfluenceUpdateCommentRequest {
+    pub(crate) version: ConfluenceUpdateVersion,
+    pub(crate) body: ConfluenceUpdateBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved: Option<bool>,
+}
+
+/// Minimal read of a single comment (`GET /wiki/api/v2/{segment}/{id}`) — just
+/// enough to learn its current `version.number` (required to build the next
+/// version on update) and its current ADF body (needed to re-send an unchanged
+/// body when only toggling the `resolved` flag). Reuses the shared
+/// [`ConfluenceCommentVersion`] / [`ConfluenceCommentBody`] shapes.
+#[derive(Deserialize)]
+pub(crate) struct ConfluenceCommentDetail {
+    #[serde(default)]
+    pub(crate) version: Option<ConfluenceCommentVersion>,
+    #[serde(default)]
+    pub(crate) body: Option<ConfluenceCommentBody>,
+}
+
+/// Response of `GET /wiki/rest/api/user/watch/content/{id}` — whether the
+/// (current or specified) user is watching the content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluenceWatchStatus {
+    /// Whether the user is watching the content.
+    #[serde(default)]
+    pub watching: bool,
 }
 
 // ── Labels ─────────────────────────────────────────────────────────

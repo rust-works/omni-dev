@@ -4,6 +4,7 @@ pub(crate) mod attachment;
 pub(crate) mod children;
 pub(crate) mod comment;
 pub(crate) mod compare;
+pub(crate) mod copy;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod download;
@@ -12,9 +13,11 @@ pub(crate) mod history;
 pub(crate) mod label;
 pub(crate) mod move_page;
 pub(crate) mod read;
+pub(crate) mod restriction;
 pub(crate) mod search;
 pub(crate) mod space;
 pub(crate) mod user;
+pub(crate) mod watcher;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -60,6 +63,8 @@ pub enum ConfluenceSubcommands {
     Delete(delete::DeleteCommand),
     /// Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool).
     Move(move_page::MoveCommand),
+    /// Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool).
+    Copy(copy::CopyCommand),
     /// Manages labels on Confluence pages.
     Label(label::LabelCommand),
     /// Manages attachments on Confluence pages.
@@ -76,6 +81,10 @@ pub enum ConfluenceSubcommands {
     User(user::UserCommand),
     /// Confluence space operations.
     Space(space::SpaceCommand),
+    /// Manages watchers on Confluence pages.
+    Watcher(watcher::WatcherCommand),
+    /// Manages read/update restrictions on Confluence pages.
+    Restriction(restriction::RestrictionCommand),
 }
 
 impl ConfluenceCommand {
@@ -92,12 +101,15 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Attachment(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Move(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Copy(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Children(cmd) => cmd.execute().await,
             ConfluenceSubcommands::History(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Compare(cmd) => cmd.execute().await,
             ConfluenceSubcommands::User(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Space(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Watcher(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Restriction(cmd) => cmd.execute().await,
         }
     }
 }
