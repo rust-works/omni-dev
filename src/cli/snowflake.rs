@@ -41,6 +41,9 @@ pub enum SnowflakeSubcommands {
     Query(QueryCommand),
     /// List active multiplexed sessions.
     Sessions(SessionsCommand),
+    /// Cancel (abort) the running query on a pool without evicting the session:
+    /// one `(account, user)` pool, a pool by id, or all pools.
+    Cancel(CancelCommand),
     /// Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or
     /// all pools.
     Disconnect(DisconnectCommand),
@@ -52,6 +55,7 @@ impl SnowflakeCommand {
         match self.command {
             SnowflakeSubcommands::Query(cmd) => cmd.execute().await,
             SnowflakeSubcommands::Sessions(cmd) => cmd.execute().await,
+            SnowflakeSubcommands::Cancel(cmd) => cmd.execute().await,
             SnowflakeSubcommands::Disconnect(cmd) => cmd.execute().await,
         }
     }
@@ -254,6 +258,102 @@ fn render_member(member: &Value) -> String {
         format!("idle {secs}s")
     };
     format!("#{mid} {context} · {state} · {qc} queries")
+}
+
+/// Cancels (aborts) the running query on a target pool **without** evicting the
+/// session.
+///
+/// Frees the pooled session promptly rather than waiting out
+/// `SNOWFLAKE_QUERY_TIMEOUT`. Exactly one selector is required — the
+/// `--account`/`--user` pair, `--id`, or `--all`. `--member` (a numeric member id
+/// from `sessions`) narrows the cancel to one authenticated session's query; it
+/// may not be combined with `--all`.
+#[derive(Parser)]
+#[command(group(
+    ArgGroup::new("cancel-target")
+        .required(true)
+        .args(["account", "id", "all"]),
+))]
+pub struct CancelCommand {
+    /// Account of the pool whose query to cancel (requires `--user`).
+    #[arg(long, requires = "user")]
+    pub account: Option<String>,
+    /// User of the pool whose query to cancel (requires `--account`).
+    #[arg(long, requires = "account")]
+    pub user: Option<String>,
+    /// Numeric id of the pool (as shown by `sessions`).
+    #[arg(long)]
+    pub id: Option<u64>,
+    /// Cancel the running query on every pool.
+    #[arg(long)]
+    pub all: bool,
+    /// Numeric member id (from `sessions`) to cancel a single session's query
+    /// instead of every busy member in the pool. Not valid with `--all`.
+    #[arg(long, conflicts_with = "all")]
+    pub member: Option<u64>,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl CancelCommand {
+    /// Executes the cancel command.
+    pub async fn execute(mut self) -> Result<()> {
+        let payload = self.payload();
+        let socket = server::resolve_socket(self.socket.take())?;
+        let result = call(&socket, "cancel", payload).await?;
+        println!("{}", self.message(&result));
+        Ok(())
+    }
+
+    /// Builds the socket payload for whichever selector was chosen, adding
+    /// `member` when set. Exactly one selector is present (enforced by the
+    /// `cancel-target` arg group).
+    fn payload(&self) -> Value {
+        let mut payload = if self.all {
+            json!({ "all": true })
+        } else if let Some(id) = self.id {
+            json!({ "id": id })
+        } else {
+            json!({ "account": self.account, "user": self.user })
+        };
+        if let (Some(member), Some(map)) = (self.member, payload.as_object_mut()) {
+            map.insert("member".to_string(), json!(member));
+        }
+        payload
+    }
+
+    /// The line printed after the socket call, matched to the selector, the
+    /// optional member, and how many running queries were actually cancelled.
+    fn message(&self, result: &Value) -> String {
+        let cancelled = result.get("cancelled").and_then(Value::as_u64).unwrap_or(0);
+        if self.all {
+            return format!("Cancelled {cancelled} running query(ies) across all pools.");
+        }
+        let target = if let Some(id) = self.id {
+            format!("pool #{id}")
+        } else {
+            // The arg group guarantees the pair when neither --all nor --id.
+            let account = self.account.as_deref().unwrap_or_default();
+            let user = self.user.as_deref().unwrap_or_default();
+            format!("{account} / {user}")
+        };
+        cancel_message(cancelled, &target, self.member)
+    }
+}
+
+/// The message printed after a targeted cancel, reflecting the scope (pool or
+/// identity, optionally a single member) and how many queries were cancelled.
+fn cancel_message(cancelled: u64, target: &str, member: Option<u64>) -> String {
+    let scope = match member {
+        Some(member) => format!("{target} member #{member}"),
+        None => target.to_string(),
+    };
+    if cancelled == 0 {
+        format!("No running query to cancel for {scope}.")
+    } else {
+        format!("Cancelled {cancelled} running query(ies) for {scope}.")
+    }
 }
 
 /// Evicts multiplexed sessions: one `(account, user)` pool, a pool by numeric id
@@ -689,6 +789,115 @@ mod tests {
             json: true,
         };
         assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_execute_errors_without_a_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        // With no daemon at the socket path, `execute` builds the payload, resolves
+        // the socket, and fails on the socket call.
+        let cmd = CancelCommand {
+            account: None,
+            user: None,
+            id: Some(3),
+            all: false,
+            member: Some(2),
+            socket: Some(dir.path().join("absent.sock")),
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[test]
+    fn cancel_selectors_and_member_parse_to_payloads() {
+        let SnowflakeSubcommands::Cancel(cmd) =
+            parse(&["cancel", "--account", "ACCT", "--user", "me"])
+        else {
+            panic!("expected cancel");
+        };
+        assert_eq!(cmd.payload(), json!({ "account": "ACCT", "user": "me" }));
+
+        let SnowflakeSubcommands::Cancel(cmd) = parse(&["cancel", "--id", "3", "--member", "2"])
+        else {
+            panic!("expected cancel");
+        };
+        assert_eq!(cmd.payload(), json!({ "id": 3, "member": 2 }));
+
+        let SnowflakeSubcommands::Cancel(cmd) = parse(&["cancel", "--all"]) else {
+            panic!("expected cancel");
+        };
+        assert!(cmd.all);
+        assert_eq!(cmd.payload(), json!({ "all": true }));
+
+        // The pair form carries `member` too.
+        let SnowflakeSubcommands::Cancel(cmd) =
+            parse(&["cancel", "--account", "A", "--user", "u", "--member", "5"])
+        else {
+            panic!("expected cancel");
+        };
+        assert_eq!(
+            cmd.payload(),
+            json!({ "account": "A", "user": "u", "member": 5 })
+        );
+    }
+
+    #[test]
+    fn cancel_requires_one_selector_and_member_conflicts_with_all() {
+        // No selector at all is an error (the `cancel-target` group is required).
+        assert!(try_parse(&["cancel"]).is_err());
+        // Selectors are mutually exclusive.
+        assert!(try_parse(&["cancel", "--all", "--id", "1"]).is_err());
+        assert!(try_parse(&["cancel", "--account", "A", "--user", "u", "--all"]).is_err());
+        // --account without --user (and vice versa) is a parse error.
+        assert!(try_parse(&["cancel", "--account", "ACCT"]).is_err());
+        assert!(try_parse(&["cancel", "--user", "me"]).is_err());
+        // --member cannot combine with --all.
+        assert!(try_parse(&["cancel", "--all", "--member", "1"]).is_err());
+    }
+
+    #[test]
+    fn cancel_message_reflects_selector_member_and_count() {
+        let all = CancelCommand {
+            account: None,
+            user: None,
+            id: None,
+            all: true,
+            member: None,
+            socket: None,
+        };
+        assert_eq!(
+            all.message(&json!({ "cancelled": 2 })),
+            "Cancelled 2 running query(ies) across all pools."
+        );
+
+        let by_id = CancelCommand {
+            account: None,
+            user: None,
+            id: Some(3),
+            all: false,
+            member: Some(2),
+            socket: None,
+        };
+        assert_eq!(
+            by_id.message(&json!({ "cancelled": 1 })),
+            "Cancelled 1 running query(ies) for pool #3 member #2."
+        );
+        assert_eq!(
+            by_id.message(&json!({ "cancelled": 0 })),
+            "No running query to cancel for pool #3 member #2."
+        );
+
+        let pair = CancelCommand {
+            account: Some("ACME".to_string()),
+            user: Some("me".to_string()),
+            id: None,
+            all: false,
+            member: None,
+            socket: None,
+        };
+        assert_eq!(
+            pair.message(&json!({ "cancelled": 1 })),
+            "Cancelled 1 running query(ies) for ACME / me."
+        );
     }
 
     #[test]
