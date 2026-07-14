@@ -312,4 +312,102 @@ mod tests {
         assert!(out.contains("Would delete component 10000."));
         assert!(!out.contains("Deleted component"));
     }
+
+    // ── execute() end-to-end (drives create_client + the API call) ──
+
+    #[tokio::test]
+    async fn list_execute_drives_create_client_and_gets() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/components",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "10000", "name": "Backend", "description": "Server"}
+                ])),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        ListCommand {
+            project: "PROJ".to_string(),
+            output: OutputFormat::Table,
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_execute_drives_create_client_and_posts() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/component"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "Backend"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CreateCommand {
+            project: "PROJ".to_string(),
+            name: "Backend".to_string(),
+            description: Some("Server side".to_string()),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_execute_drives_create_client_and_puts() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/component/10000"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "Renamed"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        UpdateCommand {
+            component_id: "10000".to_string(),
+            name: Some("Renamed".to_string()),
+            description: None,
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_execute_wrapper_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/component/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the public execute() wrapper (which
+        // wires up real stdin/stdout) does not read stdin.
+        DeleteCommand {
+            component_id: "10000".to_string(),
+            move_issues_to: None,
+            force: true,
+            dry_run: false,
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
 }
