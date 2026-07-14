@@ -17,6 +17,8 @@ import {
   openEnvelope,
   registerEnvelope,
   setShowClosedEnvelope,
+  sessionWindowEnvelope,
+  sessionWindowUnregisterEnvelope,
   subscribeEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -115,6 +117,22 @@ test("set-show-closed envelope carries the toggle as snake_case `show_closed`", 
     service: "worktrees",
     op: "set-show-closed",
     payload: { show_closed: true },
+  });
+});
+
+test("sessions window envelope builders route to the sessions service", () => {
+  assert.deepEqual(
+    sessionWindowEnvelope({ key: "k1", folders: ["/a", "/b"], tabs: 2, terminals: 1 }),
+    {
+      service: "sessions",
+      op: "window",
+      payload: { key: "k1", folders: ["/a", "/b"], tabs: 2, terminals: 1 },
+    },
+  );
+  assert.deepEqual(sessionWindowUnregisterEnvelope("k1"), {
+    service: "sessions",
+    op: "window-unregister",
+    payload: { key: "k1" },
   });
 });
 
