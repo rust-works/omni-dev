@@ -152,6 +152,20 @@ the (cheap) `tree` payload — `worktrees tree` fetches it on demand via the
 [the contract](#companion-contract-for-the-extension-and-other-clients) with
 `ahead`/`behind` merged back onto each worktree.
 
+`worktrees focus` raises the VS Code window for a worktree folder from the CLI —
+the same capability as the tray's per-window focus action, now reachable on
+Linux/headless too (#1113):
+
+```bash
+# Focus the window for a worktree folder (a path from `worktrees tree`/`list`).
+omni-dev worktrees focus /path/to/worktree
+```
+
+It resolves the path to an absolute directory client-side (a clear error if it
+doesn't exist), then sends the daemon's **`open`** op, which runs `code <path>` via
+the shared launcher resolution (`OMNI_DEV_VSCODE_BIN` → well-known paths → `code`);
+VS Code reuses the already-open window rather than opening a second one.
+
 ## Tray
 
 On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:

@@ -52,7 +52,10 @@ fn print_running(json_out: bool, report: &StatusReport) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    println!("daemon: running");
+    match &report.version {
+        Some(version) => println!("daemon: running (v{version})"),
+        None => println!("daemon: running (version unknown)"),
+    }
     if report.services.is_empty() {
         println!("  (no services registered)");
     }
@@ -60,6 +63,9 @@ fn print_running(json_out: bool, report: &StatusReport) -> Result<()> {
         let health = if svc.healthy { "ok" } else { "unhealthy" };
         println!("  {:<16} {:<10} {}", svc.name, health, svc.summary);
     }
+    // Non-fatal: flag a stale resident daemon (older/newer than this CLI) so an
+    // operator knows a `daemon restart` is needed to pick up the new binary.
+    super::warn_version_mismatch(report.version.as_deref());
     Ok(())
 }
 
@@ -74,4 +80,47 @@ fn print_not_running(json_out: bool) -> Result<()> {
         println!("daemon: not running");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::daemon::service::ServiceStatus;
+
+    fn report(version: Option<&str>) -> StatusReport {
+        StatusReport {
+            services: vec![ServiceStatus {
+                name: "browser-bridge".to_string(),
+                healthy: true,
+                summary: "no tab connected".to_string(),
+                detail: serde_json::Value::Null,
+            }],
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn print_running_renders_table_and_json_with_or_without_a_version() {
+        // Table: a known version, an unknown (pre-#1113) version, and JSON — each
+        // exercises a distinct branch of the header line without erroring.
+        print_running(false, &report(Some("1.2.3"))).unwrap();
+        print_running(false, &report(None)).unwrap();
+        print_running(true, &report(Some("1.2.3"))).unwrap();
+        // A running daemon with no services still renders.
+        print_running(
+            false,
+            &StatusReport {
+                services: vec![],
+                version: Some("1.2.3".to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn print_not_running_renders_table_and_json() {
+        print_not_running(false).unwrap();
+        print_not_running(true).unwrap();
+    }
 }

@@ -129,6 +129,11 @@ impl DaemonReply {
 pub struct StatusReport {
     /// One entry per registered service, in registration order.
     pub services: Vec<ServiceStatus>,
+    /// The daemon binary's crate version (`CARGO_PKG_VERSION`), so a client can
+    /// detect it is driving a stale resident daemon after a binary upgrade
+    /// (#1113). Absent from a pre-#1113 daemon; a client shows "unknown" then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[cfg(test)]
@@ -164,5 +169,35 @@ mod tests {
         let back: DaemonEnvelope =
             serde_json::from_str(r#"{"service":"snowflake","op":"query"}"#).unwrap();
         assert!(back.origin_invocation_id.is_none());
+    }
+
+    #[test]
+    fn status_report_from_older_daemon_defaults_version_to_none() {
+        // A pre-#1113 daemon's status payload has no `version`; a newer client
+        // must still decode it, seeing `None` (rendered as "unknown").
+        let back: StatusReport = serde_json::from_str(r#"{"services":[]}"#).unwrap();
+        assert!(back.version.is_none());
+    }
+
+    #[test]
+    fn status_report_round_trips_and_omits_absent_version() {
+        // With no version the field is skipped, keeping the wire byte-identical
+        // to what an older client/daemon exchanges.
+        let line = serde_json::to_string(&StatusReport {
+            services: vec![],
+            version: None,
+        })
+        .unwrap();
+        assert!(!line.contains("version"), "{line}");
+
+        // With a version it serializes and round-trips.
+        let line = serde_json::to_string(&StatusReport {
+            services: vec![],
+            version: Some("1.2.3".to_string()),
+        })
+        .unwrap();
+        assert!(line.contains("\"version\":\"1.2.3\""), "{line}");
+        let back: StatusReport = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.version.as_deref(), Some("1.2.3"));
     }
 }
