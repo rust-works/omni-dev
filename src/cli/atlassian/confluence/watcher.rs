@@ -130,4 +130,93 @@ mod tests {
         };
         assert!(matches!(cmd.command, WatcherSubcommands::Remove(_)));
     }
+
+    // ── execute() end-to-end (drives create_client + the API call) ──
+
+    fn watch_mock(method: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+    }
+
+    #[tokio::test]
+    async fn status_execute_reports_watching() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"watching": true})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        WatchArgs {
+            id: "12345".to_string(),
+            account_id: None,
+        }
+        .run_status()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_execute_reports_not_watching_for_account() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"watching": false})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        WatchArgs {
+            id: "12345".to_string(),
+            account_id: Some("acc-1".to_string()),
+        }
+        .run_status()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_execute_posts_watcher() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        watch_mock("POST").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        WatchArgs {
+            id: "12345".to_string(),
+            account_id: Some("acc-1".to_string()),
+        }
+        .run_add()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_execute_deletes_watcher() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        watch_mock("DELETE").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        WatchArgs {
+            id: "12345".to_string(),
+            account_id: None,
+        }
+        .run_remove()
+        .await
+        .unwrap();
+    }
 }

@@ -187,4 +187,75 @@ mod tests {
         };
         assert_eq!(group.subject(), "group devs");
     }
+
+    // ── execute() end-to-end (drives create_client + the API call) ──
+
+    #[tokio::test]
+    async fn get_execute_prints_restrictions() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"operation": "read"}]})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        GetCommand {
+            id: "12345".to_string(),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_execute_puts_user_restriction() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/update/user",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        SubjectCommand {
+            id: "12345".to_string(),
+            operation: RestrictionOperation::Update,
+            account_id: Some("acc-1".to_string()),
+            group: None,
+        }
+        .execute(true)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_execute_deletes_group_restriction() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/read/group/devs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        SubjectCommand {
+            id: "12345".to_string(),
+            operation: RestrictionOperation::Read,
+            account_id: None,
+            group: Some("devs".to_string()),
+        }
+        .execute(false)
+        .await
+        .unwrap();
+    }
 }

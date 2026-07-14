@@ -138,4 +138,43 @@ mod tests {
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("No labels supplied"));
     }
+
+    // ── execute() end-to-end (drives create_client + the PUT) ──
+
+    fn issue_put_mock() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+    }
+
+    #[tokio::test]
+    async fn add_execute_drives_create_client_and_puts() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        issue_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        AddCommand {
+            key: "PROJ-1".to_string(),
+            labels: vec!["backend".to_string(), "reviewed".to_string()],
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_execute_drives_create_client_and_puts() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        issue_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        RemoveCommand {
+            key: "PROJ-1".to_string(),
+            labels: vec!["stale".to_string()],
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
 }
