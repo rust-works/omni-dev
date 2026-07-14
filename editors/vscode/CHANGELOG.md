@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Open Claude Code** ([#1322](https://github.com/rust-works/omni-dev/issues/1322)): a **Claude-in-a-box** button in the editor title bar opens the Claude Code CLI in a terminal docked as an **editor tab** (not the bottom panel) and runs the configured command.
+  - The working directory is the active window's workspace folder — the focused editor's folder when it sits in one, else the first folder. Clicking again while the terminal is still open **focuses** it instead of spawning a duplicate; after you close it, a fresh click opens a new one.
+  - The launch command is the new `omniDevWorktrees.claudeCommand` setting (default `claude`); a shell prefix such as `proxy && claude` is allowed. The button is window-level and daemon-independent, so it works even when the omni-dev daemon is not running.
+
 ### Changed
 - **Colored PR check badge** ([#1324](https://github.com/rust-works/omni-dev/issues/1324)): a worktree's CI-check state now renders as a **colored** badge on the row — a green `✓` (passing), red `✗` (failing), or yellow `●` (pending) — instead of a monochrome glyph tucked into the muted description, so a passing and a failing PR are distinguishable at a glance.
   - The badge is a theme-aware `FileDecoration` (using the `charts.{green,red,yellow}` palette) painted from a custom `omnidev-worktree:` `resourceUri`, a custom scheme so it never collides with git's own folder decorations; the color also tints the row's branch label, matching how git status colors its badges.

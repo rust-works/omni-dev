@@ -65,6 +65,23 @@ through the **GitHub Pull Requests** extension's URI handler. If that extension
 is not installed, a single warning offers **Install** or **Copy PR URL** — it
 never silently falls back to a browser.
 
+## Open Claude Code
+
+A **Claude-in-a-box** button in the **editor title bar** (the top-right icon
+cluster, alongside the Claude Code extension's own icon) opens the **Claude Code
+CLI** in a terminal docked as an **editor tab** — one click instead of opening a
+terminal, re-docking it to the editor area, and typing `claude` by hand.
+
+- The terminal's working directory is the active window's workspace folder — the
+  folder of the focused editor when it sits in one, else the first folder.
+- Clicking again while it is still open **focuses** that terminal instead of
+  spawning a duplicate; once you close it, the next click starts a fresh one.
+- The launch command is `omniDevWorktrees.claudeCommand` (default `claude`); a
+  shell prefix such as `proxy && claude` is allowed.
+
+The button is window-level and **daemon-independent** — a plain terminal, no
+socket involved — so it works even when the omni-dev daemon is not running.
+
 ## Requirements
 
 - The omni-dev daemon running locally (`omni-dev daemon start`).
@@ -85,6 +102,7 @@ never silently falls back to a browser.
 |---------|---------|-------------|
 | `omniDevWorktrees.socketPath` | `""` | Override the daemon control-socket path (mirrors the daemon's `--socket`). Empty uses the computed default `<data_dir>/omni-dev/daemon.sock`. |
 | `omniDevWorktrees.heartbeatSeconds` | `10` | Seconds between heartbeats. The daemon reaps a window after 30s of silence, so keep this well under 30. |
+| `omniDevWorktrees.claudeCommand` | `"claude"` | Command run by the **Open Claude Code** title-bar button. A shell prefix such as `proxy && claude` is allowed. |
 
 ## Development
 
