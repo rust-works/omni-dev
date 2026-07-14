@@ -17,11 +17,21 @@ use crate::claude::error::ClaudeError;
 use crate::claude::model_config::get_model_registry;
 use crate::request_log;
 
-/// HTTP request timeout for AI API calls.
+/// Default HTTP request timeout for AI API calls.
 ///
 /// Set to 5 minutes to accommodate large prompts and long model responses
-/// (up to 64k output tokens) while preventing indefinite hangs.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// (up to 64k output tokens) while preventing indefinite hangs. Overridable
+/// per invocation via [`TIMEOUT_ENV_VAR`].
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Env var overriding [`DEFAULT_REQUEST_TIMEOUT`] for the HTTP AI backends
+/// (direct Anthropic, Bedrock, OpenAI, Ollama). Value is whole seconds.
+///
+/// Brings the HTTP backends to parity with the subprocess `claude-cli`
+/// backend, which already honours `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS` (#1119);
+/// the two are separate so each transport can be tuned independently. A
+/// missing, non-numeric, or zero value falls back to the default.
+pub(crate) const TIMEOUT_ENV_VAR: &str = "OMNI_DEV_AI_TIMEOUT_SECS";
 
 /// Metadata about an AI client implementation.
 #[derive(Clone, Debug)]
@@ -70,10 +80,30 @@ impl AiClientMetadata {
 
 // ── Shared helpers for AI client implementations ────────────────────
 
-/// Builds an HTTP client with the standard request timeout.
+/// Resolves the HTTP request timeout, honouring [`TIMEOUT_ENV_VAR`].
+///
+/// Reads through the settings helper so the override can also come from a
+/// `settings.json` `env` bundle, consistent with the other backend variables.
+pub(crate) fn request_timeout() -> Duration {
+    timeout_from_secs(crate::utils::settings::get_env_var(TIMEOUT_ENV_VAR).ok())
+}
+
+/// Parses a whole-seconds timeout override, falling back to
+/// [`DEFAULT_REQUEST_TIMEOUT`] for an absent, non-numeric, or zero value.
+///
+/// A 0-second HTTP timeout would abort every request immediately, so it is
+/// treated as unset rather than honoured. Pure so it is unit-testable without
+/// mutating the process environment.
+fn timeout_from_secs(raw: Option<String>) -> Duration {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs)
+}
+
+/// Builds an HTTP client with the resolved request timeout.
 pub(crate) fn build_http_client() -> Result<Client> {
     Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(request_timeout())
         .build()
         .context("Failed to build HTTP client")
 }
@@ -436,6 +466,31 @@ mod tests {
     fn capabilities_default_is_all_disabled() {
         let caps = AiClientCapabilities::default();
         assert!(!caps.supports_response_schema);
+    }
+
+    #[test]
+    fn timeout_from_secs_parses_valid_override() {
+        assert_eq!(
+            timeout_from_secs(Some("120".to_string())),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn timeout_from_secs_falls_back_for_absent_zero_or_garbage() {
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("abc".to_string()),
+            Some("-5".to_string()),
+        ] {
+            assert_eq!(
+                timeout_from_secs(raw.clone()),
+                DEFAULT_REQUEST_TIMEOUT,
+                "expected default for {raw:?}"
+            );
+        }
     }
 
     #[test]

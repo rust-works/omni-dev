@@ -20,6 +20,7 @@ models:
     input_context: 200000
     generation: 4.6
     tier: "flagship"
+    supports_structured_output: true
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -34,6 +35,7 @@ models:
     input_context: 200000
     generation: 4.6
     tier: "balanced"
+    supports_structured_output: true
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -49,6 +51,7 @@ models:
     input_context: 200000
     generation: 4.5
     tier: "balanced"
+    supports_structured_output: true
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -63,6 +66,7 @@ models:
     input_context: 200000
     generation: 4.5
     tier: "fast"
+    supports_structured_output: true
 
   - provider: "claude"
     model: "Claude Opus 4.5"
@@ -74,6 +78,7 @@ models:
     generation: 4.5
     tier: "flagship"
     legacy: true
+    supports_structured_output: true
 
   # Claude 4.x Series (Legacy)
   - provider: "claude"
