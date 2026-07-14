@@ -35,7 +35,7 @@ use client::{
     AuthMethod, BrowserConfig, BrowserLaunch, Error as ClientError, KeyPairConfig, Row,
     SnowflakeClient, SnowflakeClientConfig, SnowflakeSession,
 };
-use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey};
+use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey, SessionPool};
 
 /// Env var (with `~/.omni-dev/settings.json` fallback) for the default account.
 const ENV_ACCOUNT: &str = "SNOWFLAKE_ACCOUNT";
@@ -570,6 +570,40 @@ impl SnowflakeEngine {
         self.registry.take_all().len()
     }
 
+    /// Cancels the running query on the `(account, user)` pool — one specific
+    /// member when `member` is `Some`, else every busy member. Returns how many
+    /// statements an abort was issued for. Does **not** create a pool, so an
+    /// unknown identity cancels nothing.
+    ///
+    /// The pooled session frees itself promptly (its poll loop returns a cancelled
+    /// error within one poll interval) rather than waiting out the query timeout.
+    pub async fn cancel(&self, account: &str, user: &str, member: Option<u64>) -> usize {
+        let key = SessionKey::new(normalize_account(account), user.trim());
+        match self.registry.get(&key) {
+            Some(pool) => cancel_pool(&pool, member).await,
+            None => 0,
+        }
+    }
+
+    /// Like [`cancel`](Self::cancel) but selects the pool by its numeric id (as
+    /// shown by `sessions`).
+    pub async fn cancel_by_id(&self, id: u64, member: Option<u64>) -> usize {
+        match self.registry.get_by_id(id) {
+            Some(pool) => cancel_pool(&pool, member).await,
+            None => 0,
+        }
+    }
+
+    /// Cancels every running query across all pools. Returns how many statements
+    /// an abort was issued for.
+    pub async fn cancel_all(&self) -> usize {
+        let mut cancelled = 0;
+        for pool in self.registry.pools() {
+            cancelled += cancel_pool(&pool, None).await;
+        }
+        cancelled
+    }
+
     /// Stops the keep-alive heartbeat, then drops every pool (and its sessions).
     pub async fn shutdown(&self) {
         let task = self.lock_heartbeat().take();
@@ -657,8 +691,14 @@ impl SnowflakeEngine {
             ));
         }
 
-        // Record what this member is now running, so menus/status show it.
-        pool.start_query(checkout.id(), sql_preview(&req.sql, SQL_PREVIEW_MAX));
+        // Record what this member is now running, so menus/status show it, and
+        // capture an abort handle so a concurrent `cancel` can stop it while the
+        // session is checked out (and thus unreachable through the pool slot).
+        pool.start_query(
+            checkout.id(),
+            sql_preview(&req.sql, SQL_PREVIEW_MAX),
+            Some(checkout.session().abort_handle()),
+        );
 
         // Apply the requested context and run the query, transparently renewing
         // the token and retrying once if it expires mid-flight.
@@ -698,6 +738,23 @@ impl Drop for SnowflakeEngine {
             task.token.cancel();
         }
     }
+}
+
+/// Aborts running statements on one pool (a specific `member`, else all busy
+/// members), returning how many aborts were issued. Handles are snapshotted under
+/// the pool's (sync) slot lock and each abort is awaited **after** the lock is
+/// released. A failed abort is logged and skipped, not surfaced.
+async fn cancel_pool(pool: &SessionPool, member: Option<u64>) -> usize {
+    let handles = pool.abort_handles(member);
+    let mut cancelled = 0;
+    for handle in handles {
+        match handle.abort().await {
+            Ok(true) => cancelled += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(pool = pool.id(), "Snowflake query cancel failed: {e}"),
+        }
+    }
+    cancelled
 }
 
 /// Sends one keep-alive round to every pool's currently-idle sessions,
@@ -1253,6 +1310,101 @@ mod tests {
         );
         engine.shutdown().await;
         assert!(engine.lock_heartbeat().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_selectors_are_zero_on_an_empty_engine() {
+        // No pools exist, so every selector cancels nothing — and crucially does
+        // not create a pool (offline, no auth).
+        let engine = SnowflakeEngine::new(SnowflakeEngineConfig::default());
+        assert_eq!(engine.cancel("ACCT", "me", None).await, 0);
+        assert_eq!(engine.cancel("ACCT", "me", Some(3)).await, 0);
+        assert_eq!(engine.cancel_by_id(7, None).await, 0);
+        assert_eq!(engine.cancel_all().await, 0);
+        assert_eq!(engine.pool_count(), 0, "cancel must not create a pool");
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_a_running_query_on_a_pooled_session() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The query goes async and parks in the poll loop, so its statement stays
+        // published (and thus cancellable) for the whole test.
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": { "getResultUrl": "/poll/1" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/poll/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/abort-request"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "success": true, "data": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        // Inject a mock-backed session into a pool, bypassing the (live-only) SSO,
+        // and record it as running with its abort handle — the state the engine's
+        // `query` path would set.
+        let engine = SnowflakeEngine::new(SnowflakeEngineConfig::default());
+        let pool = engine
+            .registry
+            .get_or_create(&SessionKey::new("ACCT", "me"), 4);
+        let pool_id = pool.id();
+        let uri = server.uri();
+        let checkout = pool
+            .checkout(|| async {
+                Ok::<_, std::convert::Infallible>((
+                    client::test_session(&uri, Duration::from_secs(5)),
+                    QueryContext::default(),
+                ))
+            })
+            .await
+            .unwrap();
+        let member_id = checkout.id();
+        pool.start_query(
+            member_id,
+            "SELECT LONG".to_string(),
+            Some(checkout.session().abort_handle()),
+        );
+
+        // Run the (parked) query concurrently with the cancels. `select!` returns
+        // as soon as the cancels complete, dropping the still-running query.
+        tokio::select! {
+            _ = checkout.session().query("SELECT LONG") => panic!("query should stay parked"),
+            counts = async {
+                // Let the query publish its in-flight statement before cancelling.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let by_pair = engine.cancel("ACCT", "me", None).await;
+                let by_id = engine.cancel_by_id(pool_id, Some(member_id)).await;
+                let by_all = engine.cancel_all().await;
+                (by_pair, by_id, by_all)
+            } => {
+                assert_eq!(counts, (1, 1, 1), "every selector aborts the running statement");
+            }
+        }
+
+        // One abort was posted per cancel call.
+        let aborts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/queries/v1/abort-request")
+            .count();
+        assert_eq!(aborts, 3);
     }
 
     #[test]

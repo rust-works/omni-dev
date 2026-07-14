@@ -100,12 +100,27 @@ omni-dev snowflake sessions          # table; -o json for machines
 omni-dev snowflake disconnect --account MYACCT --user me   # one pool by identity
 omni-dev snowflake disconnect --id 3                       # one pool by id (from `sessions`)
 omni-dev snowflake disconnect --all                        # every pool
+
+# Cancel a runaway query without evicting the session (frees it promptly).
+omni-dev snowflake cancel --id 3                # every busy member in pool 3
+omni-dev snowflake cancel --id 3 --member 2     # one authenticated session's query
+omni-dev snowflake cancel --account MYACCT --user me   # by identity
+omni-dev snowflake cancel --all                 # every running query
 ```
 
 `disconnect` takes exactly one selector — the `--account`/`--user` pair, `--id`
 (the numeric pool id shown by `sessions`), or `--all`. The by-id and bulk forms
 were previously reachable only from the macOS tray, so non-macOS operators had to
 restart the daemon to bulk-evict sessions (#1228).
+
+`cancel` aborts the running query (via `queries/v1/abort-request`) **without**
+evicting the session, so a runaway statement frees its pooled session promptly
+(within one poll interval) instead of holding it until `SNOWFLAKE_QUERY_TIMEOUT`
+(#1225). It takes the same three selectors as `disconnect`, plus an optional
+`--member <id>` (a member id shown by `sessions`) to target one authenticated
+session's query rather than every busy member in the pool; `--member` is not
+valid with `--all`. It reports how many running queries an abort was issued for
+and is a no-op when nothing is running.
 
 `query` returns a self-describing payload:
 
@@ -337,6 +352,13 @@ openssl rsa -in sf_key.p8 -pubout -out sf_key.pub   # its body is the RSA_PUBLIC
   the client **polls** that URL until the query completes. Heavy queries (e.g. a
   multi-CTE `QUALIFY` over billions of rows) therefore run to completion, bounded
   by `SNOWFLAKE_QUERY_TIMEOUT` (default 3600s) rather than the per-request timeout.
+- **Cancelling a runaway query.** `cancel` (`omni-dev snowflake cancel`, or the
+  socket `cancel` op) aborts a running statement via `queries/v1/abort-request`,
+  authorized by the running session's own token and identified by the query's
+  original `requestId`. It does **not** evict the session: the server cancels the
+  query, the client's poll loop then returns a cancelled error within one poll
+  interval, and the pooled session is checked back in for reuse — freeing it
+  promptly instead of holding it until `SNOWFLAKE_QUERY_TIMEOUT` (#1225).
 - **Transient retries.** REST calls retry connection errors and `429/502/503/504`
   with exponential backoff, reusing the same `requestId` so a retried query is
   de-duplicated server-side (never re-executed). A per-request *timeout* is **not**
@@ -372,6 +394,7 @@ Ops:
 |--------------|--------------------------------------------------------------------|--------------------------------------------------------|
 | `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`  | `{ columns: [...], rows: [...] }`                      |
 | `sessions`   | `null`                                                             | `{ sessions: [<pool>] }` — one entry per pool, see below |
+| `cancel`     | (`{ account, user }` \| `{ id }` \| `{ all: true }`) `+ member?`   | `{ cancelled: <n> }`                                   |
 | `disconnect` | `{ account, user }` \| `{ id }` \| `{ all: true }`                 | `{ disconnected: <bool>, count: <n> }`                |
 
 `disconnect` accepts three mutually-exclusive selectors: the `(account, user)`
@@ -379,6 +402,15 @@ pair (the original contract), `id` (a numeric pool id from `sessions`), or
 `all: true` (every pool). `count` is the number of pools evicted (`0` or `1` for
 the pair/id forms); `disconnected` is `count > 0`, preserved for callers written
 against the pre-#1228 reply.
+
+`cancel` aborts running queries without evicting the session (#1225). It takes
+the same three selectors as `disconnect`, plus an optional `member` (a numeric
+member id from `sessions`) that narrows the pair/id forms to one authenticated
+session's query instead of every busy member (`member` is ignored with
+`all: true`). `cancelled` is the number of running statements an abort was issued
+for — `0` when nothing was running. The abort makes each targeted session's poll
+loop return a cancelled error within one poll interval, so the pooled session is
+freed promptly rather than held until `SNOWFLAKE_QUERY_TIMEOUT`.
 
 Each `<pool>` entry in the `sessions` reply describes one `(account, user)`
 session pool, including its live members (the CLI and tray render all of these

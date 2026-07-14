@@ -38,6 +38,21 @@ struct Tokens {
     master_expires_at: DateTime<Utc>,
 }
 
+/// The statement currently executing on a session, published for the duration of
+/// [`query`](SnowflakeSession::query) so an [`AbortHandle`] can cancel it.
+///
+/// Snowflake identifies a cancellable query by the `requestId` its submission
+/// used plus the exact `sqlText`; both — and a session token valid for the run —
+/// are captured here. The token snapshot is safe: a token is never renewed *during*
+/// a single `query` (renewal happens only between whole attempts, each of which
+/// republishes), so it always authorizes the statement it was captured with.
+#[derive(Clone, Debug)]
+struct InFlight {
+    request_id: String,
+    sql: String,
+    session_token: Secret,
+}
+
 /// A live, authenticated Snowflake session.
 ///
 /// Holds the session and master tokens behind a mutex so a query (reading the
@@ -47,8 +62,87 @@ struct Tokens {
 pub struct SnowflakeSession {
     transport: Arc<Transport>,
     tokens: StdMutex<Tokens>,
+    /// The statement currently running, published while [`query`](Self::query) is
+    /// in flight so an [`AbortHandle`] can cancel it; `None` when idle. Shared
+    /// (behind `Arc`) with every handle [`abort_handle`](Self::abort_handle) hands
+    /// out, so a handle always reads the *live* in-flight statement.
+    in_flight: Arc<StdMutex<Option<InFlight>>>,
     /// Overall deadline for one query (submit + async polling).
     query_timeout: Duration,
+}
+
+/// A cheap, cloneable handle that cancels whatever statement a
+/// [`SnowflakeSession`] is currently running.
+///
+/// It shares the session's in-flight slot and transport (both `Arc`), so it stays
+/// valid after the session itself is checked out of a pool (moved out of the
+/// pool's slot) — which is the only way a concurrent `cancel` can reach a busy
+/// session. [`abort`](Self::abort) is a no-op (returns `Ok(false)`) when nothing
+/// is running.
+#[derive(Clone)]
+pub struct AbortHandle {
+    transport: Arc<Transport>,
+    in_flight: Arc<StdMutex<Option<InFlight>>>,
+}
+
+impl AbortHandle {
+    /// Aborts the session's in-flight statement via `queries/v1/abort-request`.
+    ///
+    /// Returns `Ok(true)` when an abort was issued for a running statement,
+    /// `Ok(false)` when nothing was running or the server reported nothing to
+    /// abort (e.g. the query already finished). The abort call uses a fresh
+    /// `requestId` and is authorized by the running statement's session token.
+    ///
+    /// # Errors
+    ///
+    /// A transport error, or [`Error::SessionExpired`] if the session token that
+    /// authorized the running statement has itself lapsed.
+    pub async fn abort(&self) -> Result<bool> {
+        let Some(target) = self.snapshot() else {
+            return Ok(false);
+        };
+        let rid = request_id();
+        let body = json!({ "sqlText": target.sql, "requestId": target.request_id });
+        match self
+            .transport
+            .post(
+                "queries/v1/abort-request",
+                &[("requestId", rid.as_str())],
+                &body,
+                Some(target.session_token.expose_secret()),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            // The server rejected the abort — most often because the query already
+            // finished or was never seen; there is simply nothing left to cancel.
+            Err(Error::Server { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn snapshot(&self) -> Option<InFlight> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A handle that can never abort anything (no shared session). For tests that
+    /// need to store a handle without a live session.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn noop_for_test() -> Self {
+        use url::Url;
+        let base = Url::parse("http://127.0.0.1/").unwrap_or_else(|_| unreachable!());
+        Self {
+            transport: Arc::new(
+                Transport::with_base_url(base, Duration::from_secs(1))
+                    .unwrap_or_else(|_| unreachable!()),
+            ),
+            in_flight: Arc::new(StdMutex::new(None)),
+        }
+    }
 }
 
 impl SnowflakeSession {
@@ -67,7 +161,21 @@ impl SnowflakeSession {
                 session_expires_at: now + TimeDelta::seconds(tokens.session_validity_secs),
                 master_expires_at: now + TimeDelta::seconds(tokens.master_validity_secs),
             }),
+            in_flight: Arc::new(StdMutex::new(None)),
             query_timeout,
+        }
+    }
+
+    /// A cloneable [`AbortHandle`] for this session's in-flight statement.
+    ///
+    /// The returned handle shares the session's in-flight slot, so it can cancel
+    /// whatever statement is running even after the session is checked out of a
+    /// pool (moved out of the pool's slot).
+    #[must_use]
+    pub fn abort_handle(&self) -> AbortHandle {
+        AbortHandle {
+            transport: Arc::clone(&self.transport),
+            in_flight: Arc::clone(&self.in_flight),
         }
     }
 
@@ -94,10 +202,17 @@ impl SnowflakeSession {
         let token = self.lock().session_token.clone();
         let rid = request_id();
         let body = json!({ "sqlText": sql });
+        // Publish the statement so an `AbortHandle` can cancel it, then clear it
+        // once submission + polling returns (on both success and error).
+        self.set_in_flight(InFlight {
+            request_id: rid.clone(),
+            sql: sql.to_string(),
+            session_token: token.clone(),
+        });
         // `post_statement` submits the query and polls the async result URL until
         // it completes, so a query slower than the server's synchronous window
         // (anything heavy) is not killed by a per-request timeout.
-        let data = self
+        let result = self
             .transport
             .post_statement(
                 &[("requestId", rid.as_str())],
@@ -106,7 +221,9 @@ impl SnowflakeSession {
                 self.query_timeout,
                 POLL_INTERVAL,
             )
-            .await?;
+            .await;
+        self.clear_in_flight();
+        let data = result?;
 
         let (columns, index, mut rows) = parse_result(&data)?;
         // Large results stream the tail as external blob chunks; download and
@@ -216,6 +333,20 @@ impl SnowflakeSession {
         self.tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_in_flight(&self, in_flight: InFlight) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(in_flight);
+    }
+
+    fn clear_in_flight(&self) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -481,6 +612,125 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn abort_cancels_the_in_flight_statement_by_request_id() {
+        let server = MockServer::start().await;
+        // Submit → "in progress" with a result URL that never completes in-test,
+        // so the query parks in the poll loop with its statement published.
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": { "getResultUrl": "/poll/1" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/poll/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/abort-request"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "success": true, "data": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(live_session(&server, 3600));
+        let handle = session.abort_handle();
+
+        // Idle: nothing is running, so no abort is issued.
+        assert!(
+            !handle.abort().await.unwrap(),
+            "idle session has nothing to abort"
+        );
+
+        // Start a query that parks in the poll loop, then abort it.
+        let query = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.query("SELECT LONG").await })
+        };
+        // Let the query publish its in-flight statement before aborting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            handle.abort().await.unwrap(),
+            "a running statement is aborted"
+        );
+        query.abort();
+
+        // The abort carried the *query's* requestId and its exact sqlText, under a
+        // fresh requestId of its own.
+        let requests = server.received_requests().await.unwrap();
+        let query_rid = requests
+            .iter()
+            .find(|r| r.url.path() == "/queries/v1/query-request")
+            .and_then(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "requestId")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .expect("the query recorded its requestId");
+        let abort = requests
+            .iter()
+            .find(|r| r.url.path() == "/queries/v1/abort-request")
+            .expect("an abort request was sent");
+        let abort_rid = abort
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "requestId")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        let body: Value = serde_json::from_slice(&abort.body).unwrap();
+        assert_eq!(body["sqlText"], "SELECT LONG");
+        assert_eq!(body["requestId"], query_rid, "body targets the query's id");
+        assert_ne!(
+            abort_rid, query_rid,
+            "the abort call uses its own requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_reports_nothing_to_cancel_on_a_server_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": { "getResultUrl": "/poll/1" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/poll/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true, "code": "333333", "data": {}
+            })))
+            .mount(&server)
+            .await;
+        // The server rejects the abort (e.g. the query already finished).
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/abort-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": false, "code": "000603", "message": "query not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(live_session(&server, 3600));
+        let handle = session.abort_handle();
+        let query = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.query("SELECT LONG").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A server rejection means there was nothing left to cancel, not an error.
+        assert!(!handle.abort().await.unwrap());
+        query.abort();
     }
 
     #[tokio::test]

@@ -3401,11 +3401,30 @@ Usage: snowflake <COMMAND>
 Commands:
   query       Run SQL (from an argument or stdin) through a multiplexed session
   sessions    List active multiplexed sessions
+  cancel      Cancel (abort) the running query on a pool without evicting the session: one `(account, user)` pool, a pool by id, or all pools
   disconnect  Disconnect (evict) sessions: one `(account, user)` pool, a pool by id, or all pools
   help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev snowflake cancel - Cancel (abort) the running query on a pool without evicting the session: one `(account, user)` pool, a pool by id, or all pools
+
+Cancel (abort) the running query on a pool without evicting the session: one `(account, user)` pool, a pool by id, or all pools
+
+Usage: cancel [OPTIONS] <--account <ACCOUNT>|--id <ID>|--all>
+
+Options:
+      --account <ACCOUNT>  Account of the pool whose query to cancel (requires `--user`)
+      --user <USER>        User of the pool whose query to cancel (requires `--account`)
+      --id <ID>            Numeric id of the pool (as shown by `sessions`)
+      --all                Cancel the running query on every pool
+      --member <MEMBER>    Numeric member id (from `sessions`) to cancel a single session's query instead of every busy member in the pool. Not valid with `--all`
+      --socket <PATH>      Control-socket path. Defaults to the per-user runtime location
+  -h, --help               Print help
 
 
 ================================================================================
