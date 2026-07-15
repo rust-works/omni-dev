@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::snowflake::client::SnowflakeSession;
+use crate::snowflake::client::{AbortHandle, SnowflakeSession};
 
 /// Identifies a pool by its `(account, user)` — one authentication identity.
 ///
@@ -128,6 +128,11 @@ struct Slot<S> {
     last_used: DateTime<Utc>,
     query_count: u64,
     running: Option<RunningQuery>,
+    /// A handle to cancel the running statement, captured at
+    /// [`start_query`](SessionPool::start_query). Held here (not in the checked-out
+    /// [`Checkout`]) so a concurrent cancel can reach the busy session; cleared on
+    /// checkin.
+    running_abort: Option<AbortHandle>,
     session: Option<S>,
 }
 
@@ -342,6 +347,7 @@ impl<S> SessionPool<S> {
             last_used: Utc::now(),
             query_count: 0,
             running: None,
+            running_abort: None,
             session: None, // handle is held by the returned Checkout
         });
         Ok(self.make_checkout(permit, id, base.clone(), base, session))
@@ -427,6 +433,7 @@ impl<S> SessionPool<S> {
                 slot.current = current;
                 slot.last_used = Utc::now();
                 slot.running = None;
+                slot.running_abort = None;
                 slot.session = session;
             }
         }
@@ -436,8 +443,10 @@ impl<S> SessionPool<S> {
     }
 
     /// Records that a checked-out member has started running `sql` (a truncated
-    /// preview), so menus/status can show what each busy session is doing.
-    pub fn start_query(&self, member_id: u64, sql: String) {
+    /// preview), so menus/status can show what each busy session is doing, and
+    /// stores an `abort` handle so a concurrent cancel can stop it. `abort` is
+    /// `None` for members with no cancellation support (e.g. the test pool).
+    pub fn start_query(&self, member_id: u64, sql: String, abort: Option<AbortHandle>) {
         let mut slots = self.lock_slots();
         if let Some(slot) = slots.iter_mut().find(|slot| slot.id == member_id) {
             slot.query_count += 1;
@@ -445,7 +454,26 @@ impl<S> SessionPool<S> {
                 sql,
                 started_at: Utc::now(),
             });
+            slot.running_abort = abort;
         }
+    }
+
+    /// Cloned abort handles for the pool's currently-running statements — the one
+    /// member when `member` is `Some`, else every busy member with a handle.
+    ///
+    /// Snapshotted under the slot lock and returned by value so the caller can
+    /// `await` each abort **without** holding the (non-async) lock.
+    #[must_use]
+    pub fn abort_handles(&self, member: Option<u64>) -> Vec<AbortHandle> {
+        let slots = self.lock_slots();
+        slots
+            .iter()
+            .filter(|slot| match member {
+                Some(id) => slot.id == id,
+                None => true,
+            })
+            .filter_map(|slot| slot.running_abort.clone())
+            .collect()
     }
 
     /// Discards a session — e.g. after expiry — removing its slot (releases the
@@ -569,6 +597,23 @@ impl PoolRegistry {
         pool
     }
 
+    /// Returns the pool for `key` **without** creating one (unlike
+    /// [`get_or_create`](Self::get_or_create)). Used by read-only paths like
+    /// `cancel` that must not spin up an empty pool.
+    #[must_use]
+    pub fn get(&self, key: &SessionKey) -> Option<Arc<SessionPool>> {
+        self.lock().get(key).map(Arc::clone)
+    }
+
+    /// Returns the pool with the given id, if present, without creating one.
+    #[must_use]
+    pub fn get_by_id(&self, id: u64) -> Option<Arc<SessionPool>> {
+        self.lock()
+            .values()
+            .find(|pool| pool.id() == id)
+            .map(Arc::clone)
+    }
+
     /// Removes the pool for `key`. Returns it if present.
     pub fn remove(&self, key: &SessionKey) -> Option<Arc<SessionPool>> {
         self.lock().remove(key)
@@ -658,7 +703,11 @@ mod tests {
     async fn start_query_records_running_then_checkin_clears_it() {
         let (pool, calls) = fake_pool(2);
         let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
-        pool.start_query(c.id(), "SELECT 1".to_string());
+        pool.start_query(
+            c.id(),
+            "SELECT 1".to_string(),
+            Some(AbortHandle::noop_for_test()),
+        );
 
         let member = pool.info().members[0].clone();
         assert!(member.busy);
@@ -667,12 +716,21 @@ mod tests {
             member.running.as_ref().map(|r| r.sql.as_str()),
             Some("SELECT 1")
         );
+        // The abort handle is reachable while running…
+        assert_eq!(pool.abort_handles(None).len(), 1);
+        assert_eq!(pool.abort_handles(Some(c.id())).len(), 1);
+        assert!(pool.abort_handles(Some(c.id() + 99)).is_empty());
 
         pool.checkin(c, ctx());
         let member = pool.info().members[0].clone();
         assert!(!member.busy);
         assert!(member.running.is_none(), "running cleared on checkin");
         assert_eq!(member.query_count, 1, "count persists after checkin");
+        // …and gone once idle again.
+        assert!(
+            pool.abort_handles(None).is_empty(),
+            "abort handle cleared on checkin"
+        );
     }
 
     #[test]
@@ -956,6 +1014,24 @@ mod tests {
             "ordered by id"
         );
         assert_eq!(registry.len(), 2, "not drained");
+    }
+
+    #[test]
+    fn registry_get_and_get_by_id_never_create() {
+        let registry = PoolRegistry::new();
+        let key = SessionKey::new("ACCT", "user");
+        // Read-only lookups on an absent key/id create nothing.
+        assert!(registry.get(&key).is_none());
+        assert!(registry.get_by_id(1).is_none());
+        assert!(registry.is_empty());
+
+        let pool = registry.get_or_create(&key, 4);
+        assert_eq!(registry.get(&key).map(|p| p.id()), Some(pool.id()));
+        assert_eq!(
+            registry.get_by_id(pool.id()).map(|p| p.id()),
+            Some(pool.id())
+        );
+        assert!(registry.get_by_id(pool.id() + 99).is_none());
     }
 
     #[test]

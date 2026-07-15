@@ -65,6 +65,33 @@ impl SnowflakeService {
         let removed = self.engine.disconnect(account, user);
         Ok(json!({ "disconnected": removed, "count": u64::from(removed) }))
     }
+
+    /// Handles the `cancel` op: abort the running query on a target pool without
+    /// evicting the session. Selectors mirror `disconnect` — every pool
+    /// (`{ all: true }`), a pool by id (`{ id }`), or the `(account, user)` pair —
+    /// plus an optional `member` (a numeric member id from `sessions`) to target
+    /// one authenticated session's query rather than every busy one in the pool
+    /// (ignored with `all`). The reply's `cancelled` is how many running
+    /// statements an abort was issued for.
+    async fn handle_cancel(&self, payload: &Value) -> Result<Value> {
+        let member = payload.get("member").and_then(Value::as_u64);
+        let cancelled = if payload.get("all").and_then(Value::as_bool) == Some(true) {
+            self.engine.cancel_all().await
+        } else if let Some(id) = payload.get("id").and_then(Value::as_u64) {
+            self.engine.cancel_by_id(id, member).await
+        } else {
+            let account = payload
+                .get("account")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("`cancel` requires `account`, `id`, or `all`"))?;
+            let user = payload
+                .get("user")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("`cancel` requires `user`"))?;
+            self.engine.cancel(account, user, member).await
+        };
+        Ok(json!({ "cancelled": cancelled }))
+    }
 }
 
 #[async_trait]
@@ -84,6 +111,7 @@ impl DaemonService for SnowflakeService {
                 self.engine.query(req).await
             }
             "sessions" => Ok(json!({ "sessions": self.engine.sessions() })),
+            "cancel" => self.handle_cancel(&payload).await,
             "disconnect" => self.handle_disconnect(&payload),
             other => bail!("unknown snowflake op: {other}"),
         }
@@ -252,6 +280,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all, json!({ "disconnected": false, "count": 0 }));
+    }
+
+    #[tokio::test]
+    async fn cancel_requires_a_selector_and_is_zero_on_an_empty_engine() {
+        let svc = offline_service();
+        // No selector at all is an error.
+        assert!(svc.handle("cancel", json!({})).await.is_err());
+        // `account` without `user` is an error.
+        assert!(svc
+            .handle("cancel", json!({ "account": "ACCT" }))
+            .await
+            .is_err());
+        // Each valid selector succeeds and cancels nothing on an empty engine.
+        for payload in [
+            json!({ "account": "ACCT", "user": "me" }),
+            json!({ "account": "ACCT", "user": "me", "member": 2 }),
+            json!({ "id": 7 }),
+            json!({ "all": true }),
+        ] {
+            let reply = svc.handle("cancel", payload.clone()).await.unwrap();
+            assert_eq!(reply, json!({ "cancelled": 0 }), "for {payload}");
+        }
+        // Cancel must not create a pool.
+        let sessions = svc.handle("sessions", Value::Null).await.unwrap();
+        assert_eq!(sessions, json!({ "sessions": [] }));
     }
 
     #[tokio::test]
