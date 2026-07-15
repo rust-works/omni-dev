@@ -1200,8 +1200,10 @@ const CODE_BINARY_CANDIDATES: &[&str] = &[
 ];
 
 /// Focuses (or opens, since VS Code reuses an already-open window) `folder` in
-/// VS Code by spawning its CLI, resolved via [`resolve_code_binary`].
-fn focus_window(folder: &Path) -> Result<()> {
+/// VS Code by spawning its CLI, resolved via [`resolve_code_binary`]. Shared
+/// with the sessions service's tray "focus" action, which resolves a session to
+/// its VS Code window folder and opens it through this same guarded launcher.
+pub(crate) fn focus_window(folder: &Path) -> Result<()> {
     focus_window_with(&resolve_code_binary(), folder)
 }
 

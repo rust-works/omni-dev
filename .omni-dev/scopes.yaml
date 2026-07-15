@@ -27,6 +27,10 @@ scopes:
     description: "Snowflake query service: authenticate-once SSO sessions on the daemon"
     examples: ["snowflake: add account-agnostic session engine", "snowflake: map arbitrary rows to JSON"]
     file_patterns: ["src/snowflake/**", "src/cli/snowflake.rs", "src/daemon/services/snowflake.rs"]
+  - name: "sessions"
+    description: "Claude Code sessions tracker: cross-window live session state on the daemon"
+    examples: ["sessions: add cross-window session registry", "sessions: map hook events to state"]
+    file_patterns: ["src/sessions.rs", "src/sessions/**", "src/cli/sessions.rs", "src/daemon/services/sessions.rs"]
   - name: "daemon"
     description: "Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray"
     examples: ["daemon: add service registry", "daemon: update tray menu items in place"]
