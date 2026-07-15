@@ -1,10 +1,11 @@
 //! Create PR command — AI-powered pull request creation.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::info::InfoCommand;
+use crate::claude::error::is_transient_ai_error as ai_error_is_transient;
 
 /// Create PR command options.
 #[derive(Parser)]
@@ -58,6 +59,35 @@ pub struct PrContent {
     pub title: String,
     /// Full PR description in markdown format.
     pub description: String,
+}
+
+/// PR content plus how it was produced.
+///
+/// `used_fallback` is deliberately kept out of [`PrContent`], which is
+/// serialized to `pr-details.yaml` and must keep its two-field schema.
+struct GeneratedPr {
+    /// The title and description to apply.
+    content: PrContent,
+    /// True when the AI call failed and `content` is template-derived.
+    used_fallback: bool,
+}
+
+impl GeneratedPr {
+    /// Wraps content the AI produced successfully.
+    fn from_ai(content: PrContent) -> Self {
+        Self {
+            content,
+            used_fallback: false,
+        }
+    }
+
+    /// Wraps template-derived content produced after an AI failure.
+    fn from_fallback(content: PrContent) -> Self {
+        Self {
+            content,
+            used_fallback: true,
+        }
+    }
 }
 
 impl CreatePrCommand {
@@ -153,9 +183,13 @@ impl CreatePrCommand {
 
         // 7. Generate AI-powered PR content (title + description)
         debug!("About to generate PR content from AI");
-        let (pr_content, _claude_client) = self
+        let (generated, _claude_client) = self
             .generate_pr_content_with_client_internal(repo_root, &repo_view, claude_client)
             .await?;
+        let GeneratedPr {
+            content: pr_content,
+            used_fallback,
+        } = generated;
 
         // 8. Show detailed context information (like twiddle command)
         self.show_context_information(&repo_view).await?;
@@ -220,6 +254,10 @@ impl CreatePrCommand {
         if pr_action == PrAction::Cancel {
             println!("❌ PR operation cancelled by user");
             return Ok(());
+        }
+
+        if used_fallback && self.auto_apply && pr_action == PrAction::UpdateExisting {
+            self.refuse_template_clobber(&repo_view)?;
         }
 
         // 8. Create or update PR (re-read from file to capture any user edits)
@@ -684,19 +722,19 @@ impl CreatePrCommand {
     }
 
     /// Generates PR content with a pre-created client (internal method that does not show model info).
+    ///
+    /// The returned [`GeneratedPr::used_fallback`] reports whether the content
+    /// came from the AI or from the template fallback, so callers can refuse to
+    /// overwrite a populated PR body with template text (issue #1333).
     async fn generate_pr_content_with_client_internal(
         &self,
         repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
         claude_client: crate::claude::client::ClaudeClient,
-    ) -> Result<(PrContent, crate::claude::client::ClaudeClient)> {
+    ) -> Result<(GeneratedPr, crate::claude::client::ClaudeClient)> {
         use tracing::debug;
 
-        // Get PR template (either from repo or default)
-        let pr_template = match &repo_view.pr_template {
-            Some(template) => template.clone(),
-            None => self.get_default_pr_template(),
-        };
+        let pr_template = self.resolve_pr_template(repo_view);
 
         debug!(
             pr_template_length = pr_template.len(),
@@ -733,26 +771,93 @@ impl CreatePrCommand {
                     ai_generated_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
                     "AI successfully generated PR content"
                 );
-                Ok((pr_content, claude_client))
+                Ok((GeneratedPr::from_ai(pr_content), claude_client))
+            }
+            // A permanent failure can never succeed on a retry, so degrading to
+            // a template would report success for work that did not happen.
+            Err(e) if !ai_error_is_transient(&e) => {
+                Err(e).context("AI PR generation failed with a non-retryable error")
             }
             Err(e) => {
-                debug!(error = %e, "AI PR generation failed, falling back to basic description");
-                // Fallback to basic description with commit analysis (silently)
-                let mut description = pr_template;
-                self.enhance_description_with_commits(&mut description, repo_view)?;
-
-                // Generate fallback title from commits
-                let title = self.generate_title_from_commits(repo_view);
-
-                debug!(
-                    fallback_title = %title,
-                    fallback_description_length = description.len(),
-                    "Created fallback PR content"
-                );
-
-                Ok((PrContent { title, description }, claude_client))
+                let content = self.fallback_pr_content(&e, pr_template, repo_view)?;
+                Ok((GeneratedPr::from_fallback(content), claude_client))
             }
         }
+    }
+
+    /// Builds template-derived PR content after a transient AI failure, warning
+    /// the user that the result is degraded.
+    ///
+    /// The warning goes to stderr rather than stdout: [`run_create_pr`] shares
+    /// this path and the MCP server owns stdout for JSON-RPC.
+    fn fallback_pr_content(
+        &self,
+        error: &anyhow::Error,
+        pr_template: String,
+        repo_view: &crate::data::RepositoryView,
+    ) -> Result<PrContent> {
+        warn!(error = %format!("{error:#}"), "AI PR generation failed, falling back to the PR template");
+        eprintln!("warning: AI PR generation failed: {error:#}");
+        eprintln!(
+            "warning: falling back to the PR template — the description below is not AI-generated."
+        );
+
+        let mut description = pr_template;
+        self.enhance_description_with_commits(&mut description, repo_view)?;
+        let title = self.generate_title_from_commits(repo_view);
+
+        debug!(
+            fallback_title = %title,
+            fallback_description_length = description.len(),
+            "Created fallback PR content"
+        );
+
+        Ok(PrContent { title, description })
+    }
+
+    /// Returns the PR template for this repository, falling back to the
+    /// built-in default when the repository has none.
+    fn resolve_pr_template(&self, repo_view: &crate::data::RepositoryView) -> String {
+        match &repo_view.pr_template {
+            Some(template) => template.clone(),
+            None => self.get_default_pr_template(),
+        }
+    }
+
+    /// Refuses to replace a populated PR description with template content
+    /// after the AI failed (issue #1333).
+    ///
+    /// Overwriting is irreversible from this tool's side, so a non-interactive
+    /// run stops rather than destroying a real description. Only applies when
+    /// the user cannot see and approve the content first — an interactive run
+    /// displays it and asks.
+    fn refuse_template_clobber(&self, repo_view: &crate::data::RepositoryView) -> Result<()> {
+        let Some(existing) = repo_view.branch_prs.as_ref().and_then(|prs| prs.first()) else {
+            return Ok(());
+        };
+
+        if Self::body_is_safe_to_replace(&existing.body, &self.resolve_pr_template(repo_view)) {
+            return Ok(());
+        }
+
+        bail!(
+            "Refusing to overwrite the description of PR #{} with template content \
+             after AI generation failed.\n\
+             The existing description would be lost and cannot be recovered by this tool.\n\
+             Re-run without --auto-apply to review the content first, or resolve the AI \
+             failure reported above.",
+            existing.number
+        );
+    }
+
+    /// Reports whether an existing PR body can be replaced without losing work.
+    ///
+    /// Safe only when the body is empty or is still the unfilled template.
+    /// Anything else — including a previously enhanced template — is treated as
+    /// worth keeping, since refusing is recoverable and overwriting is not.
+    fn body_is_safe_to_replace(body: &str, template: &str) -> bool {
+        let body = body.trim();
+        body.is_empty() || body == template.trim()
     }
 
     /// Returns the default PR template when none exists in the repository.
@@ -1443,10 +1548,7 @@ pub(crate) async fn run_create_pr_with_client(
     context: &crate::data::context::CommitContext,
     claude_client: &crate::claude::client::ClaudeClient,
 ) -> Result<CreatePrOutcome> {
-    let pr_template = match &repo_view.pr_template {
-        Some(template) => template.clone(),
-        None => cmd.get_default_pr_template(),
-    };
+    let pr_template = cmd.resolve_pr_template(repo_view);
 
     let ai_result = if cmd.from_commits {
         claude_client
@@ -1459,12 +1561,13 @@ pub(crate) async fn run_create_pr_with_client(
     };
     let pr_content = match ai_result {
         Ok(content) => content,
-        Err(_e) => {
-            let mut description = pr_template;
-            cmd.enhance_description_with_commits(&mut description, repo_view)?;
-            let title = cmd.generate_title_from_commits(repo_view);
-            PrContent { title, description }
+        // A permanent failure is reported rather than papered over; this call
+        // does not mutate the PR, so a transient failure only needs the warning
+        // `fallback_pr_content` emits (issue #1333).
+        Err(e) if !ai_error_is_transient(&e) => {
+            return Err(e).context("AI PR generation failed with a non-retryable error");
         }
+        Err(e) => cmd.fallback_pr_content(&e, pr_template, repo_view)?,
     };
 
     let pr_yaml = crate::data::to_yaml(&pr_content).context("Failed to serialise PrContent")?;
@@ -1481,6 +1584,7 @@ pub(crate) async fn run_create_pr_with_client(
 mod run_create_pr_tests {
     use super::*;
     use crate::claude::client::ClaudeClient;
+    use crate::claude::error::ClaudeError;
     use crate::claude::test_utils::ConfigurableMockAiClient;
     use crate::data::context::CommitContext;
     use crate::data::{
@@ -1552,6 +1656,79 @@ mod run_create_pr_tests {
         (commit, tmp)
     }
 
+    /// Builds a repo view carrying one existing PR with the given body, as
+    /// `gh pr list --json …,body` would populate it.
+    fn repo_view_with_existing_pr(pr_template: Option<String>, body: &str) -> RepositoryView {
+        let mut view = sample_repo_view(vec![], pr_template);
+        view.branch_prs = Some(vec![crate::data::PullRequest {
+            number: 42,
+            title: "Existing PR".to_string(),
+            state: "open".to_string(),
+            url: "https://example.invalid/pr/42".to_string(),
+            body: body.to_string(),
+            base: "main".to_string(),
+        }]);
+        view
+    }
+
+    #[test]
+    fn body_is_safe_to_replace_only_when_empty_or_template() {
+        let template = "# Pull Request\n\n## Description\n";
+        assert!(CreatePrCommand::body_is_safe_to_replace("", template));
+        assert!(CreatePrCommand::body_is_safe_to_replace(
+            "   \n  ", template
+        ));
+        // Whitespace differences must not make a template look like real content.
+        assert!(CreatePrCommand::body_is_safe_to_replace(
+            "\n# Pull Request\n\n## Description\n\n",
+            template
+        ));
+        assert!(!CreatePrCommand::body_is_safe_to_replace(
+            "A real, hand-written description.",
+            template
+        ));
+    }
+
+    /// Issue #1333: the original bug replaced a populated description with an
+    /// unfilled template and reported success.
+    #[test]
+    fn refuse_template_clobber_rejects_populated_body() {
+        let cmd = fresh_cmd();
+        let view = repo_view_with_existing_pr(None, "A real description worth keeping.");
+
+        let err = cmd
+            .refuse_template_clobber(&view)
+            .expect_err("must refuse to destroy a populated description");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("#42"), "should name the PR: {chain}");
+        assert!(
+            chain.contains("Refusing to overwrite"),
+            "should say what it refused: {chain}"
+        );
+    }
+
+    #[test]
+    fn refuse_template_clobber_allows_empty_body() {
+        let cmd = fresh_cmd();
+        let view = repo_view_with_existing_pr(None, "   ");
+        assert!(cmd.refuse_template_clobber(&view).is_ok());
+    }
+
+    #[test]
+    fn refuse_template_clobber_allows_unfilled_template_body() {
+        let cmd = fresh_cmd();
+        let template = "# Custom template\n";
+        let view = repo_view_with_existing_pr(Some(template.to_string()), template);
+        assert!(cmd.refuse_template_clobber(&view).is_ok());
+    }
+
+    #[test]
+    fn refuse_template_clobber_allows_when_no_existing_pr() {
+        let cmd = fresh_cmd();
+        let view = sample_repo_view(vec![], None);
+        assert!(cmd.refuse_template_clobber(&view).is_ok());
+    }
+
     fn sample_repo_view(commits: Vec<CommitInfo>, pr_template: Option<String>) -> RepositoryView {
         RepositoryView {
             versions: Some(VersionInfo {
@@ -1616,6 +1793,58 @@ mod run_create_pr_tests {
             "fallback title unexpected: {}",
             outcome.title
         );
+    }
+
+    /// Issue #1333: a 404 (a model that does not exist) can never succeed, so
+    /// it must surface as an error rather than a template-filled "success".
+    #[tokio::test]
+    async fn run_create_pr_with_client_permanent_ai_failure_errors() {
+        let (c1, _tmp) = sample_commit("abcdef00", "feat: work");
+        let repo_view = sample_repo_view(vec![c1], None);
+        let context = CommitContext::new();
+        let cmd = fresh_cmd();
+
+        let mock = ConfigurableMockAiClient::new(vec![Err(ClaudeError::ApiHttpError {
+            status: 404,
+            body: "model: claude-sonnet-4-8 not found".to_string(),
+        }
+        .into())]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let err = run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .expect_err("a 404 must not be reported as success");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("non-retryable"),
+            "error should explain why it did not fall back: {chain}"
+        );
+        assert!(
+            chain.contains("404"),
+            "error should name the underlying failure: {chain}"
+        );
+    }
+
+    /// A transient failure still degrades to the template, since a retry (or a
+    /// later run) could plausibly succeed.
+    #[tokio::test]
+    async fn run_create_pr_with_client_transient_ai_failure_falls_back() {
+        let (c1, _tmp) = sample_commit("abcdef00", "feat: work");
+        let repo_view = sample_repo_view(vec![c1], None);
+        let context = CommitContext::new();
+        let cmd = fresh_cmd();
+
+        let mock = ConfigurableMockAiClient::new(vec![Err(ClaudeError::ApiHttpError {
+            status: 503,
+            body: "upstream unavailable".to_string(),
+        }
+        .into())]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .expect("a 5xx should still fall back to the template");
+        assert!(!outcome.title.is_empty());
     }
 
     #[tokio::test]

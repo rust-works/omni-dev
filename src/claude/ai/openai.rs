@@ -1530,7 +1530,7 @@ mod tests {
     }
 
     /// HTTP error responses propagate through `check_error_response` as a
-    /// structured `ApiRequestFailed` rather than being misinterpreted as a
+    /// structured `ApiHttpError` rather than being misinterpreted as a
     /// successful body. Pins the `?` branch on the `check_error_response`
     /// call.
     #[tokio::test]
@@ -1551,6 +1551,44 @@ mod tests {
         assert!(
             chain.contains("HTTP 500"),
             "expected 'HTTP 500' in error chain, got: {chain}"
+        );
+        assert!(
+            crate::claude::error::is_transient_ai_error(&err),
+            "a 5xx must stay retryable: {chain}"
+        );
+    }
+
+    /// Issue #1333: a live 404 must arrive at the caller as a *typed*,
+    /// permanent error. Drives the real HTTP stack through
+    /// `check_error_response`, proving the status survives rather than being
+    /// flattened into an opaque string.
+    #[tokio::test]
+    async fn send_request_classifies_http_404_as_permanent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string(r#"{"error":"model not found"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-6-does-not-exist");
+        let err = client
+            .send_request("system", "user")
+            .await
+            .expect_err("expected error from 404 response");
+
+        let claude_err = err
+            .downcast_ref::<ClaudeError>()
+            .expect("a non-2xx must surface as a typed ClaudeError");
+        assert!(
+            matches!(claude_err, ClaudeError::ApiHttpError { status: 404, .. }),
+            "expected a status-carrying error, got: {claude_err}"
+        );
+        assert!(
+            !crate::claude::error::is_transient_ai_error(&err),
+            "a 404 must be permanent so callers fail instead of falling back"
         );
     }
 

@@ -522,6 +522,33 @@ request `output_config.format` for that model — set it `true` in a user or
 project `models.yaml` entry to opt a newer model into the schema path, or
 leave it unset to keep a model on the YAML response path.
 
+**Model validation at preflight** — on the **Claude API** and **Bedrock**
+backends, an unknown model is rejected before any network call:
+
+```console
+$ omni-dev git branch create pr --model claude-sonnet-4-8
+Error: Unknown model 'claude-sonnet-4-8'.
+Known models: claude-fable-5, claude-haiku-4-5, claude-haiku-4-5-20251001, claude-opus-4-6,
+claude-opus-4-7, claude-opus-4-8, claude-sonnet-4-5, claude-sonnet-4-5-20250929,
+claude-sonnet-4-6, claude-sonnet-5.
+Add an entry to ~/.omni-dev/models.yaml to use a model this build does not know about, …
+```
+
+This applies **only** to those two backends, because they are the only ones
+whose catalogue is authoritative:
+
+| Backend      | `--model` validated? | Why                                                     |
+|--------------|----------------------|---------------------------------------------------------|
+| Claude API   | **Yes**              | The catalogue lists the Claude family.                   |
+| Bedrock      | **Yes**              | Same catalogue, after identifier normalisation.          |
+| Claude CLI   | No                   | `claude` resolves its own aliases (`haiku`, `sonnet`, …).|
+| OpenAI       | No                   | The catalogue lists only a subset of OpenAI's models.    |
+| Ollama       | No                   | The catalogue has no Ollama entries at all.              |
+
+Legacy models still resolve — they are simply omitted from the suggestion
+list. If a Claude model is newer than your build's catalogue, add it to
+`~/.omni-dev/models.yaml` (see precedence above) rather than downgrading.
+
 **Architectural background:**
 [ADR-0011](adrs/adr-0011.md) (superseded) and
 [ADR-0022](adrs/adr-0022.md) (current) — the layered catalogue with user and
@@ -552,6 +579,7 @@ errors. The most common cases:
 | Error                                           | Likely backend     | See                                                                 |
 |-------------------------------------------------|--------------------|---------------------------------------------------------------------|
 | `CLAUDE_API_KEY not found`                      | Claude API         | [troubleshooting.md](troubleshooting.md#error-claude_api_key-not-found) |
+| `Unknown model 'X'`                             | Claude API / Bedrock | Typo, or a model newer than your catalogue — see [Model Registry](#model-registry). |
 | `the assistant tried to use a tool …`           | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
 | `MCP server X not loaded`                       | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
 | `claude -p exited with cost cap exceeded`       | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
