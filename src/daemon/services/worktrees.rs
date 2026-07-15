@@ -2125,7 +2125,9 @@ fn remove_worktree(path: &Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::shim::{shim_lock, write_exec_script};
     use chrono::Utc;
+    use std::sync::MutexGuard;
 
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
         json!({
@@ -3244,13 +3246,16 @@ mod tests {
 
     /// Writes an executable stub that ignores its arguments and prints `stdout`,
     /// standing in for `gh api graphql` so the poll loop is exercised offline.
-    fn fake_gh(dir: &Path, stdout: &str) -> PathBuf {
+    /// Returns the shim lock alongside the path: the caller **must** hold the
+    /// guard until the poller has finished exec'ing the stub. Writing an
+    /// executable and then `execve`ing it races every other thread that forks —
+    /// the child inherits the still-open writable FD and the exec fails
+    /// `ETXTBSY`. See [`crate::pr_status`]'s twin helper (#642, #1344).
+    fn fake_gh(dir: &Path, stdout: &str) -> (PathBuf, MutexGuard<'static, ()>) {
+        let guard = shim_lock();
         let path = dir.join("fake-gh");
-        std::fs::write(&path, format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
+        write_exec_script(&path, &format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\n"));
+        (path, guard)
     }
 
     /// A repo with a GitHub origin and one commit on `main`.
@@ -3568,6 +3573,13 @@ mod tests {
     }
 
     #[tokio::test]
+    // The shim guard is deliberately held across the awaits below: it must span
+    // both the stub's write *and* the poller's exec of it, since the ETXTBSY race
+    // is against another test writing while this one forks. Safe here — only test
+    // threads take it, never a task inside the runtime, so it cannot deadlock.
+    // Scoped per-test rather than on the module, which would also silence the
+    // registry lock's "never held across .await" invariant.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_wakes_when_the_first_window_opens_after_an_idle_start() {
         // The normal startup order: the daemon starts at login, *before* any
         // editor. It therefore sees an empty tree and backs off to the 30-minute
@@ -3577,7 +3589,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
@@ -3792,13 +3804,15 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_resolves_via_gh_populates_the_cache_and_stops_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
         // One repo, one branch → aliases r0/b0. A still-running check so the badge
         // stays pending and the loop keeps its fast cadence.
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
@@ -3848,13 +3862,15 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_bumps_only_when_a_verdict_actually_moves() {
         // The diff-and-drop contract: an unchanged poll must not bump, or every
         // window re-renders on every tick — the cost this design exists to avoid.
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
