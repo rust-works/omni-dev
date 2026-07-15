@@ -82,6 +82,10 @@ omni-dev snowflake query --account MYACCT --user me "SELECT CURRENT_TIMESTAMP(),
 # SQL can also come from stdin (the lumon pipe path).
 echo "SELECT 1" | omni-dev snowflake query --account MYACCT --user me
 
+# Multi-statement scripts run in one submission; the payload's `statements`
+# array carries one result set per statement (JSON/YAML only).
+omni-dev snowflake query --account MYACCT --user me "USE WAREHOUSE WH; SELECT 1"
+
 # Per-query context is applied with USE … on the reused session.
 omni-dev snowflake query --account MYACCT --user me \
   --warehouse WH --role ANALYST --database DB --schema PUBLIC "SELECT 1"
@@ -120,32 +124,51 @@ evicting the session, so a runaway statement frees its pooled session promptly
 `--member <id>` (a member id shown by `sessions`) to target one authenticated
 session's query rather than every busy member in the pool; `--member` is not
 valid with `--all`. It reports how many running queries an abort was issued for
-and is a no-op when nothing is running.
+and is a no-op when nothing is running. A multi-statement script is submitted
+under one request id, so `cancel` aborts the whole script.
 
-`query` returns a self-describing payload:
+`query` returns a self-describing payload. Result sets are always wrapped in a
+`statements` array — **one entry per `;`-separated statement** — so a single-statement
+query is a one-element array:
 
 ```json
 {
-  "columns": [{ "name": "ID", "type": "fixed(38,0)" }, { "name": "NAME", "type": "text(16777216)" }],
-  "rows": [{ "ID": 1, "NAME": "hello" }]
+  "statements": [
+    {
+      "columns": [{ "name": "ID", "type": "fixed(38,0)" }, { "name": "NAME", "type": "text(16777216)" }],
+      "rows": [{ "ID": 1, "NAME": "hello" }]
+    }
+  ]
 }
 ```
 
-Cell types map as: `fixed` (scale 0) → integer (falling back to the exact string
-when it overflows `i64`); `fixed` (scale > 0) / `real`/`float`/`double` → number;
-`boolean` → bool; `text` → string; `date`/`time`/`timestamp_*` → ISO-8601 string;
-`variant`/`object`/`array` → parsed JSON; `binary` (hex) and other types → the raw
-string. An empty result reports `columns: []` (the connector exposes column
-metadata per-row only).
+Each `statements[]` entry is one result set. Cell types map as: `fixed` (scale 0) →
+integer (falling back to the exact string when it overflows `i64`); `fixed` (scale > 0)
+/ `real`/`float`/`double` → number; `boolean` → bool; `text` → string;
+`date`/`time`/`timestamp_*` → ISO-8601 string; `variant`/`object`/`array` → parsed
+JSON; `binary` (hex) and other types → the raw string. An empty result reports
+`columns: []` (the connector exposes column metadata per-row only).
 
-`-o json` (default) and `-o yaml` serialize that whole payload. `-o csv` / `-o tsv`
-instead render the tabular shape directly: a header row of column names (order taken
-from `columns[]`) followed by one row per result row, with RFC 4180 quoting — a field
-is double-quoted, and embedded quotes doubled, when it contains the delimiter, a
-quote, or a newline. `null` cells become empty fields and `variant`/`object`/`array`
-cells become compact JSON. Because an empty result reports `columns: []`, CSV/TSV of a
-zero-row query is empty. `--out-file <PATH>` writes the rendered output to a file
-instead of stdout (for any `-o` format).
+### Multi-statement scripts
+
+A semicolon-separated script (e.g. `USE WAREHOUSE WH; SELECT …`) runs as one
+submission. When the SQL parses to more than one statement the service sets
+`MULTI_STATEMENT_COUNT = 0` ("any count") on the v1 REST submission; the server then
+returns a list of child result ids, which the service fetches and returns in order as
+successive `statements[]` entries. Single-statement queries keep the original,
+cheaper path (no extra round trips) and still return a one-element `statements` array.
+Statement detection ignores `;` inside string/quoted-identifier literals, line/block
+comments, and `$$`-delimited blocks.
+
+`-o json` (default) and `-o yaml` serialize the whole `statements` payload. `-o csv` /
+`-o tsv` render a **single** tabular result set — a header row of column names (order
+taken from `columns[]`) followed by one row per result row, with RFC 4180 quoting (a
+field is double-quoted, and embedded quotes doubled, when it contains the delimiter, a
+quote, or a newline); `null` cells become empty fields and `variant`/`object`/`array`
+cells become compact JSON. A zero-row query (`columns: []`) renders empty. Because a
+flat CSV/TSV has no multi-table shape, `-o csv`/`-o tsv` **error** on a multi-statement
+result — use `-o json`/`-o yaml` for those. `--out-file <PATH>` writes the rendered
+output to a file instead of stdout (for any `-o` format).
 
 ## Configuration
 
@@ -392,7 +415,7 @@ Ops:
 
 | op           | payload                                                            | success payload                                        |
 |--------------|--------------------------------------------------------------------|--------------------------------------------------------|
-| `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`  | `{ columns: [...], rows: [...] }`                      |
+| `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`  | `{ statements: [ { columns: [...], rows: [...] }, … ] }` — one entry per `;`-separated statement |
 | `sessions`   | `null`                                                             | `{ sessions: [<pool>] }` — one entry per pool, see below |
 | `cancel`     | (`{ account, user }` \| `{ id }` \| `{ all: true }`) `+ member?`   | `{ cancelled: <n> }`                                   |
 | `disconnect` | `{ account, user }` \| `{ id }` \| `{ all: true }`                 | `{ disconnected: <bool>, count: <n> }`                |
@@ -440,7 +463,7 @@ Example exchange:
 
 ```text
 → {"service":"snowflake","op":"query","payload":{"account":"MYACCT","user":"me","sql":"SELECT 1 AS N"}}
-← {"ok":true,"payload":{"columns":[{"name":"N","type":"fixed(1,0)"}],"rows":[{"N":1}]}}
+← {"ok":true,"payload":{"statements":[{"columns":[{"name":"N","type":"fixed(1,0)"}],"rows":[{"N":1}]}]}}
 ```
 
 The first `query` for an unseen `(account, user)` blocks while the browser SSO
