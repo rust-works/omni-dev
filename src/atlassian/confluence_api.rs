@@ -4413,6 +4413,30 @@ mod tests {
             .unwrap();
     }
 
+    /// A comment fetch without `version.number` can't produce the next version,
+    /// so the update fails loudly rather than guessing.
+    #[tokio::test]
+    async fn update_page_comment_without_version_number_errors() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = ValidatedAdfDocument::empty();
+        let err = api
+            .update_page_comment("555", CommentKind::Footer, &adf)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing version.number"));
+    }
+
     #[tokio::test]
     async fn update_page_comment_api_error() {
         let server = wiremock::MockServer::start().await;

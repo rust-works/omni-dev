@@ -989,6 +989,52 @@ mod tests {
         assert!(err.to_string().contains("404"));
     }
 
+    /// Answering "y" takes the `GuardOutcome::Proceed` arm.
+    #[tokio::test]
+    async fn delete_sprint_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted sprint"));
+    }
+
+    /// Dry-run with a failing writer covers the `?` on the guard call.
+    #[tokio::test]
+    async fn delete_sprint_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
     /// Drives the `Delete` dispatch arm and `DeleteCommand::execute`'s
     /// create_client + stdin/stdout wiring (`--force` skips the prompt).
     #[tokio::test]

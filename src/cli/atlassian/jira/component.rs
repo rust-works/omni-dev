@@ -354,10 +354,13 @@ mod tests {
             .mount(&server)
             .await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        CreateCommand {
-            project: "PROJ".to_string(),
-            name: "Backend".to_string(),
-            description: Some("Server side".to_string()),
+        // Routed through the parent so the `Create` dispatch arm is covered too.
+        ComponentCommand {
+            command: ComponentSubcommands::Create(CreateCommand {
+                project: "PROJ".to_string(),
+                name: "Backend".to_string(),
+                description: Some("Server side".to_string()),
+            }),
         }
         .execute()
         .await
@@ -378,10 +381,13 @@ mod tests {
             .mount(&server)
             .await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        UpdateCommand {
-            component_id: "10000".to_string(),
-            name: Some("Renamed".to_string()),
-            description: None,
+        // Routed through the parent so the `Update` dispatch arm is covered too.
+        ComponentCommand {
+            command: ComponentSubcommands::Update(UpdateCommand {
+                component_id: "10000".to_string(),
+                name: Some("Renamed".to_string()),
+                description: Some("New desc".to_string()),
+            }),
         }
         .execute()
         .await
@@ -399,15 +405,68 @@ mod tests {
             .await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
         // `--force` skips the prompt, so the public execute() wrapper (which
-        // wires up real stdin/stdout) does not read stdin.
-        DeleteCommand {
-            component_id: "10000".to_string(),
-            move_issues_to: None,
-            force: true,
-            dry_run: false,
+        // wires up real stdin/stdout) does not read stdin. Routed through the
+        // parent so the `Delete` dispatch arm is covered too.
+        ComponentCommand {
+            command: ComponentSubcommands::Delete(DeleteCommand {
+                component_id: "10000".to_string(),
+                move_issues_to: None,
+                force: true,
+                dry_run: false,
+            }),
         }
         .execute()
         .await
         .unwrap();
+    }
+
+    /// Answering the prompt "y" takes the `GuardOutcome::Proceed` arm — the
+    /// `--force` tests skip the guard block entirely.
+    #[tokio::test]
+    async fn delete_component_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/component/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            component_id: "10000".to_string(),
+            move_issues_to: None,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete component 10000?"));
+        assert!(out.contains("Deleted component 10000."));
+    }
+
+    /// A failing writer makes the guard's own `writeln` fail, covering the `?`
+    /// propagation on `guard_destructive_with_io`.
+    #[tokio::test]
+    async fn delete_component_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            component_id: "10000".to_string(),
+            move_issues_to: None,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
     }
 }

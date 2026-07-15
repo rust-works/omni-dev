@@ -196,11 +196,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         watch_mock("POST").mount(&server).await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        WatchArgs {
-            id: "12345".to_string(),
-            account_id: Some("acc-1".to_string()),
+        // Routed through the parent so the `Add` dispatch arm is covered too.
+        WatcherCommand {
+            command: WatcherSubcommands::Add(WatchArgs {
+                id: "12345".to_string(),
+                account_id: Some("acc-1".to_string()),
+            }),
         }
-        .run_add()
+        .execute()
         .await
         .unwrap();
     }
@@ -211,11 +214,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         watch_mock("DELETE").mount(&server).await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        WatchArgs {
-            id: "12345".to_string(),
-            account_id: None,
+        // Routed through the parent so the `Remove` dispatch arm is covered too.
+        WatcherCommand {
+            command: WatcherSubcommands::Remove(WatchArgs {
+                id: "12345".to_string(),
+                account_id: None,
+            }),
         }
-        .run_remove()
+        .execute()
         .await
         .unwrap();
     }

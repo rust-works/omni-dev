@@ -3631,6 +3631,28 @@ mod tests {
         assert!(yaml.contains("/rest/api/3/issue/PROJ-1/remotelink"));
     }
 
+    /// The dry-run preview includes the optional `globalId` / `summary` /
+    /// `relationship` fields when supplied.
+    #[tokio::test]
+    async fn link_remote_create_yaml_dry_run_includes_global_id() {
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_remote_create_yaml(
+            &client,
+            "PROJ-1",
+            "https://x/doc",
+            "Doc",
+            Some("summary text"),
+            Some("relates to"),
+            Some("sys=example/doc"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("globalId"));
+        assert!(yaml.contains("sys=example/doc"));
+        assert!(yaml.contains("relates to"));
+    }
+
     #[tokio::test]
     async fn link_remote_delete_yaml_requires_confirm_true() {
         let client = mock_client("http://127.0.0.1:1");
@@ -4010,6 +4032,13 @@ mod tests {
     async fn label_add_yaml_empty_errors() {
         let client = mock_client("http://127.0.0.1:1");
         let err = label_add_yaml(&client, "PROJ-1", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("No labels"));
+    }
+
+    #[tokio::test]
+    async fn label_remove_yaml_empty_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = label_remove_yaml(&client, "PROJ-1", &[]).await.unwrap_err();
         assert!(err.to_string().contains("No labels"));
     }
 
