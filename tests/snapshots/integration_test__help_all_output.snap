@@ -19,6 +19,7 @@ Commands:
   datadog     Datadog: read-only API operations
   snowflake   Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
   worktrees   Worktrees: list the repos/worktrees open across all VS Code windows
+  sessions    Sessions: track Claude Code sessions running across all terminals and windows
   coverage    Coverage: diff/patch coverage analysis for PR comments
   transcript  Transcript and caption fetching from media platforms
   log         Search the local invocation + HTTP request log
@@ -3976,6 +3977,78 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev sessions - Sessions: track Claude Code sessions running across all terminals and windows
+
+Sessions: track Claude Code sessions running across all terminals and windows
+
+Usage: sessions <COMMAND>
+
+Commands:
+  list             List the Claude Code sessions currently running across all windows
+  hook             Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+  install-hooks    Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+  uninstall-hooks  Remove the sessions-tracker hooks from `~/.claude/settings.json`
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev sessions hook - Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+
+Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+
+Usage: hook [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev sessions install-hooks - Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+
+Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+
+Usage: install-hooks [OPTIONS]
+
+Options:
+      --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev sessions list - List the Claude Code sessions currently running across all windows
+
+List the Claude Code sessions currently running across all windows
+
+Usage: list [OPTIONS]
+
+Options:
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev sessions uninstall-hooks - Remove the sessions-tracker hooks from `~/.claude/settings.json`
+
+Remove the sessions-tracker hooks from `~/.claude/settings.json`
+
+Usage: uninstall-hooks [OPTIONS]
+
+Options:
+      --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
+  -h, --help             Print help
 
 
 ================================================================================

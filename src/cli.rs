@@ -22,6 +22,8 @@ pub mod help;
 pub mod log;
 pub mod resources;
 #[cfg(unix)]
+pub mod sessions;
+#[cfg(unix)]
 pub mod snowflake;
 pub mod transcript;
 #[cfg(unix)]
@@ -186,6 +188,9 @@ pub enum Commands {
     /// Worktrees: list the repos/worktrees open across all VS Code windows.
     #[cfg(unix)]
     Worktrees(worktrees::WorktreesCommand),
+    /// Sessions: track Claude Code sessions running across all terminals and windows.
+    #[cfg(unix)]
+    Sessions(sessions::SessionsCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
@@ -320,6 +325,8 @@ impl Cli {
             Commands::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::Worktrees(cmd) => cmd.execute().await,
+            #[cfg(unix)]
+            Commands::Sessions(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),

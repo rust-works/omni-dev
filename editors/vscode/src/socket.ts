@@ -19,6 +19,9 @@ export const MAX_SOCKET_PATH_LEN = 104;
 /** The service name the worktrees ops are routed to. */
 export const WORKTREES_SERVICE = "worktrees";
 
+/** The service name the Claude Code sessions ops are routed to (#1210). */
+export const SESSIONS_SERVICE = "sessions";
+
 /** A daemon request envelope — one newline-delimited JSON object on the wire. */
 export interface Envelope {
   service: string;
@@ -206,6 +209,31 @@ export function closeEnvelope(
     payload.confirmed = true;
   }
   return { service: WORKTREES_SERVICE, op: "close", payload };
+}
+
+/**
+ * The fields a window reports on the sessions `window` op (mirrors `WindowReport`
+ * in `src/sessions.rs`) — how many Claude editor tabs / integrated terminals this
+ * window has, plus its folders, so the daemon can tag a session's source as VS
+ * Code by joining a session's `cwd` against these folders (#1210). The companion
+ * cannot expose a tab's `session_id` (Claude Code's extension has no public API),
+ * so it reports only counts, never per-tab ids.
+ */
+export interface SessionWindowPayload {
+  key: string;
+  folders: string[];
+  tabs: number;
+  terminals: number;
+}
+
+/** Builds a sessions `window` envelope — this window's Claude-embedding report. */
+export function sessionWindowEnvelope(payload: SessionWindowPayload): Envelope {
+  return { service: SESSIONS_SERVICE, op: "window", payload };
+}
+
+/** Builds a sessions `window-unregister` envelope (the window closed). */
+export function sessionWindowUnregisterEnvelope(key: string): Envelope {
+  return { service: SESSIONS_SERVICE, op: "window-unregister", payload: { key } };
 }
 
 /**

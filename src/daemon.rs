@@ -72,6 +72,8 @@ use server::DaemonOptions;
 #[cfg(unix)]
 use services::bridge::BridgeService;
 #[cfg(unix)]
+use services::sessions::SessionsService;
+#[cfg(unix)]
 use services::snowflake::SnowflakeService;
 #[cfg(unix)]
 use services::worktrees::WorktreesService;
@@ -95,15 +97,18 @@ pub struct DaemonRunConfig {
     pub bridge_token_path: PathBuf,
 }
 
-/// Builds the daemon's default service registry: starts the browser bridge on
-/// its loopback-TCP planes and registers it alongside the Snowflake query
-/// service and the cross-window worktrees registry.
+/// Builds the daemon's default service registry.
+///
+/// Starts the browser bridge on its loopback-TCP planes and registers it
+/// alongside the Snowflake query service, the cross-window worktrees registry,
+/// and the Claude Code sessions tracker.
 ///
 /// `bridge_token_file` overrides token generation; `bridge_token_path` is where
 /// the resolved token is persisted (`0600`) for thin-client discovery. The
 /// Snowflake service is registered cheaply (no eager auth or I/O); its sessions
-/// are authenticated lazily on first query. The worktrees service is likewise
-/// cheap (in-memory only); it fills as VS Code windows register.
+/// are authenticated lazily on first query. The worktrees and sessions services
+/// are likewise cheap (in-memory only); they fill as VS Code windows register and
+/// as Claude Code hooks/transcripts report.
 #[cfg(unix)]
 pub async fn build_default_registry(
     bridge_config: BridgeConfig,
@@ -120,6 +125,12 @@ pub async fn build_default_registry(
     let worktrees = WorktreesService::new();
     worktrees.start_menu_refresh();
     registry.register(Arc::new(worktrees));
+    // The cross-window Claude Code sessions tracker; start its transcript watcher
+    // (Feed 2) so sessions predating the daemon — and the hook-silent thinking
+    // window — are still tracked (#1210).
+    let sessions = SessionsService::new();
+    sessions.start_watcher();
+    registry.register(Arc::new(sessions));
     Ok(registry)
 }
 
