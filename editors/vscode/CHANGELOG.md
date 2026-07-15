@@ -10,7 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-16
+
 ### Added
+- **Pull request badges on worktree rows** ([#1296](https://github.com/rust-works/omni-dev/issues/1296), [#1324](https://github.com/rust-works/omni-dev/issues/1324), [#1337](https://github.com/rust-works/omni-dev/issues/1337)): each worktree row in the **Worktrees** view now shows its open GitHub pull request — the PR number, a `draft` marker, and a **colored** CI-check badge: green `✓` (passing), red `✗` (failing), or yellow `●` (pending) — so a passing and a failing PR are distinguishable at a glance. A PR line is added to the row's tooltip.
+  - The badge is a theme-aware `FileDecoration` (the `charts.{green,red,yellow}` palette) painted from a custom `omnidev-worktree:` `resourceUri` — a custom scheme, so it never collides with git's own folder decorations; the color also tints the row's branch label, matching how git status colors its badges. A row reads `#1319 draft`, with the color badge carrying the check state. A PR is matched to a row by its head branch; a worktree with no PR, and a PR with no checks, show no badge.
+  - Check state is resolved **by the omni-dev daemon**, not the extension: the daemon makes a single `gh api graphql` call covering every repo and branch at once and pushes the verdict on the tree snapshot, so CI state stays **live in every window** rather than refreshing only when you expand a repo node. The extension runs no `gh` of its own and reduces no rollup.
+  - Gated behind the new `omniDevWorktrees.showPullRequests` setting (default **on**); disable it to hide the badges.
 - **Open Claude Code** ([#1322](https://github.com/rust-works/omni-dev/issues/1322)): a **Claude-in-a-box** button in the editor title bar opens the Claude Code CLI in a terminal docked as an **editor tab** (not the bottom panel) and runs the configured command.
   - The working directory is the active window's workspace folder — the focused editor's folder when it sits in one, else the first folder. Clicking again while the terminal is still open **focuses** it instead of spawning a duplicate; after you close it, a fresh click opens a new one.
   - The launch command is the new `omniDevWorktrees.claudeCommand` setting (default `claude`); a shell prefix such as `proxy && claude` is allowed. The button is window-level and daemon-independent, so it works even when the omni-dev daemon is not running.
@@ -18,12 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - It lists **this** window's sessions newest-first with a readable preview label (first user message, or a summary line), then moves both the `<id>.jsonl` transcript and its optional `<id>/` sidecar dir (subagent transcripts, overflow tool-results) into the target worktree's encoded `~/.claude/projects/` folder. **Copy (Fork)** is offered alongside a plain move.
   - A confirmation modal (showing source → destination and the exact artifacts) precedes any change; a session written moments ago is refused as possibly-live ("close its window first"); an id collision in the destination aborts rather than clobbers; and global state (`history.jsonl`, `shell-snapshots/`) is never touched.
   - Entirely a per-user filesystem operation under `~/.claude/projects/` — it needs no daemon and touches no trust boundary.
+- **Claude session reporting** ([#1210](https://github.com/rust-works/omni-dev/issues/1210)): the companion now feeds a **second** daemon service — the new Claude Code sessions tracker — by reporting how many Claude editor tabs and integrated terminals each window has, on activate, on the existing ~10s heartbeat, and whenever tabs or terminals change; it unregisters on deactivate.
+  - This lets the daemon tag a session's source as VS Code (joining the session's working directory against the window's folders), so `omni-dev sessions list` and the tray's **Claude Sessions** submenu can tell a session running in an editor window from one in a plain terminal, and offer a focus action for it.
+  - It reports **counts only — never a tab's session id**, which the Claude extension exposes no API for. This is the extension's first reporting beyond worktrees; it touches no trust boundary and persists nothing.
 
-### Changed
-- **Colored PR check badge** ([#1324](https://github.com/rust-works/omni-dev/issues/1324)): a worktree's CI-check state now renders as a **colored** badge on the row — a green `✓` (passing), red `✗` (failing), or yellow `●` (pending) — instead of a monochrome glyph tucked into the muted description, so a passing and a failing PR are distinguishable at a glance.
-  - The badge is a theme-aware `FileDecoration` (using the `charts.{green,red,yellow}` palette) painted from a custom `omnidev-worktree:` `resourceUri`, a custom scheme so it never collides with git's own folder decorations; the color also tints the row's branch label, matching how git status colors its badges.
-  - The check glyph is removed from the description text (no duplicate); the row now reads just `#1319 draft`, with the color badge carrying the check state. A PR with no checks, and a worktree with no PR, show no badge as before.
-  - Extension-only — no daemon, protocol, or trust-boundary change.
+### Removed
+- **The inline "Open in VS Code" action on worktree rows** has been removed, along with its unused `omniDevWorktrees.open` command. Double-clicking a worktree row still opens or focuses its window, which is the affordance the inline button duplicated. (The action was advertised in the 0.2.0 notes; that line no longer applies.)
+
+### Compatibility
+- The PR number and `draft` marker work against **any** daemon, but the **colored CI-check badge requires daemon 0.36.0 or later** — an older daemon omits the field, and the extension falls back to a rollup-free `gh pr list` that shows `#65` / `#65 draft` with **no** check badge. This is deliberate: nothing extension-side polls, so a verdict resolved there could never refresh, and a stale tick is worse than none.
+- Live `↑ahead ↓behind` refresh after a push or fetch ([#1344](https://github.com/rust-works/omni-dev/issues/1344)) likewise requires daemon 0.36.0 or later; against an older daemon the counts refresh only when a repo node is collapsed and re-expanded.
 
 ## [0.4.0] - 2026-07-13
 
