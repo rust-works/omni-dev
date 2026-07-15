@@ -127,6 +127,23 @@ struct RefreshTask {
     handle: JoinHandle<()>,
 }
 
+/// Whether this tick should spend a `gh` call.
+///
+/// The poller wakes far more often than it fetches — waking is a cached snapshot
+/// read, fetching is a subprocess and a network round trip. Two things justify the
+/// call: the watched state **moved** (a window opened, or a commit landed — the
+/// latter being invisible to the change-notify, so only looking finds it), or the
+/// **backoff elapsed** and it is simply time to look again.
+///
+/// Pure so the policy is testable directly: from outside, the only evidence of it
+/// is *when* a subprocess runs, which a test cannot pin down without either flaking
+/// or passing for the wrong reason.
+fn pr_should_fetch(moved: bool, since_last_fetch: Option<Duration>, backoff: Duration) -> bool {
+    // `map_or(true, ..)` rather than `is_none_or`: the latter is stable only
+    // since 1.82 and this crate's MSRV is 1.80.
+    moved || since_last_fetch.map_or(true, |elapsed| elapsed >= backoff)
+}
+
 /// The next PR-poll delay: `base` while something is still pending, else double
 /// the current delay up to [`MAX_PR_POLL_INTERVAL`].
 ///
@@ -150,14 +167,30 @@ struct PollerTask {
     handle: JoinHandle<()>,
 }
 
-/// Extracts the (repo, branch) pairs to resolve badges for from a `tree` snapshot.
+/// One thing the PR poller watches: a badge target, and the commit the worktree
+/// carrying it currently has checked out.
+///
+/// The head is what makes a **commit** observable to the poller. A window opening
+/// bumps the registry's change-notify, but nothing notifies the daemon when you
+/// commit or push — so the poller compares this against the previous tick's and
+/// treats a moved head as "go and ask now".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PrWatch {
+    /// The (repo, branch) to resolve a badge for.
+    target: PrTarget,
+    /// That worktree's HEAD, or `None` for an unborn one.
+    head_sha: Option<String>,
+}
+
+/// Extracts what the poller watches — the badge targets and their local heads —
+/// from a `tree` snapshot.
 ///
 /// Reading them back off the snapshot — rather than walking git again — means the
 /// poller reuses the coalescing [`TreeSnapshotCache`] build instead of adding a
 /// second independent per-worktree git walk, which is the idle-CPU cost #1305 went
 /// out of its way to remove. Only GitHub repos with a branch contribute; the result
 /// is sorted and deduped so N worktrees of one repo on one branch ask once.
-fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
+fn pr_watch_from_snapshot(snapshot: &Value) -> Vec<PrWatch> {
     let mut out = Vec::new();
     for repo in snapshot
         .get("repos")
@@ -181,10 +214,16 @@ fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
             .flatten()
         {
             if let Some(branch) = wt.get("branch").and_then(Value::as_str) {
-                out.push(PrTarget {
-                    owner: owner.to_string(),
-                    name: name.to_string(),
-                    branch: branch.to_string(),
+                out.push(PrWatch {
+                    head_sha: wt
+                        .get("head_sha")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    target: PrTarget {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        branch: branch.to_string(),
+                    },
                 });
             }
         }
@@ -192,6 +231,16 @@ fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
     out.sort();
     out.dedup();
     out
+}
+
+/// The (repo, branch) pairs to resolve badges for — [`pr_watch_from_snapshot`]
+/// without the heads.
+#[cfg(test)]
+fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
+    pr_watch_from_snapshot(snapshot)
+        .into_iter()
+        .map(|w| w.target)
+        .collect()
 }
 
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
@@ -338,38 +387,60 @@ impl WorktreesService {
         // while the loop is starting still wakes it rather than being missed.
         let mut changes = self.registry.subscribe_changes();
         let handle = tokio::spawn(async move {
-            let mut delay = base;
+            // Two independent cadences. The loop *wakes* every `base` — cheap: a read
+            // of the coalescing snapshot cache, no subprocess, no network. It only
+            // *asks GitHub* when there is reason to: the watched state moved, or the
+            // backoff has elapsed.
+            //
+            // They have to be separate because the two things that should trigger a
+            // fetch arrive by different routes. A window opening bumps the registry's
+            // change-notify, but **a commit does not** — nothing in the daemon is
+            // notified when you `git push`. The only way to notice is to look, so the
+            // loop looks often and cheaply, and pays only when something changed.
+            let mut backoff = base;
+            let mut last_poll: Option<Instant> = None;
+            let mut watched: Option<Vec<PrWatch>> = None;
             loop {
                 // Wait first: at startup no window has registered yet, and the
                 // first snapshot would be empty anyway.
                 tokio::select! {
                     () = loop_token.cancelled() => break,
-                    () = tokio::time::sleep(delay) => {}
-                    // The visible set moved — a window opened or closed. The daemon
-                    // normally starts at login, *before* any editor, so it will have
-                    // seen an empty tree and backed off to the 30-minute ceiling by
-                    // the time the first window appears. Without this the first badge
-                    // could take half an hour: the backoff was earned on a tree that
-                    // no longer exists, so waking resets it rather than sleeping it
-                    // out.
+                    () = tokio::time::sleep(base) => {}
+                    // A window opened or closed — look now rather than at the next
+                    // tick.
                     result = changes.changed() => {
                         if result.is_err() {
                             // The registry is gone; nothing left to poll for.
                             break;
                         }
-                        delay = base;
                     }
                 }
-                // Targets come off the coalescing snapshot cache, so this reuses
-                // the tick's `build_tree` rather than walking git a second time.
-                let targets = pr_targets_from_snapshot(&tree_cache.snapshot().await);
-                if targets.is_empty() {
-                    // No windows, or nothing on GitHub: ask nothing and idle at the
-                    // ceiling until something registers (which bumps the tree, not
-                    // this loop — the next tick will see it).
-                    delay = MAX_PR_POLL_INTERVAL;
+                // Off the coalescing snapshot cache, so this reuses the tick's
+                // `build_tree` rather than walking git a second time.
+                let snapshot = tree_cache.snapshot().await;
+                let watch = pr_watch_from_snapshot(&snapshot);
+                if watch.is_empty() {
+                    // No windows, or nothing on GitHub: ask nothing, and forget any
+                    // backoff so the next tree starts fresh rather than inheriting a
+                    // ceiling earned on a tree that no longer exists.
+                    backoff = base;
+                    last_poll = None;
+                    watched = None;
                     continue;
                 }
+                // Did anything we care about move? A new commit shows up here as a
+                // changed head — which is exactly the push case the change-notify
+                // cannot see.
+                let moved = watched.as_ref() != Some(&watch);
+                if !pr_should_fetch(moved, last_poll.map(|at| at.elapsed()), backoff) {
+                    continue;
+                }
+                if moved {
+                    // Fresh work: watch it closely rather than serving out a backoff
+                    // earned while it was quiet.
+                    backoff = base;
+                }
+                let targets: Vec<PrTarget> = watch.iter().map(|w| w.target.clone()).collect();
                 // `gh` is a blocking subprocess: never on an async worker. A join
                 // failure (the task panicked, or the runtime is going down) folds
                 // into the same error channel as a `gh` failure — both mean "no
@@ -398,7 +469,11 @@ impl WorktreesService {
                         false
                     }
                 };
-                delay = next_pr_poll_delay(delay, base, pending);
+                last_poll = Some(Instant::now());
+                // Record what this verdict was about, so the *next* tick can tell a
+                // genuine change from a quiet tree.
+                watched = Some(watch);
+                backoff = next_pr_poll_delay(backoff, base, pending);
             }
         });
         *guard = Some(PollerTask { token, handle });
@@ -3067,6 +3142,32 @@ mod tests {
     }
 
     #[test]
+    fn pr_should_fetch_on_a_moved_tree_or_an_elapsed_backoff() {
+        let backoff = Duration::from_secs(600);
+        // Never fetched: go.
+        assert!(pr_should_fetch(false, None, backoff));
+        // Quiet tree, backoff not elapsed: this is the common tick — wake, look,
+        // spend nothing.
+        assert!(!pr_should_fetch(
+            false,
+            Some(Duration::from_secs(1)),
+            backoff
+        ));
+        // Quiet tree, backoff elapsed: time to look again.
+        assert!(pr_should_fetch(false, Some(backoff), backoff));
+        assert!(pr_should_fetch(false, Some(backoff * 2), backoff));
+        // The load-bearing case: the tree moved (a commit landed), so fetch **now**
+        // regardless of how deep the backoff had grown. Without this a push waits out
+        // the full ceiling on a stale badge.
+        assert!(pr_should_fetch(true, Some(Duration::ZERO), backoff));
+        assert!(pr_should_fetch(
+            true,
+            Some(Duration::from_millis(1)),
+            backoff
+        ));
+    }
+
+    #[test]
     fn next_pr_poll_delay_holds_fast_while_pending_and_backs_off_to_the_ceiling() {
         let base = Duration::from_secs(10);
         // Something is still running: keep the watch cadence, however long we had
@@ -3340,6 +3441,26 @@ mod tests {
         assert!(badge.is_stale_for(Some("bbb")));
         // No local HEAD (unborn): nothing to compare against, so not stale.
         assert!(!badge.is_stale_for(None));
+    }
+
+    #[test]
+    fn pr_watch_tracks_the_head_so_a_commit_is_visible_to_the_poller() {
+        let snap = |sha: &str| {
+            json!({"repos":[{
+                "main_repo":"omni-dev",
+                "github":{"owner":"rust-works","name":"omni-dev"},
+                "root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","head_sha":sha,"is_main":true,"open":true}]
+            }]})
+        };
+        let before = pr_watch_from_snapshot(&snap("aaa"));
+        let after = pr_watch_from_snapshot(&snap("bbb"));
+        // Same target, different head — the poller's "something moved" signal.
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].target, after[0].target);
+        assert_ne!(before, after);
+        // Identical trees compare equal, so a quiet tick asks nothing.
+        assert_eq!(before, pr_watch_from_snapshot(&snap("aaa")));
     }
 
     #[test]
