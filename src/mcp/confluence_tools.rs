@@ -6766,4 +6766,305 @@ mod tests {
             .unwrap();
         assert!(out.contains("Version two body"), "got: {out}");
     }
+
+    // ── #[tool] handler wrappers (create_client boundary) ──────────
+    //
+    // The result-helpers above are unit-tested directly; these drive the thin
+    // `#[tool]` wrappers end-to-end through `create_client()` (env + wiremock).
+
+    fn comment_get_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_edit_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("footer-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_edit(Parameters(ConfluenceCommentEditParams {
+                comment_id: "555".to_string(),
+                kind: "footer".to_string(),
+                content: Some("revised".to_string()),
+                content_path: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_delete_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_delete(Parameters(ConfluenceCommentDeleteParams {
+                comment_id: "555".to_string(),
+                kind: "inline".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_resolve_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("inline-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_resolve(Parameters(ConfluenceCommentResolveParams {
+                comment_id: "555".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_reopen_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("inline-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_reopen(Parameters(ConfluenceCommentResolveParams {
+                comment_id: "555".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_copy_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/copy",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "999"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_copy(Parameters(ConfluenceCopyParams {
+                page_id: "12345".to_string(),
+                parent_id: "67890".to_string(),
+                title: "Copy".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_attachment_update_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1", "title": "x.txt", "version": {"number": 3}
+                })),
+            )
+            .mount(&srv)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        std::fs::write(&path, b"new bytes").unwrap();
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_attachment_update(Parameters(ConfluenceAttachmentUpdateParams {
+                page_id: "12345".to_string(),
+                attachment_id: "att-1".to_string(),
+                file_path: path.to_string_lossy().into_owned(),
+                filename: None,
+                comment: None,
+                minor_edit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    fn watch_mock(method: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"watching": true})),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_status_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("GET").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_status(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_add_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("POST").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_add(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: Some("acc-1".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_remove_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("DELETE").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_remove(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_get_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"operation": "read"}]})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_get(Parameters(ConfluenceRestrictionGetParams {
+                content_id: "12345".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_grant_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/update/user",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_grant(Parameters(ConfluenceRestrictionSubjectParams {
+                content_id: "12345".to_string(),
+                operation: "update".to_string(),
+                account_id: Some("acc-1".to_string()),
+                group: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_revoke_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/read/group/devs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_revoke(Parameters(ConfluenceRestrictionSubjectParams {
+                content_id: "12345".to_string(),
+                operation: "read".to_string(),
+                account_id: None,
+                group: Some("devs".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
 }

@@ -4360,6 +4360,344 @@ mod tests {
         assert!(err.to_string().contains("404"));
     }
 
+    // ── #[tool] handler wrappers (create_client boundary) ──────────
+    //
+    // The `*_yaml` helpers above are unit-tested directly; these drive the
+    // thin `#[tool]` wrappers end-to-end through `create_client()` (env +
+    // wiremock), covering the param-unpacking + result-wrapping glue.
+
+    /// Points credentials at `server` and returns both the env guard and the
+    /// redirected-`HOME` tempdir; the caller binds both so they stay alive for
+    /// the handler call.
+    fn handler_env(
+        server: &MockServer,
+    ) -> (
+        crate::atlassian::auth::test_util::EnvGuard,
+        tempfile::TempDir,
+    ) {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let home = guard.set_credentials(&server.uri());
+        (guard, home)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_worklog_update_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_worklog_update(Parameters(WorklogUpdateParams {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                time_spent: Some("2h".to_string()),
+                started: None,
+                comment: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_worklog_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_worklog_delete(Parameters(WorklogDeleteParams {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_release_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_release(Parameters(VersionReleaseParams {
+                version_id: "10000".to_string(),
+                release_date: Some("2026-06-01".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_archive_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_archive(Parameters(VersionArchiveParams {
+                version_id: "10000".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_rename_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_rename(Parameters(VersionRenameParams {
+                version_id: "10000".to_string(),
+                name: "2.0".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_delete(Parameters(VersionDeleteParams {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_link_remote_create_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_link_remote_create(Parameters(LinkRemoteCreateParams {
+                key: "PROJ-1".to_string(),
+                url: "https://x/doc".to_string(),
+                title: "Doc".to_string(),
+                summary: None,
+                relationship: None,
+                global_id: None,
+                dry_run: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_link_remote_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink/10010"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_link_remote_delete(Parameters(LinkRemoteDeleteParams {
+                key: "PROJ-1".to_string(),
+                link_id: "10010".to_string(),
+                confirm: true,
+                dry_run: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_sprint_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/agile/1.0/sprint/42"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_sprint_delete(Parameters(SprintDeleteParams {
+                sprint_id: 42,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_label_add_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_label_add(Parameters(LabelMutateParams {
+                key: "PROJ-1".to_string(),
+                labels: vec!["backend".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_label_remove_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_label_remove(Parameters(LabelMutateParams {
+                key: "PROJ-1".to_string(),
+                labels: vec!["stale".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_list_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/PROJ/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10000", "name": "Backend"}
+            ])))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_list(Parameters(ComponentListParams {
+                project: "PROJ".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_create_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/component"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "Backend"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_create(Parameters(ComponentCreateParams {
+                project: "PROJ".to_string(),
+                name: "Backend".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_update_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/component/10000"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "Renamed"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_update(Parameters(ComponentUpdateParams {
+                component_id: "10000".to_string(),
+                name: Some("Renamed".to_string()),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/component/10000"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_delete(Parameters(ComponentDeleteParams {
+                component_id: "10000".to_string(),
+                move_issues_to: None,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
     // ── small util ─────────────────────────────────────────────────
 
     #[test]
