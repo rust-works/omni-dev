@@ -25,7 +25,7 @@ import {
   unregisterEnvelope,
 } from "./socket";
 import { runGh } from "./gh";
-import { PullRequest, parsePrList, prBadgeForBranch, prBadgeListArgs } from "./github";
+import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
 import { openPullRequest } from "./prCommands";
 import { CLAUDE_TERMINAL_NAME, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
@@ -38,6 +38,7 @@ import {
   TreeRepoPayload,
   isCurrentWindow,
   nodeId,
+  withoutPrBadges,
   worktreeLabel,
 } from "./tree";
 import { TreeSubscription } from "./subscription";
@@ -113,9 +114,18 @@ function heartbeatMs(): number {
   return Math.max(1, seconds) * 1000;
 }
 
-/** Whether to resolve and show each worktree's GitHub PR badge via `gh` (#1296). */
+/** Whether to show each worktree's GitHub PR badge (#1296). */
 function showPullRequests(): boolean {
   return config().get<boolean>("showPullRequests") ?? true;
+}
+
+/**
+ * The repos to render, with daemon-supplied PR badges stripped when the
+ * `showPullRequests` setting is off (#1337). Since the daemon pushes badges on the
+ * snapshot, not gating here would leave the setting with nothing to switch off.
+ */
+function visibleRepos(repos: TreeRepoPayload[]): TreeRepoPayload[] {
+  return showPullRequests() ? repos : withoutPrBadges(repos);
 }
 
 /** Snapshots this window's open folders for a `register`. */
@@ -176,11 +186,11 @@ interface PrCacheEntry {
 const prCache = new Map<string, PrCacheEntry>();
 
 /**
- * The repo's open PRs, from cache when fresh, else one `gh pr list` (with the
- * checks rollup). A `gh` failure — missing binary, not authed, unknown repo — is
- * **cached as an empty list** for the TTL and logged once, so a missing `gh` is
- * not re-spawned on every pushed snapshot; the explicit "Open Pull Request…"
- * action still surfaces the real error.
+ * The repo's open PRs, from cache when fresh, else one `gh pr list`. A `gh`
+ * failure — missing binary, not authed, unknown repo — is **cached as an empty
+ * list** for the TTL and logged once, so a missing `gh` is not re-spawned on every
+ * pushed snapshot; the explicit "Open Pull Request…" action still surfaces the
+ * real error.
  */
 async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
   const key = `${repo.owner}/${repo.name}`;
@@ -190,7 +200,7 @@ async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
     return hit.prs;
   }
   try {
-    const prs = parsePrList(await runGh(prBadgeListArgs(repo)));
+    const prs = parsePrList(await runGh(prListArgsForRepo(repo)));
     prCache.set(key, { at: now, prs });
     return prs;
   } catch (err) {
@@ -203,10 +213,15 @@ async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
 }
 
 /**
- * Resolves the open PR badge for each of a GitHub repo's branches on repo-expand
- * (#1296) — the {@link PrBadgeFetcher} injected into the tree provider. One
- * `gh pr list` per repo (TTL-cached), matched to each branch by head. A no-op
- * (empty map, no `gh` call) when the `showPullRequests` setting is off.
+ * Resolves a **degraded** PR badge for each branch the daemon did not badge — the
+ * {@link PrBadgeFetcher} injected into the tree provider.
+ *
+ * Badges are resolved daemon-side since #1337: one `gh api graphql` covers every
+ * repo and branch, and a background poller keeps CI state live in every window.
+ * A daemon that supplies `pr` therefore needs nothing from here, and the provider
+ * asks only for the branches it omitted — so against a current daemon this runs no
+ * `gh` at all. Against an older one it reports the PR number without a checks
+ * glyph (see {@link prFallbackBadge}). A no-op when `showPullRequests` is off.
  */
 async function fetchPrBadges(
   repo: TreeGithubIdentity,
@@ -218,7 +233,7 @@ async function fetchPrBadges(
   const prs = await cachedRepoPrs(repo);
   const badges: Record<string, PrBadge> = {};
   for (const branch of branches) {
-    const badge = prBadgeForBranch(prs, branch);
+    const badge = prFallbackBadge(prs, branch);
     if (badge) {
       badges[branch] = badge;
     }
@@ -380,7 +395,7 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   const sub = new TreeSubscription(socketPath(), {
     onSnapshot: (snapshot) => {
       view.message = snapshot.repos.length === 0 ? EMPTY_MESSAGE : undefined;
-      treeProvider.update(snapshot.repos);
+      treeProvider.update(visibleRepos(snapshot.repos));
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
       applyShowClosed(snapshot.show_closed);
@@ -679,7 +694,7 @@ async function refreshTree(): Promise<void> {
   const reply = await send(treeEnvelope());
   if (reply?.ok && Array.isArray(reply.payload?.repos)) {
     const repos = reply.payload.repos as TreeRepoPayload[];
-    provider?.update(repos);
+    provider?.update(visibleRepos(repos));
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
     applyShowClosed(reply.payload.show_closed);

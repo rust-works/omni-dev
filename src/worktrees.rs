@@ -158,12 +158,18 @@ impl WorktreesRegistry {
         self.changes.subscribe()
     }
 
-    /// Signals subscribers that the visible window set changed. Non-blocking and
+    /// Signals subscribers that the visible state changed. Non-blocking and
     /// runtime-free; called only *after* the map guard is released so the two
     /// locks never nest. A send never fails here (the sender is owned by the
     /// registry, which outlives every receiver, and `send_modify` bumps even
     /// with no receivers).
-    fn bump(&self) {
+    ///
+    /// Visible outside the registry so the daemon's PR badge poller can signal a
+    /// changed CI verdict (#1337) — the tree snapshot carries more than the window
+    /// set. Callers must bump **only on a real change**: an unconditional bump
+    /// defeats the server's snapshot diff and re-pushes to every window on every
+    /// tick.
+    pub(crate) fn bump(&self) {
         self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 

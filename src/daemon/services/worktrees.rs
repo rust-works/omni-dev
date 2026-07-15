@@ -38,6 +38,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+
+use crate::pr_status::{PrBadge, PrCheckState, PrStatusCache, PrTarget};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
@@ -88,12 +90,157 @@ fn menu_refresh_interval() -> Duration {
     )
 }
 
+/// Environment override for [`pr_poll_interval`] — the cadence at which the PR
+/// badge poller re-asks GitHub **while a badge is still pending** (whole seconds;
+/// a blank, non-numeric, or `0` value falls back to [`DEFAULT_PR_POLL_INTERVAL`]).
+const ENV_PR_POLL_INTERVAL: &str = "OMNI_DEV_DAEMON_PR_POLL";
+
+/// Default cadence for the PR badge poller while CI is in flight (#1337).
+///
+/// Matches `gh pr checks --watch`, which uses 10 s when a human is actively
+/// watching a run — which is exactly this situation. It is affordable because the
+/// poll costs **1 point** regardless of how many repos, worktrees, or windows are
+/// open: 10 s sustained is ~360 points/hour against a 5,000/hour budget, and only
+/// while something is actually pending.
+const DEFAULT_PR_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The ceiling the poller backs off to once every badge is terminal.
+///
+/// Nothing is expected to change, so this is a liveness heartbeat, not a watch.
+/// The 30-minute figure is the cross-tool consensus for background PR polling
+/// (vscode-pull-request-github's backoff ceiling, gh-dash's and GitLens's
+/// defaults). The backoff exists for battery and wakeups rather than budget — at
+/// 1 point per poll the budget never binds.
+const MAX_PR_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// The resolved PR-poll cadence: `OMNI_DEV_DAEMON_PR_POLL` (whole seconds) when
+/// valid, else [`DEFAULT_PR_POLL_INTERVAL`].
+fn pr_poll_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(ENV_PR_POLL_INTERVAL, DEFAULT_PR_POLL_INTERVAL)
+}
+
 /// A running background menu-refresh task and the token that stops it.
 struct RefreshTask {
     /// Cancelled by `shutdown` to end the refresh loop.
     token: CancellationToken,
     /// The spawned loop, awaited on shutdown so it fully unwinds.
     handle: JoinHandle<()>,
+}
+
+/// Whether this tick should spend a `gh` call.
+///
+/// The poller wakes far more often than it fetches — waking is a cached snapshot
+/// read, fetching is a subprocess and a network round trip. Two things justify the
+/// call: the watched state **moved** (a window opened, or a commit landed — the
+/// latter being invisible to the change-notify, so only looking finds it), or the
+/// **backoff elapsed** and it is simply time to look again.
+///
+/// Pure so the policy is testable directly: from outside, the only evidence of it
+/// is *when* a subprocess runs, which a test cannot pin down without either flaking
+/// or passing for the wrong reason.
+fn pr_should_fetch(moved: bool, since_last_fetch: Option<Duration>, backoff: Duration) -> bool {
+    // `map_or(true, ..)` rather than `is_none_or`: the latter is stable only
+    // since 1.82 and this crate's MSRV is 1.80.
+    moved || since_last_fetch.map_or(true, |elapsed| elapsed >= backoff)
+}
+
+/// The next PR-poll delay: `base` while something is still pending, else double
+/// the current delay up to [`MAX_PR_POLL_INTERVAL`].
+///
+/// A pure function rather than three copies inline, because the cadence is the part
+/// worth pinning: it is only observable from outside as timing, which is exactly
+/// what a test cannot assert without flaking. A failed poll passes `pending: false`,
+/// so a persistent failure backs off instead of being retried hard.
+fn next_pr_poll_delay(current: Duration, base: Duration, pending: bool) -> Duration {
+    if pending {
+        base
+    } else {
+        current.saturating_mul(2).min(MAX_PR_POLL_INTERVAL)
+    }
+}
+
+/// A running background PR-badge poll task and the token that stops it.
+struct PollerTask {
+    /// Cancelled by `shutdown` to end the poll loop.
+    token: CancellationToken,
+    /// The spawned loop, awaited on shutdown so it fully unwinds.
+    handle: JoinHandle<()>,
+}
+
+/// One thing the PR poller watches: a badge target, and the commit the worktree
+/// carrying it currently has checked out.
+///
+/// The head is what makes a **commit** observable to the poller. A window opening
+/// bumps the registry's change-notify, but nothing notifies the daemon when you
+/// commit or push — so the poller compares this against the previous tick's and
+/// treats a moved head as "go and ask now".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PrWatch {
+    /// The (repo, branch) to resolve a badge for.
+    target: PrTarget,
+    /// That worktree's HEAD, or `None` for an unborn one.
+    head_sha: Option<String>,
+}
+
+/// Extracts what the poller watches — the badge targets and their local heads —
+/// from a `tree` snapshot.
+///
+/// Reading them back off the snapshot — rather than walking git again — means the
+/// poller reuses the coalescing [`TreeSnapshotCache`] build instead of adding a
+/// second independent per-worktree git walk, which is the idle-CPU cost #1305 went
+/// out of its way to remove. Only GitHub repos with a branch contribute; the result
+/// is sorted and deduped so N worktrees of one repo on one branch ask once.
+fn pr_watch_from_snapshot(snapshot: &Value) -> Vec<PrWatch> {
+    let mut out = Vec::new();
+    for repo in snapshot
+        .get("repos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(github) = repo.get("github") else {
+            continue;
+        };
+        let (Some(owner), Some(name)) = (
+            github.get("owner").and_then(Value::as_str),
+            github.get("name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        for wt in repo
+            .get("worktrees")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(branch) = wt.get("branch").and_then(Value::as_str) {
+                out.push(PrWatch {
+                    head_sha: wt
+                        .get("head_sha")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    target: PrTarget {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        branch: branch.to_string(),
+                    },
+                });
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The (repo, branch) pairs to resolve badges for — [`pr_watch_from_snapshot`]
+/// without the heads.
+#[cfg(test)]
+fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
+    pr_watch_from_snapshot(snapshot)
+        .into_iter()
+        .map(|w| w.target)
+        .collect()
 }
 
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
@@ -109,6 +256,15 @@ pub struct WorktreesService {
     menu_cache: Arc<Mutex<Option<Vec<MenuItem>>>>,
     /// The background refresh task, once started (`None` in tests / no runtime).
     refresh: Mutex<Option<RefreshTask>>,
+    /// PR badges resolved by the background poller and read by the tree snapshot
+    /// build (#1337). Behind an `Arc` so the poll task and the snapshot builder
+    /// share the one cache. Empty until the first poll lands — and always empty
+    /// when no poller runs (unit tests), in which case the tree simply carries no
+    /// `pr` field, exactly as a pre-#1337 daemon did.
+    pr_cache: Arc<PrStatusCache>,
+    /// The background PR-badge poll task, once started (`None` in tests / no
+    /// runtime).
+    poller: Mutex<Option<PollerTask>>,
     /// The shared, coalescing tree-snapshot cache every `subscribe` stream reads
     /// through, so N open windows perform **one** `build_tree` per tick instead
     /// of N (#1303). Behind an `Arc` so each stream holds a cheap handle to the
@@ -125,11 +281,14 @@ impl WorktreesService {
     #[must_use]
     pub fn new() -> Self {
         let registry = Arc::new(WorktreesRegistry::new());
+        let pr_cache = Arc::new(PrStatusCache::new());
         Self {
             registry: registry.clone(),
             menu_cache: Arc::new(Mutex::new(None)),
             refresh: Mutex::new(None),
-            tree_cache: Arc::new(TreeSnapshotCache::new(registry)),
+            pr_cache: pr_cache.clone(),
+            poller: Mutex::new(None),
+            tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
         }
     }
 
@@ -174,6 +333,156 @@ impl WorktreesService {
             }
         });
         *guard = Some(RefreshTask { token, handle });
+    }
+
+    /// Starts the background task that keeps PR check badges fresh (#1337).
+    ///
+    /// This is the half of the badge nothing else can do. Badges used to be
+    /// resolved extension-side on repo-expand, so they were recomputed only when a
+    /// repo node's children were rebuilt — and the streamed snapshot carries
+    /// worktree topology, not CI. While CI ran and no window opened or closed,
+    /// nothing re-asked GitHub and a badge stayed wrong indefinitely.
+    ///
+    /// The loop resolves **every** (repo, branch) pair in one `gh api graphql` call
+    /// (cost 1, independent of repo/worktree/window count), writes the cache the
+    /// tree snapshot reads, and bumps the registry's change-notify **only when a
+    /// verdict actually moved** — so the server's diff pushes to every open window
+    /// exactly when CI state changes, and never otherwise.
+    ///
+    /// Cadence adapts: [`pr_poll_interval`] (~10 s) while any badge is pending,
+    /// doubling to [`MAX_PR_POLL_INTERVAL`] once everything is terminal, and it
+    /// polls nothing at all while no window is registered. That is a battery and
+    /// wakeup concern rather than a budget one.
+    ///
+    /// Idempotent, and a no-op outside a tokio runtime (mirroring
+    /// [`start_menu_refresh`](Self::start_menu_refresh) and the Snowflake keep-alive
+    /// heartbeat), so unit tests build a bare service that never spawns `gh`.
+    pub fn start_pr_poller(&self) {
+        // Both resolved once at spawn: process-stable env config (the
+        // menu-refresh precedent), never re-read per poll.
+        self.start_pr_poller_with(pr_poll_interval(), crate::pr_status::resolve_gh_binary());
+    }
+
+    /// [`start_pr_poller`](Self::start_pr_poller) with an explicit cadence and
+    /// `gh` binary, so tests drive the loop at millisecond speed against a stub
+    /// **without mutating the process environment** — one global env var cannot
+    /// serve two parallel tests pointing at different fakes. Mirrors the
+    /// [`TreeSnapshotCache::with_ttl`] seam and the Snowflake heartbeat's
+    /// "interval via config, not env" rule.
+    fn start_pr_poller_with(&self, base: Duration, gh_bin: PathBuf) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; worktrees PR poller not started");
+            return;
+        }
+        let mut guard = self.poller.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let registry = self.registry.clone();
+        let tree_cache = self.tree_cache.clone();
+        let pr_cache = self.pr_cache.clone();
+        // Captured here, before the task's first sleep, so a window that registers
+        // while the loop is starting still wakes it rather than being missed.
+        let mut changes = self.registry.subscribe_changes();
+        let handle = tokio::spawn(async move {
+            // Two independent cadences. The loop *wakes* every `base` — cheap: a read
+            // of the coalescing snapshot cache, no subprocess, no network. It only
+            // *asks GitHub* when there is reason to: the watched state moved, or the
+            // backoff has elapsed.
+            //
+            // They have to be separate because the two things that should trigger a
+            // fetch arrive by different routes. A window opening bumps the registry's
+            // change-notify, but **a commit does not** — nothing in the daemon is
+            // notified when you `git push`. The only way to notice is to look, so the
+            // loop looks often and cheaply, and pays only when something changed.
+            let mut backoff = base;
+            let mut last_poll: Option<Instant> = None;
+            let mut watched: Option<Vec<PrWatch>> = None;
+            loop {
+                // Wait first: at startup no window has registered yet, and the
+                // first snapshot would be empty anyway.
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(base) => {}
+                    // A window opened or closed — look now rather than at the next
+                    // tick.
+                    result = changes.changed() => {
+                        // Unreachable today: this task owns an `Arc` of the registry
+                        // that holds the sender, so it cannot be dropped while we are
+                        // here. Kept anyway because the alternative is worse — a
+                        // closed channel makes `changed()` return `Ready` forever, so
+                        // ignoring the error would spin this loop at full speed,
+                        // re-snapshotting and re-running `gh` every iteration. One
+                        // unreachable line is a cheap guard against that.
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+                // Off the coalescing snapshot cache, so this reuses the tick's
+                // `build_tree` rather than walking git a second time.
+                let snapshot = tree_cache.snapshot().await;
+                let watch = pr_watch_from_snapshot(&snapshot);
+                if watch.is_empty() {
+                    // No windows, or nothing on GitHub: ask nothing, and forget any
+                    // backoff so the next tree starts fresh rather than inheriting a
+                    // ceiling earned on a tree that no longer exists.
+                    backoff = base;
+                    last_poll = None;
+                    watched = None;
+                    continue;
+                }
+                // Did anything we care about move? A new commit shows up here as a
+                // changed head — which is exactly the push case the change-notify
+                // cannot see.
+                let moved = watched.as_ref() != Some(&watch);
+                if !pr_should_fetch(moved, last_poll.map(|at| at.elapsed()), backoff) {
+                    continue;
+                }
+                if moved {
+                    // Fresh work: watch it closely rather than serving out a backoff
+                    // earned while it was quiet.
+                    backoff = base;
+                }
+                let targets: Vec<PrTarget> = watch.iter().map(|w| w.target.clone()).collect();
+                // `gh` is a blocking subprocess: never on an async worker. A join
+                // failure (the task panicked, or the runtime is going down) folds
+                // into the same error channel as a `gh` failure — both mean "no
+                // badges this round", and neither deserves its own handling.
+                let bin = gh_bin.clone();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    crate::pr_status::resolve_with(&bin, &targets)
+                })
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("blocking poll task failed: {err}")));
+                // Best-effort decoration: a missing/unauthenticated `gh`, a network
+                // blip, or a rate limit must never sink the tree. A failed poll
+                // leaves the last good badges in place rather than blanking every
+                // row, and is not "pending", so it backs off rather than hammers.
+                let pending = match resolved {
+                    Ok(badges) => {
+                        // Bump only on a real change, or the server's diff-and-drop
+                        // is defeated and every window re-renders on every poll.
+                        if pr_cache.replace(badges) {
+                            registry.bump();
+                        }
+                        pr_cache.any_pending()
+                    }
+                    Err(err) => {
+                        tracing::debug!("PR badge poll failed: {err:#}");
+                        false
+                    }
+                };
+                last_poll = Some(Instant::now());
+                // Record what this verdict was about, so the *next* tick can tell a
+                // genuine change from a quiet tree.
+                watched = Some(watch);
+                backoff = next_pr_poll_delay(backoff, base, pending);
+            }
+        });
+        *guard = Some(PollerTask { token, handle });
     }
 
     /// Handles the `close` op: close a worktree's window and, for a **linked**
@@ -312,7 +621,7 @@ impl DaemonService for WorktreesService {
                 // `tree` op is a rare manual refresh, deliberately bypassing the
                 // stream's coalescing cache so it never returns a stale view
                 // (#1303).
-                Ok(tree_snapshot(&self.registry).await)
+                Ok(tree_snapshot(&self.registry, self.pr_cache.clone()).await)
             }
             "ahead-behind" => {
                 // Lazy per-worktree divergence (#1306). The `tree`/`subscribe`
@@ -445,6 +754,17 @@ impl DaemonService for WorktreesService {
             task.token.cancel();
             let _ = task.handle.await;
         }
+        // Same discipline for the PR badge poller (#1337): take it out from under
+        // its lock before awaiting, so no `std::Mutex` is held across the `.await`.
+        let poller = self
+            .poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(poller) = poller {
+            poller.token.cancel();
+            let _ = poller.handle.await;
+        }
     }
 }
 
@@ -473,6 +793,13 @@ struct GitStatus {
     /// The checked-out branch, or `None` when detached or not in a repo.
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The commit HEAD points at, or `None` when unborn or not in a repo. Present
+    /// even on a detached HEAD, which has a commit but no branch. Rides the
+    /// streamed snapshot so a new commit is a real delta the server's diff cannot
+    /// drop — without it, a push serialises byte-identically and no client
+    /// re-renders (#1337).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
     /// Commits the branch is ahead of its upstream (`None` without an upstream).
     #[serde(skip_serializing_if = "Option::is_none")]
     ahead: Option<usize>,
@@ -538,6 +865,15 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     let Ok(head) = repo.head() else {
         // An unborn branch (fresh repo, no commits) or an unreadable HEAD.
         return base;
+    };
+    // Resolved here — before the branch filter below, so a detached HEAD still
+    // reports its commit, and before `Branch::wrap` consumes `head`. `target()` is
+    // a refs read: no revwalk and no object lookup, so unlike the divergence walk
+    // it is cheap enough for the streamed snapshot's every-worktree-every-tick
+    // rebuild (#1306's bar).
+    let base = GitStatus {
+        head_sha: head.target().map(|oid| oid.to_string()),
+        ..base
     };
     // A branch HEAD has a UTF-8 shorthand; anything else — a detached HEAD
     // (mid-rebase or a checked-out tag/commit), or the rare non-UTF-8 branch
@@ -682,6 +1018,12 @@ struct TreeWorktree {
     /// The checked-out branch, or `None` when detached or unborn.
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The commit HEAD points at, or `None` when unborn. Unlike ahead/behind this
+    /// **does** ride the snapshot: it costs a refs read, and it is what makes a new
+    /// commit a visible delta, so a push re-renders instead of being dropped by the
+    /// server's snapshot diff (#1337).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
     /// Whether this is the repository's main working tree (vs a linked worktree).
     is_main: bool,
     /// Whether a live VS Code window currently has this worktree open.
@@ -690,6 +1032,13 @@ struct TreeWorktree {
     /// resolves. Absent for a worktree with no open window.
     #[serde(skip_serializing_if = "Option::is_none")]
     window_key: Option<String>,
+    /// The open PR whose head is this worktree's branch, with its CI verdict
+    /// (#1337). Resolved by the daemon's background poller and folded on as the
+    /// snapshot is built, so every open window sees the same live state without
+    /// each running its own `gh`. Absent for a detached/non-GitHub worktree, one
+    /// with no open PR, or until the first poll lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr: Option<PrBadge>,
 }
 
 /// One repository (with **all** its worktrees) in the `tree` payload. Repos are
@@ -800,9 +1149,47 @@ fn worktree_entry(
     TreeWorktree {
         path: path.display().to_string(),
         branch: status.branch,
+        head_sha: status.head_sha,
         is_main,
         open: window_key.is_some(),
         window_key,
+        // Folded on afterwards by `fold_pr_badges`, which needs the repo's GitHub
+        // identity — known one level up, in `repo_tree`.
+        pr: None,
+    }
+}
+
+/// Folds the poller's cached PR badges onto each worktree of each repo (#1337).
+///
+/// Runs after [`build_tree`] because a badge is keyed by (repo GitHub identity,
+/// branch) and the identity is only known once the repo is assembled. Purely a
+/// cache read — no I/O, no network — so it is safe on the snapshot's hot path. A
+/// non-GitHub repo, a branchless worktree, or an unresolved branch simply keeps
+/// `pr: None` and renders nothing.
+///
+/// A verdict computed for a **different commit** than the worktree has checked out
+/// is downgraded to pending here rather than shown as-is. That is what makes a push
+/// invalidate the badge the moment it happens: the cache still holds the previous
+/// commit's verdict, and this fold — which runs on every snapshot — notices without
+/// waiting for a poll. Without it the previous head's `✓` stands until the poller
+/// next runs, which is up to the full backoff.
+fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
+    for repo in repos {
+        let Some(github) = repo.github.clone() else {
+            continue;
+        };
+        for worktree in &mut repo.worktrees {
+            let Some(branch) = &worktree.branch else {
+                continue;
+            };
+            let Some(mut badge) = pr_cache.get(&github.owner, &github.name, branch) else {
+                continue;
+            };
+            if badge.is_stale_for(worktree.head_sha.as_deref()) {
+                badge.checks = PrCheckState::Pending;
+            }
+            worktree.pr = Some(badge);
+        }
     }
 }
 
@@ -875,9 +1262,15 @@ fn build_tree(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<TreeRepo>
 /// does synchronous disk I/O and this runs inside the async control-socket
 /// handler), returning the serialized `repos` array. A join failure degrades to
 /// an empty list rather than erroring, matching [`enriched_windows`].
-async fn tree_repos(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<Value> {
+async fn tree_repos(
+    folders: Vec<PathBuf>,
+    windows: Vec<WindowEntry>,
+    pr_cache: Arc<PrStatusCache>,
+) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
-        build_tree(folders, windows)
+        let mut repos = build_tree(folders, windows);
+        fold_pr_badges(&mut repos, &pr_cache);
+        repos
             .iter()
             .map(|repo| serde_json::to_value(repo).unwrap_or_else(|_| json!({})))
             .collect()
@@ -988,6 +1381,9 @@ struct TreeSnapshotCache {
     /// The registry every snapshot is built from, and whose change-generation
     /// gates cache reuse.
     registry: Arc<WorktreesRegistry>,
+    /// PR badges folded onto each worktree as the snapshot is built (#1337).
+    /// Written by the background poller; read here. A miss simply omits `pr`.
+    pr_cache: Arc<PrStatusCache>,
     /// How long a built snapshot stays fresh before a tick-driven read rebuilds
     /// it. Defaults to the server's `STREAM_TICK` (via [`new`](Self::new)) so the
     /// coalesced build runs at most once per tick; tests inject a shorter value.
@@ -1021,15 +1417,20 @@ impl TreeSnapshotCache {
     /// Creates a cache over `registry` with the default TTL — the server's
     /// [`stream_tick`](crate::daemon::server::stream_tick), so the coalesced
     /// build runs at most once per tick.
-    fn new(registry: Arc<WorktreesRegistry>) -> Self {
-        Self::with_ttl(registry, crate::daemon::server::stream_tick())
+    fn new(registry: Arc<WorktreesRegistry>, pr_cache: Arc<PrStatusCache>) -> Self {
+        Self::with_ttl(registry, pr_cache, crate::daemon::server::stream_tick())
     }
 
     /// Creates a cache with an explicit `ttl`, for tests that need a short (or
     /// long) freshness window without waiting a real tick.
-    fn with_ttl(registry: Arc<WorktreesRegistry>, ttl: Duration) -> Self {
+    fn with_ttl(
+        registry: Arc<WorktreesRegistry>,
+        pr_cache: Arc<PrStatusCache>,
+        ttl: Duration,
+    ) -> Self {
         Self {
             registry,
+            pr_cache,
             ttl,
             state: AsyncMutex::new(None),
             computes: AtomicU64::new(0),
@@ -1055,7 +1456,7 @@ impl TreeSnapshotCache {
         let value = if let Some(value) = fresh {
             value
         } else {
-            let value = Arc::new(tree_snapshot(&self.registry).await);
+            let value = Arc::new(tree_snapshot(&self.registry, self.pr_cache.clone()).await);
             self.computes.fetch_add(1, Ordering::Relaxed);
             *state = Some(CachedTree {
                 generation,
@@ -1082,11 +1483,14 @@ impl TreeSnapshotCache {
 /// (the seed folders to derive repos from, and the live windows to join on) and
 /// a lock-free read of the toggle, then the git enumeration/enrichment off the
 /// lock on a blocking thread inside [`tree_repos`].
-async fn tree_snapshot(registry: &WorktreesRegistry) -> Value {
+async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache>) -> Value {
     let folders = registry.open_folders();
     let windows = registry.list();
     let show_closed = registry.show_closed();
-    json!({ "repos": tree_repos(folders, windows).await, "show_closed": show_closed })
+    json!({
+        "repos": tree_repos(folders, windows, pr_cache).await,
+        "show_closed": show_closed,
+    })
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,
@@ -2019,7 +2423,11 @@ mod tests {
     async fn tree_cache_coalesces_reads_within_ttl_and_generation() {
         let reg = Arc::new(WorktreesRegistry::new());
         // A long TTL so only the generation gate is exercised here.
-        let cache = TreeSnapshotCache::with_ttl(reg, Duration::from_secs(60));
+        let cache = TreeSnapshotCache::with_ttl(
+            reg,
+            Arc::new(PrStatusCache::new()),
+            Duration::from_secs(60),
+        );
         // The first read builds once.
         let first = cache.snapshot().await;
         assert_eq!(cache.compute_count(), 1);
@@ -2037,7 +2445,11 @@ mod tests {
     #[tokio::test]
     async fn tree_cache_single_flights_a_read_burst() {
         let reg = Arc::new(WorktreesRegistry::new());
-        let cache = Arc::new(TreeSnapshotCache::with_ttl(reg, Duration::from_secs(60)));
+        let cache = Arc::new(TreeSnapshotCache::with_ttl(
+            reg,
+            Arc::new(PrStatusCache::new()),
+            Duration::from_secs(60),
+        ));
         // A burst of concurrent readers — as N subscriber streams would wake
         // together on a change/tick — collapses to exactly one build; the rest
         // read the shared result (the acceptance criterion).
@@ -2064,7 +2476,11 @@ mod tests {
     #[tokio::test]
     async fn tree_cache_rebuilds_on_registry_change() {
         let reg = Arc::new(WorktreesRegistry::new());
-        let cache = TreeSnapshotCache::with_ttl(reg.clone(), Duration::from_secs(60));
+        let cache = TreeSnapshotCache::with_ttl(
+            reg.clone(),
+            Arc::new(PrStatusCache::new()),
+            Duration::from_secs(60),
+        );
         cache.snapshot().await;
         assert_eq!(cache.compute_count(), 1);
         // A registry change bumps the generation, so the next read rebuilds even
@@ -2084,7 +2500,8 @@ mod tests {
         let reg = Arc::new(WorktreesRegistry::new());
         // A zero TTL: every read is already past it, so a pure on-disk git change
         // still surfaces on the next tick with no registry bump needed.
-        let cache = TreeSnapshotCache::with_ttl(reg, Duration::ZERO);
+        let cache =
+            TreeSnapshotCache::with_ttl(reg, Arc::new(PrStatusCache::new()), Duration::ZERO);
         cache.snapshot().await;
         cache.snapshot().await;
         assert_eq!(
@@ -2392,6 +2809,8 @@ mod tests {
         init_repo(dir.path());
         let status = git_status(dir.path());
         assert_eq!(status.branch, None);
+        // An unborn HEAD has no commit to name, so the SHA is absent too (#1337).
+        assert_eq!(status.head_sha, None);
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
         assert_eq!(
@@ -2428,6 +2847,9 @@ mod tests {
         repo.set_head_detached(a).unwrap();
         let status = git_status(dir.path());
         assert_eq!(status.branch, None);
+        // A detached HEAD has no branch but *does* have a commit — the SHA is
+        // resolved before the branch filter, so it survives here (#1337).
+        assert_eq!(status.head_sha.as_deref(), Some(a.to_string().as_str()));
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
         assert_eq!(
@@ -2445,7 +2867,7 @@ mod tests {
         // the streamed tree snapshot still reads the branch and repo identity, but
         // leaves ahead/behind absent — divergence is now lazy (#1306).
         let dir = tempfile::tempdir().unwrap();
-        let _repo = diverging_repo(dir.path());
+        let repo = diverging_repo(dir.path());
         let status = git_status_cheap(dir.path());
         assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(status.ahead, None);
@@ -2454,6 +2876,36 @@ mod tests {
             status.main_repo.as_deref(),
             dir.path().file_name().and_then(|n| n.to_str())
         );
+        // The SHA rides the *cheap* path deliberately: it is a refs read, not a
+        // revwalk, and it is what makes a new commit a snapshot delta (#1337).
+        let head = repo.head().unwrap().target().unwrap();
+        assert_eq!(status.head_sha.as_deref(), Some(head.to_string().as_str()));
+    }
+
+    // --- HEAD SHA on the snapshot (#1337) ----------------------------------
+
+    #[test]
+    fn git_status_head_sha_tracks_new_commits() {
+        // The regression #1337 turns on: a commit must change the status the
+        // snapshot is built from. Before the SHA rode the payload, committing
+        // changed nothing on the wire, the server's diff dropped the identical
+        // snapshot, and no client re-rendered — so a badge computed for the old
+        // head survived the push that invalidated it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let before = git_status_cheap(dir.path());
+        assert_eq!(before.head_sha.as_deref(), Some(a.to_string().as_str()));
+
+        let head = repo.find_commit(a).unwrap();
+        let b = empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+        let after = git_status_cheap(dir.path());
+        assert_eq!(after.head_sha.as_deref(), Some(b.to_string().as_str()));
+        assert_ne!(before.head_sha, after.head_sha);
+        // The branch is unchanged — the SHA is the *only* thing that moved, which
+        // is exactly why its absence made the push invisible.
+        assert_eq!(before.branch, after.branch);
     }
 
     #[test]
@@ -2533,6 +2985,674 @@ mod tests {
         assert_eq!(main_wt.get("branch").and_then(Value::as_str), Some("main"));
         assert!(main_wt.get("ahead").is_none(), "{main_wt:?}");
         assert!(main_wt.get("behind").is_none(), "{main_wt:?}");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_carries_head_sha_so_a_commit_is_a_real_delta() {
+        // The end-to-end shape of the #1337 freshness fix. The server pushes a
+        // snapshot only when it differs from the last one
+        // (`server.rs`: `if snap != last`), so anything invisible on the wire
+        // cannot trigger a re-render. Committing must therefore move the payload.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        let before = svc.handle("tree", Value::Null).await.unwrap();
+        let wt = &repos_of(&before)[0]["worktrees"][0];
+        assert_eq!(
+            wt.get("head_sha").and_then(Value::as_str),
+            Some(a.to_string().as_str())
+        );
+
+        // Commit again: same branch, same paths, same open windows — pre-#1337 the
+        // snapshot was byte-identical here and the push was dropped.
+        let head = repo.find_commit(a).unwrap();
+        let b = empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+        let after = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(
+            repos_of(&after)[0]["worktrees"][0]
+                .get("head_sha")
+                .and_then(Value::as_str),
+            Some(b.to_string().as_str())
+        );
+        assert_ne!(before, after, "a commit must be a visible snapshot delta");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_head_sha_for_an_unborn_repo() {
+        // Wire-compat: an absent SHA is dropped entirely rather than sent as null,
+        // matching the payload's `skip_serializing_if` convention.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("head_sha").is_none(), "{wt:?}");
+    }
+
+    // --- PR badge poller (#1337) -------------------------------------------
+
+    /// Writes an executable stub that ignores its arguments and prints `stdout`,
+    /// standing in for `gh api graphql` so the poll loop is exercised offline.
+    fn fake_gh(dir: &Path, stdout: &str) -> PathBuf {
+        let path = dir.join("fake-gh");
+        std::fs::write(&path, format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A repo with a GitHub origin and one commit on `main`.
+    fn github_repo(dir: &Path) -> Repository {
+        let repo = init_repo(dir);
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        repo.remote("origin", "git@github.com:rust-works/omni-dev.git")
+            .unwrap();
+        repo
+    }
+
+    /// A pending badge whose verdict is about `head_oid`. The commit is explicit
+    /// because the fold downgrades a badge naming a different commit than the
+    /// worktree's HEAD (#1337) — a fixture that got it wrong would pass for the
+    /// wrong reason.
+    fn pending_badge(number: u64, head_oid: &str) -> PrBadge {
+        PrBadge {
+            number,
+            is_draft: false,
+            checks: PrCheckState::Pending,
+            url: "u".into(),
+            head_oid: head_oid.to_string(),
+        }
+    }
+
+    #[test]
+    fn pr_targets_from_snapshot_reads_github_branches_and_dedupes() {
+        let snapshot = json!({"repos":[
+            {
+                "main_repo":"omni-dev",
+                "github":{"owner":"rust-works","name":"omni-dev"},
+                "root":"/r",
+                // Two worktrees on the same branch must ask once, not twice.
+                "worktrees":[
+                    {"path":"/r","branch":"main","is_main":true,"open":true},
+                    {"path":"/w1","branch":"main","is_main":false,"open":true},
+                    {"path":"/w2","branch":"feature","is_main":false,"open":true},
+                    // Detached: no branch, so nothing to resolve.
+                    {"path":"/w3","is_main":false,"open":true}
+                ]
+            },
+            {
+                // Not on GitHub: contributes no targets at all.
+                "main_repo":"local","root":"/l",
+                "worktrees":[{"path":"/l","branch":"main","is_main":true,"open":true}]
+            }
+        ]});
+        let targets = pr_targets_from_snapshot(&snapshot);
+        assert_eq!(
+            targets,
+            vec![
+                PrTarget {
+                    owner: "rust-works".into(),
+                    name: "omni-dev".into(),
+                    branch: "feature".into()
+                },
+                PrTarget {
+                    owner: "rust-works".into(),
+                    name: "omni-dev".into(),
+                    branch: "main".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_targets_from_snapshot_is_empty_without_repos() {
+        assert!(pr_targets_from_snapshot(&json!({"repos":[]})).is_empty());
+        assert!(pr_targets_from_snapshot(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn pr_targets_from_snapshot_skips_a_malformed_github_identity() {
+        // Defensive: a `github` object without usable owner/name strings yields no
+        // target rather than a half-built query.
+        for github in [
+            json!({}),
+            json!({"owner": "o"}),
+            json!({"owner": 1, "name": 2}),
+        ] {
+            let snapshot = json!({"repos":[{
+                "main_repo":"r","github":github,"root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
+            }]});
+            assert!(
+                pr_targets_from_snapshot(&snapshot).is_empty(),
+                "{snapshot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_should_fetch_on_a_moved_tree_or_an_elapsed_backoff() {
+        let backoff = Duration::from_secs(600);
+        // Never fetched: go.
+        assert!(pr_should_fetch(false, None, backoff));
+        // Quiet tree, backoff not elapsed: this is the common tick — wake, look,
+        // spend nothing.
+        assert!(!pr_should_fetch(
+            false,
+            Some(Duration::from_secs(1)),
+            backoff
+        ));
+        // Quiet tree, backoff elapsed: time to look again.
+        assert!(pr_should_fetch(false, Some(backoff), backoff));
+        assert!(pr_should_fetch(false, Some(backoff * 2), backoff));
+        // The load-bearing case: the tree moved (a commit landed), so fetch **now**
+        // regardless of how deep the backoff had grown. Without this a push waits out
+        // the full ceiling on a stale badge.
+        assert!(pr_should_fetch(true, Some(Duration::ZERO), backoff));
+        assert!(pr_should_fetch(
+            true,
+            Some(Duration::from_millis(1)),
+            backoff
+        ));
+    }
+
+    #[test]
+    fn next_pr_poll_delay_holds_fast_while_pending_and_backs_off_to_the_ceiling() {
+        let base = Duration::from_secs(10);
+        // Something is still running: keep the watch cadence, however long we had
+        // backed off for.
+        assert_eq!(next_pr_poll_delay(base, base, true), base);
+        assert_eq!(next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, true), base);
+        // Everything terminal: double…
+        assert_eq!(next_pr_poll_delay(base, base, false), base * 2);
+        assert_eq!(next_pr_poll_delay(base * 2, base, false), base * 4);
+        // …but never past the ceiling, and never overflow off it.
+        assert_eq!(
+            next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, false),
+            MAX_PR_POLL_INTERVAL
+        );
+        assert_eq!(
+            next_pr_poll_delay(Duration::MAX, base, false),
+            MAX_PR_POLL_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_folds_cached_pr_badges_onto_matching_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        // No poll has landed: the badge is absent, exactly as a pre-#1337 daemon.
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("pr").is_none(), "{wt:?}");
+
+        // Seed the cache the poller writes, then re-read the tree.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pending_badge(1337, &head),
+        );
+        assert!(svc.pr_cache.replace(badges));
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr"]["number"], json!(1337));
+        assert_eq!(wt["pr"]["checks"], json!("pending"));
+        // camelCase on the wire, or the extension silently loses the draft marker.
+        assert_eq!(wt["pr"]["isDraft"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_a_badge_for_a_detached_worktree() {
+        // A detached HEAD has a commit but no branch, and a badge is keyed by
+        // branch — so there is nothing to match. It must fall through silently
+        // rather than borrow a badge from whatever branch happens to be cached, and
+        // rather than sink the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // A badge *is* cached for `main` — the branch this worktree was on before
+        // detaching. It must not leak onto the now-branchless row.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pending_badge(1, &head.to_string()),
+        );
+        svc.pr_cache.replace(badges);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("branch").is_none(), "{wt:?}");
+        // The SHA still shows — detached means no branch, not no commit.
+        assert_eq!(
+            wt.get("head_sha").and_then(Value::as_str),
+            Some(head.to_string().as_str())
+        );
+        assert!(wt.get("pr").is_none(), "{wt:?}");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_a_badge_for_an_unmatched_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // A badge for a different branch must not leak onto `main`.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "other".into(),
+            },
+            pending_badge(1, "irrelevant"),
+        );
+        svc.pr_cache.replace(badges);
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("pr").is_none(), "{wt:?}");
+    }
+
+    #[tokio::test]
+    async fn pr_poller_asks_nothing_while_no_window_is_registered() {
+        // The idle case — the daemon runs all day with no editor open. Point it at a
+        // stub that fails loudly if ever spawned: a poll here would both waste
+        // GitHub budget and, on a real `gh`, wake the radio for nothing.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let marker = bin_dir.path().join("spawned");
+        let fake = bin_dir.path().join("fake-gh");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ntouch '{}'\necho '{{}}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        svc.shutdown().await;
+        assert!(
+            !marker.exists(),
+            "the poller must not spawn gh with no windows registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_poller_survives_a_failing_gh_and_keeps_the_last_good_badges() {
+        // Badges are decoration: an unauthenticated or broken `gh` must never sink
+        // the tree, and one bad poll must not blank rows that were fine a second ago.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("fake-gh");
+        // Exits non-zero, exactly as `gh` does without `gh auth login`.
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'gh: not authenticated' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // Seed a badge as though an earlier poll had succeeded.
+        let mut seeded = HashMap::new();
+        seeded.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pending_badge(7, &head),
+        );
+        svc.pr_cache.replace(seeded);
+
+        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The tree still serves, and the seeded badge survived the failing polls.
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr"]["number"], json!(7));
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pr_poller_wakes_when_the_first_window_opens_after_an_idle_start() {
+        // The normal startup order: the daemon starts at login, *before* any
+        // editor. It therefore sees an empty tree and backs off to the 30-minute
+        // ceiling — so unless a register wakes it, the first badge of the session
+        // arrives up to half an hour after the window does, which reads as the
+        // feature being broken rather than slow.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":99,"isDraft":false,"url":"u"}]}
+            }}}}"#,
+        );
+
+        let svc = WorktreesService::new();
+        // Poller first, with nothing registered — it backs off on the empty tree.
+        svc.start_pr_poller_with(Duration::from_millis(50), fake);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Now an editor opens.
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        // The badge must follow promptly — the register wakes the loop out of its
+        // backoff. The deadline is orders of magnitude below the ceiling, so this
+        // fails on the bug rather than merely being slow.
+        let badge = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
+                    return badge;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a window opening must wake the poller out of its idle backoff");
+        assert_eq!(badge.number, 99);
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_commit_invalidates_the_previous_verdict_without_a_poll() {
+        // The acceptance criterion: "pushing a new commit invalidates the badge
+        // rather than leaving the previous head's verdict standing."
+        //
+        // The cache still holds the verdict for the *old* commit, and the poller may
+        // have backed off for up to half an hour. So the fold — which runs on every
+        // snapshot — has to notice on its own, with no network call.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let first = repo.head().unwrap().target().unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        // A green verdict, correctly describing the commit currently checked out.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            PrBadge {
+                number: 1337,
+                is_draft: false,
+                checks: PrCheckState::Success,
+                url: "u".into(),
+                head_oid: first.to_string(),
+            },
+        );
+        svc.pr_cache.replace(badges);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(
+            wt["pr"]["checks"],
+            json!("success"),
+            "green for its own commit"
+        );
+
+        // Now commit — as a push would leave things, with the cache untouched.
+        let head = repo.find_commit(first).unwrap();
+        empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(
+            wt["pr"]["checks"],
+            json!("pending"),
+            "the previous commit's ✓ must not stand after a new commit"
+        );
+        // The PR itself is still shown — it is the *verdict* that is unknown, not
+        // the PR.
+        assert_eq!(wt["pr"]["number"], json!(1337));
+    }
+
+    #[test]
+    fn is_stale_for_compares_the_commit_the_verdict_describes() {
+        let badge = pending_badge(1, "aaa");
+        assert!(!badge.is_stale_for(Some("aaa")));
+        assert!(badge.is_stale_for(Some("bbb")));
+        // No local HEAD (unborn): nothing to compare against, so not stale.
+        assert!(!badge.is_stale_for(None));
+    }
+
+    #[test]
+    fn pr_watch_tracks_the_head_so_a_commit_is_visible_to_the_poller() {
+        let snap = |sha: &str| {
+            json!({"repos":[{
+                "main_repo":"omni-dev",
+                "github":{"owner":"rust-works","name":"omni-dev"},
+                "root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","head_sha":sha,"is_main":true,"open":true}]
+            }]})
+        };
+        let before = pr_watch_from_snapshot(&snap("aaa"));
+        let after = pr_watch_from_snapshot(&snap("bbb"));
+        // Same target, different head — the poller's "something moved" signal.
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].target, after[0].target);
+        assert_ne!(before, after);
+        // Identical trees compare equal, so a quiet tick asks nothing.
+        assert_eq!(before, pr_watch_from_snapshot(&snap("aaa")));
+    }
+
+    #[test]
+    fn start_pr_poller_is_a_noop_outside_a_runtime() {
+        let svc = WorktreesService::new();
+        svc.start_pr_poller();
+        assert!(svc
+            .poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn start_pr_poller_is_idempotent_and_shutdown_stops_it() {
+        let svc = WorktreesService::new();
+        svc.start_pr_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        let token = svc
+            .poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|t| t.token.clone())
+            .expect("poller started");
+
+        // Cancel the live task, then start again: if `start` spawned a replacement
+        // it would orphan this one, so the token staying cancelled proves it did not.
+        token.cancel();
+        svc.start_pr_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        assert!(svc
+            .poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|t| t.token.is_cancelled()));
+
+        svc.shutdown().await;
+        assert!(svc
+            .poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn pr_poller_resolves_via_gh_populates_the_cache_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        // One repo, one branch → aliases r0/b0. A still-running check so the badge
+        // stays pending and the loop keeps its fast cadence.
+        let fake = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":1337,"isDraft":false,"url":"http://x/1337"}]}
+            }}}}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+
+        // Wait on a generous wall-clock deadline: each poll spawns a real
+        // subprocess, and under a loaded machine (a full `build.sh` runs a build
+        // and clippy alongside) a tight budget flakes rather than fails honestly.
+        let badge = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
+                    return badge;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("poller should resolve a badge through the fake gh");
+        assert_eq!(badge.number, 1337);
+        assert_eq!(badge.checks, crate::pr_status::PrCheckState::Pending);
+
+        // The badge reaches the wire the windows actually read.
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr"]["number"], json!(1337));
+
+        // And the loop is quiescent after shutdown: the generation must stop moving.
+        svc.shutdown().await;
+        let generation = svc.registry.change_generation();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            svc.registry.change_generation(),
+            generation,
+            "no bumps after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_poller_bumps_only_when_a_verdict_actually_moves() {
+        // The diff-and-drop contract: an unchanged poll must not bump, or every
+        // window re-renders on every tick — the cost this design exists to avoid.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":1,"isDraft":false,"url":"u"}]}
+            }}}}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.pr_cache.get("rust-works", "omni-dev", "main").is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("poller should resolve a badge through the fake gh");
+        // The fake always answers identically, so after the first resolve every
+        // subsequent poll is a no-change and must leave the generation alone.
+        let settled = svc.registry.change_generation();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            svc.registry.change_generation(),
+            settled,
+            "an unchanged poll must not bump the change-notify"
+        );
+        svc.shutdown().await;
     }
 
     #[test]

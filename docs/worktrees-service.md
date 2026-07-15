@@ -278,19 +278,49 @@ PR(s) via `gh` (a quick-pick when several match) and hands off to the **GitHub
 Pull Requests** extension (`GitHub.vscode-pull-request-github`); if that extension
 is absent it offers to install it or copy the PR URL.
 
-- **Resolved extension-side via `gh`, not the daemon.** Like `↑ahead ↓behind`, PR
-  state is **not** on the `tree` wire payload. The extension resolves it lazily
-  **on repo-expand** with one `gh pr list --state open --json …,statusCheckRollup`
-  per repo, matches each PR to a worktree by head branch, and caches the result
-  per repo for ~60 s so a re-render never re-spawns `gh`. This keeps the daemon's
-  **"persists nothing / no secret"** posture intact
-  ([ADR-0040](adrs/adr-0040.md), [ADR-0050](adrs/adr-0050.md)): the GitHub
-  credential lives inside `gh`, the daemon never sees a token, and the wire
-  contract is unchanged. It needs `gh` installed and `gh auth login`.
+- **Resolved by the daemon, and kept live (#1337).** PR state rides the `tree`
+  payload as a per-worktree `pr` object, resolved by a background poller in the
+  daemon and pushed over the existing subscribe stream. This is a **reversal of
+  [ADR-0050](adrs/adr-0050.md)**, which resolved badges extension-side on
+  repo-expand: badges were then only recomputed when a repo node's children were
+  rebuilt, and since the snapshot carries worktree topology rather than CI, nothing
+  ever re-asked GitHub — a badge went stale the moment CI moved and stayed stale,
+  including a confident `✓` on a PR whose CI was still running. Every window also
+  resolved its own, so cost scaled with window count. See
+  [ADR-0053](adrs/adr-0053.md).
+- **Still no credential in the daemon.** The daemon shells out to `gh api graphql`
+  (per [ADR-0003](adrs/adr-0003.md)), so the token stays inside `gh` exactly as
+  ADR-0050 wanted — the daemon never sees one, and ADR-0040's *"persists nothing /
+  no secret"* posture is untouched. It needs `gh` installed and `gh auth login`.
+- **One query for everything.** A single call resolves every (repo, branch) pair in
+  the tree at **1 point** against GitHub's 5,000/hour GraphQL budget, regardless of
+  how many repos, worktrees, or windows are open — `repository()`/`ref()` are not
+  GraphQL connections, so aliasing them is free. The poller **wakes** every ~10 s —
+  a read of the coalescing snapshot cache, no subprocess and no network — but only
+  **asks GitHub** when the watched state moved or its backoff elapsed: ~10 s while a
+  badge is pending (matching `gh pr checks --watch`), doubling to a 30-minute
+  ceiling once everything is terminal, and nothing at all while no window is
+  registered. The two cadences are separate because the triggers arrive by different
+  routes: a window opening bumps the change-notify, but **nothing tells the daemon
+  you committed** — so the loop looks often and cheaply, and pays only on a change.
+  Override the fetch cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds). The
+  daemon pushes to windows only when a verdict actually moves.
+- **A commit invalidates the verdict immediately.** Each badge records the commit
+  its verdict describes; when that differs from the worktree's `head_sha` the row
+  renders ● rather than the previous commit's ✓ — no network call, on the very next
+  snapshot. So committing or pushing never leaves a stale green standing, and the
+  poller (which notices the moved head on its next wake) refreshes it for real
+  shortly after. The same applies to unpushed work and to being behind the remote:
+  the verdict simply is not about the commit in front of you.
 - **Best-effort, silent.** A worktree with no branch, no matching PR, or on a
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
-  action still surfaces the real `gh` error).
+  action still surfaces the real `gh` error). A failing poll leaves the last known
+  badges in place rather than blanking the rows.
+- **Older daemons degrade.** Against a daemon predating #1337 — which omits `pr` —
+  the extension falls back to its own `gh pr list` and shows the PR number and
+  draft marker **without** a check glyph: nothing extension-side polls, so a verdict
+  there could not refresh, and a stale `✓` is worse than none.
 - **The check state is colored, not monochrome (#1324).** The `✓`/`✗`/`●` is a VS
   Code `FileDecoration` (the same mechanism git status uses to color `M`/`U`
   badges), painted from a custom `omnidev-worktree:` `resourceUri` the extension
@@ -298,8 +328,9 @@ is absent it offers to install it or copy the PR URL.
   decorations. The color uses the theme `charts.{green,red,yellow}` palette, and the
   check state is encoded in the URI so a state change re-colors on its own. Purely
   extension-side: no daemon, wire, or trust-boundary change.
-- **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) gates
-  the badge and its `gh` lookups entirely.
+- **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) hides
+  the badge. Since the daemon now supplies it on the snapshot, the setting strips
+  it on the way in rather than skipping a lookup.
 
 ## Workspace Trust (Restricted Mode)
 
@@ -403,6 +434,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | --- | --- | --- |
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
+| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed) or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
@@ -552,14 +584,25 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, is_main, open, window_key? }`. The main working tree comes
-  first (`is_main: true`), then linked worktrees sorted by path. `open` is `true`
-  when a live window currently has that worktree open, and `window_key` (the open
-  window's registry `key`, the handle a focus action resolves) is present only then.
-  `branch` is a daemon-computed, independently-degrading git field. **`ahead`/
-  `behind` are deliberately absent** from this snapshot — they are the expensive
-  part and are fetched on demand via the `ahead-behind` op (#1306; see
-  [Git enrichment](#git-enrichment)).
+  `{ path, branch?, head_sha?, is_main, open, window_key?, pr? }`. The main working tree
+  comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
+  `true` when a live window currently has that worktree open, and `window_key` (the
+  open window's registry `key`, the handle a focus action resolves) is present only
+  then. `branch` and `head_sha` are daemon-computed, independently-degrading git
+  fields. `head_sha` is the commit HEAD points at — present even on a detached HEAD
+  (which has a commit but no branch), absent on an unborn one. It rides the snapshot
+  because it is a refs read rather than a walk, and because it is what makes a new
+  commit a **visible delta**: the subscribe stream pushes only when a snapshot
+  differs from the last, so without it a push serialised byte-identically, was
+  dropped by the diff, and no window re-rendered (#1337). **`ahead`/`behind` are
+  deliberately absent** from this snapshot — they are the expensive part and are
+  fetched on demand via the `ahead-behind` op (#1306; see
+  [Git enrichment](#git-enrichment)). `pr` is
+  `{ number, isDraft, checks, url }` where `checks` is
+  `success | failure | pending | none` — resolved by the daemon's background poller
+  (#1337; see [Pull requests](#pull-requests)) and absent until the first poll
+  lands, for a non-GitHub repo, or when no open PR heads the branch. Note `isDraft`
+  is camelCase: it predates the move and every consumer already reads that key.
 - `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
   `{ paths: [<worktree path>, …] }`, it returns
   `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
@@ -623,7 +666,7 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","is_main":false,"open":false}]}],"show_closed":true}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
 → {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
 ← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
 ```
