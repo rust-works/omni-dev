@@ -124,6 +124,9 @@ pub async fn build_default_registry(
     // instead of running git enrichment on the macOS GUI thread (#1186 fix).
     let worktrees = WorktreesService::new();
     worktrees.start_menu_refresh();
+    // Keep PR check badges fresh for every open window from one `gh` call, rather
+    // than each window resolving its own and none of them ever re-asking (#1337).
+    worktrees.start_pr_poller();
     registry.register(Arc::new(worktrees));
     // The cross-window Claude Code sessions tracker; start its transcript watcher
     // (Feed 2) so sessions predating the daemon — and the hook-silent thinking
