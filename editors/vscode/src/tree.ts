@@ -51,6 +51,16 @@ export interface TreeWorktreePayload {
    */
   head_sha?: string;
   /**
+   * The commit this branch's upstream ref points at, or absent without an
+   * upstream. Carried by the streamed snapshot for the same reason as
+   * {@link TreeWorktreePayload.head_sha}, one ref over: a **push** moves only
+   * `refs/remotes/<remote>/<branch>`, so it is the one field that changes — which
+   * is what makes the frame a delta and re-fetches
+   * {@link TreeWorktreePayload.ahead} (#1344). Nothing renders it. Absent from a
+   * pre-#1344 daemon, which simply leaves the counts stale as before.
+   */
+  upstream_sha?: string;
+  /**
    * Commits ahead of upstream. **Not** carried by the streamed `tree`/`subscribe`
    * snapshot — it is fetched lazily via the `ahead-behind` op on expand and folded
    * in by {@link withAheadBehind} (#1306). Absent without an upstream, or until

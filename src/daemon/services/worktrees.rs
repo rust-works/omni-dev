@@ -167,23 +167,29 @@ struct PollerTask {
     handle: JoinHandle<()>,
 }
 
-/// One thing the PR poller watches: a badge target, and the commit the worktree
-/// carrying it currently has checked out.
+/// One thing the PR poller watches: a badge target, the commit the worktree
+/// carrying it currently has checked out, and the commit its upstream points at.
 ///
-/// The head is what makes a **commit** observable to the poller. A window opening
-/// bumps the registry's change-notify, but nothing notifies the daemon when you
-/// commit or push — so the poller compares this against the previous tick's and
-/// treats a moved head as "go and ask now".
+/// The two OIDs are what make local work observable to the poller. A window
+/// opening bumps the registry's change-notify, but nothing notifies the daemon
+/// when you commit or push — so the poller compares this against the previous
+/// tick's and treats any move as "go and ask now". Both are needed because they
+/// move on different actions: committing moves the head, while pushing moves
+/// **only** the upstream (#1344). Without the upstream, a push — the very thing
+/// that starts the CI run a badge reports — did not re-ask, and the badge sat at
+/// `●` until the backoff elapsed, up to its 30-minute ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PrWatch {
     /// The (repo, branch) to resolve a badge for.
     target: PrTarget,
     /// That worktree's HEAD, or `None` for an unborn one.
     head_sha: Option<String>,
+    /// That branch's upstream tip, or `None` when it tracks no upstream.
+    upstream_sha: Option<String>,
 }
 
-/// Extracts what the poller watches — the badge targets and their local heads —
-/// from a `tree` snapshot.
+/// Extracts what the poller watches — the badge targets and their local heads and
+/// upstream tips — from a `tree` snapshot.
 ///
 /// Reading them back off the snapshot — rather than walking git again — means the
 /// poller reuses the coalescing [`TreeSnapshotCache`] build instead of adding a
@@ -217,6 +223,10 @@ fn pr_watch_from_snapshot(snapshot: &Value) -> Vec<PrWatch> {
                 out.push(PrWatch {
                     head_sha: wt
                         .get("head_sha")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    upstream_sha: wt
+                        .get("upstream_sha")
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     target: PrTarget {
@@ -800,6 +810,15 @@ struct GitStatus {
     /// re-renders (#1337).
     #[serde(skip_serializing_if = "Option::is_none")]
     head_sha: Option<String>,
+    /// The commit the branch's configured upstream ref points at, or `None`
+    /// without an upstream (or when detached, unborn, or not in a repo). Rides
+    /// the streamed snapshot for the same reason as `head_sha`, one ref over: a
+    /// **push** moves only `refs/remotes/<remote>/<branch>`, leaving every other
+    /// field — `head_sha` included — byte-identical, so without this the frame
+    /// serialised the same, the server's diff dropped it, and the lazily-fetched
+    /// ahead/behind was never re-asked (#1344).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_sha: Option<String>,
     /// Commits the branch is ahead of its upstream (`None` without an upstream).
     #[serde(skip_serializing_if = "Option::is_none")]
     ahead: Option<usize>,
@@ -886,10 +905,17 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     else {
         return base;
     };
+    // Consumes `head`, so it has to follow the `shorthand()` read above. A pure
+    // type wrapper — no I/O — so hoisting it out of the `with_ahead_behind` arm
+    // below costs the cheap path nothing, and is what gives it a handle to
+    // resolve the upstream from.
+    let branch = git2::Branch::wrap(head);
+    // Unlike the divergence walk, this rides both paths: it is what makes a push
+    // a visible delta (#1344).
+    let upstream_sha = upstream_target(&branch);
     // The divergence walk is the dominant per-worktree cost, so the cheap path
     // skips it and leaves ahead/behind absent.
     let (ahead, behind) = if with_ahead_behind {
-        let branch = git2::Branch::wrap(head);
         match upstream_ahead_behind(&repo, &branch) {
             Some((ahead, behind)) => (Some(ahead), Some(behind)),
             None => (None, None),
@@ -899,10 +925,24 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     };
     GitStatus {
         branch: Some(name),
+        upstream_sha,
         ahead,
         behind,
         ..base
     }
+}
+
+/// The commit `branch`'s configured upstream ref points at, or `None` when it
+/// tracks no upstream (or the ref is unresolvable).
+///
+/// Costs a config lookup (`branch.<name>.remote` + `.merge`) and a
+/// remote-tracking refs read — more than [`git_status_impl`]'s single `head`
+/// refs read, but still **no revwalk and no object lookup**, which is the bar
+/// #1306 set for the snapshot's every-worktree-every-tick rebuild and the one
+/// `graph_ahead_behind` fails. [`upstream_ahead_behind`] already resolves the
+/// same OID, so it is proven reachable.
+fn upstream_target(branch: &git2::Branch<'_>) -> Option<String> {
+    Some(branch.upstream().ok()?.get().target()?.to_string())
 }
 
 /// The ahead/behind divergence of `folder`'s checked-out branch versus its
@@ -1007,10 +1047,16 @@ struct GithubIdentity {
 /// has it open (with that window's key, for the focus action). Optional git
 /// fields degrade independently, exactly like [`GitStatus`].
 ///
-/// Ahead/behind divergence is deliberately **absent** from this snapshot: it was
+/// Ahead/behind **divergence** is deliberately absent from this snapshot: it was
 /// the dominant per-worktree cost when computed eagerly for every worktree on
 /// every tick, so it is now fetched lazily via the `ahead-behind` op only for the
 /// worktrees a client actually shows (#1306).
+///
+/// The two **OIDs** the divergence is computed from — `head_sha` and
+/// `upstream_sha` — do ride the snapshot, which is not a contradiction: each is a
+/// refs read rather than a commit-graph walk, and between them they are what makes
+/// a commit (#1337) or a push (#1344) a *visible delta*, so a client knows to
+/// re-ask for the counts it left behind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TreeWorktree {
     /// Absolute path to the worktree's working directory.
@@ -1024,6 +1070,13 @@ struct TreeWorktree {
     /// server's snapshot diff (#1337).
     #[serde(skip_serializing_if = "Option::is_none")]
     head_sha: Option<String>,
+    /// The commit the branch's upstream ref points at, or `None` without an
+    /// upstream. The push counterpart of `head_sha`: a push moves only
+    /// `refs/remotes/<remote>/<branch>`, so this is the *one* field that moves —
+    /// making the snapshot a real delta the server's diff cannot drop, which is
+    /// what re-fetches the lazy ahead/behind (#1344).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_sha: Option<String>,
     /// Whether this is the repository's main working tree (vs a linked worktree).
     is_main: bool,
     /// Whether a live VS Code window currently has this worktree open.
@@ -1150,6 +1203,7 @@ fn worktree_entry(
         path: path.display().to_string(),
         branch: status.branch,
         head_sha: status.head_sha,
+        upstream_sha: status.upstream_sha,
         is_main,
         open: window_key.is_some(),
         window_key,
@@ -2071,7 +2125,9 @@ fn remove_worktree(path: &Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::shim::{shim_lock, write_exec_script};
     use chrono::Utc;
+    use std::sync::MutexGuard;
 
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
         json!({
@@ -2831,6 +2887,9 @@ mod tests {
         // No upstream → ahead/behind stay absent rather than zero.
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
+        // …and so does the upstream SHA, so such a branch still renders with no
+        // sync indicator at all (#1344).
+        assert_eq!(status.upstream_sha, None);
     }
 
     #[test]
@@ -2852,6 +2911,9 @@ mod tests {
         assert_eq!(status.head_sha.as_deref(), Some(a.to_string().as_str()));
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
+        // A detached HEAD has no branch, so there is no upstream to resolve
+        // either — the branch filter returns before the wrap (#1344).
+        assert_eq!(status.upstream_sha, None);
         assert_eq!(
             status.main_repo.as_deref(),
             dir.path().file_name().and_then(|n| n.to_str())
@@ -2906,6 +2968,72 @@ mod tests {
         // The branch is unchanged — the SHA is the *only* thing that moved, which
         // is exactly why its absence made the push invisible.
         assert_eq!(before.branch, after.branch);
+    }
+
+    // --- Upstream SHA on the snapshot (#1344) ------------------------------
+
+    /// Repoints `refs/remotes/origin/main` at `oid` — exactly what a `git push`
+    /// does, and all of what it does: the local branch and HEAD do not move. Lets
+    /// these tests exercise a push with no network and no second repo.
+    fn simulate_push(repo: &Repository, oid: git2::Oid) {
+        repo.reference("refs/remotes/origin/main", oid, true, "push")
+            .unwrap();
+    }
+
+    #[test]
+    fn git_status_upstream_sha_tracks_a_push() {
+        // The regression #1344 turns on. `diverging_repo` leaves local `main` at B
+        // and origin/main at C — 1 ahead, 1 behind. Pushing B moves *only* the
+        // remote-tracking ref, so before this field rode the payload every wire
+        // field was byte-identical across the push, the server's diff dropped the
+        // snapshot, no client re-rendered, and the lazily-fetched ahead/behind was
+        // never re-asked — the row showed `↑1 ↓0` forever.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = diverging_repo(dir.path());
+        let before = git_status(dir.path());
+        assert_eq!(before.ahead, Some(1));
+        assert_eq!(before.behind, Some(1));
+
+        let head = repo.head().unwrap().target().unwrap();
+        simulate_push(&repo, head);
+        let after = git_status(dir.path());
+
+        // The upstream now names the pushed commit, and the counts agree.
+        assert_eq!(
+            after.upstream_sha.as_deref(),
+            Some(head.to_string().as_str())
+        );
+        assert_ne!(before.upstream_sha, after.upstream_sha);
+        assert_eq!(after.ahead, Some(0));
+        assert_eq!(after.behind, Some(0));
+        // Nothing else moved — which is the whole point. A push leaves the branch
+        // and the local head exactly where they were, so `upstream_sha` is the
+        // only signal a client could possibly notice.
+        assert_eq!(before.branch, after.branch);
+        assert_eq!(before.head_sha, after.head_sha);
+    }
+
+    #[test]
+    fn git_status_cheap_reports_upstream_sha() {
+        // The crux: the field has to ride the *cheap* path, since that is the one
+        // the streamed snapshot is built from. Costing a config lookup and a refs
+        // read — no revwalk — it clears the bar #1306 set, unlike the divergence
+        // walk still absent here.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = diverging_repo(dir.path());
+        let status = git_status_cheap(dir.path());
+        let upstream = repo
+            .find_branch("origin/main", git2::BranchType::Remote)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(
+            status.upstream_sha.as_deref(),
+            Some(upstream.to_string().as_str())
+        );
+        assert_eq!(status.ahead, None);
+        assert_eq!(status.behind, None);
     }
 
     #[test]
@@ -3044,17 +3172,90 @@ mod tests {
         assert!(wt.get("head_sha").is_none(), "{wt:?}");
     }
 
+    // --- Upstream SHA on the snapshot (#1344) ------------------------------
+
+    #[tokio::test]
+    async fn tree_snapshot_carries_upstream_sha_so_a_push_is_a_real_delta() {
+        // The end-to-end shape of the #1344 fix, one ref over from #1337. A push
+        // moves neither the branch nor the local head, so `upstream_sha` is the
+        // only field that can carry the news. Without it the snapshot serialised
+        // byte-identically, `server.rs`'s `if snap != last` dropped the frame, no
+        // window re-rendered, and the lazy ahead/behind was never re-fetched.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = diverging_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        let before = svc.handle("tree", Value::Null).await.unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        assert_ne!(
+            repos_of(&before)[0]["worktrees"][0]
+                .get("upstream_sha")
+                .and_then(Value::as_str),
+            Some(head.to_string().as_str()),
+            "the fixture must start un-pushed for this to prove anything"
+        );
+
+        // Push: only `refs/remotes/origin/main` moves.
+        simulate_push(&repo, head);
+        let after = svc.handle("tree", Value::Null).await.unwrap();
+        let wt = &repos_of(&after)[0]["worktrees"][0];
+        assert_eq!(
+            wt.get("upstream_sha").and_then(Value::as_str),
+            Some(head.to_string().as_str())
+        );
+        // The head and branch are untouched across the push — so this delta rests
+        // entirely on `upstream_sha`.
+        assert_eq!(
+            wt.get("head_sha").and_then(Value::as_str),
+            repos_of(&before)[0]["worktrees"][0]
+                .get("head_sha")
+                .and_then(Value::as_str)
+        );
+        assert_ne!(before, after, "a push must be a visible snapshot delta");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_upstream_sha_without_an_upstream() {
+        // Wire-compat, and the no-regression case: a branch tracking nothing sends
+        // no key at all rather than a null, so an older client sees exactly the
+        // payload it saw before and still renders no sync indicator.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("upstream_sha").is_none(), "{wt:?}");
+        // The head still rides, so this is specifically the upstream degrading.
+        assert!(wt.get("head_sha").is_some(), "{wt:?}");
+    }
+
     // --- PR badge poller (#1337) -------------------------------------------
 
     /// Writes an executable stub that ignores its arguments and prints `stdout`,
     /// standing in for `gh api graphql` so the poll loop is exercised offline.
-    fn fake_gh(dir: &Path, stdout: &str) -> PathBuf {
+    /// Returns the shim lock alongside the path: the caller **must** hold the
+    /// guard until the poller has finished exec'ing the stub. Writing an
+    /// executable and then `execve`ing it races every other thread that forks —
+    /// the child inherits the still-open writable FD and the exec fails
+    /// `ETXTBSY`. See [`crate::pr_status`]'s twin helper (#642, #1344).
+    fn fake_gh(dir: &Path, stdout: &str) -> (PathBuf, MutexGuard<'static, ()>) {
+        let guard = shim_lock();
         let path = dir.join("fake-gh");
-        std::fs::write(&path, format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
+        write_exec_script(&path, &format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\n"));
+        (path, guard)
     }
 
     /// A repo with a GitHub origin and one commit on `main`.
@@ -3372,6 +3573,13 @@ mod tests {
     }
 
     #[tokio::test]
+    // The shim guard is deliberately held across the awaits below: it must span
+    // both the stub's write *and* the poller's exec of it, since the ETXTBSY race
+    // is against another test writing while this one forks. Safe here — only test
+    // threads take it, never a task inside the runtime, so it cannot deadlock.
+    // Scoped per-test rather than on the module, which would also silence the
+    // registry lock's "never held across .await" invariant.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_wakes_when_the_first_window_opens_after_an_idle_start() {
         // The normal startup order: the daemon starts at login, *before* any
         // editor. It therefore sees an empty tree and backs off to the 30-minute
@@ -3381,7 +3589,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
@@ -3511,6 +3719,49 @@ mod tests {
     }
 
     #[test]
+    fn pr_watch_tracks_the_upstream_so_a_push_is_visible_to_the_poller() {
+        // #1344's bonus. A push is what *starts* the CI run a badge reports, yet
+        // it moves no local head — so watching only `head_sha` left the poller
+        // blind to it and the badge sat at `●` until the backoff elapsed, up to
+        // its 30-minute ceiling.
+        let snap = |upstream: &str| {
+            json!({"repos":[{
+                "main_repo":"omni-dev",
+                "github":{"owner":"rust-works","name":"omni-dev"},
+                "root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","head_sha":"aaa",
+                              "upstream_sha":upstream,"is_main":true,"open":true}]
+            }]})
+        };
+        let before = pr_watch_from_snapshot(&snap("aaa"));
+        let after = pr_watch_from_snapshot(&snap("bbb"));
+        // Same target, same head — only the upstream moved, and that alone must
+        // register as "go and ask now".
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].target, after[0].target);
+        assert_eq!(before[0].head_sha, after[0].head_sha);
+        assert_ne!(before, after);
+        // A quiet tick still asks nothing.
+        assert_eq!(before, pr_watch_from_snapshot(&snap("aaa")));
+    }
+
+    #[test]
+    fn pr_watch_omits_an_absent_upstream_rather_than_erroring() {
+        // An older daemon — or any branch tracking nothing — simply sends no
+        // `upstream_sha`, which reads as `None` rather than failing the poll.
+        let snap = json!({"repos":[{
+            "main_repo":"omni-dev",
+            "github":{"owner":"rust-works","name":"omni-dev"},
+            "root":"/r",
+            "worktrees":[{"path":"/r","branch":"main","head_sha":"aaa","is_main":true,"open":true}]
+        }]});
+        let watch = pr_watch_from_snapshot(&snap);
+        assert_eq!(watch.len(), 1);
+        assert_eq!(watch[0].upstream_sha, None);
+        assert_eq!(watch[0].head_sha.as_deref(), Some("aaa"));
+    }
+
+    #[test]
     fn start_pr_poller_is_a_noop_outside_a_runtime() {
         let svc = WorktreesService::new();
         svc.start_pr_poller();
@@ -3553,13 +3804,15 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_resolves_via_gh_populates_the_cache_and_stops_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
         // One repo, one branch → aliases r0/b0. A still-running check so the badge
         // stays pending and the loop keeps its fast cadence.
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
@@ -3609,13 +3862,15 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_bumps_only_when_a_verdict_actually_moves() {
         // The diff-and-drop contract: an unchanged poll must not bump, or every
         // window re-renders on every tick — the cost this design exists to avoid.
         let dir = tempfile::tempdir().unwrap();
         github_repo(dir.path());
         let bin_dir = tempfile::tempdir().unwrap();
-        let fake = fake_gh(
+        let (fake, _shim) = fake_gh(
             bin_dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[

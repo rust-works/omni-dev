@@ -402,7 +402,8 @@ extension never runs git.
 - **Ahead/behind is lazy for the tree (#1306).** The `graph_ahead_behind` upstream
   revwalk is the dominant per-worktree cost, and the `tree` / `subscribe` snapshot
   is rebuilt for **every** worktree of **every** repo on **every** tick — so that
-  snapshot computes only the *cheap* state (branch, `main_repo`, `is_worktree`) and
+  snapshot computes only the *cheap* state (branch, `main_repo`, `is_worktree`, and
+  the `head_sha` / `upstream_sha` OIDs) and
   **omits** `ahead`/`behind`. Divergence is instead fetched on demand through the
   **`ahead-behind`** op, batched by path, for just the worktrees a client is about
   to show (the extension does this when a repo is expanded; `worktrees tree` does it
@@ -422,7 +423,17 @@ extension never runs git.
   `main_repo` name and `is_worktree` flag are resolved from the repository itself,
   so they are present even for an unborn or detached HEAD (only a non-repo folder
   omits them). The `ahead-behind` op degrades the same way: a path with no upstream
-  is simply omitted from its `results`. The enrichment never fails a `list`.
+  is simply omitted from its `results`. A branch with no upstream likewise has no
+  `upstream_sha`, so it renders with no sync indicator at all. The enrichment never
+  fails a `list`.
+- **The lazy counts still refresh themselves (#1344).** Fetching divergence on demand
+  means it refreshes only when a client re-renders, and a client re-renders only on a
+  snapshot delta — so the snapshot must carry a signal for every action that can
+  change the counts. Committing moves `head_sha`; **pushing and fetching move only
+  the remote-tracking ref**, which is why `upstream_sha` rides too. Both are refs
+  reads, so they clear the same every-worktree-every-tick bar the revwalk failed.
+  Without `upstream_sha` a fully-pushed worktree kept reporting `↑1 ↓0` indefinitely,
+  correctable only by collapsing and re-expanding the repo.
 
 ### Tuning the refresh cadence
 
@@ -434,7 +445,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | --- | --- | --- |
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
-| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed) or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed), a moved upstream (you pushed — #1344), or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
@@ -584,20 +595,28 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, head_sha?, is_main, open, window_key?, pr? }`. The main working tree
+  `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr? }`. The
+  main working tree
   comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
   `true` when a live window currently has that worktree open, and `window_key` (the
   open window's registry `key`, the handle a focus action resolves) is present only
-  then. `branch` and `head_sha` are daemon-computed, independently-degrading git
-  fields. `head_sha` is the commit HEAD points at — present even on a detached HEAD
-  (which has a commit but no branch), absent on an unborn one. It rides the snapshot
-  because it is a refs read rather than a walk, and because it is what makes a new
-  commit a **visible delta**: the subscribe stream pushes only when a snapshot
-  differs from the last, so without it a push serialised byte-identically, was
-  dropped by the diff, and no window re-rendered (#1337). **`ahead`/`behind` are
+  then. `branch`, `head_sha`, and `upstream_sha` are daemon-computed,
+  independently-degrading git fields. `head_sha` is the commit HEAD points at —
+  present even on a detached HEAD (which has a commit but no branch), absent on an
+  unborn one. `upstream_sha` is the commit the branch's upstream ref points at,
+  absent when it tracks no upstream.
+  Both ride the snapshot because each is a refs read rather than a walk, and because
+  between them they are what make local git work a **visible delta**: the subscribe
+  stream pushes only when a snapshot differs from the last, so a change invisible on
+  the wire is dropped by the diff and no window re-renders. They are needed
+  separately because they move on different actions — committing moves `head_sha`
+  (#1337), while **pushing moves only `refs/remotes/<remote>/<branch>`**, so
+  `upstream_sha` is the sole field that changes across a push (#1344). A `fetch` that
+  leaves you behind is the same shape. **`ahead`/`behind` are
   deliberately absent** from this snapshot — they are the expensive part and are
   fetched on demand via the `ahead-behind` op (#1306; see
-  [Git enrichment](#git-enrichment)). `pr` is
+  [Git enrichment](#git-enrichment)); carrying the two OIDs they are *computed from*
+  is what tells a client to re-ask for them. `pr` is
   `{ number, isDraft, checks, url }` where `checks` is
   `success | failure | pending | none` — resolved by the daemon's background poller
   (#1337; see [Pull requests](#pull-requests)) and absent until the first poll
@@ -629,9 +648,13 @@ Where:
   filter, so the `repos` payload is unchanged (a repo, derived from open windows,
   always keeps ≥1 open worktree, so hiding never empties it).
 - A `list` `entry` is
-  `{ key, folders[], repo?, title?, pid?, branch?, ahead?, behind?, main_repo?,
-  is_worktree?, last_seen }` with `last_seen` as an RFC 3339 timestamp; consumers
-  compute age from it. Entries are sorted by `(repo, key)` for deterministic
+  `{ key, folders[], repo?, title?, pid?, branch?, head_sha?, upstream_sha?, ahead?,
+  behind?, main_repo?, is_worktree?, last_seen }` with `last_seen` as an RFC 3339
+  timestamp; consumers
+  compute age from it. The git fields carry the same meanings as on a `tree`
+  `worktree` above — they come from the same daemon-side enrichment, flattened onto
+  the entry — except that `list` is a bounded, non-streamed surface, so it computes
+  `ahead`/`behind` inline rather than leaving them to the `ahead-behind` op. Entries are sorted by `(repo, key)` for deterministic
   output. The companion-reported fields are stored and served verbatim on the wire
   (and in `-o json`); only the human-readable `worktrees list` table sanitizes
   them for terminal display (see Security).
@@ -666,7 +689,7 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","upstream_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","upstream_sha":"c05d1f3b…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
 → {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
 ← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
 ```

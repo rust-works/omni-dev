@@ -522,7 +522,9 @@ impl PrStatusCache {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::shim::{shim_lock, write_exec_script};
     use serde_json::json;
+    use std::sync::MutexGuard;
 
     fn target(branch: &str) -> PrTarget {
         PrTarget {
@@ -889,17 +891,22 @@ mod tests {
 
     /// Writes an executable stub standing in for `gh`, printing `stdout` and
     /// exiting `code`.
-    fn fake_gh(dir: &Path, stdout: &str, code: i32) -> PathBuf {
+    ///
+    /// Returns the shim lock alongside the path: the caller **must** hold the
+    /// guard until it has finished exec'ing the stub. Writing an executable and
+    /// then `execve`ing it races every other thread that forks — the child
+    /// inherits the still-open writable FD, and the exec fails `ETXTBSY`
+    /// ("Text file busy"). Handing the guard back rather than trusting each test
+    /// to remember `shim_lock()` is deliberate: this helper originally open-coded
+    /// the write and skipped the lock, and the race duly fired in CI (#642, #1344).
+    fn fake_gh(dir: &Path, stdout: &str, code: i32) -> (PathBuf, MutexGuard<'static, ()>) {
+        let guard = shim_lock();
         let path = dir.join("fake-gh");
-        std::fs::write(
+        write_exec_script(
             &path,
-            format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {code}\n"),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
+            &format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {code}\n"),
+        );
+        (path, guard)
     }
 
     #[test]
@@ -924,7 +931,7 @@ mod tests {
     fn resolve_with_errors_on_a_nonzero_exit() {
         // e.g. `gh auth login` never run: gh exits non-zero and explains on stderr.
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_gh(dir.path(), "", 1);
+        let (bin, _shim) = fake_gh(dir.path(), "", 1);
         let err = resolve_with(&bin, &[target("main")]).unwrap_err();
         assert!(
             format!("{err:#}").contains("gh api graphql failed"),
@@ -935,7 +942,7 @@ mod tests {
     #[test]
     fn resolve_with_errors_on_unparseable_output() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_gh(dir.path(), "not json at all", 0);
+        let (bin, _shim) = fake_gh(dir.path(), "not json at all", 0);
         let err = resolve_with(&bin, &[target("main")]).unwrap_err();
         assert!(format!("{err:#}").contains("invalid JSON"), "{err:#}");
     }
@@ -946,7 +953,7 @@ mod tests {
         // that as an empty result would be indistinguishable from "no open PRs" and
         // would silently blank every badge, so it must be an error.
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_gh(
+        let (bin, _shim) = fake_gh(
             dir.path(),
             r#"{"data":null,"errors":[{"message":"API rate limit exceeded"}]}"#,
             0,
@@ -961,7 +968,7 @@ mod tests {
     fn resolve_with_ignores_an_empty_errors_array() {
         // Some responses carry `errors: []`; that is a success, not a failure.
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_gh(
+        let (bin, _shim) = fake_gh(
             dir.path(),
             r#"{"errors":[],"data":{"r0":{"b0":{
                 "target":{"oid":"a","statusCheckRollup":null},
@@ -975,7 +982,7 @@ mod tests {
     #[test]
     fn resolve_with_reads_a_real_reply_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_gh(
+        let (bin, _shim) = fake_gh(
             dir.path(),
             r#"{"data":{"r0":{"b0":{
                 "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
