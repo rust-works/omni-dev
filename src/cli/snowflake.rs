@@ -496,18 +496,40 @@ fn read_stdin() -> Result<String> {
 /// Renders a query result in the requested output format, returning the complete
 /// text including its trailing newline so file and stdout writes are identical.
 ///
-/// JSON/YAML serialize the whole `{columns, rows}` value; CSV/TSV instead consume
-/// that shape directly so column order comes from `columns` (see
-/// [`render_delimited`]).
+/// The query payload is `{ statements: [ {columns, rows}, … ] }` — one entry per
+/// `;`-separated statement. JSON/YAML serialize that whole value; CSV/TSV render
+/// a single table and so error on a multi-statement result (see
+/// [`delimited_output`]).
 fn format_output(value: &Value, format: OutputFormat) -> Result<String> {
-    Ok(match format {
+    match format {
         // `to_string_pretty` has no trailing newline; add one for parity.
-        OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(value)?),
+        OutputFormat::Json => Ok(format!("{}\n", serde_json::to_string_pretty(value)?)),
         // `serde_yaml` already emits a trailing newline.
-        OutputFormat::Yaml => serde_yaml::to_string(value)?,
-        OutputFormat::Csv => render_delimited(value, ','),
-        OutputFormat::Tsv => render_delimited(value, '\t'),
-    })
+        OutputFormat::Yaml => Ok(serde_yaml::to_string(value)?),
+        OutputFormat::Csv => delimited_output(value, ','),
+        OutputFormat::Tsv => delimited_output(value, '\t'),
+    }
+}
+
+/// Renders the `{ statements: [ {columns, rows}, … ] }` query payload as a single
+/// delimited table. A flat CSV/TSV can represent only one result set, so a
+/// multi-statement result (more than one `statements` entry) is an error — use
+/// `-o json`/`-o yaml` for those. A bare `{columns, rows}` value (no `statements`
+/// wrapper) is treated as a single table (defensive, e.g. an older daemon).
+fn delimited_output(value: &Value, delim: char) -> Result<String> {
+    let Some(statements) = value.get("statements").and_then(Value::as_array) else {
+        return Ok(render_delimited(value, delim));
+    };
+    match statements.as_slice() {
+        [] => Ok(String::new()),
+        [one] => Ok(render_delimited(one, delim)),
+        many => bail!(
+            "-o {} cannot render a multi-statement result ({} result sets); \
+             use -o json or -o yaml",
+            if delim == '\t' { "tsv" } else { "csv" },
+            many.len()
+        ),
+    }
 }
 
 /// Writes rendered output to `out_file`, or to stdout when it is `None`.
@@ -1167,6 +1189,37 @@ mod tests {
             format_output(&sample_payload(), OutputFormat::Tsv).unwrap(),
             "ID\tNAME\n1\thello\n"
         );
+    }
+
+    /// The query payload wraps result sets in `statements`.
+    fn statements_payload(statements: Value) -> Value {
+        json!({ "statements": statements })
+    }
+
+    #[test]
+    fn delimited_output_renders_a_single_statement() {
+        let one = statements_payload(json!([sample_payload()]));
+        assert_eq!(delimited_output(&one, ',').unwrap(), "ID,NAME\n1,hello\n");
+        // The JSON/YAML paths serialize the whole `statements` payload as-is.
+        assert!(format_output(&one, OutputFormat::Json)
+            .unwrap()
+            .contains("\"statements\""));
+    }
+
+    #[test]
+    fn delimited_output_errors_on_multiple_statements() {
+        let two = statements_payload(json!([sample_payload(), sample_payload()]));
+        let err = delimited_output(&two, ',').unwrap_err();
+        assert!(err.to_string().contains("multi-statement"), "{err}");
+        assert!(err.to_string().contains("csv"), "{err}");
+        let err = delimited_output(&two, '\t').unwrap_err();
+        assert!(err.to_string().contains("tsv"), "{err}");
+    }
+
+    #[test]
+    fn delimited_output_empty_statements_is_empty() {
+        let none = statements_payload(json!([]));
+        assert_eq!(delimited_output(&none, ',').unwrap(), "");
     }
 
     #[test]

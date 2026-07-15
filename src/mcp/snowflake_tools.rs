@@ -83,8 +83,10 @@ pub struct SnowflakeDisconnectParams {
 impl OmniDevServer {
     /// Tool: run SQL through a multiplexed Snowflake session.
     #[tool(
-        description = "Run SQL against Snowflake and return the result set as YAML. Mirrors \
-                       `omni-dev snowflake query`. The query runs through the omni-dev daemon, \
+        description = "Run SQL against Snowflake and return the result set(s) as YAML. Mirrors \
+                       `omni-dev snowflake query`. Multi-statement scripts (`;`-separated) are \
+                       supported: the reply is a `statements` array with one `{columns, rows}` \
+                       result set per statement. The query runs through the omni-dev daemon, \
                        which multiplexes authenticated (account, user) sessions — so the daemon \
                        must be running (`omni-dev daemon start`). First-time use of an \
                        (account, user) authenticates via external-browser SSO on the daemon host \
