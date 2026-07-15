@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use crate::claude::error::is_transient_ai_error as ai_error_is_transient;
 use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
 use crate::claude::{
@@ -930,6 +931,9 @@ impl ClaudeClient {
                         last_error = Some(e);
                     }
                 },
+                // A permanent failure cannot succeed on a retry, so report it
+                // immediately instead of repeating a doomed request (#1333).
+                Err(e) if !ai_error_is_transient(&e) => return Err(e),
                 Err(e) => {
                     if attempt < AMENDMENT_PARSE_MAX_RETRIES {
                         eprintln!(
@@ -1469,6 +1473,9 @@ impl ClaudeClient {
                                 last_error = Some(e);
                             }
                         },
+                        // A permanent failure cannot succeed on a retry, so
+                        // report it immediately (#1333).
+                        Err(e) if !ai_error_is_transient(&e) => return Err(e),
                         Err(e) => {
                             if attempt < max_retries {
                                 eprintln!(

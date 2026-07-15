@@ -53,6 +53,41 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     check_ai_credentials_with(&crate::utils::settings::SettingsEnv::load(), model_override)
 }
 
+/// Rejects a model the registry does not know, before any network call.
+///
+/// Scope is deliberately narrow (issue #1333). Only the Anthropic HTTP
+/// backends are checked, because they are the only ones whose catalog is
+/// authoritative:
+///
+/// - `Ollama` has no registry entries at all, so every model would be rejected.
+/// - `OpenAi` accepts unknown-but-well-shaped identifiers by design; the
+///   registry lists only a subset of the provider's catalog.
+/// - `ClaudeCli` resolves its own aliases (`haiku`, `sonnet`, `opus`, …) that
+///   the registry does not hold, inside the `claude` binary.
+///
+/// A Claude model newer than this build's catalog can be added to
+/// `~/.omni-dev/models.yaml`, which layers over the embedded one.
+fn validate_model(backend: crate::claude::backend::AiBackend, model: &str) -> Result<()> {
+    use crate::claude::backend::AiBackend;
+
+    if !matches!(backend, AiBackend::Default | AiBackend::Bedrock) {
+        return Ok(());
+    }
+
+    let registry = get_model_registry();
+    if registry.is_known_model(model) {
+        return Ok(());
+    }
+
+    bail!(
+        "Unknown model '{model}'.\n\
+         Known models: {}.\n\
+         Add an entry to ~/.omni-dev/models.yaml to use a model this build does not know about, \
+         or run `omni-dev config models show` to see the full catalog.",
+        registry.known_identifiers("claude").join(", ")
+    );
+}
+
 /// [`check_ai_credentials`] over an injected
 /// [`EnvSource`](crate::utils::env::EnvSource).
 ///
@@ -68,6 +103,7 @@ pub(crate) fn check_ai_credentials_with(
 
     let ai_backend = backend::resolve_backend(env)?;
     let model = backend::resolve_model(ai_backend, model_override, env, get_model_registry());
+    validate_model(ai_backend, &model)?;
 
     match ai_backend {
         // Credentials for the `claude -p` subprocess backend live inside the
@@ -406,6 +442,73 @@ mod tests {
 
         let info = check_ai_credentials_with(&env, Some("claude-opus-4-6")).unwrap();
         assert_eq!(info.model, "claude-opus-4-6");
+    }
+
+    /// Issue #1333: preflight reported "credentials verified" for a model that
+    /// cannot work, deferring the failure to a 404 the caller then swallowed.
+    #[test]
+    fn unknown_model_fails_preflight_on_direct_api() {
+        let env = MapEnv::new().with("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let err = check_ai_credentials_with(&env, Some("claude-sonnet-4-8")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown model 'claude-sonnet-4-8'"),
+            "should name the bad model: {msg}"
+        );
+        assert!(
+            msg.contains("claude-sonnet-4-6"),
+            "should list what the user could have typed: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_model_from_env_fails_preflight_on_direct_api() {
+        // The `--model` flag reaches preflight as OMNI_DEV_MODEL, not as the
+        // override parameter (every call site passes None).
+        let env = MapEnv::new()
+            .with("ANTHROPIC_API_KEY", "sk-test-dummy")
+            .with("OMNI_DEV_MODEL", "claude-sonnet-4-8");
+
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("Unknown model"));
+    }
+
+    #[test]
+    fn unknown_model_fails_preflight_on_bedrock() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_AUTH_TOKEN", "test-token")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://example.invalid")
+            .with("OMNI_DEV_MODEL", "claude-sonnet-4-8");
+
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("Unknown model"));
+    }
+
+    /// Ollama has no registry entries at all, so validation must not apply —
+    /// every model would otherwise be rejected.
+    #[test]
+    fn unknown_model_is_allowed_on_ollama() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "ollama")
+            .with("OLLAMA_MODEL", "llama3.2:70b");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.model, "llama3.2:70b");
+    }
+
+    /// Unknown-but-well-shaped OpenAI identifiers are a supported path; the
+    /// registry lists only a subset of that provider's catalog.
+    #[test]
+    fn unknown_model_is_allowed_on_openai() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("OPENAI_API_KEY", "sk-test-dummy")
+            .with("OPENAI_MODEL", "gpt-6-ultra");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.model, "gpt-6-ultra");
     }
 
     #[cfg(unix)]

@@ -600,6 +600,33 @@ impl ModelRegistry {
             .unwrap_or_default()
     }
 
+    /// Reports whether `identifier` names a model this registry knows.
+    ///
+    /// Goes through [`ModelRegistry::get_model_spec`], so Bedrock-style
+    /// identifiers (`us.anthropic.…-v1:0`) are normalised before lookup and
+    /// user-supplied `models.yaml` entries count as known.
+    #[must_use]
+    pub fn is_known_model(&self, identifier: &str) -> bool {
+        self.get_model_spec(identifier).is_some()
+    }
+
+    /// Returns the non-legacy API identifiers for a provider, sorted.
+    ///
+    /// Intended for error messages that need to show the user what they could
+    /// have typed. Legacy models are omitted: they still resolve, but should
+    /// not be suggested.
+    #[must_use]
+    pub fn known_identifiers(&self, provider: &str) -> Vec<&str> {
+        let mut identifiers: Vec<&str> = self
+            .get_models_by_provider(provider)
+            .into_iter()
+            .filter(|model| !model.legacy)
+            .map(|model| model.api_identifier.as_str())
+            .collect();
+        identifiers.sort_unstable();
+        identifiers
+    }
+
     /// Returns models filtered by provider and tier.
     #[must_use]
     pub fn get_models_by_provider_and_tier(&self, provider: &str, tier: &str) -> Vec<&ModelSpec> {
@@ -901,6 +928,82 @@ mod tests {
 
     fn embedded_only() -> ModelRegistry {
         ModelRegistry::load_layered_from_paths(None, None, None).unwrap()
+    }
+
+    /// Issue #1333: `--model claude-sonnet-4-8` reached the API and 404'd
+    /// because nothing checked the identifier against the catalog first.
+    #[test]
+    fn is_known_model_rejects_unknown_claude_identifier() {
+        let registry = embedded_only();
+        assert!(!registry.is_known_model("claude-sonnet-4-8"));
+        assert!(registry.is_known_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn is_known_model_normalizes_bedrock_identifiers() {
+        let registry = embedded_only();
+        // A Bedrock-style id must validate via the same normalisation
+        // `get_model_spec` applies, not a raw map hit.
+        let bedrock_id = registry
+            .get_all_models()
+            .iter()
+            .find(|m| m.provider == "claude")
+            .map(|m| format!("us.anthropic.{}", m.api_identifier))
+            .expect("embedded catalog should list claude models");
+        assert!(
+            registry.is_known_model(&bedrock_id),
+            "{bedrock_id} should normalise to a known model"
+        );
+    }
+
+    #[test]
+    fn known_identifiers_lists_non_legacy_claude_models() {
+        let registry = embedded_only();
+        let identifiers = registry.known_identifiers("claude");
+
+        assert!(!identifiers.is_empty());
+        assert!(identifiers.contains(&"claude-sonnet-4-6"));
+        assert!(
+            identifiers.windows(2).all(|w| w[0] <= w[1]),
+            "identifiers should be sorted: {identifiers:?}"
+        );
+        for id in &identifiers {
+            let spec = registry
+                .get_model_spec(id)
+                .expect("listed model must exist");
+            assert!(!spec.legacy, "legacy model {id} should not be suggested");
+            assert_eq!(spec.provider, "claude");
+        }
+    }
+
+    #[test]
+    fn known_identifiers_is_empty_for_provider_without_models() {
+        let registry = embedded_only();
+        assert!(registry.known_identifiers("ollama").is_empty());
+    }
+
+    /// Legacy models are omitted from suggestions but must still validate —
+    /// preflight would otherwise reject a model the user can legitimately run.
+    #[test]
+    fn legacy_models_are_known_but_not_suggested() {
+        let registry = embedded_only();
+        let legacy = registry
+            .get_all_models()
+            .iter()
+            .find(|m| m.provider == "claude" && m.legacy)
+            .map(|m| m.api_identifier.clone())
+            .expect("embedded catalog should list a legacy claude model");
+
+        assert!(
+            registry.is_known_model(&legacy),
+            "{legacy} must still resolve"
+        );
+        assert!(
+            !registry
+                .known_identifiers("claude")
+                .contains(&legacy.as_str()),
+            "{legacy} should not be suggested"
+        );
     }
 
     fn write_yaml(dir: &Path, name: &str, contents: &str) -> PathBuf {
