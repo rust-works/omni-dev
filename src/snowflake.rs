@@ -616,9 +616,11 @@ impl SnowflakeEngine {
     }
 
     /// Runs arbitrary SQL against the `(account, user)` pool, authenticating a
-    /// session on first use, and returns a self-describing `{ columns, rows }`
-    /// payload. Concurrent calls run on separate pooled sessions (up to the pool
-    /// size).
+    /// session on first use, and returns a self-describing
+    /// `{ statements: [ { columns, rows }, … ] }` payload — one entry per
+    /// `;`-separated statement, so a single-statement query is a one-element
+    /// `statements` array (multi-statement scripts set `MULTI_STATEMENT_COUNT`).
+    /// Concurrent calls run on separate pooled sessions (up to the pool size).
     ///
     /// # Errors
     ///
@@ -704,10 +706,10 @@ impl SnowflakeEngine {
         // the token and retrying once if it expires mid-flight.
         let target = checkout.base().overlay(&overrides);
         match run_with_renew(checkout.session(), checkout.current(), &target, &req.sql).await {
-            Ok(rows) => {
+            Ok(statements) => {
                 pool.touch();
                 pool.checkin(checkout, target);
-                Ok(client::rows_to_payload(&rows))
+                Ok(client::rows_to_multi_payload(&statements))
             }
             Err(e) if e.is_session_expired() => {
                 pool.discard(checkout);
@@ -879,7 +881,7 @@ async fn run_with_renew(
     current: &QueryContext,
     target: &QueryContext,
     sql: &str,
-) -> client::Result<Vec<Row>> {
+) -> client::Result<Vec<Vec<Row>>> {
     match apply_and_query(session, current, target, sql).await {
         Err(e) if e.is_session_expired() => {
             session.renew().await?;
@@ -890,15 +892,16 @@ async fn run_with_renew(
     }
 }
 
-/// Issues any needed `USE` statements, then runs the SQL.
+/// Issues any needed `USE` statements, then runs the SQL — which may itself be a
+/// multi-statement script, so this returns one row set per statement.
 async fn apply_and_query(
     session: &SnowflakeSession,
     current: &QueryContext,
     target: &QueryContext,
     sql: &str,
-) -> client::Result<Vec<Row>> {
+) -> client::Result<Vec<Vec<Row>>> {
     apply_context(session, current, target).await?;
-    session.query(sql).await
+    session.query_multi(sql).await
 }
 
 /// Issues `USE` for each context dimension whose target differs from the
