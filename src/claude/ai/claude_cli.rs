@@ -902,24 +902,39 @@ fn map_api_error(env: &JsonOutput, stderr: &str) -> anyhow::Error {
     let status = env.api_error_status;
     let msg = &env.result;
     match status {
-        Some(401 | 403) => ClaudeError::ApiRequestFailed(format!(
-            "claude -p authentication failed ({status:?}): {msg}; stderr={stderr}"
-        ))
-        .into(),
-        Some(404) => {
-            ClaudeError::ApiRequestFailed(format!("claude -p reported unknown model (404): {msg}"))
-                .into()
+        Some(code @ (401 | 403)) => ClaudeError::ApiHttpError {
+            status: status_as_u16(code),
+            body: format!("claude -p authentication failed: {msg}; stderr={stderr}"),
         }
-        Some(429) => ClaudeError::RateLimitExceeded.into(),
-        Some(code) if (500..=599).contains(&code) => ClaudeError::ApiRequestFailed(format!(
-            "claude -p transient API error ({code}): {msg}; stderr={stderr}"
-        ))
         .into(),
+        Some(404) => ClaudeError::ApiHttpError {
+            status: 404,
+            body: format!("claude -p reported unknown model: {msg}"),
+        }
+        .into(),
+        Some(429) => ClaudeError::RateLimitExceeded.into(),
+        Some(code) if (500..=599).contains(&code) => ClaudeError::ApiHttpError {
+            status: status_as_u16(code),
+            body: format!("claude -p transient API error: {msg}; stderr={stderr}"),
+        }
+        .into(),
+        // No status, or one outside the ranges above: nothing to classify on,
+        // so this stays an untyped failure and `is_transient` defaults it to
+        // retryable.
         _ => ClaudeError::ApiRequestFailed(format!(
             "claude -p reported error (api_error_status={status:?}): {msg}; stderr={stderr}"
         ))
         .into(),
     }
+}
+
+/// Narrows a `claude -p` `api_error_status` to a `u16` status code.
+///
+/// The envelope types the field as `i64`, so a nonsensical value cannot be
+/// ruled out by construction; anything out of range is reported as `0`, which
+/// [`ClaudeError::is_transient`] treats as retryable.
+fn status_as_u16(code: i64) -> u16 {
+    u16::try_from(code).unwrap_or(0)
 }
 
 /// Returns true if `err` indicates the peer closed the pipe.
@@ -2368,6 +2383,13 @@ mod tests {
         )
     }
 
+    /// Recovers the typed error so tests can assert on the classification
+    /// rather than only on the rendered message.
+    fn downcast_claude(err: &anyhow::Error) -> &ClaudeError {
+        err.downcast_ref::<ClaudeError>()
+            .expect("error should be a ClaudeError")
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn success_returns_result_field() {
@@ -2413,6 +2435,10 @@ mod tests {
             chain.contains("authentication failed"),
             "unexpected error: {chain}"
         );
+        assert!(
+            !downcast_claude(&err).is_transient(),
+            "401 must be permanent so callers fail instead of falling back"
+        );
     }
 
     #[tokio::test]
@@ -2452,6 +2478,12 @@ mod tests {
             .expect_err("expected unknown-model error");
         let chain = format!("{err:#}");
         assert!(chain.contains("unknown model"), "unexpected error: {chain}");
+        // Issue #1333: a misspelled model can never succeed, so this must not
+        // be retried or silently degraded into a template.
+        assert!(
+            !downcast_claude(&err).is_transient(),
+            "404 must be permanent"
+        );
     }
 
     #[tokio::test]
@@ -2492,6 +2524,10 @@ mod tests {
         assert!(
             chain.contains("transient API error"),
             "unexpected error: {chain}"
+        );
+        assert!(
+            downcast_claude(&err).is_transient(),
+            "5xx must stay retryable"
         );
     }
 

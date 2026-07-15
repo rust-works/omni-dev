@@ -217,7 +217,9 @@ pub(crate) fn compute_cost_usd(model: &str, input_tokens: u64, output_tokens: u6
 ///
 /// On success, returns the response unchanged for further processing.
 /// On failure, reads the error body and returns a
-/// [`ClaudeError::ApiRequestFailed`].
+/// [`ClaudeError::ApiHttpError`] carrying the status code, so callers can
+/// distinguish a permanent failure (404 for an unknown model, 401 for bad
+/// credentials) from a retryable one via [`ClaudeError::is_transient`].
 pub(crate) async fn check_error_response(response: reqwest::Response) -> Result<reqwest::Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -227,7 +229,11 @@ pub(crate) async fn check_error_response(response: reqwest::Response) -> Result<
         tracing::debug!("Failed to read error response body: {e}");
         String::new()
     });
-    Err(ClaudeError::ApiRequestFailed(format!("HTTP {status}: {error_text}")).into())
+    Err(ClaudeError::ApiHttpError {
+        status: status.as_u16(),
+        body: error_text,
+    }
+    .into())
 }
 
 /// Logs successful text extraction from an AI API response.
