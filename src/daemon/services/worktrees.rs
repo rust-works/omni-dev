@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::pr_status::{PrBadge, PrStatusCache, PrTarget};
+use crate::pr_status::{PrBadge, PrCheckState, PrStatusCache, PrTarget};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
@@ -1085,15 +1085,29 @@ fn worktree_entry(
 /// cache read — no I/O, no network — so it is safe on the snapshot's hot path. A
 /// non-GitHub repo, a branchless worktree, or an unresolved branch simply keeps
 /// `pr: None` and renders nothing.
+///
+/// A verdict computed for a **different commit** than the worktree has checked out
+/// is downgraded to pending here rather than shown as-is. That is what makes a push
+/// invalidate the badge the moment it happens: the cache still holds the previous
+/// commit's verdict, and this fold — which runs on every snapshot — notices without
+/// waiting for a poll. Without it the previous head's `✓` stands until the poller
+/// next runs, which is up to the full backoff.
 fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
     for repo in repos {
         let Some(github) = repo.github.clone() else {
             continue;
         };
         for worktree in &mut repo.worktrees {
-            if let Some(branch) = &worktree.branch {
-                worktree.pr = pr_cache.get(&github.owner, &github.name, branch);
+            let Some(branch) = &worktree.branch else {
+                continue;
+            };
+            let Some(mut badge) = pr_cache.get(&github.owner, &github.name, branch) else {
+                continue;
+            };
+            if badge.is_stale_for(worktree.head_sha.as_deref()) {
+                badge.checks = PrCheckState::Pending;
             }
+            worktree.pr = Some(badge);
         }
     }
 }
@@ -2972,12 +2986,17 @@ mod tests {
         repo
     }
 
-    fn pending_badge(number: u64) -> PrBadge {
+    /// A pending badge whose verdict is about `head_oid`. The commit is explicit
+    /// because the fold downgrades a badge naming a different commit than the
+    /// worktree's HEAD (#1337) — a fixture that got it wrong would pass for the
+    /// wrong reason.
+    fn pending_badge(number: u64, head_oid: &str) -> PrBadge {
         PrBadge {
             number,
             is_draft: false,
-            checks: crate::pr_status::PrCheckState::Pending,
+            checks: PrCheckState::Pending,
             url: "u".into(),
+            head_oid: head_oid.to_string(),
         }
     }
 
@@ -3071,7 +3090,8 @@ mod tests {
     #[tokio::test]
     async fn tree_snapshot_folds_cached_pr_badges_onto_matching_branches() {
         let dir = tempfile::tempdir().unwrap();
-        github_repo(dir.path());
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
         let svc = WorktreesService::new();
         svc.handle(
             "register",
@@ -3092,7 +3112,7 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            pending_badge(1337),
+            pending_badge(1337, &head),
         );
         assert!(svc.pr_cache.replace(badges));
 
@@ -3122,7 +3142,7 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "other".into(),
             },
-            pending_badge(1),
+            pending_badge(1, "irrelevant"),
         );
         svc.pr_cache.replace(badges);
         let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
@@ -3161,7 +3181,8 @@ mod tests {
         // Badges are decoration: an unauthenticated or broken `gh` must never sink
         // the tree, and one bad poll must not blank rows that were fine a second ago.
         let dir = tempfile::tempdir().unwrap();
-        github_repo(dir.path());
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
         let bin_dir = tempfile::tempdir().unwrap();
         let fake = bin_dir.path().join("fake-gh");
         // Exits non-zero, exactly as `gh` does without `gh auth login`.
@@ -3189,7 +3210,7 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            pending_badge(7),
+            pending_badge(7, &head),
         );
         svc.pr_cache.replace(seeded);
 
@@ -3250,6 +3271,75 @@ mod tests {
         .expect("a window opening must wake the poller out of its idle backoff");
         assert_eq!(badge.number, 99);
         svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_commit_invalidates_the_previous_verdict_without_a_poll() {
+        // The acceptance criterion: "pushing a new commit invalidates the badge
+        // rather than leaving the previous head's verdict standing."
+        //
+        // The cache still holds the verdict for the *old* commit, and the poller may
+        // have backed off for up to half an hour. So the fold — which runs on every
+        // snapshot — has to notice on its own, with no network call.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let first = repo.head().unwrap().target().unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        // A green verdict, correctly describing the commit currently checked out.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            PrBadge {
+                number: 1337,
+                is_draft: false,
+                checks: PrCheckState::Success,
+                url: "u".into(),
+                head_oid: first.to_string(),
+            },
+        );
+        svc.pr_cache.replace(badges);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(
+            wt["pr"]["checks"],
+            json!("success"),
+            "green for its own commit"
+        );
+
+        // Now commit — as a push would leave things, with the cache untouched.
+        let head = repo.find_commit(first).unwrap();
+        empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(
+            wt["pr"]["checks"],
+            json!("pending"),
+            "the previous commit's ✓ must not stand after a new commit"
+        );
+        // The PR itself is still shown — it is the *verdict* that is unknown, not
+        // the PR.
+        assert_eq!(wt["pr"]["number"], json!(1337));
+    }
+
+    #[test]
+    fn is_stale_for_compares_the_commit_the_verdict_describes() {
+        let badge = pending_badge(1, "aaa");
+        assert!(!badge.is_stale_for(Some("aaa")));
+        assert!(badge.is_stale_for(Some("bbb")));
+        // No local HEAD (unborn): nothing to compare against, so not stale.
+        assert!(!badge.is_stale_for(None));
     }
 
     #[test]

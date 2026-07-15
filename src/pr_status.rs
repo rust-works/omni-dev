@@ -113,6 +113,34 @@ pub struct PrBadge {
     pub checks: PrCheckState,
     /// The PR's web URL, for the open action.
     pub url: String,
+    /// The commit on the remote branch that [`checks`](Self::checks) describes.
+    ///
+    /// **Not on the wire** — it exists so the snapshot fold can tell a verdict
+    /// computed for *some* commit from one computed for the commit the worktree
+    /// actually has checked out. Without it a badge cannot know it is out of date,
+    /// and the previous head's verdict stands until the next poll (#1337). See
+    /// [`is_stale_for`](Self::is_stale_for).
+    #[serde(skip)]
+    pub head_oid: String,
+}
+
+impl PrBadge {
+    /// Whether this verdict describes a commit other than `head_sha`.
+    ///
+    /// The check is deliberately "different", not "older": we cannot order two
+    /// commits without a walk, and every way they can differ means the same thing —
+    /// **this verdict is not about the commit in front of you**. You pushed and CI
+    /// has not reported yet; you have unpushed work; you are behind the remote.
+    ///
+    /// This is what makes a push invalidate the badge *immediately*, with no network
+    /// call: the cache still holds the previous commit's oid, so the mismatch is
+    /// visible on the very next snapshot. A `None` head (an unborn HEAD) is not
+    /// stale — there is nothing to compare, and such a worktree has no branch and so
+    /// no badge anyway.
+    #[must_use]
+    pub fn is_stale_for(&self, head_sha: Option<&str>) -> bool {
+        head_sha.is_some_and(|sha| sha != self.head_oid)
+    }
 }
 
 /// One (repo, branch) pair to resolve a badge for. Derived from the tree — a repo
@@ -317,6 +345,15 @@ fn badge_from_ref(node: &Value) -> Option<PrBadge> {
         checks: rollup_check_state(&contexts),
         url: pr
             .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // The commit this verdict is about — the remote branch head the rollup was
+        // read from, not the PR's own `headRefOid` (the same commit, one fewer field
+        // to ask for).
+        head_oid: node
+            .get("target")
+            .and_then(|t| t.get("oid"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
@@ -797,6 +834,7 @@ mod tests {
             is_draft: true,
             checks: PrCheckState::Pending,
             url: "u".into(),
+            head_oid: String::new(),
         };
         let v = serde_json::to_value(&badge).unwrap();
         assert_eq!(v["isDraft"], json!(true));
@@ -963,6 +1001,7 @@ mod tests {
             is_draft: false,
             checks: PrCheckState::Pending,
             url: "u".into(),
+            head_oid: String::new(),
         };
         let mut map = HashMap::new();
         map.insert(target("f"), badge);
@@ -996,6 +1035,7 @@ mod tests {
                 is_draft: false,
                 checks: PrCheckState::Pending,
                 url: "u".into(),
+                head_oid: String::new(),
             },
         );
         cache.replace(map.clone());
