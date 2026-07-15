@@ -3905,6 +3905,41 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Covers the `start_date` (and `archived`) insert branches, which the
+    /// release/rename paths never populate.
+    #[tokio::test]
+    async fn update_project_version_sends_start_date_and_archived() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "archived": true,
+                "startDate": "2026-01-01"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "1.0"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        client
+            .update_project_version(
+                "10000",
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                Some("2026-01-01"),
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn update_project_version_invalid_date_short_circuits() {
         // Bad date must be rejected before any network call.
@@ -4343,6 +4378,56 @@ mod tests {
             .unwrap();
         // Numeric id is normalized to a string.
         assert_eq!(id, "10010");
+    }
+
+    /// JIRA normally returns the new remote-link id as a number, but the
+    /// normalization also accepts a string id verbatim.
+    #[tokio::test]
+    async fn create_remote_issue_link_accepts_string_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "10010"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let id = client
+            .create_remote_issue_link("PROJ-1", "https://x", "t", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(id, "10010");
+    }
+
+    /// An id that is neither a string nor a number is a hard error rather than
+    /// a silently-wrong link id.
+    #[tokio::test]
+    async fn create_remote_issue_link_rejects_unexpected_id_type() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_remote_issue_link("PROJ-1", "https://x", "t", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected remote link id type in create response"));
     }
 
     #[tokio::test]

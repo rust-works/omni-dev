@@ -938,6 +938,54 @@ mod tests {
         assert!(!out.contains("Deleted comment"));
     }
 
+    /// Dry-run with a failing writer covers the `?` on the guard call.
+    #[tokio::test]
+    async fn delete_comment_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Force + a failing writer covers the `?` on the post-success writeln.
+    #[tokio::test]
+    async fn delete_comment_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            comment_id: "100".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
     #[tokio::test]
     async fn delete_comment_force_propagates_api_error() {
         let server = wiremock::MockServer::start().await;

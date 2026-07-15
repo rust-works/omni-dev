@@ -169,9 +169,12 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         issue_put_mock().mount(&server).await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        RemoveCommand {
-            key: "PROJ-1".to_string(),
-            labels: vec!["stale".to_string()],
+        // Routed through the parent so the `Remove` dispatch arm is covered too.
+        LabelCommand {
+            command: LabelSubcommands::Remove(RemoveCommand {
+                key: "PROJ-1".to_string(),
+                labels: vec!["stale".to_string()],
+            }),
         }
         .execute()
         .await

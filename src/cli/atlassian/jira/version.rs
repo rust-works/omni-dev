@@ -1118,6 +1118,94 @@ mod tests {
         assert!(!out.contains("Deleted version"));
     }
 
+    /// The `Archive` arm of the `execute_with` DI-seam dispatch.
+    #[tokio::test]
+    async fn version_command_execute_with_archive_dispatches() {
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Archive(ArchiveCommand {
+                version_id: "10000".to_string(),
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    /// The `Delete` arm of the `execute_with` DI-seam dispatch (`--force`, so
+    /// the default-stdin prompt is skipped).
+    #[tokio::test]
+    async fn version_command_execute_with_delete_dispatches() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Delete(DeleteCommand {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                force: true,
+                dry_run: false,
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    /// Answering "y" takes the `GuardOutcome::Proceed` arm.
+    #[tokio::test]
+    async fn delete_version_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _) = create_client_from(mock_credentials(&server.uri())).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "10000".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete version 10000?"));
+        assert!(out.contains("Deleted version 10000."));
+    }
+
+    /// A failing writer makes the guard's `writeln` fail, covering the `?`
+    /// propagation on `guard_destructive_with_io`.
+    #[tokio::test]
+    async fn delete_version_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let (client, _) = create_client_from(mock_credentials("http://127.0.0.1:1")).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "10000".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
     #[tokio::test]
     async fn delete_version_prompt_no_makes_no_delete() {
         let (client, _) = create_client_from(mock_credentials("http://127.0.0.1:1")).unwrap();

@@ -188,6 +188,20 @@ mod tests {
         assert_eq!(group.subject(), "group devs");
     }
 
+    /// Neither `--account-id` nor `--group` — clap's `conflicts_with` pairing
+    /// makes this unreachable from the CLI, but `subject()` still has to render
+    /// something for the message.
+    #[test]
+    fn subject_label_without_account_or_group() {
+        let neither = SubjectCommand {
+            id: "1".to_string(),
+            operation: RestrictionOperation::Update,
+            account_id: None,
+            group: None,
+        };
+        assert_eq!(neither.subject(), "(none)");
+    }
+
     // ── execute() end-to-end (drives create_client + the API call) ──
 
     #[tokio::test]
@@ -225,13 +239,16 @@ mod tests {
             .mount(&server)
             .await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        SubjectCommand {
-            id: "12345".to_string(),
-            operation: RestrictionOperation::Update,
-            account_id: Some("acc-1".to_string()),
-            group: None,
+        // Routed through the parent so the `Grant` dispatch arm is covered too.
+        RestrictionCommand {
+            command: RestrictionSubcommands::Grant(SubjectCommand {
+                id: "12345".to_string(),
+                operation: RestrictionOperation::Update,
+                account_id: Some("acc-1".to_string()),
+                group: None,
+            }),
         }
-        .execute(true)
+        .execute()
         .await
         .unwrap();
     }
@@ -248,13 +265,16 @@ mod tests {
             .mount(&server)
             .await;
         let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
-        SubjectCommand {
-            id: "12345".to_string(),
-            operation: RestrictionOperation::Read,
-            account_id: None,
-            group: Some("devs".to_string()),
+        // Routed through the parent so the `Revoke` dispatch arm is covered too.
+        RestrictionCommand {
+            command: RestrictionSubcommands::Revoke(SubjectCommand {
+                id: "12345".to_string(),
+                operation: RestrictionOperation::Read,
+                account_id: None,
+                group: Some("devs".to_string()),
+            }),
         }
-        .execute(false)
+        .execute()
         .await
         .unwrap();
     }
