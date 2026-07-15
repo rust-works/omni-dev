@@ -21,6 +21,14 @@ pub const ATLASSIAN_EMAIL: &str = "ATLASSIAN_EMAIL";
 /// Environment variable / settings key for the Atlassian API token.
 pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 
+/// Environment variable that overrides the Atlassian instance URL.
+///
+/// Applies to **every** JIRA/Confluence command. Set by the global `--instance`
+/// flag via [`crate::cli::Cli`]'s `propagate_global_flags`; takes precedence
+/// over `ATLASSIAN_INSTANCE_URL` / settings.json. A caller-supplied override
+/// (e.g. via [`load_credentials_with_instance`]) still wins over it.
+pub const ATLASSIAN_INSTANCE_OVERRIDE_ENV: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
+
 /// Atlassian Cloud credentials.
 #[derive(Debug, Clone)]
 pub struct AtlassianCredentials {
@@ -37,8 +45,15 @@ pub struct AtlassianCredentials {
 /// Loads Atlassian credentials from environment variables or settings.json.
 ///
 /// Checks environment variables first, then falls back to the settings file.
+/// The global `--instance` flag (propagated to [`ATLASSIAN_INSTANCE_OVERRIDE_ENV`])
+/// overrides the configured instance URL for every command; a blank value is
+/// ignored. Callers that carry their own explicit override should call
+/// [`load_credentials_with_instance`] directly.
 pub fn load_credentials() -> Result<AtlassianCredentials> {
-    load_credentials_with_instance(None)
+    let env_override = std::env::var(ATLASSIAN_INSTANCE_OVERRIDE_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    load_credentials_with_instance(env_override.as_deref())
 }
 
 /// Loads Atlassian credentials, optionally overriding the instance URL.
@@ -165,6 +180,37 @@ pub(crate) fn save_credentials_to(
     )
 }
 
+/// Removes Atlassian credential keys from `~/.omni-dev/settings.json` — from
+/// the active profile's `env` map when a profile is active, the base `env`
+/// otherwise (issue #1116).
+///
+/// Leaves all other settings intact. Returns `true` if any Atlassian key was
+/// present and removed, `false` when the targeted map was already free of
+/// them (or the file did not exist).
+pub fn remove_credentials() -> Result<bool> {
+    remove_credentials_at(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+    )
+}
+
+/// [`remove_credentials`], operating on an explicit settings-file path and
+/// env map (`profiles.<name>.env` when `profile` is `Some`, base `env`
+/// otherwise).
+///
+/// Tests inject a tempdir path and an explicit profile instead of mutating
+/// `HOME` / `OMNI_DEV_PROFILE` (issue #1030).
+pub(crate) fn remove_credentials_at(
+    settings_path: &std::path::Path,
+    profile: Option<&str>,
+) -> Result<bool> {
+    Settings::remove_env_vars_in(
+        settings_path,
+        profile,
+        &[ATLASSIAN_INSTANCE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN],
+    )
+}
+
 /// Crate-internal test utilities for code that calls [`load_credentials`] /
 /// [`crate::cli::atlassian::helpers::create_client`]. Lives here because it
 /// needs the credential constants and shares process-wide env state with
@@ -173,7 +219,10 @@ pub(crate) fn save_credentials_to(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod test_util {
-    use super::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
+    use super::{
+        ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_OVERRIDE_ENV,
+        ATLASSIAN_INSTANCE_URL,
+    };
     use crate::utils::settings::PROFILE_ENV_VAR;
 
     /// Mutex shared by every test that mutates `HOME`, `OMNI_DEV_PROFILE`, or
@@ -200,6 +249,7 @@ pub(crate) mod test_util {
                 "HOME",
                 PROFILE_ENV_VAR,
                 ATLASSIAN_INSTANCE_URL,
+                ATLASSIAN_INSTANCE_OVERRIDE_ENV,
                 ATLASSIAN_EMAIL,
                 ATLASSIAN_API_TOKEN,
             ];
@@ -227,6 +277,7 @@ pub(crate) mod test_util {
             std::env::set_var("HOME", dir.path());
             std::env::remove_var(PROFILE_ENV_VAR);
             std::env::remove_var(ATLASSIAN_INSTANCE_URL);
+            std::env::remove_var(ATLASSIAN_INSTANCE_OVERRIDE_ENV);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
             dir
@@ -436,6 +487,34 @@ mod tests {
         assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "wrapper@example.com");
     }
 
+    /// The `remove_credentials()` wrapper resolves the settings path from
+    /// `HOME` and the profile from the environment; every other removal test
+    /// injects both into `remove_credentials_at` (issue #1030).
+    #[test]
+    fn remove_credentials_resolves_default_settings_path() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://wrapper.atlassian.net".to_string(),
+            email: "wrapper@example.com".to_string(),
+            api_token: "wrapper-token".into(),
+        };
+        save_credentials(&creds).unwrap();
+
+        // Present → removed.
+        assert!(remove_credentials().unwrap());
+
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(ATLASSIAN_EMAIL).is_none());
+        assert!(val["env"].get(ATLASSIAN_API_TOKEN).is_none());
+
+        // Idempotent: nothing left to remove.
+        assert!(!remove_credentials().unwrap());
+    }
+
     /// Save against injected settings-file paths — no `HOME` mutation, so the
     /// test needs no lock (issue #1030). Covers fresh-file creation and
     /// merge-with-existing.
@@ -570,5 +649,29 @@ mod tests {
         std::env::set_var(ATLASSIAN_API_TOKEN, "token");
 
         assert!(load_credentials_with_instance(None).is_err());
+    }
+
+    #[test]
+    fn load_credentials_honours_instance_override_env() {
+        // The global `--instance` flag (exported as OMNI_DEV_ATLASSIAN_INSTANCE)
+        // overrides the instance for every command, even with no configured
+        // ATLASSIAN_INSTANCE_URL (#1117). A blank value is ignored.
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_EMAIL, "person@example.com");
+        std::env::set_var(ATLASSIAN_API_TOKEN, "token");
+
+        // Blank → ignored → falls back to the (absent) configured instance.
+        std::env::set_var(ATLASSIAN_INSTANCE_OVERRIDE_ENV, "  ");
+        assert!(load_credentials().is_err());
+
+        // Set → used verbatim (trailing slash normalized).
+        std::env::set_var(
+            ATLASSIAN_INSTANCE_OVERRIDE_ENV,
+            "https://flag.atlassian.net/",
+        );
+        let creds = load_credentials().unwrap();
+        assert_eq!(creds.instance_url, "https://flag.atlassian.net");
+        assert_eq!(creds.email, "person@example.com");
     }
 }

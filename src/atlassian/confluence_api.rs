@@ -19,16 +19,47 @@ use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::confluence_types::{
-    ChildPage, CommentKind, ConfluenceAddCommentRequest, ConfluenceAddInlineCommentRequest,
-    ConfluenceAddLabelEntry, ConfluenceAttachment, ConfluenceAttachmentEntry,
-    ConfluenceAttachmentPage, ConfluenceAttachmentsResponse, ConfluenceChildrenResponse,
-    ConfluenceComment, ConfluenceCommentsResponse, ConfluenceCreateRequest,
-    ConfluenceCreateResponse, ConfluenceLabel, ConfluenceLabelsResponse, ConfluencePageResponse,
-    ConfluenceSpacePage, ConfluenceSpacePagesResponse, ConfluenceSpacePagesSummaryResponse,
-    ConfluenceSpaceResponse, ConfluenceSpacesResponse, ConfluenceUpdateBody,
-    ConfluenceUpdateRequest, ConfluenceUpdateVersion, ConfluenceV1AttachmentResponse,
-    ConfluenceVersionsResponse, InlineAnchor, InlineCommentProperties, MovePosition, MovedPage,
-    PageMetadata, PageSummary, PageSummaryPage, PageVersion, SinceFilter,
+    ChildPage,
+    CommentKind,
+    ConfluenceAddCommentRequest,
+    ConfluenceAddInlineCommentRequest,
+    ConfluenceAddLabelEntry,
+    ConfluenceAttachment,
+    ConfluenceAttachmentEntry,
+    ConfluenceAttachmentPage,
+    ConfluenceAttachmentsResponse,
+    ConfluenceChildrenResponse,
+    ConfluenceComment,
+    ConfluenceCommentDetail,
+    ConfluenceCommentsResponse,
+    ConfluenceCreateRequest,
+    ConfluenceCreateResponse,
+    ConfluenceLabel,
+    ConfluenceLabelsResponse,
+    // (ConfluenceCommentDetail reuses ConfluenceCommentVersion/ConfluenceCommentBody)
+    ConfluencePageResponse,
+    ConfluenceSpacePage,
+    ConfluenceSpacePagesResponse,
+    ConfluenceSpacePagesSummaryResponse,
+    ConfluenceSpaceResponse,
+    ConfluenceSpacesResponse,
+    ConfluenceUpdateBody,
+    ConfluenceUpdateCommentRequest,
+    ConfluenceUpdateRequest,
+    ConfluenceUpdateVersion,
+    ConfluenceV1AttachmentEntry,
+    ConfluenceV1AttachmentResponse,
+    ConfluenceVersionsResponse,
+    ConfluenceWatchStatus,
+    InlineAnchor,
+    InlineCommentProperties,
+    MovePosition,
+    MovedPage,
+    PageMetadata,
+    PageSummary,
+    PageSummaryPage,
+    PageVersion,
+    SinceFilter,
 };
 use crate::atlassian::error::AtlassianError;
 
@@ -460,6 +491,200 @@ impl ConfluenceApi {
         })
     }
 
+    /// Copies a single Confluence page under a destination parent page.
+    ///
+    /// Uses the v1 copy endpoint (`POST /wiki/rest/api/content/{id}/copy`),
+    /// carrying the page's attachments, labels, and properties (but not its
+    /// restrictions). Returns the new page's id. Single-page copy only — the
+    /// hierarchy-copy endpoint is a separate async task not handled here.
+    pub async fn copy_page(
+        &self,
+        page_id: &str,
+        dest_parent_id: &str,
+        new_title: &str,
+    ) -> Result<String> {
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/copy",
+            self.client.instance_url(),
+            page_id
+        );
+
+        let body = serde_json::json!({
+            "destination": { "type": "parent_page", "value": dest_parent_id },
+            "pageTitle": new_title,
+            "copyAttachments": true,
+            "copyPermissions": false,
+            "copyProperties": true,
+            "copyLabels": true,
+            "copyCustomContents": false,
+        });
+
+        let response = self
+            .client
+            .post_json(&url, &body)
+            .await
+            .context("Failed to send Confluence copy request")?;
+
+        let created: ConfluenceCreateResponse = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence copy response",
+        )
+        .await?;
+
+        Ok(created.id)
+    }
+
+    /// Builds the content-watch URL, optionally scoped to a specific user's
+    /// `accountId` (defaults to the authenticated user when `None`).
+    fn content_watch_url(&self, content_id: &str, account_id: Option<&str>) -> String {
+        let mut url = format!(
+            "{}/wiki/rest/api/user/watch/content/{}",
+            self.client.instance_url(),
+            content_id
+        );
+        if let Some(id) = account_id {
+            url.push_str("?accountId=");
+            url.push_str(&urlencoding(id));
+        }
+        url
+    }
+
+    /// Reports whether a user is watching a Confluence page (the authenticated
+    /// user when `account_id` is `None`).
+    ///
+    /// `GET /wiki/rest/api/user/watch/content/{id}`.
+    pub async fn is_watching_content(
+        &self,
+        content_id: &str,
+        account_id: Option<&str>,
+    ) -> Result<ConfluenceWatchStatus> {
+        let url = self.content_watch_url(content_id, account_id);
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence watch status")?;
+        AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence watch status",
+        )
+        .await
+    }
+
+    /// Adds a watcher to a Confluence page (the authenticated user when
+    /// `account_id` is `None`).
+    ///
+    /// `POST /wiki/rest/api/user/watch/content/{id}`.
+    pub async fn add_content_watcher(
+        &self,
+        content_id: &str,
+        account_id: Option<&str>,
+    ) -> Result<()> {
+        let url = self.content_watch_url(content_id, account_id);
+        let response = self.client.post_json(&url, &serde_json::json!({})).await?;
+        AtlassianClient::ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// Removes a watcher from a Confluence page (the authenticated user when
+    /// `account_id` is `None`).
+    ///
+    /// `DELETE /wiki/rest/api/user/watch/content/{id}`.
+    pub async fn remove_content_watcher(
+        &self,
+        content_id: &str,
+        account_id: Option<&str>,
+    ) -> Result<()> {
+        let url = self.content_watch_url(content_id, account_id);
+        let response = self.client.delete(&url).await?;
+        AtlassianClient::ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// Reads the read/update restrictions on a Confluence page.
+    ///
+    /// `GET /wiki/rest/api/content/{id}/restriction`. Returns the raw response
+    /// JSON (the restriction model is deeply nested — user/group arrays per
+    /// operation — so it is surfaced verbatim rather than reshaped).
+    pub async fn get_content_restrictions(&self, content_id: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/restriction",
+            self.client.instance_url(),
+            content_id
+        );
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence content restrictions")?;
+        AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence content restrictions",
+        )
+        .await
+    }
+
+    /// Builds the `byOperation` restriction URL for a user or group subject.
+    ///
+    /// Exactly one of `account_id` / `group` must be `Some`.
+    fn restriction_subject_url(
+        &self,
+        content_id: &str,
+        operation: &str,
+        account_id: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<String> {
+        let base = format!(
+            "{}/wiki/rest/api/content/{}/restriction/byOperation/{}",
+            self.client.instance_url(),
+            content_id,
+            operation
+        );
+        match (account_id, group) {
+            (Some(acc), None) => Ok(format!("{base}/user?accountId={}", urlencoding(acc))),
+            (None, Some(g)) => Ok(format!("{base}/group/{}", urlencoding(g))),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("Specify a user (--account-id) or a group (--group), not both")
+            }
+            (None, None) => {
+                anyhow::bail!("Specify a user (--account-id) or a group (--group)")
+            }
+        }
+    }
+
+    /// Grants a user or group a restriction for an operation (`read`/`update`)
+    /// on a Confluence page.
+    ///
+    /// `PUT /wiki/rest/api/content/{id}/restriction/byOperation/{op}/{user|group}/…`.
+    pub async fn grant_content_restriction(
+        &self,
+        content_id: &str,
+        operation: &str,
+        account_id: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let url = self.restriction_subject_url(content_id, operation, account_id, group)?;
+        let response = self.client.put_json(&url, &serde_json::json!({})).await?;
+        AtlassianClient::ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// Revokes a user's or group's restriction for an operation on a page.
+    ///
+    /// `DELETE /wiki/rest/api/content/{id}/restriction/byOperation/{op}/{user|group}/…`.
+    pub async fn revoke_content_restriction(
+        &self,
+        content_id: &str,
+        operation: &str,
+        account_id: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let url = self.restriction_subject_url(content_id, operation, account_id, group)?;
+        let response = self.client.delete(&url).await?;
+        AtlassianClient::ensure_success(response).await?;
+        Ok(())
+    }
+
     /// Fetches a Confluence page with its ancestors populated.
     async fn fetch_page_with_ancestors(&self, id: &str) -> Result<ConfluencePageResponse> {
         let url = format!(
@@ -777,6 +1002,163 @@ impl ConfluenceApi {
             debug!(status, body = %body, "Confluence add_inline_page_comment non-success");
             return Err(confluence_write_error(status, body, body_adf));
         }
+
+        Ok(())
+    }
+
+    /// Reads a single comment's current `version.number` and ADF body value.
+    ///
+    /// `GET /wiki/api/v2/{segment}/{id}?body-format=atlas_doc_format`. Used by
+    /// [`Self::update_page_comment`] (needs the version to bump) and
+    /// [`Self::set_inline_comment_resolved`] (also needs the current body to
+    /// re-send unchanged).
+    async fn get_comment_version_and_body(
+        &self,
+        comment_id: &str,
+        kind: CommentKind,
+    ) -> Result<(u32, String)> {
+        let url = format!(
+            "{}/wiki/api/v2/{}/{}?body-format=atlas_doc_format",
+            self.client.instance_url(),
+            kind.endpoint_segment(),
+            comment_id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence comment")?;
+
+        let detail: ConfluenceCommentDetail = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse Confluence comment detail",
+        )
+        .await?;
+
+        let version = detail.version.and_then(|v| v.number).ok_or_else(|| {
+            anyhow::anyhow!("Confluence comment {comment_id} response is missing version.number")
+        })?;
+
+        let body = detail
+            .body
+            .and_then(|b| b.atlas_doc_format)
+            .map(|v| v.value)
+            .unwrap_or_default();
+
+        Ok((version, body))
+    }
+
+    /// Edits an existing footer or inline comment's body.
+    ///
+    /// `PUT /wiki/api/v2/{segment}/{id}`. Confluence versions comments, so the
+    /// current version is fetched first and the update sends `version.number +
+    /// 1` alongside the new ADF body.
+    pub async fn update_page_comment(
+        &self,
+        comment_id: &str,
+        kind: CommentKind,
+        body_adf: &ValidatedAdfDocument,
+    ) -> Result<()> {
+        let (version, _current_body) = self.get_comment_version_and_body(comment_id, kind).await?;
+
+        let adf_json =
+            serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
+
+        let request = ConfluenceUpdateCommentRequest {
+            version: ConfluenceUpdateVersion {
+                number: version + 1,
+                message: None,
+            },
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: adf_json,
+            },
+            resolved: None,
+        };
+
+        let url = format!(
+            "{}/wiki/api/v2/{}/{}",
+            self.client.instance_url(),
+            kind.endpoint_segment(),
+            comment_id
+        );
+
+        let response = self
+            .client
+            .put_json(&url, &request)
+            .await
+            .context("Failed to update Confluence comment")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            debug!(status, body = %body, "Confluence update_page_comment non-success");
+            return Err(confluence_write_error(status, body, body_adf));
+        }
+
+        Ok(())
+    }
+
+    /// Deletes a footer or inline comment from a Confluence page.
+    ///
+    /// `DELETE /wiki/api/v2/{segment}/{id}`.
+    pub async fn delete_page_comment(&self, comment_id: &str, kind: CommentKind) -> Result<()> {
+        let url = format!(
+            "{}/wiki/api/v2/{}/{}",
+            self.client.instance_url(),
+            kind.endpoint_segment(),
+            comment_id
+        );
+
+        let response = self.client.delete(&url).await?;
+
+        AtlassianClient::ensure_success(response).await?;
+
+        Ok(())
+    }
+
+    /// Resolves (`resolved = true`) or reopens (`resolved = false`) an inline
+    /// comment.
+    ///
+    /// `PUT /wiki/api/v2/inline-comments/{id}` carrying the `resolved` flag. The
+    /// v2 update contract requires `version` and `body`, so the current version
+    /// and body are fetched first and re-sent unchanged with the toggled flag.
+    /// Footer comments have no resolution state, so this is inline-only.
+    pub async fn set_inline_comment_resolved(
+        &self,
+        comment_id: &str,
+        resolved: bool,
+    ) -> Result<()> {
+        let (version, current_body) = self
+            .get_comment_version_and_body(comment_id, CommentKind::Inline)
+            .await?;
+
+        let request = ConfluenceUpdateCommentRequest {
+            version: ConfluenceUpdateVersion {
+                number: version + 1,
+                message: None,
+            },
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: current_body,
+            },
+            resolved: Some(resolved),
+        };
+
+        let url = format!(
+            "{}/wiki/api/v2/inline-comments/{}",
+            self.client.instance_url(),
+            comment_id
+        );
+
+        let response = self
+            .client
+            .put_json(&url, &request)
+            .await
+            .context("Failed to update Confluence inline comment resolution")?;
+
+        AtlassianClient::ensure_success(response).await?;
 
         Ok(())
     }
@@ -1107,6 +1489,78 @@ impl ConfluenceApi {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("Upload response contained no attachment"))?;
+        Ok(entry.into())
+    }
+
+    /// Uploads a **new binary version** of an existing attachment, bumping its
+    /// version rather than creating a second attachment.
+    ///
+    /// Mirrors [`Self::upload_attachment`]'s multipart machinery but targets the
+    /// per-attachment `.../child/attachment/{attachmentId}/data` endpoint (v1
+    /// only, like attachment creation — the v2 API has no attachment-mutation
+    /// endpoint). Returns the updated attachment metadata.
+    pub async fn update_attachment(
+        &self,
+        page_id: &str,
+        attachment_id: &str,
+        file_path: &Path,
+        filename: Option<&str>,
+        comment: Option<&str>,
+        minor_edit: bool,
+    ) -> Result<ConfluenceAttachment> {
+        let metadata = tokio::fs::metadata(file_path)
+            .await
+            .with_context(|| format!("Failed to read file metadata for {}", file_path.display()))?;
+        let size = metadata.len();
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .with_context(|| format!("Failed to open {}", file_path.display()))?;
+
+        let resolved_name = filename
+            .map(str::to_string)
+            .or_else(|| {
+                file_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| anyhow::anyhow!("File path has no filename component"))?;
+
+        let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+
+        let stream = ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+
+        let part = reqwest::multipart::Part::stream_with_length(body, size)
+            .file_name(resolved_name)
+            .mime_str(mime.essence_str())
+            .with_context(|| format!("Invalid MIME type for {}", file_path.display()))?;
+
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(c) = comment {
+            form = form.text("comment", c.to_string());
+        }
+        form = form.text("minorEdit", if minor_edit { "true" } else { "false" });
+
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/child/attachment/{}/data",
+            self.client.instance_url(),
+            page_id,
+            attachment_id
+        );
+
+        let response = self
+            .client
+            .post_multipart(&url, form, &[("X-Atlassian-Token", "no-check")])
+            .await?;
+
+        // The `.../data` endpoint returns the updated attachment as a bare
+        // Content object (not the `{results: [...]}` envelope the create
+        // endpoint returns).
+        let entry: ConfluenceV1AttachmentEntry = AtlassianClient::parse_json(
+            AtlassianClient::ensure_success(response).await?,
+            "Failed to parse update attachment response",
+        )
+        .await?;
         Ok(entry.into())
     }
 
@@ -3157,6 +3611,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_page_returns_new_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/copy",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "destination": {"type": "parent_page", "value": "456"},
+                "pageTitle": "Copy of Page",
+                "copyAttachments": true,
+                "copyPermissions": false,
+                "copyProperties": true,
+                "copyLabels": true,
+                "copyCustomContents": false
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "99999"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let new_id = api.copy_page("12345", "456", "Copy of Page").await.unwrap();
+        assert_eq!(new_id, "99999");
+    }
+
+    #[tokio::test]
+    async fn copy_page_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/copy",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.copy_page("12345", "456", "Copy").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn is_watching_content_reports_status() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"watching": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let status = api.is_watching_content("12345", None).await.unwrap();
+        assert!(status.watching);
+    }
+
+    #[tokio::test]
+    async fn add_content_watcher_scopes_account_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .and(wiremock::matchers::query_param("accountId", "acc-1"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api
+            .add_content_watcher("12345", Some("acc-1"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_content_watcher_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api.remove_content_watcher("12345", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn content_watcher_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.add_content_watcher("12345", None).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn get_content_restrictions_returns_raw_json() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"operation": "read"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let value = api.get_content_restrictions("12345").await.unwrap();
+        assert_eq!(value["results"][0]["operation"], "read");
+    }
+
+    #[tokio::test]
+    async fn grant_content_restriction_user_puts_by_operation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/update/user",
+            ))
+            .and(wiremock::matchers::query_param("accountId", "acc-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api
+            .grant_content_restriction("12345", "update", Some("acc-1"), None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn revoke_content_restriction_group_deletes_by_operation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/read/group/devs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api
+            .revoke_content_restriction("12345", "read", None, Some("devs"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn restriction_requires_exactly_one_subject() {
+        let client = AtlassianClient::new("http://127.0.0.1:1", "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api
+            .grant_content_restriction("12345", "read", None, None)
+            .await
+            .is_err());
+        assert!(api
+            .grant_content_restriction("12345", "read", Some("a"), Some("g"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn get_children_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -3719,6 +4373,184 @@ mod tests {
         assert!(msg.contains("`expand`"), "missing child name in: {msg}");
         assert!(msg.contains("`panel`"), "missing parent name in: {msg}");
         assert!(msg.contains("Hint:"), "missing Hint line in: {msg}");
+    }
+
+    // ── update / delete / resolve comment ─────────────────────────
+
+    #[tokio::test]
+    async fn update_page_comment_fetches_version_then_puts() {
+        let server = wiremock::MockServer::start().await;
+        // GET current version.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "555",
+                    "version": {"number": 3},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // PUT the new body with version 4.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "version": {"number": 4, "message": null},
+                "body": {"representation": "atlas_doc_format", "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "555"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = ValidatedAdfDocument::empty();
+        api.update_page_comment("555", CommentKind::Footer, &adf)
+            .await
+            .unwrap();
+    }
+
+    /// A comment fetch without `version.number` can't produce the next version,
+    /// so the update fails loudly rather than guessing.
+    #[tokio::test]
+    async fn update_page_comment_without_version_number_errors() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = ValidatedAdfDocument::empty();
+        let err = api
+            .update_page_comment("555", CommentKind::Footer, &adf)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing version.number"));
+    }
+
+    #[tokio::test]
+    async fn update_page_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = ValidatedAdfDocument::empty();
+        let err = api
+            .update_page_comment("555", CommentKind::Footer, &adf)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn delete_page_comment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api
+            .delete_page_comment("555", CommentKind::Inline)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_page_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .delete_page_comment("999", CommentKind::Footer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn set_inline_comment_resolved_sends_flag_with_current_body() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 2},
+                    "body": {"atlas_doc_format": {"value": "{\"orig\":true}"}}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "version": {"number": 3, "message": null},
+                "body": {"representation": "atlas_doc_format", "value": "{\"orig\":true}"},
+                "resolved": true
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        api.set_inline_comment_resolved("555", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_inline_comment_resolved_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .set_inline_comment_resolved("555", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     // ── get_labels ────────────────────────────────────────────────
@@ -4545,6 +5377,69 @@ mod tests {
         assert_eq!(attachment.download_url.as_deref(), Some("/download/att-1"));
         assert_eq!(attachment.page_id.as_deref(), Some("12345"));
         assert_eq!(attachment.file_id.as_deref(), Some("f-1"));
+    }
+
+    #[tokio::test]
+    async fn update_attachment_posts_new_version_to_data_endpoint() {
+        let server = wiremock::MockServer::start().await;
+        // The `.../data` endpoint returns a bare Content object (no `results`).
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .and(wiremock::matchers::header("X-Atlassian-Token", "no-check"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "hello.txt",
+                    "extensions": {"mediaType": "text/plain", "fileSize": 20, "fileId": "f-1"},
+                    "version": {"number": 2},
+                    "container": {"id": "12345"},
+                    "_links": {"download": "/download/att-1"}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"hello, world! again")
+            .await
+            .unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = api
+            .update_attachment("12345", "att-1", &path, None, Some("v2"), true)
+            .await
+            .unwrap();
+        assert_eq!(attachment.id, "att-1");
+        assert_eq!(attachment.version, Some(2));
+    }
+
+    #[tokio::test]
+    async fn update_attachment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"data").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .update_attachment("12345", "att-1", &path, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     #[tokio::test]

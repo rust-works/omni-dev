@@ -563,6 +563,7 @@ async fn cli_execute_dispatches_git_commit_message_view() {
         models_yaml: None,
         repo: None,
         profile: None,
+        instance: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Commit(CommitCommand {
                 command: CommitSubcommands::Message(MessageCommand {
@@ -593,6 +594,7 @@ async fn cli_execute_dispatches_git_branch_info() {
         models_yaml: None,
         repo: None,
         profile: None,
+        instance: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Branch(BranchCommand {
                 command: BranchSubcommands::Info(InfoCommand { base_branch: None }),
@@ -617,6 +619,7 @@ async fn cli_execute_dispatches_ai_chat() {
         models_yaml: None,
         repo: None,
         profile: None,
+        instance: None,
         command: Commands::Ai(AiCommand {
             command: AiSubcommands::Chat(ChatCommand {}),
         }),

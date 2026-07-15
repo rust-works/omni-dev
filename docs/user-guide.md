@@ -612,7 +612,14 @@ omni-dev atlassian auth login
 
 # Verify credentials work
 omni-dev atlassian auth status
+
+# Remove stored Atlassian credentials from settings.json
+omni-dev atlassian auth logout
 ```
+
+`auth logout` removes the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
+`ATLASSIAN_API_TOKEN` keys from the active profile's `env` map (the base `env`
+map when no profile is selected), leaving all other settings intact.
 
 Credentials are stored in `~/.omni-dev/settings.json`. You can also use
 environment variables:
@@ -630,18 +637,35 @@ and pick one per command, store each tenant's variables in a named **profile**
 and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 [Credential Profiles](configuration-best-practices.md#credential-profiles).
 
+To override just the **instance URL** for a single invocation — for example to
+target a specific tenant without switching profiles — pass the global
+`--instance <URL>` flag (or set `OMNI_DEV_ATLASSIAN_INSTANCE`). It applies to
+every JIRA and Confluence command (email and API token still come from the
+environment/settings) and, being global, works before or after the subcommand:
+
+```bash
+omni-dev --instance https://other.atlassian.net atlassian jira read PROJ-1
+omni-dev atlassian jira read PROJ-1 --instance https://other.atlassian.net
+```
+
 #### Destructive Commands
 
 > **⚠️ Destructive commands require confirmation.**
 >
-> Six Atlassian subcommands prompt for confirmation by default and refuse
-> to run unless either the user explicitly confirms (CLI) or the caller
-> opts in (MCP):
+> Atlassian's destructive subcommands (deletes and removes) prompt for
+> confirmation by default and refuse to run unless either the user explicitly
+> confirms (CLI, via `--force`/`--dry-run`) or the caller opts in (MCP, via
+> `confirm: true`):
 >
 > - `omni-dev atlassian jira delete <KEY>`
+> - `omni-dev atlassian jira comment delete <KEY> <COMMENT_ID>`
+> - `omni-dev atlassian jira worklog delete <KEY> <WORKLOG_ID>`
+> - `omni-dev atlassian jira version delete <VERSION_ID>`
 > - `omni-dev atlassian jira link remove --link-id <ID>`
+> - `omni-dev atlassian jira link remote delete <KEY> --link-id <ID>`
 > - `omni-dev atlassian jira watcher remove --user <ACCOUNT_ID> <KEY>`
 > - `omni-dev atlassian confluence delete <ID>`
+> - `omni-dev atlassian confluence comment delete <COMMENT_ID> --kind <KIND>`
 > - `omni-dev atlassian confluence label remove --labels <LABELS> <ID>`
 > - `omni-dev atlassian confluence attachment delete <ATTACHMENT_ID>`
 >
@@ -887,6 +911,12 @@ echo "This is a comment" | omni-dev atlassian jira comment add PROJ-123
 
 # Add ADF JSON comment
 omni-dev atlassian jira comment add PROJ-123 body.json --format adf
+
+# Edit an existing comment (needs the comment id from `comment list`)
+omni-dev atlassian jira comment edit PROJ-123 10010 revised.md
+
+# Delete a comment (prompts for confirmation; --force skips it, --dry-run previews)
+omni-dev atlassian jira comment delete PROJ-123 10010
 ```
 
 #### JIRA: Delete Issues
@@ -1019,6 +1049,9 @@ omni-dev atlassian jira sprint create --board-id 1 --name "Sprint 42" \
 omni-dev atlassian jira sprint update --sprint-id 10 --state active
 omni-dev atlassian jira sprint update --sprint-id 10 --name "Sprint 42 (extended)" \
   --end-date 2026-05-21
+
+# Delete a sprint (prompts to confirm; --force skips it, --dry-run previews)
+omni-dev atlassian jira sprint delete --sprint-id 10
 ```
 
 #### JIRA: Watchers
@@ -1044,6 +1077,67 @@ omni-dev atlassian jira worklog add PROJ-123 --time-spent "2h 30m" \
   --comment "Investigated cache invalidation"
 omni-dev atlassian jira worklog add PROJ-123 --time-spent 1d \
   --started "2026-04-16T09:00:00.000+0000"
+
+# Correct an entry (needs the worklog id from `worklog list`; pass any subset of fields)
+omni-dev atlassian jira worklog edit PROJ-123 10010 --time-spent "3h" \
+  --comment "Revised estimate"
+
+# Remove an entry (prompts to confirm; --force skips it, --dry-run previews)
+omni-dev atlassian jira worklog delete PROJ-123 10010
+```
+
+#### JIRA: Versions
+
+Manage a project's release versions (the values behind `fixVersion` /
+`affectedVersion`).
+
+```bash
+# List versions (filter with --released/--unreleased, --archived/--unarchived)
+omni-dev atlassian jira version list --project PROJ
+omni-dev atlassian jira version list --project PROJ --unreleased
+
+# Create a version
+omni-dev atlassian jira version create --project PROJ --name "1.0.0" \
+  --release-date 2026-06-01
+
+# Release / archive / rename an existing version (id from `version list`)
+omni-dev atlassian jira version release 10000 --release-date 2026-06-01
+omni-dev atlassian jira version archive 10000
+omni-dev atlassian jira version rename 10000 "1.0.1" --description "Patch release"
+
+# Delete a version (prompts to confirm; --force skips it, --dry-run previews).
+# Optionally reassign issues' fix/affected versions first.
+omni-dev atlassian jira version delete 10000
+omni-dev atlassian jira version delete 10000 --move-fix-issues-to 10001
+```
+
+#### JIRA: Labels
+
+Add or remove individual labels **incrementally** — leaving the issue's other
+labels untouched, unlike `jira write --set labels=…` (a full-array replace).
+JIRA labels cannot contain spaces.
+
+```bash
+omni-dev atlassian jira label add PROJ-123 --labels backend,urgent
+omni-dev atlassian jira label remove PROJ-123 --labels stale
+```
+
+#### JIRA: Components
+
+Manage a project's components (project-level CRUD, distinct from setting an
+issue's `components` field via `jira create`/`write`).
+
+```bash
+# List a project's components
+omni-dev atlassian jira component list --project PROJ
+
+# Create / rename / delete a component
+omni-dev atlassian jira component create --project PROJ --name Backend \
+  --description "Server side"
+omni-dev atlassian jira component update 10000 --name "Backend Services"
+# Delete (prompts to confirm; --force skips it, --dry-run previews).
+# Optionally reassign referencing issues first with --move-issues-to.
+omni-dev atlassian jira component delete 10000
 ```
 
 #### JIRA: User Search
@@ -1086,6 +1180,21 @@ omni-dev atlassian jira link remove --link-id 12345
 # Set an issue's parent — Epic → Story or Story → Sub-task
 # (`--epic`/`--issue` are accepted as aliases for `--parent`/`--child`)
 omni-dev atlassian jira link parent --parent EPIC-1 --child PROJ-2
+```
+
+Remote (external-URL) links point out to non-JIRA resources (Confluence pages,
+Bitbucket PRs, external trackers):
+
+```bash
+# List remote links on an issue (shows remote link IDs)
+omni-dev atlassian jira link remote list PROJ-123
+
+# Add a remote link
+omni-dev atlassian jira link remote create PROJ-123 \
+  --url https://example.com/design --title "Design doc" --relationship "relates to"
+
+# Delete a remote link by ID (prompts to confirm; --force skips it, --dry-run previews)
+omni-dev atlassian jira link remote delete PROJ-123 --link-id 10010
 ```
 
 #### JIRA: Changelog
@@ -1277,6 +1386,15 @@ omni-dev atlassian confluence create page.md --space ENG --title "Child" --paren
 omni-dev atlassian confluence create page.md --dry-run
 ```
 
+#### Confluence: Copy Pages
+
+Copy a single page under a destination parent, carrying its attachments,
+labels, and properties (but not its restrictions):
+
+```bash
+omni-dev atlassian confluence copy 12345 --parent 67890 --title "Copy of Page"
+```
+
 #### Confluence: Delete Pages
 
 ```bash
@@ -1319,6 +1437,16 @@ echo "Looks good" | omni-dev atlassian confluence comment add 12345
 
 # Add an ADF JSON comment
 omni-dev atlassian confluence comment add 12345 body.json --format adf
+
+# Edit a comment's body (needs the comment id from `comment list` and its --kind)
+omni-dev atlassian confluence comment edit 555 --kind footer revised.md
+
+# Delete a comment (prompts to confirm; --force skips it, --dry-run previews)
+omni-dev atlassian confluence comment delete 555 --kind inline
+
+# Resolve / reopen an inline comment
+omni-dev atlassian confluence comment resolve 555
+omni-dev atlassian confluence comment reopen 555
 ```
 
 #### Confluence: Labels
@@ -1330,6 +1458,35 @@ omni-dev atlassian confluence label list 12345
 # Add or remove labels (comma-separated)
 omni-dev atlassian confluence label add 12345 --labels architecture,reviewed
 omni-dev atlassian confluence label remove 12345 --labels deprecated
+```
+
+#### Confluence: Watchers
+
+Manage per-user watch state on a page. Confluence's public API exposes
+check/add/remove for a user (defaulting to the authenticated user) but not a
+list of every watcher, so this offers `status` rather than `list`.
+
+```bash
+# Check whether you (or --account-id <ID>) watch a page
+omni-dev atlassian confluence watcher status 12345
+
+# Start / stop watching a page
+omni-dev atlassian confluence watcher add 12345
+omni-dev atlassian confluence watcher remove 12345 --account-id 5b10ac8d82e05b22cc7d4ef5
+```
+
+#### Confluence: Restrictions
+
+View and manage read/update restrictions on a page (who may view or edit it).
+
+```bash
+# Show the current restrictions
+omni-dev atlassian confluence restriction get 12345
+
+# Grant / revoke a user or group for an operation (read | update)
+omni-dev atlassian confluence restriction grant 12345 --operation update \
+  --account-id 5b10ac8d82e05b22cc7d4ef5
+omni-dev atlassian confluence restriction revoke 12345 --operation read --group developers
 ```
 
 #### Confluence: User Search
@@ -1380,7 +1537,15 @@ then `download` to pull a single binary off the page without dropping out to
 `curl` (credentials stay inside the wrapper).
 
 ```bash
-# List a page's attachments (the ID column feeds `download`/`delete`)
+# Upload a file as a new attachment
+omni-dev atlassian confluence attachment upload 12345 ./diagram.png
+
+# Upload a new binary VERSION of an existing attachment (bumps its version
+# rather than adding a second attachment)
+omni-dev atlassian confluence attachment update 12345 att-98765 ./diagram-v2.png \
+  --comment "Updated diagram"
+
+# List a page's attachments (the ID column feeds `download`/`update`/`delete`)
 omni-dev atlassian confluence attachment list 12345
 
 # Download one attachment by ID — defaults to its filename in the cwd

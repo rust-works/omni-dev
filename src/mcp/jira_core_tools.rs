@@ -414,6 +414,19 @@ pub struct JiraCommentEditParams {
     pub visibility: Option<JiraVisibilityParam>,
 }
 
+/// Parameters for the `jira_comment_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraCommentDeleteParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Comment ID to delete (from `jira_comment` with `action = "list"`).
+    pub comment_id: String,
+    /// Must be `true` to authorise the irreversible delete; the tool refuses
+    /// (without calling the API) when `false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 /// Parameters for the `jira_dev` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraDevParams {
@@ -1178,6 +1191,22 @@ async fn run_jira_comment_edit(
     yaml_result(&updated)
 }
 
+/// Deletes a comment from an issue. Refuses without an explicit `confirm`.
+async fn run_jira_comment_delete(
+    client: &AtlassianClient,
+    key: &str,
+    comment_id: &str,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        anyhow::bail!(
+            "Refusing to delete comment {comment_id} on {key}: pass `confirm: true` to authorise this irreversible operation."
+        );
+    }
+    client.delete_comment(key, comment_id).await?;
+    Ok(format!("Deleted comment {comment_id} on {key}.\n"))
+}
+
 fn parse_visibility(param: &JiraVisibilityParam) -> Result<JiraVisibility> {
     let ty = match param.ty.to_ascii_lowercase().as_str() {
         "group" => JiraVisibilityType::Group,
@@ -1551,6 +1580,27 @@ impl OmniDevServer {
         )
         .await
         .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: delete a JIRA comment.
+    #[tool(
+        description = "Delete a JIRA comment (identified by `key` + `comment_id`; get the id \
+                       from `jira_comment` with `action = \"list\"`). Irreversible: pass \
+                       `confirm: true` to authorise — without it the tool refuses and makes no \
+                       API call. To change a comment's text instead of removing it use \
+                       `jira_comment_edit`. Mirrors `omni-dev atlassian jira comment delete`. \
+                       Returns a short status line."
+    )]
+    pub async fn jira_comment_delete(
+        &self,
+        Parameters(params): Parameters<JiraCommentDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text =
+            run_jira_comment_delete(&client, &params.key, &params.comment_id, params.confirm)
+                .await
+                .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -4140,6 +4190,51 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
+    // ── run_jira_comment_delete ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_comment_delete_without_confirm_refuses() {
+        // No confirm → no API call (a live call to 127.0.0.1:1 would fail).
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_comment_delete(&client, "PROJ-1", "100", false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete comment 100 on PROJ-1"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_delete_with_confirm_deletes() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let out = run_jira_comment_delete(&client, "PROJ-1", "100", true)
+            .await
+            .unwrap();
+        assert!(out.contains("Deleted comment 100 on PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_delete_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/9999"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_comment_delete(&client, "PROJ-1", "9999", true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
     // ── run_jira_comment_edit ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -4210,6 +4305,32 @@ mod tests {
                 body: None,
                 body_path: Some(path.to_str().unwrap().to_string()),
                 visibility: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    /// Drives the `jira_comment_delete` handler end-to-end through
+    /// `create_client()` — the `run_jira_comment_delete` helper is unit-tested
+    /// above, but the thin `#[tool]` wrapper was uncovered (#1117).
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_comment_delete_handler_success_via_mock() {
+        let _lock = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let result = OmniDevServer::new()
+            .jira_comment_delete(Parameters(JiraCommentDeleteParams {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                confirm: true,
             }))
             .await
             .unwrap();

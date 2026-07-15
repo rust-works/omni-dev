@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::jira_types::JiraProjectVersionList;
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -23,6 +24,14 @@ pub enum VersionSubcommands {
     List(ListCommand),
     /// Creates a new project version (mirrors the `jira_version_create` MCP tool).
     Create(CreateCommand),
+    /// Marks a version as released (mirrors the `jira_version_release` MCP tool).
+    Release(ReleaseCommand),
+    /// Archives a version (mirrors the `jira_version_archive` MCP tool).
+    Archive(ArchiveCommand),
+    /// Renames a version (mirrors the `jira_version_rename` MCP tool).
+    Rename(RenameCommand),
+    /// Deletes a version (mirrors the `jira_version_delete` MCP tool).
+    Delete(DeleteCommand),
 }
 
 impl VersionCommand {
@@ -31,6 +40,10 @@ impl VersionCommand {
         match self.command {
             VersionSubcommands::List(cmd) => cmd.execute().await,
             VersionSubcommands::Create(cmd) => cmd.execute().await,
+            VersionSubcommands::Release(cmd) => cmd.execute().await,
+            VersionSubcommands::Archive(cmd) => cmd.execute().await,
+            VersionSubcommands::Rename(cmd) => cmd.execute().await,
+            VersionSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 
@@ -42,6 +55,10 @@ impl VersionCommand {
         match self.command {
             VersionSubcommands::List(cmd) => cmd.execute_with(client).await,
             VersionSubcommands::Create(cmd) => cmd.execute_with(client).await,
+            VersionSubcommands::Release(cmd) => cmd.execute_with(client).await,
+            VersionSubcommands::Archive(cmd) => cmd.execute_with(client).await,
+            VersionSubcommands::Rename(cmd) => cmd.execute_with(client).await,
+            VersionSubcommands::Delete(cmd) => cmd.execute_with(client).await,
         }
     }
 }
@@ -150,6 +167,187 @@ impl CreateCommand {
             self.archived,
         )
         .await
+    }
+}
+
+/// Marks a project version as released.
+#[derive(Parser)]
+pub struct ReleaseCommand {
+    /// Version ID (from `version list`).
+    pub version_id: String,
+
+    /// Release date (ISO 8601, "YYYY-MM-DD"). Defaults to leaving it unset.
+    #[arg(long)]
+    pub release_date: Option<String>,
+}
+
+impl ReleaseCommand {
+    /// Releases the version.
+    pub async fn execute(self) -> Result<()> {
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam).
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
+        client
+            .update_project_version(
+                &self.version_id,
+                None,
+                None,
+                Some(true),
+                self.release_date.as_deref(),
+                None,
+                None,
+            )
+            .await?;
+        println!("Released version {}.", self.version_id);
+        Ok(())
+    }
+}
+
+/// Archives a project version.
+#[derive(Parser)]
+pub struct ArchiveCommand {
+    /// Version ID (from `version list`).
+    pub version_id: String,
+}
+
+impl ArchiveCommand {
+    /// Archives the version.
+    pub async fn execute(self) -> Result<()> {
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam).
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
+        client
+            .update_project_version(&self.version_id, None, None, None, None, Some(true), None)
+            .await?;
+        println!("Archived version {}.", self.version_id);
+        Ok(())
+    }
+}
+
+/// Renames (and optionally re-describes) a project version.
+#[derive(Parser)]
+pub struct RenameCommand {
+    /// Version ID (from `version list`).
+    pub version_id: String,
+
+    /// New version name.
+    pub name: String,
+
+    /// New description (optional).
+    #[arg(long)]
+    pub description: Option<String>,
+}
+
+impl RenameCommand {
+    /// Renames the version.
+    pub async fn execute(self) -> Result<()> {
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam).
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
+        client
+            .update_project_version(
+                &self.version_id,
+                Some(&self.name),
+                self.description.as_deref(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        println!("Renamed version {} to {}.", self.version_id, self.name);
+        Ok(())
+    }
+}
+
+/// Deletes a project version.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// Version ID (from `version list`).
+    pub version_id: String,
+
+    /// Reassign the `fixVersion` of affected issues to this version id before
+    /// deleting (otherwise the references are simply dropped).
+    #[arg(long)]
+    pub move_fix_issues_to: Option<String>,
+
+    /// Reassign the `affectedVersion` of affected issues to this version id
+    /// before deleting.
+    #[arg(long)]
+    pub move_affected_issues_to: Option<String>,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Deletes the version.
+    pub async fn execute(self) -> Result<()> {
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam), with the
+    /// default stdin/stdout for the confirmation prompt.
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        let mut writer = std::io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn std::io::BufRead + Send),
+        writer: &mut (dyn std::io::Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format!("Delete version {}? [y/N] ", self.version_id);
+            let dry_run_message = format!("Would delete version {}.", self.version_id);
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
+        client
+            .delete_project_version(
+                &self.version_id,
+                self.move_fix_issues_to.as_deref(),
+                self.move_affected_issues_to.as_deref(),
+            )
+            .await?;
+        writeln!(writer, "Deleted version {}.", self.version_id)?;
+
+        Ok(())
     }
 }
 
@@ -409,6 +607,53 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, VersionSubcommands::Create(_)));
+    }
+
+    #[test]
+    fn version_command_release_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Release(ReleaseCommand {
+                version_id: "100".to_string(),
+                release_date: None,
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::Release(_)));
+    }
+
+    #[test]
+    fn version_command_archive_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Archive(ArchiveCommand {
+                version_id: "100".to_string(),
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::Archive(_)));
+    }
+
+    #[test]
+    fn version_command_rename_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Rename(RenameCommand {
+                version_id: "100".to_string(),
+                name: "2.0".to_string(),
+                description: None,
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::Rename(_)));
+    }
+
+    #[test]
+    fn version_command_delete_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Delete(DeleteCommand {
+                version_id: "100".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                force: false,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::Delete(_)));
     }
 
     // ── run_* version functions ────────────────────────────────────
@@ -685,5 +930,299 @@ mod tests {
         };
         let client = create_client_from(mock_credentials(&server.uri()));
         assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_release_dispatches_through_client() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/100"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "100", "name": "1.0"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Release(ReleaseCommand {
+                version_id: "100".to_string(),
+                release_date: Some("2026-04-16".to_string()),
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_rename_dispatches_through_client() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/100"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "100", "name": "2.0"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Rename(RenameCommand {
+                version_id: "100".to_string(),
+                name: "2.0".to_string(),
+                description: Some("Second release".to_string()),
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    // ── VersionCommand::execute() end-to-end ───────────────────────
+    //
+    // Drives the real top-level dispatch arm *and* each subcommand's public
+    // execute() wrapper (create_client) — the `execute_with` DI-seam tests
+    // above bypass both.
+
+    fn version_put_mock() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "1.0"})),
+            )
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_release_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Release(ReleaseCommand {
+                version_id: "10000".to_string(),
+                release_date: Some("2026-06-01".to_string()),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_archive_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Archive(ArchiveCommand {
+                version_id: "10000".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_rename_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Rename(RenameCommand {
+                version_id: "10000".to_string(),
+                name: "2.0".to_string(),
+                description: None,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the wrapper's real stdin is not read.
+        VersionCommand {
+            command: VersionSubcommands::Delete(DeleteCommand {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    // ── DeleteCommand (confirm-guarded, tested via execute_with_io) ──
+
+    #[tokio::test]
+    async fn delete_version_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/100"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _) = create_client_from(mock_credentials(&server.uri())).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "100".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted version 100."));
+    }
+
+    #[tokio::test]
+    async fn delete_version_dry_run_makes_no_api_call() {
+        let (client, _) = create_client_from(mock_credentials("http://127.0.0.1:1")).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "100".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete version 100."));
+        assert!(!out.contains("Deleted version"));
+    }
+
+    /// The `Archive` arm of the `execute_with` DI-seam dispatch.
+    #[tokio::test]
+    async fn version_command_execute_with_archive_dispatches() {
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Archive(ArchiveCommand {
+                version_id: "10000".to_string(),
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    /// The `Delete` arm of the `execute_with` DI-seam dispatch (`--force`, so
+    /// the default-stdin prompt is skipped).
+    #[tokio::test]
+    async fn version_command_execute_with_delete_dispatches() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Delete(DeleteCommand {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                force: true,
+                dry_run: false,
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    /// Answering "y" takes the `GuardOutcome::Proceed` arm.
+    #[tokio::test]
+    async fn delete_version_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _) = create_client_from(mock_credentials(&server.uri())).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "10000".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete version 10000?"));
+        assert!(out.contains("Deleted version 10000."));
+    }
+
+    /// A failing writer makes the guard's `writeln` fail, covering the `?`
+    /// propagation on `guard_destructive_with_io`.
+    #[tokio::test]
+    async fn delete_version_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let (client, _) = create_client_from(mock_credentials("http://127.0.0.1:1")).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "10000".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    #[tokio::test]
+    async fn delete_version_prompt_no_makes_no_delete() {
+        let (client, _) = create_client_from(mock_credentials("http://127.0.0.1:1")).unwrap();
+        let cmd = DeleteCommand {
+            version_id: "100".to_string(),
+            move_fix_issues_to: None,
+            move_affected_issues_to: None,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted version"));
     }
 }

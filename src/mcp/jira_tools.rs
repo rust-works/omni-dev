@@ -453,6 +453,31 @@ pub(crate) async fn sprint_update_yaml(
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
+/// Parameters for the `jira_sprint_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintDeleteParams {
+    /// Sprint ID.
+    pub sprint_id: u64,
+    /// Must be `true` to authorise the irreversible delete; the tool refuses
+    /// (without calling the API) when `false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+pub(crate) async fn sprint_delete_yaml(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete sprint {sprint_id}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client.delete_sprint(sprint_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Project version tools
 // ─────────────────────────────────────────────────────────────────────────
@@ -531,6 +556,204 @@ pub(crate) async fn version_create_yaml(
         )
         .await?;
     serde_yaml::to_string(&version).context("Failed to serialize project version as YAML")
+}
+
+/// Parameters for the `jira_version_release` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionReleaseParams {
+    /// Version ID (from `jira_version_list`).
+    pub version_id: String,
+    /// Release date (ISO 8601, `YYYY-MM-DD`). Validated client-side.
+    #[serde(default)]
+    pub release_date: Option<String>,
+}
+
+/// Parameters for the `jira_version_archive` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionArchiveParams {
+    /// Version ID (from `jira_version_list`).
+    pub version_id: String,
+}
+
+/// Parameters for the `jira_version_rename` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionRenameParams {
+    /// Version ID (from `jira_version_list`).
+    pub version_id: String,
+    /// New version name.
+    pub name: String,
+    /// New description (optional).
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Parameters for the `jira_version_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionDeleteParams {
+    /// Version ID (from `jira_version_list`).
+    pub version_id: String,
+    /// Reassign the `fixVersion` of affected issues to this version id before
+    /// deleting (otherwise the references are dropped).
+    #[serde(default)]
+    pub move_fix_issues_to: Option<String>,
+    /// Reassign the `affectedVersion` of affected issues to this version id.
+    #[serde(default)]
+    pub move_affected_issues_to: Option<String>,
+    /// Must be `true` to authorise the irreversible delete; the tool refuses
+    /// (without calling the API) when `false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+pub(crate) async fn version_release_yaml(
+    client: &AtlassianClient,
+    version_id: &str,
+    release_date: Option<&str>,
+) -> Result<String> {
+    client
+        .update_project_version(version_id, None, None, Some(true), release_date, None, None)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn version_archive_yaml(
+    client: &AtlassianClient,
+    version_id: &str,
+) -> Result<String> {
+    client
+        .update_project_version(version_id, None, None, None, None, Some(true), None)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn version_rename_yaml(
+    client: &AtlassianClient,
+    version_id: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<String> {
+    client
+        .update_project_version(version_id, Some(name), description, None, None, None, None)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn version_delete_yaml(
+    client: &AtlassianClient,
+    version_id: &str,
+    move_fix_issues_to: Option<&str>,
+    move_affected_issues_to: Option<&str>,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete version {version_id}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client
+        .delete_project_version(version_id, move_fix_issues_to, move_affected_issues_to)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Component tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_component_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComponentListParams {
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+}
+
+/// Parameters for the `jira_component_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComponentCreateParams {
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+    /// Component name.
+    pub name: String,
+    /// Component description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Parameters for the `jira_component_update` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComponentUpdateParams {
+    /// Component ID (from `jira_component_list`).
+    pub component_id: String,
+    /// New name. Omit to leave unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New description. Omit to leave unchanged.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Parameters for the `jira_component_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComponentDeleteParams {
+    /// Component ID (from `jira_component_list`).
+    pub component_id: String,
+    /// Reassign issues referencing this component to this component id before
+    /// deleting (otherwise the references are dropped).
+    #[serde(default)]
+    pub move_issues_to: Option<String>,
+    /// Must be `true` to authorise the irreversible delete; the tool refuses
+    /// (without calling the API) when `false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+pub(crate) async fn component_list_yaml(client: &AtlassianClient, project: &str) -> Result<String> {
+    let components = client.get_project_components(project).await?;
+    serde_yaml::to_string(&components).context("Failed to serialize components as YAML")
+}
+
+pub(crate) async fn component_create_yaml(
+    client: &AtlassianClient,
+    project: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<String> {
+    let component = client.create_component(project, name, description).await?;
+    serde_yaml::to_string(&component).context("Failed to serialize component as YAML")
+}
+
+pub(crate) async fn component_update_yaml(
+    client: &AtlassianClient,
+    component_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<String> {
+    if name.is_none() && description.is_none() {
+        return Err(anyhow!(
+            "Nothing to update: supply at least one of `name` or `description`."
+        ));
+    }
+    client
+        .update_component(component_id, name, description)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn component_delete_yaml(
+    client: &AtlassianClient,
+    component_id: &str,
+    move_issues_to: Option<&str>,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete component {component_id}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client
+        .delete_component(component_id, move_issues_to)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -677,6 +900,105 @@ pub(crate) async fn link_remote_list_yaml(client: &AtlassianClient, key: &str) -
     serde_yaml::to_string(&links).context("Failed to serialize remote issue links as YAML")
 }
 
+/// Parameters for the `jira_link_remote_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkRemoteCreateParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// External URL to link to.
+    pub url: String,
+    /// Link title (display text).
+    pub title: String,
+    /// Optional summary shown under the title.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Optional relationship label (e.g., `relates to`).
+    #[serde(default)]
+    pub relationship: Option<String>,
+    /// Optional global id — reusing an existing one updates that link rather
+    /// than creating a duplicate.
+    #[serde(default)]
+    pub global_id: Option<String>,
+    /// When true, validate and return the would-be request without creating
+    /// the link. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Parameters for the `jira_link_remote_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkRemoteDeleteParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Remote link ID to delete (from `jira_link_remote_list`).
+    pub link_id: String,
+    /// Must be `true` — destructive guard.
+    pub confirm: bool,
+    /// When true, preview the request without deleting (and without requiring
+    /// `confirm`). Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn link_remote_create_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    url: &str,
+    title: &str,
+    summary: Option<&str>,
+    relationship: Option<&str>,
+    global_id: Option<&str>,
+    dry_run: bool,
+) -> Result<String> {
+    if dry_run {
+        let mut object = serde_json::json!({ "url": url, "title": title });
+        if let Some(s) = summary {
+            object["summary"] = serde_json::Value::String(s.to_string());
+        }
+        let mut body = serde_json::json!({ "object": object });
+        if let Some(r) = relationship {
+            body["relationship"] = serde_json::Value::String(r.to_string());
+        }
+        if let Some(g) = global_id {
+            body["globalId"] = serde_json::Value::String(g.to_string());
+        }
+        return dry_run_request_yaml(
+            "POST",
+            format!("/rest/api/3/issue/{key}/remotelink"),
+            Some(body),
+        );
+    }
+    let id = client
+        .create_remote_issue_link(key, url, title, summary, relationship, global_id)
+        .await?;
+    serde_yaml::to_string(&serde_json::json!({ "status": "ok", "id": id }))
+        .context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn link_remote_delete_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    link_id: &str,
+    confirm: bool,
+    dry_run: bool,
+) -> Result<String> {
+    if dry_run {
+        return dry_run_request_yaml(
+            "DELETE",
+            format!("/rest/api/3/issue/{key}/remotelink/{link_id}"),
+            None,
+        );
+    }
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete remote link {link_id} on {key}: pass `confirm: true` to authorise this destructive operation."
+        ));
+    }
+    client.delete_remote_issue_link(key, link_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
 /// Parameters for the `jira_link_create` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LinkCreateParams {
@@ -782,6 +1104,37 @@ pub(crate) async fn worklog_list_yaml(
     serde_yaml::to_string(&result).context("Failed to serialize worklogs as YAML")
 }
 
+/// Parameters for the `jira_worklog_update` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorklogUpdateParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Worklog ID to update (from `jira_worklog_list`).
+    pub worklog_id: String,
+    /// New time spent (e.g., `1h 30m`, `2d`). Omit to leave unchanged.
+    #[serde(default)]
+    pub time_spent: Option<String>,
+    /// New ISO 8601 start timestamp. Omit to leave unchanged.
+    #[serde(default)]
+    pub started: Option<String>,
+    /// New plain-text comment. Omit to leave unchanged.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Parameters for the `jira_worklog_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorklogDeleteParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Worklog ID to delete (from `jira_worklog_list`).
+    pub worklog_id: String,
+    /// Must be `true` to authorise the irreversible delete; the tool refuses
+    /// (without calling the API) when `false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 pub(crate) async fn worklog_add_yaml(
     client: &AtlassianClient,
     key: &str,
@@ -792,6 +1145,77 @@ pub(crate) async fn worklog_add_yaml(
     client
         .add_worklog(key, time_spent, started, comment)
         .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn worklog_update_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    worklog_id: &str,
+    time_spent: Option<&str>,
+    started: Option<&str>,
+    comment: Option<&str>,
+) -> Result<String> {
+    if time_spent.is_none() && started.is_none() && comment.is_none() {
+        return Err(anyhow!(
+            "Nothing to update: supply at least one of `time_spent`, `started`, or `comment`."
+        ));
+    }
+    client
+        .update_worklog(key, worklog_id, time_spent, started, comment)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn worklog_delete_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    worklog_id: &str,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete worklog {worklog_id} on {key}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client.delete_worklog(key, worklog_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Label tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_label_add` / `jira_label_remove` tools.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LabelMutateParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Labels to add or remove. JIRA labels cannot contain spaces.
+    pub labels: Vec<String>,
+}
+
+pub(crate) async fn label_add_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    labels: &[String],
+) -> Result<String> {
+    if labels.is_empty() {
+        return Err(anyhow!("No labels supplied."));
+    }
+    client.modify_issue_labels(key, labels, &[]).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn label_remove_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    labels: &[String],
+) -> Result<String> {
+    if labels.is_empty() {
+        return Err(anyhow!("No labels supplied."));
+    }
+    client.modify_issue_labels(key, &[], labels).await?;
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
@@ -1246,6 +1670,25 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
+    /// Tool: delete a sprint.
+    #[tool(
+        description = "Delete a JIRA sprint (by `sprint_id`). Irreversible: pass `confirm: true` \
+                       to authorise — without it the tool refuses and makes no API call. Returns \
+                       YAML `{status: ok}`. Mirrors `omni-dev atlassian jira sprint delete`."
+    )]
+    pub async fn jira_sprint_delete(
+        &self,
+        Parameters(params): Parameters<SprintDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_delete_yaml(&client, params.sprint_id, params.confirm).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
     // ── project versions ───────────────────────────────────────────
 
     /// Tool: list project versions.
@@ -1288,6 +1731,196 @@ impl OmniDevServer {
                 params.start_date.as_deref(),
                 params.released,
                 params.archived,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: mark a project version as released.
+    #[tool(
+        description = "Mark a JIRA project version as released (by `version_id` from \
+                       `jira_version_list`). Optional `release_date` (`YYYY-MM-DD`, validated \
+                       client-side). Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian \
+                       jira version release`."
+    )]
+    pub async fn jira_version_release(
+        &self,
+        Parameters(params): Parameters<VersionReleaseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_release_yaml(&client, &params.version_id, params.release_date.as_deref()).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: archive a project version.
+    #[tool(
+        description = "Archive a JIRA project version (by `version_id` from `jira_version_list`). \
+                       Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira version \
+                       archive`."
+    )]
+    pub async fn jira_version_archive(
+        &self,
+        Parameters(params): Parameters<VersionArchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_archive_yaml(&client, &params.version_id).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: rename a project version.
+    #[tool(
+        description = "Rename a JIRA project version (by `version_id` from `jira_version_list`), \
+                       optionally updating its `description`. Returns YAML `{status: ok}`. \
+                       Mirrors `omni-dev atlassian jira version rename`."
+    )]
+    pub async fn jira_version_rename(
+        &self,
+        Parameters(params): Parameters<VersionRenameParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_rename_yaml(
+                &client,
+                &params.version_id,
+                &params.name,
+                params.description.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: delete a project version.
+    #[tool(
+        description = "Delete a JIRA project version (by `version_id` from `jira_version_list`). \
+                       Optionally reassign affected issues first via `move_fix_issues_to` / \
+                       `move_affected_issues_to` (target version ids). Irreversible: pass \
+                       `confirm: true` to authorise — without it the tool refuses and makes no \
+                       API call. Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira \
+                       version delete`."
+    )]
+    pub async fn jira_version_delete(
+        &self,
+        Parameters(params): Parameters<VersionDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_delete_yaml(
+                &client,
+                &params.version_id,
+                params.move_fix_issues_to.as_deref(),
+                params.move_affected_issues_to.as_deref(),
+                params.confirm,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── components ─────────────────────────────────────────────────
+
+    /// Tool: list a project's components.
+    #[tool(
+        description = "List a JIRA project's components. Returns YAML. Mirrors `omni-dev \
+                       atlassian jira component list`."
+    )]
+    pub async fn jira_component_list(
+        &self,
+        Parameters(params): Parameters<ComponentListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            component_list_yaml(&client, &params.project).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: create a project component.
+    #[tool(
+        description = "Create a JIRA project component (`project`, `name`, optional \
+                       `description`). Returns YAML for the created component. Mirrors \
+                       `omni-dev atlassian jira component create`."
+    )]
+    pub async fn jira_component_create(
+        &self,
+        Parameters(params): Parameters<ComponentCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            component_create_yaml(
+                &client,
+                &params.project,
+                &params.name,
+                params.description.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: update a component's name/description.
+    #[tool(
+        description = "Update a JIRA component's `name` and/or `description` (by `component_id` \
+                       from `jira_component_list`; supply at least one field). Returns YAML \
+                       `{status: ok}`. Mirrors `omni-dev atlassian jira component update`."
+    )]
+    pub async fn jira_component_update(
+        &self,
+        Parameters(params): Parameters<ComponentUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            component_update_yaml(
+                &client,
+                &params.component_id,
+                params.name.as_deref(),
+                params.description.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: delete a component.
+    #[tool(
+        description = "Delete a JIRA component (by `component_id` from `jira_component_list`). \
+                       Optionally reassign referencing issues via `move_issues_to`. \
+                       Irreversible: pass `confirm: true` to authorise — without it the tool \
+                       refuses and makes no API call. Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira component delete`."
+    )]
+    pub async fn jira_component_delete(
+        &self,
+        Parameters(params): Parameters<ComponentDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            component_delete_yaml(
+                &client,
+                &params.component_id,
+                params.move_issues_to.as_deref(),
+                params.confirm,
             )
             .await
         })
@@ -1443,6 +2076,67 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
+    /// Tool: add a remote (external URL) link to an issue.
+    #[tool(
+        description = "Add a remote (external URL) link to a JIRA issue — pointing out to a \
+                       non-JIRA resource. `url` and `title` are required; `summary`, \
+                       `relationship`, and `global_id` are optional (reusing an existing \
+                       `global_id` updates that link instead of duplicating it). Returns YAML \
+                       `{status: ok, id}`. Set `dry_run: true` to preview the request without \
+                       creating it. Mirrors `omni-dev atlassian jira link remote create`."
+    )]
+    pub async fn jira_link_remote_create(
+        &self,
+        Parameters(params): Parameters<LinkRemoteCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_remote_create_yaml(
+                &client,
+                &params.key,
+                &params.url,
+                &params.title,
+                params.summary.as_deref(),
+                params.relationship.as_deref(),
+                params.global_id.as_deref(),
+                params.dry_run,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: delete a remote (external URL) link from an issue.
+    #[tool(
+        description = "Delete a remote (external URL) link from a JIRA issue (by `key` + \
+                       `link_id` from `jira_link_remote_list`). Irreversible: pass \
+                       `confirm: true` to authorise — without it the tool refuses and makes no \
+                       API call. Set `dry_run: true` to preview the request without deleting \
+                       (and without requiring `confirm`). Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira link remote delete`."
+    )]
+    pub async fn jira_link_remote_delete(
+        &self,
+        Parameters(params): Parameters<LinkRemoteDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_remote_delete_yaml(
+                &client,
+                &params.key,
+                &params.link_id,
+                params.confirm,
+                params.dry_run,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
     /// Tool: create a typed link between two issues.
     #[tool(
         description = "Create a typed link between two JIRA issues (e.g. `Blocks`, \
@@ -1537,6 +2231,96 @@ impl OmniDevServer {
                 params.comment.as_deref(),
             )
             .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: edit a worklog entry on an issue.
+    #[tool(
+        description = "Edit an existing JIRA worklog (by `key` + `worklog_id`; get the id from \
+                       `jira_worklog_list`). Supply at least one of `time_spent` (JIRA duration, \
+                       e.g. `1h 30m`), `started` (ISO 8601), or `comment`; omitted fields keep \
+                       their current value. Returns YAML `{status: ok}`. Mirrors `omni-dev \
+                       atlassian jira worklog edit`."
+    )]
+    pub async fn jira_worklog_update(
+        &self,
+        Parameters(params): Parameters<WorklogUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            worklog_update_yaml(
+                &client,
+                &params.key,
+                &params.worklog_id,
+                params.time_spent.as_deref(),
+                params.started.as_deref(),
+                params.comment.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: delete a worklog entry from an issue.
+    #[tool(
+        description = "Delete a JIRA worklog (by `key` + `worklog_id`; get the id from \
+                       `jira_worklog_list`). Irreversible: pass `confirm: true` to authorise — \
+                       without it the tool refuses and makes no API call. Returns YAML \
+                       `{status: ok}`. Mirrors `omni-dev atlassian jira worklog delete`."
+    )]
+    pub async fn jira_worklog_delete(
+        &self,
+        Parameters(params): Parameters<WorklogDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            worklog_delete_yaml(&client, &params.key, &params.worklog_id, params.confirm).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── labels ─────────────────────────────────────────────────────
+
+    /// Tool: add labels to an issue incrementally.
+    #[tool(
+        description = "Add one or more labels to a JIRA issue incrementally (leaves the issue's \
+                       other labels untouched, unlike `jira_edit` with a full `labels` array). \
+                       JIRA labels cannot contain spaces. Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira label add`."
+    )]
+    pub async fn jira_label_add(
+        &self,
+        Parameters(params): Parameters<LabelMutateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            label_add_yaml(&client, &params.key, &params.labels).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: remove labels from an issue incrementally.
+    #[tool(
+        description = "Remove one or more labels from a JIRA issue incrementally (leaves the \
+                       issue's other labels untouched). Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira label remove`."
+    )]
+    pub async fn jira_label_remove(
+        &self,
+        Parameters(params): Parameters<LabelMutateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            label_remove_yaml(&client, &params.key, &params.labels).await
         })
         .await
         .map_err(tool_error)?;
@@ -2315,6 +3099,28 @@ mod tests {
         assert!(err.to_string().contains("404"));
     }
 
+    #[tokio::test]
+    async fn sprint_delete_yaml_without_confirm_refuses() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = sprint_delete_yaml(&client, 42, false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete sprint 42"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn sprint_delete_yaml_with_confirm_deletes() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/agile/1.0/sprint/42"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_delete_yaml(&client, 42, true).await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
     // ── project versions ───────────────────────────────────────────
 
     #[tokio::test]
@@ -2440,6 +3246,151 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("YYYY-MM-DD"));
+    }
+
+    #[tokio::test]
+    async fn version_release_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_release_yaml(&client, "100", Some("2026-06-01"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn version_archive_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_archive_yaml(&client, "100").await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn version_rename_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_rename_yaml(&client, "100", "2.0", Some("desc"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn version_delete_yaml_without_confirm_refuses() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = version_delete_yaml(&client, "100", None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete version 100"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn version_delete_yaml_with_confirm_deletes() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/version/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_delete_yaml(&client, "100", None, None, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    // ── components ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn component_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/PROJ/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "1", "name": "Backend"}
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = component_list_yaml(&client, "PROJ").await.unwrap();
+        assert!(yaml.contains("Backend"));
+    }
+
+    #[tokio::test]
+    async fn component_create_yaml_returns_component() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/component"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "1", "name": "Backend"})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = component_create_yaml(&client, "PROJ", "Backend", None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Backend"));
+    }
+
+    #[tokio::test]
+    async fn component_update_yaml_without_fields_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = component_update_yaml(&client, "1", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Nothing to update"));
+    }
+
+    #[tokio::test]
+    async fn component_delete_yaml_without_confirm_refuses() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = component_delete_yaml(&client, "1", None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete component 1"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn component_delete_yaml_with_confirm_deletes() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/component/1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = component_delete_yaml(&client, "1", None, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
     }
 
     // ── watchers ───────────────────────────────────────────────────
@@ -2631,6 +3582,111 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = link_remote_list_yaml(&client, "NOPE-1").await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_create_yaml_returns_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_remote_create_yaml(
+            &client,
+            "PROJ-1",
+            "https://x/doc",
+            "Doc",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("ok"));
+        assert!(yaml.contains("10010"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_create_yaml_dry_run_previews_without_api() {
+        // No mock: a real POST would fail the connection.
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_remote_create_yaml(
+            &client,
+            "PROJ-1",
+            "https://x/doc",
+            "Doc",
+            Some("s"),
+            Some("relates to"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("POST"));
+        assert!(yaml.contains("/rest/api/3/issue/PROJ-1/remotelink"));
+    }
+
+    /// The dry-run preview includes the optional `globalId` / `summary` /
+    /// `relationship` fields when supplied.
+    #[tokio::test]
+    async fn link_remote_create_yaml_dry_run_includes_global_id() {
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_remote_create_yaml(
+            &client,
+            "PROJ-1",
+            "https://x/doc",
+            "Doc",
+            Some("summary text"),
+            Some("relates to"),
+            Some("sys=example/doc"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("globalId"));
+        assert!(yaml.contains("sys=example/doc"));
+        assert!(yaml.contains("relates to"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_delete_yaml_requires_confirm_true() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = link_remote_delete_yaml(&client, "PROJ-1", "10010", false, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete remote link 10010 on PROJ-1"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_delete_yaml_with_confirm_calls_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink/10010"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_remote_delete_yaml(&client, "PROJ-1", "10010", true, false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_delete_yaml_dry_run_previews_without_confirm_or_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_remote_delete_yaml(&client, "PROJ-1", "10010", false, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("DELETE"));
+        assert!(yaml.contains("/rest/api/3/issue/PROJ-1/remotelink/10010"));
     }
 
     #[tokio::test]
@@ -2880,6 +3936,110 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn worklog_update_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = worklog_update_yaml(&client, "PROJ-1", "100", Some("2h"), None, None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn worklog_update_yaml_without_fields_errors_before_call() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = worklog_update_yaml(&client, "PROJ-1", "100", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Nothing to update"));
+    }
+
+    #[tokio::test]
+    async fn worklog_delete_yaml_without_confirm_refuses() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = worklog_delete_yaml(&client, "PROJ-1", "100", false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete worklog 100 on PROJ-1"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn worklog_delete_yaml_with_confirm_deletes() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = worklog_delete_yaml(&client, "PROJ-1", "100", true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    // ── labels ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn label_add_yaml_sends_update_verb() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "update": {"labels": [{"add": "backend"}]}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = label_add_yaml(&client, "PROJ-1", &["backend".to_string()])
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn label_remove_yaml_sends_update_verb() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "update": {"labels": [{"remove": "stale"}]}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = label_remove_yaml(&client, "PROJ-1", &["stale".to_string()])
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn label_add_yaml_empty_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = label_add_yaml(&client, "PROJ-1", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("No labels"));
+    }
+
+    #[tokio::test]
+    async fn label_remove_yaml_empty_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = label_remove_yaml(&client, "PROJ-1", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("No labels"));
     }
 
     // ── fields ─────────────────────────────────────────────────────
@@ -3227,6 +4387,344 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = delete_yaml(&client, "PROJ-1", true).await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    // ── #[tool] handler wrappers (create_client boundary) ──────────
+    //
+    // The `*_yaml` helpers above are unit-tested directly; these drive the
+    // thin `#[tool]` wrappers end-to-end through `create_client()` (env +
+    // wiremock), covering the param-unpacking + result-wrapping glue.
+
+    /// Points credentials at `server` and returns both the env guard and the
+    /// redirected-`HOME` tempdir; the caller binds both so they stay alive for
+    /// the handler call.
+    fn handler_env(
+        server: &MockServer,
+    ) -> (
+        crate::atlassian::auth::test_util::EnvGuard,
+        tempfile::TempDir,
+    ) {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let home = guard.set_credentials(&server.uri());
+        (guard, home)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_worklog_update_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_worklog_update(Parameters(WorklogUpdateParams {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                time_spent: Some("2h".to_string()),
+                started: None,
+                comment: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_worklog_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_worklog_delete(Parameters(WorklogDeleteParams {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_release_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_release(Parameters(VersionReleaseParams {
+                version_id: "10000".to_string(),
+                release_date: Some("2026-06-01".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_archive_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_archive(Parameters(VersionArchiveParams {
+                version_id: "10000".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_rename_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "10000"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_rename(Parameters(VersionRenameParams {
+                version_id: "10000".to_string(),
+                name: "2.0".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_version_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/version/10000"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_version_delete(Parameters(VersionDeleteParams {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_link_remote_create_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_link_remote_create(Parameters(LinkRemoteCreateParams {
+                key: "PROJ-1".to_string(),
+                url: "https://x/doc".to_string(),
+                title: "Doc".to_string(),
+                summary: None,
+                relationship: None,
+                global_id: None,
+                dry_run: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_link_remote_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink/10010"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_link_remote_delete(Parameters(LinkRemoteDeleteParams {
+                key: "PROJ-1".to_string(),
+                link_id: "10010".to_string(),
+                confirm: true,
+                dry_run: false,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_sprint_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/agile/1.0/sprint/42"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_sprint_delete(Parameters(SprintDeleteParams {
+                sprint_id: 42,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_label_add_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_label_add(Parameters(LabelMutateParams {
+                key: "PROJ-1".to_string(),
+                labels: vec!["backend".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_label_remove_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_label_remove(Parameters(LabelMutateParams {
+                key: "PROJ-1".to_string(),
+                labels: vec!["stale".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_list_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/PROJ/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "10000", "name": "Backend"}
+            ])))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_list(Parameters(ComponentListParams {
+                project: "PROJ".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_create_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/component"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "Backend"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_create(Parameters(ComponentCreateParams {
+                project: "PROJ".to_string(),
+                name: "Backend".to_string(),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_update_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/component/10000"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "Renamed"})),
+            )
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_update(Parameters(ComponentUpdateParams {
+                component_id: "10000".to_string(),
+                name: Some("Renamed".to_string()),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_component_delete_handler_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/component/10000"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_g, _home) = handler_env(&server);
+        let r = OmniDevServer::new()
+            .jira_component_delete(Parameters(ComponentDeleteParams {
+                component_id: "10000".to_string(),
+                move_issues_to: None,
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!r.is_error.unwrap_or(false));
     }
 
     // ── small util ─────────────────────────────────────────────────
