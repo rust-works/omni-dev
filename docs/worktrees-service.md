@@ -301,6 +301,46 @@ is absent it offers to install it or copy the PR URL.
 - **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) gates
   the badge and its `gh` lookups entirely.
 
+## Workspace Trust (Restricted Mode)
+
+When the daemon opens a worktree folder VS Code has never seen before — the tray
+focus action, the tree view's double-click, or the `open` op, all of which run
+`code <folder>` — the new window starts in **Restricted Mode** behind VS Code's
+[Workspace Trust](https://code.visualstudio.com/docs/editing/workspaces/workspace-trust)
+gate. The worktrees workflow (many short-lived per-branch worktrees) hits this
+prompt constantly. Trust is decided by the VS Code workbench purely from the
+folder path against a per-user trusted-folders list, **independent of how the
+folder is opened**, so the launcher cannot influence it (#1297).
+
+**Recommended: trust the worktree parent folder once.** Trigger the trust prompt
+for your worktree root (e.g. `~/wrk/work-trees`) and choose to trust the **parent
+folder**, or add it under *Manage Workspace Trust → Trusted Folders*. VS Code
+trusts a folder together with all of its subfolders, so **every future worktree
+window — including every daemon-spawned one — opens trusted** with no further
+prompt. This is a one-time UI action and the only robust, supported route today.
+
+Two approaches that look like a launcher-side fix are deliberately **not** taken,
+with the reasons recorded so they are not re-proposed
+([ADR-0051](adrs/adr-0051.md)):
+
+- **`code --disable-workspace-trust <folder>`** — a real (but `--help`-hidden)
+  flag. It is **session-only** ("only affects the current session") and, once a
+  VS Code instance is already running, `code <folder>` **forwards the open to
+  that resident instance**, which never received the switch — so the flag is a
+  no-op in the daemon's normal "windows already open" state. Verified on VS Code
+  1.128.0: a folder opened this way while other windows were open still landed in
+  Restricted Mode. Shipping it behind an opt-in env would offer a false sense of a
+  fix, so the launcher does not pass it.
+- **Pre-seeding the global trust store** (`state.vscdb` → `ItemTable` key
+  `content.trust.model.key`) genuinely trusts a path, but the write only sticks
+  while VS Code is **fully quit** (the in-memory cache clobbers external writes on
+  flush) and the internal schema is version-fragile, so the daemon does not touch
+  it.
+
+No supported declarative "default trusted folders" mechanism exists yet; upstream
+[microsoft/vscode#291933](https://github.com/microsoft/vscode/issues/291933)
+tracks one.
+
 ## Status
 
 `omni-dev daemon status` includes the service:
