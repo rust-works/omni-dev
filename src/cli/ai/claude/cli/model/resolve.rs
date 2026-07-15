@@ -180,13 +180,33 @@ struct ResolvedDefaults {
     haiku: String,
 }
 
+/// Fallback model for the `opus` alias when `ANTHROPIC_DEFAULT_OPUS_MODEL` is
+/// unset. See [`resolve_defaults`] for why the exact string matters.
+const DEFAULT_OPUS_MODEL: &str = "claude-opus-4-8";
+/// Fallback model for the `sonnet` alias when `ANTHROPIC_DEFAULT_SONNET_MODEL`
+/// is unset. See [`resolve_defaults`].
+const DEFAULT_SONNET_MODEL: &str = "claude-sonnet-5";
+/// Fallback model for the `haiku` alias when `ANTHROPIC_DEFAULT_HAIKU_MODEL` is
+/// unset. See [`resolve_defaults`].
+const DEFAULT_HAIKU_MODEL: &str = "claude-haiku-4-5";
+
+/// Per-family fallbacks for the `opus` / `sonnet` / `haiku` aliases.
+///
+/// Every value must exist verbatim as an `api_identifier` in
+/// `src/templates/models.yaml`. Identifier resolution is exact-match plus a
+/// narrow normalization that will not map one spelling onto another, so an ID
+/// that is merely *plausible* still misses the registry and silently inherits
+/// the provider's fallback limits instead of the model's real ones — which is
+/// exactly what `claude-haiku-4-5` did before it gained an entry (#1334).
+/// `defaults_are_registered` guards this.
 fn resolve_defaults() -> ResolvedDefaults {
     ResolvedDefaults {
-        opus: env::var("ANTHROPIC_DEFAULT_OPUS_MODEL").unwrap_or_else(|_| "claude-opus-4-6".into()),
+        opus: env::var("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            .unwrap_or_else(|_| DEFAULT_OPUS_MODEL.into()),
         sonnet: env::var("ANTHROPIC_DEFAULT_SONNET_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+            .unwrap_or_else(|_| DEFAULT_SONNET_MODEL.into()),
         haiku: env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL")
-            .unwrap_or_else(|_| "claude-haiku-4-5".into()),
+            .unwrap_or_else(|_| DEFAULT_HAIKU_MODEL.into()),
     }
 }
 
@@ -611,6 +631,35 @@ fn build_resolution_report() -> Result<ResolutionReport> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The shipped alias fallbacks must be real registry identifiers.
+    ///
+    /// The rest of this module builds `ResolvedDefaults` from literals to
+    /// exercise `expand_alias`'s mapping logic, which means nothing otherwise
+    /// checks the strings this binary actually ships. That gap is what let
+    /// `claude-haiku-4-5` sit here while no such `api_identifier` existed:
+    /// resolution missed, and the alias silently resolved to the provider's
+    /// 4096-token fallback instead of the model's real 64000 (#1334). Assert
+    /// against the registry rather than a hard-coded expectation, so this stays
+    /// true as the lineup moves.
+    #[test]
+    fn defaults_are_registered() {
+        let registry = crate::claude::model_config::get_model_registry();
+
+        for (env_var, model) in [
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", DEFAULT_OPUS_MODEL),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", DEFAULT_SONNET_MODEL),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", DEFAULT_HAIKU_MODEL),
+        ] {
+            assert!(
+                registry.get_model_spec(model).is_some(),
+                "{env_var} falls back to '{model}', which is not an \
+                 api_identifier in src/templates/models.yaml — the alias would \
+                 silently inherit the provider's fallback limits. Add an entry \
+                 for it, or point the fallback at a registered identifier."
+            );
+        }
+    }
 
     #[test]
     fn expand_alias_sonnet() {

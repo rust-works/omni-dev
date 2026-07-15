@@ -891,8 +891,8 @@ impl AiClient for ClaudeCliAiClient {
 fn resolve_alias(model: &str) -> String {
     match model {
         "haiku" => "claude-haiku-4-5-20251001".to_string(),
-        "sonnet" => "claude-sonnet-4-6".to_string(),
-        "opus" => "claude-opus-4-6".to_string(),
+        "sonnet" => "claude-sonnet-5".to_string(),
+        "opus" => "claude-opus-4-8".to_string(),
         other => other.to_string(),
     }
 }
@@ -1979,8 +1979,8 @@ mod tests {
     #[test]
     fn resolve_alias_known() {
         assert_eq!(resolve_alias("haiku"), "claude-haiku-4-5-20251001");
-        assert_eq!(resolve_alias("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(resolve_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_alias("sonnet"), "claude-sonnet-5");
+        assert_eq!(resolve_alias("opus"), "claude-opus-4-8");
     }
 
     #[test]

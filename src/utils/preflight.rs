@@ -347,7 +347,7 @@ mod tests {
 
         let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::Claude);
-        assert_eq!(info.model, "claude-sonnet-4-6");
+        assert_eq!(info.model, "claude-sonnet-5");
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
 
         let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::Bedrock);
-        assert_eq!(info.model, "claude-sonnet-4-6");
+        assert_eq!(info.model, "claude-sonnet-5");
     }
 
     #[test]
@@ -432,7 +432,7 @@ mod tests {
 
         let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
-        assert_eq!(info.model, "claude-sonnet-4-6");
+        assert_eq!(info.model, "claude-sonnet-5");
     }
 
     #[test]
