@@ -43,6 +43,8 @@ Options:
           Path to a single user-side `models.yaml` that short-circuits the standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml` lookup. The file is still merged over the embedded catalog. Equivalent to setting `OMNI_DEV_MODELS_YAML`
       --profile <NAME>
           Selects a named credential/config profile from `~/.omni-dev/settings.json` (AWS-CLI style)
+      --instance <URL>
+          Overrides the Atlassian instance URL (e.g. `https://org.atlassian.net`) for every JIRA and Confluence command
   -C, --repo <PATH>
           Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help
@@ -284,6 +286,7 @@ Usage: auth <COMMAND>
 
 Commands:
   login   Configures Atlassian Cloud credentials interactively
+  logout  Removes Atlassian Cloud credentials from settings.json
   status  Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
@@ -298,6 +301,18 @@ omni-dev atlassian auth login - Configures Atlassian Cloud credentials interacti
 Configures Atlassian Cloud credentials interactively
 
 Usage: login
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian auth logout - Removes Atlassian Cloud credentials from settings.json
+
+Removes Atlassian Cloud credentials from settings.json
+
+Usage: logout
 
 Options:
   -h, --help  Print help
@@ -324,23 +339,26 @@ Confluence page management, search, and more
 Usage: confluence <COMMAND>
 
 Commands:
-  comment     Manages comments on a Confluence page
-  read        Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
-  write       Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
-  edit        Interactive fetch-edit-push cycle for a Confluence page
-  search      Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
-  create      Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
-  delete      Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
-  move        Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
-  label       Manages labels on Confluence pages
-  attachment  Manages attachments on Confluence pages
-  download    Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
-  children    Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
-  history     Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
-  compare     Compares two versions of a Confluence page (structural diff)
-  user        Confluence user operations
-  space       Confluence space operations
-  help        Print this message or the help of the given subcommand(s)
+  comment      Manages comments on a Confluence page
+  read         Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
+  write        Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
+  edit         Interactive fetch-edit-push cycle for a Confluence page
+  search       Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
+  create       Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
+  delete       Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
+  move         Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
+  copy         Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+  label        Manages labels on Confluence pages
+  attachment   Manages attachments on Confluence pages
+  download     Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
+  children     Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
+  history      Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
+  compare      Compares two versions of a Confluence page (structural diff)
+  user         Confluence user operations
+  space        Confluence space operations
+  watcher      Manages watchers on Confluence pages
+  restriction  Manages read/update restrictions on Confluence pages
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -356,6 +374,7 @@ Usage: attachment <COMMAND>
 
 Commands:
   upload    Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
+  update    Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
   list      Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool)
   download  Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool)
   delete    Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool)
@@ -419,6 +438,26 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence attachment update - Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
+
+Uploads a new binary version of an existing attachment (mirrors the `confluence_attachment_update` MCP tool)
+
+Usage: update [OPTIONS] <PAGE_ID> <ATTACHMENT_ID> <FILE>
+
+Arguments:
+  <PAGE_ID>        Confluence page ID (e.g., 12345678)
+  <ATTACHMENT_ID>  Attachment ID to update (from `attachment list`)
+  <FILE>           Path to the local file whose contents become the new version
+
+Options:
+      --filename <FILENAME>  Override the filename used in Confluence (defaults to the local basename)
+      --comment <COMMENT>    Optional version comment recorded with the new version
+      --minor-edit           Marks the new version as a minor edit
+  -h, --help                 Print help
+
+
+================================================================================
+
 omni-dev atlassian confluence attachment upload - Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
 
 Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
@@ -470,6 +509,10 @@ Commands:
   replies     Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
   audit       Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool)
   reanchor    Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool)
+  edit        Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+  delete      Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+  resolve     Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+  reopen      Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -530,6 +573,42 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment delete - Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+
+Deletes a comment (mirrors the `confluence_comment_delete` MCP tool)
+
+Usage: delete [OPTIONS] --kind <KIND> <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Comment ID to delete (from `comment list`)
+
+Options:
+      --kind <KIND>  Whether the target is a footer or inline comment (the v2 API uses separate endpoints) [possible values: footer, inline]
+      --force        Skips the confirmation prompt
+      --dry-run      Prints what would be deleted without making any API calls
+  -h, --help         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment edit - Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+
+Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool)
+
+Usage: edit [OPTIONS] --kind <KIND> <COMMENT_ID> [FILE]
+
+Arguments:
+  <COMMENT_ID>  Comment ID to edit (from `comment list`)
+  [FILE]        Input file (reads from stdin if omitted or "-")
+
+Options:
+      --kind <KIND>      Whether the target is a footer or inline comment (the v2 API uses separate endpoints) [possible values: footer, inline]
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence comment list - Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
 
 Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
@@ -568,6 +647,21 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment reopen - Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
+
+Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool)
+
+Usage: reopen <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Inline comment ID to reopen (from `comment list`)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
 omni-dev atlassian confluence comment replies - Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
 
 Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
@@ -582,6 +676,21 @@ Options:
       --limit <LIMIT>    Maximum number of replies to display [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment resolve - Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+
+Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool)
+
+Usage: resolve <COMMENT_ID>
+
+Arguments:
+  <COMMENT_ID>  Inline comment ID to resolve (from `comment list`)
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================
@@ -647,6 +756,23 @@ Options:
       --cursor <CURSOR>  Cursor returned by an outline-mode `confluence compare` call
       --format <FORMAT>  Output text format [default: unified] [possible values: unified, side-by-side, markdown-inline]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence copy - Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+
+Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool)
+
+Usage: copy --parent <PARENT> --title <TITLE> <ID>
+
+Arguments:
+  <ID>  Source Confluence page ID to copy
+
+Options:
+      --parent <PARENT>  Destination parent page ID the copy is placed under
+      --title <TITLE>    Title for the new copied page
+  -h, --help             Print help
 
 
 ================================================================================
@@ -849,6 +975,75 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence restriction - Manages read/update restrictions on Confluence pages
+
+Manages read/update restrictions on Confluence pages
+
+Usage: restriction <COMMAND>
+
+Commands:
+  get     Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+  grant   Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+  revoke  Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction get - Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+
+Shows the current restrictions on a page (mirrors the `confluence_restriction_get` MCP tool)
+
+Usage: get <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction grant - Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+
+Grants a user or group a restriction for an operation (mirrors the `confluence_restriction_grant` MCP tool)
+
+Usage: grant [OPTIONS] --operation <OPERATION> <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --operation <OPERATION>    Operation the restriction applies to [possible values: read, update]
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Mutually exclusive with `--group`
+      --group <GROUP>            Group name. Mutually exclusive with `--account-id`
+  -h, --help                     Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence restriction revoke - Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+
+Revokes a user's or group's restriction for an operation (mirrors the `confluence_restriction_revoke` MCP tool)
+
+Usage: revoke [OPTIONS] --operation <OPERATION> <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --operation <OPERATION>    Operation the restriction applies to [possible values: read, update]
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Mutually exclusive with `--group`
+      --group <GROUP>            Group name. Mutually exclusive with `--account-id`
+  -h, --help                     Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence search - Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
 
 Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
@@ -967,6 +1162,72 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence watcher - Manages watchers on Confluence pages
+
+Manages watchers on Confluence pages
+
+Usage: watcher <COMMAND>
+
+Commands:
+  status  Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+  add     Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+  remove  Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher add - Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+
+Adds a watcher to a page (mirrors the `confluence_watcher_add` MCP tool)
+
+Usage: add [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher remove - Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+
+Removes a watcher from a page (mirrors the `confluence_watcher_remove` MCP tool)
+
+Usage: remove [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence watcher status - Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+
+Reports whether a user watches a page (mirrors the `confluence_watcher_status` MCP tool)
+
+Usage: status [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page (content) ID
+
+Options:
+      --account-id <ACCOUNT_ID>  Atlassian `accountId` of the user. Defaults to the authenticated user
+  -h, --help                     Print help
+
+
+================================================================================
+
 omni-dev atlassian confluence write - Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
 
 Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
@@ -1057,12 +1318,14 @@ Commands:
   board       Manages JIRA agile boards
   sprint      Manages JIRA agile sprints
   link        Manages JIRA issue links
+  label       Adds or removes labels on a JIRA issue incrementally
   changelog   Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool)
   attachment  Downloads JIRA issue attachments
   watcher     Manages watchers on a JIRA issue
   worklog     Manages worklogs (time tracking) on a JIRA issue
   user        JIRA user operations (search by name or email)
   version     Manages JIRA project versions (release versions)
+  component   Manages JIRA project components
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1229,10 +1492,11 @@ Manages comments on a JIRA issue
 Usage: comment <COMMAND>
 
 Commands:
-  list  Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`)
-  add   Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`)
-  edit  Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool)
-  help  Print this message or the help of the given subcommand(s)
+  list    Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`)
+  add     Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`)
+  edit    Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool)
+  delete  Deletes a comment from a JIRA issue (mirrors the `jira_comment_delete` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -1253,6 +1517,24 @@ Arguments:
 Options:
       --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira comment delete - Deletes a comment from a JIRA issue (mirrors the `jira_comment_delete` MCP tool)
+
+Deletes a comment from a JIRA issue (mirrors the `jira_comment_delete` MCP tool)
+
+Usage: delete [OPTIONS] <KEY> <COMMENT_ID>
+
+Arguments:
+  <KEY>         JIRA issue key (e.g., PROJ-123)
+  <COMMENT_ID>  Comment ID to delete
+
+Options:
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+  -h, --help     Print help
 
 
 ================================================================================
@@ -1298,6 +1580,93 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian jira component - Manages JIRA project components
+
+Manages JIRA project components
+
+Usage: component <COMMAND>
+
+Commands:
+  list    Lists components for a project (mirrors the `jira_component_list` MCP tool)
+  create  Creates a new project component (mirrors the `jira_component_create` MCP tool)
+  update  Updates a component's name/description (mirrors the `jira_component_update` MCP tool)
+  delete  Deletes a component (mirrors the `jira_component_delete` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira component create - Creates a new project component (mirrors the `jira_component_create` MCP tool)
+
+Creates a new project component (mirrors the `jira_component_create` MCP tool)
+
+Usage: create [OPTIONS] --project <PROJECT> --name <NAME>
+
+Options:
+      --project <PROJECT>          Project key (e.g., "PROJ")
+      --name <NAME>                Component name
+      --description <DESCRIPTION>  Component description
+  -h, --help                       Print help
+
+
+================================================================================
+
+omni-dev atlassian jira component delete - Deletes a component (mirrors the `jira_component_delete` MCP tool)
+
+Deletes a component (mirrors the `jira_component_delete` MCP tool)
+
+Usage: delete [OPTIONS] <COMPONENT_ID>
+
+Arguments:
+  <COMPONENT_ID>  Component ID (from `component list`)
+
+Options:
+      --move-issues-to <MOVE_ISSUES_TO>
+          Reassign issues referencing this component to this component id before deleting (otherwise the references are dropped)
+      --force
+          Skips the confirmation prompt
+      --dry-run
+          Prints what would be deleted without making any API calls
+  -h, --help
+          Print help
+
+
+================================================================================
+
+omni-dev atlassian jira component list - Lists components for a project (mirrors the `jira_component_list` MCP tool)
+
+Lists components for a project (mirrors the `jira_component_list` MCP tool)
+
+Usage: list [OPTIONS] --project <PROJECT>
+
+Options:
+      --project <PROJECT>  Project key (e.g., "PROJ")
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira component update - Updates a component's name/description (mirrors the `jira_component_update` MCP tool)
+
+Updates a component's name/description (mirrors the `jira_component_update` MCP tool)
+
+Usage: update [OPTIONS] <COMPONENT_ID>
+
+Arguments:
+  <COMPONENT_ID>  Component ID (from `component list`)
+
+Options:
+      --name <NAME>                New component name
+      --description <DESCRIPTION>  New component description
+  -h, --help                       Print help
+
+
+================================================================================
+
 omni-dev atlassian jira create - Creates a new JIRA issue (mirrors the `jira_create` MCP tool)
 
 Creates a new JIRA issue (mirrors the `jira_create` MCP tool)
@@ -1309,7 +1678,6 @@ Arguments:
 
 Options:
       --format <FORMAT>         Input format [default: jfm] [possible values: jfm, adf]
-      --instance <URL>          Atlassian instance URL (e.g. "https://org.atlassian.net"). Overrides ATLASSIAN_INSTANCE_URL / settings.json for this invocation
       --project <PROJECT>       Project key (e.g., "PROJ"). Overrides frontmatter
       --type <TYPE>             Issue type (e.g., "Task", "Bug", "Story"). Overrides frontmatter
       --summary <SUMMARY>       Issue summary/title. Overrides frontmatter
@@ -1432,6 +1800,55 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian jira label - Adds or removes labels on a JIRA issue incrementally
+
+Adds or removes labels on a JIRA issue incrementally
+
+Usage: label <COMMAND>
+
+Commands:
+  add     Adds one or more labels to a JIRA issue (mirrors the `jira_label_add` MCP tool)
+  remove  Removes one or more labels from a JIRA issue (mirrors the `jira_label_remove` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira label add - Adds one or more labels to a JIRA issue (mirrors the `jira_label_add` MCP tool)
+
+Adds one or more labels to a JIRA issue (mirrors the `jira_label_add` MCP tool)
+
+Usage: add [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --labels <LABELS>  Labels to add (comma-separated). JIRA labels cannot contain spaces
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev atlassian jira label remove - Removes one or more labels from a JIRA issue (mirrors the `jira_label_remove` MCP tool)
+
+Removes one or more labels from a JIRA issue (mirrors the `jira_label_remove` MCP tool)
+
+Usage: remove [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --labels <LABELS>  Labels to remove (comma-separated)
+  -h, --help             Print help
+
+
+================================================================================
+
 omni-dev atlassian jira link - Manages JIRA issue links
 
 Manages JIRA issue links
@@ -1505,11 +1922,51 @@ Manages remote (external URL) issue links
 Usage: remote <COMMAND>
 
 Commands:
-  list  Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool)
-  help  Print this message or the help of the given subcommand(s)
+  list    Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool)
+  create  Adds a remote (external URL) link to a JIRA issue (mirrors the `jira_link_remote_create` MCP tool)
+  delete  Deletes a remote (external URL) link from a JIRA issue (mirrors the `jira_link_remote_delete` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link remote create - Adds a remote (external URL) link to a JIRA issue (mirrors the `jira_link_remote_create` MCP tool)
+
+Adds a remote (external URL) link to a JIRA issue (mirrors the `jira_link_remote_create` MCP tool)
+
+Usage: create [OPTIONS] --url <URL> --title <TITLE> <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --url <URL>                    External URL to link to
+      --title <TITLE>                Link title (display text)
+      --summary <SUMMARY>            Optional summary shown under the title
+      --relationship <RELATIONSHIP>  Optional relationship label (e.g., "relates to", "causes")
+      --global-id <GLOBAL_ID>        Optional global ID. Reusing an existing global ID updates that link instead of creating a duplicate
+  -h, --help                         Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link remote delete - Deletes a remote (external URL) link from a JIRA issue (mirrors the `jira_link_remote_delete` MCP tool)
+
+Deletes a remote (external URL) link from a JIRA issue (mirrors the `jira_link_remote_delete` MCP tool)
+
+Usage: delete [OPTIONS] --link-id <LINK_ID> <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --link-id <LINK_ID>  Remote link ID to delete (from `link remote list`)
+      --force              Skips the confirmation prompt
+      --dry-run            Prints what would be deleted without making any API calls
+  -h, --help               Print help
 
 
 ================================================================================
@@ -1653,6 +2110,7 @@ Commands:
   add     Adds issues to a sprint (mirrors the `jira_sprint_add` MCP tool)
   create  Creates a new sprint (mirrors the `jira_sprint_create` MCP tool)
   update  Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool)
+  delete  Deletes a sprint (mirrors the `jira_sprint_delete` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1688,6 +2146,21 @@ Options:
       --end-date <END_DATE>      End date (ISO 8601, e.g., "2026-05-14")
       --goal <GOAL>              Sprint goal
   -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira sprint delete - Deletes a sprint (mirrors the `jira_sprint_delete` MCP tool)
+
+Deletes a sprint (mirrors the `jira_sprint_delete` MCP tool)
+
+Usage: delete [OPTIONS] --sprint-id <SPRINT_ID>
+
+Options:
+      --sprint-id <SPRINT_ID>  Sprint ID
+      --force                  Skips the confirmation prompt
+      --dry-run                Prints what would be deleted without making any API calls
+  -h, --help                   Print help
 
 
 ================================================================================
@@ -1847,9 +2320,28 @@ Manages JIRA project versions (release versions)
 Usage: version <COMMAND>
 
 Commands:
-  list    Lists versions for a project (mirrors the `jira_version_list` MCP tool)
-  create  Creates a new project version (mirrors the `jira_version_create` MCP tool)
-  help    Print this message or the help of the given subcommand(s)
+  list     Lists versions for a project (mirrors the `jira_version_list` MCP tool)
+  create   Creates a new project version (mirrors the `jira_version_create` MCP tool)
+  release  Marks a version as released (mirrors the `jira_version_release` MCP tool)
+  archive  Archives a version (mirrors the `jira_version_archive` MCP tool)
+  rename   Renames a version (mirrors the `jira_version_rename` MCP tool)
+  delete   Deletes a version (mirrors the `jira_version_delete` MCP tool)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira version archive - Archives a version (mirrors the `jira_version_archive` MCP tool)
+
+Archives a version (mirrors the `jira_version_archive` MCP tool)
+
+Usage: archive <VERSION_ID>
+
+Arguments:
+  <VERSION_ID>  Version ID (from `version list`)
 
 Options:
   -h, --help  Print help
@@ -1876,6 +2368,30 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian jira version delete - Deletes a version (mirrors the `jira_version_delete` MCP tool)
+
+Deletes a version (mirrors the `jira_version_delete` MCP tool)
+
+Usage: delete [OPTIONS] <VERSION_ID>
+
+Arguments:
+  <VERSION_ID>  Version ID (from `version list`)
+
+Options:
+      --move-fix-issues-to <MOVE_FIX_ISSUES_TO>
+          Reassign the `fixVersion` of affected issues to this version id before deleting (otherwise the references are simply dropped)
+      --move-affected-issues-to <MOVE_AFFECTED_ISSUES_TO>
+          Reassign the `affectedVersion` of affected issues to this version id before deleting
+      --force
+          Skips the confirmation prompt
+      --dry-run
+          Prints what would be deleted without making any API calls
+  -h, --help
+          Print help
+
+
+================================================================================
+
 omni-dev atlassian jira version list - Lists versions for a project (mirrors the `jira_version_list` MCP tool)
 
 Lists versions for a project (mirrors the `jira_version_list` MCP tool)
@@ -1890,6 +2406,39 @@ Options:
       --unarchived         Show only non-archived versions
   -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira version release - Marks a version as released (mirrors the `jira_version_release` MCP tool)
+
+Marks a version as released (mirrors the `jira_version_release` MCP tool)
+
+Usage: release [OPTIONS] <VERSION_ID>
+
+Arguments:
+  <VERSION_ID>  Version ID (from `version list`)
+
+Options:
+      --release-date <RELEASE_DATE>  Release date (ISO 8601, "YYYY-MM-DD"). Defaults to leaving it unset
+  -h, --help                         Print help
+
+
+================================================================================
+
+omni-dev atlassian jira version rename - Renames a version (mirrors the `jira_version_rename` MCP tool)
+
+Renames a version (mirrors the `jira_version_rename` MCP tool)
+
+Usage: rename [OPTIONS] <VERSION_ID> <NAME>
+
+Arguments:
+  <VERSION_ID>  Version ID (from `version list`)
+  <NAME>        New version name
+
+Options:
+      --description <DESCRIPTION>  New description (optional)
+  -h, --help                       Print help
 
 
 ================================================================================
@@ -1969,9 +2518,11 @@ Manages worklogs (time tracking) on a JIRA issue
 Usage: worklog <COMMAND>
 
 Commands:
-  list  Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool)
-  add   Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool)
-  help  Print this message or the help of the given subcommand(s)
+  list    Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool)
+  add     Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool)
+  edit    Edits a worklog entry on a JIRA issue (mirrors the `jira_worklog_update` MCP tool)
+  delete  Deletes a worklog entry from a JIRA issue (mirrors the `jira_worklog_delete` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -1992,6 +2543,43 @@ Options:
       --time-spent <TIME_SPENT>  Time spent in JIRA duration format (e.g., "2h 30m", "1d", "45m")
       --started <STARTED>        When the work was started (ISO 8601, e.g., "2026-04-16T09:00:00.000+0000")
       --comment <COMMENT>        Comment describing the work performed
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira worklog delete - Deletes a worklog entry from a JIRA issue (mirrors the `jira_worklog_delete` MCP tool)
+
+Deletes a worklog entry from a JIRA issue (mirrors the `jira_worklog_delete` MCP tool)
+
+Usage: delete [OPTIONS] <KEY> <WORKLOG_ID>
+
+Arguments:
+  <KEY>         JIRA issue key (e.g., PROJ-123)
+  <WORKLOG_ID>  Worklog ID to delete (from `worklog list`)
+
+Options:
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+  -h, --help     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira worklog edit - Edits a worklog entry on a JIRA issue (mirrors the `jira_worklog_update` MCP tool)
+
+Edits a worklog entry on a JIRA issue (mirrors the `jira_worklog_update` MCP tool)
+
+Usage: edit [OPTIONS] <KEY> <WORKLOG_ID>
+
+Arguments:
+  <KEY>         JIRA issue key (e.g., PROJ-123)
+  <WORKLOG_ID>  Worklog ID to edit (from `worklog list`)
+
+Options:
+      --time-spent <TIME_SPENT>  New time spent in JIRA duration format (e.g., "2h 30m")
+      --started <STARTED>        New start time (ISO 8601, e.g., "2026-04-16T09:00:00.000+0000")
+      --comment <COMMENT>        New comment describing the work performed
   -h, --help                     Print help
 
 

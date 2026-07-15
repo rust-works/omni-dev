@@ -26,16 +26,17 @@ use crate::atlassian::jira_types::{
     DevStatusCommit, DevStatusResponse, DevStatusSummaryCategory, DevStatusSummaryResponse,
     EditMeta, EditMetaField, FieldSelection, JiraAllowedValueRaw, JiraAttachment,
     JiraAttachmentEntry, JiraAttachmentIssueResponse, JiraChangelogEntry, JiraChangelogItem,
-    JiraChangelogResponse, JiraComment, JiraCommentEntry, JiraCommentsResponse,
-    JiraCreateMetaFullResponse, JiraCreateMetaResponse, JiraCreateMetaSchemaRaw,
-    JiraCreateResponse, JiraCreatedIssue, JiraDevBranch, JiraDevCommit, JiraDevProvider,
-    JiraDevPullRequest, JiraDevRepository, JiraDevStatus, JiraDevStatusCount, JiraDevStatusSummary,
-    JiraEditMetaField, JiraEditMetaResponse, JiraField, JiraFieldContextsResponse, JiraFieldEntry,
-    JiraFieldOption, JiraFieldOptionsResponse, JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse,
-    JiraIssueLink, JiraIssueLinksResponse, JiraLinkType, JiraLinkTypesResponse, JiraProject,
-    JiraProjectList, JiraProjectSearchResponse, JiraProjectVersion, JiraProjectVersionEntry,
-    JiraProjectVersionList, JiraRemoteIssueLink, JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon,
-    JiraRemoteIssueLinkObject, JiraSearchResponse, JiraSearchResult, JiraTransition,
+    JiraChangelogResponse, JiraComment, JiraCommentEntry, JiraCommentsResponse, JiraComponent,
+    JiraComponentEntry, JiraCreateMetaFullResponse, JiraCreateMetaResponse,
+    JiraCreateMetaSchemaRaw, JiraCreateResponse, JiraCreatedIssue, JiraDevBranch, JiraDevCommit,
+    JiraDevProvider, JiraDevPullRequest, JiraDevRepository, JiraDevStatus, JiraDevStatusCount,
+    JiraDevStatusSummary, JiraEditMetaField, JiraEditMetaResponse, JiraField,
+    JiraFieldContextsResponse, JiraFieldEntry, JiraFieldOption, JiraFieldOptionsResponse,
+    JiraIssue, JiraIssueEnvelope, JiraIssueIdResponse, JiraIssueLink, JiraIssueLinksResponse,
+    JiraLinkType, JiraLinkTypesResponse, JiraProject, JiraProjectList, JiraProjectSearchResponse,
+    JiraProjectVersion, JiraProjectVersionEntry, JiraProjectVersionList, JiraRemoteIssueLink,
+    JiraRemoteIssueLinkEntry, JiraRemoteIssueLinkIcon, JiraRemoteIssueLinkObject,
+    JiraRemoteLinkCreateResponse, JiraSearchResponse, JiraSearchResult, JiraTransition,
     JiraTransitionEntry, JiraTransitionToStatus, JiraTransitionsResponse, JiraUser,
     JiraUserGetResults, JiraUserRecord, JiraUserSearchEntry, JiraUserSearchResult,
     JiraUserSearchResults, JiraVisibility, JiraWatcherList, JiraWorklog, JiraWorklogList,
@@ -2097,6 +2098,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_comment_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client.delete_comment("PROJ-1", "10010").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_comment_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/9999",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errorMessages": ["Comment not found"]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_comment("PROJ-1", "9999").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("Comment not found"));
+    }
+
+    #[tokio::test]
     async fn get_transitions_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -3474,6 +3516,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client.delete_sprint(42).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_sprint(999).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn get_project_versions_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -3805,6 +3875,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_project_version_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10000",
+                    "name": "1.0",
+                    "released": true
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .update_project_version(
+                "10000",
+                None,
+                None,
+                Some(true),
+                Some("2026-04-16"),
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    /// Covers the `start_date` (and `archived`) insert branches, which the
+    /// release/rename paths never populate.
+    #[tokio::test]
+    async fn update_project_version_sends_start_date_and_archived() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "archived": true,
+                "startDate": "2026-01-01"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "1.0"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        client
+            .update_project_version(
+                "10000",
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                Some("2026-01-01"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_project_version_invalid_date_short_circuits() {
+        // Bad date must be rejected before any network call.
+        let client = AtlassianClient::new("http://127.0.0.1:1", "u@t.com", "tok").unwrap();
+        let err = client
+            .update_project_version("10000", None, None, Some(true), Some("nope"), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("release_date"));
+    }
+
+    #[tokio::test]
+    async fn update_project_version_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/9999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .update_project_version("9999", Some("2.0"), None, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn delete_project_version_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client
+            .delete_project_version("10000", None, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_project_version_with_move_targets_sets_query() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .and(wiremock::matchers::query_param("moveFixIssuesTo", "10001"))
+            .and(wiremock::matchers::query_param(
+                "moveAffectedIssuesTo",
+                "10002",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client
+            .delete_project_version("10000", Some("10001"), Some("10002"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_project_version_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/9999"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .delete_project_version("9999", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn get_project_components_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/components",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "10000", "name": "Backend", "description": "Server side"},
+                    {"id": "10001", "name": "Frontend"}
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let components = client.get_project_components("PROJ").await.unwrap();
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].name, "Backend");
+        assert_eq!(components[0].description.as_deref(), Some("Server side"));
+        assert!(components[1].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_component_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/component"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "project": "PROJ", "name": "Backend", "description": "Server side"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "Backend", "description": "Server side"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let component = client
+            .create_component("PROJ", "Backend", Some("Server side"))
+            .await
+            .unwrap();
+        assert_eq!(component.id, "10000");
+        assert_eq!(component.name, "Backend");
+    }
+
+    #[tokio::test]
+    async fn update_component_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/component/10000"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "name": "Backend Services"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10000", "name": "Backend Services"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client
+            .update_component("10000", Some("Backend Services"), None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_component_with_move_target() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/component/10000"))
+            .and(wiremock::matchers::query_param("moveIssuesTo", "10001"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client
+            .delete_component("10000", Some("10001"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_component_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/component"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_component("PROJ", "X", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn get_issue_links_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -4018,6 +4348,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_remote_issue_link_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 10010,
+                    "self": "https://example.atlassian.net/rest/api/3/issue/PROJ-1/remotelink/10010"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let id = client
+            .create_remote_issue_link(
+                "PROJ-1",
+                "https://example.com/doc",
+                "Design doc",
+                Some("Architecture"),
+                Some("relates to"),
+                Some("sys=example/doc"),
+            )
+            .await
+            .unwrap();
+        // Numeric id is normalized to a string.
+        assert_eq!(id, "10010");
+    }
+
+    /// JIRA normally returns the new remote-link id as a number, but the
+    /// normalization also accepts a string id verbatim.
+    #[tokio::test]
+    async fn create_remote_issue_link_accepts_string_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "10010"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let id = client
+            .create_remote_issue_link("PROJ-1", "https://x", "t", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(id, "10010");
+    }
+
+    /// An id that is neither a string nor a number is a hard error rather than
+    /// a silently-wrong link id.
+    #[tokio::test]
+    async fn create_remote_issue_link_rejects_unexpected_id_type() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_remote_issue_link("PROJ-1", "https://x", "t", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected remote link id type in create response"));
+    }
+
+    #[tokio::test]
+    async fn create_remote_issue_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_remote_issue_link("PROJ-1", "https://x", "t", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn delete_remote_issue_link_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client
+            .delete_remote_issue_link("PROJ-1", "10010")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_remote_issue_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/9999",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .delete_remote_issue_link("PROJ-1", "9999")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_link_types_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -4136,6 +4606,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn modify_issue_labels_sends_update_verb() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "update": {"labels": [{"add": "backend"}, {"add": "urgent"}, {"remove": "stale"}]}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .modify_issue_labels(
+                "PROJ-1",
+                &["backend".to_string(), "urgent".to_string()],
+                &["stale".to_string()],
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn modify_issue_labels_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .modify_issue_labels("PROJ-1", &["x".to_string()], &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
     #[tokio::test]
@@ -5874,6 +6385,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_worklog_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/10010",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "10010"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .update_worklog(
+                "PROJ-1",
+                "10010",
+                Some("3h"),
+                Some("2026-04-16T09:00:00.000+0000"),
+                Some("Corrected estimate"),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_worklog_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/9999",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .update_worklog("PROJ-1", "9999", Some("1h"), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn delete_worklog_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client.delete_worklog("PROJ-1", "10010").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_worklog_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/9999",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_worklog("PROJ-1", "9999").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn get_worklogs_respects_limit() {
         let server = wiremock::MockServer::start().await;
 
@@ -6608,6 +7203,22 @@ impl AtlassianClient {
         })
     }
 
+    /// Deletes a comment from a JIRA issue.
+    ///
+    /// Issues a `DELETE /rest/api/3/issue/{key}/comment/{id}` (204 on success).
+    pub async fn delete_comment(&self, key: &str, comment_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/comment/{}",
+            self.instance_url, key, comment_id
+        );
+
+        let response = self.delete(&url).await?;
+
+        Self::ensure_success(response).await?;
+
+        Ok(())
+    }
+
     /// Lists worklogs for a JIRA issue.
     pub async fn get_worklogs(&self, key: &str, limit: u32) -> Result<JiraWorklogList> {
         let effective_limit = if limit == 0 { u32::MAX } else { limit };
@@ -6679,6 +7290,79 @@ impl AtlassianClient {
         }
 
         let response = self.post_json(&url, &body).await?;
+
+        Self::ensure_success(response).await?;
+
+        Ok(())
+    }
+
+    /// Updates an existing worklog entry on a JIRA issue.
+    ///
+    /// Issues a `PUT /rest/api/3/issue/{key}/worklog/{id}` with only the fields
+    /// that are `Some`; omitted fields keep their current value. The comment is
+    /// sent as an ADF document, mirroring [`Self::add_worklog`].
+    pub async fn update_worklog(
+        &self,
+        key: &str,
+        worklog_id: &str,
+        time_spent: Option<&str>,
+        started: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/worklog/{}",
+            self.instance_url, key, worklog_id
+        );
+
+        let mut body = serde_json::Map::new();
+        if let Some(time_spent) = time_spent {
+            body.insert(
+                "timeSpent".to_string(),
+                serde_json::Value::String(time_spent.to_string()),
+            );
+        }
+        if let Some(started) = started {
+            body.insert(
+                "started".to_string(),
+                serde_json::Value::String(started.to_string()),
+            );
+        }
+        if let Some(comment_text) = comment {
+            body.insert(
+                "comment".to_string(),
+                serde_json::json!({
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{
+                            "type": "text",
+                            "text": comment_text
+                        }]
+                    }]
+                }),
+            );
+        }
+
+        let response = self
+            .put_json(&url, &serde_json::Value::Object(body))
+            .await?;
+
+        Self::ensure_success(response).await?;
+
+        Ok(())
+    }
+
+    /// Deletes a worklog entry from a JIRA issue.
+    ///
+    /// Issues a `DELETE /rest/api/3/issue/{key}/worklog/{id}` (204 on success).
+    pub async fn delete_worklog(&self, key: &str, worklog_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/worklog/{}",
+            self.instance_url, key, worklog_id
+        );
+
+        let response = self.delete(&url).await?;
 
         Self::ensure_success(response).await?;
 
@@ -7562,6 +8246,16 @@ impl AtlassianClient {
         Ok(())
     }
 
+    /// Deletes a sprint.
+    ///
+    /// Issues `DELETE /rest/agile/1.0/sprint/{id}`.
+    pub async fn delete_sprint(&self, sprint_id: u64) -> Result<()> {
+        let url = format!("{}/rest/agile/1.0/sprint/{}", self.instance_url, sprint_id);
+        let response = self.delete(&url).await?;
+        Self::ensure_success(response).await?;
+        Ok(())
+    }
+
     /// Lists versions for a JIRA project.
     ///
     /// Uses the lightweight `GET /rest/api/3/project/{key}/versions` endpoint,
@@ -7663,6 +8357,202 @@ impl AtlassianClient {
         })
     }
 
+    /// Updates an existing project version — the shared backend for
+    /// release / archive / rename / edit.
+    ///
+    /// Issues `PUT /rest/api/3/version/{id}` with only the `Some` fields;
+    /// omitted fields keep their current value. Any provided dates are
+    /// validated first. Returns `()` (mirroring [`Self::update_sprint`]); the
+    /// caller already knows the mutation it requested.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_project_version(
+        &self,
+        version_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        released: Option<bool>,
+        release_date: Option<&str>,
+        archived: Option<bool>,
+        start_date: Option<&str>,
+    ) -> Result<()> {
+        validate_iso_date(release_date, "release_date")?;
+        validate_iso_date(start_date, "start_date")?;
+
+        let url = format!("{}/rest/api/3/version/{}", self.instance_url, version_id);
+
+        let mut body = serde_json::Map::new();
+        if let Some(n) = name {
+            body.insert("name".to_string(), serde_json::Value::String(n.to_string()));
+        }
+        if let Some(d) = description {
+            body.insert(
+                "description".to_string(),
+                serde_json::Value::String(d.to_string()),
+            );
+        }
+        if let Some(r) = released {
+            body.insert("released".to_string(), serde_json::Value::Bool(r));
+        }
+        if let Some(rd) = release_date {
+            body.insert(
+                "releaseDate".to_string(),
+                serde_json::Value::String(rd.to_string()),
+            );
+        }
+        if let Some(a) = archived {
+            body.insert("archived".to_string(), serde_json::Value::Bool(a));
+        }
+        if let Some(sd) = start_date {
+            body.insert(
+                "startDate".to_string(),
+                serde_json::Value::String(sd.to_string()),
+            );
+        }
+
+        let response = self
+            .put_json(&url, &serde_json::Value::Object(body))
+            .await?;
+
+        Self::ensure_success(response).await?;
+
+        Ok(())
+    }
+
+    /// Deletes a project version.
+    ///
+    /// Issues `DELETE /rest/api/3/version/{id}`. Issues that reference the
+    /// version can be reassigned first via `moveFixIssuesTo` /
+    /// `moveAffectedIssuesTo` (each a target version id); omit both to delete
+    /// and simply drop the references.
+    pub async fn delete_project_version(
+        &self,
+        version_id: &str,
+        move_fix_issues_to: Option<&str>,
+        move_affected_issues_to: Option<&str>,
+    ) -> Result<()> {
+        let mut url = format!("{}/rest/api/3/version/{}", self.instance_url, version_id);
+        let mut params = Vec::new();
+        if let Some(v) = move_fix_issues_to {
+            params.push(format!("moveFixIssuesTo={v}"));
+        }
+        if let Some(v) = move_affected_issues_to {
+            params.push(format!("moveAffectedIssuesTo={v}"));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+
+        let response = self.delete(&url).await?;
+
+        Self::ensure_success(response).await?;
+
+        Ok(())
+    }
+
+    /// Lists the components of a JIRA project.
+    ///
+    /// `GET /rest/api/3/project/{key}/components`.
+    pub async fn get_project_components(&self, project_key: &str) -> Result<Vec<JiraComponent>> {
+        let url = format!(
+            "{}/rest/api/3/project/{}/components",
+            self.instance_url, project_key
+        );
+        let response = self.get_json(&url).await?;
+        let entries: Vec<JiraComponentEntry> = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse project components response",
+        )
+        .await?;
+        Ok(entries
+            .into_iter()
+            .map(|e| JiraComponent {
+                id: e.id,
+                name: e.name,
+                description: e.description,
+            })
+            .collect())
+    }
+
+    /// Creates a component on a JIRA project.
+    ///
+    /// `POST /rest/api/3/component`.
+    pub async fn create_component(
+        &self,
+        project_key: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<JiraComponent> {
+        let url = format!("{}/rest/api/3/component", self.instance_url);
+        let mut body = serde_json::json!({ "project": project_key, "name": name });
+        if let Some(d) = description {
+            body["description"] = serde_json::Value::String(d.to_string());
+        }
+        let response = self.post_json(&url, &body).await?;
+        let entry: JiraComponentEntry = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse component create response",
+        )
+        .await?;
+        Ok(JiraComponent {
+            id: entry.id,
+            name: entry.name,
+            description: entry.description,
+        })
+    }
+
+    /// Updates a JIRA component's name and/or description.
+    ///
+    /// `PUT /rest/api/3/component/{id}` with only the `Some` fields.
+    pub async fn update_component(
+        &self,
+        component_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/component/{}",
+            self.instance_url, component_id
+        );
+        let mut body = serde_json::Map::new();
+        if let Some(n) = name {
+            body.insert("name".to_string(), serde_json::Value::String(n.to_string()));
+        }
+        if let Some(d) = description {
+            body.insert(
+                "description".to_string(),
+                serde_json::Value::String(d.to_string()),
+            );
+        }
+        let response = self
+            .put_json(&url, &serde_json::Value::Object(body))
+            .await?;
+        Self::ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// Deletes a JIRA component.
+    ///
+    /// `DELETE /rest/api/3/component/{id}`. Issues that reference the component
+    /// can be reassigned via `moveIssuesTo` (another component id).
+    pub async fn delete_component(
+        &self,
+        component_id: &str,
+        move_issues_to: Option<&str>,
+    ) -> Result<()> {
+        let mut url = format!(
+            "{}/rest/api/3/component/{}",
+            self.instance_url, component_id
+        );
+        if let Some(target) = move_issues_to {
+            url.push_str("?moveIssuesTo=");
+            url.push_str(target);
+        }
+        let response = self.delete(&url).await?;
+        Self::ensure_success(response).await?;
+        Ok(())
+    }
+
     /// Lists links on a JIRA issue.
     pub async fn get_issue_links(&self, key: &str) -> Result<Vec<JiraIssueLink>> {
         let url = format!(
@@ -7752,6 +8642,87 @@ impl AtlassianClient {
         Ok(links)
     }
 
+    /// Creates (or, when `global_id` matches an existing link, updates) a
+    /// remote (external-URL) link on a JIRA issue.
+    ///
+    /// Issues `POST /rest/api/3/issue/{key}/remotelink`. Returns the new/updated
+    /// link's id (normalized to `String`, since JIRA returns it as a number).
+    pub async fn create_remote_issue_link(
+        &self,
+        key: &str,
+        url: &str,
+        title: &str,
+        summary: Option<&str>,
+        relationship: Option<&str>,
+        global_id: Option<&str>,
+    ) -> Result<String> {
+        let endpoint = format!("{}/rest/api/3/issue/{}/remotelink", self.instance_url, key);
+
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+        object.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        if let Some(s) = summary {
+            object.insert(
+                "summary".to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
+        }
+
+        let mut body = serde_json::Map::new();
+        body.insert("object".to_string(), serde_json::Value::Object(object));
+        if let Some(r) = relationship {
+            body.insert(
+                "relationship".to_string(),
+                serde_json::Value::String(r.to_string()),
+            );
+        }
+        if let Some(g) = global_id {
+            body.insert(
+                "globalId".to_string(),
+                serde_json::Value::String(g.to_string()),
+            );
+        }
+
+        let response = self
+            .post_json(&endpoint, &serde_json::Value::Object(body))
+            .await?;
+
+        let created: JiraRemoteLinkCreateResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse remote link create response",
+        )
+        .await?;
+
+        Ok(match created.id {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Number(n) => n.to_string(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unexpected remote link id type in create response: {other:?}"
+                ));
+            }
+        })
+    }
+
+    /// Deletes a remote (external-URL) link from a JIRA issue by its link id.
+    ///
+    /// Issues `DELETE /rest/api/3/issue/{key}/remotelink/{linkId}`.
+    pub async fn delete_remote_issue_link(&self, key: &str, link_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/remotelink/{}",
+            self.instance_url, key, link_id
+        );
+        let response = self.delete(&url).await?;
+        Self::ensure_success(response).await?;
+        Ok(())
+    }
+
     /// Lists available issue link types.
     pub async fn get_link_types(&self) -> Result<Vec<JiraLinkType>> {
         let url = format!("{}/rest/api/3/issueLinkType", self.instance_url);
@@ -7801,6 +8772,33 @@ impl AtlassianClient {
     pub async fn set_issue_parent(&self, issue_key: &str, parent_key: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, issue_key);
         let body = serde_json::json!({"fields": {"parent": {"key": parent_key}}});
+        let response = self.put_json(&url, &body).await?;
+        Self::ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// Incrementally adds and/or removes labels on a JIRA issue.
+    ///
+    /// Issues `PUT /rest/api/3/issue/{key}` with the `update` verb
+    /// (`{"update": {"labels": [{"add": …}, {"remove": …}]}}`), so labels not
+    /// mentioned are preserved — unlike a full-array `fields.labels` replace
+    /// (which `jira write --set labels=…` performs).
+    pub async fn modify_issue_labels(
+        &self,
+        key: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        let mut ops: Vec<serde_json::Value> = Vec::with_capacity(add.len() + remove.len());
+        for label in add {
+            ops.push(serde_json::json!({ "add": label }));
+        }
+        for label in remove {
+            ops.push(serde_json::json!({ "remove": label }));
+        }
+        let body = serde_json::json!({ "update": { "labels": ops } });
+
+        let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
         let response = self.put_json(&url, &body).await?;
         Self::ensure_success(response).await?;
         Ok(())

@@ -2700,6 +2700,17 @@ fn try_dispatch_inline_directive(text: &str, pos: usize, depth: usize) -> Option
             let ext_key = d.attrs.as_ref().and_then(|a| a.get("key")).unwrap_or("");
             AdfNode::inline_extension(ext_type, ext_key, Some(content))
         }
+        "adf-unsupported" => {
+            // Round-trips an unsupported inline node emitted by
+            // `render_non_text_inline_body`: the full node JSON rides in the
+            // `json` attribute (the inline mirror of the block-level
+            // ```adf-unsupported``` fence reader, ADR-0029 / issue #1117).
+            // Deserialize it straight back into the original node; a malformed
+            // or missing payload falls through to plain text, exactly like the
+            // block reader degrading to a normal code block.
+            let json = d.attrs.as_ref().and_then(|a| a.get("json"))?;
+            serde_json::from_str::<AdfNode>(json).ok()?
+        }
         _ => return None, // unknown directive — fall through to plain text
     };
 
@@ -4634,7 +4645,17 @@ fn render_non_text_inline_body(
             }
         }
         _ => {
-            output.push_str(&format!("<!-- unsupported inline: {} -->", node.node_type));
+            // Preserve an unsupported inline node losslessly as an
+            // `:adf-unsupported[]{json="…"}` directive carrying the full node
+            // JSON — the inline mirror of the block-level ```adf-unsupported```
+            // fence (ADR-0029). Read back by `try_dispatch_inline_directive`,
+            // so a read → edit → write round-trips instead of collapsing to a
+            // lossy `<!-- unsupported inline -->` comment (issue #1117).
+            if let Ok(json) = serde_json::to_string(node) {
+                output.push_str(":adf-unsupported[]{");
+                output.push_str(&format_kv("json", &json));
+                output.push('}');
+            }
         }
     }
 }
@@ -7964,14 +7985,13 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn adf_unsupported_inline_to_markdown() {
         let doc = AdfDocument {
             version: 1,
             doc_type: "doc".to_string(),
             content: vec![AdfNode::paragraph(vec![AdfNode {
                 node_type: "unknownInline".to_string(),
-                attrs: None,
+                attrs: Some(serde_json::json!({"key": "value"})),
                 content: None,
                 text: None,
                 marks: None,
@@ -7980,7 +8000,47 @@ mod tests {
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains("<!-- unsupported inline: unknownInline -->"));
+        // Unsupported inline nodes now round-trip via an `:adf-unsupported`
+        // directive carrying the full node JSON (issue #1117), replacing the
+        // old lossy `<!-- unsupported inline -->` comment.
+        assert!(md.contains(":adf-unsupported[]{json="));
+        assert!(md.contains("unknownInline"));
+        assert!(!md.contains("<!-- unsupported inline"));
+    }
+
+    #[test]
+    fn unsupported_inline_round_trips() {
+        let original = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![
+                AdfNode::text("before "),
+                AdfNode {
+                    node_type: "unknownInline".to_string(),
+                    attrs: Some(serde_json::json!({"key": "value", "n": 3})),
+                    content: None,
+                    text: Some("fallback".to_string()),
+                    marks: None,
+                    local_id: None,
+                    parameters: None,
+                },
+                AdfNode::text(" after"),
+            ])],
+        };
+        let md = adf_to_markdown(&original).unwrap();
+        let restored = markdown_to_adf(&md).unwrap();
+        // The paragraph's unknown inline node survives with its attrs and text.
+        let para = &restored.content[0];
+        let unknown = para
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.node_type == "unknownInline")
+            .expect("unknownInline node preserved");
+        assert_eq!(unknown.attrs.as_ref().unwrap()["key"], "value");
+        assert_eq!(unknown.attrs.as_ref().unwrap()["n"], 3);
+        assert_eq!(unknown.text.as_deref(), Some("fallback"));
     }
 
     // ── mediaInline tests (issue #476) ─────────────────────────────────

@@ -41,6 +41,14 @@ pub enum CommentSubcommands {
     Audit(AuditCommand),
     /// Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool).
     Reanchor(ReanchorCommand),
+    /// Edits an existing comment's body (mirrors the `confluence_comment_edit` MCP tool).
+    Edit(EditCommand),
+    /// Deletes a comment (mirrors the `confluence_comment_delete` MCP tool).
+    Delete(DeleteCommand),
+    /// Resolves an inline comment (mirrors the `confluence_comment_resolve` MCP tool).
+    Resolve(ResolveCommand),
+    /// Reopens a resolved inline comment (mirrors the `confluence_comment_reopen` MCP tool).
+    Reopen(ReopenCommand),
 }
 
 impl CommentCommand {
@@ -53,6 +61,10 @@ impl CommentCommand {
             CommentSubcommands::Replies(cmd) => cmd.execute().await,
             CommentSubcommands::Audit(cmd) => cmd.execute().await,
             CommentSubcommands::Reanchor(cmd) => cmd.execute().await,
+            CommentSubcommands::Edit(cmd) => cmd.execute().await,
+            CommentSubcommands::Delete(cmd) => cmd.execute().await,
+            CommentSubcommands::Resolve(cmd) => cmd.execute().await,
+            CommentSubcommands::Reopen(cmd) => cmd.execute().await,
         }
     }
 }
@@ -331,6 +343,137 @@ impl ReanchorCommand {
             "Re-anchored inline comment {} to {:?}.",
             outcome.comment_id, outcome.new_anchor_text
         )?;
+        Ok(())
+    }
+}
+
+/// Edits an existing comment's body on a Confluence page.
+#[derive(Parser)]
+pub struct EditCommand {
+    /// Comment ID to edit (from `comment list`).
+    pub comment_id: String,
+
+    /// Whether the target is a footer or inline comment (the v2 API uses
+    /// separate endpoints).
+    #[arg(long, value_enum)]
+    pub kind: CommentKindArg,
+
+    /// Input file (reads from stdin if omitted or "-").
+    pub file: Option<String>,
+
+    /// Input format.
+    #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
+    pub format: ContentFormat,
+}
+
+impl EditCommand {
+    /// Reads input, converts to ADF, and updates the comment.
+    pub async fn execute(self) -> Result<()> {
+        let adf = parse_comment_input(self.file.as_deref(), self.format)?;
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        api.update_page_comment(&self.comment_id, self.kind.into(), &adf)
+            .await?;
+        println!("Comment {} updated.", self.comment_id);
+        Ok(())
+    }
+}
+
+/// Deletes a comment from a Confluence page.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// Comment ID to delete (from `comment list`).
+    pub comment_id: String,
+
+    /// Whether the target is a footer or inline comment (the v2 API uses
+    /// separate endpoints).
+    #[arg(long, value_enum)]
+    pub kind: CommentKindArg,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Executes the delete command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &mut reader, &mut writer).await
+    }
+
+    /// Inner form taking explicit API and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        let kind: CommentKind = self.kind.into();
+        let prompt = format!("Delete {kind} comment {}? [y/N] ", self.comment_id);
+        let dry_run_message = format!("Would delete {kind} comment {}.", self.comment_id);
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
+        match outcome {
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+            GuardOutcome::Proceed => {}
+        }
+
+        api.delete_page_comment(&self.comment_id, kind).await?;
+        writeln!(writer, "Deleted comment {}.", self.comment_id)?;
+        Ok(())
+    }
+}
+
+/// Resolves an inline comment on a Confluence page.
+#[derive(Parser)]
+pub struct ResolveCommand {
+    /// Inline comment ID to resolve (from `comment list`).
+    pub comment_id: String,
+}
+
+impl ResolveCommand {
+    /// Resolves the inline comment.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        api.set_inline_comment_resolved(&self.comment_id, true)
+            .await?;
+        println!("Resolved inline comment {}.", self.comment_id);
+        Ok(())
+    }
+}
+
+/// Reopens a resolved inline comment on a Confluence page.
+#[derive(Parser)]
+pub struct ReopenCommand {
+    /// Inline comment ID to reopen (from `comment list`).
+    pub comment_id: String,
+}
+
+impl ReopenCommand {
+    /// Reopens the inline comment.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        api.set_inline_comment_resolved(&self.comment_id, false)
+            .await?;
+        println!("Reopened inline comment {}.", self.comment_id);
         Ok(())
     }
 }
@@ -784,6 +927,234 @@ mod tests {
     fn comment_kind_arg_into_inline() {
         let k: CommentKind = CommentKindArg::Inline.into();
         assert_eq!(k, CommentKind::Inline);
+    }
+
+    // ── edit / delete / resolve / reopen ───────────────────────────
+
+    #[test]
+    fn comment_command_edit_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Edit(EditCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Footer,
+                file: None,
+                format: ContentFormat::Jfm,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn comment_command_delete_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Delete(DeleteCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Inline,
+                force: false,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Delete(_)));
+    }
+
+    #[test]
+    fn comment_command_resolve_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Resolve(ResolveCommand {
+                comment_id: "555".to_string(),
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Resolve(_)));
+    }
+
+    #[test]
+    fn comment_command_reopen_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Reopen(ReopenCommand {
+                comment_id: "555".to_string(),
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Reopen(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let cmd = DeleteCommand {
+            comment_id: "555".to_string(),
+            kind: CommentKindArg::Footer,
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted comment 555."));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_dry_run_makes_no_api_call() {
+        // No mocks mounted: a real DELETE would 404/connect-fail.
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+        let cmd = DeleteCommand {
+            comment_id: "555".to_string(),
+            kind: CommentKindArg::Inline,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete inline comment 555."));
+        assert!(!out.contains("Deleted comment"));
+    }
+
+    // ── CommentCommand::execute() end-to-end ───────────────────────
+    //
+    // Drives the top-level dispatch arm *and* each subcommand's execute()
+    // wrapper (create_client + API call) against a wiremock.
+
+    fn comment_detail_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+    }
+
+    fn comment_put_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_edit_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("footer-comments").mount(&server).await;
+        comment_put_mock("footer-comments").mount(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("body.md");
+        std::fs::write(&file, "revised body\n").unwrap();
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Edit(EditCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Footer,
+                file: Some(file.to_string_lossy().into_owned()),
+                format: ContentFormat::Jfm,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the wrapper's real stdin is not read.
+        CommentCommand {
+            command: CommentSubcommands::Delete(DeleteCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Inline,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_resolve_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("inline-comments").mount(&server).await;
+        comment_put_mock("inline-comments").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Resolve(ResolveCommand {
+                comment_id: "555".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_reopen_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("inline-comments").mount(&server).await;
+        comment_put_mock("inline-comments").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Reopen(ReopenCommand {
+                comment_id: "555".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_comment_prompt_no_makes_no_delete() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+        let cmd = DeleteCommand {
+            comment_id: "555".to_string(),
+            kind: CommentKindArg::Footer,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted comment"));
     }
 
     // ── run_list_comments / run_add_comment ────────────────────────
@@ -1524,6 +1895,28 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("writer failed"))
         }
+    }
+
+    /// A dry-run with a failing writer makes the guard's own `writeln` fail,
+    /// covering the `?` propagation on `guard_destructive_with_io` in
+    /// `DeleteCommand::execute_with_io` — the last uncovered line of #1117.
+    #[tokio::test]
+    async fn delete_comment_dry_run_propagates_guard_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+        let cmd = DeleteCommand {
+            comment_id: "555".to_string(),
+            kind: CommentKindArg::Inline,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter { fail_write: true };
+        let err = cmd
+            .execute_with_io(&api, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("writer failed"));
     }
 
     #[tokio::test]

@@ -201,6 +201,10 @@ pub struct RemoteLinkCommand {
 pub enum RemoteLinkSubcommands {
     /// Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool).
     List(ListRemoteLinksCommand),
+    /// Adds a remote (external URL) link to a JIRA issue (mirrors the `jira_link_remote_create` MCP tool).
+    Create(CreateRemoteLinkCommand),
+    /// Deletes a remote (external URL) link from a JIRA issue (mirrors the `jira_link_remote_delete` MCP tool).
+    Delete(DeleteRemoteLinkCommand),
 }
 
 impl RemoteLinkCommand {
@@ -208,6 +212,8 @@ impl RemoteLinkCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             RemoteLinkSubcommands::List(cmd) => cmd.execute().await,
+            RemoteLinkSubcommands::Create(cmd) => cmd.execute().await,
+            RemoteLinkSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -228,6 +234,123 @@ impl ListRemoteLinksCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         run_list_remote_links(&client, &self.key, &self.output).await
+    }
+}
+
+/// Adds a remote (external URL) link to a JIRA issue.
+#[derive(Parser)]
+pub struct CreateRemoteLinkCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// External URL to link to.
+    #[arg(long)]
+    pub url: String,
+
+    /// Link title (display text).
+    #[arg(long)]
+    pub title: String,
+
+    /// Optional summary shown under the title.
+    #[arg(long)]
+    pub summary: Option<String>,
+
+    /// Optional relationship label (e.g., "relates to", "causes").
+    #[arg(long)]
+    pub relationship: Option<String>,
+
+    /// Optional global ID. Reusing an existing global ID updates that link
+    /// instead of creating a duplicate.
+    #[arg(long)]
+    pub global_id: Option<String>,
+}
+
+impl CreateRemoteLinkCommand {
+    /// Creates the remote link.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let id = client
+            .create_remote_issue_link(
+                &self.key,
+                &self.url,
+                &self.title,
+                self.summary.as_deref(),
+                self.relationship.as_deref(),
+                self.global_id.as_deref(),
+            )
+            .await?;
+        println!("Added remote link {id} to {}.", self.key);
+        Ok(())
+    }
+}
+
+/// Deletes a remote (external URL) link from a JIRA issue.
+#[derive(Parser)]
+pub struct DeleteRemoteLinkCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Remote link ID to delete (from `link remote list`).
+    #[arg(long)]
+    pub link_id: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteRemoteLinkCommand {
+    /// Deletes the remote link.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        let prompt = format!(
+            "Delete remote link {} on {}? [y/N] ",
+            self.link_id, self.key
+        );
+        let dry_run_message = format!("Would delete remote link {} on {}.", self.link_id, self.key);
+
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
+
+        match outcome {
+            GuardOutcome::Proceed => {
+                client
+                    .delete_remote_issue_link(&self.key, &self.link_id)
+                    .await?;
+                writeln!(
+                    writer,
+                    "Deleted remote link {} on {}.",
+                    self.link_id, self.key
+                )?;
+                Ok(())
+            }
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
+        }
     }
 }
 
@@ -1096,6 +1219,148 @@ mod tests {
         cmd.execute().await.unwrap();
     }
 
+    #[test]
+    fn link_command_remote_create_variant() {
+        let cmd = LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::Create(CreateRemoteLinkCommand {
+                    key: "PROJ-1".to_string(),
+                    url: "https://x".to_string(),
+                    title: "T".to_string(),
+                    summary: None,
+                    relationship: None,
+                    global_id: None,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, LinkSubcommands::Remote(_)));
+    }
+
+    #[tokio::test]
+    async fn remote_create_execute_drives_create_client_and_posts() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = CreateRemoteLinkCommand {
+            key: "PROJ-1".to_string(),
+            url: "https://example.com/doc".to_string(),
+            title: "Design doc".to_string(),
+            summary: Some("Architecture".to_string()),
+            relationship: Some("relates to".to_string()),
+            global_id: None,
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_delete_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteRemoteLinkCommand {
+            key: "PROJ-1".to_string(),
+            link_id: "10010".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted remote link 10010 on PROJ-1."));
+    }
+
+    /// Dry-run with a failing writer covers the `?` on the guard call in
+    /// `DeleteRemoteLinkCommand::execute_with_io`.
+    #[tokio::test]
+    async fn remote_delete_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteRemoteLinkCommand {
+            key: "PROJ-1".to_string(),
+            link_id: "10010".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Force + a failing writer covers the `?` on the post-success writeln.
+    #[tokio::test]
+    async fn remote_delete_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteRemoteLinkCommand {
+            key: "PROJ-1".to_string(),
+            link_id: "10010".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    #[tokio::test]
+    async fn remote_delete_dry_run_makes_no_api_call() {
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteRemoteLinkCommand {
+            key: "PROJ-1".to_string(),
+            link_id: "10010".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete remote link 10010 on PROJ-1."));
+        assert!(!out.contains("Deleted remote link"));
+    }
+
     #[tokio::test]
     async fn run_list_remote_links_propagates_error() {
         let server = wiremock::MockServer::start().await;
@@ -1113,5 +1378,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    /// Drives the nested `Remote` → `Create` dispatch arms through the public
+    /// `LinkCommand::execute` chain.
+    #[tokio::test]
+    async fn link_command_execute_remote_create_arm() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::Create(CreateRemoteLinkCommand {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.com/doc".to_string(),
+                    title: "Doc".to_string(),
+                    summary: None,
+                    relationship: None,
+                    global_id: None,
+                }),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    /// Drives the nested `Remote` → `Delete` dispatch arms and
+    /// `DeleteRemoteLinkCommand::execute`'s create_client + stdio wiring.
+    #[tokio::test]
+    async fn link_command_execute_remote_delete_arm() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::Delete(DeleteRemoteLinkCommand {
+                    key: "PROJ-1".to_string(),
+                    link_id: "10010".to_string(),
+                    force: true,
+                    dry_run: false,
+                }),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
     }
 }

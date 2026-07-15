@@ -4,6 +4,7 @@ pub(crate) mod attachment;
 pub(crate) mod children;
 pub(crate) mod comment;
 pub(crate) mod compare;
+pub(crate) mod copy;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod download;
@@ -12,9 +13,11 @@ pub(crate) mod history;
 pub(crate) mod label;
 pub(crate) mod move_page;
 pub(crate) mod read;
+pub(crate) mod restriction;
 pub(crate) mod search;
 pub(crate) mod space;
 pub(crate) mod user;
+pub(crate) mod watcher;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -60,6 +63,8 @@ pub enum ConfluenceSubcommands {
     Delete(delete::DeleteCommand),
     /// Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool).
     Move(move_page::MoveCommand),
+    /// Copies a Confluence page under a destination parent (mirrors the `confluence_copy` MCP tool).
+    Copy(copy::CopyCommand),
     /// Manages labels on Confluence pages.
     Label(label::LabelCommand),
     /// Manages attachments on Confluence pages.
@@ -76,6 +81,10 @@ pub enum ConfluenceSubcommands {
     User(user::UserCommand),
     /// Confluence space operations.
     Space(space::SpaceCommand),
+    /// Manages watchers on Confluence pages.
+    Watcher(watcher::WatcherCommand),
+    /// Manages read/update restrictions on Confluence pages.
+    Restriction(restriction::RestrictionCommand),
 }
 
 impl ConfluenceCommand {
@@ -92,12 +101,15 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Attachment(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Move(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Copy(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Children(cmd) => cmd.execute().await,
             ConfluenceSubcommands::History(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Compare(cmd) => cmd.execute().await,
             ConfluenceSubcommands::User(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Space(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Watcher(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Restriction(cmd) => cmd.execute().await,
         }
     }
 }
@@ -566,5 +578,86 @@ mod tests {
         std::env::remove_var("ATLASSIAN_INSTANCE_URL");
         std::env::remove_var("ATLASSIAN_EMAIL");
         std::env::remove_var("ATLASSIAN_API_TOKEN");
+    }
+
+    /// Points credentials at a dead address so `cmd.execute()` reaches the
+    /// dispatch arm and the subcommand's `create_client()` glue then fails on
+    /// transport — the success paths are covered by each subcommand's own
+    /// wiremock tests. Sync helpers (the caller holds the env mutex across the
+    /// await, so the future must not capture a guard here).
+    fn set_dead_credentials() {
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+    }
+
+    fn clear_credentials_env() {
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
+    }
+
+    /// Exercises the `Copy` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_copy_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Copy(copy::CopyCommand {
+                id: "12345".to_string(),
+                parent: "67890".to_string(),
+                title: "Copy".to_string(),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
+    }
+
+    /// Exercises the `Watcher` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_watcher_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Watcher(watcher::WatcherCommand {
+                command: watcher::WatcherSubcommands::Status(watcher::WatchArgs {
+                    id: "12345".to_string(),
+                    account_id: None,
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
+    }
+
+    /// Exercises the `Restriction` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_restriction_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Restriction(restriction::RestrictionCommand {
+                command: restriction::RestrictionSubcommands::Get(restriction::GetCommand {
+                    id: "12345".to_string(),
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
     }
 }

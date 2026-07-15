@@ -194,6 +194,50 @@ pub struct ConfluenceMoveParams {
     pub position: Option<String>,
 }
 
+/// Parameters for the `confluence_copy` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCopyParams {
+    /// Source page ID to copy.
+    pub page_id: String,
+    /// Destination parent page ID the copy is placed under.
+    pub parent_id: String,
+    /// Title for the new copied page.
+    pub title: String,
+}
+
+/// Parameters for the `confluence_watcher_{status,add,remove}` tools.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceWatchParams {
+    /// Confluence page (content) ID.
+    pub content_id: String,
+    /// Atlassian `accountId` of the user. Defaults to the authenticated user.
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+/// Parameters for the `confluence_restriction_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceRestrictionGetParams {
+    /// Confluence page (content) ID.
+    pub content_id: String,
+}
+
+/// Parameters for the `confluence_restriction_{grant,revoke}` tools.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceRestrictionSubjectParams {
+    /// Confluence page (content) ID.
+    pub content_id: String,
+    /// Operation the restriction applies to — `"read"` or `"update"`.
+    pub operation: String,
+    /// Atlassian `accountId` of the user. Exactly one of `account_id` /
+    /// `group` must be set.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Group name. Exactly one of `account_id` / `group` must be set.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 /// Parameters for the `confluence_download` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceDownloadParams {
@@ -351,6 +395,42 @@ pub struct ConfluenceCommentReanchorParams {
     pub dry_run: bool,
 }
 
+/// Parameters for the `confluence_comment_edit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentEditParams {
+    /// Comment ID to edit (from `confluence_comment_list`).
+    pub comment_id: String,
+    /// `"footer"` or `"inline"` — the v2 API uses separate endpoints.
+    pub kind: String,
+    /// New markdown body. Converted to ADF. Mutually exclusive with
+    /// `content_path`; exactly one is required.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Filesystem path the server reads the new body from, instead of
+    /// `content`.
+    #[serde(default)]
+    pub content_path: Option<String>,
+}
+
+/// Parameters for the `confluence_comment_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentDeleteParams {
+    /// Comment ID to delete (from `confluence_comment_list`).
+    pub comment_id: String,
+    /// `"footer"` or `"inline"` — the v2 API uses separate endpoints.
+    pub kind: String,
+    /// Must be `true` — destructive guard.
+    pub confirm: bool,
+}
+
+/// Parameters for the `confluence_comment_resolve` / `confluence_comment_reopen`
+/// tools (inline comments only).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentResolveParams {
+    /// Inline comment ID (from `confluence_comment_list`).
+    pub comment_id: String,
+}
+
 /// Parameters for the `confluence_label_list` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceLabelListParams {
@@ -419,6 +499,28 @@ pub struct ConfluenceAttachmentUploadParams {
     #[serde(default)]
     pub comment: Option<String>,
     /// Marks the upload as a minor edit. Defaults to false.
+    #[serde(default)]
+    pub minor_edit: Option<bool>,
+}
+
+/// Parameters for the `confluence_attachment_update` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceAttachmentUpdateParams {
+    /// Confluence page ID the attachment lives on.
+    pub page_id: String,
+    /// Attachment ID to update (from `confluence_attachment_list`).
+    pub attachment_id: String,
+    /// Local filesystem path whose contents become the new version. Streamed
+    /// from disk (never fully buffered in memory).
+    pub file_path: String,
+    /// Override the filename used in Confluence (defaults to the local
+    /// basename).
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Optional version comment recorded with the new version.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Marks the new version as a minor edit. Defaults to false.
     #[serde(default)]
     pub minor_edit: Option<bool>,
 }
@@ -1028,6 +1130,66 @@ pub async fn audit_comments_yaml(api: &ConfluenceApi, id: &str) -> Result<String
     to_yaml(&drifts)
 }
 
+/// Edits a comment's body and returns the outcome as YAML.
+pub async fn edit_comment_result(
+    api: &ConfluenceApi,
+    comment_id: &str,
+    kind: CommentKind,
+    content: &str,
+) -> Result<String> {
+    let adf = markdown_to_validated_adf(content)?;
+    api.update_page_comment(comment_id, kind, &adf).await?;
+    let result = MutationResult {
+        ok: true,
+        message: format!("Comment {comment_id} updated."),
+        id: comment_id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
+/// Deletes a comment and returns the outcome as YAML. Refuses without an
+/// explicit `confirm`.
+pub async fn delete_comment_result(
+    api: &ConfluenceApi,
+    comment_id: &str,
+    kind: CommentKind,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        anyhow::bail!(
+            "Refusing to delete comment {comment_id}: pass `confirm: true` to authorise this irreversible operation."
+        );
+    }
+    api.delete_page_comment(comment_id, kind).await?;
+    let result = MutationResult {
+        ok: true,
+        message: format!("Comment {comment_id} deleted."),
+        id: comment_id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
+/// Resolves (`resolved = true`) or reopens (`resolved = false`) an inline
+/// comment and returns the outcome as YAML.
+pub async fn set_comment_resolved_result(
+    api: &ConfluenceApi,
+    comment_id: &str,
+    resolved: bool,
+) -> Result<String> {
+    api.set_inline_comment_resolved(comment_id, resolved)
+        .await?;
+    let verb = if resolved { "resolved" } else { "reopened" };
+    let result = MutationResult {
+        ok: true,
+        message: format!("Inline comment {comment_id} {verb}."),
+        id: comment_id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
 /// Moves an inline comment's anchor and returns the outcome as YAML.
 ///
 /// With `dry_run`, the move is computed and validated but the page is not
@@ -1131,6 +1293,24 @@ pub async fn upload_attachment_result(
     let path = std::path::Path::new(file_path);
     let attachment = api
         .upload_attachment(page_id, path, filename, comment, minor_edit)
+        .await?;
+    to_yaml(&attachment)
+}
+
+/// Uploads a new binary version of an existing attachment and returns YAML.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_attachment_result(
+    api: &ConfluenceApi,
+    page_id: &str,
+    attachment_id: &str,
+    file_path: &str,
+    filename: Option<&str>,
+    comment: Option<&str>,
+    minor_edit: bool,
+) -> Result<String> {
+    let path = std::path::Path::new(file_path);
+    let attachment = api
+        .update_attachment(page_id, attachment_id, path, filename, comment, minor_edit)
         .await?;
     to_yaml(&attachment)
 }
@@ -1428,6 +1608,175 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
+    /// Tool: copy a Confluence page under a destination parent.
+    #[tool(
+        description = "Copy a single Confluence page under a destination parent page \
+                       (`parent_id`), giving the copy `title`. Carries the source page's \
+                       attachments, labels, and properties (not its restrictions). Single-page \
+                       copy only. Returns YAML with the new page id. Mirrors `omni-dev atlassian \
+                       confluence copy`."
+    )]
+    pub async fn confluence_copy(
+        &self,
+        Parameters(params): Parameters<ConfluenceCopyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            let new_id = api
+                .copy_page(&params.page_id, &params.parent_id, &params.title)
+                .await?;
+            to_yaml(&serde_json::json!({ "id": new_id }))
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: report whether a user watches a Confluence page.
+    #[tool(
+        description = "Report whether a user watches a Confluence page (`account_id` defaults \
+                       to the authenticated user). Returns YAML `{watching: bool}`. Mirrors \
+                       `omni-dev atlassian confluence watcher status`."
+    )]
+    pub async fn confluence_watcher_status(
+        &self,
+        Parameters(params): Parameters<ConfluenceWatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            let status = api
+                .is_watching_content(&params.content_id, params.account_id.as_deref())
+                .await?;
+            to_yaml(&status)
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: add a watcher to a Confluence page.
+    #[tool(
+        description = "Add a watcher to a Confluence page (`account_id` defaults to the \
+                       authenticated user). Returns YAML `{watching: true}`. Mirrors \
+                       `omni-dev atlassian confluence watcher add`."
+    )]
+    pub async fn confluence_watcher_add(
+        &self,
+        Parameters(params): Parameters<ConfluenceWatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            api.add_content_watcher(&params.content_id, params.account_id.as_deref())
+                .await?;
+            to_yaml(&serde_json::json!({ "watching": true }))
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: remove a watcher from a Confluence page.
+    #[tool(
+        description = "Remove a watcher from a Confluence page (`account_id` defaults to the \
+                       authenticated user). Returns YAML `{watching: false}`. Mirrors \
+                       `omni-dev atlassian confluence watcher remove`."
+    )]
+    pub async fn confluence_watcher_remove(
+        &self,
+        Parameters(params): Parameters<ConfluenceWatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            api.remove_content_watcher(&params.content_id, params.account_id.as_deref())
+                .await?;
+            to_yaml(&serde_json::json!({ "watching": false }))
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: show a Confluence page's restrictions.
+    #[tool(
+        description = "Show the read/update restrictions on a Confluence page. Returns the raw \
+                       restriction JSON as YAML (the model is deeply nested — user/group arrays \
+                       per operation). Mirrors `omni-dev atlassian confluence restriction get`."
+    )]
+    pub async fn confluence_restriction_get(
+        &self,
+        Parameters(params): Parameters<ConfluenceRestrictionGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            let value = api.get_content_restrictions(&params.content_id).await?;
+            to_yaml(&value)
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: grant a user/group a restriction for an operation.
+    #[tool(
+        description = "Grant a user or group a read/update restriction on a Confluence page. \
+                       `operation` is `\"read\"` or `\"update\"`; supply exactly one of \
+                       `account_id` or `group`. Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian confluence restriction grant`."
+    )]
+    pub async fn confluence_restriction_grant(
+        &self,
+        Parameters(params): Parameters<ConfluenceRestrictionSubjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            api.grant_content_restriction(
+                &params.content_id,
+                &params.operation,
+                params.account_id.as_deref(),
+                params.group.as_deref(),
+            )
+            .await?;
+            to_yaml(&serde_json::json!({ "status": "ok" }))
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: revoke a user/group restriction for an operation.
+    #[tool(
+        description = "Revoke a user's or group's read/update restriction on a Confluence page. \
+                       `operation` is `\"read\"` or `\"update\"`; supply exactly one of \
+                       `account_id` or `group`. Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian confluence restriction revoke`."
+    )]
+    pub async fn confluence_restriction_revoke(
+        &self,
+        Parameters(params): Parameters<ConfluenceRestrictionSubjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _url) = create_client()?;
+            let api = ConfluenceApi::new(client);
+            api.revoke_content_restriction(
+                &params.content_id,
+                &params.operation,
+                params.account_id.as_deref(),
+                params.group.as_deref(),
+            )
+            .await?;
+            to_yaml(&serde_json::json!({ "status": "ok" }))
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
     /// Tool: recursively download a Confluence page tree.
     #[tool(
         description = "Recursively download a Confluence page or an entire space into a directory. \
@@ -1591,6 +1940,88 @@ impl OmniDevServer {
         )
         .await
         .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Edits an existing Confluence comment's body.
+    #[tool(
+        description = "Edit an existing Confluence comment's body (by `comment_id` from \
+                       `confluence_comment_list`). `kind` must be \"footer\" or \"inline\". The \
+                       new body replaces the current text; supply it as `content` (inline) OR \
+                       `content_path` (a filesystem path the server reads) — not both. Returns \
+                       YAML. Mirrors `omni-dev atlassian confluence comment edit`."
+    )]
+    pub async fn confluence_comment_edit(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = require_content_input(
+            params.content.as_deref(),
+            params.content_path.as_deref(),
+            "content",
+        )
+        .map_err(tool_error)?;
+        let kind = parse_comment_kind(&params.kind).map_err(tool_error)?;
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = edit_comment_result(&api, &params.comment_id, kind, &content)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Deletes a Confluence comment.
+    #[tool(description = "Delete a Confluence comment (by `comment_id` from \
+                       `confluence_comment_list`). `kind` must be \"footer\" or \"inline\". \
+                       Irreversible: pass `confirm: true` to authorise — without it the tool \
+                       refuses and makes no API call. Returns YAML. Mirrors `omni-dev atlassian \
+                       confluence comment delete`.")]
+    pub async fn confluence_comment_delete(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = parse_comment_kind(&params.kind).map_err(tool_error)?;
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = delete_comment_result(&api, &params.comment_id, kind, params.confirm)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Resolves an inline Confluence comment.
+    #[tool(
+        description = "Resolve an inline Confluence comment (by `comment_id` from \
+                       `confluence_comment_list`). Inline comments only. Returns YAML. Mirrors \
+                       `omni-dev atlassian confluence comment resolve`."
+    )]
+    pub async fn confluence_comment_resolve(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentResolveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = set_comment_resolved_result(&api, &params.comment_id, true)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Reopens a resolved inline Confluence comment.
+    #[tool(
+        description = "Reopen a resolved inline Confluence comment (by `comment_id` from \
+                       `confluence_comment_list`). Inline comments only. Returns YAML. Mirrors \
+                       `omni-dev atlassian confluence comment reopen`."
+    )]
+    pub async fn confluence_comment_reopen(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentResolveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = set_comment_resolved_result(&api, &params.comment_id, false)
+            .await
+            .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
@@ -1782,6 +2213,36 @@ impl OmniDevServer {
         let yaml = upload_attachment_result(
             &api,
             &params.page_id,
+            &params.file_path,
+            params.filename.as_deref(),
+            params.comment.as_deref(),
+            params.minor_edit.unwrap_or(false),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Uploads a new binary version of an existing attachment.
+    #[tool(
+        description = "Upload a new binary version of an EXISTING Confluence attachment (by \
+                       `page_id` + `attachment_id` from `confluence_attachment_list`), bumping \
+                       its version instead of creating a second attachment. `file_path` is a path \
+                       on the MCP server's filesystem (streamed from disk). Optional `filename` / \
+                       `comment` / `minor_edit` as with upload. Returns YAML describing the \
+                       updated attachment. Mirrors `omni-dev atlassian confluence attachment \
+                       update`."
+    )]
+    pub async fn confluence_attachment_update(
+        &self,
+        Parameters(params): Parameters<ConfluenceAttachmentUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = update_attachment_result(
+            &api,
+            &params.page_id,
+            &params.attachment_id,
             &params.file_path,
             params.filename.as_deref(),
             params.comment.as_deref(),
@@ -5244,6 +5705,129 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
+    // ── edit / delete / resolve comment ────────────────────────────
+
+    #[tokio::test]
+    async fn edit_comment_result_fetches_version_then_puts() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/c9"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/c9"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = edit_comment_result(&phase2d_mock_api(&server), "c9", CommentKind::Footer, "hi")
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("updated"));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_result_without_confirm_refuses() {
+        // No mocks: any HTTP call would be a test failure.
+        let server = wiremock::MockServer::start().await;
+        let err =
+            delete_comment_result(&phase2d_mock_api(&server), "c9", CommentKind::Inline, false)
+                .await
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete comment c9"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn delete_comment_result_with_confirm_deletes() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/c9"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml =
+            delete_comment_result(&phase2d_mock_api(&server), "c9", CommentKind::Inline, true)
+                .await
+                .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("deleted"));
+    }
+
+    #[tokio::test]
+    async fn set_comment_resolved_result_resolves() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/c9"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 4},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/c9"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = set_comment_resolved_result(&phase2d_mock_api(&server), "c9", true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("resolved"));
+    }
+
+    #[tokio::test]
+    async fn update_attachment_result_posts_new_version() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1", "title": "x.txt", "version": {"number": 3}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        tokio::fs::write(&path, b"new bytes").await.unwrap();
+
+        let yaml = update_attachment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "att-1",
+            path.to_str().unwrap(),
+            None,
+            Some("v3"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("att-1"));
+    }
+
     // ── add_inline_comment_result ──────────────────────────────────
 
     /// Mounts a page fetch returning a page whose body contains `anchor_text`.
@@ -6181,5 +6765,306 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("Version two body"), "got: {out}");
+    }
+
+    // ── #[tool] handler wrappers (create_client boundary) ──────────
+    //
+    // The result-helpers above are unit-tested directly; these drive the thin
+    // `#[tool]` wrappers end-to-end through `create_client()` (env + wiremock).
+
+    fn comment_get_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_edit_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("footer-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_edit(Parameters(ConfluenceCommentEditParams {
+                comment_id: "555".to_string(),
+                kind: "footer".to_string(),
+                content: Some("revised".to_string()),
+                content_path: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_delete_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_delete(Parameters(ConfluenceCommentDeleteParams {
+                comment_id: "555".to_string(),
+                kind: "inline".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_resolve_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("inline-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_resolve(Parameters(ConfluenceCommentResolveParams {
+                comment_id: "555".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_reopen_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        comment_get_mock("inline-comments").mount(&srv).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_comment_reopen(Parameters(ConfluenceCommentResolveParams {
+                comment_id: "555".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_copy_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/copy",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "999"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_copy(Parameters(ConfluenceCopyParams {
+                page_id: "12345".to_string(),
+                parent_id: "67890".to_string(),
+                title: "Copy".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_attachment_update_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment/att-1/data",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1", "title": "x.txt", "version": {"number": 3}
+                })),
+            )
+            .mount(&srv)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        std::fs::write(&path, b"new bytes").unwrap();
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_attachment_update(Parameters(ConfluenceAttachmentUpdateParams {
+                page_id: "12345".to_string(),
+                attachment_id: "att-1".to_string(),
+                file_path: path.to_string_lossy().into_owned(),
+                filename: None,
+                comment: None,
+                minor_edit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    fn watch_mock(method: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/user/watch/content/12345",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"watching": true})),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_status_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("GET").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_status(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_add_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("POST").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_add(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: Some("acc-1".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_watcher_remove_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        watch_mock("DELETE").mount(&srv).await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_watcher_remove(Parameters(ConfluenceWatchParams {
+                content_id: "12345".to_string(),
+                account_id: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_get_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"operation": "read"}]})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_get(Parameters(ConfluenceRestrictionGetParams {
+                content_id: "12345".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_grant_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/update/user",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_grant(Parameters(ConfluenceRestrictionSubjectParams {
+                content_id: "12345".to_string(),
+                operation: "update".to_string(),
+                account_id: Some("acc-1".to_string()),
+                group: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_restriction_revoke_handler_success() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/restriction/byOperation/read/group/devs",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+        let result = make_server()
+            .confluence_restriction_revoke(Parameters(ConfluenceRestrictionSubjectParams {
+                content_id: "12345".to_string(),
+                operation: "read".to_string(),
+                account_id: None,
+                group: Some("devs".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 }

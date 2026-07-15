@@ -12,9 +12,7 @@ use crate::atlassian::create::{create_resolved_jira_issue, resolve_jira_create};
 use crate::atlassian::custom_fields::parse_set_field;
 use crate::atlassian::document::CustomFieldSection;
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{
-    create_client_with_instance, print_create_dry_run, read_input,
-};
+use crate::cli::atlassian::helpers::{create_client, print_create_dry_run, read_input};
 
 /// `--help` epilogue documenting the fields accepted only via JFM frontmatter,
 /// so they are discoverable without first triggering a runtime error.
@@ -53,11 +51,6 @@ pub struct CreateCommand {
     /// Input format.
     #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
     pub format: ContentFormat,
-
-    /// Atlassian instance URL (e.g. "https://org.atlassian.net"). Overrides
-    /// ATLASSIAN_INSTANCE_URL / settings.json for this invocation.
-    #[arg(long, value_name = "URL")]
-    pub instance: Option<String>,
 
     /// Project key (e.g., "PROJ"). Overrides frontmatter.
     #[arg(long)]
@@ -127,7 +120,10 @@ impl CreateCommand {
             );
         }
 
-        let (client, _instance_url) = create_client_with_instance(self.instance.as_deref())?;
+        // The instance is resolved by `create_client()` — the global
+        // `--instance` flag (propagated to OMNI_DEV_ATLASSIAN_INSTANCE) overrides
+        // the configured one for every command, this one included (#1117).
+        let (client, _instance_url) = create_client()?;
         run_create(&client, &params).await
     }
 
@@ -246,7 +242,6 @@ mod tests {
         let cmd = CreateCommand {
             file: None,
             format: ContentFormat::default(),
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -254,7 +249,6 @@ mod tests {
             dry_run: false,
         };
         assert!(cmd.file.is_none());
-        assert!(cmd.instance.is_none());
         assert!(cmd.project.is_none());
         assert!(!cmd.dry_run);
     }
@@ -272,7 +266,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -295,7 +288,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -320,7 +312,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -342,7 +333,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: Some("NEW".to_string()),
             r#type: Some("Story".to_string()),
             summary: Some("New Title".to_string()),
@@ -368,7 +358,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -394,7 +383,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -417,7 +405,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -439,7 +426,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: Some("Bug".to_string()),
             summary: Some("Fix it".to_string()),
@@ -463,7 +449,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
-            instance: None,
             project: None,
             r#type: None,
             summary: Some("Title".to_string()),
@@ -485,7 +470,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: None,
@@ -507,7 +491,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -530,7 +513,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: Some("Story".to_string()),
             summary: Some("Flag-driven".to_string()),
@@ -553,7 +535,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("S".to_string()),
@@ -574,7 +555,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: Some("Has summary".to_string()),
@@ -595,7 +575,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: None,
@@ -621,7 +600,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: Some("From flag".to_string()),
@@ -645,7 +623,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -668,7 +645,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("Test".to_string()),
@@ -691,7 +667,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -759,17 +734,22 @@ mod tests {
         let file_path = temp_dir.path().join("body.md");
         fs::write(&file_path, "Plain body.\n").unwrap();
 
-        // Email/token from env; instance comes from the --instance flag, which
-        // points at the mock server.
+        // Email/token from env; the instance comes from the global `--instance`
+        // flag, which `propagate_global_flags` exports as
+        // `OMNI_DEV_ATLASSIAN_INSTANCE` — here set directly to the mock server
+        // (the `EnvGuard` snapshots and restores that var too). #1117.
         let guard = crate::atlassian::auth::test_util::EnvGuard::take();
         let _home = guard.clear_credentials();
         std::env::set_var(crate::atlassian::auth::ATLASSIAN_EMAIL, "u@test.com");
         std::env::set_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN, "token");
+        std::env::set_var(
+            crate::atlassian::auth::ATLASSIAN_INSTANCE_OVERRIDE_ENV,
+            server.uri(),
+        );
 
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: Some(server.uri()),
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("From flag".to_string()),
@@ -887,7 +867,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -912,7 +891,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
-            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -934,7 +912,6 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
-            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("T".to_string()),

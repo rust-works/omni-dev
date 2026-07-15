@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::jira_types::{AgileSprintList, JiraSearchResult};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -29,6 +30,8 @@ pub enum SprintSubcommands {
     Create(CreateCommand),
     /// Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool).
     Update(UpdateCommand),
+    /// Deletes a sprint (mirrors the `jira_sprint_delete` MCP tool).
+    Delete(DeleteCommand),
 }
 
 impl SprintCommand {
@@ -40,6 +43,7 @@ impl SprintCommand {
             SprintSubcommands::Add(cmd) => cmd.execute().await,
             SprintSubcommands::Create(cmd) => cmd.execute().await,
             SprintSubcommands::Update(cmd) => cmd.execute().await,
+            SprintSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -221,6 +225,64 @@ impl UpdateCommand {
             self.goal.as_deref(),
         )
         .await
+    }
+}
+
+/// Deletes a sprint.
+#[derive(Parser)]
+pub struct DeleteCommand {
+    /// Sprint ID.
+    #[arg(long)]
+    pub sprint_id: u64,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl DeleteCommand {
+    /// Executes the delete command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        let mut writer = std::io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn std::io::BufRead + Send),
+        writer: &mut (dyn std::io::Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format!("Delete sprint {}? [y/N] ", self.sprint_id);
+            let dry_run_message = format!("Would delete sprint {}.", self.sprint_id);
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
+        client.delete_sprint(self.sprint_id).await?;
+        writeln!(writer, "Deleted sprint {}.", self.sprint_id)?;
+        Ok(())
     }
 }
 
@@ -678,6 +740,62 @@ mod tests {
     }
 
     #[test]
+    fn sprint_command_delete_variant() {
+        let cmd = SprintCommand {
+            command: SprintSubcommands::Delete(DeleteCommand {
+                sprint_id: 42,
+                force: false,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, SprintSubcommands::Delete(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_sprint_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted sprint 42."));
+    }
+
+    #[tokio::test]
+    async fn delete_sprint_dry_run_makes_no_api_call() {
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete sprint 42."));
+        assert!(!out.contains("Deleted sprint"));
+    }
+
+    #[test]
     fn create_command_all_fields() {
         let cmd = CreateCommand {
             board_id: 1,
@@ -869,5 +987,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    /// Answering "y" takes the `GuardOutcome::Proceed` arm.
+    #[tokio::test]
+    async fn delete_sprint_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Deleted sprint"));
+    }
+
+    /// Dry-run with a failing writer covers the `?` on the guard call.
+    #[tokio::test]
+    async fn delete_sprint_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let client = mock_client("http://127.0.0.1:1");
+        let cmd = DeleteCommand {
+            sprint_id: 42,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Drives the `Delete` dispatch arm and `DeleteCommand::execute`'s
+    /// create_client + stdin/stdout wiring (`--force` skips the prompt).
+    #[tokio::test]
+    async fn sprint_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        SprintCommand {
+            command: SprintSubcommands::Delete(DeleteCommand {
+                sprint_id: 42,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
     }
 }
