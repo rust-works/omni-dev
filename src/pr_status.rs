@@ -127,16 +127,30 @@ pub struct PrTarget {
     pub branch: String,
 }
 
+/// How a **single** rollup entry classifies.
+///
+/// Deliberately narrower than [`PrCheckState`]: an individual check is always
+/// failing, running, or passing. "No checks" is a property of the rollup as a
+/// whole, never of an entry — so rather than carry an impossible `None` case as an
+/// unreachable match arm (as the TypeScript this was ported from did), it simply is
+/// not representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryState {
+    Failure,
+    Pending,
+    Success,
+}
+
 /// Classifies one `statusCheckRollup` entry.
 ///
 /// A `CheckRun` that has not `COMPLETED` is pending regardless of its (null)
 /// conclusion; otherwise the `conclusion` (a `CheckRun`) or `state` (a legacy
 /// `StatusContext`) decides. Anything unrecognised is pending, so a still-resolving
 /// or unknown check never reads as passing.
-fn check_entry_state(entry: &Value) -> PrCheckState {
+fn check_entry_state(entry: &Value) -> EntryState {
     let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
     if !status.is_empty() && !status.eq_ignore_ascii_case("COMPLETED") {
-        return PrCheckState::Pending;
+        return EntryState::Pending;
     }
     // `conclusion` then `state`, each ignored when empty — a completed CheckRun
     // carries `conclusion`, a StatusContext carries `state`, and neither is set on
@@ -154,38 +168,37 @@ fn check_entry_state(entry: &Value) -> PrCheckState {
         .unwrap_or("")
         .to_ascii_uppercase();
     if FAILURE_STATES.contains(&raw.as_str()) {
-        return PrCheckState::Failure;
+        return EntryState::Failure;
     }
     if SUCCESS_STATES.contains(&raw.as_str()) {
-        return PrCheckState::Success;
+        return EntryState::Success;
     }
-    PrCheckState::Pending
+    EntryState::Pending
 }
 
 /// Reduces a PR's rollup contexts to one verdict: any failing check dominates
-/// (`failure`); else any still-running one (`pending`); else, if at least one
-/// succeeded, `success`; an empty rollup means no checks (`none`).
+/// (`failure`); else any still-running one (`pending`); else `success`. An empty
+/// rollup means no checks (`none`) — the only way `none` arises, since every entry
+/// classifies as one of the three.
 fn rollup_check_state(contexts: &[Value]) -> PrCheckState {
     if contexts.is_empty() {
         return PrCheckState::None;
     }
     let mut saw_pending = false;
-    let mut saw_success = false;
     for entry in contexts {
         match check_entry_state(entry) {
-            PrCheckState::Failure => return PrCheckState::Failure,
-            PrCheckState::Pending => saw_pending = true,
-            PrCheckState::Success => saw_success = true,
-            PrCheckState::None => {}
+            EntryState::Failure => return PrCheckState::Failure,
+            EntryState::Pending => saw_pending = true,
+            EntryState::Success => {}
         }
     }
+    // Non-empty, nothing failing, nothing running ⇒ everything passed. (The
+    // TypeScript tracked a `sawSuccess` flag here; it could never be false at this
+    // point, so the branch it guarded was dead.)
     if saw_pending {
-        return PrCheckState::Pending;
-    }
-    if saw_success {
-        PrCheckState::Success
+        PrCheckState::Pending
     } else {
-        PrCheckState::None
+        PrCheckState::Success
     }
 }
 
@@ -712,6 +725,116 @@ mod tests {
         );
         // The real-env wrapper resolves without panicking.
         let _ = resolve_gh_binary();
+    }
+
+    // --- resolve_with: the degradation contract ---
+    //
+    // Badges are decoration: a missing, unauthenticated, or failing `gh` must
+    // surface an error to the poller (which backs off and keeps the last good
+    // badges) and never panic or hang. These cover the paths that decide that.
+
+    /// Writes an executable stub standing in for `gh`, printing `stdout` and
+    /// exiting `code`.
+    fn fake_gh(dir: &Path, stdout: &str, code: i32) -> PathBuf {
+        let path = dir.join("fake-gh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {code}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_with_asks_nothing_for_no_targets() {
+        // No branches to resolve → no subprocess at all. The binary is deliberately
+        // bogus: if this spawned anything it would error instead of returning empty.
+        let out = resolve_with(Path::new("/no/such/gh/xyzzy"), &[]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolve_with_errors_when_gh_is_missing() {
+        // The common real case: `gh` not installed, or absent from launchd's
+        // minimal PATH.
+        let err = resolve_with(Path::new("/no/such/gh/xyzzy"), &[target("main")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to run"), "{msg}");
+        assert!(msg.contains("GitHub CLI"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_with_errors_on_a_nonzero_exit() {
+        // e.g. `gh auth login` never run: gh exits non-zero and explains on stderr.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(dir.path(), "", 1);
+        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("gh api graphql failed"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_with_errors_on_unparseable_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(dir.path(), "not json at all", 0);
+        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid JSON"), "{err:#}");
+    }
+
+    #[test]
+    fn resolve_with_surfaces_graphql_errors_rather_than_reporting_no_badges() {
+        // A GraphQL 200 can still carry errors (a bad field, a rate limit). Reading
+        // that as an empty result would be indistinguishable from "no open PRs" and
+        // would silently blank every badge, so it must be an error.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(
+            dir.path(),
+            r#"{"data":null,"errors":[{"message":"API rate limit exceeded"}]}"#,
+            0,
+        );
+        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("returned errors"), "{msg}");
+        assert!(msg.contains("rate limit"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_with_ignores_an_empty_errors_array() {
+        // Some responses carry `errors: []`; that is a success, not a failure.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(
+            dir.path(),
+            r#"{"errors":[],"data":{"r0":{"b0":{
+                "target":{"oid":"a","statusCheckRollup":null},
+                "associatedPullRequests":{"nodes":[{"number":9,"isDraft":false,"url":"u"}]}}}}}"#,
+            0,
+        );
+        let out = resolve_with(&bin, &[target("main")]).unwrap();
+        assert_eq!(out.get(&target("main")).unwrap().number, 9);
+    }
+
+    #[test]
+    fn resolve_with_reads_a_real_reply_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(
+            dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":42,"isDraft":true,"url":"u42"}]}}}}}"#,
+            0,
+        );
+        let out = resolve_with(&bin, &[target("main")]).unwrap();
+        let badge = out.get(&target("main")).unwrap();
+        assert_eq!(badge.number, 42);
+        assert!(badge.is_draft);
+        assert_eq!(badge.checks, PrCheckState::Failure);
     }
 
     // --- Cache ---

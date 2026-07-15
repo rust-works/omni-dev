@@ -127,6 +127,21 @@ struct RefreshTask {
     handle: JoinHandle<()>,
 }
 
+/// The next PR-poll delay: `base` while something is still pending, else double
+/// the current delay up to [`MAX_PR_POLL_INTERVAL`].
+///
+/// A pure function rather than three copies inline, because the cadence is the part
+/// worth pinning: it is only observable from outside as timing, which is exactly
+/// what a test cannot assert without flaking. A failed poll passes `pending: false`,
+/// so a persistent failure backs off instead of being retried hard.
+fn next_pr_poll_delay(current: Duration, base: Duration, pending: bool) -> Duration {
+    if pending {
+        base
+    } else {
+        current.saturating_mul(2).min(MAX_PR_POLL_INTERVAL)
+    }
+}
+
 /// A running background PR-badge poll task and the token that stops it.
 struct PollerTask {
     /// Cancelled by `shutdown` to end the poll loop.
@@ -355,39 +370,35 @@ impl WorktreesService {
                     delay = MAX_PR_POLL_INTERVAL;
                     continue;
                 }
-                // `gh` is a blocking subprocess: never on an async worker.
+                // `gh` is a blocking subprocess: never on an async worker. A join
+                // failure (the task panicked, or the runtime is going down) folds
+                // into the same error channel as a `gh` failure — both mean "no
+                // badges this round", and neither deserves its own handling.
                 let bin = gh_bin.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
                     crate::pr_status::resolve_with(&bin, &targets)
                 })
-                .await;
-                match resolved {
-                    Ok(Ok(badges)) => {
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("blocking poll task failed: {err}")));
+                // Best-effort decoration: a missing/unauthenticated `gh`, a network
+                // blip, or a rate limit must never sink the tree. A failed poll
+                // leaves the last good badges in place rather than blanking every
+                // row, and is not "pending", so it backs off rather than hammers.
+                let pending = match resolved {
+                    Ok(badges) => {
                         // Bump only on a real change, or the server's diff-and-drop
                         // is defeated and every window re-renders on every poll.
                         if pr_cache.replace(badges) {
                             registry.bump();
                         }
-                        delay = if pr_cache.any_pending() {
-                            base
-                        } else {
-                            (delay.saturating_mul(2)).min(MAX_PR_POLL_INTERVAL)
-                        };
-                    }
-                    Ok(Err(err)) => {
-                        // Best-effort decoration: a missing/unauthenticated `gh`, a
-                        // network blip, or a rate limit must never sink the tree.
-                        // Back off so a persistent failure is not retried hard, and
-                        // leave the last good badges in place rather than blanking
-                        // the rows on one bad poll.
-                        tracing::debug!("PR badge poll failed: {err:#}");
-                        delay = (delay.saturating_mul(2)).min(MAX_PR_POLL_INTERVAL);
+                        pr_cache.any_pending()
                     }
                     Err(err) => {
-                        tracing::debug!("PR badge poll task failed: {err}");
-                        delay = (delay.saturating_mul(2)).min(MAX_PR_POLL_INTERVAL);
+                        tracing::debug!("PR badge poll failed: {err:#}");
+                        false
                     }
-                }
+                };
+                delay = next_pr_poll_delay(delay, base, pending);
             }
         });
         *guard = Some(PollerTask { token, handle });
@@ -3016,6 +3027,47 @@ mod tests {
         assert!(pr_targets_from_snapshot(&json!({})).is_empty());
     }
 
+    #[test]
+    fn pr_targets_from_snapshot_skips_a_malformed_github_identity() {
+        // Defensive: a `github` object without usable owner/name strings yields no
+        // target rather than a half-built query.
+        for github in [
+            json!({}),
+            json!({"owner": "o"}),
+            json!({"owner": 1, "name": 2}),
+        ] {
+            let snapshot = json!({"repos":[{
+                "main_repo":"r","github":github,"root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
+            }]});
+            assert!(
+                pr_targets_from_snapshot(&snapshot).is_empty(),
+                "{snapshot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_pr_poll_delay_holds_fast_while_pending_and_backs_off_to_the_ceiling() {
+        let base = Duration::from_secs(10);
+        // Something is still running: keep the watch cadence, however long we had
+        // backed off for.
+        assert_eq!(next_pr_poll_delay(base, base, true), base);
+        assert_eq!(next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, true), base);
+        // Everything terminal: double…
+        assert_eq!(next_pr_poll_delay(base, base, false), base * 2);
+        assert_eq!(next_pr_poll_delay(base * 2, base, false), base * 4);
+        // …but never past the ceiling, and never overflow off it.
+        assert_eq!(
+            next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, false),
+            MAX_PR_POLL_INTERVAL
+        );
+        assert_eq!(
+            next_pr_poll_delay(Duration::MAX, base, false),
+            MAX_PR_POLL_INTERVAL
+        );
+    }
+
     #[tokio::test]
     async fn tree_snapshot_folds_cached_pr_badges_onto_matching_branches() {
         let dir = tempfile::tempdir().unwrap();
@@ -3075,6 +3127,79 @@ mod tests {
         svc.pr_cache.replace(badges);
         let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
         assert!(wt.get("pr").is_none(), "{wt:?}");
+    }
+
+    #[tokio::test]
+    async fn pr_poller_asks_nothing_while_no_window_is_registered() {
+        // The idle case — the daemon runs all day with no editor open. Point it at a
+        // stub that fails loudly if ever spawned: a poll here would both waste
+        // GitHub budget and, on a real `gh`, wake the radio for nothing.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let marker = bin_dir.path().join("spawned");
+        let fake = bin_dir.path().join("fake-gh");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ntouch '{}'\necho '{{}}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        svc.shutdown().await;
+        assert!(
+            !marker.exists(),
+            "the poller must not spawn gh with no windows registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_poller_survives_a_failing_gh_and_keeps_the_last_good_badges() {
+        // Badges are decoration: an unauthenticated or broken `gh` must never sink
+        // the tree, and one bad poll must not blank rows that were fine a second ago.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("fake-gh");
+        // Exits non-zero, exactly as `gh` does without `gh auth login`.
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'gh: not authenticated' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // Seed a badge as though an earlier poll had succeeded.
+        let mut seeded = HashMap::new();
+        seeded.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pending_badge(7),
+        );
+        svc.pr_cache.replace(seeded);
+
+        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The tree still serves, and the seeded badge survived the failing polls.
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr"]["number"], json!(7));
+        svc.shutdown().await;
     }
 
     #[tokio::test]
