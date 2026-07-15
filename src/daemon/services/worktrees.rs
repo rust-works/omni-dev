@@ -473,6 +473,13 @@ struct GitStatus {
     /// The checked-out branch, or `None` when detached or not in a repo.
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The commit HEAD points at, or `None` when unborn or not in a repo. Present
+    /// even on a detached HEAD, which has a commit but no branch. Rides the
+    /// streamed snapshot so a new commit is a real delta the server's diff cannot
+    /// drop — without it, a push serialises byte-identically and no client
+    /// re-renders (#1337).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
     /// Commits the branch is ahead of its upstream (`None` without an upstream).
     #[serde(skip_serializing_if = "Option::is_none")]
     ahead: Option<usize>,
@@ -538,6 +545,15 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     let Ok(head) = repo.head() else {
         // An unborn branch (fresh repo, no commits) or an unreadable HEAD.
         return base;
+    };
+    // Resolved here — before the branch filter below, so a detached HEAD still
+    // reports its commit, and before `Branch::wrap` consumes `head`. `target()` is
+    // a refs read: no revwalk and no object lookup, so unlike the divergence walk
+    // it is cheap enough for the streamed snapshot's every-worktree-every-tick
+    // rebuild (#1306's bar).
+    let base = GitStatus {
+        head_sha: head.target().map(|oid| oid.to_string()),
+        ..base
     };
     // A branch HEAD has a UTF-8 shorthand; anything else — a detached HEAD
     // (mid-rebase or a checked-out tag/commit), or the rare non-UTF-8 branch
@@ -682,6 +698,12 @@ struct TreeWorktree {
     /// The checked-out branch, or `None` when detached or unborn.
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The commit HEAD points at, or `None` when unborn. Unlike ahead/behind this
+    /// **does** ride the snapshot: it costs a refs read, and it is what makes a new
+    /// commit a visible delta, so a push re-renders instead of being dropped by the
+    /// server's snapshot diff (#1337).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
     /// Whether this is the repository's main working tree (vs a linked worktree).
     is_main: bool,
     /// Whether a live VS Code window currently has this worktree open.
@@ -800,6 +822,7 @@ fn worktree_entry(
     TreeWorktree {
         path: path.display().to_string(),
         branch: status.branch,
+        head_sha: status.head_sha,
         is_main,
         open: window_key.is_some(),
         window_key,
@@ -2392,6 +2415,8 @@ mod tests {
         init_repo(dir.path());
         let status = git_status(dir.path());
         assert_eq!(status.branch, None);
+        // An unborn HEAD has no commit to name, so the SHA is absent too (#1337).
+        assert_eq!(status.head_sha, None);
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
         assert_eq!(
@@ -2428,6 +2453,9 @@ mod tests {
         repo.set_head_detached(a).unwrap();
         let status = git_status(dir.path());
         assert_eq!(status.branch, None);
+        // A detached HEAD has no branch but *does* have a commit — the SHA is
+        // resolved before the branch filter, so it survives here (#1337).
+        assert_eq!(status.head_sha.as_deref(), Some(a.to_string().as_str()));
         assert_eq!(status.ahead, None);
         assert_eq!(status.behind, None);
         assert_eq!(
@@ -2445,7 +2473,7 @@ mod tests {
         // the streamed tree snapshot still reads the branch and repo identity, but
         // leaves ahead/behind absent — divergence is now lazy (#1306).
         let dir = tempfile::tempdir().unwrap();
-        let _repo = diverging_repo(dir.path());
+        let repo = diverging_repo(dir.path());
         let status = git_status_cheap(dir.path());
         assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(status.ahead, None);
@@ -2454,6 +2482,36 @@ mod tests {
             status.main_repo.as_deref(),
             dir.path().file_name().and_then(|n| n.to_str())
         );
+        // The SHA rides the *cheap* path deliberately: it is a refs read, not a
+        // revwalk, and it is what makes a new commit a snapshot delta (#1337).
+        let head = repo.head().unwrap().target().unwrap();
+        assert_eq!(status.head_sha.as_deref(), Some(head.to_string().as_str()));
+    }
+
+    // --- HEAD SHA on the snapshot (#1337) ----------------------------------
+
+    #[test]
+    fn git_status_head_sha_tracks_new_commits() {
+        // The regression #1337 turns on: a commit must change the status the
+        // snapshot is built from. Before the SHA rode the payload, committing
+        // changed nothing on the wire, the server's diff dropped the identical
+        // snapshot, and no client re-rendered — so a badge computed for the old
+        // head survived the push that invalidated it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let before = git_status_cheap(dir.path());
+        assert_eq!(before.head_sha.as_deref(), Some(a.to_string().as_str()));
+
+        let head = repo.find_commit(a).unwrap();
+        let b = empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+        let after = git_status_cheap(dir.path());
+        assert_eq!(after.head_sha.as_deref(), Some(b.to_string().as_str()));
+        assert_ne!(before.head_sha, after.head_sha);
+        // The branch is unchanged — the SHA is the *only* thing that moved, which
+        // is exactly why its absence made the push invisible.
+        assert_eq!(before.branch, after.branch);
     }
 
     #[test]
@@ -2533,6 +2591,63 @@ mod tests {
         assert_eq!(main_wt.get("branch").and_then(Value::as_str), Some("main"));
         assert!(main_wt.get("ahead").is_none(), "{main_wt:?}");
         assert!(main_wt.get("behind").is_none(), "{main_wt:?}");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_carries_head_sha_so_a_commit_is_a_real_delta() {
+        // The end-to-end shape of the #1337 freshness fix. The server pushes a
+        // snapshot only when it differs from the last one
+        // (`server.rs`: `if snap != last`), so anything invisible on the wire
+        // cannot trigger a re-render. Committing must therefore move the payload.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        let before = svc.handle("tree", Value::Null).await.unwrap();
+        let wt = &repos_of(&before)[0]["worktrees"][0];
+        assert_eq!(
+            wt.get("head_sha").and_then(Value::as_str),
+            Some(a.to_string().as_str())
+        );
+
+        // Commit again: same branch, same paths, same open windows — pre-#1337 the
+        // snapshot was byte-identical here and the push was dropped.
+        let head = repo.find_commit(a).unwrap();
+        let b = empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+        let after = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(
+            repos_of(&after)[0]["worktrees"][0]
+                .get("head_sha")
+                .and_then(Value::as_str),
+            Some(b.to_string().as_str())
+        );
+        assert_ne!(before, after, "a commit must be a visible snapshot delta");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_head_sha_for_an_unborn_repo() {
+        // Wire-compat: an absent SHA is dropped entirely rather than sent as null,
+        // matching the payload's `skip_serializing_if` convention.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("head_sha").is_none(), "{wt:?}");
     }
 
     #[test]
