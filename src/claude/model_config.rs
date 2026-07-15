@@ -155,6 +155,22 @@ pub struct ModelSpec {
     /// Whether this is a legacy model that may be deprecated.
     #[serde(default)]
     pub legacy: bool,
+    /// Announced retirement date (`YYYY-MM-DD`), if the provider has published
+    /// one.
+    ///
+    /// Complements [`Self::legacy`], which cannot distinguish "older but fine"
+    /// from "stops working on a known date" (#1334). `None` covers both models
+    /// with no announced retirement and deprecated models whose date is still
+    /// TBD — absence means "no published date", never "not retiring".
+    ///
+    /// A past date means the model is already retired and its identifier now
+    /// `404`s; such entries are retained only so Bedrock/AWS identifier
+    /// normalization keeps resolving them (see ADR-0011).
+    ///
+    /// Held as a plain `String`: nothing parses or compares it today, it is
+    /// carried verbatim into `omni-dev config models show`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retires: Option<String>,
     /// Whether this model supports structured JSON-schema output via the
     /// Anthropic Messages API `output_config.format` (and the equivalent on
     /// Bedrock).
@@ -1007,7 +1023,7 @@ mod tests {
 
         assert_eq!(
             registry.get_default_model("claude"),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         assert_eq!(registry.get_default_model("openai"), Some("gpt-5-mini"));
         assert_eq!(
@@ -1064,6 +1080,10 @@ mod tests {
         let registry = embedded_only();
 
         // Flagged models — including the default and a Bedrock-style prefix.
+        assert!(registry.supports_structured_output("claude-fable-5"));
+        assert!(registry.supports_structured_output("claude-opus-4-8"));
+        assert!(registry.supports_structured_output("claude-opus-4-7"));
+        assert!(registry.supports_structured_output("claude-sonnet-5"));
         assert!(registry.supports_structured_output("claude-sonnet-4-6"));
         assert!(registry.supports_structured_output("claude-opus-4-6"));
         assert!(registry.supports_structured_output("claude-haiku-4-5-20251001"));
@@ -1080,6 +1100,126 @@ mod tests {
 
         // Unknown identifiers are conservatively unsupported.
         assert!(!registry.supports_structured_output("totally-unknown-model"));
+    }
+
+    /// The current-generation Claude models carry a 1M context window natively,
+    /// at standard pricing with no long-context premium — no beta header
+    /// involved (#1334).
+    #[test]
+    fn current_generation_models_are_registered() {
+        let registry = embedded_only();
+
+        for id in [
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ] {
+            let spec = registry
+                .get_model_spec(id)
+                .unwrap_or_else(|| panic!("{id} must be registered"));
+            assert_eq!(spec.input_context, 1_000_000, "{id} context window");
+            assert_eq!(spec.max_output_tokens, 128_000, "{id} max output");
+            assert!(
+                spec.beta_headers.is_empty(),
+                "{id} exposes 1M natively and must not rely on a context beta header"
+            );
+            assert!(spec.input_token_price.is_some(), "{id} input price");
+            assert!(spec.output_token_price.is_some(), "{id} output price");
+            assert!(!spec.legacy, "{id} is current, not legacy");
+        }
+
+        // Sonnet 5 records the sticker rate; the schema cannot express the
+        // time-bounded introductory price ($2/$10 through 2026-08-31).
+        let sonnet5 = registry.get_model_spec("claude-sonnet-5").unwrap();
+        assert_eq!(sonnet5.input_token_price, Some(3.0));
+        assert_eq!(sonnet5.output_token_price, Some(15.0));
+    }
+
+    /// The 4.6 generation also exposes 1M context natively. These values were
+    /// stale (200k + a beta header, and a 64k output cap on Sonnet 4.6) — see
+    /// #1334.
+    #[test]
+    fn claude_4_6_limits_are_native_not_beta_gated() {
+        let registry = embedded_only();
+
+        assert_eq!(registry.get_input_context("claude-opus-4-6"), 1_000_000);
+        assert_eq!(registry.get_input_context("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(registry.get_max_output_tokens("claude-sonnet-4-6"), 128_000);
+        assert_eq!(registry.get_max_output_tokens("claude-opus-4-6"), 128_000);
+    }
+
+    /// Anthropic's undated aliases must each have their own entry: identifier
+    /// resolution is exact-match plus a narrow normalization that never maps an
+    /// alias onto its dated form. Without an entry the lookup misses and the
+    /// caller silently gets the provider fallback (4096 output tokens) instead
+    /// of the model's real limits — which is what `ANTHROPIC_DEFAULT_HAIKU_MODEL`
+    /// defaulting to `claude-haiku-4-5` used to do (#1334).
+    #[test]
+    fn undated_aliases_resolve_to_real_limits() {
+        let registry = embedded_only();
+
+        for (alias, dated) in [
+            ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4-5", "claude-opus-4-5-20251101"),
+        ] {
+            assert_eq!(
+                registry.get_max_output_tokens(alias),
+                registry.get_max_output_tokens(dated),
+                "{alias} must resolve to the same output cap as {dated}, \
+                 not the provider fallback"
+            );
+            assert_eq!(
+                registry.get_input_context(alias),
+                registry.get_input_context(dated),
+                "{alias} context window must match {dated}"
+            );
+        }
+
+        // The specific regression: the fallback would have been 4096.
+        assert_eq!(registry.get_max_output_tokens("claude-haiku-4-5"), 64_000);
+    }
+
+    /// `retires` records an *announced* date only. Absence means "no published
+    /// date" — never "not retiring" — which is why deprecated-but-undated models
+    /// leave it unset (#1334).
+    #[test]
+    fn retires_records_announced_dates_only() {
+        let registry = embedded_only();
+
+        let opus_41 = registry.get_model_spec("claude-opus-4-1-20250805").unwrap();
+        assert_eq!(opus_41.retires.as_deref(), Some("2026-08-05"));
+        assert!(opus_41.legacy);
+
+        // Retired models keep a past date; they are retained purely so Bedrock
+        // identifier normalization still resolves them (ADR-0011).
+        assert_eq!(
+            registry
+                .get_model_spec("claude-3-opus-20240229")
+                .unwrap()
+                .retires
+                .as_deref(),
+            Some("2026-01-05")
+        );
+
+        // Deprecated with retirement still TBD — no date invented.
+        for id in ["claude-opus-4-20250514", "claude-sonnet-4-20250514"] {
+            let spec = registry.get_model_spec(id).unwrap();
+            assert!(spec.legacy, "{id} is deprecated");
+            assert!(
+                spec.retires.is_none(),
+                "{id} has no announced retirement date; absence must not be \
+                 filled in with a guess"
+            );
+        }
+
+        // Current models are not retiring.
+        assert!(registry
+            .get_model_spec("claude-sonnet-5")
+            .unwrap()
+            .retires
+            .is_none());
     }
 
     #[test]
@@ -1112,11 +1252,15 @@ mod tests {
     fn beta_header_lookups() {
         let registry = embedded_only();
 
-        // Opus 4.6 base limits
+        // Opus 4.6 base limits — 1M context is native on this generation, so
+        // the base already grants what the context beta used to unlock (#1334).
         assert_eq!(registry.get_max_output_tokens("claude-opus-4-6"), 128_000);
-        assert_eq!(registry.get_input_context("claude-opus-4-6"), 200_000);
+        assert_eq!(registry.get_input_context("claude-opus-4-6"), 1_000_000);
 
-        // Opus 4.6 with 1M context beta
+        // The context beta is now a no-op for limits: it resolves to the same
+        // 1M the base grants. The entry is retained only so that
+        // `validate_beta_header` keeps accepting the flag from callers who
+        // still pass it — hence it must still resolve, not vanish.
         assert_eq!(
             registry.get_input_context_with_beta("claude-opus-4-6", "context-1m-2025-08-07"),
             1_000_000

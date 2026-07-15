@@ -63,7 +63,10 @@ pub const USE_OLLAMA_ENV: &str = "USE_OLLAMA";
 pub const USE_BEDROCK_ENV: &str = "CLAUDE_CODE_USE_BEDROCK";
 
 /// Hard fallback when the registry has no default for the `claude` provider.
-const FALLBACK_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+///
+/// Keep in sync with `providers.claude.default_model` in
+/// `src/templates/models.yaml`; this only applies when that file fails to load.
+const FALLBACK_CLAUDE_MODEL: &str = "claude-sonnet-5";
 /// Hard fallback when the registry has no default for the `openai` provider.
 const FALLBACK_OPENAI_MODEL: &str = "gpt-5-mini";
 /// Default Ollama model; the registry has no `ollama` provider entry.
@@ -391,7 +394,7 @@ mod tests {
 
             assert_eq!(
                 resolve_model(backend, None, &MapEnv::new(), registry),
-                "claude-sonnet-4-6"
+                "claude-sonnet-5"
             );
         }
     }

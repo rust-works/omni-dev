@@ -1,7 +1,7 @@
 # AI Model Specifications
 # This file defines the capabilities and limits for all supported AI models
 # Used by omni-dev to configure API requests correctly
-# Last updated: February 2026
+# Last updated: July 2026
 
 # Schema version. Bumped when the YAML structure changes in a backwards-
 # incompatible way. User/project files declaring a different version receive
@@ -10,14 +10,76 @@
 version: "1"
 
 models:
-  # Claude 4.6 Series (Current Generation)
+  # Claude 5 / Opus 4.8 / Opus 4.7 (Current Generation)
+  #
+  # These models expose a 1M context window natively, at standard pricing with
+  # no long-context premium — so they set `input_context: 1000000` directly and
+  # carry no `context-1m-2025-08-07` beta header. That header is the older
+  # mechanism and is not how this generation exposes 1M context.
+  - provider: "claude"
+    model: "Claude Fable 5"
+    api_identifier: "claude-fable-5"
+    input_token_price: 10.0
+    output_token_price: 50.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.0
+    tier: "flagship"
+    supports_structured_output: true
+
+  - provider: "claude"
+    model: "Claude Opus 4.8"
+    api_identifier: "claude-opus-4-8"
+    input_token_price: 5.0
+    output_token_price: 25.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 4.8
+    tier: "flagship"
+    supports_structured_output: true
+
+  - provider: "claude"
+    model: "Claude Opus 4.7"
+    api_identifier: "claude-opus-4-7"
+    input_token_price: 5.0
+    output_token_price: 25.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 4.7
+    tier: "flagship"
+    supports_structured_output: true
+
+  # Sonnet 5 has introductory pricing of $2.00/$10.00 per MTok through
+  # 2026-08-31. The schema has no way to express a time-bounded price, so the
+  # sticker rate is recorded here; cost estimates during the intro period are
+  # therefore over-stated rather than silently wrong once it lapses.
+  - provider: "claude"
+    model: "Claude Sonnet 5"
+    api_identifier: "claude-sonnet-5"
+    input_token_price: 3.0
+    output_token_price: 15.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.0
+    tier: "balanced"
+    supports_structured_output: true
+
+  # Claude 4.6 Series
+  #
+  # 1M context is native on this generation too, so `input_context` is
+  # 1000000 here rather than 200000-plus-a-beta-header. The
+  # `context-1m-2025-08-07` block below is retained deliberately: it is now a
+  # no-op for limits (it resolves to the same 1M the base already grants), but
+  # `validate_beta_header` hard-errors on any header absent from this list, so
+  # dropping it would newly reject `--beta-header
+  # anthropic-beta:context-1m-2025-08-07` for callers who still pass it.
   - provider: "claude"
     model: "Claude Opus 4.6"
     api_identifier: "claude-opus-4-6"
     input_token_price: 5.0
     output_token_price: 25.0
     max_output_tokens: 128000
-    input_context: 200000
+    input_context: 1000000
     generation: 4.6
     tier: "flagship"
     supports_structured_output: true
@@ -31,8 +93,8 @@ models:
     api_identifier: "claude-sonnet-4-6"
     input_token_price: 3.0
     output_token_price: 15.0
-    max_output_tokens: 64000
-    input_context: 200000
+    max_output_tokens: 128000
+    input_context: 1000000
     generation: 4.6
     tier: "balanced"
     supports_structured_output: true
@@ -41,10 +103,34 @@ models:
         value: "context-1m-2025-08-07"
         input_context: 1000000
 
-  # Claude 4.5 Series (Current Generation)
+  # Claude 4.5 Series (Active, superseded by the 5 / 4.8 / 4.7 generation)
+  #
+  # Anthropic publishes an undated alias alongside each dated identifier
+  # (e.g. `claude-haiku-4-5` for `claude-haiku-4-5-20251001`) and documents the
+  # alias as the preferred form. Identifier resolution is exact-match then a
+  # narrow normalization (region prefix / `anthropic.` prefix / `-v<N>:<M>`
+  # suffix) — none of which maps an alias onto its dated entry. So each alias
+  # needs its own entry, or `--model claude-haiku-4-5` silently misses the
+  # registry and falls back to the provider default of 4096 output tokens
+  # instead of this model's real 64000 (#1334).
   - provider: "claude"
     model: "Claude Sonnet 4.5"
     api_identifier: "claude-sonnet-4-5-20250929"
+    input_token_price: 3.0
+    output_token_price: 15.0
+    max_output_tokens: 64000
+    input_context: 200000
+    generation: 4.5
+    tier: "balanced"
+    supports_structured_output: true
+    beta_headers:
+      - key: "anthropic-beta"
+        value: "context-1m-2025-08-07"
+        input_context: 1000000
+
+  - provider: "claude"
+    model: "Claude Sonnet 4.5"
+    api_identifier: "claude-sonnet-4-5"
     input_token_price: 3.0
     output_token_price: 15.0
     max_output_tokens: 64000
@@ -69,6 +155,17 @@ models:
     supports_structured_output: true
 
   - provider: "claude"
+    model: "Claude Haiku 4.5"
+    api_identifier: "claude-haiku-4-5"
+    input_token_price: 1.0
+    output_token_price: 5.0
+    max_output_tokens: 64000
+    input_context: 200000
+    generation: 4.5
+    tier: "fast"
+    supports_structured_output: true
+
+  - provider: "claude"
     model: "Claude Opus 4.5"
     api_identifier: "claude-opus-4-5-20251101"
     input_token_price: 5.0
@@ -80,7 +177,23 @@ models:
     legacy: true
     supports_structured_output: true
 
-  # Claude 4.x Series (Legacy)
+  - provider: "claude"
+    model: "Claude Opus 4.5"
+    api_identifier: "claude-opus-4-5"
+    input_token_price: 5.0
+    output_token_price: 25.0
+    max_output_tokens: 64000
+    input_context: 200000
+    generation: 4.5
+    tier: "flagship"
+    legacy: true
+    supports_structured_output: true
+
+  # Claude 4.x Series (Deprecated)
+  #
+  # `retires` is set only where a date has actually been announced. Opus 4 and
+  # Sonnet 4 below are deprecated with retirement still TBD, so they carry no
+  # `retires` — absence means "no published date", not "not retiring".
   - provider: "claude"
     model: "Claude Opus 4.1"
     api_identifier: "claude-opus-4-1-20250805"
@@ -91,6 +204,7 @@ models:
     generation: 4.1
     tier: "flagship"
     legacy: true
+    retires: "2026-08-05"
 
   - provider: "claude"
     model: "Claude Opus 4"
@@ -118,7 +232,16 @@ models:
         value: "context-1m-2025-08-07"
         input_context: 1000000
 
-  # Claude 3.x Series (Legacy - deprecated, retiring Feb 19, 2026)
+  # Claude 3.x Series (RETIRED - these identifiers now 404 against the live API)
+  #
+  # Retained deliberately, not by oversight: Bedrock/AWS identifier
+  # normalization resolves regional and versioned forms through these entries
+  # (ADR-0011), and removing them would break that contract. A `retires` date
+  # in the past is the machine-readable marker; `legacy: true` alone could not
+  # distinguish "older but fine" from "already gone".
+  #
+  # Claude Haiku 3 is deprecated rather than retired — its date is in the
+  # future, so it stays in this block but is still callable.
   - provider: "claude"
     model: "Claude Sonnet 3.7"
     api_identifier: "claude-3-7-sonnet-20250219"
@@ -129,6 +252,7 @@ models:
     generation: 3.7
     tier: "balanced"
     legacy: true
+    retires: "2026-02-19"
     beta_headers:
       - key: "anthropic-beta"
         value: "output-128k-2025-02-19"
@@ -147,6 +271,7 @@ models:
     generation: 3.5
     tier: "fast"
     legacy: true
+    retires: "2026-02-19"
 
   - provider: "claude"
     model: "Claude Haiku 3"
@@ -158,8 +283,9 @@ models:
     generation: 3
     tier: "fast"
     legacy: true
+    retires: "2026-04-19"
 
-  # Claude 3 Series (Retired - kept for Bedrock/AWS fuzzy matching)
+  # Claude 3 Series (RETIRED - kept for Bedrock/AWS identifier normalization)
   - provider: "claude"
     model: "Claude Opus 3"
     api_identifier: "claude-3-opus-20240229"
@@ -170,6 +296,7 @@ models:
     generation: 3
     tier: "flagship"
     legacy: true
+    retires: "2026-01-05"
 
   - provider: "claude"
     model: "Claude Sonnet 3.5"
@@ -181,6 +308,7 @@ models:
     generation: 3.5
     tier: "balanced"
     legacy: true
+    retires: "2025-10-28"
 
   # OpenAI GPT-5 Series (Current Generation)
   - provider: "openai"
@@ -443,7 +571,13 @@ providers:
   claude:
     name: "Anthropic Claude"
     api_base: "https://api.anthropic.com/v1"
-    default_model: "claude-sonnet-4-6"
+    # The model every invocation gets when `--model` / `OMNI_DEV_MODEL` is not
+    # passed — the highest-impact single value in this file. Sonnet 5 is the
+    # current balanced tier and the direct successor to the previous default
+    # (claude-sonnet-4-6), so the cost profile is unchanged at the sticker rate
+    # ($3/$15 per MTok). Kept in sync with `FALLBACK_CLAUDE_MODEL` in
+    # src/claude/backend.rs, which covers the case where this file fails to load.
+    default_model: "claude-sonnet-5"
 
     # Model tier descriptions for Claude
     tiers:

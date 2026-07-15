@@ -2333,6 +2333,48 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The 4.6 entries expose 1M context natively, which makes their
+    /// `context-1m-2025-08-07` entry a no-op for limits. It is retained anyway
+    /// because this validator hard-errors on any header absent from the
+    /// registry — dropping it would newly reject a flag these callers can pass
+    /// today (#1334).
+    #[test]
+    fn validate_beta_header_context_1m_still_accepted_on_4_6() {
+        let header = Some((
+            "anthropic-beta".to_string(),
+            "context-1m-2025-08-07".to_string(),
+        ));
+
+        assert!(
+            validate_beta_header("claude-opus-4-6", &header).is_ok(),
+            "context-1m must stay accepted on Opus 4.6 even though 1M is now native"
+        );
+        assert!(
+            validate_beta_header("claude-sonnet-4-6", &header).is_ok(),
+            "context-1m must stay accepted on Sonnet 4.6 even though 1M is now native"
+        );
+    }
+
+    /// The current generation never used the context beta header, so passing it
+    /// is a genuine mistake and must surface rather than be silently ignored.
+    #[test]
+    fn validate_beta_header_context_1m_rejected_on_current_generation() {
+        let header = Some((
+            "anthropic-beta".to_string(),
+            "context-1m-2025-08-07".to_string(),
+        ));
+
+        for model in ["claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"] {
+            let err = validate_beta_header(model, &header)
+                .expect_err("current-generation models declare no beta headers");
+            assert!(
+                err.to_string()
+                    .contains("does not support any beta headers"),
+                "unexpected error for {model}: {err}"
+            );
+        }
+    }
+
     // ── ClaudeClient::new / get_ai_client_metadata ─────────────────
 
     #[test]
@@ -4495,7 +4537,7 @@ mod tests {
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.provider, "Claude CLI");
         // Default model falls through to the registry's claude default.
-        assert_eq!(metadata.model, "claude-sonnet-4-6");
+        assert_eq!(metadata.model, "claude-sonnet-5");
     }
 
     #[tokio::test]
@@ -4813,7 +4855,7 @@ mod tests {
         let client = create_default_claude_client_with(&env, None, None)
             .await
             .expect("factory should succeed");
-        assert_eq!(client.get_ai_client_metadata().model, "claude-sonnet-4-6");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-sonnet-5");
     }
 
     #[tokio::test]
