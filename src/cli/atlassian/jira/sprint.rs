@@ -988,4 +988,28 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
+
+    /// Drives the `Delete` dispatch arm and `DeleteCommand::execute`'s
+    /// create_client + stdin/stdout wiring (`--force` skips the prompt).
+    #[tokio::test]
+    async fn sprint_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        SprintCommand {
+            command: SprintSubcommands::Delete(DeleteCommand {
+                sprint_id: 42,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
 }

@@ -579,4 +579,85 @@ mod tests {
         std::env::remove_var("ATLASSIAN_EMAIL");
         std::env::remove_var("ATLASSIAN_API_TOKEN");
     }
+
+    /// Points credentials at a dead address so `cmd.execute()` reaches the
+    /// dispatch arm and the subcommand's `create_client()` glue then fails on
+    /// transport — the success paths are covered by each subcommand's own
+    /// wiremock tests. Sync helpers (the caller holds the env mutex across the
+    /// await, so the future must not capture a guard here).
+    fn set_dead_credentials() {
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+    }
+
+    fn clear_credentials_env() {
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
+    }
+
+    /// Exercises the `Copy` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_copy_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Copy(copy::CopyCommand {
+                id: "12345".to_string(),
+                parent: "67890".to_string(),
+                title: "Copy".to_string(),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
+    }
+
+    /// Exercises the `Watcher` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_watcher_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Watcher(watcher::WatcherCommand {
+                command: watcher::WatcherSubcommands::Status(watcher::WatchArgs {
+                    id: "12345".to_string(),
+                    account_id: None,
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
+    }
+
+    /// Exercises the `Restriction` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_restriction_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_dead_credentials();
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Restriction(restriction::RestrictionCommand {
+                command: restriction::RestrictionSubcommands::Get(restriction::GetCommand {
+                    id: "12345".to_string(),
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        clear_credentials_env();
+    }
 }

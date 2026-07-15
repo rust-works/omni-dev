@@ -497,6 +497,66 @@ mod tests {
         assert!(err.to_string().contains("Nothing to update"));
     }
 
+    // ── WorklogCommand::execute() end-to-end ───────────────────────
+    //
+    // Drives the top-level dispatch arm *and* each subcommand's execute()
+    // wrapper (create_client + API call) against a wiremock.
+
+    #[tokio::test]
+    async fn worklog_command_execute_edit_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/100",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        WorklogCommand {
+            command: WorklogSubcommands::Edit(EditCommand {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                time_spent: Some("3h".to_string()),
+                started: None,
+                comment: Some("Revised".to_string()),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worklog_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/worklog/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the wrapper's real stdin is not read.
+        WorklogCommand {
+            command: WorklogSubcommands::Delete(DeleteCommand {
+                key: "PROJ-1".to_string(),
+                worklog_id: "100".to_string(),
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
     // ── DeleteCommand ──────────────────────────────────────────────
 
     fn mock_client(base_url: &str) -> AtlassianClient {

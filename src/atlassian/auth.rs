@@ -487,6 +487,34 @@ mod tests {
         assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "wrapper@example.com");
     }
 
+    /// The `remove_credentials()` wrapper resolves the settings path from
+    /// `HOME` and the profile from the environment; every other removal test
+    /// injects both into `remove_credentials_at` (issue #1030).
+    #[test]
+    fn remove_credentials_resolves_default_settings_path() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://wrapper.atlassian.net".to_string(),
+            email: "wrapper@example.com".to_string(),
+            api_token: "wrapper-token".into(),
+        };
+        save_credentials(&creds).unwrap();
+
+        // Present → removed.
+        assert!(remove_credentials().unwrap());
+
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(ATLASSIAN_EMAIL).is_none());
+        assert!(val["env"].get(ATLASSIAN_API_TOKEN).is_none());
+
+        // Idempotent: nothing left to remove.
+        assert!(!remove_credentials().unwrap());
+    }
+
     /// Save against injected settings-file paths — no `HOME` mutation, so the
     /// test needs no lock (issue #1030). Covers fresh-file creation and
     /// merge-with-existing.

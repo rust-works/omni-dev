@@ -1330,4 +1330,67 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
+
+    /// Drives the nested `Remote` → `Create` dispatch arms through the public
+    /// `LinkCommand::execute` chain.
+    #[tokio::test]
+    async fn link_command_execute_remote_create_arm() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": 10010})),
+            )
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::Create(CreateRemoteLinkCommand {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.com/doc".to_string(),
+                    title: "Doc".to_string(),
+                    summary: None,
+                    relationship: None,
+                    global_id: None,
+                }),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    /// Drives the nested `Remote` → `Delete` dispatch arms and
+    /// `DeleteRemoteLinkCommand::execute`'s create_client + stdio wiring.
+    #[tokio::test]
+    async fn link_command_execute_remote_delete_arm() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink/10010",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::Delete(DeleteRemoteLinkCommand {
+                    key: "PROJ-1".to_string(),
+                    link_id: "10010".to_string(),
+                    force: true,
+                    dry_run: false,
+                }),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
 }
