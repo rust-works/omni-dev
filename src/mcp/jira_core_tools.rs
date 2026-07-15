@@ -4311,6 +4311,32 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false));
     }
 
+    /// Drives the `jira_comment_delete` handler end-to-end through
+    /// `create_client()` — the `run_jira_comment_delete` helper is unit-tested
+    /// above, but the thin `#[tool]` wrapper was uncovered (#1117).
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_comment_delete_handler_success_via_mock() {
+        let _lock = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let result = OmniDevServer::new()
+            .jira_comment_delete(Parameters(JiraCommentDeleteParams {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                confirm: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn jira_comment_edit_handler_requires_body_or_path() {
         // Neither body source supplied → tool error before any client/HTTP.
