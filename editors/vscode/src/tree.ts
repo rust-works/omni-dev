@@ -109,6 +109,33 @@ export function withAheadBehind(
  * absent badge (no GitHub identity, no matching PR, or not yet fetched) leaves the
  * worktree unchanged, so it renders with no PR indicator.
  */
+/**
+ * Strips every daemon-supplied PR badge from a snapshot's repos (#1337).
+ *
+ * The `showPullRequests` setting used to work by simply not running `gh` — the
+ * badge could only come from the fetch it gated. Since the daemon resolves badges
+ * and pushes them on the snapshot, gating the fetch no longer suppresses anything,
+ * so the setting has to strip on the way in or it silently stops working.
+ *
+ * Returns the input unchanged when there is nothing to strip, so an unchanged
+ * snapshot stays reference-equal.
+ */
+export function withoutPrBadges(repos: TreeRepoPayload[]): TreeRepoPayload[] {
+  if (!repos.some((r) => r.worktrees.some((w) => w.pr))) {
+    return repos;
+  }
+  return repos.map((repo) => ({
+    ...repo,
+    worktrees: repo.worktrees.map((wt) => {
+      if (!wt.pr) {
+        return wt;
+      }
+      const { pr: _pr, ...rest } = wt;
+      return rest;
+    }),
+  }));
+}
+
 export function withPr(wt: TreeWorktreePayload, pr?: PrBadge): TreeWorktreePayload {
   if (pr === undefined) {
     return wt;

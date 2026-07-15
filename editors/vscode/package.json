@@ -190,7 +190,7 @@
         "omniDevWorktrees.showPullRequests": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Show each worktree's open GitHub pull request (number, draft, and CI-checks status) in the tree. Resolved via the GitHub CLI (`gh`) on repo-expand, so it needs `gh` installed and `gh auth login`; without it, badges are silently omitted. Disable to skip the lookup entirely."
+          "markdownDescription": "Show each worktree's open GitHub pull request (number, draft, and CI-checks status) in the tree. Resolved by the omni-dev daemon, which runs the GitHub CLI (`gh`) for you and keeps CI state live in every window — so it needs `gh` installed and `gh auth login`; without it, badges are silently omitted. Disable to hide them."
         },
         "omniDevWorktrees.claudeCommand": {
           "type": "string",
