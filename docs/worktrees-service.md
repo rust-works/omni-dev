@@ -295,11 +295,23 @@ is absent it offers to install it or copy the PR URL.
 - **One query for everything.** A single call resolves every (repo, branch) pair in
   the tree at **1 point** against GitHub's 5,000/hour GraphQL budget, regardless of
   how many repos, worktrees, or windows are open — `repository()`/`ref()` are not
-  GraphQL connections, so aliasing them is free. Cadence adapts: ~10 s while a badge
-  is pending (matching `gh pr checks --watch`), backing off to a 30-minute ceiling
-  once everything is terminal, and nothing at all while no window is registered.
-  Override the pending cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds).
-  The daemon pushes only when a verdict actually moves.
+  GraphQL connections, so aliasing them is free. The poller **wakes** every ~10 s —
+  a read of the coalescing snapshot cache, no subprocess and no network — but only
+  **asks GitHub** when the watched state moved or its backoff elapsed: ~10 s while a
+  badge is pending (matching `gh pr checks --watch`), doubling to a 30-minute
+  ceiling once everything is terminal, and nothing at all while no window is
+  registered. The two cadences are separate because the triggers arrive by different
+  routes: a window opening bumps the change-notify, but **nothing tells the daemon
+  you committed** — so the loop looks often and cheaply, and pays only on a change.
+  Override the fetch cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds). The
+  daemon pushes to windows only when a verdict actually moves.
+- **A commit invalidates the verdict immediately.** Each badge records the commit
+  its verdict describes; when that differs from the worktree's `head_sha` the row
+  renders ● rather than the previous commit's ✓ — no network call, on the very next
+  snapshot. So committing or pushing never leaves a stale green standing, and the
+  poller (which notices the moved head on its next wake) refreshes it for real
+  shortly after. The same applies to unpushed work and to being behind the remote:
+  the verdict simply is not about the commit in front of you.
 - **Best-effort, silent.** A worktree with no branch, no matching PR, or on a
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
@@ -422,7 +434,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | --- | --- | --- |
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
-| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337). It backs off ×2 to a 30-minute ceiling once every badge is terminal, and polls nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed) or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
