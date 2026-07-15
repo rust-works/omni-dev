@@ -43,6 +43,14 @@ export interface TreeWorktreePayload {
   /** The checked-out branch, or absent when detached/unborn. */
   branch?: string;
   /**
+   * The commit HEAD points at, or absent when unborn (present even on a detached
+   * HEAD). Unlike {@link TreeWorktreePayload.ahead} this **is** carried by the
+   * streamed snapshot: it is what makes a new commit a visible delta, so a push
+   * re-renders instead of being dropped by the daemon's snapshot diff (#1337).
+   * Absent from a pre-#1337 daemon.
+   */
+  head_sha?: string;
+  /**
    * Commits ahead of upstream. **Not** carried by the streamed `tree`/`subscribe`
    * snapshot — it is fetched lazily via the `ahead-behind` op on expand and folded
    * in by {@link withAheadBehind} (#1306). Absent without an upstream, or until
@@ -101,6 +109,33 @@ export function withAheadBehind(
  * absent badge (no GitHub identity, no matching PR, or not yet fetched) leaves the
  * worktree unchanged, so it renders with no PR indicator.
  */
+/**
+ * Strips every daemon-supplied PR badge from a snapshot's repos (#1337).
+ *
+ * The `showPullRequests` setting used to work by simply not running `gh` — the
+ * badge could only come from the fetch it gated. Since the daemon resolves badges
+ * and pushes them on the snapshot, gating the fetch no longer suppresses anything,
+ * so the setting has to strip on the way in or it silently stops working.
+ *
+ * Returns the input unchanged when there is nothing to strip, so an unchanged
+ * snapshot stays reference-equal.
+ */
+export function withoutPrBadges(repos: TreeRepoPayload[]): TreeRepoPayload[] {
+  if (!repos.some((r) => r.worktrees.some((w) => w.pr))) {
+    return repos;
+  }
+  return repos.map((repo) => ({
+    ...repo,
+    worktrees: repo.worktrees.map((wt) => {
+      if (!wt.pr) {
+        return wt;
+      }
+      const { pr: _pr, ...rest } = wt;
+      return rest;
+    }),
+  }));
+}
+
 export function withPr(wt: TreeWorktreePayload, pr?: PrBadge): TreeWorktreePayload {
   if (pr === undefined) {
     return wt;

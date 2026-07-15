@@ -9,33 +9,14 @@
 // labels, the URI, and the scope→discovery mapping — is here behind an injected
 // runner so it can be exercised without a real `gh` or a real editor.
 
-import { PrBadge, PrCheckState, TreeGithubIdentity } from "./tree";
+import { PrBadge, TreeGithubIdentity } from "./tree";
 
-/**
- * One entry of a PR's `statusCheckRollup` (#1296), as `gh pr list --json
- * statusCheckRollup` emits it. The array mixes GitHub's two check types — a
- * `CheckRun` (Actions/apps: `status` plus a `conclusion` once complete) and a
- * `StatusContext` (the legacy commit-status API: a single `state`) — so every
- * field is optional and {@link rollupCheckState} reduces across whichever are
- * present.
- */
-export interface StatusCheckRollupEntry {
-  /** `"CheckRun"` or `"StatusContext"`; informational, not required to classify. */
-  __typename?: string;
-  /** CheckRun lifecycle: `QUEUED` | `IN_PROGRESS` | `COMPLETED` | …. */
-  status?: string;
-  /** CheckRun verdict once `COMPLETED`: `SUCCESS` | `FAILURE` | `NEUTRAL` | …. */
-  conclusion?: string;
-  /** StatusContext verdict: `SUCCESS` | `FAILURE` | `ERROR` | `PENDING` | `EXPECTED`. */
-  state?: string;
-}
 
 /**
  * One open pull request, as returned by `gh pr list --json …`. Only the fields
  * this feature requests are modelled; `gh` guarantees their presence for the
  * `--json` keys we pass, so they are non-optional except `author` (which `gh`
- * can report as an object with a missing `login` for some actors) and
- * `statusCheckRollup` (requested only by the badge path, {@link prBadgeListArgs}).
+ * can report as an object with a missing `login` for some actors).
  */
 export interface PullRequest {
   number: number;
@@ -46,19 +27,10 @@ export interface PullRequest {
   isDraft: boolean;
   state: string;
   author?: { login?: string; name?: string };
-  statusCheckRollup?: StatusCheckRollupEntry[];
 }
 
 /** The `--json` fields requested from `gh pr list` — mirrors {@link PullRequest}. */
 export const PR_JSON_FIELDS = "number,title,url,headRefName,baseRefName,isDraft,state,author";
-
-/**
- * The `--json` fields for the tree PR **badge** (#1296): the base fields plus the
- * verbose `statusCheckRollup` needed for the checks glyph. Kept separate from
- * {@link PR_JSON_FIELDS} so the "Open Pull Request…" quick-pick — which never
- * shows check state — does not pay to fetch the rollup.
- */
-export const PR_BADGE_JSON_FIELDS = `${PR_JSON_FIELDS},statusCheckRollup`;
 
 /** The `gh pr list --limit` cap — high enough to list a repo's open PRs in one call. */
 export const PR_LIST_LIMIT = "100";
@@ -119,26 +91,6 @@ export function prListArgsForBranch(repo: TreeGithubIdentity, branch: string): s
   ];
 }
 
-/**
- * Builds the `gh pr list` argv for **all** of a repo's open PRs *with* their
- * `statusCheckRollup` (#1296) — the one call the tree makes per repo-expand to
- * badge every worktree. Like {@link prListArgsForRepo} but requesting the extra
- * checks field.
- */
-export function prBadgeListArgs(repo: TreeGithubIdentity): string[] {
-  return [
-    "pr",
-    "list",
-    "--repo",
-    repoSlug(repo),
-    "--state",
-    "open",
-    "--json",
-    PR_BADGE_JSON_FIELDS,
-    "--limit",
-    PR_LIST_LIMIT,
-  ];
-}
 
 /**
  * Parses `gh pr list --json` stdout into a `PullRequest[]`, defensively: empty
@@ -228,82 +180,22 @@ export function prOverviewUri(scheme: string, prWebUrl: string): string {
   return `${scheme}://github.vscode-pull-request-github/open-pull-request-webview?${query}`;
 }
 
-// GitHub's check conclusions / status-context states, bucketed. Names are
-// upper-cased before lookup, so the sets hold the canonical GraphQL enum values.
-const FAILURE_STATES = new Set([
-  "FAILURE",
-  "ERROR",
-  "CANCELLED",
-  "TIMED_OUT",
-  "ACTION_REQUIRED",
-  "STARTUP_FAILURE",
-  "STALE",
-]);
-// A skipped/neutral check is non-blocking, so it counts toward `success` (matching
-// how `gh pr checks` treats "skipping" as a pass, not a failure).
-const SUCCESS_STATES = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
-
 /**
- * Classifies one rollup entry. A CheckRun that has not `COMPLETED` is pending
- * regardless of its (null) conclusion; otherwise the conclusion (CheckRun) or
- * state (StatusContext) decides. Anything unrecognized is treated as pending so a
- * still-resolving or unknown check never reads as passing.
+ * The **degraded** PR badge for `branch`, for when the daemon does not supply one
+ * (#1337).
+ *
+ * Check state is resolved daemon-side now — one `gh api graphql` for every repo
+ * and branch at once, kept live by a background poller — so this exists only for a
+ * daemon older than #1337, which omits `pr` from the tree payload. It reports the
+ * PR itself (`#65`, `#65 draft`) from the quick-pick's rollup-free `gh pr list`,
+ * with `checks: "none"` so no ✓/✗/● is rendered: a badge with no poller behind it
+ * could never refresh, and a stale verdict is worse than none. Matching a PR by
+ * head branch mirrors the daemon's `Ref.associatedPullRequests(states:OPEN)`.
+ *
+ * Returns `undefined` for a detached/unborn worktree (no `branch`) or when no open
+ * PR heads that branch.
  */
-function checkEntryState(entry: StatusCheckRollupEntry): PrCheckState {
-  if (entry.status !== undefined && entry.status !== "" && entry.status.toUpperCase() !== "COMPLETED") {
-    return "pending";
-  }
-  const raw = (entry.conclusion || entry.state || "").toUpperCase();
-  if (FAILURE_STATES.has(raw)) {
-    return "failure";
-  }
-  if (SUCCESS_STATES.has(raw)) {
-    return "success";
-  }
-  // Everything else — a pending state (PENDING/EXPECTED/…), an empty verdict
-  // (completed-but-unset), or an unknown value — falls through to pending, so a
-  // still-resolving or unrecognized check never reads as a false pass.
-  return "pending";
-}
-
-/**
- * Reduces a PR's `statusCheckRollup` to one verdict (#1296): any failing check
- * dominates (`failure`); else any still-running one (`pending`); else, if at least
- * one succeeded, `success`; an empty or absent rollup means no checks (`none`).
- */
-export function rollupCheckState(rollup?: StatusCheckRollupEntry[]): PrCheckState {
-  if (!rollup || rollup.length === 0) {
-    return "none";
-  }
-  let sawPending = false;
-  let sawSuccess = false;
-  for (const entry of rollup) {
-    switch (checkEntryState(entry)) {
-      case "failure":
-        return "failure";
-      case "pending":
-        sawPending = true;
-        break;
-      case "success":
-        sawSuccess = true;
-        break;
-      case "none":
-        break;
-    }
-  }
-  if (sawPending) {
-    return "pending";
-  }
-  return sawSuccess ? "success" : "none";
-}
-
-/**
- * Finds the open PR whose head is `branch` and reduces it to a {@link PrBadge}
- * for the tree (#1296): the first head-branch match (mirroring the issue's "first
- * match" rule), with its checks rolled up. Returns `undefined` for a
- * detached/unborn worktree (no `branch`) or when no open PR heads that branch.
- */
-export function prBadgeForBranch(prs: PullRequest[], branch?: string): PrBadge | undefined {
+export function prFallbackBadge(prs: PullRequest[], branch?: string): PrBadge | undefined {
   if (!branch) {
     return undefined;
   }
@@ -311,10 +203,5 @@ export function prBadgeForBranch(prs: PullRequest[], branch?: string): PrBadge |
   if (!pr) {
     return undefined;
   }
-  return {
-    number: pr.number,
-    isDraft: pr.isDraft,
-    checks: rollupCheckState(pr.statusCheckRollup),
-    url: pr.url,
-  };
+  return { number: pr.number, isDraft: pr.isDraft, checks: "none", url: pr.url };
 }
