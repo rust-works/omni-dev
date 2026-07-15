@@ -2105,9 +2105,22 @@ fn is_transient_rmdir_error(e: &std::io::Error) -> bool {
 /// message. Runs on a blocking thread (called only from [`remove_worktree`], via
 /// `spawn_blocking`), so the between-retry `sleep` is fine.
 fn remove_dir_all_retrying(dir: &Path) -> Result<()> {
-    let mut backoff = WORKTREE_RMDIR_BACKOFF.iter();
+    remove_dir_all_retrying_with(dir, WORKTREE_RMDIR_BACKOFF, || std::fs::remove_dir_all(dir))
+}
+
+/// [`remove_dir_all_retrying`] with the schedule and the removal itself injected.
+/// Provoking the real race requires a concurrent writer to lose a timing window,
+/// so only an injected sequence of errors can drive every branch of the loop —
+/// exhausting the backoff especially — deterministically and without sleeping out
+/// the production schedule.
+fn remove_dir_all_retrying_with(
+    dir: &Path,
+    backoff: &[Duration],
+    mut remove: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
+    let mut backoff = backoff.iter();
     loop {
-        match std::fs::remove_dir_all(dir) {
+        match remove() {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
@@ -4542,6 +4555,125 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("gone");
         assert!(remove_dir_all_retrying(&missing).is_ok());
+    }
+
+    #[test]
+    fn is_transient_rmdir_error_matches_only_the_repopulated_directory_race() {
+        use std::io::Error;
+        for errno in [nix::libc::ENOTEMPTY, nix::libc::EEXIST, nix::libc::EBUSY] {
+            assert!(
+                is_transient_rmdir_error(&Error::from_raw_os_error(errno)),
+                "errno {errno} is the concurrent-writer race and must be retried"
+            );
+        }
+        // A hard failure must surface immediately rather than burn the backoff
+        // waiting for a condition that will never clear.
+        for errno in [
+            nix::libc::EACCES,
+            nix::libc::EPERM,
+            nix::libc::EROFS,
+            nix::libc::ENOTDIR,
+        ] {
+            assert!(
+                !is_transient_rmdir_error(&Error::from_raw_os_error(errno)),
+                "errno {errno} is permanent and must not be retried"
+            );
+        }
+        // Not from the OS at all, so there is no errno to classify.
+        assert!(!is_transient_rmdir_error(&Error::other("synthetic")));
+    }
+
+    #[test]
+    fn remove_dir_all_retrying_surfaces_a_non_transient_error_without_retrying() {
+        // Removing a *file* as if it were a directory fails with ENOTDIR: not the
+        // race, so it must fail on the first attempt with the original cause
+        // attached, leaving the path untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut attempts = 0;
+        let err = remove_dir_all_retrying_with(&file, WORKTREE_RMDIR_BACKOFF, || {
+            attempts += 1;
+            std::fs::remove_dir_all(&file)
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1, "a permanent error must not be retried");
+        assert!(
+            err.to_string()
+                .contains("failed to remove worktree directory"),
+            "unexpected error: {err:#}"
+        );
+        assert!(err.source().is_some(), "the io::Error cause is preserved");
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn remove_dir_all_retrying_gives_up_after_the_backoff_is_exhausted() {
+        // A writer that never quiesces: every sweep re-finds the directory
+        // populated. Once the schedule runs out the ENOTEMPTY must surface rather
+        // than the loop spinning forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut attempts = 0;
+        let backoff = [Duration::ZERO, Duration::ZERO];
+        let err = remove_dir_all_retrying_with(tmp.path(), &backoff, || {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(nix::libc::ENOTEMPTY))
+        })
+        .unwrap_err();
+
+        // One attempt per delay, plus the initial one.
+        assert_eq!(attempts, backoff.len() + 1);
+        assert!(
+            err.to_string()
+                .contains("failed to remove worktree directory"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn remove_dir_all_retrying_succeeds_once_the_writer_quiesces() {
+        // The #1315 happy path, deterministically: the race clears partway through
+        // the schedule and the removal then succeeds.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut attempts = 0;
+        let result = remove_dir_all_retrying_with(tmp.path(), WORKTREE_RMDIR_BACKOFF, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(nix::libc::ENOTEMPTY))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn is_orphaned_worktree_ignores_a_git_file_that_is_not_a_gitlink() {
+        // A `.git` file that is readable but carries no `gitdir:` pointer is not
+        // something we may delete.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), b"not a gitlink\n").unwrap();
+        assert!(!is_orphaned_worktree(tmp.path()));
+    }
+
+    #[test]
+    fn remove_worktree_rejects_a_path_that_is_not_a_worktree() {
+        // Neither a repo nor an orphan: refuse it rather than recursively deleting
+        // whatever directory was passed in.
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let err = remove_worktree(&plain).unwrap_err();
+
+        assert!(
+            err.to_string().contains("not a git worktree"),
+            "unexpected error: {err:#}"
+        );
+        assert!(plain.exists(), "a non-worktree path must be left alone");
     }
 
     #[test]
