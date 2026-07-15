@@ -552,13 +552,19 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, is_main, open, window_key? }`. The main working tree comes
-  first (`is_main: true`), then linked worktrees sorted by path. `open` is `true`
-  when a live window currently has that worktree open, and `window_key` (the open
-  window's registry `key`, the handle a focus action resolves) is present only then.
-  `branch` is a daemon-computed, independently-degrading git field. **`ahead`/
-  `behind` are deliberately absent** from this snapshot — they are the expensive
-  part and are fetched on demand via the `ahead-behind` op (#1306; see
+  `{ path, branch?, head_sha?, is_main, open, window_key? }`. The main working tree
+  comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
+  `true` when a live window currently has that worktree open, and `window_key` (the
+  open window's registry `key`, the handle a focus action resolves) is present only
+  then. `branch` and `head_sha` are daemon-computed, independently-degrading git
+  fields. `head_sha` is the commit HEAD points at — present even on a detached HEAD
+  (which has a commit but no branch), absent on an unborn one. It rides the snapshot
+  because it is a refs read rather than a walk, and because it is what makes a new
+  commit a **visible delta**: the subscribe stream pushes only when a snapshot
+  differs from the last, so without it a push serialised byte-identically, was
+  dropped by the diff, and no window re-rendered (#1337). **`ahead`/`behind` are
+  deliberately absent** from this snapshot — they are the expensive part and are
+  fetched on demand via the `ahead-behind` op (#1306; see
   [Git enrichment](#git-enrichment)).
 - `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
   `{ paths: [<worktree path>, …] }`, it returns
@@ -623,7 +629,7 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","is_main":false,"open":false}]}],"show_closed":true}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","is_main":false,"open":false}]}],"show_closed":true}}
 → {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
 ← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
 ```
