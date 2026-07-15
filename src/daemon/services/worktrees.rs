@@ -409,8 +409,14 @@ impl WorktreesService {
                     // A window opened or closed — look now rather than at the next
                     // tick.
                     result = changes.changed() => {
+                        // Unreachable today: this task owns an `Arc` of the registry
+                        // that holds the sender, so it cannot be dropped while we are
+                        // here. Kept anyway because the alternative is worse — a
+                        // closed channel makes `changed()` return `Ready` forever, so
+                        // ignoring the error would spin this loop at full speed,
+                        // re-snapshotting and re-running `gh` every iteration. One
+                        // unreachable line is a cheap guard against that.
                         if result.is_err() {
-                            // The registry is gone; nothing left to poll for.
                             break;
                         }
                     }
@@ -3222,6 +3228,47 @@ mod tests {
         assert_eq!(wt["pr"]["checks"], json!("pending"));
         // camelCase on the wire, or the extension silently loses the draft marker.
         assert_eq!(wt["pr"]["isDraft"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_a_badge_for_a_detached_worktree() {
+        // A detached HEAD has a commit but no branch, and a badge is keyed by
+        // branch — so there is nothing to match. It must fall through silently
+        // rather than borrow a badge from whatever branch happens to be cached, and
+        // rather than sink the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // A badge *is* cached for `main` — the branch this worktree was on before
+        // detaching. It must not leak onto the now-branchless row.
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pending_badge(1, &head.to_string()),
+        );
+        svc.pr_cache.replace(badges);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(wt.get("branch").is_none(), "{wt:?}");
+        // The SHA still shows — detached means no branch, not no commit.
+        assert_eq!(
+            wt.get("head_sha").and_then(Value::as_str),
+            Some(head.to_string().as_str())
+        );
+        assert!(wt.get("pr").is_none(), "{wt:?}");
     }
 
     #[tokio::test]
