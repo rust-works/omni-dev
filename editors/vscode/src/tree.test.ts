@@ -14,6 +14,7 @@ import {
   reposToNodes,
   withAheadBehind,
   withPr,
+  withoutPrBadges,
   worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
@@ -339,4 +340,36 @@ test("worktreeTooltip distinguishes the current window's open line", () => {
   const elsewhere = worktreeTooltip(REPOS[0].worktrees[0], REPOS[0], "w2");
   assert.match(elsewhere, /● window open/);
   assert.doesNotMatch(elsewhere, /● this window/);
+});
+
+test("withoutPrBadges strips daemon-supplied badges so the setting can switch them off", () => {
+  const repos: TreeRepoPayload[] = [
+    {
+      main_repo: "omni-dev",
+      github: { owner: "o", name: "r" },
+      root: "/r",
+      worktrees: [
+        { path: "/r", branch: "main", is_main: true, open: true, pr: OPEN_PR },
+        { path: "/w", branch: "feature", is_main: false, open: false },
+      ],
+    },
+  ];
+  const stripped = withoutPrBadges(repos);
+  assert.equal(stripped[0].worktrees[0].pr, undefined);
+  // Everything else survives untouched.
+  assert.equal(stripped[0].worktrees[0].branch, "main");
+  assert.equal(stripped[0].worktrees.length, 2);
+  assert.equal(stripped[0].main_repo, "omni-dev");
+});
+
+test("withoutPrBadges returns the input unchanged when there is nothing to strip", () => {
+  const repos: TreeRepoPayload[] = [
+    {
+      main_repo: "omni-dev",
+      root: "/r",
+      worktrees: [{ path: "/r", branch: "main", is_main: true, open: true }],
+    },
+  ];
+  // Reference-equal, so an unbadged snapshot allocates nothing.
+  assert.equal(withoutPrBadges(repos), repos);
 });

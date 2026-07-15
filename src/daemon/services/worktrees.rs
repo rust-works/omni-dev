@@ -3192,18 +3192,21 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.start_pr_poller_with(Duration::from_millis(20), fake.clone());
+        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
 
-        // Poll with a deadline rather than sleeping a fixed span.
-        let mut got = None;
-        for _ in 0..100 {
-            if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
-                got = Some(badge);
-                break;
+        // Wait on a generous wall-clock deadline: each poll spawns a real
+        // subprocess, and under a loaded machine (a full `build.sh` runs a build
+        // and clippy alongside) a tight budget flakes rather than fails honestly.
+        let badge = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
+                    return badge;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let badge = got.expect("poller should resolve a badge through the fake gh");
+        })
+        .await
+        .expect("poller should resolve a badge through the fake gh");
         assert_eq!(badge.number, 1337);
         assert_eq!(badge.checks, crate::pr_status::PrCheckState::Pending);
 
@@ -3245,14 +3248,18 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.start_pr_poller_with(Duration::from_millis(20), fake.clone());
+        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
 
-        for _ in 0..100 {
-            if svc.pr_cache.get("rust-works", "omni-dev", "main").is_some() {
-                break;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.pr_cache.get("rust-works", "omni-dev", "main").is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("poller should resolve a badge through the fake gh");
         // The fake always answers identically, so after the first resolve every
         // subsequent poll is a no-change and must leave the generation alone.
         let settled = svc.registry.change_generation();

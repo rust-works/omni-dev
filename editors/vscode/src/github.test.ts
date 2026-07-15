@@ -4,20 +4,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  PR_BADGE_JSON_FIELDS,
   PR_JSON_FIELDS,
   PR_LIST_LIMIT,
   PullRequest,
   discoverPullRequests,
   parsePrList,
-  prBadgeForBranch,
-  prBadgeListArgs,
+  prFallbackBadge,
   prListArgsForBranch,
   prListArgsForRepo,
   prOverviewUri,
   prQuickPickDescription,
   prQuickPickLabel,
-  rollupCheckState,
 } from "./github";
 import { TreeGithubIdentity } from "./tree";
 
@@ -155,104 +152,54 @@ test("discoverPullRequests returns [] for a detached worktree without calling gh
 
 // --- PR badge (#1296): checks rollup + branch matching -----------------------
 
-test("prBadgeListArgs lists all open PRs with the statusCheckRollup field", () => {
-  assert.deepEqual(prBadgeListArgs(REPO), [
-    "pr",
-    "list",
-    "--repo",
-    "rust-works/omni-dev",
-    "--state",
-    "open",
-    "--json",
-    PR_BADGE_JSON_FIELDS,
-    "--limit",
-    PR_LIST_LIMIT,
-  ]);
-  // The badge field set is the base set plus the checks rollup.
-  assert.ok(PR_BADGE_JSON_FIELDS.startsWith(`${PR_JSON_FIELDS},`));
-  assert.match(PR_BADGE_JSON_FIELDS, /statusCheckRollup/);
-});
+// The rollup reducer moved to the daemon with #1337 (badges are resolved there
+// now, and kept live by its poller); its coverage moved with it, to the Rust unit
+// tests in `src/pr_status.rs`. What remains extension-side is the degraded
+// fallback used only against a daemon too old to supply `pr`.
 
-test("rollupCheckState reports none for an empty or absent rollup", () => {
-  assert.equal(rollupCheckState(undefined), "none");
-  assert.equal(rollupCheckState([]), "none");
-});
-
-test("rollupCheckState maps a completed CheckRun's conclusion", () => {
-  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "SUCCESS" }]), "success");
-  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "FAILURE" }]), "failure");
-  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "CANCELLED" }]), "failure");
-  // Neutral/skipped are non-blocking → success.
-  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "NEUTRAL" }]), "success");
-  assert.equal(rollupCheckState([{ status: "COMPLETED", conclusion: "SKIPPED" }]), "success");
-});
-
-test("rollupCheckState treats an incomplete CheckRun as pending", () => {
-  assert.equal(rollupCheckState([{ status: "IN_PROGRESS" }]), "pending");
-  assert.equal(rollupCheckState([{ status: "QUEUED" }]), "pending");
-});
-
-test("rollupCheckState reads a StatusContext's state", () => {
-  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "SUCCESS" }]), "success");
-  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "FAILURE" }]), "failure");
-  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "ERROR" }]), "failure");
-  assert.equal(rollupCheckState([{ __typename: "StatusContext", state: "PENDING" }]), "pending");
-});
-
-test("rollupCheckState precedence: any failure dominates, else any pending, else success", () => {
-  assert.equal(
-    rollupCheckState([
-      { status: "COMPLETED", conclusion: "SUCCESS" },
-      { status: "IN_PROGRESS" },
-      { status: "COMPLETED", conclusion: "FAILURE" },
-    ]),
-    "failure",
-  );
-  assert.equal(
-    rollupCheckState([{ status: "COMPLETED", conclusion: "SUCCESS" }, { status: "IN_PROGRESS" }]),
-    "pending",
-  );
-  assert.equal(
-    rollupCheckState([
-      { status: "COMPLETED", conclusion: "SUCCESS" },
-      { __typename: "StatusContext", state: "SUCCESS" },
-    ]),
-    "success",
-  );
-});
-
-test("prBadgeForBranch matches the head branch and rolls up its checks", () => {
-  const prs: PullRequest[] = [
-    {
-      ...PR,
-      number: 1300,
-      headRefName: "issue-1300",
-      isDraft: true,
-      url: "https://github.com/rust-works/omni-dev/pull/1300",
-      statusCheckRollup: [{ status: "COMPLETED", conclusion: "FAILURE" }],
-    },
-    { ...PR },
-  ];
-  assert.deepEqual(prBadgeForBranch(prs, "issue-1300"), {
-    number: 1300,
+const FALLBACK_PRS: PullRequest[] = [
+  {
+    number: 65,
+    title: "Add thing",
+    url: "https://github.com/o/r/pull/65",
+    headRefName: "feature",
+    baseRefName: "main",
     isDraft: true,
-    checks: "failure",
-    url: "https://github.com/rust-works/omni-dev/pull/1300",
-  });
-});
-
-test("prBadgeForBranch returns undefined for no branch or no head match", () => {
-  assert.equal(prBadgeForBranch([PR], undefined), undefined);
-  assert.equal(prBadgeForBranch([PR], ""), undefined);
-  assert.equal(prBadgeForBranch([PR], "no-such-branch"), undefined);
-});
-
-test("prBadgeForBranch takes the first head match and defaults absent checks to none", () => {
-  // The PR fixture carries no statusCheckRollup → checks resolve to `none`.
-  assert.deepEqual(prBadgeForBranch([PR], PR.headRefName), {
-    number: PR.number,
+    state: "OPEN",
+  },
+  {
+    number: 66,
+    title: "Other",
+    url: "https://github.com/o/r/pull/66",
+    headRefName: "other",
+    baseRefName: "main",
     isDraft: false,
+    state: "OPEN",
+  },
+];
+
+test("prFallbackBadge matches the head branch and carries the PR, never a check state", () => {
+  const badge = prFallbackBadge(FALLBACK_PRS, "feature");
+  assert.deepEqual(badge, {
+    number: 65,
+    isDraft: true,
+    // Deliberately never a verdict: nothing extension-side polls, so a checks
+    // glyph here could not refresh and a stale one is worse than none (#1337).
     checks: "none",
-    url: PR.url,
+    url: "https://github.com/o/r/pull/65",
   });
+});
+
+test("prFallbackBadge returns undefined for no branch or no head match", () => {
+  assert.equal(prFallbackBadge(FALLBACK_PRS, undefined), undefined);
+  assert.equal(prFallbackBadge(FALLBACK_PRS, "nope"), undefined);
+  assert.equal(prFallbackBadge([], "feature"), undefined);
+});
+
+test("prFallbackBadge takes the first head match", () => {
+  const dupes: PullRequest[] = [
+    { ...FALLBACK_PRS[0], number: 1 },
+    { ...FALLBACK_PRS[0], number: 2 },
+  ];
+  assert.equal(prFallbackBadge(dupes, "feature")?.number, 1);
 });

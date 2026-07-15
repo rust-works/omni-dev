@@ -102,31 +102,37 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     if (nodes.length === 0) {
       return nodes;
     }
-    // Lazily enrich this repo's worktrees on expand — the streamed snapshot no
-    // longer carries per-worktree extras (#1306). Two independent, best-effort
-    // lookups run in parallel: ahead/behind via the daemon `ahead-behind` op
-    // (#1306), and — when the repo is on GitHub — PR badges via `gh` (#1296). A
-    // re-render (a new snapshot) re-runs this and re-fetches, keeping both fresh;
-    // a failure of either leaves just that indicator off.
+    // Lazily enrich this repo's worktrees on expand — the streamed snapshot does
+    // not carry ahead/behind (#1306), which is fetched via the daemon's
+    // `ahead-behind` op. Best-effort: a failure leaves just that indicator off.
+    //
+    // PR badges are **not** in the same boat since #1337. The daemon resolves them
+    // and pushes them on the snapshot, kept live by its own poller — which is the
+    // whole point, because a re-render only happens when the *worktree* state
+    // changes, and CI moves without it. So we ask the fallback fetcher only for the
+    // branches the daemon left unbadged (an older daemon omits `pr` entirely);
+    // against a current daemon that list is empty and no `gh` runs at all.
     const paths = nodes.flatMap((n) => (n.kind === "worktree" ? [n.wt.path] : []));
-    const branches = nodes.flatMap((n) =>
-      n.kind === "worktree" && n.wt.branch ? [n.wt.branch] : [],
+    const unbadged = nodes.flatMap((n) =>
+      n.kind === "worktree" && n.wt.branch && !n.wt.pr ? [n.wt.branch] : [],
     );
     const abPromise: Promise<AheadBehindMap> = this.fetchAheadBehind
       ? this.fetchAheadBehind(paths).catch(() => ({}))
       : Promise.resolve({});
     const prPromise: Promise<Record<string, PrBadge>> =
-      this.fetchPrBadges && element.repo.github && branches.length > 0
-        ? this.fetchPrBadges(element.repo.github, branches).catch(() => ({}))
+      this.fetchPrBadges && element.repo.github && unbadged.length > 0
+        ? this.fetchPrBadges(element.repo.github, unbadged).catch(() => ({}))
         : Promise.resolve({});
     const [ab, prBadges] = await Promise.all([abPromise, prPromise]);
     return nodes.map((n) => {
       if (n.kind !== "worktree") {
         return n;
       }
+      // `withPr(wt, undefined)` is a no-op, so a daemon-supplied badge is never
+      // overwritten by the (checks-less) fallback.
       const wt = withPr(
         withAheadBehind(n.wt, ab[n.wt.path]),
-        n.wt.branch ? prBadges[n.wt.branch] : undefined,
+        n.wt.branch && !n.wt.pr ? prBadges[n.wt.branch] : undefined,
       );
       return { ...n, wt };
     });
