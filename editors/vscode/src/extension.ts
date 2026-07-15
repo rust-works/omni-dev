@@ -26,6 +26,7 @@ import { runGh } from "./gh";
 import { PullRequest, parsePrList, prBadgeForBranch, prBadgeListArgs } from "./github";
 import { openPullRequest } from "./prCommands";
 import { CLAUDE_TERMINAL_NAME, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
+import { moveClaudeSessionHere } from "./moveSessionCommand";
 import {
   AheadBehindMap,
   Node,
@@ -355,6 +356,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",
       (node?: Node) => void openPullRequest(node),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.moveClaudeSessionHere",
+      (node?: Node) => void moveClaudeSessionHere(node, output),
     ),
     // The two halves of the one title-bar toggle: exactly one is contributed at a
     // time (gated on the context key), so clicking the visible button flips the
