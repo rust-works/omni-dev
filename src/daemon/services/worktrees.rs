@@ -2072,18 +2072,108 @@ fn worktree_name_for_path(main_repo: &Repository, target: &Path) -> Result<Strin
         })
 }
 
+/// Backoff delays between recursive-removal retries (#1315). A concurrent
+/// writer — a just-closed window's language server (Metals/Bloop) or
+/// `rust-analyzer`/`cargo` still flushing build artifacts into `target/` — can
+/// create a file between our directory scan and its `rmdir`, making the removal
+/// fail with `ENOTEMPTY` ("Directory not empty"). Each retry re-sweeps and
+/// waits longer, giving the winding-down process time to quiesce. Total wait
+/// ~2.75s across four retries; the window teardown the caller already waited on
+/// dominates it.
+const WORKTREE_RMDIR_BACKOFF: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+];
+
+/// Whether `e` is the transient "directory re-populated under us" race we retry
+/// (see [`WORKTREE_RMDIR_BACKOFF`]) rather than a hard failure (permission
+/// denied, read-only filesystem) we must surface immediately. Matches the raw
+/// errno — `std::io::ErrorKind::DirectoryNotEmpty` is only stable from Rust 1.83,
+/// past our MSRV — including the `EEXIST`/`EBUSY` siblings libgit2 lumps in.
+fn is_transient_rmdir_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(nix::libc::ENOTEMPTY | nix::libc::EEXIST | nix::libc::EBUSY)
+    )
+}
+
+/// Recursively removes `dir`, retrying on the transient concurrent-writer race
+/// (see [`is_transient_rmdir_error`]) and treating an already-absent directory
+/// as success. Non-transient errors surface immediately with the original
+/// message. Runs on a blocking thread (called only from [`remove_worktree`], via
+/// `spawn_blocking`), so the between-retry `sleep` is fine.
+fn remove_dir_all_retrying(dir: &Path) -> Result<()> {
+    let mut backoff = WORKTREE_RMDIR_BACKOFF.iter();
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if is_transient_rmdir_error(&e) {
+                    if let Some(delay) = backoff.next() {
+                        std::thread::sleep(*delay);
+                        continue;
+                    }
+                }
+                return Err(e).with_context(|| {
+                    format!("failed to remove worktree directory {}", dir.display())
+                });
+            }
+        }
+    }
+}
+
+/// Whether `path` is a **half-removed** linked worktree: its `.git` gitlink
+/// still points at an admin directory a prior failed removal already deleted.
+/// libgit2's combined prune deletes the admin metadata *before* it rmdirs the
+/// working tree, so a working-tree rmdir failure (#1315) leaves exactly this
+/// orphan — the directory on disk with a dangling gitlink, no longer tracked by
+/// git. Safe to delete outright: a live worktree's gitlink resolves (its repo
+/// opens) and a normal checkout has a `.git` *directory*, so this matches
+/// neither.
+fn is_orphaned_worktree(path: &Path) -> bool {
+    // `read_to_string` fails on a `.git` directory (a normal checkout), so only
+    // a linked worktree's gitlink file gets past here.
+    let Ok(contents) = std::fs::read_to_string(path.join(".git")) else {
+        return false;
+    };
+    let Some(admin) = contents.strip_prefix("gitdir:").map(str::trim) else {
+        return false;
+    };
+    let admin = Path::new(admin);
+    // A linked-worktree admin path (`…/worktrees/<name>`) whose target is gone.
+    admin.components().any(|c| c.as_os_str() == "worktrees") && !admin.exists()
+}
+
 /// Removes a **linked** worktree at `path` via `git2` (no shell — avoiding the
-/// daemon-`PATH` problem the launcher fights): deletes both the admin files and
-/// the checked-out directory. Refuses the main working tree (the defensive
-/// backstop behind the UI gating) and a locked worktree (surfacing "unlock
-/// first" rather than forcing past the lock). Idempotent: an already-removed
-/// path is a success.
+/// daemon-`PATH` problem the launcher fights): deletes both the checked-out
+/// directory and the admin metadata. Refuses the main working tree (the
+/// defensive backstop behind the UI gating) and a locked worktree (surfacing
+/// "unlock first" rather than forcing past the lock). Idempotent: an
+/// already-removed path is a success.
+///
+/// The working tree is removed **first** (retrying to absorb the
+/// concurrent-writer race, #1315), and only then is the admin metadata pruned.
+/// This is deliberately the reverse of libgit2's combined
+/// `prune(working_tree: true)`, which deletes the admin dir first and, when the
+/// working-tree rmdir then fails, leaves a **half-removed orphan** git no longer
+/// tracks (and which a naive prune-retry cannot recover, since its admin gitdir
+/// is already gone). Doing the directory first means a transient failure leaves
+/// the worktree fully tracked and cleanly retryable; a pre-existing orphan from
+/// the old ordering is detected and its leftover directory cleaned up directly.
 fn remove_worktree(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let repo = Repository::open(path)
-        .with_context(|| format!("not a git worktree: {}", path.display()))?;
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        // Admin metadata already gone (a prior failed removal); git no longer
+        // tracks this path, so no prune applies — just delete the leftover.
+        Err(_) if is_orphaned_worktree(path) => return remove_dir_all_retrying(path),
+        Err(e) => return Err(e).context(format!("not a git worktree: {}", path.display())),
+    };
     if !repo.is_worktree() {
         bail!(
             "refusing to delete the main working tree: {}",
@@ -2097,7 +2187,7 @@ fn remove_worktree(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("no repository root for {}", path.display()))?
         .to_path_buf();
-    // Drop the worktree-scoped handle before pruning deletes its directory.
+    // Drop the worktree-scoped handle before we delete its directory.
     drop(repo);
     let main_repo = Repository::open(&main_root)
         .with_context(|| format!("failed to open repository at {}", main_root.display()))?;
@@ -2110,14 +2200,19 @@ fn remove_worktree(path: &Path) -> Result<()> {
         bail!("worktree is locked{because}; unlock it first (git worktree unlock)");
     }
 
-    // valid(true): prune even though the worktree still exists on disk;
-    // working_tree(true): also recursively delete the checked-out directory.
-    // locked stays false, so a lock (re-checked above) is never forced.
+    // Delete the checked-out directory ourselves, retrying past the
+    // concurrent-writer race (#1315).
+    remove_dir_all_retrying(path)?;
+
+    // The directory is gone; prune only the admin metadata. working_tree(false)
+    // keeps git2 from re-attempting (and failing on) the now-absent directory;
+    // valid(true) prunes even though the worktree was valid; locked stays false,
+    // so a lock (re-checked above) is never forced.
     let mut opts = git2::WorktreePruneOptions::new();
-    opts.valid(true).working_tree(true);
+    opts.valid(true).working_tree(false);
     worktree
         .prune(Some(&mut opts))
-        .with_context(|| format!("failed to remove worktree {}", path.display()))?;
+        .with_context(|| format!("failed to prune worktree metadata for {}", path.display()))?;
     Ok(())
 }
 
@@ -4383,6 +4478,112 @@ mod tests {
             !wt_path.exists(),
             "the worktree directory should be deleted"
         );
+    }
+
+    #[test]
+    fn remove_worktree_deletes_the_directory_and_prunes_the_admin_metadata() {
+        // The reorder (#1315) must still fully remove a worktree: both the
+        // checked-out directory *and* the admin metadata git tracks it by, so it
+        // no longer appears in `Repository::worktrees()`.
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let admin = main.path().join(".git").join("worktrees").join("feature");
+        assert!(admin.exists(), "admin metadata should exist before removal");
+
+        remove_worktree(&wt_path).unwrap();
+
+        assert!(!wt_path.exists(), "the working directory should be gone");
+        assert!(!admin.exists(), "the admin metadata should be pruned");
+        let main_repo = Repository::open(main.path()).unwrap();
+        assert_eq!(
+            main_repo.worktrees().unwrap().len(),
+            0,
+            "git should no longer track the worktree"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_recovers_a_half_removed_orphan() {
+        // The exact #1315 leftover: the old ordering deleted the admin metadata
+        // first, then failed to rmdir the working tree, orphaning the directory
+        // with a dangling `.git` gitlink. `remove_worktree` must clean it up
+        // rather than error with "not a git worktree".
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        let admin = main.path().join(".git").join("worktrees").join("feature");
+        // Simulate the half-removed state: admin gone, directory (+gitlink) left.
+        std::fs::remove_dir_all(&admin).unwrap();
+        assert!(wt_path.join(".git").is_file(), "dangling gitlink remains");
+        assert!(
+            Repository::open(&wt_path).is_err(),
+            "the orphan should not open as a repo"
+        );
+
+        remove_worktree(&wt_path).unwrap();
+        assert!(
+            !wt_path.exists(),
+            "the leftover directory should be removed"
+        );
+    }
+
+    #[test]
+    fn is_orphaned_worktree_only_matches_a_dangling_linked_gitlink() {
+        let (main, _wtp, wt_path) = repo_with_linked_worktree();
+        // A live worktree: gitlink resolves → not an orphan.
+        assert!(!is_orphaned_worktree(&wt_path));
+        // The main checkout has a `.git` directory → not an orphan.
+        assert!(!is_orphaned_worktree(main.path()));
+        // Drop the admin metadata → the gitlink now dangles → orphan.
+        std::fs::remove_dir_all(main.path().join(".git").join("worktrees").join("feature"))
+            .unwrap();
+        assert!(is_orphaned_worktree(&wt_path));
+    }
+
+    #[test]
+    fn remove_dir_all_retrying_is_idempotent_on_a_missing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("gone");
+        assert!(remove_dir_all_retrying(&missing).is_ok());
+    }
+
+    #[test]
+    fn remove_worktree_succeeds_while_a_concurrent_writer_winds_down() {
+        // Acceptance criterion (#1315): a language server / cargo still writing
+        // into `target/` as the window closes makes the recursive rmdir race with
+        // "Directory not empty". A background thread reproduces that by
+        // repopulating `target/` for a bounded window; removal must retry past it
+        // and still succeed once the writer stops.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (_main, _wtp, wt_path) = repo_with_linked_worktree();
+        let target = wt_path.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_dir = target;
+        let writer = std::thread::spawn(move || {
+            let mut n = 0u64;
+            // Churn hard for ~400ms (well under the ~2.75s retry budget), then
+            // stop so a later removal pass finds the directory quiescent.
+            let deadline = std::time::Instant::now() + Duration::from_millis(400);
+            while !writer_stop.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                let nested = writer_dir.join("nested");
+                // Best-effort: the parent may be mid-deletion — ignore failures.
+                let _ = std::fs::create_dir_all(&nested);
+                let _ = std::fs::write(nested.join(format!("artifact-{n}.tmp")), b"x");
+                n += 1;
+            }
+        });
+
+        let result = remove_worktree(&wt_path);
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "removal should retry past the writer: {result:?}"
+        );
+        assert!(!wt_path.exists(), "the worktree directory should be gone");
     }
 
     #[tokio::test]
