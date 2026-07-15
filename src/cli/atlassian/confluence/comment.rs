@@ -1897,6 +1897,28 @@ mod tests {
         }
     }
 
+    /// A dry-run with a failing writer makes the guard's own `writeln` fail,
+    /// covering the `?` propagation on `guard_destructive_with_io` in
+    /// `DeleteCommand::execute_with_io` — the last uncovered line of #1117.
+    #[tokio::test]
+    async fn delete_comment_dry_run_propagates_guard_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+        let cmd = DeleteCommand {
+            comment_id: "555".to_string(),
+            kind: CommentKindArg::Inline,
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter { fail_write: true };
+        let err = cmd
+            .execute_with_io(&api, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("writer failed"));
+    }
+
     #[tokio::test]
     async fn reanchor_execute_with_io_propagates_prompt_write_error() {
         let server = wiremock::MockServer::start().await;
