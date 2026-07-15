@@ -192,14 +192,41 @@ fn rollup_check_state(contexts: &[Value]) -> PrCheckState {
             EntryState::Success => {}
         }
     }
-    // Non-empty, nothing failing, nothing running ⇒ everything passed. (The
-    // TypeScript tracked a `sawSuccess` flag here; it could never be false at this
-    // point, so the branch it guarded was dead.)
     if saw_pending {
-        PrCheckState::Pending
-    } else {
-        PrCheckState::Success
+        return PrCheckState::Pending;
     }
+    // Every check *that exists* has passed — but more may still be coming, so this
+    // is not yet a pass. See [`suite_still_running`].
+    if contexts.iter().any(suite_still_running) {
+        return PrCheckState::Pending;
+    }
+    // Non-empty, nothing failing, nothing running, every suite terminal ⇒ passed.
+    // (The TypeScript tracked a `sawSuccess` flag here; it could never be false at
+    // this point, so the branch it guarded was dead.)
+    PrCheckState::Success
+}
+
+/// Whether the check **suite** backing this entry is still running.
+///
+/// This is what catches the `needs:`-gate false green. GitHub does not create a
+/// gated job's check run until its dependency completes, so in the window between
+/// the gate passing and the fan-out appearing, every check run that *exists* is
+/// green and the rollup reduces to `success` — GitHub's own aggregate `state` says
+/// `SUCCESS` too. Only the suite knows more jobs are coming.
+///
+/// Reading the suite off a **`CheckRun` in the rollup** (rather than querying
+/// `checkSuites` on the commit) is what makes this safe as well as free. A suite
+/// only appears here by way of a check run it owns, so a suite with **zero** runs —
+/// e.g. codecov leaves one `QUEUED` on every PR, observed still queued after 3.7
+/// days — is never seen and cannot pin a badge yellow forever. No age heuristic, no
+/// app denylist, and no third-level `checkRuns { totalCount }` connection (which
+/// would cost 11 points instead of 1).
+fn suite_still_running(entry: &Value) -> bool {
+    entry
+        .get("checkSuite")
+        .and_then(|suite| suite.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| !status.is_empty() && !status.eq_ignore_ascii_case("COMPLETED"))
 }
 
 /// The GraphQL fragment resolving one branch: its head OID, the rollup contexts
@@ -220,7 +247,7 @@ fn branch_fragment(alias: &str, branch: &str) -> String {
       target{{ ...on Commit{{ oid
         statusCheckRollup{{ contexts(first:100){{ nodes{{
           __typename
-          ...on CheckRun{{ status conclusion }}
+          ...on CheckRun{{ status conclusion checkSuite{{ status }} }}
           ...on StatusContext{{ state }}
         }} }} }}
       }} }}
@@ -553,6 +580,95 @@ mod tests {
             PrCheckState::Pending
         );
         assert_eq!(rollup_check_state(&[ok]), PrCheckState::Success);
+    }
+
+    // --- Suite awareness: the `needs:`-gate false green ---
+
+    fn run(conclusion: &str, suite: Option<&str>) -> Value {
+        let mut e = json!({
+            "__typename": "CheckRun",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        });
+        if let Some(s) = suite {
+            e["checkSuite"] = json!({ "status": s });
+        }
+        e
+    }
+
+    #[test]
+    fn rollup_is_pending_while_a_suite_is_still_creating_jobs() {
+        // The exact shape observed on PRs #1294/#1329: every check run that exists
+        // is green — GitHub's own rollup `state` reads SUCCESS — but the CI suite is
+        // still spawning the `needs: gate` fan-out. Reporting success here is the
+        // false ✓ this issue is about.
+        let contexts = vec![
+            run("SUCCESS", Some("IN_PROGRESS")),
+            run("SUCCESS", Some("IN_PROGRESS")),
+        ];
+        assert_eq!(rollup_check_state(&contexts), PrCheckState::Pending);
+        // QUEUED counts too — the suite exists but has not started its fan-out.
+        assert_eq!(
+            rollup_check_state(&[run("SUCCESS", Some("QUEUED"))]),
+            PrCheckState::Pending
+        );
+    }
+
+    #[test]
+    fn rollup_is_success_once_every_backing_suite_is_terminal() {
+        let contexts = vec![
+            run("SUCCESS", Some("COMPLETED")),
+            run("SKIPPED", Some("COMPLETED")),
+        ];
+        assert_eq!(rollup_check_state(&contexts), PrCheckState::Success);
+    }
+
+    #[test]
+    fn rollup_ignores_a_zero_run_zombie_suite() {
+        // codecov leaves a QUEUED suite with **zero** check runs on every PR — one
+        // was still queued after 3.7 days. A rule keyed on "any non-terminal suite"
+        // would pin such a PR yellow forever. Keying on suites reachable *through a
+        // check run* excludes it structurally: with no runs, it never appears in the
+        // rollup at all. So a rollup whose runs all carry terminal suites is green,
+        // even though a zombie suite exists on the commit.
+        let contexts = vec![run("SUCCESS", Some("COMPLETED"))];
+        assert_eq!(rollup_check_state(&contexts), PrCheckState::Success);
+    }
+
+    #[test]
+    fn rollup_tolerates_entries_without_suite_information() {
+        // A legacy StatusContext has no `checkSuite`, and neither does a CheckRun if
+        // the field is ever absent. Missing suite info must not imply "still
+        // running", or every StatusContext-only repo pins yellow.
+        assert_eq!(
+            rollup_check_state(&[json!({"__typename":"StatusContext","state":"SUCCESS"})]),
+            PrCheckState::Success
+        );
+        assert_eq!(
+            rollup_check_state(&[run("SUCCESS", None)]),
+            PrCheckState::Success
+        );
+        // An empty suite status is not a running suite either.
+        assert_eq!(
+            rollup_check_state(&[run("SUCCESS", Some(""))]),
+            PrCheckState::Success
+        );
+    }
+
+    #[test]
+    fn rollup_failure_still_dominates_a_running_suite() {
+        // A red check is red regardless of what else is still spawning.
+        let contexts = vec![
+            run("FAILURE", Some("IN_PROGRESS")),
+            run("SUCCESS", Some("IN_PROGRESS")),
+        ];
+        assert_eq!(rollup_check_state(&contexts), PrCheckState::Failure);
+    }
+
+    #[test]
+    fn build_query_asks_for_the_backing_suite_status() {
+        let (query, _) = build_query(&[target("main")]).unwrap();
+        assert!(query.contains("checkSuite{ status }"), "{query}");
     }
 
     // --- Query shape ---
