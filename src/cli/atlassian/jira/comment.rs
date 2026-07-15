@@ -964,4 +964,31 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
+
+    /// Drives the `Delete` dispatch arm and `DeleteCommand::execute`'s
+    /// create_client + stdin/stdout wiring (`--force` skips the prompt).
+    #[tokio::test]
+    async fn comment_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Delete(DeleteCommand {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
 }

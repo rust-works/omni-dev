@@ -1025,6 +1025,118 @@ mod tests {
         assert!(!out.contains("Deleted comment"));
     }
 
+    // ── CommentCommand::execute() end-to-end ───────────────────────
+    //
+    // Drives the top-level dispatch arm *and* each subcommand's execute()
+    // wrapper (create_client + API call) against a wiremock.
+
+    fn comment_detail_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": "{}"}}
+                })),
+            )
+    }
+
+    fn comment_put_mock(segment: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/{segment}/555"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "555"})),
+            )
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_edit_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("footer-comments").mount(&server).await;
+        comment_put_mock("footer-comments").mount(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("body.md");
+        std::fs::write(&file, "revised body\n").unwrap();
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Edit(EditCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Footer,
+                file: Some(file.to_string_lossy().into_owned()),
+                format: ContentFormat::Jfm,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments/555"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the wrapper's real stdin is not read.
+        CommentCommand {
+            command: CommentSubcommands::Delete(DeleteCommand {
+                comment_id: "555".to_string(),
+                kind: CommentKindArg::Inline,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_resolve_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("inline-comments").mount(&server).await;
+        comment_put_mock("inline-comments").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Resolve(ResolveCommand {
+                comment_id: "555".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_command_execute_reopen_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        comment_detail_mock("inline-comments").mount(&server).await;
+        comment_put_mock("inline-comments").mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        CommentCommand {
+            command: CommentSubcommands::Reopen(ReopenCommand {
+                comment_id: "555".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn delete_comment_prompt_no_makes_no_delete() {
         let server = wiremock::MockServer::start().await;

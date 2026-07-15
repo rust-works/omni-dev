@@ -977,6 +977,97 @@ mod tests {
         assert!(cmd.execute_with(client).await.is_ok());
     }
 
+    // ── VersionCommand::execute() end-to-end ───────────────────────
+    //
+    // Drives the real top-level dispatch arm *and* each subcommand's public
+    // execute() wrapper (create_client) — the `execute_with` DI-seam tests
+    // above bypass both.
+
+    fn version_put_mock() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "10000", "name": "1.0"})),
+            )
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_release_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Release(ReleaseCommand {
+                version_id: "10000".to_string(),
+                release_date: Some("2026-06-01".to_string()),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_archive_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Archive(ArchiveCommand {
+                version_id: "10000".to_string(),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_rename_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        version_put_mock().mount(&server).await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        VersionCommand {
+            command: VersionSubcommands::Rename(RenameCommand {
+                version_id: "10000".to_string(),
+                name: "2.0".to_string(),
+                description: None,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_delete_drives_create_client() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/version/10000"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        // `--force` skips the prompt, so the wrapper's real stdin is not read.
+        VersionCommand {
+            command: VersionSubcommands::Delete(DeleteCommand {
+                version_id: "10000".to_string(),
+                move_fix_issues_to: None,
+                move_affected_issues_to: None,
+                force: true,
+                dry_run: false,
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+    }
+
     // ── DeleteCommand (confirm-guarded, tested via execute_with_io) ──
 
     #[tokio::test]

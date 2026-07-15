@@ -437,4 +437,64 @@ mod tests {
         };
         assert!(cmd.execute().await.is_ok());
     }
+
+    /// The `Label` arm — also drives `LabelCommand`'s own dispatch and
+    /// `AddCommand::execute` (create_client + the `update`-verb PUT).
+    #[tokio::test]
+    async fn jira_command_execute_label_arm() {
+        use crate::atlassian::auth::test_util::EnvGuard;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Label(label::LabelCommand {
+                command: label::LabelSubcommands::Add(label::AddCommand {
+                    key: "PROJ-1".to_string(),
+                    labels: vec!["backend".to_string()],
+                }),
+            }),
+        };
+        assert!(cmd.execute().await.is_ok());
+    }
+
+    /// The `Component` arm — also drives `ComponentCommand`'s own dispatch and
+    /// `ListCommand::execute`.
+    #[tokio::test]
+    async fn jira_command_execute_component_arm() {
+        use crate::atlassian::auth::test_util::EnvGuard;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/components",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "10000", "name": "Backend"}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Component(component::ComponentCommand {
+                command: component::ComponentSubcommands::List(component::ListCommand {
+                    project: "PROJ".to_string(),
+                    output: OutputFormat::Yaml,
+                }),
+            }),
+        };
+        assert!(cmd.execute().await.is_ok());
+    }
 }

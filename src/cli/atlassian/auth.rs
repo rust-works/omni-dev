@@ -343,6 +343,34 @@ mod tests {
         assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "base@test.com");
     }
 
+    /// Drives the `Logout` arm of `AuthCommand::execute` (the dispatch match),
+    /// not just `LogoutCommand::execute` directly.
+    #[tokio::test]
+    async fn auth_command_execute_logout_arm() {
+        use crate::atlassian::auth::ATLASSIAN_EMAIL;
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let omni_dir = dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {"ATLASSIAN_EMAIL": "me@test.com"}}"#,
+        )
+        .unwrap();
+
+        AuthCommand {
+            command: AuthSubcommands::Logout(LogoutCommand),
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(ATLASSIAN_EMAIL).is_none());
+    }
+
     /// `LogoutCommand::execute` resolves the settings path from `HOME` and the
     /// profile from `OMNI_DEV_PROFILE`, so this one test redirects both under
     /// the shared [`crate::atlassian::auth::test_util::EnvGuard`]; every other
