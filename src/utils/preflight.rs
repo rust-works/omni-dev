@@ -586,6 +586,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn claude_cli_backend_nonzero_version_probe_fails_preflight() {
+        // The binary exists and runs, but `--version` exits non-zero — the
+        // `Ok(_)` arm treats that as unavailable, same as a missing binary.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
+        let _guard = crate::test_support::shim::shim_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shim = make_version_shim(&tmp, 1);
+
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
+
+        let err =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .expect_err("a non-zero version probe should fail preflight");
+        assert!(
+            format!("{err:#}").contains("Claude Code CLI not available"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn backend_env_var_overrides_legacy_use_flags() {
         // OMNI_DEV_AI_BACKEND=openai wins even though USE_OLLAMA is set.
         let env = MapEnv::new()

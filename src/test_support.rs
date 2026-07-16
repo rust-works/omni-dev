@@ -220,18 +220,19 @@ pub(crate) mod shim {
         use std::time::Duration;
         const MAX_ATTEMPTS: u32 = 8;
         let mut backoff = Duration::from_millis(5);
-        for attempt in 1..=MAX_ATTEMPTS {
+        for _ in 1..MAX_ATTEMPTS {
             match f() {
-                Err(e) if attempt < MAX_ATTEMPTS && is_etxtbsy(&e) => {
+                Err(e) if is_etxtbsy(&e) => {
                     std::thread::sleep(backoff);
                     backoff = backoff.saturating_mul(2);
                 }
-                // Success, a non-ETXTBSY error, or the final attempt's error:
-                // hand it straight back to the caller.
+                // Success, or a non-ETXTBSY error: hand it straight back.
                 other => return other,
             }
         }
-        unreachable!("the final attempt always returns via the `other` arm")
+        // Budget exhausted: return the final attempt's result, ETXTBSY or not,
+        // so the caller fails loudly rather than looping forever.
+        f()
     }
 
     /// Whether any error in `err`'s chain is an [`std::io::Error`] carrying
@@ -317,6 +318,19 @@ pub(crate) mod shim {
             });
             assert!(result.is_err());
             assert_eq!(calls, 1, "a non-ETXTBSY error must not be retried");
+        }
+
+        #[test]
+        fn retry_on_etxtbsy_gives_up_after_the_budget_and_returns_the_last_error() {
+            // Persistent ETXTBSY: exhaust the retry budget and surface the final
+            // error rather than looping forever. Covers the give-up path.
+            let mut calls = 0;
+            let result: anyhow::Result<()> = retry_on_etxtbsy(|| {
+                calls += 1;
+                Err(etxtbsy_error())
+            });
+            assert!(is_etxtbsy(&result.unwrap_err()));
+            assert_eq!(calls, 8, "should try MAX_ATTEMPTS times, then give up");
         }
     }
 }
