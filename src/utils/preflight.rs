@@ -532,7 +532,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_version_probe() {
-        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
@@ -541,7 +542,9 @@ mod tests {
             .with("OMNI_DEV_AI_BACKEND", "claude-cli")
             .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
 
-        let info = check_ai_credentials_with(&env, None).unwrap();
+        let info =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "claude-sonnet-5");
     }
@@ -549,7 +552,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_model_from_env() {
-        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
@@ -559,7 +563,9 @@ mod tests {
             .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap())
             .with("CLAUDE_MODEL", "haiku");
 
-        let info = check_ai_credentials_with(&env, None).unwrap();
+        let info =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "haiku");
     }
