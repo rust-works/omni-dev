@@ -6,12 +6,37 @@
 export const DEFAULT_CLAUDE_COMMAND = "claude";
 
 /**
- * The name of the editor-area terminal the button opens. The title-bar button is
- * a single, window-level session (not per-worktree, unlike #1317), so one stable
- * name is all we need — and it keeps the reuse check to "is that terminal still
- * open?".
+ * The base name of the editor-area terminals the button opens (#1322, #1347). The
+ * first session takes this name verbatim; concurrent sessions are numbered
+ * `Claude Code 2`, `Claude Code 3`, … by {@link nextClaudeTerminalName}, so open
+ * tabs stay distinguishable and a closed session frees its number for reuse.
  */
 export const CLAUDE_TERMINAL_NAME = "Claude Code";
+
+/**
+ * Picks the name for a new Claude terminal: the lowest free name in the sequence
+ * `Claude Code`, `Claude Code 2`, `Claude Code 3`, …, given the names already in
+ * use. Every click of the button opens a fresh session (#1347), so distinct names
+ * keep the editor tabs apart; drawing from the lowest free number means closing a
+ * session frees its number for the next launch rather than letting a counter climb
+ * forever.
+ *
+ * `existing` is fed **all** of the window's terminal names, not just Claude's, so
+ * an unrelated terminal a user renamed `Claude Code` still pushes ours to the next
+ * number.
+ */
+export function nextClaudeTerminalName(existing: readonly string[]): string {
+  const taken = new Set(existing);
+  if (!taken.has(CLAUDE_TERMINAL_NAME)) {
+    return CLAUDE_TERMINAL_NAME;
+  }
+  for (let n = 2; ; n += 1) {
+    const candidate = `${CLAUDE_TERMINAL_NAME} ${n}`;
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+}
 
 /**
  * Normalizes the configured launch command: trims surrounding whitespace and
