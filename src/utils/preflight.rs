@@ -115,16 +115,24 @@ pub(crate) fn check_ai_credentials_with(
             let probe = std::process::Command::new(&binary)
                 .arg("--version")
                 .output();
+            // Same guidance whichever way the probe failed; on the `Err` path we
+            // preserve the spawn error as the chain source so the real errno
+            // survives (a missing binary's ENOENT, or the shim tests' transient
+            // ETXTBSY) rather than being flattened into this message.
+            let unavailable = || {
+                format!(
+                    "Claude Code CLI not available at '{binary}'.\n\
+                     Install it from https://github.com/anthropics/claude-code \
+                     or set OMNI_DEV_CLAUDE_CLI_BIN to its path."
+                )
+            };
             match probe {
                 Ok(out) if out.status.success() => Ok(AiCredentialInfo {
                     provider: AiProvider::ClaudeCli,
                     model,
                 }),
-                _ => bail!(
-                    "Claude Code CLI not available at '{binary}'.\n\
-                     Install it from https://github.com/anthropics/claude-code \
-                     or set OMNI_DEV_CLAUDE_CLI_BIN to its path."
-                ),
+                Ok(_) => Err(anyhow::anyhow!(unavailable())),
+                Err(e) => Err(anyhow::Error::new(e).context(unavailable())),
             }
         }
 
@@ -524,7 +532,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_version_probe() {
-        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
@@ -533,7 +542,9 @@ mod tests {
             .with("OMNI_DEV_AI_BACKEND", "claude-cli")
             .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
 
-        let info = check_ai_credentials_with(&env, None).unwrap();
+        let info =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "claude-sonnet-5");
     }
@@ -541,7 +552,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_model_from_env() {
-        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
@@ -551,7 +563,9 @@ mod tests {
             .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap())
             .with("CLAUDE_MODEL", "haiku");
 
-        let info = check_ai_credentials_with(&env, None).unwrap();
+        let info =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "haiku");
     }
@@ -568,6 +582,30 @@ mod tests {
         assert!(
             chain.contains("Claude Code CLI not available"),
             "unexpected error: {chain}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_cli_backend_nonzero_version_probe_fails_preflight() {
+        // The binary exists and runs, but `--version` exits non-zero — the
+        // `Ok(_)` arm treats that as unavailable, same as a missing binary.
+        // shim_lock bounds concurrent shim subprocesses; retry_on_etxtbsy closes
+        // the exec-script/ETXTBSY race the lock can't (#642, #1348).
+        let _guard = crate::test_support::shim::shim_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shim = make_version_shim(&tmp, 1);
+
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
+
+        let err =
+            crate::test_support::shim::retry_on_etxtbsy(|| check_ai_credentials_with(&env, None))
+                .expect_err("a non-zero version probe should fail preflight");
+        assert!(
+            format!("{err:#}").contains("Claude Code CLI not available"),
+            "unexpected error: {err:#}"
         );
     }
 
