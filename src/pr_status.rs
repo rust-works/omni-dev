@@ -522,7 +522,7 @@ impl PrStatusCache {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::shim::{shim_lock, write_exec_script};
+    use crate::test_support::shim::{retry_on_etxtbsy, shim_lock, write_exec_script};
     use serde_json::json;
     use std::sync::MutexGuard;
 
@@ -892,13 +892,13 @@ mod tests {
     /// Writes an executable stub standing in for `gh`, printing `stdout` and
     /// exiting `code`.
     ///
-    /// Returns the shim lock alongside the path: the caller **must** hold the
-    /// guard until it has finished exec'ing the stub. Writing an executable and
-    /// then `execve`ing it races every other thread that forks — the child
-    /// inherits the still-open writable FD, and the exec fails `ETXTBSY`
-    /// ("Text file busy"). Handing the guard back rather than trusting each test
-    /// to remember `shim_lock()` is deliberate: this helper originally open-coded
-    /// the write and skipped the lock, and the race duly fired in CI (#642, #1344).
+    /// Returns the shim serialisation lock alongside the path: the caller
+    /// **must** hold the guard until it has finished exec'ing the stub, so
+    /// concurrent shim subprocesses stay bounded. That lock does **not** close
+    /// the `ETXTBSY` ("Text file busy") race — writing an executable and then
+    /// `execve`ing it races every other thread that forks, which never takes
+    /// this lock — so the caller also runs the exec through [`retry_on_etxtbsy`]
+    /// (#642, #1344, #1348).
     fn fake_gh(dir: &Path, stdout: &str, code: i32) -> (PathBuf, MutexGuard<'static, ()>) {
         let guard = shim_lock();
         let path = dir.join("fake-gh");
@@ -932,7 +932,7 @@ mod tests {
         // e.g. `gh auth login` never run: gh exits non-zero and explains on stderr.
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path(), "", 1);
-        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        let err = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap_err();
         assert!(
             format!("{err:#}").contains("gh api graphql failed"),
             "{err:#}"
@@ -943,7 +943,7 @@ mod tests {
     fn resolve_with_errors_on_unparseable_output() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path(), "not json at all", 0);
-        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        let err = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap_err();
         assert!(format!("{err:#}").contains("invalid JSON"), "{err:#}");
     }
 
@@ -958,7 +958,7 @@ mod tests {
             r#"{"data":null,"errors":[{"message":"API rate limit exceeded"}]}"#,
             0,
         );
-        let err = resolve_with(&bin, &[target("main")]).unwrap_err();
+        let err = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("returned errors"), "{msg}");
         assert!(msg.contains("rate limit"), "{msg}");
@@ -975,7 +975,7 @@ mod tests {
                 "associatedPullRequests":{"nodes":[{"number":9,"isDraft":false,"url":"u"}]}}}}}"#,
             0,
         );
-        let out = resolve_with(&bin, &[target("main")]).unwrap();
+        let out = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap();
         assert_eq!(out.get(&target("main")).unwrap().number, 9);
     }
 
@@ -991,7 +991,7 @@ mod tests {
                 "associatedPullRequests":{"nodes":[{"number":42,"isDraft":true,"url":"u42"}]}}}}}"#,
             0,
         );
-        let out = resolve_with(&bin, &[target("main")]).unwrap();
+        let out = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap();
         let badge = out.get(&target("main")).unwrap();
         assert_eq!(badge.number, 42);
         assert!(badge.is_draft);
