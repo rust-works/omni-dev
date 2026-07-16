@@ -155,19 +155,50 @@ pub(crate) mod atlassian_env {
 
 #[cfg(unix)]
 pub(crate) mod shim {
+    //! Helpers for tests that write an executable shim and then `execve` it.
+    //!
+    //! Writing a file and immediately running it races every other thread in
+    //! the test binary that `fork()`s — every `Command::spawn` does. The child
+    //! inherits a *duplicate* of our still-open writable FD, and because
+    //! `O_CLOEXEC` closes only on `execve` (not on a bare `fork`), the kernel
+    //! refuses our own `execve` of that file with `ETXTBSY` ("Text file busy")
+    //! until the child execs and the duplicate closes. The window is
+    //! microscopic but real under high parallelism (`cargo llvm-cov`); it fired
+    //! on the v0.36.0 release CI. See issues #642 and #1348.
+    //!
+    //! [`write_exec_script`] holds the writable FD open for as short as
+    //! possible (one open, `sync_all`, explicit drop) but cannot make the
+    //! window zero. [`retry_on_etxtbsy`] closes it for good: re-run the exec a
+    //! few times, since the child releases the inherited FD the instant it
+    //! execs. The retry lives only in the test harness — `ETXTBSY` here is an
+    //! artifact of writing the very binary we then run, which never happens to
+    //! a real `gh`/`claude`, so production keeps failing loudly on it. (The
+    //! `claude-cli` backend does the equivalent at its own spawn boundary with
+    //! [`spawn_with_etxtbsy_retry`](crate::claude::ai::claude_cli).)
+    //!
+    //! Separately, [`shim_lock`] serialises tests that spawn a subprocess from a
+    //! freshly-written shim. This is **not** the `ETXTBSY` fix (the retry above
+    //! is) — the offending `fork()` comes from unrelated tests that never take
+    //! this lock. What it does buy is bounding how many such subprocesses run at
+    //! once: without it, high parallelism (e.g. `cargo test` on a many-core
+    //! host) starves timing-sensitive subprocess tests — a freshly-spawned shim
+    //! scheduled too late to write its state before a short run timeout reaps
+    //! it. See `claude::ai::claude_cli::tests::timeout_reaps_full_process_group`.
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
 
-    /// Serializes every test that writes an executable shim and then
-    /// `execve`s it. Belt-and-braces pairing with `write_exec_script`'s
-    /// sync+close: even with each test's FD fully released before exec,
-    /// high parallelism (cargo llvm-cov) could still land a `fork()` from
-    /// one test while another thread's writable FD was live, letting the
-    /// child inherit it and hit `ETXTBSY`. See issue #642.
+    /// The errno the kernel returns when a process execs a file that some
+    /// (possibly other) process still holds open for writing. `26` on both
+    /// Linux and macOS.
+    const ETXTBSY: i32 = 26;
+
+    /// Serialises tests that spawn a subprocess from a freshly-written shim, so
+    /// concurrent subprocess load stays bounded (see the module docs — this is
+    /// the starvation guard, **not** the `ETXTBSY` fix).
     static SHIM_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquires the crate-wide shim lock, recovering from poisoning so
-    /// intentional panics in one test don't cascade into the rest of the
+    /// Acquires the shim serialisation lock, recovering from poisoning so an
+    /// intentional panic in one shim test doesn't cascade into the rest of the
     /// suite.
     pub(crate) fn shim_lock() -> MutexGuard<'static, ()> {
         SHIM_LOCK
@@ -175,10 +206,52 @@ pub(crate) mod shim {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Retries `f` while it fails with [`ETXTBSY`], backing off with bounded
+    /// exponential delay. Success and every *non*-`ETXTBSY` error return
+    /// immediately — so a test that expects a different failure (a non-zero
+    /// exit, unparseable output) still sees exactly that, never a spuriously
+    /// retried success.
+    ///
+    /// Wrap any call that ultimately `execve`s a freshly-written shim. See the
+    /// module docs for why the race exists and why the retry is test-only.
+    pub(crate) fn retry_on_etxtbsy<T>(
+        mut f: impl FnMut() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        use std::time::Duration;
+        const MAX_ATTEMPTS: u32 = 8;
+        let mut backoff = Duration::from_millis(5);
+        for attempt in 1..=MAX_ATTEMPTS {
+            match f() {
+                Err(e) if attempt < MAX_ATTEMPTS && is_etxtbsy(&e) => {
+                    std::thread::sleep(backoff);
+                    backoff = backoff.saturating_mul(2);
+                }
+                // Success, a non-ETXTBSY error, or the final attempt's error:
+                // hand it straight back to the caller.
+                other => return other,
+            }
+        }
+        unreachable!("the final attempt always returns via the `other` arm")
+    }
+
+    /// Whether any error in `err`'s chain is an [`std::io::Error`] carrying
+    /// [`ETXTBSY`]. Walks the whole chain because the exec failure is usually
+    /// wrapped in caller `.context(..)` by the time it reaches a test.
+    fn is_etxtbsy(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(ETXTBSY)
+        })
+    }
+
     /// Writes an executable script at `path`, flushes it to disk, and
     /// explicitly drops the writable FD before returning. Setting mode
     /// via `OpenOptions` avoids a second open-for-write that
-    /// `chmod`-after-`fs::write` would cause.
+    /// `chmod`-after-`fs::write` would cause. Pair the exec of the written
+    /// shim with [`retry_on_etxtbsy`] to absorb the residual `fork`/`exec`
+    /// race.
     pub(crate) fn write_exec_script(path: &Path, script: &str) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -192,5 +265,58 @@ pub(crate) mod shim {
         file.write_all(script.as_bytes()).unwrap();
         file.sync_all().unwrap();
         drop(file);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// An `ETXTBSY` `io::Error` wrapped in `.context(..)`, matching how the
+        /// exec failure reaches a test through a caller's error chain.
+        fn etxtbsy_error() -> anyhow::Error {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(ETXTBSY))
+                .context("failed to run the shim")
+        }
+
+        #[test]
+        fn is_etxtbsy_sees_a_wrapped_text_file_busy() {
+            assert!(is_etxtbsy(&etxtbsy_error()));
+        }
+
+        #[test]
+        fn is_etxtbsy_rejects_other_errors() {
+            // ENOENT is a spawn error too, but not the race we retry.
+            let enoent = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+                .context("failed to run the shim");
+            assert!(!is_etxtbsy(&enoent));
+            assert!(!is_etxtbsy(&anyhow::anyhow!("plain error, no io source")));
+        }
+
+        #[test]
+        fn retry_on_etxtbsy_succeeds_after_transient_failures() {
+            let mut calls = 0;
+            let out = retry_on_etxtbsy(|| {
+                calls += 1;
+                if calls <= 3 {
+                    Err(etxtbsy_error())
+                } else {
+                    Ok(calls)
+                }
+            })
+            .unwrap();
+            assert_eq!(out, 4, "should succeed on the 4th attempt");
+            assert_eq!(calls, 4);
+        }
+
+        #[test]
+        fn retry_on_etxtbsy_returns_a_non_etxtbsy_error_without_retrying() {
+            let mut calls = 0;
+            let result: anyhow::Result<()> = retry_on_etxtbsy(|| {
+                calls += 1;
+                Err(anyhow::anyhow!("a real failure"))
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "a non-ETXTBSY error must not be retried");
+        }
     }
 }
