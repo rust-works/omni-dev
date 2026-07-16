@@ -306,17 +306,13 @@ Set whichever form your Bedrock deployment expects:
 export ANTHROPIC_MODEL="us.anthropic.claude-sonnet-4-6-v1:0"
 ```
 
+To discover which identifiers your account and region actually offer, see
+[Discovering available models](#discovering-available-models) below.
+
 **Structured output.** Like the direct Claude API, the Bedrock backend
 requests structured output via `output_config.format` on models the registry
 flags as supporting it (regional / provider prefixes normalise to the same
 entry). Unflagged models fall back to the YAML response path.
-
-**Limitations.**
-
-- Bedrock model availability is region-specific — not every Anthropic model
-  is listed in every region.
-- Inference profiles (the `us.`-prefixed regional IDs) may be required by
-  your AWS account; check the Bedrock console.
 
 **Verification.**
 
@@ -326,6 +322,94 @@ export ANTHROPIC_AUTH_TOKEN="..."
 export ANTHROPIC_BEDROCK_BASE_URL="https://bedrock-runtime.us-east-1.amazonaws.com"
 omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 ```
+
+### Discovering available models
+
+Bedrock model availability is **region-specific** — not every Anthropic model
+is offered in every region — and the IDs you actually pass to `--model` /
+`ANTHROPIC_MODEL` are often **inference-profile IDs** (the `us.`- or
+`global.`-prefixed forms), not the bare `modelId`. Rather than clicking through
+the Bedrock console, query both from the [`aws` CLI](https://aws.amazon.com/cli/)
+in about a second — if you set Bedrock up with `aws configure sso`, you already
+have it installed.
+
+**Prerequisites.** Install the CLI (`brew install awscli`, or see the link
+above) and grant these least-privilege IAM permissions (the AWS-managed
+`AmazonBedrockReadOnly` policy also works, but is broader):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "bedrock:ListFoundationModels",
+      "bedrock:GetFoundationModel",
+      "bedrock:GetFoundationModelAvailability",
+      "bedrock:ListInferenceProfiles"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+These are **control-plane** (`bedrock`) actions, distinct from the
+`bedrock-runtime` inference endpoint omni-dev's Bedrock backend actually calls
+(`ANTHROPIC_BEDROCK_BASE_URL`). They let you *list* models; they do not grant
+permission to *invoke* one.
+
+**The commands.** `--region` is required; `--profile` and
+`--output json|yaml|table|text` work as usual.
+
+```bash
+# Every model in a region (auto-paginates)
+aws bedrock list-foundation-models --region us-east-1
+
+# Anthropic only, as a readable table
+aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic \
+  --query 'modelSummaries[].[modelId,modelLifecycle.status]' --output table
+
+# The IDs you can actually pass to --model / ANTHROPIC_MODEL  (gotcha 1)
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query 'inferenceProfileSummaries[?contains(inferenceProfileId,`anthropic`)].inferenceProfileId' \
+  --output text
+
+# Whether THIS account is entitled to a given model  (gotcha 3)
+aws bedrock get-foundation-model-availability \
+  --region us-east-1 --model-id anthropic.claude-opus-4-8
+```
+
+**Gotchas.** A bare `list-foundation-models` recipe is actively misleading —
+three things trip people up (all verified against a live account in `us-east-1`
+on 2026-07-15 with `aws-cli/2.35.23`):
+
+1. **Most `modelId`s are not directly invocable.** Current Anthropic models
+   report `inferenceTypesSupported: [INFERENCE_PROFILE]`, and their bare
+   `modelId` (e.g. `anthropic.claude-opus-4-8`) *fails* when passed as a model
+   identifier. The invocable IDs come from `list-inference-profiles` and carry
+   a routing prefix — both `us.` and `global.` scopes exist
+   (`us.anthropic.claude-opus-4-7`, `global.anthropic.claude-sonnet-4-6`). This
+   is the same `ANTHROPIC_MODEL` form shown under **Model** above.
+
+2. **`--by-inference-type ON_DEMAND` is a trap.** It excludes every current
+   model — they are `INFERENCE_PROFILE`, not `ON_DEMAND` — leaving only a
+   couple of 2024-era Claude 3 models. (`INFERENCE_PROFILE` *is* accepted as a
+   filter value even though the [API reference](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_ListFoundationModels.html)
+   enumerates only `ON_DEMAND | PROVISIONED`; the documented enum is stale.)
+
+3. **`list-foundation-models` does not tell you what you can access.** Its
+   `modelLifecycle.status` is the *model's* lifecycle (`ACTIVE` / `LEGACY`),
+   not your entitlement — the response is identical for an account with full
+   Bedrock access and one with none. The API that answers "can I invoke this?"
+   is `get-foundation-model-availability`, which reports `authorizationStatus`,
+   `entitlementAvailability`, and `regionAvailability` per model.
+
+**The registry can disagree with reality.** The
+[Model Registry](#model-registry) (`src/templates/models.yaml`) may list Claude
+models a given region does not offer. Because preflight validates `--model`
+against that *static* registry, such an ID passes preflight and then fails at
+Bedrock with `AccessDeniedException`. The commands above let you confirm what a
+region actually serves before committing to a model ID.
 
 ## Claude CLI Deep-dive
 
@@ -579,13 +663,13 @@ errors. The most common cases:
 | Error                                           | Likely backend     | See                                                                 |
 |-------------------------------------------------|--------------------|---------------------------------------------------------------------|
 | `CLAUDE_API_KEY not found`                      | Claude API         | [troubleshooting.md](troubleshooting.md#error-claude_api_key-not-found) |
-| `Unknown model 'X'`                             | Claude API / Bedrock | Typo, or a model newer than your catalogue — see [Model Registry](#model-registry). |
+| `Unknown model 'X'`                             | Claude API / Bedrock | Typo, or a model newer than your catalogue — see [Model Registry](#model-registry); for the live Bedrock catalogue, [Discovering available models](#discovering-available-models). |
 | `the assistant tried to use a tool …`           | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
 | `MCP server X not loaded`                       | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
 | `claude -p exited with cost cap exceeded`       | Claude CLI         | [troubleshooting.md](troubleshooting.md#claude-cli-backend-issues)  |
 | Connection refused on `localhost:11434`         | Ollama             | Start `ollama serve` or set `OLLAMA_BASE_URL`.                      |
 | `401 Unauthorized` from OpenAI                  | OpenAI             | Check `OPENAI_API_KEY` / `OPENAI_AUTH_TOKEN`.                       |
-| `AccessDeniedException` on a model ID           | Bedrock            | Region doesn't have the model, or your IAM policy blocks it.        |
+| `AccessDeniedException` on a model ID           | Bedrock            | Region doesn't have the model, or your IAM policy blocks it — see [Discovering available models](#discovering-available-models). |
 
 Enable verbose logging when reporting issues:
 
