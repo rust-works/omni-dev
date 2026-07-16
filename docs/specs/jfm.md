@@ -359,7 +359,7 @@ When the desired nesting is rejected, common rewrites are:
 
 ### Coverage and limits
 
-As of `SCHEMA_VERSION 56.1.1-2026-07-09`, the validator covers:
+As of `SCHEMA_VERSION 56.1.3-2026-07-16`, the validator covers:
 
 - Allowed-children sets for every container node type.
 - Per-term quantifiers and content-term sequences (e.g. empty `bulletList`,
