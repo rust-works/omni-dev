@@ -7,7 +7,7 @@ use clap::Parser;
 
 use super::control;
 use crate::daemon::client::DaemonClient;
-use crate::daemon::server;
+use crate::daemon::{server, DaemonServiceKind, ServiceSelection};
 
 /// Starts the daemon in the background.
 ///
@@ -24,6 +24,13 @@ pub struct StartCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+
+    /// Host only this comma-separated subset of services (default: all), baked
+    /// into the generated launchd plist / systemd unit so it survives the
+    /// service-manager exec. Overrides `OMNI_DEV_DAEMON_SERVICES`. Values:
+    /// browser-bridge, snowflake, worktrees, sessions.
+    #[arg(long, value_name = "SVC", value_delimiter = ',')]
+    pub services: Vec<DaemonServiceKind>,
 }
 
 impl StartCommand {
@@ -34,7 +41,8 @@ impl StartCommand {
             println!("daemon already running (socket {})", socket_path.display());
             return Ok(());
         }
-        control::launch(&socket_path)?;
+        let services = ServiceSelection::from_flag_or_env(&self.services);
+        control::launch(&socket_path, &services)?;
         control::wait_until_ready(&socket_path).await?;
         println!("daemon started (socket {})", socket_path.display());
         Ok(())

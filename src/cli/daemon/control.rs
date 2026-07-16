@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::time::timeout;
 
 use crate::daemon::client::DaemonClient;
+use crate::daemon::ServiceSelection;
 
 /// Per-attempt cap on a single `ping`, so one hung probe can't blow the overall
 /// budget — without it a `connect` that succeeds but is never accepted (e.g.
@@ -27,34 +28,38 @@ const POLL_BUDGET: Duration = Duration::from_secs(5);
 /// (falling back to a detached spawn otherwise); any other Unix spawns a detached
 /// `omni-dev daemon run` directly. Both service managers auto-start the daemon at
 /// login; the detached-spawn fallback (`spawn_detached`) does not (#1174).
+///
+/// `services` is the resolved subset to host; it is baked into the plist / unit
+/// (or the detached-spawn argv) so it survives the service manager's
+/// fixed-command, minimal-env exec (#1318).
 #[cfg(target_os = "macos")]
-pub(super) fn launch(socket: &Path) -> Result<()> {
-    crate::daemon::launchd::install_and_load(socket)
+pub(super) fn launch(socket: &Path, services: &ServiceSelection) -> Result<()> {
+    crate::daemon::launchd::install_and_load(socket, services)
 }
 
 /// Linux `launch`: install a systemd user unit for auto-start at login when a user
 /// manager is available, else fall back to the detached spawn. See the macOS
 /// `launch` for the cross-platform contract.
 #[cfg(target_os = "linux")]
-pub(super) fn launch(socket: &Path) -> Result<()> {
+pub(super) fn launch(socket: &Path, services: &ServiceSelection) -> Result<()> {
     use crate::daemon::systemd;
 
     if systemd::is_available() {
-        match systemd::install_and_load(socket) {
+        match systemd::install_and_load(socket, services) {
             Ok(()) => return Ok(()),
             Err(e) => tracing::warn!(
                 "systemd auto-start unavailable ({e}); falling back to a detached spawn"
             ),
         }
     }
-    spawn_detached(socket)
+    spawn_detached(socket, services)
 }
 
 /// Non-macOS, non-Linux Unix `launch`: there is no login auto-start integration,
 /// so always use the detached spawn.
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-pub(super) fn launch(socket: &Path) -> Result<()> {
-    spawn_detached(socket)
+pub(super) fn launch(socket: &Path, services: &ServiceSelection) -> Result<()> {
+    spawn_detached(socket, services)
 }
 
 /// Spawns a detached `omni-dev daemon run`: `setsid` puts it in its own session
@@ -63,7 +68,7 @@ pub(super) fn launch(socket: &Path) -> Result<()> {
 /// socket. The off-macOS fallback when no service-manager auto-start is installed;
 /// it does not restart the daemon at login (#1174).
 #[cfg(not(target_os = "macos"))]
-fn spawn_detached(socket: &Path) -> Result<()> {
+fn spawn_detached(socket: &Path, services: &ServiceSelection) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -96,6 +101,12 @@ fn spawn_detached(socket: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
+    // Bake the service subset into the spawned argv so it survives the detached
+    // process (which is not re-execed from a shell env). `None` for `All`, so a
+    // full-registry daemon spawns with no `--services` — identical to before.
+    if let Some(csv) = services.to_csv() {
+        command.arg("--services").arg(csv);
+    }
     // `pre_exec` runs between fork and exec in the child, where only
     // async-signal-safe calls are allowed — which is exactly why it is
     // `unsafe` and there is no safe route to `setsid` on `Command`.
