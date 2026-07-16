@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Open Claude Code now opens a new session on every click** ([#1347](https://github.com/rust-works/omni-dev/issues/1347)): the editor title-bar button ([#1322](https://github.com/rust-works/omni-dev/issues/1322)) no longer focuses the terminal it already opened — every click launches a **new** Claude Code CLI session as its own editor tab, so starting a second or third concurrent session in one window is one click each. This supersedes the 0.5.0 note that clicking again "focuses" the open terminal; "reuse" only ever meant "the tab is still open" (VS Code's terminal API cannot report whether `claude` is still running), which is not what a click on a launch button asks for.
+  - Concurrent terminals are named `Claude Code`, `Claude Code 2`, `Claude Code 3`, … so their editor tabs stay distinguishable, and closing a session frees its number for the next launch instead of letting a counter climb forever.
+  - The icon, `editor/title` placement, `cwd` resolution, and the `omniDevWorktrees.claudeCommand` setting are unchanged; the button remains window-level and daemon-independent.
+
 ## [0.5.0] - 2026-07-16
 
 ### Added

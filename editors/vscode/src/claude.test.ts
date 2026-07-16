@@ -4,7 +4,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  CLAUDE_TERMINAL_NAME,
   DEFAULT_CLAUDE_COMMAND,
+  nextClaudeTerminalName,
   resolveClaudeCommand,
   resolveClaudeCwd,
 } from "./claude";
@@ -38,4 +40,36 @@ test("resolveClaudeCwd falls back to the first folder when the active folder is 
 test("resolveClaudeCwd returns undefined when no folders are open", () => {
   assert.equal(resolveClaudeCwd([], undefined), undefined);
   assert.equal(resolveClaudeCwd([], "/home/me/a"), undefined);
+});
+
+test("nextClaudeTerminalName uses the base name for the first launch", () => {
+  assert.equal(nextClaudeTerminalName([]), CLAUDE_TERMINAL_NAME);
+  // Unrelated open terminals never take the base name.
+  assert.equal(nextClaudeTerminalName(["zsh", "npm run watch"]), CLAUDE_TERMINAL_NAME);
+});
+
+test("nextClaudeTerminalName numbers past an open Claude terminal", () => {
+  assert.equal(nextClaudeTerminalName([CLAUDE_TERMINAL_NAME]), "Claude Code 2");
+  assert.equal(
+    nextClaudeTerminalName([CLAUDE_TERMINAL_NAME, "Claude Code 2"]),
+    "Claude Code 3",
+  );
+});
+
+test("nextClaudeTerminalName reuses a number freed by a closed session", () => {
+  // `Claude Code 2` was closed, leaving a gap between the base name and `3`; the
+  // next launch fills the gap rather than climbing to `4`.
+  assert.equal(
+    nextClaudeTerminalName([CLAUDE_TERMINAL_NAME, "Claude Code 3"]),
+    "Claude Code 2",
+  );
+});
+
+test("nextClaudeTerminalName treats a non-Claude terminal named `Claude Code` as taken", () => {
+  // The helper is fed *all* terminal names, so a user's own terminal that happens
+  // to be named `Claude Code` still pushes ours to the next number.
+  assert.equal(
+    nextClaudeTerminalName(["Claude Code", "server"]),
+    "Claude Code 2",
+  );
 });
