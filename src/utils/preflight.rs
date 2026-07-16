@@ -115,16 +115,24 @@ pub(crate) fn check_ai_credentials_with(
             let probe = std::process::Command::new(&binary)
                 .arg("--version")
                 .output();
+            // Same guidance whichever way the probe failed; on the `Err` path we
+            // preserve the spawn error as the chain source so the real errno
+            // survives (a missing binary's ENOENT, or the shim tests' transient
+            // ETXTBSY) rather than being flattened into this message.
+            let unavailable = || {
+                format!(
+                    "Claude Code CLI not available at '{binary}'.\n\
+                     Install it from https://github.com/anthropics/claude-code \
+                     or set OMNI_DEV_CLAUDE_CLI_BIN to its path."
+                )
+            };
             match probe {
                 Ok(out) if out.status.success() => Ok(AiCredentialInfo {
                     provider: AiProvider::ClaudeCli,
                     model,
                 }),
-                _ => bail!(
-                    "Claude Code CLI not available at '{binary}'.\n\
-                     Install it from https://github.com/anthropics/claude-code \
-                     or set OMNI_DEV_CLAUDE_CLI_BIN to its path."
-                ),
+                Ok(_) => Err(anyhow::anyhow!(unavailable())),
+                Err(e) => Err(anyhow::Error::new(e).context(unavailable())),
             }
         }
 
