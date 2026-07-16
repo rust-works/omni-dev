@@ -61,6 +61,10 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     strategy:
+      # A single flaky/failing leg must not cancel the other five: one red leg
+      # (e.g. a transient test flake) would otherwise hide whether the rest are
+      # healthy, which reads as a wholly broken run on a release. See #1348.
+      fail-fast: false
       matrix:
         rust:
           - stable
