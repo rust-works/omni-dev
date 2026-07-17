@@ -57,6 +57,11 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.openWorktree",
+        "title": "Open Worktree",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.closeWorktree",
         "title": "Close Worktree",
         "category": "omni-dev"
@@ -109,6 +114,10 @@
           "when": "false"
         },
         {
+          "command": "omniDevWorktrees.openWorktree",
+          "when": "false"
+        },
+        {
           "command": "omniDevWorktrees.closeWorktree",
           "when": "false"
         },
@@ -156,6 +165,11 @@
       ],
       "view/item/context": [
         {
+          "command": "omniDevWorktrees.openWorktree",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
+          "group": "0_open@1"
+        },
+        {
           "command": "omniDevWorktrees.openPullRequest",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",
           "group": "1_pr@1"
@@ -167,18 +181,18 @@
         },
         {
           "command": "omniDevWorktrees.moveClaudeSessionHere",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/ && !listMultiSelection",
           "group": "2_session@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.(current|open)\\.main/",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.(current|open)\\./",
           "group": "9_close@1"
         },
         {
           "command": "omniDevWorktrees.closeWorktree",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
-          "group": "9_close@1"
+          "group": "9_close@2"
         }
       ],
       "editor/title": [

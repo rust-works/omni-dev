@@ -36,10 +36,16 @@ import {
   PrBadge,
   TreeGithubIdentity,
   TreeRepoPayload,
+  WorktreeNode,
   isCurrentWindow,
   nodeId,
+  orderSelfLast,
+  partitionByRole,
+  partitionByWindow,
+  selectionTargets,
   withoutPrBadges,
   worktreeLabel,
+  worktreeTargets,
 } from "./tree";
 import { TreeSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
@@ -359,9 +365,14 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // moment the first snapshot lands (#1301) — no per-window `globalState`.
   applyShowClosed(true);
 
+  // `canSelectMany` makes every item command plural: VS Code then invokes them as
+  // `(clicked, selected[])`, and each handler resolves its targets through
+  // `selectionTargets` and re-validates them (the `when` clause only ever saw the
+  // *clicked* row, so a mixed selection can reach any handler).
   const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
     showCollapseAll: true,
+    canSelectMany: true,
   });
   treeView = view;
   // Start with the daemon-down hint; the first snapshot clears it.
@@ -402,23 +413,32 @@ function setupTreeView(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("omniDevWorktrees.refresh", () => void refreshTree()),
+    // Fires from `TreeItem.command`, which passes only its own declared
+    // `arguments` — never the `(clicked, selected[])` pair a `view/item/context`
+    // command gets — so this one stays single-node.
     vscode.commands.registerCommand(ITEM_CLICKED_COMMAND, (node?: Node) => onItemClicked(node)),
     vscode.commands.registerCommand(
+      "omniDevWorktrees.openWorktree",
+      (node?: Node, selected?: Node[]) => void openWorktrees(node, selected),
+    ),
+    vscode.commands.registerCommand(
       "omniDevWorktrees.closeWorktree",
-      (node?: Node) => void closeWorktree(node),
+      (node?: Node, selected?: Node[]) => void closeWorktree(node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWindow",
-      (node?: Node) => void closeWindow(node),
+      (node?: Node, selected?: Node[]) => void closeWindow(node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",
-      (node?: Node) => void openPullRequest(node),
+      (node?: Node, selected?: Node[]) => void openPullRequest(node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequestInBrowser",
-      (node?: Node) => void openPullRequestInBrowser(node),
+      (node?: Node, selected?: Node[]) => void openPullRequestInBrowser(node, selected),
     ),
+    // A destination, not a subject — the menu hides it while a multi-selection is
+    // active (`!listMultiSelection`), so it stays single-node here too.
     vscode.commands.registerCommand(
       "omniDevWorktrees.moveClaudeSessionHere",
       (node?: Node) => void moveClaudeSessionHere(node, output),
@@ -502,6 +522,142 @@ async function openNode(node?: Node): Promise<void> {
 }
 
 /**
+ * The **Open Worktree** command: opens (or focuses) a window for every selected
+ * worktree — the multi-select answer to "restore my working set", which
+ * double-click, being inherently single, cannot express. Repo nodes in the
+ * selection are ignored.
+ */
+async function openWorktrees(clicked?: Node, selected?: Node[]): Promise<void> {
+  const targets = worktreeTargets(selectionTargets(clicked, selected));
+  if (targets.length === 0) {
+    return;
+  }
+  if (targets.length === 1) {
+    await openNode(targets[0]);
+    return;
+  }
+  await runBatch(targets, `Opening ${targets.length} worktrees…`, async (target) => {
+    const reply = await send(openEnvelope(target.wt.path));
+    if (reply && !reply.ok) {
+      throw new Error(reply.error ?? "unknown error");
+    }
+  });
+}
+
+/** One target's failure, collected so a batch reports once rather than N times. */
+interface BatchFailure {
+  label: string;
+  message: string;
+}
+
+/**
+ * The daemon is unreachable. Distinct from a per-target failure because it is
+ * never per-target: one socket serves every target, so a batch aborts rather than
+ * failing N times over, and the user gets the actionable start-it message once.
+ */
+class DaemonDownError extends Error {
+  constructor() {
+    super("daemon not running");
+  }
+}
+
+/**
+ * Reports a batch's failures in **one** message rather than N toasts. A batch of
+ * one is not a batch — it gets the bare message, which is what these commands have
+ * always shown for a single target.
+ */
+function reportFailures(failures: BatchFailure[], total: number): void {
+  if (failures.length === 0) {
+    return;
+  }
+  if (total === 1) {
+    void vscode.window.showErrorMessage(`omni-dev: ${failures[0].message}`);
+    return;
+  }
+  void vscode.window.showErrorMessage(
+    `omni-dev: ${failures.length} of ${total} failed — ${failures
+      .map((f) => `${f.label}: ${f.message}`)
+      .join("; ")}`,
+  );
+}
+
+/**
+ * Runs `action` over each target **sequentially**, reporting `n/total` into an
+ * existing progress and continuing past a failure, which it collects rather than
+ * throws. A {@link DaemonDownError} aborts the run — every remaining target would
+ * fail identically.
+ *
+ * Sequential is deliberate for the close verbs: parallel executes would contend on
+ * `git2`'s worktree prune against the same repo's `.git/worktrees`, and the
+ * daemon's per-target cost is a *wait* on the target window's heartbeat, not work
+ * we can overlap safely. Callers whose batch may contain this window's own
+ * worktree must run {@link orderSelfLast} first — closing it kills the extension
+ * host mid-loop.
+ */
+async function runSequential(
+  targets: WorktreeNode[],
+  progress: vscode.Progress<{ message?: string }>,
+  action: (target: WorktreeNode) => Promise<void>,
+): Promise<BatchFailure[]> {
+  const failures: BatchFailure[] = [];
+  let done = 0;
+  for (const target of targets) {
+    progress.report({ message: `${done + 1}/${targets.length} — ${worktreeLabel(target.wt)}` });
+    try {
+      await action(target);
+    } catch (err) {
+      if (err instanceof DaemonDownError) {
+        daemonDownError();
+        return failures;
+      }
+      failures.push({
+        label: worktreeLabel(target.wt),
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+    done += 1;
+  }
+  return failures;
+}
+
+/** {@link runSequential} plus its own progress notification and failure summary. */
+async function runBatch(
+  targets: WorktreeNode[],
+  title: string,
+  action: (target: WorktreeNode) => Promise<void>,
+): Promise<void> {
+  const failures = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title },
+    (progress) => runSequential(targets, progress, action),
+  );
+  reportFailures(failures, targets.length);
+}
+
+/** One target, with the same error reporting a batch of one would give it. */
+async function runOne(
+  target: WorktreeNode,
+  action: (target: WorktreeNode) => Promise<void>,
+): Promise<void> {
+  try {
+    await action(target);
+  } catch (err) {
+    if (err instanceof DaemonDownError) {
+      daemonDownError();
+      return;
+    }
+    reportFailures(
+      [
+        {
+          label: worktreeLabel(target.wt),
+          message: err instanceof Error ? err.message : String(err),
+        },
+      ],
+      1,
+    );
+  }
+}
+
+/**
  * The "Open Claude Code" title-bar button (#1322, #1347). On **every** click opens
  * a new terminal docked as an **editor tab** (not the bottom panel) running the
  * Claude Code CLI — concurrent sessions in one window are a normal way to work, so
@@ -563,115 +719,241 @@ function daemonDownError(): void {
   );
 }
 
+/** A phase-1 safety check's result for one target. */
+type CheckOutcome =
+  | { kind: "ok"; target: WorktreeNode; report: CloseSafetyReport }
+  | { kind: "error"; target: WorktreeNode; message: string; daemonDown?: true };
+
+/** Runs the side-effect-free phase-1 `close-check` for one target (ADR-0049). */
+async function closeCheck(target: WorktreeNode): Promise<CheckOutcome> {
+  const reply = await send(closeCheckEnvelope(target.wt.path, windowKey));
+  if (!reply) {
+    return { kind: "error", target, message: "daemon not running", daemonDown: true };
+  }
+  if (!reply.ok) {
+    return {
+      kind: "error",
+      target,
+      message: `could not check worktree — ${reply.error ?? "unknown error"}`,
+    };
+  }
+  return { kind: "ok", target, report: reply.payload as CloseSafetyReport };
+}
+
+/** What a removal would cost: the daemon's risks, plus a multi-root window note. */
+function closeWarnings(report: CloseSafetyReport): string[] {
+  const warnings = (report.risks ?? []).map((r) => r.detail);
+  if (report.window_folder_count > 1) {
+    warnings.push(`This window has ${report.window_folder_count} folders open; all will close.`);
+  }
+  return warnings;
+}
+
 /**
- * Closes a **linked** worktree: a phase-1 safety check, a modal confirm only
- * when something would be lost (or a multi-root window would close), then a
- * phase-2 execute that closes the owning window and deletes the worktree. If
- * this window is the one open on it, it closes itself once removal succeeds.
+ * The delete confirmation.
+ *
+ * A **single** target confirms only when something would actually be lost — data
+ * at risk, or a multi-root window whose other folders would also close. A
+ * **batch** always confirms and lists exactly what dies: a mis-aimed multi-select
+ * is far easier to make than a mis-aimed right-click, and the modal is the only
+ * place the user sees the full set. Main working trees carried in by a mixed
+ * selection are named as skipped rather than silently downgraded to a window
+ * close — quietly turning a requested delete into something else is worse than
+ * refusing it.
  */
-async function closeWorktree(node?: Node): Promise<void> {
-  if (!node || node.kind !== "worktree") {
+async function confirmDelete(
+  deletable: { target: WorktreeNode; report: CloseSafetyReport }[],
+  skippedMain: WorktreeNode[],
+  selectedCount: number,
+): Promise<boolean> {
+  // Batch-ness is a property of the *gesture*, not of what survived phase 1: a
+  // two-row selection whose first check failed is still a batch, and must still
+  // confirm. Keying this off `deletable.length` would let a partly-failed batch
+  // delete silently.
+  const single = selectedCount === 1 && skippedMain.length === 0;
+  const warnings = deletable.flatMap(({ report }) => closeWarnings(report));
+  if (single && warnings.length === 0) {
+    return true;
+  }
+
+  const confirmLabel = deletable.length === 1 ? "Delete Worktree" : "Delete Worktrees";
+  const detail = single
+    ? warnings.map((w) => `• ${w}`).join("\n")
+    : [
+        ...deletable.map(({ target, report }) => {
+          const warns = closeWarnings(report);
+          const label = worktreeLabel(target.wt);
+          return warns.length > 0 ? `• ${label} — ${warns.join("; ")}` : `• ${label}`;
+        }),
+        ...(skippedMain.length > 0
+          ? [
+              "",
+              `${skippedMain.length} main working ${
+                skippedMain.length === 1 ? "tree" : "trees"
+              } will be skipped (never deleted): ${skippedMain
+                .map((n) => worktreeLabel(n.wt))
+                .join(", ")}`,
+            ]
+          : []),
+      ].join("\n");
+
+  const choice = await vscode.window.showWarningMessage(
+    deletable.length === 1
+      ? `Delete worktree “${worktreeLabel(deletable[0].target.wt)}”? This cannot be undone.`
+      : `Delete ${deletable.length} worktrees? This cannot be undone.`,
+    { modal: true, detail },
+    confirmLabel,
+  );
+  return choice === confirmLabel;
+}
+
+/**
+ * The **Close Worktree** command: deletes every selected **linked** worktree and
+ * closes the window each is open in. Phase-1 safety checks run in parallel (they
+ * are side-effect-free by design — ADR-0049), aggregate into one confirmation,
+ * then phase 2 executes sequentially. A selection of one behaves exactly as it
+ * always has, down to the messages.
+ *
+ * Repo nodes and main working trees are filtered out here rather than trusted to
+ * the menu: `when` clauses see only the *clicked* row, so a mixed selection
+ * reaches this handler intact.
+ */
+async function closeWorktree(clicked?: Node, selected?: Node[]): Promise<void> {
+  const { linked, main } = partitionByRole(worktreeTargets(selectionTargets(clicked, selected)));
+  if (linked.length === 0) {
+    // Defensive: the daemon refuses to delete a main working tree; the UI should
+    // never route one here, but never delete if it somehow does.
+    if (main.length > 0) {
+      void vscode.window.showErrorMessage(
+        "omni-dev: this is the repository's main working tree and is never deleted. Use Close Window.",
+      );
+    }
     return;
   }
-  const wt = node.wt;
+
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Closing worktree “${worktreeLabel(wt)}”…`,
+      title:
+        linked.length === 1
+          ? `Closing worktree “${worktreeLabel(linked[0].wt)}”…`
+          : `Closing ${linked.length} worktrees…`,
     },
-    async () => {
-      // Phase 1: what would removal lose?
-      const check = await send(closeCheckEnvelope(wt.path, windowKey));
-      if (!check) {
+    async (progress) => {
+      // Phase 1: what would removal lose? Side-effect-free, so fan out.
+      const outcomes = await Promise.all(linked.map(closeCheck));
+      if (outcomes.every((o) => o.kind === "error" && o.daemonDown)) {
         daemonDownError();
         return;
       }
-      if (!check.ok) {
-        void vscode.window.showErrorMessage(
-          `omni-dev: could not check worktree — ${check.error ?? "unknown error"}`,
-        );
-        return;
-      }
-      const report = check.payload as CloseSafetyReport;
-      // Defensive: the daemon refuses to delete a main working tree; the UI
-      // should never route one here, but never delete if it somehow does.
-      if (report.is_main || !report.removable) {
-        void vscode.window.showErrorMessage(
-          "omni-dev: this is the repository's main working tree and is never deleted. Use Close Window.",
-        );
-        return;
-      }
 
-      // Confirm only when there is something to warn about: data at risk, or a
-      // multi-root window whose other folders would also close.
-      const warnings = (report.risks ?? []).map((r) => r.detail);
-      if (report.window_folder_count > 1) {
-        warnings.push(
-          `This window has ${report.window_folder_count} folders open; all will close.`,
-        );
-      }
-      if (warnings.length > 0) {
-        const choice = await vscode.window.showWarningMessage(
-          `Delete worktree “${worktreeLabel(wt)}”? This cannot be undone.`,
-          { modal: true, detail: warnings.map((w) => `• ${w}`).join("\n") },
-          "Delete Worktree",
-        );
-        if (choice !== "Delete Worktree") {
-          return;
+      const failures: BatchFailure[] = [];
+      const deletable: { target: WorktreeNode; report: CloseSafetyReport }[] = [];
+      for (const outcome of outcomes) {
+        if (outcome.kind === "error") {
+          failures.push({ label: worktreeLabel(outcome.target.wt), message: outcome.message });
+        } else if (outcome.report.is_main || !outcome.report.removable) {
+          // A stale tree: the row said linked, the daemon says otherwise. Never delete.
+          failures.push({
+            label: worktreeLabel(outcome.target.wt),
+            message:
+              "this is the repository's main working tree and is never deleted. Use Close Window.",
+          });
+        } else {
+          deletable.push(outcome);
         }
       }
 
-      // Phase 2: execute (a long wait if a cross-window target must close first).
-      const exec = await send(
-        closeEnvelope(wt.path, { remove: true, requesterKey: windowKey, confirmed: true }),
-        CLOSE_EXECUTE_TIMEOUT_MS,
+      if (deletable.length === 0 || !(await confirmDelete(deletable, main, linked.length))) {
+        reportFailures(failures, linked.length);
+        return;
+      }
+
+      // Phase 2: execute (a long wait if a cross-window target must close first),
+      // sequentially and with this window's own worktree last — closing it kills
+      // the extension host, and everything after it would silently never run.
+      const ordered = orderSelfLast(
+        deletable.map((d) => d.target),
+        windowKey,
       );
-      if (!exec) {
-        daemonDownError();
-        return;
-      }
-      if (!exec.ok) {
-        void vscode.window.showErrorMessage(
-          `omni-dev: could not close worktree — ${exec.error ?? "unknown error"}`,
-        );
-        return;
-      }
-      // Self-close: if *this* window has the worktree open, close it now that
-      // the removal has succeeded (the daemon replied first to dodge the
-      // ext-host-dies-mid-op race).
-      if (isCurrentWindow(wt, windowKey)) {
-        await vscode.commands.executeCommand("workbench.action.closeWindow");
-      }
+      failures.push(
+        ...(await runSequential(ordered, progress, async (target) => {
+          const exec = await send(
+            closeEnvelope(target.wt.path, {
+              remove: true,
+              requesterKey: windowKey,
+              confirmed: true,
+            }),
+            CLOSE_EXECUTE_TIMEOUT_MS,
+          );
+          if (!exec) {
+            throw new DaemonDownError();
+          }
+          if (!exec.ok) {
+            throw new Error(`could not close worktree — ${exec.error ?? "unknown error"}`);
+          }
+          // Self-close: if *this* window has the worktree open, close it now that
+          // the removal has succeeded (the daemon replied first to dodge the
+          // ext-host-dies-mid-op race). `orderSelfLast` put us here at the end, so
+          // nothing is lost when the host dies — and if the user cancels an
+          // unsaved-file prompt, the window survives and the summary below still
+          // reports, exactly once.
+          if (isCurrentWindow(target.wt, windowKey)) {
+            await vscode.commands.executeCommand("workbench.action.closeWindow");
+          }
+        })),
+      );
+      reportFailures(failures, linked.length);
     },
   );
 }
 
 /**
- * Closes the **window** a main working tree is open in, without ever deleting
- * the repository. If it is *this* window, close it directly; otherwise ask the
- * daemon to signal the owning window (it closes on the directive's heartbeat).
+ * The **Close Window** command: closes the window every selected worktree is open
+ * in, **without ever deleting anything** — the non-destructive counterpart to
+ * {@link closeWorktree}, and the only way to close a *linked* worktree's window
+ * while keeping the worktree. Selected worktrees with no window are skipped;
+ * nothing is confirmed, since VS Code prompts for unsaved editors itself.
  */
-async function closeWindow(node?: Node): Promise<void> {
-  if (!node || node.kind !== "worktree") {
+async function closeWindow(clicked?: Node, selected?: Node[]): Promise<void> {
+  const { open } = partitionByWindow(worktreeTargets(selectionTargets(clicked, selected)));
+  if (open.length === 0) {
     return;
   }
-  const wt = node.wt;
-  if (isCurrentWindow(wt, windowKey)) {
+  // This window's own worktree goes last: closing it kills the extension host.
+  const ordered = orderSelfLast(open, windowKey);
+
+  if (ordered.length === 1) {
+    await runOne(ordered[0], closeOneWindow);
+    return;
+  }
+  await runBatch(ordered, `Closing ${ordered.length} windows…`, closeOneWindow);
+}
+
+/**
+ * Closes the window holding one worktree. This window closes itself directly;
+ * any other is signalled through the daemon, which delivers the directive on the
+ * target's next heartbeat — the only channel it has to a window it can reply to
+ * but never call — and waits for it to unregister.
+ */
+async function closeOneWindow(target: WorktreeNode): Promise<void> {
+  if (isCurrentWindow(target.wt, windowKey)) {
     await vscode.commands.executeCommand("workbench.action.closeWindow");
     return;
   }
   const reply = await send(
-    closeEnvelope(wt.path, { remove: false, requesterKey: windowKey, confirmed: true }),
+    closeEnvelope(target.wt.path, {
+      remove: false,
+      requesterKey: windowKey,
+      confirmed: true,
+    }),
     CLOSE_EXECUTE_TIMEOUT_MS,
   );
   if (!reply) {
-    daemonDownError();
-    return;
+    throw new DaemonDownError();
   }
   if (!reply.ok) {
-    void vscode.window.showErrorMessage(
-      `omni-dev: could not close window — ${reply.error ?? "unknown error"}`,
-    );
+    throw new Error(`could not close window — ${reply.error ?? "unknown error"}`);
   }
 }
 
