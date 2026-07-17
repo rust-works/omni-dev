@@ -9,7 +9,7 @@
 // labels, the URI, and the scope→discovery mapping — is here behind an injected
 // runner so it can be exercised without a real `gh` or a real editor.
 
-import { PrBadge, TreeGithubIdentity } from "./tree";
+import { Node, PrBadge, TreeGithubIdentity } from "./tree";
 
 
 /**
@@ -55,6 +55,74 @@ export type PrScope =
 /** The `owner/name` slug `gh --repo` expects. */
 function repoSlug(repo: TreeGithubIdentity): string {
   return `${repo.owner}/${repo.name}`;
+}
+
+/** The scope to search for a node, or `undefined` when it has no GitHub identity. */
+export function prScopeForNode(node: Node): PrScope | undefined {
+  const github = node.repo.github;
+  if (!github) {
+    return undefined;
+  }
+  if (node.kind === "repo") {
+    return { kind: "repo", repo: github };
+  }
+  return { kind: "worktree", repo: github, branch: node.wt.branch };
+}
+
+/** A human label for the scope, used in progress and info messages. */
+export function scopeLabel(scope: PrScope): string {
+  const repo = repoSlug(scope.repo);
+  return scope.kind === "worktree" && scope.branch ? `${repo}@${scope.branch}` : repo;
+}
+
+/** A scope's identity, for deduping a selection down to the distinct `gh` calls. */
+function scopeKey(scope: PrScope): string {
+  return `${scope.kind}:${repoSlug(scope.repo)}:${scope.kind === "worktree" ? (scope.branch ?? "") : ""}`;
+}
+
+/**
+ * The distinct scopes to search for a selection of nodes: nodes with no GitHub
+ * identity are dropped, and identical scopes collapse — two selected worktrees on
+ * the same branch, or the same repo node twice, are one `gh` call, not two.
+ *
+ * A repo scope is deliberately **not** treated as subsuming its own worktrees'
+ * branch scopes, even though it usually does: `gh pr list` caps at
+ * {@link PR_LIST_LIMIT}, so on a busy repo the branch's PR may fall outside the
+ * repo listing. Overlapping *results* are deduped after discovery instead, by
+ * {@link dedupePullRequests}.
+ */
+export function prScopesForNodes(nodes: Node[]): PrScope[] {
+  const seen = new Set<string>();
+  const scopes: PrScope[] = [];
+  for (const node of nodes) {
+    const scope = prScopeForNode(node);
+    if (!scope) {
+      continue;
+    }
+    const key = scopeKey(scope);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    scopes.push(scope);
+  }
+  return scopes;
+}
+
+/**
+ * Dedupes PRs by `url`, preserving first-seen order. A repo node and one of its
+ * own worktree nodes in the same selection both yield that worktree's PR; without
+ * this it would open twice.
+ */
+export function dedupePullRequests(prs: PullRequest[]): PullRequest[] {
+  const seen = new Set<string>();
+  return prs.filter((pr) => {
+    if (seen.has(pr.url)) {
+      return false;
+    }
+    seen.add(pr.url);
+    return true;
+  });
 }
 
 /** Builds the `gh pr list` argv for **all** of a repo's open PRs. */

@@ -422,3 +422,87 @@ export function worktreeContextValue(
 export function nodeId(node: Node): string {
   return node.kind === "repo" ? `repo:${node.repo.root}` : `wt:${node.wt.path}`;
 }
+
+/** A {@link Node} narrowed to a worktree — what every item command acts on. */
+export type WorktreeNode = Extract<Node, { kind: "worktree" }>;
+
+/**
+ * The nodes a `view/item/context` command should act on, given the two arguments
+ * VS Code invokes it with.
+ *
+ * The contract is subtle: VS Code passes the `selected` array **only** when more
+ * than one item is selected *and* the right-clicked item is part of that
+ * selection — otherwise it passes `undefined` and only the clicked node. So the
+ * selection wins when present and the clicked node is the fallback; the two are
+ * never concatenated, which would process the clicked node twice.
+ *
+ * The dedupe by {@link nodeId} is cheap insurance — the same identity already
+ * keys `vscode.TreeItem.id`, so a selection cannot normally repeat a node.
+ */
+export function selectionTargets(clicked?: Node, selected?: Node[]): Node[] {
+  const nodes = selected?.length ? selected : clicked ? [clicked] : [];
+  const seen = new Set<string>();
+  return nodes.filter((node) => {
+    const id = nodeId(node);
+    if (seen.has(id)) {
+      return false;
+    }
+    seen.add(id);
+    return true;
+  });
+}
+
+/**
+ * The worktree nodes of a selection, in order. A user can ctrl+click a repo node
+ * alongside worktree rows, so every handler filters to what it understands rather
+ * than trusting the menu's `when` clause — which VS Code evaluates against the
+ * **clicked** item only, and so says nothing about the rest of the selection.
+ */
+export function worktreeTargets(nodes: Node[]): WorktreeNode[] {
+  return nodes.filter((node): node is WorktreeNode => node.kind === "worktree");
+}
+
+/**
+ * Splits worktree targets by role: `linked` worktrees, which a close *deletes*,
+ * and `main` working trees, which are never deleted. A mixed batch partitions
+ * rather than silently downgrading a requested delete into a window close.
+ */
+export function partitionByRole(nodes: WorktreeNode[]): {
+  linked: WorktreeNode[];
+  main: WorktreeNode[];
+} {
+  return {
+    linked: nodes.filter((node) => !node.wt.is_main),
+    main: nodes.filter((node) => node.wt.is_main),
+  };
+}
+
+/**
+ * Splits worktree targets by window: those a VS Code window currently has open —
+ * the only ones "Close Window" has anything to close — and those without one,
+ * which the batch skips.
+ */
+export function partitionByWindow(nodes: WorktreeNode[]): {
+  open: WorktreeNode[];
+  closed: WorktreeNode[];
+} {
+  return {
+    open: nodes.filter((node) => node.wt.open),
+    closed: nodes.filter((node) => !node.wt.open),
+  };
+}
+
+/**
+ * Stable-orders this window's **own** worktree last.
+ *
+ * Closing it runs `workbench.action.closeWindow`, which kills this extension host
+ * — so anywhere in a batch but the end means every later target is silently never
+ * closed. The single-target commands sidestep this by construction; a batch must
+ * order for it explicitly. At most one node can match, but the partition is
+ * written generically and preserves the relative order of everything else.
+ */
+export function orderSelfLast(nodes: WorktreeNode[], windowKey?: string): WorktreeNode[] {
+  const others = nodes.filter((node) => !isCurrentWindow(node.wt, windowKey));
+  const self = nodes.filter((node) => isCurrentWindow(node.wt, windowKey));
+  return [...others, ...self];
+}
