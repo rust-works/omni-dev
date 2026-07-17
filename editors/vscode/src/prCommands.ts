@@ -1,9 +1,13 @@
-// The `vscode`-facing "Open Pull Request…" command. It is a thin adapter: the
+// The `vscode`-facing "Open Pull Request…" commands. They are thin adapters: the
 // discovery, `gh` arg building, parsing, URI building, and quick-pick formatting
 // all live in the `vscode`-free, unit-tested `github.ts`; this file only wires
 // those onto the editor — a progress notification, the empty/single/multi-select
-// branches, and opening each chosen PR as a tab through the GitHub Pull Requests
-// extension's URI handler.
+// branches, and the open step.
+//
+// Both commands share one selection pipeline (`selectPullRequests`) and differ
+// only in what they hand `openExternal`: the in-editor one opens each PR as a tab
+// through the GitHub Pull Requests extension's URI handler, the browser one opens
+// the PR's `github.com` page in the OS default browser.
 
 import * as vscode from "vscode";
 
@@ -23,45 +27,12 @@ const PR_EXTENSION_ID = "GitHub.vscode-pull-request-github";
 
 /**
  * Opens the pull request(s) for a repo or worktree node **as a tab inside VS
- * Code** (never a browser). Discovers via `gh` under a progress notification,
- * then: no PR → a friendly info message; one PR → open it; several → a
- * multi-select quick-pick to open any or all. A node with no GitHub identity is
- * ignored (the menu is gated so it can only ever fire on a `github` item).
+ * Code** (never a browser) — see `openPullRequestInBrowser` for the sibling that
+ * opens `github.com` instead.
  */
 export async function openPullRequest(node?: Node): Promise<void> {
-  if (!node) {
-    return;
-  }
-  const scope = prScopeForNode(node);
-  if (!scope) {
-    return;
-  }
-
-  let prs: PullRequest[];
-  try {
-    prs = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `Finding pull requests for ${scopeLabel(scope)}…`,
-      },
-      () => discoverPullRequests(scope, runGh),
-    );
-  } catch (err) {
-    void vscode.window.showErrorMessage(
-      `omni-dev: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return;
-  }
-
-  if (prs.length === 0) {
-    void vscode.window.showInformationMessage(
-      `No open pull request for ${scopeLabel(scope)}.`,
-    );
-    return;
-  }
-
-  const selected = prs.length === 1 ? prs : await pickPullRequests(prs, scope);
-  if (!selected || selected.length === 0) {
+  const selected = await selectPullRequests(node);
+  if (!selected) {
     return;
   }
 
@@ -77,6 +48,67 @@ export async function openPullRequest(node?: Node): Promise<void> {
     const uri = vscode.Uri.parse(prOverviewUri(vscode.env.uriScheme, pr.url));
     await vscode.env.openExternal(uri);
   }
+}
+
+/**
+ * Opens the pull request(s) for a repo or worktree node **in the OS default
+ * browser** — the same selection flow as `openPullRequest`, handing `openExternal`
+ * the PR's plain `github.com` web URL rather than the extension URI. Needs no
+ * GitHub Pull Requests extension, so there is nothing to warn about or fall back
+ * to.
+ */
+export async function openPullRequestInBrowser(node?: Node): Promise<void> {
+  const selected = await selectPullRequests(node);
+  if (!selected) {
+    return;
+  }
+
+  for (const pr of selected) {
+    await vscode.env.openExternal(vscode.Uri.parse(pr.url));
+  }
+}
+
+/**
+ * The pull request(s) to open for a node, or `undefined` when there is nothing to
+ * open. Discovers via `gh` under a progress notification, then: no PR → a friendly
+ * info message; one PR → it; several → a multi-select quick-pick. A node with no
+ * GitHub identity is ignored (the menu is gated so it can only ever fire on a
+ * `github` item), as is a cancelled or empty pick.
+ */
+async function selectPullRequests(node?: Node): Promise<PullRequest[] | undefined> {
+  if (!node) {
+    return undefined;
+  }
+  const scope = prScopeForNode(node);
+  if (!scope) {
+    return undefined;
+  }
+
+  let prs: PullRequest[];
+  try {
+    prs = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Finding pull requests for ${scopeLabel(scope)}…`,
+      },
+      () => discoverPullRequests(scope, runGh),
+    );
+  } catch (err) {
+    void vscode.window.showErrorMessage(
+      `omni-dev: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+
+  if (prs.length === 0) {
+    void vscode.window.showInformationMessage(
+      `No open pull request for ${scopeLabel(scope)}.`,
+    );
+    return undefined;
+  }
+
+  const selected = prs.length === 1 ? prs : await pickPullRequests(prs, scope);
+  return selected && selected.length > 0 ? selected : undefined;
 }
 
 /** The scope to search for a node, or `undefined` when it has no GitHub identity. */

@@ -73,6 +73,12 @@
         "icon": "$(git-pull-request)"
       },
       {
+        "command": "omniDevWorktrees.openPullRequestInBrowser",
+        "title": "Open Pull Request in Browser…",
+        "category": "omni-dev",
+        "icon": "$(link-external)"
+      },
+      {
         "command": "omniDevWorktrees.moveClaudeSessionHere",
         "title": "Move Claude Session Here",
         "category": "omni-dev"
@@ -115,6 +121,10 @@
           "when": "false"
         },
         {
+          "command": "omniDevWorktrees.openPullRequestInBrowser",
+          "when": "false"
+        },
+        {
           "command": "omniDevWorktrees.moveClaudeSessionHere",
           "when": "false"
         },
@@ -149,6 +159,11 @@
           "command": "omniDevWorktrees.openPullRequest",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",
           "group": "1_pr@1"
+        },
+        {
+          "command": "omniDevWorktrees.openPullRequestInBrowser",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",
+          "group": "1_pr@2"
         },
         {
           "command": "omniDevWorktrees.moveClaudeSessionHere",
