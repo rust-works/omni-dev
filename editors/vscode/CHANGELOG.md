@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Open Pull Request in Browser…** ([#1354](https://github.com/rust-works/omni-dev/issues/1354)): a second context-menu action on the **Worktrees** view opens a repo's or worktree's pull request(s) on `github.com` in your **default browser**, alongside the existing **Open Pull Request…** ([#1299](https://github.com/rust-works/omni-dev/issues/1299)) that opens them as a tab inside VS Code. The badge on a row already shows there is an open PR; now the row can open it wherever you want to read it.
+  - Both actions appear together on any node with a `github.com` origin, in-editor first, and share one discovery flow — the same `gh` lookup, the same friendly "no open pull request" message, and the same multi-select quick-pick when a repo node matches several PRs. Only the open step differs, so the in-editor action's behavior is unchanged.
+  - The browser action has **no dependency on the GitHub Pull Requests extension** — it opens the PR's plain `github.com` URL with the OS default browser, so there is no Install/Copy prompt on this path. `gh` is still needed to find the PRs.
+
 ### Changed
 - **Open Claude Code now opens a new session on every click** ([#1347](https://github.com/rust-works/omni-dev/issues/1347)): the editor title-bar button ([#1322](https://github.com/rust-works/omni-dev/issues/1322)) no longer focuses the terminal it already opened — every click launches a **new** Claude Code CLI session as its own editor tab, so starting a second or third concurrent session in one window is one click each. This supersedes the 0.5.0 note that clicking again "focuses" the open terminal; "reuse" only ever meant "the tab is still open" (VS Code's terminal API cannot report whether `claude` is still running), which is not what a click on a launch button asks for.
   - Concurrent terminals are named `Claude Code`, `Claude Code 2`, `Claude Code 3`, … so their editor tabs stay distinguishable, and closing a session frees its number for the next launch instead of letting a counter climb forever.
