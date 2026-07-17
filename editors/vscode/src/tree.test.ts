@@ -12,9 +12,9 @@ import {
   checkStateDecoration,
   isCurrentWindow,
   nodeId,
-  orderSelfLast,
   partitionByRole,
   partitionByWindow,
+  partitionSelfLast,
   repoLabel,
   reposToNodes,
   selectionTargets,
@@ -455,26 +455,31 @@ test("partitionByWindow splits the worktrees a window has open from those withou
   assert.deepEqual(closed, [CLOSED_LINKED]);
 });
 
-test("orderSelfLast moves this window's own worktree to the end", () => {
+test("partitionSelfLast splits this window's own worktree out from the rest", () => {
   // The hazard this exists for: closing our own window kills the extension host,
-  // so every target after it would silently never be closed.
-  const ordered = orderSelfLast([SELF_MAIN, OTHER_LINKED, CLOSED_LINKED], "w1");
-  assert.deepEqual(ordered, [OTHER_LINKED, CLOSED_LINKED, SELF_MAIN]);
+  // so it must run alone, after everything else has finished.
+  const { others, self } = partitionSelfLast([SELF_MAIN, OTHER_LINKED, CLOSED_LINKED], "w1");
+  assert.deepEqual(others, [OTHER_LINKED, CLOSED_LINKED]);
+  assert.deepEqual(self, [SELF_MAIN]);
 });
 
-test("orderSelfLast leaves a batch without this window's worktree untouched", () => {
+test("partitionSelfLast puts a batch without this window's worktree entirely in others", () => {
   const batch: WorktreeNode[] = [OTHER_LINKED, CLOSED_LINKED];
-  assert.deepEqual(orderSelfLast(batch, "w1"), batch);
-  // No window key (never registered) can never match, so nothing moves.
-  assert.deepEqual(orderSelfLast([SELF_MAIN, OTHER_LINKED], undefined), [SELF_MAIN, OTHER_LINKED]);
-  // A worktree open in *another* window is not self, however similar it looks.
-  assert.deepEqual(orderSelfLast([OTHER_LINKED, CLOSED_LINKED], "w2"), [
-    CLOSED_LINKED,
-    OTHER_LINKED,
-  ]);
+  assert.deepEqual(partitionSelfLast(batch, "w1"), { others: batch, self: [] });
+  // No window key (never registered) can never match, so nothing is self.
+  assert.deepEqual(partitionSelfLast([SELF_MAIN, OTHER_LINKED], undefined), {
+    others: [SELF_MAIN, OTHER_LINKED],
+    self: [],
+  });
+  // Self is keyed on the window, not the row: with "w2" as our key it is
+  // OTHER_LINKED that is self, and SELF_MAIN that is someone else's.
+  assert.deepEqual(partitionSelfLast([OTHER_LINKED, CLOSED_LINKED], "w2"), {
+    others: [CLOSED_LINKED],
+    self: [OTHER_LINKED],
+  });
 });
 
-test("orderSelfLast handles a batch of only this window's worktree", () => {
-  assert.deepEqual(orderSelfLast([SELF_MAIN], "w1"), [SELF_MAIN]);
-  assert.deepEqual(orderSelfLast([], "w1"), []);
+test("partitionSelfLast handles a batch of only this window's worktree, and an empty one", () => {
+  assert.deepEqual(partitionSelfLast([SELF_MAIN], "w1"), { others: [], self: [SELF_MAIN] });
+  assert.deepEqual(partitionSelfLast([], "w1"), { others: [], self: [] });
 });

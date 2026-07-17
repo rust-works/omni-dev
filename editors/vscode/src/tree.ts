@@ -493,16 +493,23 @@ export function partitionByWindow(nodes: WorktreeNode[]): {
 }
 
 /**
- * Stable-orders this window's **own** worktree last.
+ * Splits this window's **own** worktree out from the rest of a batch.
  *
- * Closing it runs `workbench.action.closeWindow`, which kills this extension host
- * — so anywhere in a batch but the end means every later target is silently never
- * closed. The single-target commands sidestep this by construction; a batch must
- * order for it explicitly. At most one node can match, but the partition is
- * written generically and preserves the relative order of everything else.
+ * Closing it runs `workbench.action.closeWindow`, which kills this extension host.
+ * So it must not merely run *last* — it must run *alone*: anything still in flight
+ * beside it dies with the host, unreported and possibly half-done. That is why the
+ * callers need the two halves rather than one ordering — they run `others` to
+ * completion, then `self`. The single-target commands sidestep this by
+ * construction; a batch must split for it explicitly. At most one node can match,
+ * but the partition is written generically and preserves the relative order within
+ * each half.
  */
-export function orderSelfLast(nodes: WorktreeNode[], windowKey?: string): WorktreeNode[] {
-  const others = nodes.filter((node) => !isCurrentWindow(node.wt, windowKey));
-  const self = nodes.filter((node) => isCurrentWindow(node.wt, windowKey));
-  return [...others, ...self];
+export function partitionSelfLast(
+  nodes: WorktreeNode[],
+  windowKey?: string,
+): { others: WorktreeNode[]; self: WorktreeNode[] } {
+  return {
+    others: nodes.filter((node) => !isCurrentWindow(node.wt, windowKey)),
+    self: nodes.filter((node) => isCurrentWindow(node.wt, windowKey)),
+  };
 }
