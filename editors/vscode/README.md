@@ -46,9 +46,39 @@ window or open a worktree's folder. Two title-bar actions:
   worktrees. The setting is stored per-machine (`globalState`), so it reads the
   same in every window and survives a reload.
 
-Right-click a leaf or repo for context-menu actions: **Close Worktree** /
-**Close Window**, and — for a `github.com` repo — **Open Pull Request…** and
-**Open Pull Request in Browser…**.
+Right-click a leaf or repo for context-menu actions: **Open Worktree**, **Close
+Window**, **Close Worktree**, and — for a `github.com` repo — **Open Pull
+Request…** and **Open Pull Request in Browser…**.
+
+The three worktree verbs are deliberately separate, because closing a *window* and
+deleting a *worktree* are different things:
+
+- **Open Worktree** — opens (or focuses) a window for each selected worktree.
+- **Close Window** — closes the window each selected worktree is open in, and
+  **deletes nothing**. Available for any worktree that has a window, linked or
+  main.
+- **Close Worktree** — **deletes** each selected linked worktree and closes its
+  window. Offered only on linked worktrees; a repository's main working tree is
+  never deleted.
+
+### Multi-select
+
+Ctrl/cmd+click or shift+click to select several rows, then act on all of them at
+once — the view lists every window's worktrees, so the useful verbs are plural
+("open the PRs for these three branches", "close these five stale worktrees").
+
+- **Open Pull Request…** / **Open Pull Request in Browser…** open every selected
+  row's PR. A repo node and one of its own worktrees both selected will not open
+  the same PR twice. Above five PRs it asks first, since a repo node contributes
+  *every* open PR of its repository — a count you did not pick.
+- **Close Worktree** / **Close Window** run as one batch: a single confirmation
+  listing exactly what will be deleted, then progress through the targets. A main
+  working tree caught up in a **Close Worktree** selection is skipped and named,
+  never deleted and never quietly downgraded to a window close.
+- **Move Claude Session Here** is hidden while more than one row is selected — its
+  argument is a single *destination*, so it has no multi-target meaning.
+- Selecting rows never opens them: double-click still opens a worktree, and
+  ctrl/shift+click only changes the selection.
 
 ### Open Pull Request…
 

@@ -7,6 +7,7 @@ import {
   PR_JSON_FIELDS,
   PR_LIST_LIMIT,
   PullRequest,
+  dedupePullRequests,
   discoverPullRequests,
   parsePrList,
   prFallbackBadge,
@@ -15,8 +16,11 @@ import {
   prOverviewUri,
   prQuickPickDescription,
   prQuickPickLabel,
+  prScopeForNode,
+  prScopesForNodes,
+  scopeLabel,
 } from "./github";
-import { TreeGithubIdentity } from "./tree";
+import { Node, TreeGithubIdentity, TreeRepoPayload } from "./tree";
 
 const REPO: TreeGithubIdentity = { owner: "rust-works", name: "omni-dev" };
 
@@ -202,4 +206,103 @@ test("prFallbackBadge takes the first head match", () => {
     { ...FALLBACK_PRS[0], number: 2 },
   ];
   assert.equal(prFallbackBadge(dupes, "feature")?.number, 1);
+});
+
+// --- Scope mapping and multi-select fan-out (#1357) --------------------------
+
+const SCOPE_REPO: TreeRepoPayload = {
+  main_repo: "omni-dev",
+  github: REPO,
+  root: "/home/me/omni-dev",
+  worktrees: [
+    { path: "/home/me/omni-dev", branch: "main", is_main: true, open: true },
+    { path: "/home/me/wt/a", branch: "a", is_main: false, open: true },
+    { path: "/home/me/wt/detached", is_main: false, open: true },
+  ],
+};
+
+/** A repo with no `github` — an origin that is not `github.com`, or none at all. */
+const NO_GITHUB_REPO: TreeRepoPayload = {
+  main_repo: "scratch",
+  root: "/home/me/scratch",
+  worktrees: [{ path: "/home/me/scratch", branch: "main", is_main: true, open: true }],
+};
+
+const repoNode = (repo: TreeRepoPayload): Node => ({ kind: "repo", repo });
+const wtNode = (repo: TreeRepoPayload, i: number): Node => ({
+  kind: "worktree",
+  repo,
+  wt: repo.worktrees[i],
+});
+
+test("prScopeForNode maps a repo node to a whole-repo scope", () => {
+  assert.deepEqual(prScopeForNode(repoNode(SCOPE_REPO)), { kind: "repo", repo: REPO });
+});
+
+test("prScopeForNode maps a worktree node to its branch's scope", () => {
+  assert.deepEqual(prScopeForNode(wtNode(SCOPE_REPO, 1)), {
+    kind: "worktree",
+    repo: REPO,
+    branch: "a",
+  });
+  // Detached/unborn: a scope with no branch, which discovery resolves to `[]`.
+  assert.deepEqual(prScopeForNode(wtNode(SCOPE_REPO, 2)), {
+    kind: "worktree",
+    repo: REPO,
+    branch: undefined,
+  });
+});
+
+test("prScopeForNode yields nothing for a repo with no GitHub identity", () => {
+  assert.equal(prScopeForNode(repoNode(NO_GITHUB_REPO)), undefined);
+  assert.equal(prScopeForNode(wtNode(NO_GITHUB_REPO, 0)), undefined);
+});
+
+test("prScopesForNodes drops nodes with no GitHub identity", () => {
+  const scopes = prScopesForNodes([wtNode(NO_GITHUB_REPO, 0), wtNode(SCOPE_REPO, 1)]);
+  assert.deepEqual(scopes, [{ kind: "worktree", repo: REPO, branch: "a" }]);
+  assert.deepEqual(prScopesForNodes([repoNode(NO_GITHUB_REPO)]), []);
+  assert.deepEqual(prScopesForNodes([]), []);
+});
+
+test("prScopesForNodes collapses identical scopes to one `gh` call", () => {
+  // The same repo node twice, and two nodes resolving to the same branch scope.
+  const scopes = prScopesForNodes([
+    repoNode(SCOPE_REPO),
+    repoNode(SCOPE_REPO),
+    wtNode(SCOPE_REPO, 1),
+    wtNode(SCOPE_REPO, 1),
+  ]);
+  assert.deepEqual(scopes, [
+    { kind: "repo", repo: REPO },
+    { kind: "worktree", repo: REPO, branch: "a" },
+  ]);
+});
+
+test("prScopesForNodes keeps a repo scope and its own worktree's branch scope apart", () => {
+  // A repo scope usually subsumes its branches, but `gh pr list` caps at
+  // PR_LIST_LIMIT — so both calls run and the *results* are deduped instead.
+  const scopes = prScopesForNodes([repoNode(SCOPE_REPO), wtNode(SCOPE_REPO, 1)]);
+  assert.equal(scopes.length, 2);
+});
+
+test("dedupePullRequests collapses a repo node and its worktree node's shared PR", () => {
+  const other: PullRequest = { ...PR, number: 1300, url: "https://github.com/o/r/pull/1300" };
+  // The repo scope found both PRs; the worktree scope found one of them again.
+  assert.deepEqual(dedupePullRequests([PR, other, { ...PR }]), [PR, other]);
+});
+
+test("dedupePullRequests preserves first-seen order and tolerates an empty list", () => {
+  assert.deepEqual(dedupePullRequests([]), []);
+  assert.deepEqual(dedupePullRequests([PR]), [PR]);
+});
+
+test("scopeLabel names a repo scope and a branch scope", () => {
+  assert.equal(scopeLabel({ kind: "repo", repo: REPO }), "rust-works/omni-dev");
+  assert.equal(
+    scopeLabel({ kind: "worktree", repo: REPO, branch: "issue-1357" }),
+    "rust-works/omni-dev@issue-1357",
+  );
+  // A detached worktree has no branch to qualify the repo with.
+  assert.equal(scopeLabel({ kind: "worktree", repo: REPO }), "rust-works/omni-dev");
 });
