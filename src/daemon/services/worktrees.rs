@@ -281,6 +281,23 @@ pub struct WorktreesService {
     /// one cache. The one-shot `tree` op deliberately bypasses it and computes
     /// fresh (it is a rare manual refresh, not part of the per-tick fan-out).
     tree_cache: Arc<TreeSnapshotCache>,
+    /// Serializes [`remove_worktree`] across concurrent `close` executes (#1359).
+    ///
+    /// The extension fans a multi-select delete out into one `close` op per
+    /// target, so two executes can reach the prune at once. Their heartbeat waits
+    /// overlap freely — that is the point — but the prunes themselves should not:
+    /// each op enumerates the repo's worktrees ([`worktree_name_for_path`]) and
+    /// then prunes an entry out of that same `.git/worktrees`, so concurrent ops
+    /// read a directory a sibling is midway through removing from, and `git2`
+    /// promises nothing about that. Precautionary rather than a fix for an
+    /// observed corruption — the window is narrow enough that it has not been
+    /// reproduced — but serializing costs nothing measurable (the prune is a
+    /// directory delete; the wait it follows is seconds) and keeps the fan-out
+    /// safe at the source rather than relying on every caller to stay sequential.
+    ///
+    /// A `tokio` mutex rather than a `std` one: it is held across the
+    /// `spawn_blocking` join, which is an `.await`.
+    prune_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorktreesService {
@@ -299,6 +316,7 @@ impl WorktreesService {
             pr_cache: pr_cache.clone(),
             poller: Mutex::new(None),
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
+            prune_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -570,6 +588,12 @@ impl WorktreesService {
 
         if req.remove {
             let path = req.path.clone();
+            // Taken *after* the wait above, so concurrent executes still overlap
+            // their heartbeat waits (#1359) and only the prune itself serializes.
+            // Load-bearing placement, not incidental: hoisting this above
+            // `await_windows_closed` would restack the waits and undo the whole
+            // point. Pinned by `concurrent_closes_overlap_their_heartbeat_waits`.
+            let _guard = self.prune_lock.lock().await;
             tokio::task::spawn_blocking(move || remove_worktree(&path))
                 .await
                 .map_err(|e| anyhow!("worktree removal task panicked: {e}"))??;
@@ -4451,6 +4475,126 @@ mod tests {
         let wt_path = wt_parent.path().join("feature-wt");
         add_worktree(&repo, a, &wt_path, "feature");
         (main_dir, wt_parent, wt_path)
+    }
+
+    /// [`repo_with_linked_worktree`] with a **second** linked worktree of the same
+    /// repo — the shape a multi-select delete fans out over, and the only one where
+    /// two prunes share a `.git/worktrees` to race on (#1359).
+    fn repo_with_two_linked_worktrees() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf)
+    {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let first = wt_parent.path().join("first-wt");
+        let second = wt_parent.path().join("second-wt");
+        add_worktree(&repo, a, &first, "first");
+        add_worktree(&repo, a, &second, "second");
+        (main_dir, wt_parent, first, second)
+    }
+
+    #[tokio::test]
+    async fn close_removes_two_linked_worktrees_of_one_repo_concurrently() {
+        let (main_dir, _wtp, first, second) = repo_with_two_linked_worktrees();
+        let svc = Arc::new(WorktreesService::new());
+
+        // The multi-select fan-out: one `close` op per target, both in flight at
+        // once against the one repo's shared admin state. Genuinely concurrent
+        // even on this single-threaded runtime — each op's prune is a
+        // `spawn_blocking`, so awaiting its join yields to the other op.
+        //
+        // This guards the fan-out end-to-end (both ops complete, neither is
+        // starved or deadlocked by `prune_lock`); it is deliberately *not* sold as
+        // a race detector for the lock, because it is not one — it passes with the
+        // guard removed, the two prunes being far too quick to collide reliably.
+        let close = |path: PathBuf| {
+            let svc = svc.clone();
+            async move {
+                svc.handle(
+                    "close",
+                    json!({ "path": path, "remove": true, "confirmed": true }),
+                )
+                .await
+            }
+        };
+        let (a, b) = tokio::join!(close(first.clone()), close(second.clone()));
+
+        assert_eq!(a.unwrap(), json!({ "removed": true }));
+        assert_eq!(b.unwrap(), json!({ "removed": true }));
+        assert!(!first.exists());
+        assert!(!second.exists());
+        // Both *admin* entries pruned too, not merely the directories — the half
+        // the two ops contend on.
+        let repo = Repository::open(main_dir.path()).unwrap();
+        assert!(repo.worktrees().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_closes_overlap_their_heartbeat_waits() {
+        let (_main, _wtp, first, second) = repo_with_two_linked_worktrees();
+        let svc = Arc::new(WorktreesService::new());
+        // Two *different* windows own the two targets — the multi-select shape.
+        for (key, path) in [("w2", &first), ("w3", &second)] {
+            svc.handle("register", json!({ "key": key, "folders": [path] }))
+                .await
+                .unwrap();
+        }
+
+        let spawn_close = |path: PathBuf| {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.handle(
+                    "close",
+                    json!({
+                        "path": path,
+                        "remove": true,
+                        "confirmed": true,
+                        "requester_key": "w1",
+                    }),
+                )
+                .await
+            })
+        };
+        let a = spawn_close(first.clone());
+        let b = spawn_close(second.clone());
+
+        // The crux of #1359, and the one thing pinning `prune_lock`'s placement:
+        // *both* windows are told to close while *neither* op has finished, so the
+        // two multi-second heartbeat waits are in flight at once. Take the guard
+        // before `await_windows_closed` instead of after and this fails — op B
+        // would sit on the lock without ever marking w3, restoring exactly the
+        // N-stacked-waits latency the fan-out exists to remove.
+        for key in ["w2", "w3"] {
+            let mut saw_close = false;
+            for _ in 0..400 {
+                let hb = svc
+                    .handle("heartbeat", json!({ "key": key }))
+                    .await
+                    .unwrap();
+                if hb.get("close").and_then(Value::as_bool) == Some(true) {
+                    saw_close = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(saw_close, "{key} should have been told to close while the other target's close was still waiting");
+        }
+        assert!(
+            !a.is_finished() && !b.is_finished(),
+            "neither close can have finished: both windows are still registered"
+        );
+
+        // Both windows close; both ops then remove.
+        for key in ["w2", "w3"] {
+            svc.handle("unregister", json!({ "key": key }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(a.await.unwrap().unwrap(), json!({ "removed": true }));
+        assert_eq!(b.await.unwrap().unwrap(), json!({ "removed": true }));
+        assert!(!first.exists());
+        assert!(!second.exists());
     }
 
     #[tokio::test]

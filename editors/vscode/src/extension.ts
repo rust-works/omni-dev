@@ -39,9 +39,9 @@ import {
   WorktreeNode,
   isCurrentWindow,
   nodeId,
-  orderSelfLast,
   partitionByRole,
   partitionByWindow,
+  partitionSelfLast,
   selectionTargets,
   withoutPrBadges,
   worktreeLabel,
@@ -582,45 +582,68 @@ function reportFailures(failures: BatchFailure[], total: number): void {
 }
 
 /**
- * Runs `action` over each target **sequentially**, reporting `n/total` into an
+ * Runs `action` over the targets **concurrently**, reporting completions into an
  * existing progress and continuing past a failure, which it collects rather than
- * throws. A {@link DaemonDownError} aborts the run — every remaining target would
- * fail identically.
+ * throws.
  *
- * Sequential is deliberate for the close verbs: parallel executes would contend on
- * `git2`'s worktree prune against the same repo's `.git/worktrees`, and the
- * daemon's per-target cost is a *wait* on the target window's heartbeat, not work
- * we can overlap safely. Callers whose batch may contain this window's own
- * worktree must run {@link orderSelfLast} first — closing it kills the extension
- * host mid-loop.
+ * Fanning out is the point (#1359): the daemon's per-target cost in a close is
+ * almost entirely a *wait* on the target window's next heartbeat (~10s), and waits
+ * on N **independent** windows are exactly the thing that overlaps — marked
+ * together they all fire within one shared interval rather than N stacked ones.
+ * The transport carries it: `sendEnvelope` opens a connection per request and the
+ * daemon spawns a task per connection. The one genuinely shared resource, `git2`'s
+ * prune against a repo's `.git/worktrees`, is serialized daemon-side rather than
+ * here, so safety does not depend on every caller staying sequential.
+ *
+ * This window's own worktree is the exception, and runs alone after the rest: see
+ * {@link partitionSelfLast}.
  */
-async function runSequential(
+async function runConcurrent(
   targets: WorktreeNode[],
   progress: vscode.Progress<{ message?: string }>,
   action: (target: WorktreeNode) => Promise<void>,
 ): Promise<BatchFailure[]> {
+  const { others, self } = partitionSelfLast(targets, windowKey);
   const failures: BatchFailure[] = [];
   let done = 0;
-  for (const target of targets) {
-    progress.report({ message: `${done + 1}/${targets.length} — ${worktreeLabel(target.wt)}` });
+  let daemonDown = false;
+
+  const run = async (target: WorktreeNode) => {
     try {
       await action(target);
     } catch (err) {
       if (err instanceof DaemonDownError) {
-        daemonDownError();
-        return failures;
+        daemonDown = true;
+      } else {
+        failures.push({
+          label: worktreeLabel(target.wt),
+          message: err instanceof Error ? err.message : String(err),
+        });
       }
-      failures.push({
-        label: worktreeLabel(target.wt),
-        message: err instanceof Error ? err.message : String(err),
-      });
     }
     done += 1;
+    // Completions, not a current target: a fan-out has no single "current" one.
+    progress.report({ message: `${done}/${targets.length}` });
+  };
+
+  await Promise.all(others.map(run));
+  // One socket serves every target, so a down daemon fails them all identically.
+  // Report it once and skip the self-close, exactly as the sequential abort this
+  // replaces did — rather than listing N copies of the same message.
+  if (daemonDown) {
+    daemonDownError();
+    return failures;
+  }
+  for (const target of self) {
+    await run(target);
+  }
+  if (daemonDown) {
+    daemonDownError();
   }
   return failures;
 }
 
-/** {@link runSequential} plus its own progress notification and failure summary. */
+/** {@link runConcurrent} plus its own progress notification and failure summary. */
 async function runBatch(
   targets: WorktreeNode[],
   title: string,
@@ -628,7 +651,7 @@ async function runBatch(
 ): Promise<void> {
   const failures = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title },
-    (progress) => runSequential(targets, progress, action),
+    (progress) => runConcurrent(targets, progress, action),
   );
   reportFailures(failures, targets.length);
 }
@@ -811,8 +834,9 @@ async function confirmDelete(
  * The **Close Worktree** command: deletes every selected **linked** worktree and
  * closes the window each is open in. Phase-1 safety checks run in parallel (they
  * are side-effect-free by design — ADR-0049), aggregate into one confirmation,
- * then phase 2 executes sequentially. A selection of one behaves exactly as it
- * always has, down to the messages.
+ * then phase 2 fans out too, so N closes share one heartbeat wait instead of
+ * stacking N of them (#1359). A selection of one behaves exactly as it always has,
+ * down to the messages.
  *
  * Repo nodes and main working trees are filtered out here rather than trusted to
  * the menu: `when` clauses see only the *clicked* row, so a mixed selection
@@ -869,39 +893,40 @@ async function closeWorktree(clicked?: Node, selected?: Node[]): Promise<void> {
         return;
       }
 
-      // Phase 2: execute (a long wait if a cross-window target must close first),
-      // sequentially and with this window's own worktree last — closing it kills
-      // the extension host, and everything after it would silently never run.
-      const ordered = orderSelfLast(
-        deletable.map((d) => d.target),
-        windowKey,
-      );
+      // Phase 2: execute. Each target is mostly a *wait* on its window's next
+      // heartbeat, so they fan out and share one interval rather than stacking N
+      // of them; `runConcurrent` keeps this window's own worktree until last and
+      // alone, since closing it kills the extension host.
       failures.push(
-        ...(await runSequential(ordered, progress, async (target) => {
-          const exec = await send(
-            closeEnvelope(target.wt.path, {
-              remove: true,
-              requesterKey: windowKey,
-              confirmed: true,
-            }),
-            CLOSE_EXECUTE_TIMEOUT_MS,
-          );
-          if (!exec) {
-            throw new DaemonDownError();
-          }
-          if (!exec.ok) {
-            throw new Error(`could not close worktree — ${exec.error ?? "unknown error"}`);
-          }
-          // Self-close: if *this* window has the worktree open, close it now that
-          // the removal has succeeded (the daemon replied first to dodge the
-          // ext-host-dies-mid-op race). `orderSelfLast` put us here at the end, so
-          // nothing is lost when the host dies — and if the user cancels an
-          // unsaved-file prompt, the window survives and the summary below still
-          // reports, exactly once.
-          if (isCurrentWindow(target.wt, windowKey)) {
-            await vscode.commands.executeCommand("workbench.action.closeWindow");
-          }
-        })),
+        ...(await runConcurrent(
+          deletable.map((d) => d.target),
+          progress,
+          async (target) => {
+            const exec = await send(
+              closeEnvelope(target.wt.path, {
+                remove: true,
+                requesterKey: windowKey,
+                confirmed: true,
+              }),
+              CLOSE_EXECUTE_TIMEOUT_MS,
+            );
+            if (!exec) {
+              throw new DaemonDownError();
+            }
+            if (!exec.ok) {
+              throw new Error(`could not close worktree — ${exec.error ?? "unknown error"}`);
+            }
+            // Self-close: if *this* window has the worktree open, close it now that
+            // the removal has succeeded (the daemon replied first to dodge the
+            // ext-host-dies-mid-op race). `partitionSelfLast` held us back until
+            // every other target had finished, so nothing is lost when the host
+            // dies — and if the user cancels an unsaved-file prompt, the window
+            // survives and the summary below still reports, exactly once.
+            if (isCurrentWindow(target.wt, windowKey)) {
+              await vscode.commands.executeCommand("workbench.action.closeWindow");
+            }
+          },
+        )),
       );
       reportFailures(failures, linked.length);
     },
@@ -920,14 +945,13 @@ async function closeWindow(clicked?: Node, selected?: Node[]): Promise<void> {
   if (open.length === 0) {
     return;
   }
-  // This window's own worktree goes last: closing it kills the extension host.
-  const ordered = orderSelfLast(open, windowKey);
-
-  if (ordered.length === 1) {
-    await runOne(ordered[0], closeOneWindow);
+  if (open.length === 1) {
+    await runOne(open[0], closeOneWindow);
     return;
   }
-  await runBatch(ordered, `Closing ${ordered.length} windows…`, closeOneWindow);
+  // `runBatch` fans these out and keeps this window's own worktree until last and
+  // alone — closing it kills the extension host.
+  await runBatch(open, `Closing ${open.length} windows…`, closeOneWindow);
 }
 
 /**
