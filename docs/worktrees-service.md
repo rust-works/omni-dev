@@ -254,6 +254,29 @@ file decoration, not description text), which also tints that row's branch label
   shows a hint ("start it with `omni-dev daemon start`") rather than an error dialog,
   and the subscription reconnects with exponential backoff (500 ms → 10 s) once the
   daemon returns. An empty-but-connected daemon shows "No worktrees are open…".
+- **Multi-select (#1357).** The view is `canSelectMany`, so ctrl/cmd+click and
+  shift+click select several rows and every context-menu action acts on the whole
+  selection — the view is a *cross-window aggregate*, so its natural verbs are
+  plural. Three properties of VS Code's `(clicked, selected[])` contract shape the
+  client code: the selection argument is passed **only** when >1 row is selected
+  *and* the clicked row is one of them (so handlers fall back to the clicked node,
+  and never concatenate the two); `when` clauses are evaluated against the
+  **clicked** row alone (so a mixed selection reaches any handler, and every
+  handler re-validates each node rather than trusting `viewItem`); and repo nodes
+  can appear in any selection (handlers filter to what they understand). The
+  ordering hazard is **self-close**: a batch containing *this* window's worktree
+  must close it last, or `workbench.action.closeWindow` kills the extension host
+  mid-loop and the remaining targets are silently skipped. Selection survives the
+  live snapshot churn for free, since it is keyed by `TreeItem.id` — the stable
+  repo-root/worktree-path identity — and not by node object identity.
+- **Three worktree verbs.** Window management and worktree deletion are separate
+  actions (#1357): **Open Worktree** opens/focuses a window per selected worktree;
+  **Close Window** closes the window of any selected worktree — main *or* linked —
+  and deletes nothing; **Close Worktree** is the only destructive one, deleting
+  selected *linked* worktrees and skipping (never silently downgrading) any main
+  working tree in the batch. **Move Claude Session Here** takes a single
+  *destination* rather than a subject, so it is hidden while a multi-selection is
+  active via the built-in `listMultiSelection` context key.
 
 The tree view runs **alongside** the reporter lifecycle (register/heartbeat/
 unregister): every window is both a reporter and, if it has the view open, a reader.
@@ -574,8 +597,10 @@ Where:
     - **Phase 2** (`confirmed:true`, or any `remove:false`) executes. With
       `remove:true` it deletes the (linked) worktree via `git2` prune after
       closing the owning window(s); the reply is `{ removed: true }`. With
-      `remove:false` ("Close Window", the main working tree) it only closes the
-      window; the reply is `{ closed: true }`.
+      `remove:false` ("Close Window") it only closes the window and never inspects
+      git at all — so it applies to **any** worktree, main or linked (#1357); the
+      reply is `{ closed: true }`, and a target with no open window is a no-op
+      success.
   Deletability keys **solely on `is_main`** (structural), never the branch name: a
   linked worktree on the default branch is fully deletable and its branch is kept.
   The daemon **refuses `remove:true` on a main working tree** regardless of the

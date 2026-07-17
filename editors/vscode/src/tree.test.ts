@@ -4,14 +4,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  Node,
   PrBadge,
   TreeRepoPayload,
   TreeWorktreePayload,
+  WorktreeNode,
   checkStateDecoration,
   isCurrentWindow,
   nodeId,
+  orderSelfLast,
+  partitionByRole,
+  partitionByWindow,
   repoLabel,
   reposToNodes,
+  selectionTargets,
   withAheadBehind,
   withPr,
   withoutPrBadges,
@@ -21,6 +27,7 @@ import {
   worktreeLabel,
   worktreeNodes,
   worktreePrBadge,
+  worktreeTargets,
   worktreeTooltip,
 } from "./tree";
 
@@ -372,4 +379,102 @@ test("withoutPrBadges returns the input unchanged when there is nothing to strip
   ];
   // Reference-equal, so an unbadged snapshot allocates nothing.
   assert.equal(withoutPrBadges(repos), repos);
+});
+
+// --- Multi-select target resolution (#1357) ---------------------------------
+
+// A selection's worth of nodes: this window's own main tree ("w1"), a linked
+// worktree open in *another* window ("w2"), and a linked worktree with no window.
+const SELECTION_REPO: TreeRepoPayload = {
+  main_repo: "omni-dev",
+  github: { owner: "rust-works", name: "omni-dev" },
+  root: "/home/me/omni-dev",
+  worktrees: [
+    { path: "/home/me/omni-dev", branch: "main", is_main: true, open: true, window_key: "w1" },
+    { path: "/home/me/wt/a", branch: "a", is_main: false, open: true, window_key: "w2" },
+    { path: "/home/me/wt/b", branch: "b", is_main: false, open: false },
+  ],
+};
+
+const REPO_NODE: Node = { kind: "repo", repo: SELECTION_REPO };
+const SELF_MAIN = { kind: "worktree", repo: SELECTION_REPO, wt: SELECTION_REPO.worktrees[0] } as const;
+const OTHER_LINKED = {
+  kind: "worktree",
+  repo: SELECTION_REPO,
+  wt: SELECTION_REPO.worktrees[1],
+} as const;
+const CLOSED_LINKED = {
+  kind: "worktree",
+  repo: SELECTION_REPO,
+  wt: SELECTION_REPO.worktrees[2],
+} as const;
+
+test("selectionTargets falls back to the clicked node when VS Code passes no selection", () => {
+  // The common case: VS Code omits the second argument unless >1 item is selected
+  // *and* the clicked item is one of them.
+  assert.deepEqual(selectionTargets(SELF_MAIN, undefined), [SELF_MAIN]);
+  // An empty array is the same as none — it must not swallow the clicked node.
+  assert.deepEqual(selectionTargets(SELF_MAIN, []), [SELF_MAIN]);
+});
+
+test("selectionTargets prefers the selection and never double-counts the clicked node", () => {
+  // The clicked node is *inside* the selection VS Code passes; concatenating the
+  // two would process it twice — deleting it twice, opening its PR twice.
+  const targets = selectionTargets(OTHER_LINKED, [SELF_MAIN, OTHER_LINKED]);
+  assert.deepEqual(targets, [SELF_MAIN, OTHER_LINKED]);
+});
+
+test("selectionTargets dedupes by node identity", () => {
+  // Distinct objects for the same row (fresh nodes are minted on every snapshot)
+  // collapse to one, since `nodeId` keys off the path.
+  const copy = { kind: "worktree", repo: SELECTION_REPO, wt: { ...SELECTION_REPO.worktrees[1] } } as const;
+  assert.deepEqual(selectionTargets(undefined, [OTHER_LINKED, copy]), [OTHER_LINKED]);
+});
+
+test("selectionTargets yields nothing when there is neither a click nor a selection", () => {
+  assert.deepEqual(selectionTargets(undefined, undefined), []);
+});
+
+test("worktreeTargets drops repo nodes a mixed selection carries in", () => {
+  assert.deepEqual(worktreeTargets([REPO_NODE, SELF_MAIN, CLOSED_LINKED]), [
+    SELF_MAIN,
+    CLOSED_LINKED,
+  ]);
+  assert.deepEqual(worktreeTargets([REPO_NODE]), []);
+});
+
+test("partitionByRole splits the deletable linked worktrees from the main trees", () => {
+  const { linked, main } = partitionByRole([SELF_MAIN, OTHER_LINKED, CLOSED_LINKED]);
+  assert.deepEqual(linked, [OTHER_LINKED, CLOSED_LINKED]);
+  assert.deepEqual(main, [SELF_MAIN]);
+});
+
+test("partitionByWindow splits the worktrees a window has open from those without", () => {
+  const { open, closed } = partitionByWindow([SELF_MAIN, OTHER_LINKED, CLOSED_LINKED]);
+  assert.deepEqual(open, [SELF_MAIN, OTHER_LINKED]);
+  assert.deepEqual(closed, [CLOSED_LINKED]);
+});
+
+test("orderSelfLast moves this window's own worktree to the end", () => {
+  // The hazard this exists for: closing our own window kills the extension host,
+  // so every target after it would silently never be closed.
+  const ordered = orderSelfLast([SELF_MAIN, OTHER_LINKED, CLOSED_LINKED], "w1");
+  assert.deepEqual(ordered, [OTHER_LINKED, CLOSED_LINKED, SELF_MAIN]);
+});
+
+test("orderSelfLast leaves a batch without this window's worktree untouched", () => {
+  const batch: WorktreeNode[] = [OTHER_LINKED, CLOSED_LINKED];
+  assert.deepEqual(orderSelfLast(batch, "w1"), batch);
+  // No window key (never registered) can never match, so nothing moves.
+  assert.deepEqual(orderSelfLast([SELF_MAIN, OTHER_LINKED], undefined), [SELF_MAIN, OTHER_LINKED]);
+  // A worktree open in *another* window is not self, however similar it looks.
+  assert.deepEqual(orderSelfLast([OTHER_LINKED, CLOSED_LINKED], "w2"), [
+    CLOSED_LINKED,
+    OTHER_LINKED,
+  ]);
+});
+
+test("orderSelfLast handles a batch of only this window's worktree", () => {
+  assert.deepEqual(orderSelfLast([SELF_MAIN], "w1"), [SELF_MAIN]);
+  assert.deepEqual(orderSelfLast([], "w1"), []);
 });
