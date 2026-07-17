@@ -272,11 +272,14 @@ appears on **every** worktree in the view — the one open in this window and th
 open in others (and closed worktrees when shown) — and the hover tooltip adds a
 `PR #<n> · open/draft · checks …` line.
 
-A right-click **"Open Pull Request…"** action on any GitHub worktree (or repo)
-opens its PR **as a tab inside the editor** — never a browser. It discovers the
-PR(s) via `gh` (a quick-pick when several match) and hands off to the **GitHub
-Pull Requests** extension (`GitHub.vscode-pull-request-github`); if that extension
-is absent it offers to install it or copy the PR URL.
+Two right-click actions on any GitHub worktree (or repo) open its PR, sharing one
+discovery flow — `gh` finds the PR(s) (a quick-pick when several match) — and
+differing only in where they open it. **"Open Pull Request…"** opens it **as a tab
+inside the editor**, never a browser: it hands off to the **GitHub Pull Requests**
+extension (`GitHub.vscode-pull-request-github`), and if that extension is absent it
+offers to install it or copy the PR URL. **"Open Pull Request in Browser…"** is the
+explicit way to ask for a browser instead — it opens the PR's `github.com` page in
+the OS default browser and needs no extension.
 
 - **Resolved by the daemon, and kept live (#1337).** PR state rides the `tree`
   payload as a per-worktree `pr` object, resolved by a background poller in the

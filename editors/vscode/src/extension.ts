@@ -27,7 +27,7 @@ import {
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
-import { openPullRequest } from "./prCommands";
+import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import {
@@ -414,6 +414,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",
       (node?: Node) => void openPullRequest(node),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.openPullRequestInBrowser",
+      (node?: Node) => void openPullRequestInBrowser(node),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.moveClaudeSessionHere",
