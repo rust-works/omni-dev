@@ -11,7 +11,7 @@ conventional commit formats with project-aware suggestions.
 
 ## 🎬 See It In Action
 
-[![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
+[![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.png)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
 
 *Watch omni-dev transform messy commits into professional ones with AI-powered analysis*
 
