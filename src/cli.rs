@@ -11,8 +11,8 @@ pub mod completions;
 pub mod config;
 pub mod coverage;
 // The daemon and the Snowflake client (which talks to the daemon over its
-// Unix-domain control socket) are Unix-only; running them on Windows is future
-// work (#1237).
+// Unix-domain control socket) are Unix-only; on Windows they run only under WSL2,
+// and a native (non-WSL) Windows port is future work (#1363).
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
