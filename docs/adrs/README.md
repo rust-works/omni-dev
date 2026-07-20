@@ -77,3 +77,4 @@ by Michael Nygard.
 | [ADR-0051](adr-0051.md)  | ✅ Accepted                              | 2026-07-14 | Do Not Pre-Trust Daemon-Opened Worktree Windows; Recommend Parent-Folder Trust              |
 | [ADR-0052](adr-0052.md)  | ✅ Accepted                              | 2026-07-15 | Cross-Window Claude Code Sessions Tracker as a Daemon Service Fed by Three Feeds            |
 | [ADR-0053](adr-0053.md)  | ✅ Accepted                              | 2026-07-15 | Worktree PR Badges Resolved in the Daemon via `gh api graphql`                              |
+| [ADR-0054](adr-0054.md)  | ✅ Accepted                              | 2026-07-20 | Native Windows Daemon Control Plane on a Per-User Named Pipe with Detached-Spawn Activation |
