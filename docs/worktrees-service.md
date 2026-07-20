@@ -408,6 +408,14 @@ active mode as `pr_source` on every snapshot). Both sources feed the **same**
   was offline beyond retention. Configure it with `OMNI_DEV_WEBHOOK_BUFFER_URL` and
   `OMNI_DEV_WEBHOOK_READ_TOKEN` (or `…_PATH`); install the webhook with
   [`omni-dev daemon webhook register`](#cli).
+  - **On (re)start the source re-walks the whole retained KV window** (`since=""`),
+    replaying every retained delivery into the aggregator, so it rebuilds as much
+    verdict/metadata/activity state as the buffer still holds rather than starting cold.
+    The aggregator is in-memory, so the pull cursor is deliberately **not** persisted —
+    resuming from a saved cursor would skip exactly the history a restart should recover.
+    The buffer is the source of truth; the reconcile then fills what the window cannot
+    (checks that finished before retention; metadata for a branch with no captured
+    `pull_request` event).
 - **The reconcile is cost-split by webhook-backed-ness.** `register` marks a repo
   **webhook-backed** (a per-repo set persisted in `webhook-backed.json`, set via the
   `set-webhook-backed` op); `remove` unmarks it. A backed repo's reconcile uses a

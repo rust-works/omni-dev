@@ -53,15 +53,6 @@ pub fn webhook_token_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("webhook.token"))
 }
 
-/// Default webhook-buffer pull-cursor path: `<runtime_dir>/webhook.cursor`.
-///
-/// The webhook PR source persists its `/events` cursor here so a daemon restart
-/// resumes where it left off rather than re-pulling the whole retention window
-/// (#1384). Non-secret, but co-located with the other `0600` runtime state.
-pub fn webhook_cursor_path() -> Result<PathBuf> {
-    Ok(runtime_dir()?.join("webhook.cursor"))
-}
-
 /// Default PR-source-mode preference path: `<runtime_dir>/pr-source.json`.
 ///
 /// The worktrees service persists which live PR-status source is active

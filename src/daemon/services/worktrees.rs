@@ -912,24 +912,16 @@ impl WorktreesService {
     /// [`PrStatusCache::replace`] (which swaps the whole map). Resolves the config,
     /// cadences, and `gh` binary once at spawn.
     pub fn start_webhook_source(&self) {
-        // Only wire the persisted cursor when a real buffer is configured — an
-        // unconfigured service (tests) does no cursor I/O at all.
-        let cursor_path = if self.webhook_config.is_configured() {
-            crate::daemon::paths::webhook_cursor_path().ok()
-        } else {
-            None
-        };
         self.start_webhook_source_with(
             self.webhook_config.clone(),
             webhook_pull_interval(),
             webhook_reconcile_interval(),
             crate::pr_status::resolve_gh_binary(),
-            cursor_path,
         );
     }
 
     /// [`start_webhook_source`](Self::start_webhook_source) with explicit config,
-    /// cadences, `gh` binary, and cursor path — the test seam, mirroring
+    /// cadences, and `gh` binary — the test seam, mirroring
     /// [`start_pr_poller_with`](Self::start_pr_poller_with). Idempotent and a no-op
     /// outside a tokio runtime.
     fn start_webhook_source_with(
@@ -938,7 +930,6 @@ impl WorktreesService {
         pull: Duration,
         reconcile: Duration,
         gh_bin: PathBuf,
-        cursor_path: Option<PathBuf>,
     ) {
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::debug!("no tokio runtime; worktrees webhook source not started");
@@ -984,7 +975,16 @@ impl WorktreesService {
             };
 
             let mut agg = WebhookAggregator::new();
-            let mut cursor = cursor_path.as_deref().map(load_cursor).unwrap_or_default();
+            // Start from the beginning of the retained window (`since=""`) so the
+            // first drain **re-walks the whole KV buffer** into the aggregator,
+            // rebuilding as much verdict/metadata/activity state as the buffer still
+            // holds (#1384). This is deliberately *not* resumed from a persisted
+            // cursor: the aggregator is in-memory, so resuming would start it cold
+            // and throw away exactly the history a restart should recover. The buffer
+            // is the source of truth; the cursor only advances in-session from here.
+            // (The reconcile fills what the window cannot: checks that finished before
+            // retention, and metadata for repos with no captured `pull_request` event.)
+            let mut cursor = String::new();
             // The reconcile result is the base map for every watched target; it is
             // refreshed only every `reconcile`, and reused between refreshes.
             let mut reconcile_map: HashMap<PrTarget, PrResolution> = HashMap::new();
@@ -1030,9 +1030,6 @@ impl WorktreesService {
                                     }
                                 }
                                 cursor = page.cursor;
-                                if let Some(path) = &cursor_path {
-                                    persist_cursor(path, &cursor);
-                                }
                                 // A successful pull — even an empty one — is the
                                 // "connected" signal; record it and clear any error.
                                 {
@@ -1779,34 +1776,6 @@ fn now_epoch_ms() -> u64 {
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
-}
-
-/// Reads the persisted webhook pull cursor, or `""` (pull from the start of the
-/// retained window) when the file is absent or unreadable. Best-effort: a missing
-/// cursor just re-pulls a bounded window, which the buffer's KV TTL caps.
-fn load_cursor(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Persists the webhook pull cursor (`0600`, co-located with the other runtime
-/// state). Best-effort: a write failure is logged at DEBUG and swallowed — the
-/// loop keeps the cursor in memory, so only a restart would re-pull a bounded
-/// window.
-fn persist_cursor(path: &Path, cursor: &str) {
-    if let Some(parent) = path.parent() {
-        if let Err(err) = crate::daemon::paths::ensure_dir_0700(parent) {
-            tracing::debug!("could not ensure webhook cursor dir: {err:#}");
-            return;
-        }
-    }
-    if let Err(err) = crate::daemon::paths::write_file_0600(path, cursor.as_bytes()) {
-        tracing::debug!(
-            "could not persist webhook cursor to {}: {err:#}",
-            path.display()
-        );
-    }
 }
 
 /// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
@@ -5316,13 +5285,12 @@ mod tests {
         .await
         .unwrap();
         // Start the source directly (test seam): empty config → reconcile-only,
-        // millisecond cadence, no cursor file.
+        // millisecond cadence.
         svc.start_webhook_source_with(
             WebhookBufferConfig::default(),
             Duration::from_millis(50),
             Duration::from_millis(50),
             fake,
-            None,
         );
 
         let badge = tokio::time::timeout(Duration::from_secs(30), async {
