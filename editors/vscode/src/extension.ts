@@ -20,6 +20,7 @@ import {
   sendEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
+  setPollingEnvelope,
   setShowClosedEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -43,6 +44,7 @@ import {
   partitionByRole,
   partitionByWindow,
   partitionSelfLast,
+  repoLabel,
   selectionTargets,
   withoutPrBadges,
   worktreeLabel,
@@ -67,6 +69,14 @@ const TREE_VIEW_ID = "omniDevWorktrees.tree";
  * to `true` — show all worktrees — until the first snapshot lands.
  */
 const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
+
+/**
+ * The `when`-clause context key mirroring the global `showPullRequests` setting,
+ * so the per-repo "Enable/Disable PR Polling" menu items are hidden while PR
+ * badges are globally off — the master switch (#1376). Set from the setting on
+ * activation and on every configuration change (see {@link applyShowPullRequests}).
+ */
+const SHOW_PR_KEY = "omniDevWorktrees.showPullRequests";
 
 /**
  * How close (ms) two clicks on the same item must be to count as a double-click.
@@ -369,6 +379,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // the daemon's pushed `show_closed` is authoritative and updates both the
   // moment the first snapshot lands (#1301) — no per-window `globalState`.
   applyShowClosed(true);
+  // Seed the PR-master context key + icon-colour flag from the current setting
+  // (#1376), so the per-repo toggle menu and green icons reflect it from frame one.
+  applyShowPullRequests();
 
   // `canSelectMany` makes every item command plural: VS Code then invokes them as
   // `(clicked, selected[])`, and each handler resolves its targets through
@@ -473,6 +486,27 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.showClosedWorktrees",
       () => void setShowClosed(true),
     ),
+    // The per-repo PR-poll toggle (#1376): each acts on the GitHub repo node(s)
+    // right-clicked, sending the daemon a `set-polling` op. The daemon holds the
+    // (persisted) state and re-pushes a snapshot, so the icon/badges reconcile
+    // from the snapshot — the `set-show-closed` pattern, no local write.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.enablePolling",
+      (node?: Node, selected?: Node[]) => void setPolling(node, selected, true),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.disablePolling",
+      (node?: Node, selected?: Node[]) => void setPolling(node, selected, false),
+    ),
+    // Keep the PR-master context key + icon colour in sync when the user flips
+    // `showPullRequests`, so the toggle menu and green icons respond immediately
+    // rather than at the next ~10s snapshot.
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration(`${CONFIG_SECTION}.showPullRequests`)) {
+        applyShowPullRequests();
+        void refreshTree();
+      }
+    }),
   );
 }
 
@@ -500,6 +534,58 @@ function applyShowClosed(showClosed = true): void {
  */
 async function setShowClosed(showClosed: boolean): Promise<void> {
   await send(setShowClosedEnvelope(showClosed));
+}
+
+/**
+ * Applies the global `showPullRequests` setting to this window's UI (#1376):
+ * flips the `when`-clause context key that hides the per-repo "Enable/Disable PR
+ * Polling" menu while PR badges are globally off (the master switch), and tells
+ * the provider to grey repo icons accordingly. Pure local UI — the per-repo poll
+ * state lives in the daemon.
+ */
+function applyShowPullRequests(): void {
+  const on = showPullRequests();
+  void vscode.commands.executeCommand("setContext", SHOW_PR_KEY, on);
+  provider?.setShowPullRequests(on);
+}
+
+/**
+ * Enables or disables PR polling for the GitHub repo node(s) among the command
+ * targets (#1376), sending the daemon one `set-polling` op per distinct repo. It
+ * covers every worktree of the repo — the daemon keys by `owner/name`. The daemon
+ * holds the (persisted) state and re-pushes a snapshot, so the icon recolours and
+ * badges drop/appear from that snapshot; this handler writes nothing locally. A
+ * missing daemon is a silent no-op (the shared `send` logs it).
+ */
+async function setPolling(
+  clicked: Node | undefined,
+  selected: Node[] | undefined,
+  enabled: boolean,
+): Promise<void> {
+  const seen = new Set<string>();
+  const labels: string[] = [];
+  for (const node of selectionTargets(clicked, selected)) {
+    if (node.kind !== "repo" || !node.repo.github) {
+      continue;
+    }
+    const gh = node.repo.github;
+    const key = `${gh.owner}/${gh.name}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    await send(setPollingEnvelope(gh, enabled));
+    labels.push(repoLabel(node.repo));
+  }
+  if (labels.length > 0) {
+    const what = labels.length === 1 ? labels[0] : `${labels.length} repositories`;
+    // Enabling is a time-boxed lease (#1376): the daemon auto-disables the repo
+    // after ~15 minutes, so say so rather than implying it stays on forever.
+    const message = enabled
+      ? `Enabled PR polling for ${what} — auto-disables after 15 min`
+      : `Disabled PR polling for ${what}`;
+    vscode.window.setStatusBarMessage(message, 4000);
+  }
 }
 
 /**
