@@ -13,6 +13,8 @@ pub(crate) mod stop;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::daemon::protocol::StatusReport;
+
 /// Daemon: host long-lived services (e.g. the browser bridge) under one
 /// supervised, menu-bar-controllable process.
 #[derive(Parser)]
@@ -43,26 +45,59 @@ pub enum DaemonSubcommands {
     Service(service::ServiceCommand),
 }
 
-/// Prints a non-fatal warning when the resident daemon's version differs from
-/// this CLI binary's — the client is driving a stale daemon after a binary
-/// upgrade (#1113). A `None` daemon version (a pre-#1113 daemon that advertises
-/// none) is treated as unknown and never warns.
-pub(crate) fn warn_version_mismatch(daemon_version: Option<&str>) {
-    if let Some(daemon) = daemon_version {
-        if is_version_stale(daemon_version, crate::VERSION) {
-            eprintln!(
-                "warning: omni-dev CLI v{} is talking to daemon v{daemon}; \
-                 run `omni-dev daemon restart` to upgrade the resident daemon",
-                crate::VERSION
-            );
-        }
+/// Prints a non-fatal warning when the resident daemon differs from this CLI
+/// binary — the client is driving a stale daemon after a binary upgrade (#1113).
+///
+/// Comparison prefers the git commit SHA when both sides know theirs, so a
+/// rebuilt-but-same-crate-version daemon the CLI has outrun is still flagged
+/// (#1374); it falls back to crate-version string equality otherwise. A daemon
+/// that advertises neither is treated as unknown and never warns.
+pub(crate) fn warn_version_mismatch(report: &StatusReport) {
+    if is_daemon_stale(
+        report.version.as_deref(),
+        report.provenance.commit_long.as_deref(),
+        crate::VERSION,
+        crate::build_info::GIT_SHA,
+    ) {
+        let cli = describe_build(crate::VERSION, crate::build_info::GIT_SHA_SHORT);
+        let daemon = describe_build(
+            report.version.as_deref().unwrap_or("unknown"),
+            report.provenance.commit.as_deref(),
+        );
+        eprintln!(
+            "warning: omni-dev CLI {cli} is talking to daemon {daemon}; \
+             run `omni-dev daemon restart` to upgrade the resident daemon"
+        );
     }
 }
 
-/// Whether a daemon advertising `daemon_version` is stale relative to a CLI of
-/// `cli_version`. A daemon that advertises no version (`None`) is never stale.
-fn is_version_stale(daemon_version: Option<&str>, cli_version: &str) -> bool {
-    matches!(daemon_version, Some(v) if v != cli_version)
+/// Whether a resident daemon is stale relative to this CLI. When both sides
+/// report a commit SHA the comparison is commit-level (catching a same-version
+/// rebuild); otherwise it falls back to crate-version string equality. A daemon
+/// that advertises no version and no commit is never stale.
+fn is_daemon_stale(
+    daemon_version: Option<&str>,
+    daemon_commit: Option<&str>,
+    cli_version: &str,
+    cli_commit: Option<&str>,
+) -> bool {
+    match (cli_commit, daemon_commit) {
+        // Both know their commit: a mismatch means different code even at the
+        // same crate version (#1374).
+        (Some(cli), Some(daemon)) => cli != daemon,
+        // Otherwise fall back to crate-version equality (a pre-#1374 daemon, or
+        // a build with no git metadata on either side).
+        _ => matches!(daemon_version, Some(v) if v != cli_version),
+    }
+}
+
+/// Formats a `v<version> (<short-sha>)` build descriptor, omitting the commit
+/// when unknown.
+fn describe_build(version: &str, short_commit: Option<&str>) -> String {
+    match short_commit {
+        Some(commit) => format!("v{version} ({commit})"),
+        None => format!("v{version}"),
+    }
 }
 
 /// Sends one operation to a named daemon service over the control socket and
@@ -166,24 +201,53 @@ mod tests {
     }
 
     #[test]
-    fn is_version_stale_only_warns_on_a_known_mismatch() {
-        // Same version → not stale.
-        assert!(!is_version_stale(Some("1.2.3"), "1.2.3"));
-        // A different advertised version → stale (either direction).
-        assert!(is_version_stale(Some("1.2.2"), "1.2.3"));
-        assert!(is_version_stale(Some("1.3.0"), "1.2.3"));
-        // A daemon that advertises no version is never treated as stale.
-        assert!(!is_version_stale(None, "1.2.3"));
+    fn is_daemon_stale_falls_back_to_version_when_a_commit_is_unknown() {
+        // No commits known on either side → crate-version string comparison.
+        assert!(!is_daemon_stale(Some("1.2.3"), None, "1.2.3", None));
+        assert!(is_daemon_stale(Some("1.2.2"), None, "1.2.3", None));
+        assert!(is_daemon_stale(Some("1.3.0"), None, "1.2.3", None));
+        // A daemon that advertises neither version nor commit is never stale.
+        assert!(!is_daemon_stale(None, None, "1.2.3", None));
+        // One side missing a commit still falls back to the version compare.
+        assert!(is_daemon_stale(Some("1.2.2"), None, "1.2.3", Some("aaaa")));
+        assert!(is_daemon_stale(Some("1.2.2"), Some("bbbb"), "1.2.3", None));
+    }
+
+    #[test]
+    fn is_daemon_stale_compares_on_commit_when_both_are_known() {
+        // Same crate version, different commit → stale (the #1374 blind-spot fix).
+        assert!(is_daemon_stale(
+            Some("1.2.3"),
+            Some("bbbbbbbb"),
+            "1.2.3",
+            Some("aaaaaaaa")
+        ));
+        // Same commit → not stale, regardless of any version noise.
+        assert!(!is_daemon_stale(
+            Some("1.2.3"),
+            Some("aaaaaaaa"),
+            "1.2.3",
+            Some("aaaaaaaa")
+        ));
     }
 
     #[test]
     fn warn_version_mismatch_covers_every_branch_without_panicking() {
-        // Exercises the print branch (a known mismatch) and both no-op branches
-        // (a matching version, and a daemon advertising none). It writes to
-        // stderr, so there is nothing to assert beyond it not panicking.
-        warn_version_mismatch(Some("0.0.0-mismatch"));
-        warn_version_mismatch(Some(crate::VERSION));
-        warn_version_mismatch(None);
+        // Exercises the print branch (a commit mismatch) and the no-op branches
+        // (matching, and a daemon advertising nothing). It writes to stderr, so
+        // there is nothing to assert beyond it not panicking.
+        let mismatch = StatusReport {
+            version: Some("0.0.0-mismatch".to_string()),
+            provenance: crate::build_info::Provenance {
+                commit: Some("deadbeef".to_string()),
+                commit_long: Some("deadbeefdeadbeef".to_string()),
+                ..crate::build_info::Provenance::default()
+            },
+            ..StatusReport::default()
+        };
+        warn_version_mismatch(&mismatch);
+        warn_version_mismatch(&StatusReport::current(vec![]));
+        warn_version_mismatch(&StatusReport::default());
     }
 
     #[tokio::test]
