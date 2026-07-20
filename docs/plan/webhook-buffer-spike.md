@@ -1,6 +1,6 @@
 # Webhook Buffer Spike — Confirming the CI Signal Is Available
 
-**Status:** Aspirational — spike infrastructure ready, results pending (owned-repo capture not yet run).
+**Status:** Built — spike complete; **Go**. Live capture on `rust-works/omni-dev` (PR [#1383], 80 real events) confirms every needed field is obtainable and the rollup reconstructs to the true CI verdict.
 
 **ADRs:** [ADR-0053](../adrs/adr-0053.md) · [ADR-0040](../adrs/adr-0040.md) · [ADR-0036](../adrs/adr-0036.md) · [ADR-0003](../adrs/adr-0003.md)
 
@@ -70,13 +70,17 @@ is filled from live capture (see [Results](#results)).
 
 | Needed field           | `check_run`                                    | `check_suite`                              | `status`                                  | `pull_request`                     | Confirmed? |
 |------------------------|------------------------------------------------|--------------------------------------------|-------------------------------------------|------------------------------------|:----------:|
-| 1 owner / name         | ✅ `repository.owner.login` / `.name`          | ✅ same                                    | ✅ same                                   | ✅ same                            |   _TBD_    |
-| 2 branch (ref)         | ⚠️ `check_run.check_suite.head_branch` (nullable) | ⚠️ `check_suite.head_branch` (nullable) | ⚠️ `branches[]` (only refs whose head **is** this sha) | ✅ `pull_request.head.ref`      |   _TBD_    |
-| 3 head oid             | ✅ `check_run.head_sha`                         | ✅ `check_suite.head_sha`                  | ✅ `sha`                                  | ✅ `pull_request.head.sha`         |   _TBD_    |
-| 4 check state          | ✅ `status` + `conclusion` (per run)           | ✅ `status` + `conclusion` (per **suite**, one app) | ✅ `state` (per context)         | ❌                                 |   _TBD_    |
-| 5 PR number            | ⚠️ `check_run.pull_requests[].number` (empty for forks) | ⚠️ `check_suite.pull_requests[]`  | ❌                                        | ✅ `number`                        |   _TBD_    |
-| 6 PR isDraft           | ❌                                             | ❌                                         | ❌                                        | ✅ `pull_request.draft`            |   _TBD_    |
-| 7 PR url (html)        | ⚠️ `pull_requests[].url` is the **API** URL, not `html_url` | ⚠️ same                       | ❌                                        | ✅ `pull_request.html_url`         |   _TBD_    |
+| 1 owner / name         | ✅ `repository.owner.login` / `.name`          | ✅ same                                    | ✅ same                                   | ✅ same                            | ✅ live       |
+| 2 branch (ref)         | ⚠️ `check_run.check_suite.head_branch` (nullable) | ⚠️ `check_suite.head_branch` (nullable) | ⚠️ `branches[]` (only refs whose head **is** this sha) | ✅ `pull_request.head.ref`      | ✅ **not null** |
+| 3 head oid             | ✅ `check_run.head_sha`                         | ✅ `check_suite.head_sha`                  | ✅ `sha`                                  | ✅ `pull_request.head.sha`         | ✅ live       |
+| 4 check state          | ✅ `status` + `conclusion` (per run)           | ✅ `status` + `conclusion` (per **suite**, one app) | ✅ `state` (per context)         | ❌                                 | ✅ live²      |
+| 5 PR number            | ⚠️ `check_run.pull_requests[].number` (empty for forks) | ⚠️ `check_suite.pull_requests[]`  | ❌                                        | ✅ `number`                        | ✅ live¹      |
+| 6 PR isDraft           | ❌                                             | ❌                                         | ❌                                        | ✅ `pull_request.draft`            | ✅ PR-event only |
+| 7 PR url (html)        | ⚠️ `pull_requests[].url` is the **API** URL, not `html_url` | ⚠️ same                       | ❌                                        | ✅ `pull_request.html_url`         | ✅ PR-event only |
+
+Live capture: 80 relevant events on `rust-works/omni-dev` (PR [#1383]) — 73 `check_run`, 5 `check_suite`, 2 `pull_request`; **0 `status`**.
+¹ PR number present on PR-branch check events (72/73); the one `n/a` is a push to `main` (no associated PR — correct).
+² `status` events were **not emitted** — this repo's CI uses the Checks API (`check_run`/`check_suite`), not legacy commit statuses, so the `status` column stays at documented-schema confidence.
 
 ### What the hypothesis already tells us (the likely findings to confirm)
 
@@ -147,15 +151,43 @@ runbook in its [`README.md`](../../deploy/webhook-buffer/README.md); summary:
 
 ## Results
 
-_Not yet run against live owned-repo captures. Fill from the verifier output._
+**Outcome: Go.** Captured live on `rust-works/omni-dev` via PR [#1383] — 80 relevant
+deliveries (73 `check_run`, 5 `check_suite`, 2 `pull_request`; plus 1 `ping`), through the
+deployed capture Worker, read back with `verify-fields.mjs`.
 
-- **Field matrix (live):** _TBD_
-- **Rollup reconstruction vs GraphQL poll:** _TBD_
-- **`head_branch` populated on owned-repo pushes?** _TBD_
-- **`pull_requests[]` populated / timely on check events?** _TBD_
-- **Deltas needed to rebuild the current-commit verdict (event count, ordering):** _TBD_
+- **Field matrix (live):** repo, branch, and head_sha present on **100%** of `check_run`
+  (73/73), `check_suite` (5/5), and `pull_request` (2/2). Check state present on every check
+  event. PR number present on PR-branch check events (72/73) and both `pull_request` events.
+  `isDraft` and the browser `html_url` present **only** on `pull_request` (check events carry
+  the REST `api` url) — the metadata split is real and exactly as hypothesised.
+- **Rollup reconstruction vs the real CI verdict:** the verifier rebuilt the badge verdict
+  per `(repo, branch, head_sha)` from the raw per-check stream and matched the *actual* CI
+  result at **both** commits of this PR — `dd15e4a1` (pre-fix) → **Failure** (18 Success + the
+  one failed Commit Message Check), `3aec0a5b` (fixed head) → **Success** (19/19). A `main`
+  push at `9fc5bb69` → Success (2). No false pass, no false fail.
+- **`head_branch` populated on owned-repo pushes?** **Yes** — 73/73 `check_run` and 5/5
+  `check_suite` carried the branch. The fork-nullability risk does not apply to owned,
+  same-repo branches; field #2 resolves from ⚠️ to ✅.
+- **`pull_requests[]` populated / timely on check events?** **Yes for PR-branch checks**
+  (72/73 carried PR number + api-url). The single miss is the `main`-push check event, which
+  correctly has no associated PR. But `isDraft` is never on check events, and the url there is
+  the REST api url — so PR draft + browser url must come from the `pull_request` event (or the
+  reconcile poll).
+- **Deltas needed to rebuild the verdict:** ~19 `check_run`/`check_suite` deliveries per
+  commit (each Actions job emits `queued`→`in_progress`→`completed`); reducing to the latest
+  state per check name converges cleanly. `status` events were not emitted (Checks-API CI), so
+  a repo relying on legacy status contexts stays at documented-schema confidence here.
+
+**Design implication (confirmed):** the **CI-events-drive-the-verdict,
+`pull_request`-event-(plus reconcile poll)-fill-the-PR-metadata** design is viable.
+`isDraft` and `html_url` are the *only* needed fields absent from the CI stream, and both are
+supplied by the `pull_request` event — which the capture confirmed arrives.
 
 ## Decision criteria
+
+**→ Met: Go.** All seven fields are obtainable (with `isDraft`/`html_url` off the
+`pull_request` event), and the reconstructed rollup matched the true CI verdict at both a
+failed and a passing commit. [#1378] proceeds with the merge/fill design below.
 
 - **Go** — every needed field (#1–7) is obtainable from the event stream (directly or via
   the `pull_request`-event / reconcile-poll fill), and the reconstructed rollup matches the
