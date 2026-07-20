@@ -502,7 +502,10 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
     //    show/hide-closed toggle at its default (show all).
     let initial = read_frame(&mut reader).await;
     assert!(initial.ok, "initial frame errored: {:?}", initial.error);
-    assert_eq!(initial.payload, json!({ "repos": [], "show_closed": true }));
+    assert_eq!(
+        initial.payload,
+        json!({ "repos": [], "show_closed": true, "pr_source": "poll" })
+    );
 
     // 2) A window opens on a real git repo → a fresh snapshot carrying it.
     let repo_dir = tempfile::tempdir().unwrap();
@@ -544,7 +547,7 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
     let removed = read_frame(&mut reader).await;
     assert_eq!(
         removed.payload,
-        json!({ "repos": [], "show_closed": true }),
+        json!({ "repos": [], "show_closed": true, "pr_source": "poll" }),
         "expected the post-unregister empty frame, not a duplicate of the repo frame"
     );
 
@@ -616,11 +619,11 @@ async fn set_show_closed_live_syncs_across_subscribers() {
     let (mut b, _b_w) = open_subscription(&socket).await;
     assert_eq!(
         read_frame(&mut a).await.payload,
-        json!({ "repos": [], "show_closed": true })
+        json!({ "repos": [], "show_closed": true, "pr_source": "poll" })
     );
     assert_eq!(
         read_frame(&mut b).await.payload,
-        json!({ "repos": [], "show_closed": true })
+        json!({ "repos": [], "show_closed": true, "pr_source": "poll" })
     );
 
     // A third client flips the toggle. The daemon holds the single cross-window
@@ -639,12 +642,12 @@ async fn set_show_closed_live_syncs_across_subscribers() {
     // neither had to reload, and neither is the one that sent the op.
     assert_eq!(
         read_frame(&mut a).await.payload,
-        json!({ "repos": [], "show_closed": false }),
+        json!({ "repos": [], "show_closed": false, "pr_source": "poll" }),
         "window A should live-sync the toggle flip"
     );
     assert_eq!(
         read_frame(&mut b).await.payload,
-        json!({ "repos": [], "show_closed": false }),
+        json!({ "repos": [], "show_closed": false, "pr_source": "poll" }),
         "window B should live-sync the toggle flip"
     );
 
@@ -653,7 +656,7 @@ async fn set_show_closed_live_syncs_across_subscribers() {
     let (mut c, _c_w) = open_subscription(&socket).await;
     assert_eq!(
         read_frame(&mut c).await.payload,
-        json!({ "repos": [], "show_closed": false }),
+        json!({ "repos": [], "show_closed": false, "pr_source": "poll" }),
         "a newly-opened window should see the current toggle on its first frame"
     );
 
