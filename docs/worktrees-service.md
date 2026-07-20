@@ -331,6 +331,20 @@ the OS default browser and needs no extension.
   you committed** — so the loop looks often and cheaply, and pays only on a change.
   Override the fetch cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds). The
   daemon pushes to windows only when a verdict actually moves.
+- **Per-repository, off by default, and time-boxed (#1376).** Polling is opt-in
+  **per repo**: the daemon polls a repo's badges only once you enable it
+  (right-click the repo → **Enable PR Polling**), so a repo it is not polling
+  issues **zero** `gh`. With many repos open but only a couple in active work, this
+  is the difference between polling all of them and polling the two that matter. An
+  enable is a **15-minute lease** — the repo **auto-disables** when it elapses (and
+  re-enabling refreshes it), so an idle repo stops costing budget even if you never
+  turn it off. The repo icon is **green** while polling and **gray** when off; the
+  choice covers every worktree/branch of the repo and is **persisted** (with its
+  expiry) in `worktrees-polling.json` (`0600`), so a restart within the window
+  keeps the remaining lease. Disabling — or letting a lease expire — drops the
+  repo's badges on the next snapshot. See the
+  [`set-polling` / `polling_enabled`](#companion-contract-for-the-extension-and-other-clients)
+  contract entry.
 - **A commit invalidates the verdict immediately.** Each badge records the commit
   its verdict describes; when that differs from the worktree's `head_sha` the row
   renders ● rather than the previous commit's ✓ — no network call, on the very next
@@ -367,7 +381,10 @@ the OS default browser and needs no extension.
   extension-side: no daemon, wire, or trust-boundary change.
 - **Opt-out.** The `omniDevWorktrees.showPullRequests` setting (default on) hides
   the badge. Since the daemon now supplies it on the snapshot, the setting strips
-  it on the way in rather than skipping a lookup.
+  it on the way in rather than skipping a lookup. It is the **master switch** above
+  the per-repo toggle (#1376): when off, badges are stripped and repo icons render
+  gray regardless of per-repo state, and the "Enable/Disable PR Polling" menu items
+  are hidden.
 
 ## Workspace Trust (Restricted Mode)
 
@@ -609,9 +626,10 @@ Ops:
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
+| `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first nine ops are strictly **request → one reply**. `subscribe` is the one
+The first ten ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
@@ -730,6 +748,37 @@ Where:
   filter itself is client-side — `show_closed` only tells each window which way to
   filter, so the `repos` payload is unchanged (a repo, derived from open windows,
   always keeps ≥1 open worktree, so hiding never empties it).
+- `set-polling` / `polling_enabled` — the **per-repository PR-poll toggle**
+  (#1376). PR-badge polling defaults **off**: the daemon polls a repo's badges
+  only once the user enables it, so a repo it is not polling issues **zero** `gh`
+  (the poll's single `gh api graphql` never mentions it). `set-polling` (payload
+  `{ owner, name, enabled }`) flips one GitHub repo — covering **all** its
+  worktrees/branches, since it is keyed by `owner/name` — and, like
+  `set-show-closed`, an effective off→on/on→off change re-pushes a snapshot to
+  every subscriber. Each repo in the `tree`/`subscribe` snapshot carries
+  `polling_enabled: true` while the daemon is polling it (omitted, i.e. false,
+  otherwise — so a not-polled repo and a pre-#1376 daemon are byte-identical). The
+  companion colours the repo icon **green** when set and **gray** when not, and
+  gates its "Enable/Disable PR Polling" context-menu items on it. Disabling a repo
+  also drops its badges immediately: the snapshot build skips folding badges onto a
+  not-polled repo, so the next pushed frame strips them without waiting for a poll.
+- **Enabling is a 15-minute lease, not a permanent flag.** Each `set-polling`
+  enable leases the repo for **15 minutes**, after which it **auto-disables** — so
+  an idle repo stops costing `gh` even if the user forgets to turn it off, which is
+  the whole budget win. Re-enabling refreshes the lease; **Disable** ends it early.
+  Expiry is enforced lazily, reaped on read the same way stale windows are: within
+  one snapshot tick (~10 s) of a lease elapsing, the repo drops `polling_enabled`,
+  its badges strip, and the poller stops watching it. The lease state is
+  **persisted** under the daemon data dir (`<data_dir>/omni-dev/worktrees-polling.json`,
+  `0600`, storing each enabled repo **with its expiry**), so a daemon restart
+  within the window keeps the *remaining* lease rather than resetting the clock;
+  an already-expired lease is dropped on load. The extension-only global
+  `omniDevWorktrees.showPullRequests` setting is a master switch above all of this:
+  when off, the companion strips badges and greys icons regardless. (The daemon
+  cannot see that extension-only setting, so an explicitly-enabled repo would still
+  be polled while the global is off — a benign known gap, since default-off already
+  means nothing is polled until a repo is enabled, and the lease caps it at 15 min
+  anyway.)
 - A `list` `entry` is
   `{ key, folders[], repo?, title?, pid?, branch?, head_sha?, upstream_sha?, ahead?,
   behind?, main_repo?, is_worktree?, last_seen }` with `last_seen` as an RFC 3339
