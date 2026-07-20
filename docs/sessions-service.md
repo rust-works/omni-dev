@@ -222,6 +222,6 @@ where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
   window's heartbeat.
 - **Per-tab attribution** stays heuristic until (if ever) the Claude extension
   exposes a tab↔session API.
-- **Windows** support waits on the broader daemon Windows work (#1237); the hook
+- **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.
