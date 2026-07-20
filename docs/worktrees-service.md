@@ -777,7 +777,8 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   and the daemon computes per-worktree branch and ahead/behind state with `git2`
   (see [Git enrichment](#git-enrichment)), keeping the companion thin.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
-  Windows support is tracked with the broader daemon work (#1237).
+  they run on Windows only under WSL2, and a native (non-WSL) Windows port is
+  tracked with the broader daemon work (#1363).
 - **Open-window-derived repos (v1):** a repository appears in the `tree` only while
   at least one of its windows is open. **Configured repo roots** — so a repo shows
   with zero windows open — are a deliberate follow-up ([ADR-0048](adrs/adr-0048.md),
