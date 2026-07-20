@@ -38,6 +38,7 @@ import {
   TreeRepoPayload,
   WorktreeNode,
   isCurrentWindow,
+  nodeDirectories,
   nodeId,
   partitionByRole,
   partitionByWindow,
@@ -428,6 +429,20 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWindow",
       (node?: Node, selected?: Node[]) => void closeWindow(node, selected),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.copyDirectory",
+      (node?: Node, selected?: Node[]) => {
+        const dirs = nodeDirectories(selectionTargets(node, selected));
+        if (!dirs.length) {
+          return;
+        }
+        void vscode.env.clipboard.writeText(dirs.join("\n"));
+        vscode.window.setStatusBarMessage(
+          dirs.length === 1 ? `Copied ${dirs[0]}` : `Copied ${dirs.length} directories`,
+          3000,
+        );
+      },
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",

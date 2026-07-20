@@ -463,6 +463,19 @@ export function worktreeTargets(nodes: Node[]): WorktreeNode[] {
 }
 
 /**
+ * The directories of the given nodes, deduplicated, in selection order. Unlike
+ * {@link worktreeTargets} this keeps repo nodes — a repo's `root` is exactly as
+ * copyable as a worktree's `path`. The dedupe is on the mapped paths, not
+ * {@link nodeId}: a repo node (`repo:/x`) and its main worktree (`wt:/x`) have
+ * distinct ids but the same directory, so the id-level dedupe in
+ * {@link selectionTargets} cannot collapse them.
+ */
+export function nodeDirectories(nodes: Node[]): string[] {
+  const dirs = nodes.map((n) => (n.kind === "repo" ? n.repo.root : n.wt.path));
+  return [...new Set(dirs)];
+}
+
+/**
  * Splits worktree targets by role: `linked` worktrees, which a close *deletes*,
  * and `main` working trees, which are never deleted. A mixed batch partitions
  * rather than silently downgrading a requested delete into a window close.
