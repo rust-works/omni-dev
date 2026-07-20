@@ -16,6 +16,7 @@ import {
   heartbeatEnvelope,
   openEnvelope,
   registerEnvelope,
+  setPollingEnvelope,
   setShowClosedEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
@@ -117,6 +118,20 @@ test("set-show-closed envelope carries the toggle as snake_case `show_closed`", 
     service: "worktrees",
     op: "set-show-closed",
     payload: { show_closed: true },
+  });
+});
+
+test("set-polling envelope carries owner/name/enabled for one repo", () => {
+  const repo = { owner: "rust-works", name: "omni-dev" };
+  assert.deepEqual(setPollingEnvelope(repo, true), {
+    service: "worktrees",
+    op: "set-polling",
+    payload: { owner: "rust-works", name: "omni-dev", enabled: true },
+  });
+  assert.deepEqual(setPollingEnvelope(repo, false), {
+    service: "worktrees",
+    op: "set-polling",
+    payload: { owner: "rust-works", name: "omni-dev", enabled: false },
   });
 });
 

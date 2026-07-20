@@ -106,6 +106,16 @@
         "icon": "$(eye-closed)"
       },
       {
+        "command": "omniDevWorktrees.enablePolling",
+        "title": "Enable PR Polling",
+        "category": "omni-dev"
+      },
+      {
+        "command": "omniDevWorktrees.disablePolling",
+        "title": "Disable PR Polling",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.openClaude",
         "title": "Open Claude Code",
         "category": "omni-dev",
@@ -153,6 +163,14 @@
         {
           "command": "omniDevWorktrees.showClosedWorktrees",
           "when": "!omniDevWorktrees.showClosed"
+        },
+        {
+          "command": "omniDevWorktrees.enablePolling",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.disablePolling",
+          "when": "false"
         }
       ],
       "view/title": [
@@ -177,6 +195,16 @@
           "command": "omniDevWorktrees.openWorktree",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
           "group": "0_open@1"
+        },
+        {
+          "command": "omniDevWorktrees.enablePolling",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-off/ && omniDevWorktrees.showPullRequests",
+          "group": "1_pr@0"
+        },
+        {
+          "command": "omniDevWorktrees.disablePolling",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-on/ && omniDevWorktrees.showPullRequests",
+          "group": "1_pr@0"
         },
         {
           "command": "omniDevWorktrees.openPullRequest",

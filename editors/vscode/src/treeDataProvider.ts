@@ -14,7 +14,9 @@ import {
   isCurrentWindow,
   needsPrFallback,
   nodeId,
+  repoContextValue,
   repoLabel,
+  repoPollingEnabled,
   reposToNodes,
   unbadgedBranches,
   withAheadBehind,
@@ -62,6 +64,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   private repos: TreeRepoPayload[] = [];
   /** Whether worktrees with no open window are shown; false hides them. */
   private showClosed = true;
+  /**
+   * Whether the global `showPullRequests` setting is on (#1376). When off it is
+   * the master switch: the repo icon renders neutral/gray regardless of the
+   * per-repo `polling_enabled` flag (badges are already stripped upstream by
+   * `visibleRepos`). Defaults on.
+   */
+  private showPr = true;
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -91,6 +100,16 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    */
   setShowClosed(showClosed: boolean): void {
     this.showClosed = showClosed;
+    this.emitter.fire(undefined);
+  }
+
+  /**
+   * Sets whether the global `showPullRequests` master is on (#1376), then
+   * refreshes so repo icons recolour: with it off, an enabled repo's icon greys
+   * rather than showing green (badges are stripped separately by `visibleRepos`).
+   */
+  setShowPullRequests(showPr: boolean): void {
+    this.showPr = showPr;
     this.emitter.fire(undefined);
   }
 
@@ -148,10 +167,18 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
         vscode.TreeItemCollapsibleState.Expanded,
       );
       item.id = nodeId(node);
-      item.iconPath = new vscode.ThemeIcon(node.repo.github ? "github" : "repo");
-      // `.github` gates the "Open Pull Request…" menu; the plain `repo` value is
-      // unchanged for non-GitHub repos.
-      item.contextValue = node.repo.github ? "repo.github" : "repo";
+      // The GitHub repo icon reflects PR-poll state (#1376): green when the
+      // daemon is polling this repo *and* the global master is on, else the
+      // default gray. A non-GitHub repo keeps the plain `repo` glyph.
+      item.iconPath = node.repo.github
+        ? this.showPr && repoPollingEnabled(node.repo)
+          ? new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.green"))
+          : new vscode.ThemeIcon("github")
+        : new vscode.ThemeIcon("repo");
+      // Encodes GitHub identity (gates "Open Pull Request…") and poll state (gates
+      // "Enable/Disable PR Polling"); the plain `repo` value is unchanged for
+      // non-GitHub repos.
+      item.contextValue = repoContextValue(node.repo);
       item.tooltip = node.repo.root;
       return item;
     }
