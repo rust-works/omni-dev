@@ -71,6 +71,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * `visibleRepos`). Defaults on.
    */
   private showPr = true;
+  /**
+   * The daemon's active PR-status source (#1384). Recolours the GitHub repo icon:
+   * in `webhook` mode every owned repo is backed the same way, so the green/gray
+   * poll distinction is meaningless and the icon goes **blue** instead. Defaults
+   * `poll` until the first snapshot drives {@link setPrSource}.
+   */
+  private prSource: "poll" | "webhook" = "poll";
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -111,6 +118,31 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   setShowPullRequests(showPr: boolean): void {
     this.showPr = showPr;
     this.emitter.fire(undefined);
+  }
+
+  /**
+   * Sets the active PR-status source (#1384), then refreshes so GitHub repo icons
+   * recolour — blue in `webhook` mode, else the poll-state green/gray.
+   */
+  setPrSource(source: "poll" | "webhook"): void {
+    this.prSource = source;
+    this.emitter.fire(undefined);
+  }
+
+  /**
+   * The icon for a GitHub repo node. Master switch off → neutral. `webhook`
+   * mode → blue (every owned repo is backed the same way, so the poll distinction
+   * does not apply). `poll` mode → green while the daemon is polling this repo,
+   * else neutral.
+   */
+  private githubRepoIcon(repo: TreeRepoPayload): vscode.ThemeIcon {
+    if (!this.showPr) return new vscode.ThemeIcon("github");
+    if (this.prSource === "webhook") {
+      return new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.blue"));
+    }
+    return repoPollingEnabled(repo)
+      ? new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.green"))
+      : new vscode.ThemeIcon("github");
   }
 
   async getChildren(element?: Node): Promise<Node[]> {
@@ -167,13 +199,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
         vscode.TreeItemCollapsibleState.Expanded,
       );
       item.id = nodeId(node);
-      // The GitHub repo icon reflects PR-poll state (#1376): green when the
-      // daemon is polling this repo *and* the global master is on, else the
-      // default gray. A non-GitHub repo keeps the plain `repo` glyph.
+      // The GitHub repo icon reflects the live PR source: blue in `webhook` mode
+      // (#1384), else the #1376 poll state — green when the daemon is polling this
+      // repo and the master is on, otherwise gray. A non-GitHub repo keeps `repo`.
       item.iconPath = node.repo.github
-        ? this.showPr && repoPollingEnabled(node.repo)
-          ? new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.green"))
-          : new vscode.ThemeIcon("github")
+        ? this.githubRepoIcon(node.repo)
         : new vscode.ThemeIcon("repo");
       // Encodes GitHub identity (gates "Open Pull Request…") and poll state (gates
       // "Enable/Disable PR Polling"); the plain `repo` value is unchanged for

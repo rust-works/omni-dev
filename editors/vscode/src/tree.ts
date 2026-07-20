@@ -209,6 +209,13 @@ export interface TreeSnapshot {
    * read as `true` (show all, the original behavior).
    */
   show_closed?: boolean;
+  /**
+   * The daemon's active live PR-status source (#1384): `"poll"` (default) or
+   * `"webhook"`. Carried on every snapshot so all windows render the same mode and
+   * gate the poll-volume UI in lock-step. Optional for forward-compatibility: an
+   * older daemon that omits it is read as `"poll"`.
+   */
+  pr_source?: "poll" | "webhook";
 }
 
 /**

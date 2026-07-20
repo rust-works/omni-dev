@@ -21,6 +21,7 @@ import {
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
   setPollingEnvelope,
+  setPrSourceEnvelope,
   setShowClosedEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -79,6 +80,15 @@ const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
 const SHOW_PR_KEY = "omniDevWorktrees.showPullRequests";
 
 /**
+ * The `when`-clause context key mirroring the daemon's active PR-status source
+ * (#1384). Driven from every pushed `tree` snapshot's `pr_source` (see
+ * {@link applyPrSource}), so the poll-volume UI — the #1376 Enable/Disable PR
+ * Polling items — is hidden in `webhook` mode, where there is no poll volume to
+ * manage. Defaults to `"poll"` until the first snapshot lands.
+ */
+const PR_SOURCE_KEY = "omniDevWorktrees.prStatusSource";
+
+/**
  * How close (ms) two clicks on the same item must be to count as a double-click.
  * The TreeView API has no native double-click event (single click only selects),
  * so `onItemClicked` implements this manually.
@@ -125,6 +135,15 @@ function heartbeatMs(): number {
 /** Whether to show each worktree's GitHub PR badge (#1296). */
 function showPullRequests(): boolean {
   return config().get<boolean>("showPullRequests") ?? true;
+}
+
+/**
+ * The live PR-status source this user selects (#1384): `"poll"` (default) or
+ * `"webhook"`. Forwarded to the daemon (the authority) via `set-pr-source`; the
+ * daemon then echoes the active mode on every snapshot's `pr_source`.
+ */
+function prStatusSource(): "poll" | "webhook" {
+  return config().get<string>("prStatusSource") === "webhook" ? "webhook" : "poll";
 }
 
 /**
@@ -382,6 +401,11 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // Seed the PR-master context key + icon-colour flag from the current setting
   // (#1376), so the per-repo toggle menu and green icons reflect it from frame one.
   applyShowPullRequests();
+  // Seed the PR-source context key from the setting so the poll-volume UI is
+  // gated from frame one, and forward the setting to the daemon (the authority),
+  // which echoes the active mode back on every snapshot (#1384).
+  applyPrSource(prStatusSource());
+  void setPrSource();
 
   // `canSelectMany` makes every item command plural: VS Code then invokes them as
   // `(clicked, selected[])`, and each handler resolves its targets through
@@ -414,6 +438,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
       applyShowClosed(snapshot.show_closed);
+      // The active PR-source mode rides along too (#1384), so the poll-volume UI
+      // hides/shows in lock-step across every window.
+      applyPrSource(snapshot.pr_source);
       // A new snapshot re-runs the lazy PR-badge fetch, so re-evaluate every row's
       // check colour (state-keyed URIs already re-decorate; this covers the rest).
       decorations.refresh();
@@ -506,6 +533,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
         applyShowPullRequests();
         void refreshTree();
       }
+      // Selecting a new PR source (#1384) forwards it to the daemon; the pushed
+      // snapshot's `pr_source` then drives the context key everywhere. The local
+      // seed keeps this window's poll-volume UI in step without waiting a tick.
+      if (e.affectsConfiguration(`${CONFIG_SECTION}.prStatusSource`)) {
+        applyPrSource(prStatusSource());
+        void setPrSource();
+      }
     }),
   );
 }
@@ -547,6 +581,30 @@ function applyShowPullRequests(): void {
   const on = showPullRequests();
   void vscode.commands.executeCommand("setContext", SHOW_PR_KEY, on);
   provider?.setShowPullRequests(on);
+}
+
+/**
+ * Applies an authoritative PR-source mode — from a daemon snapshot or the
+ * pre-snapshot default — to this window's UI (#1384): flips the `when`-clause
+ * context key that hides the poll-volume UI (the #1376 Enable/Disable PR Polling
+ * items) while the source is `webhook`. Never persists or sends; the daemon owns
+ * the state. A `pr_source` omitted by an older daemon degrades to `"poll"`.
+ */
+function applyPrSource(source: "poll" | "webhook" = "poll"): void {
+  void vscode.commands.executeCommand("setContext", PR_SOURCE_KEY, source);
+  provider?.setPrSource(source);
+}
+
+/**
+ * Forwards this window's `omniDevWorktrees.prStatusSource` setting to the daemon
+ * via `set-pr-source` (#1384). The daemon is the authority and pushes a fresh
+ * `tree` snapshot carrying the new `pr_source` to every window, whose `onSnapshot`
+ * then drives {@link applyPrSource} — the `set-show-closed` reconcile pattern.
+ * Sent on activation and on every configuration change; a missing daemon is a
+ * silent no-op (the shared `send` logs it).
+ */
+async function setPrSource(): Promise<void> {
+  await send(setPrSourceEnvelope(prStatusSource()));
 }
 
 /**
@@ -1098,6 +1156,8 @@ async function refreshTree(): Promise<void> {
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
     applyShowClosed(reply.payload.show_closed);
+    // …and `pr_source` (#1384), so the poll-volume UI stays correctly gated.
+    applyPrSource(reply.payload.pr_source);
     // Re-evaluate the PR-check colours for the freshly-fetched rows (#1324).
     decorationProvider?.refresh();
     if (treeView) {

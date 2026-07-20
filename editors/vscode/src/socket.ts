@@ -183,6 +183,21 @@ export function setPollingEnvelope(
 }
 
 /**
+ * Builds a `set-pr-source` envelope — selects the daemon's live PR-status source
+ * (#1384). `"poll"` (default) is today's GraphQL poller; `"webhook"` swaps it for
+ * the buffer pull + reconcile. The daemon is the authority and re-pushes a `tree`
+ * snapshot carrying the new `pr_source`, so every window renders the same mode and
+ * gates its poll-volume UI consistently — the `set-show-closed` pattern.
+ */
+export function setPrSourceEnvelope(source: "poll" | "webhook"): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "set-pr-source",
+    payload: { source },
+  };
+}
+
+/**
  * The fields the extension sends on a `close` op — mirrors the daemon's
  * `CloseRequest` (`src/daemon/services/worktrees.rs`). `remove` selects delete
  * (linked "Close Worktree") vs close-only (main "Close Window"); `requester_key`

@@ -17,6 +17,7 @@ import {
   openEnvelope,
   registerEnvelope,
   setPollingEnvelope,
+  setPrSourceEnvelope,
   setShowClosedEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
@@ -132,6 +133,19 @@ test("set-polling envelope carries owner/name/enabled for one repo", () => {
     service: "worktrees",
     op: "set-polling",
     payload: { owner: "rust-works", name: "omni-dev", enabled: false },
+  });
+});
+
+test("set-pr-source envelope carries the mode as `source`", () => {
+  assert.deepEqual(setPrSourceEnvelope("webhook"), {
+    service: "worktrees",
+    op: "set-pr-source",
+    payload: { source: "webhook" },
+  });
+  assert.deepEqual(setPrSourceEnvelope("poll"), {
+    service: "worktrees",
+    op: "set-pr-source",
+    payload: { source: "poll" },
   });
 });
 
