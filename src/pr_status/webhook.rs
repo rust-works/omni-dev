@@ -51,6 +51,14 @@ pub(crate) struct WebhookEvent {
 }
 
 impl WebhookEvent {
+    /// The `(owner, name)` this delivery is for, from its `repository` object, or
+    /// `None` for an event without one (a malformed/unrelated payload). Lets the
+    /// source record per-repo webhook activity for `daemon webhook status` without
+    /// re-deriving the event shape.
+    pub fn repo(&self) -> Option<(String, String)> {
+        repo_of(&self.payload)
+    }
+
     /// Extracts the `events` array from a `/events` reply body (`{ events: [...],
     /// cursor, ... }`), skipping anything that fails to deserialise. Unknown or
     /// malformed entries are dropped rather than failing the whole pull — a single
@@ -534,6 +542,21 @@ mod tests {
             payload: json!({ "zen": "…", "repository": { "name": NAME, "owner": { "login": OWNER } } }),
         });
         assert!(agg.resolve(&[target()]).is_empty());
+    }
+
+    #[test]
+    fn webhook_event_repo_reads_owner_and_name() {
+        let events = sample("pull_request.json");
+        assert_eq!(
+            events[0].repo(),
+            Some(("acme".to_string(), "widget".to_string()))
+        );
+        let no_repo = WebhookEvent {
+            event: "ping".into(),
+            received: 1,
+            payload: json!({}),
+        };
+        assert_eq!(no_repo.repo(), None);
     }
 
     #[test]

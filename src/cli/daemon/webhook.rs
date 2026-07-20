@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use crate::cli::format::TableOrJson;
 use crate::daemon::server;
 
 /// The webhook events the daemon's buffer source consumes.
@@ -39,6 +40,9 @@ pub enum WebhookSubcommands {
     List(RepoArg),
     /// Remove a webhook from a repo by its numeric id (see `list`).
     Remove(RemoveArgs),
+    /// Show, per repo, whether the daemon is receiving webhook events (queries the
+    /// daemon only — no GitHub calls).
+    Status(StatusArgs),
     /// Print the buffer-deployment and daemon-configuration summary.
     Config,
 }
@@ -51,6 +55,7 @@ impl WebhookCommand {
             WebhookSubcommands::Register(args) => args.execute().await,
             WebhookSubcommands::Remove(args) => args.execute().await,
             WebhookSubcommands::List(args) => list_hooks(&args.repo),
+            WebhookSubcommands::Status(args) => args.execute().await,
             WebhookSubcommands::Config => {
                 print!("{}", config_summary());
                 Ok(())
@@ -99,6 +104,30 @@ pub struct RemoveArgs {
     /// the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+}
+
+/// `status` arguments: the socket override plus the output format.
+#[derive(Parser)]
+pub struct StatusArgs {
+    /// Daemon control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+}
+
+impl StatusArgs {
+    async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let status =
+            super::call_service(&socket, "worktrees", "webhook-status", Value::Null).await?;
+        match self.output {
+            TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+            TableOrJson::Table => print!("{}", render_status(&status)),
+        }
+        Ok(())
+    }
 }
 
 impl RegisterArgs {
@@ -214,6 +243,98 @@ fn list_hooks(repo: &str) -> Result<()> {
     Ok(())
 }
 
+/// Renders the `webhook-status` payload as a table.
+fn render_status(status: &Value) -> String {
+    let mode = status
+        .get("pr_source")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let configured = status
+        .get("configured")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let now = now_ms();
+
+    // The honest connectivity signal: did the last pull succeed? A successful pull
+    // with zero events still counts, so a quiet CI period reads as connected.
+    let buffer = if !configured {
+        "NOT configured — reconcile-only".to_string()
+    } else if let Some(err) = status.get("last_pull_error").and_then(Value::as_str) {
+        format!("configured, last pull FAILED: {err}")
+    } else if let Some(ms) = status.get("last_pull_ms").and_then(Value::as_u64) {
+        format!("connected (last pull {})", humanize_since(now, ms))
+    } else {
+        "configured, no successful pull yet".to_string()
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("mode: {mode}    buffer: {buffer}\n"));
+    if mode != "webhook" {
+        out.push_str("(the webhook source is inactive: prStatusSource is not \"webhook\")\n");
+    }
+
+    let repos = status
+        .get("repos")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if repos.is_empty() {
+        out.push_str("\nno webhook-relevant repos yet\n");
+        return out;
+    }
+    out.push_str(&format!(
+        "\n{:<40} {:<7} {:<11} {}\n",
+        "REPO", "BACKED", "DELIVERING", "LAST EVENT"
+    ));
+    for repo in &repos {
+        let owner = repo.get("owner").and_then(Value::as_str).unwrap_or("");
+        let name = repo.get("name").and_then(Value::as_str).unwrap_or("");
+        let last = repo.get("last_event_ms").and_then(Value::as_u64);
+        out.push_str(&format!(
+            "{:<40} {:<7} {:<11} {}\n",
+            format!("{owner}/{name}"),
+            if repo.get("backed").and_then(Value::as_bool) == Some(true) {
+                "yes"
+            } else {
+                "no"
+            },
+            if last.is_some() { "yes" } else { "no" },
+            last.map_or_else(|| "—".to_string(), |ms| humanize_since(now, ms)),
+        ));
+    }
+    out.push_str(
+        "\nnote: the `buffer:` line above is the connection signal (last successful pull).\n\
+         \"DELIVERING\" is per-repo and only counts events seen since this daemon started,\n\
+         so a repo reads \"no\" during quiet CI even when connected. `daemon webhook list`\n\
+         hits GitHub to confirm a hook actually exists.\n",
+    );
+    out
+}
+
+/// Current time in epoch-ms (0 if the clock is before the epoch).
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// A compact "Ns/Nm/Nh/Nd ago" for an epoch-ms instant relative to `now`.
+fn humanize_since(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then) / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 /// Runs `gh` with `args`, returning stdout on success or an error carrying
 /// `gh`'s stderr. Reuses the daemon's `gh` resolution so it works under a minimal
 /// launchd/systemd `PATH`.
@@ -275,4 +396,48 @@ The HMAC secret stays only in the Worker; the daemon holds only the read token,
 persisted 0600 at <data-dir>/omni-dev/webhook.token, and pulls outbound-only.
 "
     .to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn render_status_reports_the_buffer_connection_state() {
+        // Not configured → reconcile-only.
+        let s = render_status(&json!({ "pr_source": "webhook", "configured": false, "repos": [] }));
+        assert!(s.contains("NOT configured"), "{s}");
+
+        // Configured + a recent successful pull → connected, even with no events.
+        let s = render_status(&json!({
+            "pr_source": "webhook", "configured": true, "last_pull_ms": now_ms(), "repos": []
+        }));
+        assert!(s.contains("connected (last pull"), "{s}");
+
+        // Configured but the most recent pull failed.
+        let s = render_status(&json!({
+            "pr_source": "webhook", "configured": true,
+            "last_pull_error": "401 unauthorized", "repos": []
+        }));
+        assert!(s.contains("last pull FAILED: 401 unauthorized"), "{s}");
+
+        // Configured, no pull completed yet.
+        let s = render_status(&json!({ "pr_source": "webhook", "configured": true, "repos": [] }));
+        assert!(s.contains("no successful pull yet"), "{s}");
+    }
+
+    #[test]
+    fn render_status_lists_repos_with_backed_and_delivering_columns() {
+        let s = render_status(&json!({
+            "pr_source": "webhook", "configured": true, "last_pull_ms": now_ms(),
+            "repos": [
+                { "owner": "rust-works", "name": "succinctly", "backed": true, "last_event_ms": now_ms() },
+                { "owner": "rust-works", "name": "omni-dev", "backed": false, "last_event_ms": null },
+            ]
+        }));
+        assert!(s.contains("rust-works/succinctly"), "{s}");
+        assert!(s.contains("rust-works/omni-dev"), "{s}");
+    }
 }

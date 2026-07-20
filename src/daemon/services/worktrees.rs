@@ -364,6 +364,24 @@ fn partition_reconcile_targets(
         .partition(|t| !backed.contains(&format!("{}/{}", t.owner, t.name)))
 }
 
+/// The distinct GitHub `"owner/name"` repos in a tree snapshot — the currently
+/// open (watched) repos, so `webhook-status` can flag which open repos are **not**
+/// yet webhook-backed (still on the full reconcile).
+fn github_repos_from_snapshot(snapshot: &Value) -> HashSet<String> {
+    snapshot
+        .get("repos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|repo| {
+            let github = repo.get("github")?;
+            let owner = github.get("owner").and_then(Value::as_str)?;
+            let name = github.get("name").and_then(Value::as_str)?;
+            Some(format!("{owner}/{name}"))
+        })
+        .collect()
+}
+
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
 pub struct WorktreesService {
     /// The cross-window registry this adapter routes ops to. Behind an `Arc` so
@@ -448,6 +466,27 @@ pub struct WorktreesService {
     /// Where the webhook-backed repo set is persisted (#1384). Same lock
     /// discipline as [`polling_prefs_path`](Self::polling_prefs_path).
     webhook_backed_pref_path: Mutex<Option<PathBuf>>,
+    /// Per-repo (`"owner/name"`) arrival time (epoch ms) of the most recent webhook
+    /// event the pull loop has ingested (#1384). The **positive** "this repo's hook
+    /// is actually delivering" signal `daemon webhook status` reads — distinct from
+    /// the `webhook_backed` *marker* (intent). Shared `Arc` so the spawned pull task
+    /// writes it and the `webhook-status` op reads it; the lock is held only briefly.
+    webhook_activity: Arc<Mutex<HashMap<String, u64>>>,
+    /// The pull loop's connectivity state (#1384): when the last buffer pull
+    /// **succeeded** (epoch ms) and the last pull error, if the most recent attempt
+    /// failed. This is the honest "is the buffer connected?" signal — a successful
+    /// pull with **zero** new events still updates `last_success_ms`, so a quiet CI
+    /// period no longer reads as "disconnected" (the per-repo `webhook_activity`
+    /// map, by contrast, only moves when real events arrive). Shared `Arc`.
+    webhook_pull: Arc<Mutex<WebhookPullState>>,
+}
+
+/// The webhook pull loop's connectivity state (#1384). `last_error` is cleared on
+/// the next success, so a present error always means the *most recent* pull failed.
+#[derive(Debug, Default, Clone)]
+struct WebhookPullState {
+    last_success_ms: Option<u64>,
+    last_error: Option<String>,
 }
 
 impl WorktreesService {
@@ -474,6 +513,8 @@ impl WorktreesService {
             webhook_source: Mutex::new(None),
             pr_source_pref_path: Mutex::new(None),
             webhook_backed_pref_path: Mutex::new(None),
+            webhook_activity: Arc::new(Mutex::new(HashMap::new())),
+            webhook_pull: Arc::new(Mutex::new(WebhookPullState::default())),
         }
     }
 
@@ -915,6 +956,8 @@ impl WorktreesService {
         let registry = self.registry.clone();
         let tree_cache = self.tree_cache.clone();
         let pr_cache = self.pr_cache.clone();
+        let activity = self.webhook_activity.clone();
+        let pull_state = self.webhook_pull.clone();
         let mut changes = self.registry.subscribe_changes();
         let handle = tokio::spawn(async move {
             // Bounds a single iteration's page drain — a pathological backlog cannot
@@ -976,10 +1019,27 @@ impl WorktreesService {
                             Ok(page) => {
                                 for event in &page.events {
                                     agg.ingest(event);
+                                    // Record the repo's most recent delivery time, the
+                                    // positive "hook is delivering" signal for status.
+                                    if let Some((owner, name)) = event.repo() {
+                                        let mut seen =
+                                            activity.lock().unwrap_or_else(PoisonError::into_inner);
+                                        let entry =
+                                            seen.entry(format!("{owner}/{name}")).or_insert(0);
+                                        *entry = (*entry).max(event.received);
+                                    }
                                 }
                                 cursor = page.cursor;
                                 if let Some(path) = &cursor_path {
                                     persist_cursor(path, &cursor);
+                                }
+                                // A successful pull — even an empty one — is the
+                                // "connected" signal; record it and clear any error.
+                                {
+                                    let mut st =
+                                        pull_state.lock().unwrap_or_else(PoisonError::into_inner);
+                                    st.last_success_ms = Some(now_epoch_ms());
+                                    st.last_error = None;
                                 }
                                 if !page.more {
                                     break;
@@ -987,6 +1047,10 @@ impl WorktreesService {
                             }
                             Err(err) => {
                                 tracing::debug!("webhook buffer pull failed: {err:#}");
+                                pull_state
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .last_error = Some(format!("{err:#}"));
                                 break;
                             }
                         }
@@ -1393,6 +1457,54 @@ impl DaemonService for WorktreesService {
                 }
                 Ok(json!({ "ok": true }))
             }
+            "webhook-status" => {
+                // Reports, per repo the daemon knows about webhook-wise (#1384): the
+                // `backed` **marker** (intent), whether it is a currently-open
+                // (`watched`) repo, and `last_event_ms` — the arrival time of the most
+                // recent webhook event actually pulled, the positive "the hook is
+                // delivering" signal. Backed-but-no-events flags a misconfiguration
+                // (or just quiet CI — the daemon cannot tell those apart, so `status`
+                // is a positive signal, not proof a hook is broken).
+                let backed = self.registry.webhook_backed_repos();
+                let activity = self
+                    .webhook_activity
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let pull = self
+                    .webhook_pull
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let snapshot = tree_snapshot(&self.registry, self.pr_cache.clone()).await;
+                let watched = github_repos_from_snapshot(&snapshot);
+
+                // Union of every webhook-relevant repo, sorted for a stable table.
+                let mut keys: BTreeSet<String> = BTreeSet::new();
+                keys.extend(backed.iter().cloned());
+                keys.extend(activity.keys().cloned());
+                keys.extend(watched.iter().cloned());
+                let repos: Vec<Value> = keys
+                    .iter()
+                    .map(|key| {
+                        let (owner, name) = key.split_once('/').unwrap_or((key.as_str(), ""));
+                        json!({
+                            "owner": owner,
+                            "name": name,
+                            "backed": backed.contains(key),
+                            "watched": watched.contains(key),
+                            "last_event_ms": activity.get(key).copied(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "pr_source": self.registry.pr_source().as_wire(),
+                    "configured": self.webhook_config.is_configured(),
+                    "last_pull_ms": pull.last_success_ms,
+                    "last_pull_error": pull.last_error,
+                    "repos": repos,
+                }))
+            }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
                 // arbitrary worktree folder supplied by a socket client, reusing
@@ -1656,6 +1768,17 @@ fn write_webhook_backed_pref(path: &Path, pref: &WebhookBackedPref) -> Result<()
     let json =
         serde_json::to_vec_pretty(pref).context("failed to serialize webhook-backed pref")?;
     crate::daemon::paths::write_file_0600(path, &json)
+}
+
+/// Current time in epoch-ms (0 if the clock predates the epoch). Used to stamp the
+/// webhook pull loop's last-success time for `webhook-status` (#1384).
+fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// Reads the persisted webhook pull cursor, or `""` (pull from the start of the
@@ -5245,6 +5368,33 @@ mod tests {
         let (full2, meta2) = partition_reconcile_targets(&targets, &HashSet::new());
         assert_eq!(full2.len(), 3);
         assert!(meta2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_status_reports_backed_marker_and_delivery_activity() {
+        let svc = WorktreesService::new();
+        svc.registry
+            .set_webhook_backed("rust-works", "succinctly", true);
+        // Simulate a delivered event (the pull loop populates this map).
+        svc.webhook_activity
+            .lock()
+            .unwrap()
+            .insert("rust-works/succinctly".to_string(), 1_784_559_250_627);
+        // Backed but never delivered — a misconfiguration (or just quiet CI).
+        svc.registry.set_webhook_backed("rust-works", "quiet", true);
+
+        let out = svc.handle("webhook-status", Value::Null).await.unwrap();
+        assert_eq!(out["pr_source"], json!("poll")); // default in tests
+        assert_eq!(out["configured"], json!(false)); // no buffer config in tests
+
+        let repos = out["repos"].as_array().unwrap();
+        let find = |name: &str| repos.iter().find(|r| r["name"] == name).unwrap();
+        let succ = find("succinctly");
+        assert_eq!(succ["backed"], json!(true));
+        assert_eq!(succ["last_event_ms"], json!(1_784_559_250_627u64));
+        let quiet = find("quiet");
+        assert_eq!(quiet["backed"], json!(true));
+        assert!(quiet["last_event_ms"].is_null(), "no activity → null");
     }
 
     #[tokio::test]

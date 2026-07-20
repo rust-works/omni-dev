@@ -417,7 +417,11 @@ active mode as `pr_source` on every snapshot). Both sources feed the **same**
   the genuine fallback. Without this split the reconcile rolled up every branch of
   every open repo, which for a large working set (dozens of repos, hundreds of
   branches) spends a big slice of the GraphQL budget each cadence — defeating the
-  near-zero-cost premise.
+  near-zero-cost premise. **`omni-dev daemon webhook status`** (the `webhook-status`
+  op — queries the daemon only, no GitHub calls) shows, per repo, whether it is
+  `backed` (the marker) and whether the daemon is actually **receiving events** for
+  it (`last_event_ms`); a backed repo with no events is a misconfiguration to chase
+  (or just quiet CI — the daemon cannot tell those apart).
 - **The poll-volume UI disappears in `webhook` mode.** There is no poll volume to
   manage, so the #1376 **Enable/Disable PR Polling** menu items and green/gray polling
   icons are hidden (the extension mirrors `pr_source` into a `when`-clause context key);
@@ -682,9 +686,10 @@ Ops:
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `set-pr-source`   | `{ source: "poll" \| "webhook" }`              | `{ ok: true }`                             |
 | `set-webhook-backed` | `{ owner, name, backed }`                   | `{ ok: true }`                             |
+| `webhook-status`  | `null`                                         | `{ pr_source, configured, repos: [{owner,name,backed,watched,last_event_ms}] }` |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first twelve ops are strictly **request → one reply**. `subscribe` is the one
+The first thirteen ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed, pr_source } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —

@@ -3216,6 +3216,7 @@ Commands:
   register  Install the buffer webhook on a repo you own (needs repo admin)
   list      List the webhooks installed on a repo
   remove    Remove a webhook from a repo by its numeric id (see `list`)
+  status    Show, per repo, whether the daemon is receiving webhook events (queries the daemon only — no GitHub calls)
   config    Print the buffer-deployment and daemon-configuration summary
   help      Print this message or the help of the given subcommand(s)
 
@@ -3283,6 +3284,20 @@ Options:
       --id <ID>        The numeric hook id to remove (from `daemon webhook list`)
       --socket <PATH>  Daemon control-socket path (to unmark the repo webhook-backed). Defaults to the per-user runtime location
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev daemon webhook status - Show, per repo, whether the daemon is receiving webhook events (queries the daemon only — no GitHub calls)
+
+Show, per repo, whether the daemon is receiving webhook events (queries the daemon only — no GitHub calls)
+
+Usage: status [OPTIONS]
+
+Options:
+      --socket <PATH>    Daemon control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
