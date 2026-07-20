@@ -459,6 +459,7 @@ async fn handle_builtin(
             let report = StatusReport {
                 services: registry.statuses().await,
                 version: Some(crate::VERSION.to_string()),
+                github_rate_limit: registry.github_rate_limit(),
             };
             match serde_json::to_value(report) {
                 Ok(payload) => DaemonReply::ok(payload),
