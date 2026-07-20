@@ -122,7 +122,7 @@ socket involved — so it works even when the omni-dev daemon is not running.
 - The omni-dev daemon running locally (`omni-dev daemon start`).
 - **macOS or Linux only** — like the daemon, the companion is Unix-only; on
   Windows there is no daemon socket to talk to (tracked in
-  [#1237](https://github.com/rust-works/omni-dev/issues/1237)).
+  [#1363](https://github.com/rust-works/omni-dev/issues/1363)).
 - For the **Open Pull Request…** actions only: the [`gh`
   CLI](https://cli.github.com/) installed and authenticated (`gh auth login`) —
   both actions discover PRs with it. `gh` is found on your `PATH` or in the usual
