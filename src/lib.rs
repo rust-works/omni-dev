@@ -59,6 +59,7 @@ pub mod sessions;
 pub mod snowflake;
 pub mod transcript;
 pub mod utils;
+pub mod webhook_buffer;
 pub mod worktrees;
 
 #[cfg(test)]

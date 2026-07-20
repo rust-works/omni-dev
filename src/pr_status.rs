@@ -59,6 +59,12 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+/// Reconstructs badges from #1378 webhook-buffer deltas, reusing this module's
+/// private [`rollup_check_state`] reducer (a child module may read its parent's
+/// private items) so a webhook verdict equals the verdict the GraphQL poll would
+/// produce. Driven by the daemon's `WebhookPrSource`.
+pub(crate) mod webhook;
+
 /// Environment override for the `gh` binary, for when the daemon runs under
 /// launchd/systemd with a minimal `PATH` that does not contain it. Mirrors
 /// `OMNI_DEV_VSCODE_BIN` for the tray's `code` launcher, and the companion
@@ -295,18 +301,29 @@ fn suite_still_running(entry: &Value) -> bool {
 /// a false badge. On a `Ref` it matches on **head**, reproducing the extension's
 /// "first open PR whose `headRefName` is this branch" rule (verified: `main` is the
 /// base of many open PRs and correctly resolves to nothing).
-fn branch_fragment(alias: &str, branch: &str) -> String {
+fn branch_fragment(alias: &str, branch: &str, include_rollup: bool) -> String {
     // JSON string escaping is valid GraphQL string escaping, so this is safe for
     // any branch name git permits.
     let qualified = Value::String(format!("refs/heads/{branch}"));
+    // `statusCheckRollup.contexts(first:100)` is the query's cost driver — one
+    // connection of up to 100 nodes **per ref**. The webhook source's metadata-only
+    // reconcile (#1384) omits it for webhook-backed repos, whose CI verdict comes
+    // from webhook events, not GraphQL — keeping only `oid` (for staleness) and the
+    // open-PR metadata, which are one node each. With `include_rollup = true` the
+    // fragment is byte-identical to the original full query.
+    let rollup = if include_rollup {
+        r"
+        statusCheckRollup{ contexts(first:100){ nodes{
+          __typename
+          ...on CheckRun{ status conclusion checkSuite{ status } }
+          ...on StatusContext{ state }
+        } } }"
+    } else {
+        ""
+    };
     format!(
         r"{alias}: ref(qualifiedName:{qualified}){{
-      target{{ ...on Commit{{ oid
-        statusCheckRollup{{ contexts(first:100){{ nodes{{
-          __typename
-          ...on CheckRun{{ status conclusion checkSuite{{ status }} }}
-          ...on StatusContext{{ state }}
-        }} }} }}
+      target{{ ...on Commit{{ oid{rollup}
       }} }}
       associatedPullRequests(first:1, states:OPEN){{ nodes{{ number isDraft url }} }}
     }}"
@@ -321,6 +338,18 @@ type QueryIndex = HashMap<(usize, usize), PrTarget>;
 /// needed to read the reply back. Targets are grouped by repo so each repo appears
 /// once. Returns `None` when there is nothing to ask.
 fn build_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
+    build_query_inner(targets, true)
+}
+
+/// [`build_query`] without the expensive `statusCheckRollup` — the webhook source's
+/// metadata-only reconcile (#1384). The reply parses through the same path; a ref
+/// with no rollup reads as `checks: None` ([`badge_from_ref`] defaults the empty
+/// context list), and the CI verdict is supplied by webhook events instead.
+fn build_metadata_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
+    build_query_inner(targets, false)
+}
+
+fn build_query_inner(targets: &[PrTarget], include_rollup: bool) -> Option<(String, QueryIndex)> {
     if targets.is_empty() {
         return None;
     }
@@ -338,7 +367,11 @@ fn build_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
     for (ri, ((owner, name), branches)) in by_repo.iter().enumerate() {
         let mut frags = Vec::new();
         for (bi, target) in branches.iter().enumerate() {
-            frags.push(branch_fragment(&format!("b{bi}"), &target.branch));
+            frags.push(branch_fragment(
+                &format!("b{bi}"),
+                &target.branch,
+                include_rollup,
+            ));
             index.insert((ri, bi), (*target).clone());
         }
         let owner = Value::String((*owner).to_string());
@@ -506,12 +539,32 @@ fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
 /// and a failed call (`Err`, including a GraphQL 200 carrying `errors`) yields no
 /// map at all — so a failed poll can never manufacture negatives.
 pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget, PrResolution>> {
-    let Some((query, index)) = build_query(targets) else {
+    run_query(bin, build_query(targets))
+}
+
+/// Like [`resolve_with`] but with the **metadata-only** query (#1384).
+///
+/// No `statusCheckRollup`, so it costs one node per ref instead of up to 100. The
+/// webhook source uses it for webhook-backed repos, whose CI verdict already
+/// arrives via events; the returned badges carry PR metadata and `head_oid` with
+/// `checks: None`, which the webhook overlay then supersedes for active branches.
+pub fn resolve_metadata_with(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<HashMap<PrTarget, PrResolution>> {
+    run_query(bin, build_metadata_query(targets))
+}
+
+/// Runs a built query (or returns an empty map for `None`), surfacing a GraphQL
+/// `errors` array as a hard failure so a 200-with-errors never looks like "no PRs".
+fn run_query(
+    bin: &Path,
+    built: Option<(String, QueryIndex)>,
+) -> Result<HashMap<PrTarget, PrResolution>> {
+    let Some((query, index)) = built else {
         return Ok(HashMap::new());
     };
     let body = run_gh_graphql(bin, &query)?;
-    // A GraphQL 200 can still carry errors; surface them rather than silently
-    // reporting "no badges", which would look identical to "no PRs".
     if let Some(errors) = body.get("errors").and_then(Value::as_array) {
         if !errors.is_empty() {
             bail!("gh api graphql returned errors: {errors:?}");
@@ -775,6 +828,20 @@ mod tests {
     fn build_query_asks_for_the_backing_suite_status() {
         let (query, _) = build_query(&[target("main")]).unwrap();
         assert!(query.contains("checkSuite{ status }"), "{query}");
+    }
+
+    #[test]
+    fn build_metadata_query_omits_the_costly_rollup() {
+        // #1384: the metadata-only reconcile drops `statusCheckRollup` (the
+        // per-ref, up-to-100-node cost driver) but keeps `oid` (for staleness) and
+        // the open-PR metadata. The full query still carries the rollup.
+        let (full, _) = build_query(&[target("main")]).unwrap();
+        assert!(full.contains("statusCheckRollup"), "{full}");
+
+        let (meta, _) = build_metadata_query(&[target("main")]).unwrap();
+        assert!(!meta.contains("statusCheckRollup"), "{meta}");
+        assert!(meta.contains("...on Commit{ oid"), "{meta}");
+        assert!(meta.contains("associatedPullRequests(first:1"), "{meta}");
     }
 
     // --- Query shape ---
