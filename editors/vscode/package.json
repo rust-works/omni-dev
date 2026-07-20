@@ -72,6 +72,11 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.copyDirectory",
+        "title": "Copy Directory",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.openPullRequest",
         "title": "Open Pull Request…",
         "category": "omni-dev",
@@ -123,6 +128,10 @@
         },
         {
           "command": "omniDevWorktrees.closeWindow",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.copyDirectory",
           "when": "false"
         },
         {
@@ -183,6 +192,11 @@
           "command": "omniDevWorktrees.moveClaudeSessionHere",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/ && !listMultiSelection",
           "group": "2_session@1"
+        },
+        {
+          "command": "omniDevWorktrees.copyDirectory",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
+          "group": "3_copy@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",

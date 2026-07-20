@@ -11,6 +11,7 @@ import {
   WorktreeNode,
   checkStateDecoration,
   isCurrentWindow,
+  nodeDirectories,
   nodeId,
   partitionByRole,
   partitionByWindow,
@@ -441,6 +442,29 @@ test("worktreeTargets drops repo nodes a mixed selection carries in", () => {
     CLOSED_LINKED,
   ]);
   assert.deepEqual(worktreeTargets([REPO_NODE]), []);
+});
+
+test("nodeDirectories maps a repo node to its root and a worktree node to its path", () => {
+  assert.deepEqual(nodeDirectories([REPO_NODE]), ["/home/me/omni-dev"]);
+  assert.deepEqual(nodeDirectories([OTHER_LINKED]), ["/home/me/wt/a"]);
+});
+
+test("nodeDirectories preserves selection order", () => {
+  assert.deepEqual(nodeDirectories([CLOSED_LINKED, REPO_NODE, OTHER_LINKED]), [
+    "/home/me/wt/b",
+    "/home/me/omni-dev",
+    "/home/me/wt/a",
+  ]);
+});
+
+test("nodeDirectories collapses a repo node and its main worktree to one directory", () => {
+  // The two nodes have distinct `nodeId`s (`repo:` vs `wt:` prefixed), so only a
+  // dedupe on the mapped paths — not on node identity — can catch this.
+  assert.deepEqual(nodeDirectories([REPO_NODE, SELF_MAIN]), ["/home/me/omni-dev"]);
+});
+
+test("nodeDirectories yields nothing for an empty selection", () => {
+  assert.deepEqual(nodeDirectories([]), []);
 });
 
 test("partitionByRole splits the deletable linked worktrees from the main trees", () => {
