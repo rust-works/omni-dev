@@ -47,6 +47,7 @@ pub mod daemon;
 pub mod data;
 pub mod datadog;
 pub mod git;
+pub mod github_rate_limit;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod pr_status;

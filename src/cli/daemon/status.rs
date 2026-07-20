@@ -56,6 +56,15 @@ fn print_running(json_out: bool, report: &StatusReport) -> Result<()> {
         Some(version) => println!("daemon: running (v{version})"),
         None => println!("daemon: running (version unknown)"),
     }
+    // A top-level GitHub API budget line (#1375), when the monitor has a reading —
+    // the daemon's `gh` usage spends this budget machine-wide, so it belongs above
+    // the per-service rows, not nested under one. `⚠` flags a resource ≥ ~80% used.
+    if let Some(rate_limit) = &report.github_rate_limit {
+        let line = rate_limit.summary_line();
+        if !line.is_empty() {
+            println!("  github rate limit: {line}");
+        }
+    }
     if report.services.is_empty() {
         println!("  (no services registered)");
     }
@@ -97,6 +106,7 @@ mod tests {
                 detail: serde_json::Value::Null,
             }],
             version: version.map(str::to_string),
+            github_rate_limit: None,
         }
     }
 
@@ -113,9 +123,39 @@ mod tests {
             &StatusReport {
                 services: vec![],
                 version: Some("1.2.3".to_string()),
+                github_rate_limit: None,
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn print_running_renders_the_github_rate_limit_line() {
+        use crate::github_rate_limit::{RateLimitResource, RateLimitSnapshot};
+        let res = |used: u64| RateLimitResource {
+            used,
+            limit: 5000,
+            remaining: 5000 - used,
+            percent: used as f64 / 5000.0 * 100.0,
+            reset: 1_700_000_000,
+        };
+        // Below threshold, at/over threshold, and JSON — each renders without error
+        // (the field serializes into the JSON payload automatically).
+        let mut rep = report(Some("1.2.3"));
+        rep.github_rate_limit = Some(RateLimitSnapshot {
+            graphql: Some(res(100)),
+            core: Some(res(27)),
+            search: None,
+        });
+        print_running(false, &rep).unwrap();
+        print_running(true, &rep).unwrap();
+
+        rep.github_rate_limit = Some(RateLimitSnapshot {
+            graphql: Some(res(4500)), // 90% ⇒ warn branch
+            core: Some(res(27)),
+            search: None,
+        });
+        print_running(false, &rep).unwrap();
     }
 
     #[test]

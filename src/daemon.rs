@@ -128,7 +128,14 @@ pub async fn build_default_registry(
     // Keep PR check badges fresh for every open window from one `gh` call, rather
     // than each window resolving its own and none of them ever re-asking (#1337).
     worktrees.start_pr_poller();
+    // Watch the GitHub API budget the PR poller (and every other `gh` on the box)
+    // spends, so `daemon status` / the tray surface an approaching exhaustion before
+    // it rate-limits everything — polling `/rate_limit` is exempt, so this is free
+    // (#1375). Share the cache with the registry for the built-in `status` op.
+    worktrees.start_rate_limit_poller();
+    let rate_limit_cache = worktrees.rate_limit_cache();
     registry.register(Arc::new(worktrees));
+    registry.set_github_rate_limit(rate_limit_cache);
     // The cross-window Claude Code sessions tracker; start its transcript watcher
     // (Feed 2) so sessions predating the daemon — and the hook-silent thinking
     // window — are still tracked (#1210).
