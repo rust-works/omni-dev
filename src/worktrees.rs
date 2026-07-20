@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -33,6 +33,12 @@ use tokio::sync::watch;
 /// disappears on the next read. The resident process is what makes this
 /// liveness correct — a flat shared file could not reap stale entries.
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
+
+/// How long a per-repository PR-poll lease lasts before it auto-expires (#1376).
+/// Enabling polling for a repo is deliberately **temporary** — 15 minutes — so an
+/// idle repo stops costing GitHub budget without the user remembering to disable
+/// it; re-enabling refreshes the lease.
+const DEFAULT_POLL_LEASE: Duration = Duration::from_secs(15 * 60);
 
 /// Ceiling on live registry entries, so a misbehaving companion flooding
 /// `register` with distinct keys cannot grow daemon memory faster than the TTL
@@ -129,6 +135,36 @@ pub struct WorktreesRegistry {
     /// like the window map: a daemon restart resets it to the default, which the
     /// next snapshot propagates to every window.
     show_closed: AtomicBool,
+    /// The **per-repository PR-poll** enable set (#1376): the GitHub repos
+    /// (`"owner/name"`) whose PR badges the daemon polls. Polling defaults
+    /// **off** — a repo not in this set issues zero `gh` — so the user enables
+    /// only the handful of repos they are actively working on, rather than the
+    /// daemon polling all 29 open repos and exhausting the GitHub budget. A
+    /// cross-window value like [`show_closed`](Self::show_closed): the daemon
+    /// stamps each repo's state onto the `tree` snapshot (`polling_enabled`) and
+    /// a [`set_polling`](Self::set_polling) flip [`bump`](Self::bump)s the
+    /// change-notify so every window recolors and drops/keeps badges in sync.
+    ///
+    /// Unlike `show_closed` this survives a daemon restart: the adapter seeds it
+    /// from a `0600` file on startup ([`seed_polling`](Self::seed_polling)) and
+    /// persists it on each change — otherwise a restart would silently re-disable
+    /// every repo. Behind its **own** `Mutex`, taken independently of the window
+    /// map's (neither nests) and never held across an `.await`.
+    ///
+    /// Each enable is a **time-boxed lease**, not a permanent flag (#1376): the
+    /// value is the wall-clock instant the lease **expires** ([`poll_ttl`] after
+    /// it was enabled), so an idle repo auto-disables and stops costing `gh`
+    /// without the user remembering to turn it back off. Expired entries are
+    /// reaped on read — the window-TTL precedent — so the icon greys, badges
+    /// drop, and the poller stops within one snapshot tick of expiry.
+    ///
+    /// [`poll_ttl`]: Self::poll_ttl
+    polling_enabled: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// How long a repo's PR-poll lease lasts before it auto-expires (#1376).
+    /// [`DEFAULT_POLL_LEASE`] in production; tests inject a short value via the
+    /// `#[cfg(test)]` `with_poll_ttl` constructor (not linked — it does not exist
+    /// in a non-test doc build).
+    poll_ttl: Duration,
 }
 
 impl WorktreesRegistry {
@@ -141,6 +177,19 @@ impl WorktreesRegistry {
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
             show_closed: AtomicBool::new(true),
+            polling_enabled: Mutex::new(HashMap::new()),
+            poll_ttl: DEFAULT_POLL_LEASE,
+        }
+    }
+
+    /// Creates a registry with a custom PR-poll lease duration, for tests that
+    /// exercise auto-expiry without waiting the full 15 minutes.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_poll_ttl(poll_ttl: Duration) -> Self {
+        Self {
+            poll_ttl,
+            ..Self::new()
         }
     }
 
@@ -310,6 +359,112 @@ impl WorktreesRegistry {
         changed
     }
 
+    /// Locks the per-repo PR-poll lease map (`"owner/name"` → lease-expiry
+    /// instant), recovering from a poisoned mutex (a panic in a prior critical
+    /// section must not wedge polling for the whole daemon).
+    fn polling_lock(&self) -> MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+        self.polling_enabled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether PR polling is currently leased for the GitHub repo `owner/name`
+    /// (#1376) — the entry exists **and** its lease has not expired. Defaults
+    /// **false** (a never-toggled repo does not poll), so only repos the user has
+    /// explicitly enabled, within the last [`poll_ttl`](Self::poll_ttl), poll.
+    #[must_use]
+    pub fn is_polling_enabled(&self, owner: &str, name: &str) -> bool {
+        let now = Utc::now();
+        self.polling_lock()
+            .get(&polling_key(owner, name))
+            .is_some_and(|expiry| *expiry > now)
+    }
+
+    /// The repos with a **live** (unexpired) lease, as a set of `"owner/name"`
+    /// keys — what stamps `polling_enabled` onto the `tree` snapshot. Reaps
+    /// expired leases first (the window-TTL reap-on-read precedent), so an idle
+    /// repo drops out on the next snapshot build without a background timer.
+    /// Cloned out so the lock is never held across the (blocking-thread) tree
+    /// build that reads it.
+    #[must_use]
+    pub fn enabled_polling_repos(&self) -> HashSet<String> {
+        let now = Utc::now();
+        let mut map = self.polling_lock();
+        map.retain(|_, expiry| *expiry > now);
+        map.keys().cloned().collect()
+    }
+
+    /// The live leases as `(repo, expiry)` pairs sorted by repo, for
+    /// deterministic persistence to the `0600` prefs file (#1376) — the expiry is
+    /// stored so a daemon restart within the lease window keeps the *remaining*
+    /// time rather than resetting the clock. Reaps expired leases first, so a
+    /// stale entry is never written back.
+    #[must_use]
+    pub fn polling_snapshot(&self) -> Vec<(String, DateTime<Utc>)> {
+        let now = Utc::now();
+        let mut map = self.polling_lock();
+        map.retain(|_, expiry| *expiry > now);
+        let mut entries: Vec<(String, DateTime<Utc>)> =
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Enables (leases for [`poll_ttl`](Self::poll_ttl)) or disables PR polling
+    /// for `owner/name`, returning whether the stored map changed — which the
+    /// adapter uses to decide whether to persist. Enabling an already-leased repo
+    /// **refreshes** the lease (a new expiry), which is a change worth persisting.
+    ///
+    /// [`bump`](Self::bump)s the change-notify only when the repo's **effective**
+    /// enabled state flips (off→on or on→off), so every subscribed window
+    /// re-pushes a snapshot that recolours the icon and drops/keeps badges — the
+    /// [`set_show_closed`](Self::set_show_closed) precedent. A lease *refresh*
+    /// (already on, still on) changes the expiry but not the visible state, so it
+    /// persists without waking anyone.
+    pub fn set_polling(&self, owner: &str, name: &str, enabled: bool) -> bool {
+        let key = polling_key(owner, name);
+        let now = Utc::now();
+        let (changed, flipped) = {
+            let mut map = self.polling_lock();
+            let was_enabled = map.get(&key).is_some_and(|expiry| *expiry > now);
+            if enabled {
+                let expiry = now
+                    + ChronoDuration::from_std(self.poll_ttl).unwrap_or_else(|_| {
+                        ChronoDuration::seconds(DEFAULT_POLL_LEASE.as_secs() as i64)
+                    });
+                let changed = map.insert(key, expiry) != Some(expiry);
+                (changed, !was_enabled)
+            } else {
+                let removed = map.remove(&key).is_some();
+                (removed, was_enabled)
+            }
+        };
+        if flipped {
+            self.bump();
+        }
+        changed
+    }
+
+    /// Replaces the lease map wholesale from the persisted `0600` prefs file
+    /// (#1376), dropping any lease that already expired while the daemon was down.
+    /// Does **not** [`bump`](Self::bump): it runs before any window subscribes, so
+    /// there is no one to notify, and each window's first snapshot already
+    /// reflects the seeded leases.
+    pub fn seed_polling(&self, leases: impl IntoIterator<Item = (String, DateTime<Utc>)>) {
+        let now = Utc::now();
+        *self.polling_lock() = leases
+            .into_iter()
+            .filter(|(_, expiry)| *expiry > now)
+            .collect();
+    }
+
+    /// Test-only: forces `owner/name`'s lease to `expiry`, so a test can simulate
+    /// an elapsed lease deterministically without sleeping for [`poll_ttl`].
+    #[cfg(test)]
+    pub fn set_polling_expiry(&self, owner: &str, name: &str, expiry: DateTime<Utc>) {
+        self.polling_lock().insert(polling_key(owner, name), expiry);
+    }
+
     /// Reaps stale entries, then returns the live set sorted for deterministic
     /// output. Holds the lock only for pure-CPU work.
     ///
@@ -393,6 +548,13 @@ fn evict_oldest(windows: &mut HashMap<String, WindowEntry>) {
     if let Some(key) = oldest {
         windows.remove(&key);
     }
+}
+
+/// The canonical key for a GitHub repo in the per-repo PR-poll set: `owner/name`
+/// (#1376). One place so the registry's set, the snapshot stamp, and the poller
+/// filter all agree on the exact string.
+fn polling_key(owner: &str, name: &str) -> String {
+    format!("{owner}/{name}")
 }
 
 /// Snapshots the registry into a stably-ordered vector (by repo, then key) so
@@ -830,5 +992,124 @@ mod tests {
             rx.has_changed().unwrap(),
             "flipping the toggle should bump the change-notify"
         );
+    }
+
+    #[test]
+    fn polling_defaults_off_for_an_untoggled_repo() {
+        let reg = WorktreesRegistry::new();
+        // #1376: the whole point — a repo the user has never enabled is not polled.
+        assert!(!reg.is_polling_enabled("rust-works", "omni-dev"));
+        assert!(reg.enabled_polling_repos().is_empty());
+        assert!(reg.polling_snapshot().is_empty());
+    }
+
+    #[test]
+    fn set_polling_leases_and_disables() {
+        let reg = WorktreesRegistry::new();
+        // Enabling a fresh repo reports a change and leases it live.
+        assert!(reg.set_polling("rust-works", "omni-dev", true));
+        assert!(reg.is_polling_enabled("rust-works", "omni-dev"));
+        // Re-enabling refreshes the lease — the map changes (new expiry).
+        assert!(reg.set_polling("rust-works", "omni-dev", true));
+        assert!(reg.is_polling_enabled("rust-works", "omni-dev"));
+        // Disabling reports a change and clears it.
+        assert!(reg.set_polling("rust-works", "omni-dev", false));
+        assert!(!reg.is_polling_enabled("rust-works", "omni-dev"));
+        // Disabling an already-disabled repo is a no-op.
+        assert!(!reg.set_polling("rust-works", "omni-dev", false));
+    }
+
+    #[test]
+    fn polling_lease_auto_expires() {
+        // The 15-minute lease (#1376): an enabled repo drops out once its lease
+        // elapses, reaped on the next read — no background timer.
+        let reg = WorktreesRegistry::new();
+        reg.set_polling("rust-works", "omni-dev", true);
+        assert!(reg.is_polling_enabled("rust-works", "omni-dev"));
+        // Force the lease into the past (as if 15 min elapsed).
+        reg.set_polling_expiry(
+            "rust-works",
+            "omni-dev",
+            Utc::now() - ChronoDuration::seconds(1),
+        );
+        assert!(
+            !reg.is_polling_enabled("rust-works", "omni-dev"),
+            "an expired lease reads as disabled"
+        );
+        // The read paths reap it, so it is gone from the snapshot entirely.
+        assert!(reg.enabled_polling_repos().is_empty());
+        assert!(reg.polling_snapshot().is_empty());
+        // A tiny real TTL expires on its own after a short sleep.
+        let short = WorktreesRegistry::with_poll_ttl(Duration::from_millis(30));
+        short.set_polling("o", "n", true);
+        assert!(short.is_polling_enabled("o", "n"));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!short.is_polling_enabled("o", "n"));
+    }
+
+    #[test]
+    fn set_polling_bumps_only_on_an_effective_flip() {
+        let reg = WorktreesRegistry::new();
+        let rx = reg.subscribe_changes();
+        // A no-op (disabling an already-off repo) does not wake subscribers.
+        assert!(!reg.set_polling("o", "n", false));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a no-op poll toggle must not bump the change-notify"
+        );
+        // A real enable flips off→on and bumps so every window recolors.
+        assert!(reg.set_polling("o", "n", true));
+        assert!(
+            rx.has_changed().unwrap(),
+            "enabling a repo should bump the change-notify"
+        );
+    }
+
+    #[test]
+    fn refreshing_a_live_lease_does_not_bump() {
+        // A lease refresh (already on, still on) persists a new expiry but does
+        // not change the visible state, so it must not wake every window.
+        let reg = WorktreesRegistry::new();
+        reg.set_polling("o", "n", true);
+        let rx = reg.subscribe_changes();
+        assert!(
+            reg.set_polling("o", "n", true),
+            "re-enabling refreshes the lease (map changed → persist)"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "refreshing a live lease must not bump — the visible state is unchanged"
+        );
+    }
+
+    #[test]
+    fn seed_polling_loads_leases_and_drops_expired() {
+        let reg = WorktreesRegistry::new();
+        reg.set_polling("a", "z", true);
+        let future = Utc::now() + ChronoDuration::minutes(10);
+        let past = Utc::now() - ChronoDuration::minutes(1);
+        // Seeding (the startup load) replaces wholesale, dropping the prior entry
+        // and any already-expired lease from the file.
+        reg.seed_polling([
+            ("rust-works/omni-dev".to_string(), future),
+            ("acme/widgets".to_string(), future),
+            ("stale/repo".to_string(), past),
+        ]);
+        assert!(!reg.is_polling_enabled("a", "z"));
+        assert!(reg.is_polling_enabled("rust-works", "omni-dev"));
+        assert!(
+            !reg.is_polling_enabled("stale", "repo"),
+            "expired lease dropped"
+        );
+        // The persisted form is deterministic (sorted) and carries the expiries.
+        let snap = reg.polling_snapshot();
+        assert_eq!(
+            snap.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![
+                "acme/widgets".to_string(),
+                "rust-works/omni-dev".to_string()
+            ]
+        );
+        assert!(snap.iter().all(|(_, expiry)| *expiry == future));
     }
 }

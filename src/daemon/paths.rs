@@ -34,6 +34,15 @@ pub fn token_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("bridge.token"))
 }
 
+/// Default per-repo PR-poll preferences path: `<runtime_dir>/worktrees-polling.json`.
+///
+/// The worktrees service persists the set of GitHub repos whose PR badges it
+/// polls here (`0600`), so the enable/disable choice survives a daemon restart
+/// (#1376). Non-secret, but co-located with the other `0600` runtime state.
+pub fn worktrees_polling_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("worktrees-polling.json"))
+}
+
 /// The bridge token file co-located with a control socket
 /// (`<socket dir>/bridge.token`), so a custom `--socket` keeps its token beside
 /// it. For the default socket this equals [`token_path`].
@@ -174,6 +183,9 @@ mod tests {
         let rt = runtime_dir().unwrap();
         assert!(socket_path().unwrap().starts_with(&rt));
         assert!(token_path().unwrap().starts_with(&rt));
+        let polling = worktrees_polling_path().unwrap();
+        assert!(polling.starts_with(&rt));
+        assert_eq!(polling.file_name().unwrap(), "worktrees-polling.json");
     }
 
     #[test]
