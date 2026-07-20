@@ -211,15 +211,19 @@ async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
 }
 
 /**
- * Resolves a **degraded** PR badge for each branch the daemon did not badge — the
- * {@link PrBadgeFetcher} injected into the tree provider.
+ * Resolves a **degraded** PR badge for each branch the daemon left unresolved —
+ * the {@link PrBadgeFetcher} injected into the tree provider.
  *
  * Badges are resolved daemon-side since #1337: one `gh api graphql` covers every
  * repo and branch, and a background poller keeps CI state live in every window.
- * A daemon that supplies `pr` therefore needs nothing from here, and the provider
- * asks only for the branches it omitted — so against a current daemon this runs no
- * `gh` at all. Against an older one it reports the PR number without a checks
- * glyph (see {@link prFallbackBadge}). A no-op when `showPullRequests` is off.
+ * A current daemon reports every checked branch as either a badge (`pr`) or the
+ * explicit "no open PR" negative (`pr_none`, #1370), and the provider asks only
+ * for branches carrying neither — so against a current daemon this runs no `gh`
+ * at all. (Before #1370 a PR-less branch was indistinguishable from an unchecked
+ * one, which kept this firing per window × repo × 60s forever.) Against a
+ * pre-#1370 daemon the unresolved branches land here and it reports the PR
+ * number without a checks glyph (see {@link prFallbackBadge}) — the intended
+ * degraded path. A no-op when `showPullRequests` is off.
  */
 async function fetchPrBadges(
   repo: TreeGithubIdentity,
