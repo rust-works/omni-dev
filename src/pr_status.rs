@@ -38,6 +38,17 @@
 //! - `checkSuites { checkRuns { totalCount } }` is a third-level connection and
 //!   costs **11**.
 //!
+//! # The explicit negative (#1370)
+//!
+//! Resolution is tri-state per target, not binary. "No open PR heads this branch"
+//! is a *successful* answer ([`PrResolution::NoPr`]), distinct from "never
+//! resolved" (absent from the cache). Absence used to carry both meanings, which
+//! left a client unable to tell "checked, none" from "old daemon that never
+//! checked" — so every window's degraded `gh pr list` fallback re-fired per
+//! window × repo × 60s forever, burning the very GraphQL budget this module
+//! exists to protect. A **failed** poll still reports nothing: negatives are only
+//! ever minted from a successfully parsed reply.
+//!
 //! [ADR-0050]: ../../docs/adrs/adr-0050.md
 
 use std::collections::{BTreeMap, HashMap};
@@ -153,6 +164,25 @@ pub struct PrTarget {
     pub name: String,
     /// The branch checked out in the worktree.
     pub branch: String,
+}
+
+/// The outcome for one **successfully checked** target (#1370).
+///
+/// [`NoPr`](Self::NoPr) deliberately carries no `head_oid`: a negative has no
+/// verdict to be stale against, and carrying the remote head would turn every
+/// push into a `NoPr(a) → NoPr(b)` map change — spuriously bumping the
+/// change-notify that [`PrStatusCache::replace`] exists to gate. A negative that
+/// *is* out of date (a PR was just opened) is corrected by the poller's
+/// `moved`-triggered immediate re-poll instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrResolution {
+    /// An open PR heads the branch; here is its badge.
+    Pr(PrBadge),
+    /// The branch was checked against GitHub and **no open PR** heads it —
+    /// including a branch never pushed. Serialized as `pr_none: true` on the
+    /// tree wire, so a client can tell "checked, none" from "not resolved" and
+    /// keep its degraded fallback quiet.
+    NoPr,
 }
 
 /// How a **single** rollup entry classifies.
@@ -322,9 +352,9 @@ fn build_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
     Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
 }
 
-/// Reads one resolved `ref` node into a badge. `None` — rendering no badge — for a
-/// branch that does not exist on the remote (never pushed), or that no open PR
-/// heads.
+/// Reads one resolved `ref` node into a badge. `None` for a node without a
+/// readable open PR; [`resolution_from_ref`] decides whether that means "no PR"
+/// (an explicit negative) or "malformed" (unresolved) before delegating here.
 fn badge_from_ref(node: &Value) -> Option<PrBadge> {
     let pr = node
         .get("associatedPullRequests")?
@@ -360,26 +390,51 @@ fn badge_from_ref(node: &Value) -> Option<PrBadge> {
     })
 }
 
-/// Reads the GraphQL reply back into badges, keyed by target.
+/// Reads one **non-null** `ref` node into a resolution: [`PrResolution::NoPr`]
+/// when the PR list is present and empty, a badge for an open PR, and `None` —
+/// *unresolved*, never a negative — for a malformed node. A false negative would
+/// silence the client fallback for a branch that may well have a PR, so anything
+/// we cannot positively read stays unresolved (#1370).
+fn resolution_from_ref(node: &Value) -> Option<PrResolution> {
+    let prs = node
+        .get("associatedPullRequests")?
+        .get("nodes")?
+        .as_array()?;
+    if prs.is_empty() {
+        return Some(PrResolution::NoPr);
+    }
+    badge_from_ref(node).map(PrResolution::Pr)
+}
+
+/// Reads the GraphQL reply back into resolutions, keyed by target.
 ///
-/// Best-effort per branch: a missing or malformed node is skipped rather than
-/// sinking the whole poll, matching the tree's "absent field → absent indicator"
-/// degradation.
-fn parse_response(body: &Value, index: &QueryIndex) -> HashMap<PrTarget, PrBadge> {
+/// Tri-state per target (#1370): an open PR yields its badge, a checked branch
+/// with none — including one never pushed, whose aliased `ref` comes back null —
+/// yields [`PrResolution::NoPr`], and a target whose part of the reply is missing
+/// or malformed is simply **absent** (unresolved). Best-effort per branch: one
+/// bad node never sinks the whole poll, and never mints a negative.
+fn parse_response(body: &Value, index: &QueryIndex) -> HashMap<PrTarget, PrResolution> {
     let mut out = HashMap::new();
     let Some(data) = body.get("data") else {
         return out;
     };
     for ((ri, bi), target) in index {
-        let node = data
-            .get(format!("r{ri}"))
-            .and_then(|r| r.get(format!("b{bi}")));
-        // A null ref (unpushed branch) is expected, not an error.
-        let Some(node) = node.filter(|n| !n.is_null()) else {
+        // A repo alias absent or null (a repo-level failure) is unresolved — only
+        // an answer *about the ref* may mint a negative.
+        let Some(repo) = data.get(format!("r{ri}")).filter(|r| !r.is_null()) else {
             continue;
         };
-        if let Some(badge) = badge_from_ref(node) {
-            out.insert(target.clone(), badge);
+        let Some(node) = repo.get(format!("b{bi}")) else {
+            continue;
+        };
+        // A null ref is a branch that does not exist on the remote (never
+        // pushed): checked, and definitively PR-less.
+        if node.is_null() {
+            out.insert(target.clone(), PrResolution::NoPr);
+            continue;
+        }
+        if let Some(resolution) = resolution_from_ref(node) {
+            out.insert(target.clone(), resolution);
         }
     }
     out
@@ -433,8 +488,8 @@ fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("gh api graphql returned invalid JSON")
 }
 
-/// Resolves a badge for every target in **one** `gh api graphql` call, using the
-/// `gh` at `bin`.
+/// Resolves every target in **one** `gh api graphql` call, using the `gh` at
+/// `bin`.
 ///
 /// The binary is a parameter rather than resolved here so callers read the
 /// environment **once** (the poller does it at spawn, like its interval) and so
@@ -442,9 +497,13 @@ fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
 /// tests pointing one global env var at different fakes race, and the project is
 /// migrating away from test env locks toward injection (#1030).
 ///
-/// **Blocking** — run on a blocking thread. Returns only the targets that resolved
-/// to an open PR; a branch with no PR, or not pushed, is simply absent.
-pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget, PrBadge>> {
+/// **Blocking** — run on a blocking thread. Every target that was successfully
+/// checked appears in the map: [`PrResolution::Pr`] for an open PR,
+/// [`PrResolution::NoPr`] for a branch — pushed or not — with none (#1370). A
+/// target is *absent* only when its part of the reply was missing or malformed,
+/// and a failed call (`Err`, including a GraphQL 200 carrying `errors`) yields no
+/// map at all — so a failed poll can never manufacture negatives.
+pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget, PrResolution>> {
     let Some((query, index)) = build_query(targets) else {
         return Ok(HashMap::new());
     };
@@ -459,27 +518,28 @@ pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget
     Ok(parse_response(&body, &index))
 }
 
-/// The poller-written, snapshot-read badge cache.
+/// The poller-written, snapshot-read resolution cache.
 ///
 /// A plain `std::Mutex` map: writes come from the poll loop, reads from the tree
 /// snapshot build. The lock is never held across an `.await` — every method takes
 /// it, finishes, and drops it.
 #[derive(Debug, Default)]
 pub struct PrStatusCache {
-    badges: Mutex<HashMap<PrTarget, PrBadge>>,
+    resolutions: Mutex<HashMap<PrTarget, PrResolution>>,
 }
 
 impl PrStatusCache {
     /// An empty cache. Until the first poll lands, every lookup misses and the
-    /// tree simply renders no badge.
+    /// tree simply renders no badge — and no negative either (#1370).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The badge for one (repo, branch), if resolved.
+    /// The resolution for one (repo, branch): a badge, an explicit no-PR, or
+    /// `None` when never successfully checked.
     #[must_use]
-    pub fn get(&self, owner: &str, name: &str, branch: &str) -> Option<PrBadge> {
+    pub fn get(&self, owner: &str, name: &str, branch: &str) -> Option<PrResolution> {
         let key = PrTarget {
             owner: owner.to_string(),
             name: name.to_string(),
@@ -493,8 +553,10 @@ impl PrStatusCache {
     /// The bool is load-bearing: the caller bumps the registry's change-notify only
     /// when it is `true`. Bumping unconditionally would defeat the server's
     /// diff-and-drop and re-push an identical snapshot to every window on every
-    /// poll — the cost this whole design exists to avoid.
-    pub fn replace(&self, next: HashMap<PrTarget, PrBadge>) -> bool {
+    /// poll — the cost this whole design exists to avoid. A first round of
+    /// negatives *is* a change — the one push that delivers them — after which
+    /// identical polls stay silent.
+    pub fn replace(&self, next: HashMap<PrTarget, PrResolution>) -> bool {
         let mut guard = self.lock();
         if *guard == next {
             return false;
@@ -503,18 +565,21 @@ impl PrStatusCache {
         true
     }
 
-    /// Whether any cached badge is still pending — the poller's cadence signal.
+    /// Whether any cached badge is still pending — the poller's cadence signal. A
+    /// negative is terminal and never holds the fast cadence.
     #[must_use]
     pub fn any_pending(&self) -> bool {
         self.lock()
             .values()
-            .any(|b| b.checks == PrCheckState::Pending)
+            .any(|r| matches!(r, PrResolution::Pr(b) if b.checks == PrCheckState::Pending))
     }
 
     /// Poison-tolerant lock: a panicking holder must not wedge the badge cache,
     /// which is best-effort decoration.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PrTarget, PrBadge>> {
-        self.badges.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PrTarget, PrResolution>> {
+        self.resolutions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -776,7 +841,7 @@ mod tests {
     // --- Reply parsing ---
 
     #[test]
-    fn parse_response_reads_badges_and_skips_absent_refs() {
+    fn parse_response_reads_badges_and_resolves_absent_refs_as_negatives() {
         let targets = vec![target("feature"), target("unpushed"), target("no-pr")];
         let (_, index) = build_query(&targets).unwrap();
         // Aliases are assigned in BTreeMap order of (owner,name) then input order.
@@ -787,7 +852,7 @@ mod tests {
                 ]}}},
                 "associatedPullRequests":{"nodes":[{"number":65,"isDraft":true,"url":"u"}]}
             },
-            // An unpushed branch resolves to a null ref — expected, not an error.
+            // An unpushed branch resolves to a null ref — checked, and PR-less.
             "b1": null,
             // Pushed, but no open PR heads it.
             "b2": {
@@ -796,12 +861,58 @@ mod tests {
             }
         }}});
         let out = parse_response(&body, &index);
-        assert_eq!(out.len(), 1, "{out:?}");
-        let badge = out.get(&target("feature")).unwrap();
+        assert_eq!(out.len(), 3, "{out:?}");
+        let Some(PrResolution::Pr(badge)) = out.get(&target("feature")) else {
+            panic!("expected a badge for feature: {out:?}");
+        };
         assert_eq!(badge.number, 65);
         assert!(badge.is_draft);
         assert_eq!(badge.checks, PrCheckState::Success);
         assert_eq!(badge.url, "u");
+        assert_eq!(out.get(&target("unpushed")), Some(&PrResolution::NoPr));
+        assert_eq!(out.get(&target("no-pr")), Some(&PrResolution::NoPr));
+    }
+
+    #[test]
+    fn parse_response_reports_a_pushed_branch_with_no_pr_as_a_negative() {
+        let (_, index) = build_query(&[target("quiet")]).unwrap();
+        let body = json!({"data":{"r0":{"b0":{
+            "target": {"oid":"abc","statusCheckRollup":null},
+            "associatedPullRequests":{"nodes":[]}
+        }}}});
+        let out = parse_response(&body, &index);
+        assert_eq!(out.get(&target("quiet")), Some(&PrResolution::NoPr));
+    }
+
+    #[test]
+    fn parse_response_reports_an_unpushed_branch_as_a_negative() {
+        let (_, index) = build_query(&[target("local-only")]).unwrap();
+        let body = json!({"data":{"r0":{"b0":null}}});
+        let out = parse_response(&body, &index);
+        assert_eq!(out.get(&target("local-only")), Some(&PrResolution::NoPr));
+    }
+
+    #[test]
+    fn parse_response_leaves_a_missing_alias_unresolved_rather_than_negative() {
+        // Only an answer about the ref may mint a negative: a reply missing the
+        // ref alias, or with a null repo alias (a repo-level failure), says
+        // nothing about the branch — a false NoPr would silence the client
+        // fallback for a branch that may have a PR.
+        let (_, index) = build_query(&[target("x")]).unwrap();
+        assert!(parse_response(&json!({"data":{"r0":{}}}), &index).is_empty());
+        assert!(parse_response(&json!({"data":{"r0":null}}), &index).is_empty());
+    }
+
+    #[test]
+    fn parse_response_leaves_a_malformed_pr_node_unresolved_rather_than_negative() {
+        let (_, index) = build_query(&[target("x")]).unwrap();
+        // The PR list is non-empty, so this is not "no PR" — but the node has no
+        // readable number, so it is not a badge either. It must stay unresolved.
+        let body = json!({"data":{"r0":{"b0":{
+            "target": {"oid":"abc","statusCheckRollup":null},
+            "associatedPullRequests":{"nodes":[{"isDraft":false,"url":"u"}]}
+        }}}});
+        assert!(parse_response(&body, &index).is_empty());
     }
 
     #[test]
@@ -813,14 +924,16 @@ mod tests {
             "associatedPullRequests":{"nodes":[{"number":7,"isDraft":false,"url":"u"}]}
         }}}});
         let out = parse_response(&body, &index);
-        assert_eq!(
-            out.get(&target("feature")).unwrap().checks,
-            PrCheckState::None
-        );
+        // A PR with no checks is still a PR — PrCheckState::None, never NoPr.
+        let Some(PrResolution::Pr(badge)) = out.get(&target("feature")) else {
+            panic!("expected a badge: {out:?}");
+        };
+        assert_eq!(badge.checks, PrCheckState::None);
     }
 
     #[test]
     fn parse_response_tolerates_a_missing_data_block() {
+        // A reply without `data` resolves nothing — and mints no negatives.
         let (_, index) = build_query(&[target("x")]).unwrap();
         assert!(parse_response(&json!({}), &index).is_empty());
     }
@@ -951,7 +1064,9 @@ mod tests {
     fn resolve_with_surfaces_graphql_errors_rather_than_reporting_no_badges() {
         // A GraphQL 200 can still carry errors (a bad field, a rate limit). Reading
         // that as an empty result would be indistinguishable from "no open PRs" and
-        // would silently blank every badge, so it must be an error.
+        // would silently blank every badge, so it must be an error. Doubly
+        // load-bearing since #1370: the hard Err is what guarantees a failed poll
+        // can never manufacture NoPr negatives.
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(
             dir.path(),
@@ -976,7 +1091,10 @@ mod tests {
             0,
         );
         let out = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap();
-        assert_eq!(out.get(&target("main")).unwrap().number, 9);
+        let Some(PrResolution::Pr(badge)) = out.get(&target("main")) else {
+            panic!("expected a badge: {out:?}");
+        };
+        assert_eq!(badge.number, 9);
     }
 
     #[test]
@@ -992,26 +1110,58 @@ mod tests {
             0,
         );
         let out = retry_on_etxtbsy(|| resolve_with(&bin, &[target("main")])).unwrap();
-        let badge = out.get(&target("main")).unwrap();
+        let Some(PrResolution::Pr(badge)) = out.get(&target("main")) else {
+            panic!("expected a badge: {out:?}");
+        };
         assert_eq!(badge.number, 42);
         assert!(badge.is_draft);
         assert_eq!(badge.checks, PrCheckState::Failure);
     }
 
+    #[test]
+    fn resolve_with_reports_negatives_alongside_badges_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"data":{"r0":{
+                "b0":{
+                    "target":{"oid":"a","statusCheckRollup":null},
+                    "associatedPullRequests":{"nodes":[{"number":7,"isDraft":false,"url":"u"}]}},
+                "b1":null,
+                "b2":{
+                    "target":{"oid":"b","statusCheckRollup":null},
+                    "associatedPullRequests":{"nodes":[]}}}}}"#,
+            0,
+        );
+        let targets = vec![target("main"), target("unpushed"), target("quiet")];
+        let out = retry_on_etxtbsy(|| resolve_with(&bin, &targets)).unwrap();
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert!(
+            matches!(out.get(&target("main")), Some(PrResolution::Pr(b)) if b.number == 7),
+            "{out:?}"
+        );
+        assert_eq!(out.get(&target("unpushed")), Some(&PrResolution::NoPr));
+        assert_eq!(out.get(&target("quiet")), Some(&PrResolution::NoPr));
+    }
+
     // --- Cache ---
 
-    #[test]
-    fn cache_replace_reports_whether_anything_changed() {
-        let cache = PrStatusCache::new();
-        let badge = PrBadge {
-            number: 1,
+    /// A pending badge wrapped as a resolution, for cache fixtures.
+    fn pending_pr(number: u64) -> PrResolution {
+        PrResolution::Pr(PrBadge {
+            number,
             is_draft: false,
             checks: PrCheckState::Pending,
             url: "u".into(),
             head_oid: String::new(),
-        };
+        })
+    }
+
+    #[test]
+    fn cache_replace_reports_whether_anything_changed() {
+        let cache = PrStatusCache::new();
         let mut map = HashMap::new();
-        map.insert(target("f"), badge);
+        map.insert(target("f"), pending_pr(1));
 
         // First write is a change.
         assert!(cache.replace(map.clone()));
@@ -1021,11 +1171,43 @@ mod tests {
 
         // A changed verdict is a change.
         let mut moved = map.clone();
-        moved.get_mut(&target("f")).unwrap().checks = PrCheckState::Success;
+        if let Some(PrResolution::Pr(badge)) = moved.get_mut(&target("f")) {
+            badge.checks = PrCheckState::Success;
+        }
         assert!(cache.replace(moved));
         // Emptying is a change.
         assert!(cache.replace(HashMap::new()));
         assert!(!cache.replace(HashMap::new()));
+    }
+
+    #[test]
+    fn cache_replace_counts_a_new_negative_as_a_change() {
+        let cache = PrStatusCache::new();
+        let mut negatives = HashMap::new();
+        negatives.insert(target("f"), PrResolution::NoPr);
+
+        // The first round of negatives is a change — the one push that delivers
+        // them to clients so their fallback goes quiet.
+        assert!(cache.replace(negatives.clone()));
+        // Re-polling the same answer is not.
+        assert!(!cache.replace(negatives.clone()));
+
+        // A PR opening (negative → badge) and closing (badge → negative) are both
+        // real transitions.
+        let mut opened = HashMap::new();
+        opened.insert(target("f"), pending_pr(1));
+        assert!(cache.replace(opened));
+        assert!(cache.replace(negatives));
+    }
+
+    #[test]
+    fn cache_any_pending_ignores_negative_resolutions() {
+        // A negative is terminal: it must never hold the poller's fast cadence.
+        let cache = PrStatusCache::new();
+        let mut map = HashMap::new();
+        map.insert(target("f"), PrResolution::NoPr);
+        cache.replace(map);
+        assert!(!cache.any_pending());
     }
 
     #[test]
@@ -1035,23 +1217,22 @@ mod tests {
         assert!(!cache.any_pending());
 
         let mut map = HashMap::new();
-        map.insert(
-            target("f"),
-            PrBadge {
-                number: 1,
-                is_draft: false,
-                checks: PrCheckState::Pending,
-                url: "u".into(),
-                head_oid: String::new(),
-            },
-        );
+        map.insert(target("f"), pending_pr(1));
         cache.replace(map.clone());
-        assert_eq!(cache.get("rust-works", "omni-dev", "f").unwrap().number, 1);
+        assert!(
+            matches!(
+                cache.get("rust-works", "omni-dev", "f"),
+                Some(PrResolution::Pr(b)) if b.number == 1
+            ),
+            "expected the cached badge back"
+        );
         assert!(cache.any_pending());
         // A miss on a branch we never resolved.
         assert!(cache.get("rust-works", "omni-dev", "other").is_none());
 
-        map.get_mut(&target("f")).unwrap().checks = PrCheckState::Success;
+        if let Some(PrResolution::Pr(badge)) = map.get_mut(&target("f")) {
+            badge.checks = PrCheckState::Success;
+        }
         cache.replace(map);
         assert!(!cache.any_pending());
     }
