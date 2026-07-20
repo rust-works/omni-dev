@@ -30,7 +30,7 @@
 //! "is a window open on it?" becomes a per-worktree attribute. All of this is
 //! git disk I/O, so it runs on a blocking thread, never under the registry lock.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 
 use crate::github_rate_limit::{
     resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
@@ -250,6 +251,13 @@ fn pr_watch_from_snapshot(snapshot: &Value) -> Vec<PrWatch> {
         .into_iter()
         .flatten()
     {
+        // The zero-`gh` guarantee (#1376): a repo the user has not enabled
+        // contributes no watch, so the poll's `gh api graphql` never mentions it.
+        // The snapshot this reads is already `stamp_polling`-stamped, so this one
+        // check is the single filter point — default-off means an absent flag skips.
+        if repo.get("polling_enabled").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
         let Some(github) = repo.get("github") else {
             continue;
         };
@@ -355,6 +363,14 @@ pub struct WorktreesService {
     /// A `tokio` mutex rather than a `std` one: it is held across the
     /// `spawn_blocking` join, which is an `.await`.
     prune_lock: tokio::sync::Mutex<()>,
+    /// Where the per-repo PR-poll enable set is persisted (#1376), so a user's
+    /// choice survives a daemon restart. `None` disables persistence entirely —
+    /// the default from [`new`](Self::new), which keeps the bare service cheap
+    /// and I/O-free for unit tests; the daemon wires it via
+    /// [`load_polling_prefs`](Self::load_polling_prefs) at startup. Behind a
+    /// `std::Mutex` only so `load_polling_prefs` can set it on `&self`; read
+    /// briefly and never held across an `.await`.
+    polling_prefs_path: Mutex<Option<PathBuf>>,
 }
 
 impl WorktreesService {
@@ -376,6 +392,69 @@ impl WorktreesService {
             rate_limit_poller: Mutex::new(None),
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
             prune_lock: tokio::sync::Mutex::new(()),
+            polling_prefs_path: Mutex::new(None),
+        }
+    }
+
+    /// Seeds the per-repo PR-poll enable set from the persisted `0600` prefs file
+    /// and remembers `path` so later [`set-polling`](Self::handle) changes persist
+    /// back to it (#1376). Called once by the daemon at startup, before any window
+    /// subscribes — so [`seed_polling`](WorktreesRegistry::seed_polling) needs no
+    /// bump. Best-effort throughout: a missing file is the first-run default (no
+    /// repos enabled), and a corrupt/unreadable one is logged and treated as
+    /// empty rather than wedging the service — the user simply re-enables. The
+    /// path is stored regardless, so the next change rewrites a clean file.
+    pub fn load_polling_prefs(&self, path: PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<PollingPrefs>(&bytes) {
+                Ok(prefs) => self
+                    .registry
+                    .seed_polling(prefs.enabled.into_iter().map(|l| (l.repo, l.expires_at))),
+                Err(err) => tracing::warn!(
+                    "ignoring unreadable worktrees polling prefs at {}: {err:#}",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                "could not read worktrees polling prefs at {}: {err:#}",
+                path.display()
+            ),
+        }
+        *self
+            .polling_prefs_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Writes the current enable set to the `0600` prefs file, if persistence is
+    /// configured ([`load_polling_prefs`](Self::load_polling_prefs) set a path).
+    /// Best-effort: a write failure is logged at WARN and swallowed, since the
+    /// in-memory set is authoritative for the running daemon — the user's toggle
+    /// still took effect, it just would not survive a restart. A no-op (returns
+    /// early) in unit tests, which never configure a path.
+    fn persist_polling_prefs(&self) {
+        let Some(path) = self
+            .polling_prefs_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let prefs = PollingPrefs {
+            enabled: self
+                .registry
+                .polling_snapshot()
+                .into_iter()
+                .map(|(repo, expires_at)| PollingLease { repo, expires_at })
+                .collect(),
+        };
+        if let Err(err) = write_polling_prefs(&path, &prefs) {
+            tracing::warn!(
+                "could not persist worktrees polling prefs to {}: {err:#}",
+                path.display()
+            );
         }
     }
 
@@ -858,6 +937,29 @@ impl DaemonService for WorktreesService {
                 self.registry.set_show_closed(show_closed);
                 Ok(json!({ "ok": true }))
             }
+            "set-polling" => {
+                // Per-repo PR-poll toggle (#1376). Enabling a repo starts the
+                // poller resolving its badges (default is off — zero `gh`);
+                // disabling stops it and drops its badges. `set_polling` bumps the
+                // change-notify on a real change, so every subscribed window
+                // re-pushes a `tree` snapshot carrying the new per-repo
+                // `polling_enabled` — the reliable cross-window sync the
+                // `set-show-closed` precedent relies on. A changed value is
+                // persisted so it survives a daemon restart.
+                let owner = require_str(&payload, "owner", "set-polling")?;
+                let name = require_str(&payload, "name", "set-polling")?;
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| anyhow!("`set-polling` requires a boolean `enabled`"))?;
+                if owner.trim().is_empty() || name.trim().is_empty() {
+                    bail!("`set-polling` requires a non-empty `owner` and `name`");
+                }
+                if self.registry.set_polling(owner, name, enabled) {
+                    self.persist_polling_prefs();
+                }
+                Ok(json!({ "ok": true }))
+            }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
                 // arbitrary worktree folder supplied by a socket client, reusing
@@ -1049,6 +1151,38 @@ struct GitStatus {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// One persisted PR-poll lease: the GitHub repo (`"owner/name"`) and when its
+/// lease expires (#1376). Storing the expiry — not just the repo — is what lets a
+/// daemon restart within the lease window keep the *remaining* time rather than
+/// resetting the 15-minute clock; an already-expired entry is dropped on load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PollingLease {
+    repo: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// The on-disk shape of the per-repo PR-poll prefs (#1376): the live leases whose
+/// PR badges the daemon polls. Only **enabled** (leased) repos are stored —
+/// absence means not-polled (the default-off model) — so the file stays small (a
+/// handful of active repos out of many open). `#[serde(default)]` so an
+/// empty/older file decodes to "nothing enabled".
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PollingPrefs {
+    #[serde(default)]
+    enabled: Vec<PollingLease>,
+}
+
+/// Writes `prefs` to `path` as pretty JSON with `0600` perms, creating the
+/// parent runtime dir (`0700`) if needed — the bridge-token persistence pattern
+/// (`BridgeService`), reusing the same [`crate::daemon::paths`] helpers.
+fn write_polling_prefs(path: &Path, prefs: &PollingPrefs) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::daemon::paths::ensure_dir_0700(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(prefs).context("failed to serialize polling prefs")?;
+    crate::daemon::paths::write_file_0600(path, &json)
 }
 
 /// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
@@ -1323,6 +1457,15 @@ struct TreeRepo {
     github: Option<GithubIdentity>,
     /// Absolute path to the main working tree — the repo's root.
     root: String,
+    /// Whether the daemon polls this repo's PR badges (#1376). Stamped from the
+    /// registry's per-repo enable set, which defaults **off**, so it is omitted
+    /// (false) for the common not-polled repo — keeping older clients
+    /// byte-identical — and present (`true`) only for a repo the user has
+    /// explicitly enabled. The extension colours the repo icon green when set and
+    /// gates the "Disable PR Polling" menu on it; the daemon's own poller filters
+    /// on it so a not-polled repo issues zero `gh`.
+    #[serde(skip_serializing_if = "is_false")]
+    polling_enabled: bool,
     /// Every worktree of the repo: the main working tree first, then linked
     /// worktrees sorted by path.
     worktrees: Vec<TreeWorktree>,
@@ -1451,8 +1594,30 @@ fn worktree_entry(
 /// when `head_sha` moves: it has no commit to be stale against, and dropping it
 /// would re-arm every client's `gh` fallback on every local commit. The poller's
 /// `moved` trigger re-checks the branch within one fast poll anyway.
+/// Stamps each repo's `polling_enabled` flag from the registry's per-repo PR-poll
+/// enable set (#1376).
+///
+/// Runs after [`build_tree`] (which knows the GitHub identity) and **before**
+/// [`fold_pr_badges`] (which skips a not-polled repo), so a repo the user has not
+/// enabled carries neither the flag nor any badge. Purely a set membership check —
+/// no I/O — so it is safe on the snapshot's hot path. A non-GitHub repo has no key
+/// and stays `false`; it never polls anyway.
+fn stamp_polling(repos: &mut [TreeRepo], enabled: &HashSet<String>) {
+    for repo in repos {
+        if let Some(github) = &repo.github {
+            repo.polling_enabled = enabled.contains(&format!("{}/{}", github.owner, github.name));
+        }
+    }
+}
+
 fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
     for repo in repos {
+        // A not-polled repo (#1376) never carries a badge: skip it so a repo the
+        // user disabled drops its `pr`/`pr_none` the moment `stamp_polling` clears
+        // the flag, and so the icon greys cross-window on the next pushed snapshot.
+        if !repo.polling_enabled {
+            continue;
+        }
         let Some(github) = repo.github.clone() else {
             continue;
         };
@@ -1512,6 +1677,9 @@ fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> 
         main_repo: main_repo_name(&commondir)?,
         github: remote_github_identity(&main_repo),
         root: main_root.display().to_string(),
+        // Defaults off; `stamp_polling` sets it from the registry's enable set
+        // once the repo (and thus its GitHub identity) is assembled.
+        polling_enabled: false,
         worktrees,
     })
 }
@@ -1547,9 +1715,13 @@ async fn tree_repos(
     folders: Vec<PathBuf>,
     windows: Vec<WindowEntry>,
     pr_cache: Arc<PrStatusCache>,
+    enabled_polling: HashSet<String>,
 ) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
         let mut repos = build_tree(folders, windows);
+        // Stamp per-repo poll state first so `fold_pr_badges` can skip a
+        // not-polled repo — a disabled repo carries neither the flag nor a badge.
+        stamp_polling(&mut repos, &enabled_polling);
         fold_pr_badges(&mut repos, &pr_cache);
         repos
             .iter()
@@ -1768,8 +1940,9 @@ async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache
     let folders = registry.open_folders();
     let windows = registry.list();
     let show_closed = registry.show_closed();
+    let enabled_polling = registry.enabled_polling_repos();
     json!({
-        "repos": tree_repos(folders, windows, pr_cache).await,
+        "repos": tree_repos(folders, windows, pr_cache, enabled_polling).await,
         "show_closed": show_closed,
     })
 }
@@ -2475,7 +2648,6 @@ fn remove_worktree(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::shim::{shim_lock, write_exec_script};
-    use chrono::Utc;
     use std::sync::MutexGuard;
 
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
@@ -2984,6 +3156,298 @@ mod tests {
             .expect("changed should resolve after a toggle flip");
         // The pushed snapshot now reflects the new toggle.
         assert_eq!(stream.snapshot().await["show_closed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn set_polling_toggles_the_snapshot_field_for_a_repo() {
+        // #1376: enabling stamps `polling_enabled: true` on the repo; disabling
+        // drops it (skip-if-false), so the extension colours the icon off the flag.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        let repo = repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0].clone();
+        assert!(
+            repo.get("polling_enabled").is_none(),
+            "default off omits the flag: {repo:?}"
+        );
+
+        let reply = svc
+            .handle(
+                "set-polling",
+                json!({ "owner": "rust-works", "name": "omni-dev", "enabled": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "ok": true }));
+        let repo = repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0].clone();
+        assert_eq!(repo["polling_enabled"], json!(true));
+
+        svc.handle(
+            "set-polling",
+            json!({ "owner": "rust-works", "name": "omni-dev", "enabled": false }),
+        )
+        .await
+        .unwrap();
+        let repo = repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0].clone();
+        assert!(repo.get("polling_enabled").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_polling_rejects_missing_or_empty_fields() {
+        let svc = WorktreesService::new();
+        // Missing `enabled`.
+        assert!(svc
+            .handle("set-polling", json!({ "owner": "o", "name": "n" }))
+            .await
+            .is_err());
+        // Missing `owner`/`name`.
+        assert!(svc
+            .handle("set-polling", json!({ "enabled": true }))
+            .await
+            .is_err());
+        // Blank `owner`/`name`.
+        assert!(svc
+            .handle(
+                "set-polling",
+                json!({ "owner": " ", "name": "n", "enabled": true })
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_polling_wakes_the_subscription() {
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        let mut stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        svc.handle(
+            "set-polling",
+            json!({ "owner": "rust-works", "name": "omni-dev", "enabled": true }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stream.changed())
+            .await
+            .expect("changed should resolve after enabling a repo");
+        let repo = repos_of(&stream.snapshot().await)[0].clone();
+        assert_eq!(repo["polling_enabled"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn disabling_a_repo_drops_its_pr_badges_immediately() {
+        // The "drop existing badges immediately" requirement (#1376), done
+        // daemon-side: the fold skips a not-polled repo, so a disable strips the
+        // badge on the very next snapshot rather than waiting for a poll.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pr(pending_badge(7, &head)),
+        );
+        svc.pr_cache.replace(badges);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr"]["number"], json!(7));
+
+        svc.handle(
+            "set-polling",
+            json!({ "owner": "rust-works", "name": "omni-dev", "enabled": false }),
+        )
+        .await
+        .unwrap();
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert!(
+            wt.get("pr").is_none(),
+            "a disabled repo must carry no badge: {wt:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_drops_the_flag_and_badges() {
+        // The 15-minute auto-expire (#1376) seen end-to-end: once a repo's lease
+        // elapses, the snapshot drops `polling_enabled` *and* the badge, and the
+        // poller would no longer watch it — all reaped on read, no timer.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        let mut badges = HashMap::new();
+        badges.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            pr(pending_badge(7, &head)),
+        );
+        svc.pr_cache.replace(badges);
+
+        // Leased: flag stamped, badge folded, and the poller would watch it.
+        let snap = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(repos_of(&snap)[0]["polling_enabled"], json!(true));
+        assert_eq!(repos_of(&snap)[0]["worktrees"][0]["pr"]["number"], json!(7));
+        assert_eq!(pr_targets_from_snapshot(&snap).len(), 1);
+
+        // Force the lease into the past — as 15 minutes elapsing would.
+        svc.registry.set_polling_expiry(
+            "rust-works",
+            "omni-dev",
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+
+        let snap = svc.handle("tree", Value::Null).await.unwrap();
+        let repo0 = &repos_of(&snap)[0];
+        assert!(
+            repo0.get("polling_enabled").is_none(),
+            "expired lease drops the flag: {repo0:?}"
+        );
+        assert!(
+            repo0["worktrees"][0].get("pr").is_none(),
+            "expired lease drops the badge"
+        );
+        assert!(
+            pr_targets_from_snapshot(&snap).is_empty(),
+            "the poller no longer watches an expired repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_prefs_persist_across_reloads_with_0600() {
+        // The enable set survives a daemon restart (#1376): a change writes the
+        // `0600` file, and a fresh service seeded from it comes up enabled.
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = dir.path().join("worktrees-polling.json");
+
+        let svc = WorktreesService::new();
+        svc.load_polling_prefs(prefs.clone());
+        assert!(!svc.registry.is_polling_enabled("rust-works", "omni-dev"));
+        svc.handle(
+            "set-polling",
+            json!({ "owner": "rust-works", "name": "omni-dev", "enabled": true }),
+        )
+        .await
+        .unwrap();
+        assert!(prefs.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&prefs).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        // A new service reloads the enabled set from that file.
+        let svc2 = WorktreesService::new();
+        svc2.load_polling_prefs(prefs.clone());
+        assert!(svc2.registry.is_polling_enabled("rust-works", "omni-dev"));
+
+        // Disabling rewrites the file, so the next reload has nothing enabled.
+        svc2.handle(
+            "set-polling",
+            json!({ "owner": "rust-works", "name": "omni-dev", "enabled": false }),
+        )
+        .await
+        .unwrap();
+        let svc3 = WorktreesService::new();
+        svc3.load_polling_prefs(prefs);
+        assert!(!svc3.registry.is_polling_enabled("rust-works", "omni-dev"));
+    }
+
+    #[test]
+    fn load_polling_prefs_tolerates_a_corrupt_or_unreadable_file() {
+        // Best-effort load (#1376): a hand-edited/corrupt file or an unreadable
+        // path is logged and treated as "nothing enabled" rather than wedging the
+        // service. A missing file is already the first-run default (covered by the
+        // persistence round-trip above); this exercises the two error branches.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Corrupt JSON — the parse error is swallowed, nothing is enabled.
+        let corrupt = dir.path().join("worktrees-polling.json");
+        std::fs::write(&corrupt, b"{ not valid json ]").unwrap();
+        let svc = WorktreesService::new();
+        svc.load_polling_prefs(corrupt);
+        assert!(svc.registry.enabled_polling_repos().is_empty());
+
+        // A directory at the path — the (non-NotFound) read error is swallowed too.
+        let as_dir = dir.path().join("is-a-directory");
+        std::fs::create_dir(&as_dir).unwrap();
+        let svc2 = WorktreesService::new();
+        svc2.load_polling_prefs(as_dir);
+        assert!(svc2.registry.enabled_polling_repos().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_poller_asks_nothing_for_a_registered_but_not_enabled_repo() {
+        // The zero-`gh` guarantee (#1376): a window is open on a GitHub repo, but
+        // the user has not enabled polling for it — so the poller spawns no `gh`.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let marker = bin_dir.path().join("spawned");
+        let fake = bin_dir.path().join("fake-gh");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ntouch '{}'\necho '{{}}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // Deliberately NOT enabling polling for the repo.
+        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        svc.shutdown().await;
+        assert!(
+            !marker.exists(),
+            "a registered-but-not-enabled repo must drive zero gh"
+        );
     }
 
     #[tokio::test]
@@ -3643,6 +4107,9 @@ mod tests {
                 "main_repo":"omni-dev",
                 "github":{"owner":"rust-works","name":"omni-dev"},
                 "root":"/r",
+                // Enabled (#1376) — a not-polled repo contributes no targets (see
+                // `pr_watch_from_snapshot_skips_a_not_polled_repo`).
+                "polling_enabled":true,
                 // Two worktrees on the same branch must ask once, not twice.
                 "worktrees":[
                     {"path":"/r","branch":"main","is_main":true,"open":true},
@@ -3692,7 +4159,7 @@ mod tests {
             json!({"owner": 1, "name": 2}),
         ] {
             let snapshot = json!({"repos":[{
-                "main_repo":"r","github":github,"root":"/r",
+                "main_repo":"r","github":github,"root":"/r","polling_enabled":true,
                 "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
             }]});
             assert!(
@@ -3700,6 +4167,37 @@ mod tests {
                 "{snapshot:?}"
             );
         }
+    }
+
+    #[test]
+    fn pr_watch_from_snapshot_skips_a_not_polled_repo() {
+        // The zero-`gh` guarantee (#1376): a GitHub repo with `polling_enabled`
+        // absent (the default-off case) or explicitly false contributes no watch,
+        // so the poll never mentions it. Only an enabled repo is polled.
+        for repo in [
+            json!({
+                "main_repo":"omni-dev","github":{"owner":"o","name":"n"},"root":"/r",
+                "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
+            }),
+            json!({
+                "main_repo":"omni-dev","github":{"owner":"o","name":"n"},"root":"/r",
+                "polling_enabled":false,
+                "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
+            }),
+        ] {
+            let snapshot = json!({ "repos": [repo] });
+            assert!(
+                pr_targets_from_snapshot(&snapshot).is_empty(),
+                "not-polled repo must yield no targets: {snapshot:?}"
+            );
+        }
+        // Flipping the same repo to enabled makes it contribute.
+        let enabled = json!({"repos":[{
+            "main_repo":"omni-dev","github":{"owner":"o","name":"n"},"root":"/r",
+            "polling_enabled":true,
+            "worktrees":[{"path":"/r","branch":"main","is_main":true,"open":true}]
+        }]});
+        assert_eq!(pr_targets_from_snapshot(&enabled).len(), 1);
     }
 
     #[test]
@@ -3761,6 +4259,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
 
         // No poll has landed: the badge is absent, exactly as a pre-#1337 daemon —
         // and so is the negative, so "not resolved" stays distinguishable (#1370).
@@ -3807,6 +4308,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         // A badge *is* cached for `main` — the branch this worktree was on before
         // detaching. It must not leak onto the now-branchless row.
         let mut badges = HashMap::new();
@@ -3843,6 +4347,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         // A badge for a different branch must not leak onto `main`.
         let mut badges = HashMap::new();
         badges.insert(
@@ -3874,6 +4381,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
 
         let mut resolutions = HashMap::new();
         resolutions.insert(
@@ -3909,6 +4419,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
 
         let mut resolutions = HashMap::new();
         resolutions.insert(
@@ -3989,6 +4502,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         // Seed a badge as though an earlier poll had succeeded.
         let mut seeded = HashMap::new();
         seeded.insert(
@@ -4051,6 +4567,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
 
         // The badge must follow promptly — the register wakes the loop out of its
         // backoff. The deadline is orders of magnitude below the ceiling, so this
@@ -4090,6 +4609,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
 
         // A green verdict, correctly describing the commit currently checked out.
         let mut badges = HashMap::new();
@@ -4147,6 +4669,7 @@ mod tests {
                 "main_repo":"omni-dev",
                 "github":{"owner":"rust-works","name":"omni-dev"},
                 "root":"/r",
+                "polling_enabled":true,
                 "worktrees":[{"path":"/r","branch":"main","head_sha":sha,"is_main":true,"open":true}]
             }]})
         };
@@ -4171,6 +4694,7 @@ mod tests {
                 "main_repo":"omni-dev",
                 "github":{"owner":"rust-works","name":"omni-dev"},
                 "root":"/r",
+                "polling_enabled":true,
                 "worktrees":[{"path":"/r","branch":"main","head_sha":"aaa",
                               "upstream_sha":upstream,"is_main":true,"open":true}]
             }]})
@@ -4195,6 +4719,7 @@ mod tests {
             "main_repo":"omni-dev",
             "github":{"owner":"rust-works","name":"omni-dev"},
             "root":"/r",
+            "polling_enabled":true,
             "worktrees":[{"path":"/r","branch":"main","head_sha":"aaa","is_main":true,"open":true}]
         }]});
         let watch = pr_watch_from_snapshot(&snap);
@@ -4416,6 +4941,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
 
         // Wait on a generous wall-clock deadline: each poll spawns a real
@@ -4476,6 +5004,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
 
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -4525,6 +5056,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Polling defaults off (#1376): enable it for this repo so the poller/fold
+        // act on it, as if the user had toggled it on.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
 
         tokio::time::timeout(Duration::from_secs(30), async {

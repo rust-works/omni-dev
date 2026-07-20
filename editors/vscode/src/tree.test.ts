@@ -17,7 +17,9 @@ import {
   partitionByRole,
   partitionByWindow,
   partitionSelfLast,
+  repoContextValue,
   repoLabel,
+  repoPollingEnabled,
   reposToNodes,
   selectionTargets,
   unbadgedBranches,
@@ -108,6 +110,32 @@ test("worktreeNodes hides no-window worktrees when showClosed is false", () => {
   // derived from open windows); as a pure function it can return an empty list,
   // but the daemon's invariant means the filter never empties a real repo.
   assert.equal(worktreeNodes(REPOS[1], false).length, 0);
+});
+
+test("repoPollingEnabled is true only for an explicit polling_enabled flag", () => {
+  // Default-off (#1376): an absent flag reads as not-polled, matching a repo the
+  // user never enabled and a pre-#1376 daemon.
+  assert.equal(repoPollingEnabled(REPOS[0]), false);
+  assert.equal(repoPollingEnabled({ ...REPOS[0], polling_enabled: false }), false);
+  assert.equal(repoPollingEnabled({ ...REPOS[0], polling_enabled: true }), true);
+});
+
+test("repoContextValue encodes GitHub identity and PR-poll state", () => {
+  // GitHub repo, not enabled → `.polling-off` (gates "Enable PR Polling").
+  assert.equal(repoContextValue(REPOS[0]), "repo.github.polling-off");
+  // GitHub repo, enabled → `.polling-on` (gates "Disable PR Polling").
+  assert.equal(
+    repoContextValue({ ...REPOS[0], polling_enabled: true }),
+    "repo.github.polling-on",
+  );
+  // Non-GitHub repo → the bare `repo` (no PR polling), unchanged.
+  assert.equal(repoContextValue(REPOS[1]), "repo");
+  // Every value still starts with `repo`, and a GitHub one still contains
+  // `github`, so the existing copyDirectory / "Open Pull Request…" gates hold.
+  for (const repo of [REPOS[0], { ...REPOS[0], polling_enabled: true }, REPOS[1]]) {
+    assert.match(repoContextValue(repo), /^repo/);
+  }
+  assert.match(repoContextValue(REPOS[0]), /github/);
 });
 
 test("repoLabel prefers the GitHub owner/name, else the main repo name", () => {

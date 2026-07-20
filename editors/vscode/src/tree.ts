@@ -186,6 +186,14 @@ export interface TreeRepoPayload {
   github?: TreeGithubIdentity;
   /** Absolute path to the main working tree — the repo root. */
   root: string;
+  /**
+   * Whether the daemon polls this repo's PR badges (#1376). Polling defaults
+   * **off**, so this is absent for a repo the user has not enabled (and from a
+   * pre-#1376 daemon), and `true` only for an explicitly-enabled repo. The
+   * provider colours the repo icon green when set and gates the "Disable PR
+   * Polling" menu on it; see {@link repoPollingEnabled} / {@link repoContextValue}.
+   */
+  polling_enabled?: boolean;
   /** Every worktree of the repo: main working tree first, then linked. */
   worktrees: TreeWorktreePayload[];
 }
@@ -246,6 +254,32 @@ export function unbadgedBranches(nodes: Node[]): string[] {
 /** A repo's display label: `owner/name` for GitHub repos, else its `main_repo`. */
 export function repoLabel(repo: TreeRepoPayload): string {
   return repo.github ? `${repo.github.owner}/${repo.github.name}` : repo.main_repo;
+}
+
+/**
+ * Whether the daemon is polling this repo's PR badges (#1376) — the flag the
+ * provider colours the repo icon green on. Strictly `=== true` so an absent flag
+ * (the default-off case, or a pre-#1376 daemon) reads as not-polled.
+ */
+export function repoPollingEnabled(repo: TreeRepoPayload): boolean {
+  return repo.polling_enabled === true;
+}
+
+/**
+ * The repo node's `contextValue`, gating its context-menu items (#1376):
+ *  - a GitHub repo → `repo.github.polling-on` or `repo.github.polling-off`, so
+ *    the "Enable/Disable PR Polling" items gate on the matching one;
+ *  - a non-GitHub repo → the bare `repo` (unchanged) — it has no PR polling.
+ *
+ * Every value still starts with `repo` (so copyDirectory's `/^(repo|worktree)/`
+ * matches) and a GitHub repo still contains `github` (so the existing
+ * `/github/`-gated items are unaffected).
+ */
+export function repoContextValue(repo: TreeRepoPayload): string {
+  if (!repo.github) {
+    return "repo";
+  }
+  return repoPollingEnabled(repo) ? "repo.github.polling-on" : "repo.github.polling-off";
 }
 
 /**

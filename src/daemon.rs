@@ -124,6 +124,13 @@ pub async fn build_default_registry(
     // Start the off-thread menu-refresh loop so the tray serves a cached menu
     // instead of running git enrichment on the macOS GUI thread (#1186 fix).
     let worktrees = WorktreesService::new();
+    // Seed the per-repo PR-poll enable set from its persisted `0600` file so the
+    // user's choices survive a restart; the poller reads it below (#1376). A path
+    // that cannot be resolved (no data dir) just disables persistence.
+    match crate::daemon::paths::worktrees_polling_path() {
+        Ok(path) => worktrees.load_polling_prefs(path),
+        Err(err) => tracing::warn!("worktrees polling prefs disabled: {err:#}"),
+    }
     worktrees.start_menu_refresh();
     // Keep PR check badges fresh for every open window from one `gh` call, rather
     // than each window resolving its own and none of them ever re-asking (#1337).
