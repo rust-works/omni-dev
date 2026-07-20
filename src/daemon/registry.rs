@@ -5,6 +5,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
+use crate::github_rate_limit::{RateLimitCache, RateLimitSnapshot};
+
 use super::service::{DaemonService, ServiceStatus, ServiceStream};
 
 /// Holds the daemon's registered services and routes control-socket envelopes
@@ -12,6 +14,12 @@ use super::service::{DaemonService, ServiceStatus, ServiceStream};
 #[derive(Clone, Default)]
 pub struct ServiceRegistry {
     services: Vec<Arc<dyn DaemonService>>,
+    /// The GitHub API rate-limit monitor's cache (#1375), shared with the poller
+    /// that fills it (hosted by the worktrees service). `None` until the daemon
+    /// wires it in via [`set_github_rate_limit`](Self::set_github_rate_limit), so
+    /// the built-in `status` op can report machine-wide GitHub budget usage as a
+    /// top-level field without downcasting a specific service.
+    github_rate_limit: Option<Arc<RateLimitCache>>,
 }
 
 impl ServiceRegistry {
@@ -41,6 +49,20 @@ impl ServiceRegistry {
     /// All registered services, in registration order.
     pub fn services(&self) -> &[Arc<dyn DaemonService>] {
         &self.services
+    }
+
+    /// Wires in the GitHub rate-limit monitor's cache (#1375), so the built-in
+    /// `status` op can surface budget usage. Called once at daemon start with the
+    /// same `Arc` the worktrees service's poller writes.
+    pub fn set_github_rate_limit(&mut self, cache: Arc<RateLimitCache>) {
+        self.github_rate_limit = Some(cache);
+    }
+
+    /// The latest GitHub rate-limit snapshot, or `None` when the monitor is
+    /// unwired or has not polled successfully yet.
+    #[must_use]
+    pub fn github_rate_limit(&self) -> Option<RateLimitSnapshot> {
+        self.github_rate_limit.as_ref().and_then(|c| c.get())
     }
 
     /// Routes an operation to the named service, erroring if no such service is

@@ -39,6 +39,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::github_rate_limit::{
+    resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
+};
 use crate::pr_status::{PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
@@ -119,6 +122,28 @@ fn pr_poll_interval() -> Duration {
     crate::daemon::server::duration_secs_from_env(ENV_PR_POLL_INTERVAL, DEFAULT_PR_POLL_INTERVAL)
 }
 
+/// Environment override for [`rate_limit_poll_interval`] — the cadence at which
+/// the GitHub rate-limit monitor re-reads `/rate_limit` (whole seconds; a blank,
+/// non-numeric, or `0` value falls back to [`DEFAULT_RATE_LIMIT_POLL_INTERVAL`]).
+const ENV_RATE_LIMIT_POLL_INTERVAL: &str = "OMNI_DEV_DAEMON_RATE_LIMIT_POLL";
+
+/// Default cadence for the GitHub rate-limit monitor (#1375).
+///
+/// A fixed 60 s is fine and simple: querying `/rate_limit` is **exempt** — it
+/// spends nothing against any budget — so unlike the PR poller this cadence has no
+/// budget concern and needs no adaptive backoff. One free `gh` subprocess a minute
+/// keeps `daemon status` current enough to catch a slow drain.
+const DEFAULT_RATE_LIMIT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The resolved rate-limit-poll cadence: `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` (whole
+/// seconds) when valid, else [`DEFAULT_RATE_LIMIT_POLL_INTERVAL`].
+fn rate_limit_poll_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(
+        ENV_RATE_LIMIT_POLL_INTERVAL,
+        DEFAULT_RATE_LIMIT_POLL_INTERVAL,
+    )
+}
+
 /// A running background menu-refresh task and the token that stops it.
 struct RefreshTask {
     /// Cancelled by `shutdown` to end the refresh loop.
@@ -157,6 +182,27 @@ fn next_pr_poll_delay(current: Duration, base: Duration, pending: bool) -> Durat
     } else {
         current.saturating_mul(2).min(MAX_PR_POLL_INTERVAL)
     }
+}
+
+/// Whether the rate-limit poller should emit a WARN this poll: `true` only when a
+/// resource **crosses** the [`WARN_PERCENT`](crate::github_rate_limit::WARN_PERCENT)
+/// threshold upward since the previous reading (or is already over on the first
+/// poll, when `prev` is `None`). Keying on the rising edge means the log fires once
+/// per crossing rather than every poll while usage stays high.
+///
+/// Pure so the policy is testable without driving a live poll.
+fn rate_limit_crossed_warn(prev: Option<&RateLimitSnapshot>, next: &RateLimitSnapshot) -> bool {
+    let over = |res: Option<RateLimitResource>| res.is_some_and(|r| r.over_warn());
+    // Per-resource so a *different* resource crossing (while another recovers) is
+    // still caught — `graphql` dropping below while `core` climbs over would look
+    // unchanged to a whole-snapshot `over_warn` comparison.
+    [
+        (prev.and_then(|p| p.graphql), next.graphql),
+        (prev.and_then(|p| p.core), next.core),
+        (prev.and_then(|p| p.search), next.search),
+    ]
+    .into_iter()
+    .any(|(before, after)| over(after) && !over(before))
 }
 
 /// A running background PR-badge poll task and the token that stops it.
@@ -275,6 +321,17 @@ pub struct WorktreesService {
     /// The background PR-badge poll task, once started (`None` in tests / no
     /// runtime).
     poller: Mutex<Option<PollerTask>>,
+    /// The GitHub API rate-limit snapshot the [`rate-limit poller`] writes and the
+    /// tray menu build / built-in `status` op read (#1375). Behind an `Arc` so the
+    /// poll task, the tray refresh, and the daemon's registry share the one cache.
+    /// Empty until the first poll lands; the daemon hands a clone to the registry
+    /// so `status` can report machine-wide GitHub budget usage.
+    ///
+    /// [`rate-limit poller`]: Self::start_rate_limit_poller
+    rate_limit_cache: Arc<RateLimitCache>,
+    /// The background rate-limit poll task, once started (`None` in tests / no
+    /// runtime).
+    rate_limit_poller: Mutex<Option<PollerTask>>,
     /// The shared, coalescing tree-snapshot cache every `subscribe` stream reads
     /// through, so N open windows perform **one** `build_tree` per tick instead
     /// of N (#1303). Behind an `Arc` so each stream holds a cheap handle to the
@@ -315,9 +372,19 @@ impl WorktreesService {
             refresh: Mutex::new(None),
             pr_cache: pr_cache.clone(),
             poller: Mutex::new(None),
+            rate_limit_cache: Arc::new(RateLimitCache::new()),
+            rate_limit_poller: Mutex::new(None),
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
             prune_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// A handle to the GitHub rate-limit snapshot cache (#1375), so the daemon can
+    /// share it with the [`ServiceRegistry`](crate::daemon::registry::ServiceRegistry)
+    /// for the built-in `status` op to read.
+    #[must_use]
+    pub fn rate_limit_cache(&self) -> Arc<RateLimitCache> {
+        self.rate_limit_cache.clone()
     }
 
     /// Starts the background task that recomputes the tray menu snapshot every
@@ -340,6 +407,7 @@ impl WorktreesService {
         let loop_token = token.clone();
         let registry = self.registry.clone();
         let cache = self.menu_cache.clone();
+        let rate_limit_cache = self.rate_limit_cache.clone();
         // Resolved once at spawn: the interval is process-stable env config, and
         // re-reading it every loop would be wasted work.
         let interval = menu_refresh_interval();
@@ -349,8 +417,13 @@ impl WorktreesService {
                 // which opens repos and parses git config — on a blocking thread,
                 // never on this async worker or the tray's main thread.
                 let entries = registry.list();
-                if let Ok(items) =
-                    tokio::task::spawn_blocking(move || menu_items_for(&entries)).await
+                // The rate-limit reading (a cheap lock, `Copy`) prepends a status
+                // line; read it here and hand it to the blocking build (#1375).
+                let rate_limit = rate_limit_cache.get();
+                if let Ok(items) = tokio::task::spawn_blocking(move || {
+                    menu_items_for(&entries, rate_limit.as_ref())
+                })
+                .await
                 {
                     *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(items);
                 }
@@ -510,6 +583,101 @@ impl WorktreesService {
                 // genuine change from a quiet tree.
                 watched = Some(watch);
                 backoff = next_pr_poll_delay(backoff, base, pending);
+            }
+        });
+        *guard = Some(PollerTask { token, handle });
+    }
+
+    /// Starts the background task that keeps the GitHub API rate-limit reading
+    /// fresh (#1375).
+    ///
+    /// The daemon's PR-badge poller shells out to `gh`, spending the same GitHub
+    /// budget as every other tool sharing the user's token; when that drains, `gh`
+    /// rate-limits machine-wide with no warning until commands start failing. This
+    /// loop polls `gh api rate_limit` — an endpoint GitHub documents (and this
+    /// project verified) as **exempt**, spending nothing against any budget — so
+    /// `daemon status`, the JSON payload, and the tray can show the used-percentage
+    /// *trend* and warn before exhaustion, at zero cost to the budget watched.
+    ///
+    /// A plain fixed cadence ([`rate_limit_poll_interval`], ~60 s): no adaptive
+    /// backoff and no window-gating, because the endpoint is free and a current
+    /// reading is wanted whenever an operator checks `status`. Idempotent, and a
+    /// no-op outside a tokio runtime (mirroring [`start_pr_poller`](Self::start_pr_poller)
+    /// and [`start_menu_refresh`](Self::start_menu_refresh)), so unit tests build a
+    /// bare service that never spawns `gh`.
+    pub fn start_rate_limit_poller(&self) {
+        // Both resolved once at spawn: process-stable env config, never re-read per
+        // poll (the PR-poller precedent).
+        self.start_rate_limit_poller_with(
+            rate_limit_poll_interval(),
+            crate::pr_status::resolve_gh_binary(),
+        );
+    }
+
+    /// [`start_rate_limit_poller`](Self::start_rate_limit_poller) with an explicit
+    /// cadence and `gh` binary, so tests drive the loop at millisecond speed
+    /// against a stub **without mutating the process environment** (the
+    /// [`start_pr_poller_with`](Self::start_pr_poller_with) seam).
+    fn start_rate_limit_poller_with(&self, interval: Duration, gh_bin: PathBuf) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; worktrees rate-limit poller not started");
+            return;
+        }
+        let mut guard = self
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let cache = self.rate_limit_cache.clone();
+        let handle = tokio::spawn(async move {
+            // Remembers the previous reading so a WARN fires only on the *rising*
+            // edge across the threshold, not every poll while usage stays high.
+            let mut prev: Option<RateLimitSnapshot> = None;
+            loop {
+                // Poll first, so `status` has a reading soon after boot rather than
+                // one interval later. `gh` is a blocking subprocess: never on an
+                // async worker. A join failure folds into the same channel as a
+                // `gh` failure — both mean "no fresh reading this round".
+                let bin = gh_bin.clone();
+                let resolved = tokio::task::spawn_blocking(move || resolve_rate_limit_with(&bin))
+                    .await
+                    .unwrap_or_else(|err| {
+                        Err(anyhow!("blocking rate-limit poll task failed: {err}"))
+                    });
+                match resolved {
+                    Ok(snap) => {
+                        if rate_limit_crossed_warn(prev.as_ref(), &snap) {
+                            // Bound to a local (rather than inlined into the macro)
+                            // so it is computed whenever the branch is taken, not
+                            // only when a WARN-level subscriber is installed —
+                            // `tracing` skips evaluating macro args otherwise.
+                            let summary = snap.summary_line();
+                            tracing::warn!(
+                                "GitHub API rate limit high: {summary} (querying /rate_limit \
+                                 is free; the daemon's gh usage is not)"
+                            );
+                        }
+                        // Update the cache only; deliberately no `registry.bump()`
+                        // — the rate limit is not tree topology, and bumping would
+                        // re-push an unchanged tree to every window. The tray
+                        // re-polls `menu()` at ~1 Hz and `status` reads on demand.
+                        cache.replace(snap);
+                        prev = Some(snap);
+                    }
+                    // Best-effort decoration: a missing/unauthenticated `gh` or a
+                    // network blip leaves the last good reading in place rather than
+                    // blanking the line, and never affects the budget (the read is
+                    // free).
+                    Err(err) => tracing::debug!("GitHub rate-limit poll failed: {err:#}"),
+                }
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {}
+                }
             }
         });
         *guard = Some(PollerTask { token, handle });
@@ -743,7 +911,9 @@ impl DaemonService for WorktreesService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let items = cached.unwrap_or_else(|| menu_items_for(&self.registry.list()));
+        let items = cached.unwrap_or_else(|| {
+            menu_items_for(&self.registry.list(), self.rate_limit_cache.get().as_ref())
+        });
         MenuSnapshot {
             title: SUBMENU_TITLE.to_string(),
             items,
@@ -798,6 +968,16 @@ impl DaemonService for WorktreesService {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(poller) = poller {
+            poller.token.cancel();
+            let _ = poller.handle.await;
+        }
+        // And the GitHub rate-limit poller (#1375), same discipline.
+        let rate_limit_poller = self
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(poller) = rate_limit_poller {
             poller.token.cancel();
             let _ = poller.handle.await;
         }
@@ -1619,12 +1799,26 @@ const WORKTREE_SEP: char = '⑂';
 /// when empty, else one line per window via [`window_menu_items`]. Does the git
 /// enrichment (blocking disk I/O), so it runs on a blocking thread from the
 /// background refresh task — and inline only as a cold-start fallback in `menu`.
-fn menu_items_for(entries: &[WindowEntry]) -> Vec<MenuItem> {
-    if entries.is_empty() {
-        vec![MenuItem::Label("No open windows".to_string())]
-    } else {
-        window_menu_items(entries)
+fn menu_items_for(
+    entries: &[WindowEntry],
+    rate_limit: Option<&RateLimitSnapshot>,
+) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    // Prepend the GitHub rate-limit reading (#1375) as a non-clickable status line
+    // above the windows, so an approaching exhaustion is visible in the tray before
+    // it bites. Absent (unpolled `gh`, or no resources) → no line and no separator.
+    if let Some(label) = rate_limit.map(RateLimitSnapshot::tray_label) {
+        if !label.is_empty() {
+            items.push(MenuItem::Label(label));
+            items.push(MenuItem::Separator);
+        }
     }
+    if entries.is_empty() {
+        items.push(MenuItem::Label("No open windows".to_string()));
+    } else {
+        items.extend(window_menu_items(entries));
+    }
+    items
 }
 
 /// Builds the tray items for a non-empty window list: **one clickable line per
@@ -4049,6 +4243,152 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_none());
+    }
+
+    // --- Rate-limit monitor (#1375) ---
+
+    /// A resource at `used`% of a 100-request budget.
+    fn rl_resource(used: u64) -> RateLimitResource {
+        RateLimitResource {
+            used,
+            limit: 100,
+            remaining: 100 - used,
+            percent: used as f64,
+            reset: 0,
+        }
+    }
+
+    #[test]
+    fn rate_limit_crossed_warn_fires_only_on_the_rising_edge() {
+        let snap = |graphql: u64, core: u64| RateLimitSnapshot {
+            graphql: Some(rl_resource(graphql)),
+            core: Some(rl_resource(core)),
+            search: None,
+        };
+        // First poll already over threshold → warn.
+        assert!(rate_limit_crossed_warn(None, &snap(85, 3)));
+        // First poll below → no warn.
+        assert!(!rate_limit_crossed_warn(None, &snap(50, 3)));
+        // Crossing upward → warn.
+        assert!(rate_limit_crossed_warn(Some(&snap(70, 3)), &snap(85, 3)));
+        // Staying over → no repeat warn.
+        assert!(!rate_limit_crossed_warn(Some(&snap(85, 3)), &snap(90, 3)));
+        // Recovering below → no warn.
+        assert!(!rate_limit_crossed_warn(Some(&snap(85, 3)), &snap(50, 3)));
+        // A *different* resource crossing while the first recovers is still caught.
+        assert!(rate_limit_crossed_warn(Some(&snap(85, 3)), &snap(50, 90)));
+    }
+
+    #[test]
+    fn start_rate_limit_poller_is_a_noop_outside_a_runtime() {
+        let svc = WorktreesService::new();
+        svc.start_rate_limit_poller();
+        assert!(svc
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn start_rate_limit_poller_is_idempotent_and_shutdown_stops_it() {
+        let svc = WorktreesService::new();
+        svc.start_rate_limit_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        let token = svc
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|t| t.token.clone())
+            .expect("poller started");
+
+        // Cancel the live task, then start again: a second start must not spawn a
+        // replacement (which would orphan this one), so the token stays cancelled.
+        token.cancel();
+        svc.start_rate_limit_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        assert!(svc
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|t| t.token.is_cancelled()));
+
+        svc.shutdown().await;
+        assert!(svc
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn rate_limit_poller_resolves_via_gh_populates_the_cache_and_stops_on_shutdown() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"resources":{
+                "graphql":{"limit":5000,"used":4100,"remaining":900,"reset":1700000000},
+                "core":{"limit":5000,"used":27,"remaining":4973,"reset":1700000000}
+            }}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.start_rate_limit_poller_with(Duration::from_millis(50), fake.clone());
+
+        // Each poll spawns a real subprocess; wait on a generous deadline so a
+        // loaded machine fails honestly rather than flaking.
+        let snap = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(snap) = svc.rate_limit_cache.get() {
+                    return snap;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("poller should populate the cache through the fake gh");
+        assert_eq!(snap.graphql.unwrap().used, 4100);
+        assert_eq!(snap.core.unwrap().used, 27);
+
+        // The reading reaches the built-in status field via the shared cache.
+        assert!(svc.rate_limit_cache().get().is_some());
+
+        svc.shutdown().await;
+        assert!(svc
+            .rate_limit_poller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[test]
+    fn menu_prepends_the_rate_limit_line_only_when_the_cache_is_populated() {
+        let svc = WorktreesService::new();
+        // Empty cache → no rate-limit line (the pre-#1375 shape).
+        let items = svc.menu().items;
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, MenuItem::Label(l) if l.contains("github:"))),
+            "no github line before the first poll"
+        );
+
+        // Populate the cache → the first item is the rate-limit status line.
+        svc.rate_limit_cache.replace(RateLimitSnapshot {
+            graphql: Some(rl_resource(82)),
+            core: Some(rl_resource(3)),
+            search: None,
+        });
+        let items = svc.menu().items;
+        assert!(
+            matches!(items.first(), Some(MenuItem::Label(l)) if l.starts_with("github: graphql 82%")),
+            "expected the github line first, got {items:?}"
+        );
+        assert!(
+            matches!(items.get(1), Some(MenuItem::Separator)),
+            "expected a separator after the github line"
+        );
     }
 
     #[tokio::test]

@@ -134,6 +134,11 @@ pub struct StatusReport {
     /// (#1113). Absent from a pre-#1113 daemon; a client shows "unknown" then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The daemon's latest GitHub API rate-limit reading (#1375), when its
+    /// monitor has polled at least once. Absent before the first poll, when no
+    /// `gh` is available, or on a pre-#1375 daemon — a client shows nothing then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_rate_limit: Option<crate::github_rate_limit::RateLimitSnapshot>,
 }
 
 #[cfg(test)]
@@ -186,6 +191,7 @@ mod tests {
         let line = serde_json::to_string(&StatusReport {
             services: vec![],
             version: None,
+            github_rate_limit: None,
         })
         .unwrap();
         assert!(!line.contains("version"), "{line}");
@@ -194,10 +200,48 @@ mod tests {
         let line = serde_json::to_string(&StatusReport {
             services: vec![],
             version: Some("1.2.3".to_string()),
+            github_rate_limit: None,
         })
         .unwrap();
         assert!(line.contains("\"version\":\"1.2.3\""), "{line}");
         let back: StatusReport = serde_json::from_str(&line).unwrap();
         assert_eq!(back.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn status_report_omits_and_round_trips_github_rate_limit() {
+        use crate::github_rate_limit::{RateLimitResource, RateLimitSnapshot};
+
+        // Absent by default: byte-identical to a pre-#1375 daemon's payload.
+        let line = serde_json::to_string(&StatusReport {
+            services: vec![],
+            version: Some("1.2.3".to_string()),
+            github_rate_limit: None,
+        })
+        .unwrap();
+        assert!(!line.contains("github_rate_limit"), "{line}");
+
+        // Present: serializes and decodes back, and a pre-#1375 client (which sees
+        // an unknown field) ignores it — serde does that automatically.
+        let snap = RateLimitSnapshot {
+            graphql: Some(RateLimitResource {
+                used: 4100,
+                limit: 5000,
+                remaining: 900,
+                percent: 82.0,
+                reset: 1_700_000_000,
+            }),
+            core: None,
+            search: None,
+        };
+        let line = serde_json::to_string(&StatusReport {
+            services: vec![],
+            version: None,
+            github_rate_limit: Some(snap),
+        })
+        .unwrap();
+        assert!(line.contains("github_rate_limit"), "{line}");
+        let back: StatusReport = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.github_rate_limit, Some(snap));
     }
 }

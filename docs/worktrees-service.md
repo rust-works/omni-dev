@@ -421,6 +421,44 @@ daemon: running
 The `-o json` status detail carries the same enriched window entries as
 `worktrees list -o json`.
 
+## GitHub rate-limit monitor
+
+The PR-badge poller shells out to `gh`, spending the same GitHub API budget as
+every other tool sharing the user's `gh` token. When that budget drains — a poll
+storm, or heavy `gh` use elsewhere — GitHub rate-limits `gh` **machine-wide** with
+no warning until commands start failing. A background monitor (#1375) polls
+`gh api rate_limit` on a fixed cadence and surfaces the used-percentage as an
+early-warning *trend*.
+
+Polling `/rate_limit` is **exempt**: GitHub documents it as not counting against
+any budget (confirmed empirically — consecutive reads leave `core.used` flat), so
+the monitor costs nothing against the very budget it watches, and needs no adaptive
+backoff (unlike the PR poller). It lives alongside the PR poller in the worktrees
+service because that is the daemon's `gh` consumer, but the reading is machine-wide.
+
+It surfaces three ways:
+
+- **`omni-dev daemon status`** gains a top-level line above the per-service rows,
+  with a `⚠` prefix when any resource is at or above ~80% used:
+
+  ```text
+  daemon: running (v0.36.0)
+    github rate limit: graphql 82% (4100/5000, resets 06:50Z) · core 3% (27/1000)
+    worktrees        ok         3 window(s) across 2 repo(s)
+  ```
+
+- **`-o json`** carries an additive optional `github_rate_limit` object on the
+  status payload — `{ graphql, core, search }`, each `{ used, limit, remaining,
+  percent, reset }` — omitted entirely until the monitor has polled successfully,
+  so a pre-#1375 client stays byte-compatible.
+
+- **The tray** prepends a compact `github: graphql 82% · core 3%` line (trailing
+  `⚠` over threshold) to the Worktrees submenu.
+
+The poller also logs a `WARN` (visible via `omni-dev daemon logs`) the moment a
+resource *crosses* ~80% — once per crossing, not every poll. Cadence is
+`OMNI_DEV_DAEMON_RATE_LIMIT_POLL` whole seconds (default 60).
+
 ## Git enrichment
 
 The companion reports only raw folder paths; the **daemon** computes the richer
@@ -483,6 +521,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
 | `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed), a moved upstream (you pushed — #1344), or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
