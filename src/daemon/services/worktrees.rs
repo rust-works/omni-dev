@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::pr_status::{PrBadge, PrCheckState, PrStatusCache, PrTarget};
+use crate::pr_status::{PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
@@ -487,13 +487,15 @@ impl WorktreesService {
                 .unwrap_or_else(|err| Err(anyhow!("blocking poll task failed: {err}")));
                 // Best-effort decoration: a missing/unauthenticated `gh`, a network
                 // blip, or a rate limit must never sink the tree. A failed poll
-                // leaves the last good badges in place rather than blanking every
-                // row, and is not "pending", so it backs off rather than hammers.
+                // leaves the last good resolutions in place — badges *and* explicit
+                // negatives, and it mints no new negatives (#1370) — rather than
+                // blanking every row, and is not "pending", so it backs off rather
+                // than hammers.
                 let pending = match resolved {
-                    Ok(badges) => {
+                    Ok(resolutions) => {
                         // Bump only on a real change, or the server's diff-and-drop
                         // is defeated and every window re-renders on every poll.
-                        if pr_cache.replace(badges) {
+                        if pr_cache.replace(resolutions) {
                             registry.bump();
                         }
                         pr_cache.any_pending()
@@ -1113,9 +1115,20 @@ struct TreeWorktree {
     /// (#1337). Resolved by the daemon's background poller and folded on as the
     /// snapshot is built, so every open window sees the same live state without
     /// each running its own `gh`. Absent for a detached/non-GitHub worktree, one
-    /// with no open PR, or until the first poll lands.
+    /// with no open PR (see `pr_none`), or until the first poll lands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pr: Option<PrBadge>,
+    /// Set when the daemon **checked GitHub and found no open PR** for this
+    /// worktree's branch — the explicit negative (#1370), mutually exclusive
+    /// with `pr`. Omitted (false) whenever `pr` is present, for a branchless or
+    /// non-GitHub worktree, and — crucially — while the branch is simply **not
+    /// yet resolved** (before the first poll lands, or ever, on a failed one):
+    /// `pr` absent *and* `pr_none` absent still means "not resolved", so an
+    /// older client stays byte-identical (ADR-0053). Clients use it to keep
+    /// their degraded per-window `gh pr list` fallback quiet for branches the
+    /// daemon has already answered for.
+    #[serde(skip_serializing_if = "is_false")]
+    pr_none: bool,
 }
 
 /// One repository (with **all** its worktrees) in the `tree` payload. Repos are
@@ -1234,16 +1247,18 @@ fn worktree_entry(
         // Folded on afterwards by `fold_pr_badges`, which needs the repo's GitHub
         // identity — known one level up, in `repo_tree`.
         pr: None,
+        pr_none: false,
     }
 }
 
-/// Folds the poller's cached PR badges onto each worktree of each repo (#1337).
+/// Folds the poller's cached PR resolutions onto each worktree of each repo
+/// (#1337).
 ///
-/// Runs after [`build_tree`] because a badge is keyed by (repo GitHub identity,
-/// branch) and the identity is only known once the repo is assembled. Purely a
-/// cache read — no I/O, no network — so it is safe on the snapshot's hot path. A
-/// non-GitHub repo, a branchless worktree, or an unresolved branch simply keeps
-/// `pr: None` and renders nothing.
+/// Runs after [`build_tree`] because a resolution is keyed by (repo GitHub
+/// identity, branch) and the identity is only known once the repo is assembled.
+/// Purely a cache read — no I/O, no network — so it is safe on the snapshot's hot
+/// path. A non-GitHub repo, a branchless worktree, or an unresolved branch simply
+/// keeps `pr: None`/`pr_none: false` and renders nothing.
 ///
 /// A verdict computed for a **different commit** than the worktree has checked out
 /// is downgraded to pending here rather than shown as-is. That is what makes a push
@@ -1251,6 +1266,11 @@ fn worktree_entry(
 /// commit's verdict, and this fold — which runs on every snapshot — notices without
 /// waiting for a poll. Without it the previous head's `✓` stands until the poller
 /// next runs, which is up to the full backoff.
+///
+/// A **negative** ([`PrResolution::NoPr`], #1370) is deliberately *not* dropped
+/// when `head_sha` moves: it has no commit to be stale against, and dropping it
+/// would re-arm every client's `gh` fallback on every local commit. The poller's
+/// `moved` trigger re-checks the branch within one fast poll anyway.
 fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
     for repo in repos {
         let Some(github) = repo.github.clone() else {
@@ -1260,13 +1280,16 @@ fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
             let Some(branch) = &worktree.branch else {
                 continue;
             };
-            let Some(mut badge) = pr_cache.get(&github.owner, &github.name, branch) else {
-                continue;
-            };
-            if badge.is_stale_for(worktree.head_sha.as_deref()) {
-                badge.checks = PrCheckState::Pending;
+            match pr_cache.get(&github.owner, &github.name, branch) {
+                Some(PrResolution::Pr(mut badge)) => {
+                    if badge.is_stale_for(worktree.head_sha.as_deref()) {
+                        badge.checks = PrCheckState::Pending;
+                    }
+                    worktree.pr = Some(badge);
+                }
+                Some(PrResolution::NoPr) => worktree.pr_none = true,
+                None => {}
             }
-            worktree.pr = Some(badge);
         }
     }
 }
@@ -3414,6 +3437,11 @@ mod tests {
         }
     }
 
+    /// Wraps a badge as the cache's resolution value (#1370).
+    fn pr(badge: PrBadge) -> PrResolution {
+        PrResolution::Pr(badge)
+    }
+
     #[test]
     fn pr_targets_from_snapshot_reads_github_branches_and_dedupes() {
         let snapshot = json!({"repos":[
@@ -3540,9 +3568,11 @@ mod tests {
         .await
         .unwrap();
 
-        // No poll has landed: the badge is absent, exactly as a pre-#1337 daemon.
+        // No poll has landed: the badge is absent, exactly as a pre-#1337 daemon —
+        // and so is the negative, so "not resolved" stays distinguishable (#1370).
         let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
         assert!(wt.get("pr").is_none(), "{wt:?}");
+        assert!(wt.get("pr_none").is_none(), "{wt:?}");
 
         // Seed the cache the poller writes, then re-read the tree.
         let mut badges = HashMap::new();
@@ -3552,7 +3582,7 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            pending_badge(1337, &head),
+            pr(pending_badge(1337, &head)),
         );
         assert!(svc.pr_cache.replace(badges));
 
@@ -3561,6 +3591,8 @@ mod tests {
         assert_eq!(wt["pr"]["checks"], json!("pending"));
         // camelCase on the wire, or the extension silently loses the draft marker.
         assert_eq!(wt["pr"]["isDraft"], json!(false));
+        // A badge and the negative are mutually exclusive.
+        assert!(wt.get("pr_none").is_none(), "{wt:?}");
     }
 
     #[tokio::test]
@@ -3590,7 +3622,7 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            pending_badge(1, &head.to_string()),
+            pr(pending_badge(1, &head.to_string())),
         );
         svc.pr_cache.replace(badges);
 
@@ -3602,6 +3634,8 @@ mod tests {
             Some(head.to_string().as_str())
         );
         assert!(wt.get("pr").is_none(), "{wt:?}");
+        // No branch means nothing was checked either: no negative on the row.
+        assert!(wt.get("pr_none").is_none(), "{wt:?}");
     }
 
     #[tokio::test]
@@ -3623,11 +3657,89 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "other".into(),
             },
-            pending_badge(1, "irrelevant"),
+            pr(pending_badge(1, "irrelevant")),
         );
         svc.pr_cache.replace(badges);
         let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
         assert!(wt.get("pr").is_none(), "{wt:?}");
+        // An unmatched branch is unresolved, not negative.
+        assert!(wt.get("pr_none").is_none(), "{wt:?}");
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_reports_an_explicit_negative_for_a_branch_with_no_pr() {
+        // The #1370 fix on the wire: a branch the poller checked and found PR-less
+        // carries `pr_none: true` — never a sentinel `pr` object — so a client can
+        // tell "checked, none" from "not resolved" and keep its fallback quiet.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        let mut resolutions = HashMap::new();
+        resolutions.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            PrResolution::NoPr,
+        );
+        assert!(svc.pr_cache.replace(resolutions));
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr_none"], json!(true));
+        // Mutually exclusive with a badge.
+        assert!(wt.get("pr").is_none(), "{wt:?}");
+    }
+
+    #[tokio::test]
+    async fn a_commit_does_not_drop_a_negative_resolution() {
+        // A negative has no commit to be stale against. Dropping it when HEAD
+        // moves would flip the row back to "unresolved" on every local commit —
+        // re-arming every client's `gh` fallback, the very cost #1370 removes. The
+        // poller's `moved` trigger re-checks the branch promptly instead.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let first = repo.head().unwrap().target().unwrap();
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        let mut resolutions = HashMap::new();
+        resolutions.insert(
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "main".into(),
+            },
+            PrResolution::NoPr,
+        );
+        svc.pr_cache.replace(resolutions);
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr_none"], json!(true));
+
+        // Commit — as a push would leave things, with the cache untouched.
+        let head = repo.find_commit(first).unwrap();
+        empty_commit(&repo, Some("refs/heads/main"), &[&head], "B");
+
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(
+            wt["pr_none"],
+            json!(true),
+            "a local commit must not drop the negative"
+        );
     }
 
     #[tokio::test]
@@ -3691,16 +3803,18 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            pending_badge(7, &head),
+            pr(pending_badge(7, &head)),
         );
         svc.pr_cache.replace(seeded);
 
         svc.start_pr_poller_with(Duration::from_millis(20), fake);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // The tree still serves, and the seeded badge survived the failing polls.
+        // The tree still serves, and the seeded badge survived the failing polls —
+        // which also minted no false "no PR" negatives (#1370).
         let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
         assert_eq!(wt["pr"]["number"], json!(7));
+        assert!(wt.get("pr_none").is_none(), "{wt:?}");
         svc.shutdown().await;
     }
 
@@ -3749,7 +3863,9 @@ mod tests {
         // fails on the bug rather than merely being slow.
         let badge = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
+                if let Some(PrResolution::Pr(badge)) =
+                    svc.pr_cache.get("rust-works", "omni-dev", "main")
+                {
                     return badge;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3789,13 +3905,13 @@ mod tests {
                 name: "omni-dev".into(),
                 branch: "main".into(),
             },
-            PrBadge {
+            pr(PrBadge {
                 number: 1337,
                 is_draft: false,
                 checks: PrCheckState::Success,
                 url: "u".into(),
                 head_oid: first.to_string(),
-            },
+            }),
         );
         svc.pr_cache.replace(badges);
 
@@ -3967,7 +4083,9 @@ mod tests {
         // and clippy alongside) a tight budget flakes rather than fails honestly.
         let badge = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(badge) = svc.pr_cache.get("rust-works", "omni-dev", "main") {
+                if let Some(PrResolution::Pr(badge)) =
+                    svc.pr_cache.get("rust-works", "omni-dev", "main")
+                {
                     return badge;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -4038,6 +4156,60 @@ mod tests {
             svc.registry.change_generation(),
             settled,
             "an unchanged poll must not bump the change-notify"
+        );
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poller_resolves_a_negative_through_gh_and_bumps_once() {
+        // The negative twin of `pr_poller_bumps_only_when_a_verdict_actually_moves`
+        // (#1370): a PR-less branch resolves to NoPr end-to-end, reaches the wire
+        // as `pr_none`, and — since the answer never changes — bumps the
+        // change-notify only for the poll that first delivered it.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":null},
+                "associatedPullRequests":{"nodes":[]}
+            }}}}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.pr_cache.get("rust-works", "omni-dev", "main") == Some(PrResolution::NoPr) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("poller should resolve the negative through the fake gh");
+
+        // The negative reaches the wire the windows actually read.
+        let wt = &repos_of(&svc.handle("tree", Value::Null).await.unwrap())[0]["worktrees"][0];
+        assert_eq!(wt["pr_none"], json!(true));
+        assert!(wt.get("pr").is_none(), "{wt:?}");
+
+        // Identical re-polls of the same negative must not bump.
+        let settled = svc.registry.change_generation();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            svc.registry.change_generation(),
+            settled,
+            "an unchanged negative must not bump the change-notify"
         );
         svc.shutdown().await;
     }

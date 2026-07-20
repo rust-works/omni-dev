@@ -342,11 +342,22 @@ the OS default browser and needs no extension.
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
   action still surfaces the real `gh` error). A failing poll leaves the last known
-  badges in place rather than blanking the rows.
+  state in place rather than blanking the rows — badges *and* negatives — and
+  mints no new negatives.
+- **"No open PR" is an explicit answer (#1370).** A branch the poller successfully
+  checked and found PR-less rides the snapshot as `pr_none: true` (mutually
+  exclusive with `pr`; a never-pushed branch counts as PR-less). Without it,
+  absence carried two meanings — "checked, none" and "old daemon that never
+  checked" — so every window's degraded `gh pr list` fallback re-fired per window
+  × repo × 60 s forever for every PR-less branch, silently reintroducing the very
+  windows × repos GitHub cost #1337 removed. Both fields absent still means "not
+  resolved".
 - **Older daemons degrade.** Against a daemon predating #1337 — which omits `pr` —
   the extension falls back to its own `gh pr list` and shows the PR number and
   draft marker **without** a check glyph: nothing extension-side polls, so a verdict
-  there could not refresh, and a stale `✓` is worse than none.
+  there could not refresh, and a stale `✓` is worse than none. The fallback covers
+  only branches with **neither** `pr` nor `pr_none` (#1370), so against a current
+  daemon it runs no `gh` at all.
 - **The check state is colored, not monochrome (#1324).** The `✓`/`✗`/`●` is a VS
   Code `FileDecoration` (the same mechanism git status uses to color `M`/`U`
   badges), painted from a custom `omnidev-worktree:` `resourceUri` the extension
@@ -623,7 +634,7 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr? }`. The
+  `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr?, pr_none? }`. The
   main working tree
   comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
   `true` when a live window currently has that worktree open, and `window_key` (the
@@ -650,6 +661,11 @@ Where:
   (#1337; see [Pull requests](#pull-requests)) and absent until the first poll
   lands, for a non-GitHub repo, or when no open PR heads the branch. Note `isDraft`
   is camelCase: it predates the move and every consumer already reads that key.
+  `pr_none` is the **explicit negative** (#1370): a skip-when-false boolean set
+  when the poller checked the branch and found **no open PR** (a never-pushed
+  branch included), mutually exclusive with `pr`. Both absent still means "not
+  resolved" — before the first poll, after a failed one, or from a pre-#1370
+  daemon — which is the only case a client's degraded `gh` fallback should cover.
 - `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
   `{ paths: [<worktree path>, …] }`, it returns
   `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
@@ -717,7 +733,7 @@ Example exchange:
 → {"service":"worktrees","op":"list"}
 ← {"ok":true,"payload":{"windows":[{"key":"3f1c…","folders":["/home/me/omni-dev"],"repo":"omni-dev","title":"omni-dev — main","pid":4321,"branch":"main","ahead":2,"behind":0,"main_repo":"omni-dev","last_seen":"2026-06-23T01:20:00Z"}]}}
 → {"service":"worktrees","op":"tree"}
-← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","upstream_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…"},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","upstream_sha":"c05d1f3b…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
+← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","upstream_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…","pr_none":true},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","upstream_sha":"c05d1f3b…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
 → {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
 ← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
 ```
