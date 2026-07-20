@@ -651,10 +651,14 @@ impl WorktreesService {
                 match resolved {
                     Ok(snap) => {
                         if rate_limit_crossed_warn(prev.as_ref(), &snap) {
+                            // Bound to a local (rather than inlined into the macro)
+                            // so it is computed whenever the branch is taken, not
+                            // only when a WARN-level subscriber is installed —
+                            // `tracing` skips evaluating macro args otherwise.
+                            let summary = snap.summary_line();
                             tracing::warn!(
-                                "GitHub API rate limit high: {} (querying /rate_limit is free; \
-                                 the daemon's gh usage is not)",
-                                snap.summary_line()
+                                "GitHub API rate limit high: {summary} (querying /rate_limit \
+                                 is free; the daemon's gh usage is not)"
                             );
                         }
                         // Update the cache only; deliberately no `registry.bump()`

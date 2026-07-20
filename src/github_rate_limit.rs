@@ -469,6 +469,17 @@ mod tests {
         assert!(label.ends_with('⚠'), "{label}");
     }
 
+    #[test]
+    fn tray_label_omits_the_marker_below_threshold() {
+        let body = json!({"resources": {
+            "graphql": {"limit": 5000, "used": 10, "remaining": 4990, "reset": 1},
+            "core": {"limit": 5000, "used": 27, "remaining": 4973, "reset": 1},
+        }});
+        let label = parse_rate_limit(&body).tray_label();
+        assert_eq!(label, "github: graphql 0.2% · core 0.5%", "{label}");
+        assert!(!label.contains('⚠'), "{label}");
+    }
+
     // --- Cache ---
 
     #[test]
