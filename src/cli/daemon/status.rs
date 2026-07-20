@@ -52,10 +52,7 @@ fn print_running(json_out: bool, report: &StatusReport) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    match &report.version {
-        Some(version) => println!("daemon: running (v{version})"),
-        None => println!("daemon: running (version unknown)"),
-    }
+    println!("daemon: running ({})", describe_status(report));
     // A top-level GitHub API budget line (#1375), when the monitor has a reading —
     // the daemon's `gh` usage spends this budget machine-wide, so it belongs above
     // the per-service rows, not nested under one. `⚠` flags a resource ≥ ~80% used.
@@ -74,8 +71,29 @@ fn print_running(json_out: bool, report: &StatusReport) -> Result<()> {
     }
     // Non-fatal: flag a stale resident daemon (older/newer than this CLI) so an
     // operator knows a `daemon restart` is needed to pick up the new binary.
-    super::warn_version_mismatch(report.version.as_deref());
+    super::warn_version_mismatch(report);
     Ok(())
+}
+
+/// Formats the `daemon status` header detail: the daemon's crate version plus
+/// whatever git provenance it advertised — commit, build time, and a `dirty`
+/// marker (#1374). Each provenance piece is appended only when present, so a
+/// daemon built without git metadata renders exactly `v<version>`.
+fn describe_status(report: &StatusReport) -> String {
+    let mut parts = match &report.version {
+        Some(version) => vec![format!("v{version}")],
+        None => vec!["version unknown".to_string()],
+    };
+    if let Some(commit) = &report.provenance.commit {
+        parts.push(commit.clone());
+    }
+    if let Some(built) = &report.provenance.build_timestamp {
+        parts.push(format!("built {built}"));
+    }
+    if report.provenance.dirty == Some(true) {
+        parts.push("dirty".to_string());
+    }
+    parts.join(", ")
 }
 
 /// Prints the "not running" status (or its JSON equivalent).
@@ -106,7 +124,7 @@ mod tests {
                 detail: serde_json::Value::Null,
             }],
             version: version.map(str::to_string),
-            github_rate_limit: None,
+            ..StatusReport::default()
         }
     }
 
@@ -123,7 +141,7 @@ mod tests {
             &StatusReport {
                 services: vec![],
                 version: Some("1.2.3".to_string()),
-                github_rate_limit: None,
+                ..StatusReport::default()
             },
         )
         .unwrap();
@@ -156,6 +174,44 @@ mod tests {
             search: None,
         });
         print_running(false, &rep).unwrap();
+    }
+
+    #[test]
+    fn describe_status_appends_provenance_pieces_when_present() {
+        use crate::build_info::Provenance;
+
+        // Bare version only when no provenance is advertised.
+        assert_eq!(describe_status(&report(Some("0.36.0"))), "v0.36.0");
+        // Unknown version renders its placeholder.
+        assert_eq!(describe_status(&report(None)), "version unknown");
+
+        // Commit, build time, and the dirty marker are appended in order; a
+        // clean tree omits the `dirty` marker.
+        let dirty = StatusReport {
+            version: Some("0.36.0".to_string()),
+            provenance: Provenance {
+                commit: Some("a6d304fd".to_string()),
+                build_timestamp: Some("2026-07-20T05:33:17+00:00".to_string()),
+                dirty: Some(true),
+                ..Provenance::default()
+            },
+            ..StatusReport::default()
+        };
+        assert_eq!(
+            describe_status(&dirty),
+            "v0.36.0, a6d304fd, built 2026-07-20T05:33:17+00:00, dirty"
+        );
+
+        let clean = StatusReport {
+            version: Some("0.36.0".to_string()),
+            provenance: Provenance {
+                commit: Some("a6d304fd".to_string()),
+                dirty: Some(false),
+                ..Provenance::default()
+            },
+            ..StatusReport::default()
+        };
+        assert_eq!(describe_status(&clean), "v0.36.0, a6d304fd");
     }
 
     #[test]

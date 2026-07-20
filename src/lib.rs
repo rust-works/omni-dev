@@ -40,6 +40,7 @@
 
 pub mod atlassian;
 pub mod browser;
+pub mod build_info;
 pub mod claude;
 pub mod cli;
 pub mod coverage;
