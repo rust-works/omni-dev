@@ -47,7 +47,9 @@ pub use crate::claude::backend::AiBackend;
     about = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog.",
     long_about = None
 )]
-#[command(version)]
+// `-V` shows the bare crate version; `--version` adds git provenance (commit,
+// date, dirty flag) so a local/unreleased build is identifiable (#1374).
+#[command(version = crate::VERSION, long_version = crate::build_info::long_version())]
 pub struct Cli {
     /// Selects the AI backend used by commands that invoke an AI model.
     ///
