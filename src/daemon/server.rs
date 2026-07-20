@@ -452,15 +452,26 @@ async fn handle_builtin(
     shutdown: &CancellationToken,
 ) -> DaemonReply {
     match op {
-        // Carry the daemon binary's version so a client can detect it is talking
-        // to a stale resident daemon after a binary upgrade (#1113).
-        "ping" => DaemonReply::ok(json!({ "pong": true, "version": crate::VERSION })),
+        // Carry the daemon binary's version and git provenance so a client can
+        // detect it is talking to a stale resident daemon after a binary upgrade
+        // (#1113, #1374). Provenance keys are added only when present, keeping the
+        // reply byte-identical to a pre-#1374 daemon's when built without git.
+        "ping" => {
+            let mut payload = serde_json::Map::new();
+            payload.insert("pong".to_string(), json!(true));
+            payload.insert("version".to_string(), json!(crate::VERSION));
+            if let Ok(serde_json::Value::Object(prov)) =
+                serde_json::to_value(crate::build_info::provenance())
+            {
+                payload.extend(prov);
+            }
+            DaemonReply::ok(serde_json::Value::Object(payload))
+        }
         "status" => {
-            let report = StatusReport {
-                services: registry.statuses().await,
-                version: Some(crate::VERSION.to_string()),
-                github_rate_limit: registry.github_rate_limit(),
-            };
+            // `current()` stamps the build-time fields (version + git provenance,
+            // #1374); the runtime rate-limit reading (#1375) is injected after.
+            let mut report = StatusReport::current(registry.statuses().await);
+            report.github_rate_limit = registry.github_rate_limit();
             match serde_json::to_value(report) {
                 Ok(payload) => DaemonReply::ok(payload),
                 Err(e) => DaemonReply::err(format!("failed to encode status: {e}")),

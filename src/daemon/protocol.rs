@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::service::ServiceStatus;
+use crate::build_info::Provenance;
 
 /// The reserved service name for the daemon's own built-in operations
 /// (`ping`, `status`, `shutdown`). A `None` `service` targets the same.
@@ -125,7 +126,7 @@ impl DaemonReply {
 }
 
 /// The payload of a built-in `status` reply: per-service status snapshots.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusReport {
     /// One entry per registered service, in registration order.
     pub services: Vec<ServiceStatus>,
@@ -139,6 +140,29 @@ pub struct StatusReport {
     /// `gh` is available, or on a pre-#1375 daemon — a client shows nothing then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_rate_limit: Option<crate::github_rate_limit::RateLimitSnapshot>,
+    /// Git provenance (commit SHA, dirty flag, dates) of the daemon binary,
+    /// flattened as sibling fields of [`version`](Self::version) so two builds
+    /// of the same crate version can be told apart (#1374). Every field is
+    /// omitted when absent, so a daemon built without git metadata stays
+    /// byte-identical on the wire to a pre-#1374 one.
+    #[serde(flatten)]
+    pub provenance: Provenance,
+}
+
+impl StatusReport {
+    /// Builds a status report stamped with this daemon binary's own version and
+    /// git provenance (from [`crate::build_info`]). Runtime-only fields (e.g. the
+    /// GitHub rate-limit reading) default to absent and are injected by the
+    /// caller after construction.
+    #[must_use]
+    pub fn current(services: Vec<ServiceStatus>) -> Self {
+        Self {
+            services,
+            version: Some(crate::VERSION.to_string()),
+            provenance: crate::build_info::provenance(),
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,21 +210,21 @@ mod tests {
 
     #[test]
     fn status_report_round_trips_and_omits_absent_version() {
-        // With no version the field is skipped, keeping the wire byte-identical
-        // to what an older client/daemon exchanges.
+        // With no version and no provenance both are skipped, keeping the wire
+        // byte-identical to what an older client/daemon exchanges.
         let line = serde_json::to_string(&StatusReport {
             services: vec![],
             version: None,
-            github_rate_limit: None,
+            ..StatusReport::default()
         })
         .unwrap();
-        assert!(!line.contains("version"), "{line}");
+        assert_eq!(line, r#"{"services":[]}"#, "{line}");
 
         // With a version it serializes and round-trips.
         let line = serde_json::to_string(&StatusReport {
             services: vec![],
             version: Some("1.2.3".to_string()),
-            github_rate_limit: None,
+            ..StatusReport::default()
         })
         .unwrap();
         assert!(line.contains("\"version\":\"1.2.3\""), "{line}");
@@ -217,6 +241,7 @@ mod tests {
             services: vec![],
             version: Some("1.2.3".to_string()),
             github_rate_limit: None,
+            ..StatusReport::default()
         })
         .unwrap();
         assert!(!line.contains("github_rate_limit"), "{line}");
@@ -238,10 +263,35 @@ mod tests {
             services: vec![],
             version: None,
             github_rate_limit: Some(snap),
+            ..StatusReport::default()
         })
         .unwrap();
         assert!(line.contains("github_rate_limit"), "{line}");
         let back: StatusReport = serde_json::from_str(&line).unwrap();
         assert_eq!(back.github_rate_limit, Some(snap));
+    }
+
+    #[test]
+    fn status_report_flattens_provenance_as_siblings_and_round_trips() {
+        // Provenance fields render as siblings of `version`, not nested, and a
+        // newer client decodes them back into the flattened struct.
+        let report = StatusReport {
+            services: vec![],
+            version: Some("1.2.3".to_string()),
+            provenance: Provenance {
+                commit: Some("a6d304fd".to_string()),
+                dirty: Some(true),
+                ..Provenance::default()
+            },
+            ..StatusReport::default()
+        };
+        let line = serde_json::to_string(&report).unwrap();
+        assert!(line.contains("\"commit\":\"a6d304fd\""), "{line}");
+        assert!(line.contains("\"dirty\":true"), "{line}");
+        let back: StatusReport = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.provenance.commit.as_deref(), Some("a6d304fd"));
+        assert_eq!(back.provenance.dirty, Some(true));
+        // Absent provenance fields decode to `None`, not an error.
+        assert!(back.provenance.commit_long.is_none());
     }
 }
