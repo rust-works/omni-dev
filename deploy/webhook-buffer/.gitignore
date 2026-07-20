@@ -1,0 +1,11 @@
+# Node / wrangler
+node_modules/
+.wrangler/
+package-lock.json
+
+# Local secrets for `wrangler dev` — NEVER commit
+.dev.vars
+.env
+
+# Locally captured live payloads (the spike's raw evidence stays out of git)
+captured/

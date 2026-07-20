@@ -1,0 +1,25 @@
+{
+  "event": "pull_request",
+  "delivery": "sample-pull-request",
+  "received": 1721433620000,
+  "payload": {
+    "action": "opened",
+    "number": 42,
+    "pull_request": {
+      "number": 42,
+      "state": "open",
+      "draft": false,
+      "html_url": "https://github.com/acme/widget/pull/42",
+      "url": "https://api.github.com/repos/acme/widget/pulls/42",
+      "title": "Spike: webhook buffer",
+      "head": { "ref": "feature/spike", "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112" },
+      "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+    },
+    "repository": {
+      "name": "widget",
+      "full_name": "acme/widget",
+      "owner": { "login": "acme" }
+    },
+    "sender": { "login": "octocat" }
+  }
+}
