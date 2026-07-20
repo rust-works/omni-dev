@@ -1,0 +1,30 @@
+{
+  "event": "check_suite",
+  "delivery": "sample-check-suite",
+  "received": 1721433610000,
+  "payload": {
+    "action": "completed",
+    "check_suite": {
+      "id": 200099,
+      "head_branch": "feature/spike",
+      "head_sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+      "status": "completed",
+      "conclusion": "success",
+      "app": { "id": 254, "slug": "codecov" },
+      "pull_requests": [
+        {
+          "number": 42,
+          "url": "https://api.github.com/repos/acme/widget/pulls/42",
+          "head": { "ref": "feature/spike", "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112" },
+          "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+        }
+      ]
+    },
+    "repository": {
+      "name": "widget",
+      "full_name": "acme/widget",
+      "owner": { "login": "acme" }
+    },
+    "sender": { "login": "octocat" }
+  }
+}

@@ -1,0 +1,19 @@
+name = "omni-dev-webhook-buffer"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# The KV namespace that buffers GitHub webhook deliveries. Create it with
+#   npx wrangler kv namespace create GITHUB_EVENTS
+# then paste the printed id below (and, if you use one, a preview_id).
+[[kv_namespaces]]
+binding = "GITHUB_EVENTS"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Secrets are NOT set here — set them with `wrangler secret put` so they never hit
+# the repo (see README.md):
+#   WEBHOOK_SECRET   the GitHub webhook HMAC key (also handed to `gh api .../hooks`)
+#   READ_TOKEN       the Bearer token the daemon presents on GET /events
+#
+# Optional plain var — override the 3-day (259200s) KV retention (min 60s):
+# [vars]
+# RETENTION_SECONDS = "259200"

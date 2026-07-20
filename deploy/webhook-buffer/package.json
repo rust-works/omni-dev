@@ -1,0 +1,15 @@
+{
+  "name": "omni-dev-webhook-buffer",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cloudflare Worker + KV buffer for omni-dev's non-polling (webhook-driven) PR status source (#1384)",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "verify": "node verify-fields.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
