@@ -12,9 +12,11 @@ import {
   TreeGithubIdentity,
   TreeRepoPayload,
   isCurrentWindow,
+  needsPrFallback,
   nodeId,
   repoLabel,
   reposToNodes,
+  unbadgedBranches,
   withAheadBehind,
   withPr,
   worktreeCheckDecoration,
@@ -38,9 +40,10 @@ export type AheadBehindFetcher = (paths: string[]) => Promise<AheadBehindMap>;
  * Resolves the open PR badge for each of a GitHub repo's branches on demand — one
  * `gh pr list` per repo-expand (#1296). Injected like {@link AheadBehindFetcher}
  * so the provider stays `vscode`-testable; the returned map is keyed by branch
- * name (only branches with an open PR appear). Resolves to an empty map — so the
- * tree renders without PR badges — when `gh` is missing, the feature is disabled,
- * or the lookup fails.
+ * name (only branches with an open PR appear). Invoked only for branches the
+ * daemon left unresolved (`needsPrFallback`, #1370). Resolves to an empty map —
+ * so the tree renders without PR badges — when `gh` is missing, the feature is
+ * disabled, or the lookup fails.
  */
 export type PrBadgeFetcher = (
   repo: TreeGithubIdentity,
@@ -109,13 +112,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     // PR badges are **not** in the same boat since #1337. The daemon resolves them
     // and pushes them on the snapshot, kept live by its own poller — which is the
     // whole point, because a re-render only happens when the *worktree* state
-    // changes, and CI moves without it. So we ask the fallback fetcher only for the
-    // branches the daemon left unbadged (an older daemon omits `pr` entirely);
-    // against a current daemon that list is empty and no `gh` runs at all.
+    // changes, and CI moves without it. A current daemon marks every checked
+    // branch with either a badge (`pr`) or the explicit negative (`pr_none`,
+    // #1370), so the fallback list is empty and no `gh` runs at all; only a
+    // pre-#1370 daemon — or a branch it has not yet resolved — lands here.
     const paths = nodes.flatMap((n) => (n.kind === "worktree" ? [n.wt.path] : []));
-    const unbadged = nodes.flatMap((n) =>
-      n.kind === "worktree" && n.wt.branch && !n.wt.pr ? [n.wt.branch] : [],
-    );
+    const unbadged = unbadgedBranches(nodes);
     const abPromise: Promise<AheadBehindMap> = this.fetchAheadBehind
       ? this.fetchAheadBehind(paths).catch(() => ({}))
       : Promise.resolve({});
@@ -128,11 +130,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       if (n.kind !== "worktree") {
         return n;
       }
-      // `withPr(wt, undefined)` is a no-op, so a daemon-supplied badge is never
-      // overwritten by the (checks-less) fallback.
+      // `withPr(wt, undefined)` is a no-op, so a daemon-supplied badge — or its
+      // explicit `pr_none` negative — is never overwritten by the (checks-less)
+      // fallback. Guarded by the same predicate as the collection above.
       const wt = withPr(
         withAheadBehind(n.wt, ab[n.wt.path]),
-        n.wt.branch && !n.wt.pr ? prBadges[n.wt.branch] : undefined,
+        n.wt.branch && needsPrFallback(n.wt) ? prBadges[n.wt.branch] : undefined,
       );
       return { ...n, wt };
     });
