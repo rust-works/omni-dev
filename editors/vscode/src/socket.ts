@@ -164,6 +164,25 @@ export function setShowClosedEnvelope(showClosed: boolean): Envelope {
 }
 
 /**
+ * Builds a `set-polling` envelope — enables or disables the daemon's PR-badge
+ * polling for one GitHub repo (#1376). Polling defaults **off**, so a repo only
+ * issues `gh` once enabled; the daemon holds the (persisted) per-repo state and
+ * re-pushes a `tree` snapshot carrying the new `polling_enabled` to every window,
+ * so the icon recolours and badges drop/appear in sync — the `set-show-closed`
+ * pattern. Keyed by `owner`/`name` so it covers every worktree of the repo.
+ */
+export function setPollingEnvelope(
+  repo: { owner: string; name: string },
+  enabled: boolean,
+): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "set-polling",
+    payload: { owner: repo.owner, name: repo.name, enabled },
+  };
+}
+
+/**
  * The fields the extension sends on a `close` op — mirrors the daemon's
  * `CloseRequest` (`src/daemon/services/worktrees.rs`). `remove` selects delete
  * (linked "Close Worktree") vs close-only (main "Close Window"); `requester_key`
