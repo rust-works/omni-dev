@@ -1,8 +1,10 @@
-// The real `gh` subprocess runner behind `github.ts`'s injectable `GhRunner`.
+// The real `gh` subprocess runner. Since #1389 (fix 7) the extension prefers the
+// daemon's shared, counted `open-prs` op and only reaches for this against a daemon
+// too old to serve it — the last-resort per-window `gh pr list`.
 //
 // Kept separate (and `vscode`-free) so `github.ts` stays a pure, unit-tested
-// module: everything with logic worth asserting lives there behind an injected
-// runner, and this file only does the one thing that must touch the OS — spawn
+// module: everything with logic worth asserting lives there behind injected
+// fetchers, and this file only does the one thing that must touch the OS — spawn
 // `gh` — and turn its failure modes into actionable errors.
 
 import { execFile } from "child_process";

@@ -16,6 +16,7 @@ import {
   defaultSocketPath,
   heartbeatEnvelope,
   openEnvelope,
+  openPrsEnvelope,
   registerEnvelope,
   sendEnvelope,
   sessionWindowEnvelope,
@@ -190,15 +191,45 @@ interface PrCacheEntry {
   prs: PullRequest[];
 }
 
-/** Per-repo (`owner/name`) cache of the last `gh pr list`, TTL'd by {@link PR_CACHE_TTL_MS}. */
+/** Per-repo (`owner/name`) cache of the last open-PR fetch, TTL'd by {@link PR_CACHE_TTL_MS}. */
 const prCache = new Map<string, PrCacheEntry>();
 
 /**
- * The repo's open PRs, from cache when fresh, else one `gh pr list`. A `gh`
- * failure — missing binary, not authed, unknown repo — is **cached as an empty
- * list** for the TTL and logged once, so a missing `gh` is not re-spawned on every
- * pushed snapshot; the explicit "Open Pull Request…" action still surfaces the
- * real error.
+ * A repo's open PRs from the daemon's shared, TTL-cached `open-prs` op (#1389,
+ * fix 7), or `undefined` when the daemon is unreachable or too old to serve the op
+ * (a non-`ok` reply, or a payload without a `pull_requests` array) — the signal to
+ * fall back to this window's own `gh`.
+ */
+async function daemonRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[] | undefined> {
+  const reply = await send(openPrsEnvelope(repo.owner, repo.name));
+  if (!reply?.ok) {
+    return undefined;
+  }
+  const raw = reply.payload?.pull_requests;
+  return Array.isArray(raw) ? (raw as PullRequest[]) : undefined;
+}
+
+/**
+ * Every open PR of a repo, preferring the daemon's shared op so N windows dedupe to
+ * one counted `gh` (#1389, fix 7), and falling back to this window's own
+ * `gh pr list` **only** against a daemon too old to serve it. This is the single
+ * choke point both the "Open Pull Request…" command and the transient badge
+ * fallback resolve a repo's PRs through.
+ */
+async function repoOpenPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
+  const viaDaemon = await daemonRepoPrs(repo);
+  if (viaDaemon !== undefined) {
+    return viaDaemon;
+  }
+  return parsePrList(await runGh(prListArgsForRepo(repo)));
+}
+
+/**
+ * The repo's open PRs, from this window's cache when fresh, else {@link repoOpenPrs}
+ * (the shared daemon op, or one `gh pr list` against an old daemon). A failure —
+ * missing binary, not authed, unknown repo — is **cached as an empty list** for the
+ * TTL and logged once, so it is not re-attempted on every pushed snapshot; the
+ * explicit "Open Pull Request…" action still surfaces the real error.
  */
 async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
   const key = `${repo.owner}/${repo.name}`;
@@ -208,7 +239,7 @@ async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
     return hit.prs;
   }
   try {
-    const prs = parsePrList(await runGh(prListArgsForRepo(repo)));
+    const prs = await repoOpenPrs(repo);
     prCache.set(key, { at: now, prs });
     return prs;
   } catch (err) {
@@ -463,11 +494,12 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",
-      (node?: Node, selected?: Node[]) => void openPullRequest(node, selected),
+      (node?: Node, selected?: Node[]) => void openPullRequest(node, selected, repoOpenPrs),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequestInBrowser",
-      (node?: Node, selected?: Node[]) => void openPullRequestInBrowser(node, selected),
+      (node?: Node, selected?: Node[]) =>
+        void openPullRequestInBrowser(node, selected, repoOpenPrs),
     ),
     // A destination, not a subject — the menu hides it while a multi-selection is
     // active (`!listMultiSelection`), so it stays single-node here too.

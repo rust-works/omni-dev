@@ -8,6 +8,7 @@ import * as path from "path";
 import {
   MAX_SOCKET_PATH_LEN,
   aheadBehindEnvelope,
+  openPrsEnvelope,
   checkSocketPathLen,
   closeCheckEnvelope,
   closeEnvelope,
@@ -105,6 +106,14 @@ test("ahead-behind envelope batches worktree paths for the lazy divergence op", 
     service: "worktrees",
     op: "ahead-behind",
     payload: { paths: [] },
+  });
+});
+
+test("open-prs envelope carries the repo owner/name for the daemon-served PR list", () => {
+  assert.deepEqual(openPrsEnvelope("rust-works", "omni-dev"), {
+    service: "worktrees",
+    op: "open-prs",
+    payload: { owner: "rust-works", name: "omni-dev" },
   });
 });
 
