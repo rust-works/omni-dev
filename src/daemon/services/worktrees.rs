@@ -5123,6 +5123,7 @@ mod tests {
         // Best-effort: an unwritable path is logged at WARN and swallowed — the
         // in-memory cache stays authoritative, and losing the warm start only
         // costs one extra poll after the next restart.
+        let _trace = warn_subscriber();
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"").unwrap();
@@ -5130,6 +5131,9 @@ mod tests {
         let path = blocker.join("pr-cache.json");
         persist_pr_cache(&path, &PrStatusCache::new(), &[], Utc::now());
         assert!(!path.exists());
+        // The root has no parent at all — nothing to create, and the write
+        // itself fails (it is a directory); still swallowed.
+        persist_pr_cache(Path::new("/"), &PrStatusCache::new(), &[], Utc::now());
     }
 
     #[tokio::test]
