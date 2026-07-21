@@ -3899,6 +3899,7 @@ Search the local invocation + HTTP request log
 Usage: log [OPTIONS] [COMMAND]
 
 Commands:
+  count  Count records by kind and source (`--kind gh` for the GitHub breakdown)
   prune  Prune old records to bound the log's on-disk growth
   help   Print this message or the help of the given subcommand(s)
 
@@ -3918,6 +3919,23 @@ Options:
   -n, --limit <N>          Show at most N (most recent) matching records
   -f, --follow             Follow the log, printing new matching records as they are appended
   -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev log count - Count records by kind and source (`--kind gh` for the GitHub breakdown)
+
+Count records by kind and source (`--kind gh` for the GitHub breakdown)
+
+Usage: count [OPTIONS]
+
+Options:
+      --since <DUR_OR_TS>  Lower time bound: relative (`30m`, `2h`, `1d`, `1w`) or absolute (`2026-07-01`, RFC3339). Same forms as `omni-dev log --since`
+      --until <DUR_OR_TS>  Upper time bound (same forms as `--since`; a relative value means that long ago)
+      --source <SOURCE>    Restrict to records from one source [possible values: cli, daemon, mcp]
+      --kind <KIND>        Restrict to one record kind (`--kind gh` shows the GitHub breakdown) [possible values: invocation, http, gh]
+      --json               Emit JSON instead of a table
+  -h, --help               Print help
 
 
 ================================================================================

@@ -21,6 +21,22 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // Install the per-invocation context up front — crucially *before* the macOS
+    // menu-bar handoff below, which `return`s without ever reaching the common
+    // path. Otherwise a tray-hosted daemon's `gh`/HTTP records would default to
+    // `Source::Cli` instead of `Daemon` (#1387). `daemon run` → Daemon, else Cli;
+    // set_global is first-write-wins.
+    let source = if daemon_run {
+        Source::Daemon
+    } else {
+        Source::Cli
+    };
+    request_log::set_global(RequestLogContext {
+        invocation_id: request_log::new_id(),
+        source,
+        mcp_tool: None,
+    });
+
     // The macOS menu-bar daemon needs the GUI event loop on the main thread,
     // which a tokio runtime cannot own. Detect `daemon run` (without
     // `--no-menu`) and hand the main thread to the tray; every other invocation
@@ -48,20 +64,9 @@ fn main() {
         }
     };
 
-    // Stash the per-invocation context so HTTP records can correlate to this
-    // run, then time the whole command and append one invocation record after
-    // it returns. Logging is best-effort and never affects the exit code.
-    let source = if daemon_run {
-        Source::Daemon
-    } else {
-        Source::Cli
-    };
-    request_log::set_global(RequestLogContext {
-        invocation_id: request_log::new_id(),
-        source,
-        mcp_tool: None,
-    });
-
+    // Time the whole command and append one invocation record after it returns.
+    // Logging is best-effort and never affects the exit code. (The per-invocation
+    // context was installed up front, above, before the menu-bar handoff.)
     let start = Instant::now();
     let result = runtime.block_on(cli.execute());
 

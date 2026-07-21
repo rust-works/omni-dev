@@ -53,7 +53,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{bail, Context, Result};
@@ -471,16 +470,19 @@ fn resolve_gh_binary_from(
 /// Runs one `gh api graphql` call against `bin`. **Blocking** — callers must be on
 /// a blocking thread, never an async worker.
 fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
-    let output = Command::new(bin)
-        .args(["api", "graphql", "-f"])
-        .arg(format!("query={query}"))
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to run {} (is the GitHub CLI installed?)",
-                bin.display()
-            )
-        })?;
+    let query_arg = format!("query={query}");
+    let output = crate::github_metrics::run_gh(
+        bin,
+        ["api", "graphql", "-f", query_arg.as_str()],
+        "api graphql",
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to run {} (is the GitHub CLI installed?)",
+            bin.display()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("gh api graphql failed: {}", stderr.trim());

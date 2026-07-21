@@ -28,7 +28,6 @@
 //! following ADR-0003's "shell out to `gh`/`git` for GitHub operations".
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{bail, Context, Result};
@@ -251,9 +250,7 @@ fn parse_rate_limit(body: &Value) -> RateLimitSnapshot {
 /// on a blocking thread, never an async worker. Mirrors
 /// [`crate::pr_status`]'s `run_gh_graphql`.
 fn run_gh_rate_limit(bin: &Path) -> Result<Value> {
-    let output = Command::new(bin)
-        .args(["api", "rate_limit"])
-        .output()
+    let output = crate::github_metrics::run_gh(bin, ["api", "rate_limit"], "api rate_limit", None)
         .with_context(|| {
             format!(
                 "failed to run {} (is the GitHub CLI installed?)",

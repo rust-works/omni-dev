@@ -59,6 +59,21 @@ fn oneline(rec: &LogRecord) -> String {
                 "{time}  http  {service:<14} {method:<6} {status:<4} {elapsed:>7}  {url}{daemon}{err}"
             )
         }
+        RecordKind::Gh => {
+            let source = source_str(rec.source);
+            let command = if rec.command.is_empty() {
+                "-".to_string()
+            } else {
+                rec.command.join(" ")
+            };
+            let exit = rec
+                .exit_code
+                .map_or_else(String::new, |c| format!(" exit={c}"));
+            let dur = rec
+                .duration_ms
+                .map_or_else(String::new, |ms| format!(" {ms}ms"));
+            format!("{time}  gh    {source:<14} gh {command}{exit}{dur}")
+        }
         RecordKind::Invocation | RecordKind::Unknown => {
             let source = source_str(rec.source);
             let command = if rec.command.is_empty() {
@@ -163,6 +178,33 @@ mod tests {
         let line = render(&rec, "", Format::Oneline);
         assert!(line.contains("mcp"));
         assert!(line.contains("jira_read"));
+    }
+
+    #[test]
+    fn oneline_gh_shows_subcommand_exit_and_duration() {
+        let rec = LogRecord {
+            kind: RecordKind::Gh,
+            timestamp: "2026-06-22T12:34:56.789Z".to_string(),
+            command: vec!["pr".to_string(), "list".to_string()],
+            source: Some(Source::Daemon),
+            exit_code: Some(0),
+            duration_ms: Some(87),
+            ..LogRecord::default()
+        };
+        let line = render(&rec, "", Format::Oneline);
+        assert!(line.contains("gh"), "line was: {line}");
+        assert!(line.contains("daemon"), "line was: {line}");
+        assert!(line.contains("pr list"), "line was: {line}");
+        assert!(line.contains("exit=0"), "line was: {line}");
+        assert!(line.contains("87ms"), "line was: {line}");
+
+        // An empty command renders the "-" placeholder rather than a bare "gh ".
+        let bare = LogRecord {
+            kind: RecordKind::Gh,
+            timestamp: "2026-06-22T12:34:56.789Z".to_string(),
+            ..LogRecord::default()
+        };
+        assert!(render(&bare, "", Format::Oneline).contains("gh -"));
     }
 
     #[test]

@@ -218,19 +218,21 @@ pub(crate) fn check_ai_credentials_with(
 /// `repo_root` anchors the repository-access probe to the injected repository
 /// rather than the process current working directory.
 pub fn check_github_cli(repo_root: &std::path::Path) -> Result<()> {
+    let gh_bin = crate::pr_status::resolve_gh_binary();
     // Check if gh CLI is available. This probe is a PATH availability check
-    // (CWD-independent), so it is not anchored to `repo_root`.
-    let gh_check = std::process::Command::new("gh")
-        .args(["--version"])
-        .output();
+    // (CWD-independent), so it is not anchored to `repo_root`. `--version` is a
+    // local probe (no API call), counted as such via the metrics choke point.
+    let gh_check = crate::github_metrics::run_gh(&gh_bin, ["--version"], "--version", None);
 
     match gh_check {
         Ok(output) if output.status.success() => {
             // Test if gh can access the injected repo
-            let repo_check = std::process::Command::new("gh")
-                .args(["repo", "view", "--json", "name"])
-                .current_dir(repo_root)
-                .output();
+            let repo_check = crate::github_metrics::run_gh(
+                &gh_bin,
+                ["repo", "view", "--json", "name"],
+                "repo view",
+                Some(repo_root),
+            );
 
             match repo_check {
                 Ok(repo_output) if repo_output.status.success() => Ok(()),

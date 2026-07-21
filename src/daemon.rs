@@ -73,6 +73,8 @@ use server::DaemonOptions;
 #[cfg(unix)]
 use services::bridge::BridgeService;
 #[cfg(unix)]
+use services::github_counters::GithubCountersService;
+#[cfg(unix)]
 use services::sessions::SessionsService;
 #[cfg(unix)]
 use services::snowflake::SnowflakeService;
@@ -149,6 +151,12 @@ pub async fn build_default_registry(
     let sessions = SessionsService::new();
     sessions.start_watcher();
     registry.register(Arc::new(sessions));
+    // Periodically log a summary of the GitHub API-call counters (#1387): once
+    // ~5s after boot, every 10 minutes, and once on shutdown. Best-effort and
+    // bounded (a small local log read, no network); never blocks shutdown.
+    let github_counters = GithubCountersService::new();
+    github_counters.start_counter_logger();
+    registry.register(Arc::new(github_counters));
     Ok(registry)
 }
 

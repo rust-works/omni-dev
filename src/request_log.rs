@@ -42,7 +42,7 @@ const DEFAULT_KEEP_FILES: u32 = 3;
 
 /// Which kind of record a line holds. Unknown future kinds deserialize to
 /// [`RecordKind::Unknown`] rather than failing the read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordKind {
     /// One per process invocation (or per MCP tool call).
@@ -50,14 +50,32 @@ pub enum RecordKind {
     Invocation,
     /// One per outbound HTTP request.
     Http,
+    /// One per `gh` CLI subprocess invocation (the only path to the GitHub API;
+    /// the token never enters our process, so these are subprocess records, not
+    /// [`RecordKind::Http`]). See `crate::github_metrics`.
+    Gh,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]
     Unknown,
 }
 
+impl RecordKind {
+    /// Stable lowercase name, used for display and JSON map keys (matches the
+    /// `serde(rename_all = "lowercase")` wire form).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invocation => "invocation",
+            Self::Http => "http",
+            Self::Gh => "gh",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// What drove an invocation. Unknown future sources deserialize to
 /// [`Source::Unknown`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     /// A direct `omni-dev` CLI invocation.
@@ -726,6 +744,54 @@ pub fn record_invocation(outcome: InvocationOutcome) {
     record(&rec);
 }
 
+/// The outcome of one `gh` subprocess invocation, recorded by
+/// `crate::github_metrics::run_gh` after the process exits.
+#[derive(Debug, Clone)]
+pub struct GhOutcome {
+    /// The semantic subcommand label, e.g. `"api graphql"`, `"pr list"`. Split on
+    /// spaces into the record's `command` so `--command`/`command:` queries work.
+    pub label: String,
+    /// Full argv passed to `gh` (without the binary path). Scrubbed before write.
+    pub argv: Vec<String>,
+    /// Process exit code; `None` when the process could not be spawned.
+    pub exit_code: Option<i32>,
+    /// Wall time of the subprocess.
+    pub duration: Duration,
+    /// Spawn/collection error, when the invocation did not complete.
+    pub error: Option<String>,
+}
+
+/// Appends one `kind: "gh"` record from the active context.
+///
+/// Best effort and exit-code-safe: it goes through [`record`], which swallows
+/// every error, so a logging failure can never change a `gh` caller's result.
+pub fn record_gh(outcome: GhOutcome) {
+    record(&build_gh_record(outcome, current_context()));
+}
+
+/// Builds the `kind: "gh"` record for `outcome` under `ctx`. Split out from
+/// [`record_gh`] so the record shape (source stamping, subcommand split, argv
+/// scrubbing) is unit-testable without touching the filesystem or environment.
+fn build_gh_record(outcome: GhOutcome, ctx: RequestLogContext) -> LogRecord {
+    let mut rec = LogRecord::new(RecordKind::Gh, ctx.invocation_id);
+    rec.source = Some(ctx.source);
+    rec.mcp_tool = ctx.mcp_tool;
+    rec.command = outcome
+        .label
+        .split(' ')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Same scrubbing as invocation records — defense in depth. `gh` manages its
+    // own auth (the token never enters our argv), but any secret-bearing `--flag`
+    // or URL-query value is redacted regardless.
+    rec.command_line = scrub_argv(&outcome.argv);
+    rec.exit_code = outcome.exit_code;
+    rec.error = outcome.error;
+    rec.duration_ms = Some(outcome.duration.as_millis() as u64);
+    rec
+}
+
 /// Optional, non-secret extras for an HTTP record. Bodies/headers are gated and
 /// redacted centrally in [`record_http_with`], so callers may pass them freely.
 #[derive(Debug, Clone, Default)]
@@ -1234,6 +1300,77 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().copied().map(String::from).collect()
+    }
+
+    #[test]
+    fn build_gh_record_stamps_kind_source_and_split_command() {
+        let ctx = RequestLogContext {
+            invocation_id: "inv-1".to_string(),
+            source: Source::Daemon,
+            mcp_tool: None,
+        };
+        let rec = build_gh_record(
+            GhOutcome {
+                label: "api graphql".to_string(),
+                argv: argv(&["api", "graphql", "-f", "query=xyz"]),
+                exit_code: Some(0),
+                duration: Duration::from_millis(120),
+                error: None,
+            },
+            ctx,
+        );
+        assert_eq!(rec.kind, RecordKind::Gh);
+        assert_eq!(rec.invocation_id, "inv-1");
+        assert_eq!(rec.source, Some(Source::Daemon));
+        // The label is split into `command` for per-subcommand aggregation.
+        assert_eq!(rec.command, argv(&["api", "graphql"]));
+        assert_eq!(
+            rec.command_line,
+            argv(&["api", "graphql", "-f", "query=xyz"])
+        );
+        assert_eq!(rec.exit_code, Some(0));
+        assert_eq!(rec.duration_ms, Some(120));
+        assert!(rec.error.is_none());
+    }
+
+    #[test]
+    fn build_gh_record_scrubs_secret_bearing_argv() {
+        // Defense in depth: even though `gh` never receives our auth, a
+        // secret-bearing flag value in the argv is redacted before write.
+        let rec = build_gh_record(
+            GhOutcome {
+                label: "api graphql".to_string(),
+                argv: argv(&["api", "--header", "Authorization: Bearer sekret"]),
+                exit_code: Some(0),
+                duration: Duration::from_millis(5),
+                error: None,
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.command_line,
+            argv(&["api", "--header", "Authorization: REDACTED"])
+        );
+    }
+
+    #[test]
+    fn record_kind_gh_serializes_as_gh_and_round_trips() {
+        let rec = build_gh_record(
+            GhOutcome {
+                label: "pr list".to_string(),
+                argv: argv(&["pr", "list"]),
+                exit_code: Some(1),
+                duration: Duration::from_millis(1),
+                error: Some("boom".to_string()),
+            },
+            RequestLogContext::default(),
+        );
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(line.contains("\"kind\":\"gh\""), "line was: {line}");
+        let back: LogRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.kind, RecordKind::Gh);
+        assert_eq!(back.command, argv(&["pr", "list"]));
+        assert_eq!(back.error.as_deref(), Some("boom"));
     }
 
     #[test]
