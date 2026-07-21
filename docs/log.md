@@ -19,15 +19,20 @@ types, so the log is a complete invocation history, not just an HTTP history:
   retry loop, so retries and transport failures are captured too): service,
   method, URL (secret-bearing query/fragment parameter **values** redacted —
   see [Redaction posture](#redaction-posture)), status, elapsed, and any error.
+- **`kind: "gh"`** — one per `gh` CLI subprocess invocation. Every GitHub call
+  funnels through `gh` (the token never enters our process), so these are
+  subprocess records, not `http` ones. Each carries the semantic subcommand
+  (`api graphql`, `pr list`, `repo view`, …) in `command`, the scrubbed argv in
+  `command_line`, the `source`, the exit code, and the duration. This is what
+  `omni-dev log count --kind gh` aggregates — see [Counting GitHub API calls](#counting-github-api-calls).
 
-Every HTTP record shares an `invocation_id` with the invocation that issued it,
-so you can pull a run and all of its requests with a single `--id`.
+Every HTTP and `gh` record shares an `invocation_id` with the invocation that
+issued it, so you can pull a run and all of its requests with a single `--id`.
 
-**Coverage caveat:** only requests issued by `omni-dev`'s own in-process HTTP
-clients are recorded. GitHub operations that shell out to the `gh` CLI (PR
-creation, some git integration) run in a **separate process** and are therefore
-invisible to the log — the parent invocation is still recorded, but the network
-calls `gh` makes are not.
+**Coverage caveat:** `omni-dev`'s own in-process HTTP clients and its Rust `gh`
+calls (daemon *and* one-shot CLI) are recorded. The one gap left is the VS Code
+companion extension's `gh pr list`, which runs in a **separate Node process** and
+does not write to this log.
 
 ## Location
 
@@ -142,6 +147,60 @@ omni-dev log -o json --service datadog | jq 'select(.status_code == 429)'
 # Follow live.
 omni-dev log -f --service browser-bridge
 ```
+
+## Counting records
+
+`omni-dev log count` aggregates the log by record **kind** and **source** over an
+optional window — a quick tally without paging through matches:
+
+```
+omni-dev log count [--since <DUR_OR_TS>] [--until <DUR_OR_TS>] [--source <SOURCE>] [--kind <KIND>] [--json]
+```
+
+| Flag | Effect |
+|------|--------|
+| `--since <DUR_OR_TS>` | Lower time bound — same forms as `omni-dev log --since` (`1h`, `2026-07-01`, RFC3339). |
+| `--until <DUR_OR_TS>` | Upper time bound (a relative value means that long ago). |
+| `--source <SOURCE>` | Restrict to `cli`, `daemon`, or `mcp`. |
+| `--kind <KIND>` | Restrict to `invocation`, `http`, or `gh`. `gh` unlocks the GitHub breakdown (below). |
+| `--json` | Emit JSON (string map keys, composes with `jq`) instead of the table. |
+
+With no `--kind` it reports the total and the split by kind and source:
+
+```bash
+# What has this machine done in the last day?
+omni-dev log count --since 1d
+```
+
+### Counting GitHub API calls
+
+Because every GitHub call is recorded as a `kind: "gh"` line (see [What gets
+recorded](#what-gets-recorded)), `--kind gh` turns the log into a ground-truth
+count of the GitHub API calls `omni-dev` itself makes — the *local* counterpart
+to `gh api rate_limit`, which is GitHub's *server-side* view of everything the
+token spent. It renders a richer breakdown by **category** — `api` (`gh api …`),
+`subcommand` (`gh pr list`, `gh repo view`, …), and `local` (`gh --version`,
+excluded from the API total) — as well as by subcommand and by source:
+
+```bash
+# All GitHub API calls in the last hour.
+omni-dev log count --kind gh --since 1h
+
+# Just what the daemon's pollers spent today, as JSON.
+omni-dev log count --kind gh --since 1d --source daemon --json
+
+# The raw records (composes with jq / anything log can express).
+omni-dev log --query 'kind:gh'
+```
+
+The counts share the request log's storage, so they honor the same window and
+are subject to `prune`/rotation. The daemon also logs a summary of these counters
+to its own log (`daemon.log` / the journal) ~5 seconds after startup, every 10
+minutes, and once on shutdown — a periodic, restart-delimited footprint without
+anyone running a command; `daemon status` surfaces the current count too.
+
+**Not yet counted:** the VS Code companion extension's `gh pr list` runs in a
+separate process and does not write to the log (a planned follow-up).
 
 ## Bounding growth
 

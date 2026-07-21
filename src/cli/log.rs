@@ -4,6 +4,7 @@
 //! line, applies the filter matrix, and renders each match as `oneline`,
 //! `json` (byte-identical to the on-disk NDJSON), or `full`.
 
+mod count;
 mod format;
 mod prune;
 mod query;
@@ -14,6 +15,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::request_log;
 use query::Filter;
+
+/// Shared `--since`/`--until` parser (relative durations, dates, or RFC3339),
+/// reused by the `count` subcommand so its time bounds match `omni-dev log`.
+pub(crate) use query::parse_time_bound;
 
 /// Output rendering for `omni-dev log`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -29,8 +34,10 @@ pub enum Format {
 
 /// Searches and pretty-prints the local invocation + HTTP request log.
 ///
-/// With no subcommand, the flags below search the log; the `prune` subcommand
-/// trims it to bound its on-disk growth.
+/// With no subcommand, the flags below search the log; the `count` subcommand
+/// aggregates records by kind and source (`--kind gh` gives the GitHub API-call
+/// breakdown), and the `prune` subcommand trims the log to bound its on-disk
+/// growth.
 #[derive(Parser)]
 pub struct LogCommand {
     /// Subcommand; when absent, the flags below search the log.
@@ -89,6 +96,8 @@ pub struct LogCommand {
 /// A `log` subcommand. Absent = search (the flags on [`LogCommand`]).
 #[derive(Subcommand)]
 enum LogAction {
+    /// Count records by kind and source (`--kind gh` for the GitHub breakdown).
+    Count(count::CountCommand),
     /// Prune old records to bound the log's on-disk growth.
     Prune(prune::PruneCommand),
 }
@@ -98,6 +107,7 @@ impl LogCommand {
     pub fn execute(mut self) -> Result<()> {
         if let Some(action) = self.action {
             return match action {
+                LogAction::Count(cmd) => cmd.execute(),
                 LogAction::Prune(cmd) => cmd.execute(),
             };
         }

@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 
-use crate::request_log::{LogRecord, RecordKind, Source};
+use crate::request_log::{LogRecord, Source};
 
 /// The raw, borrowed flag values used to build a [`Filter`].
 pub struct FilterInput<'a> {
@@ -155,7 +155,7 @@ impl Filter {
 /// Relative durations never parse as RFC3339 or a date, so the ordering is
 /// unambiguous. An absolute value is that instant; a relative value is
 /// "now minus the duration".
-fn parse_time_bound(s: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_time_bound(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
 
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -263,15 +263,6 @@ fn contains_ci(field: Option<&str>, value: &str) -> bool {
     field.is_some_and(|f| f.to_ascii_lowercase().contains(&value.to_ascii_lowercase()))
 }
 
-/// Lowercase string form of a [`RecordKind`].
-fn kind_str(kind: RecordKind) -> &'static str {
-    match kind {
-        RecordKind::Invocation => "invocation",
-        RecordKind::Http => "http",
-        RecordKind::Unknown => "unknown",
-    }
-}
-
 /// Lowercase string form of a [`Source`].
 fn source_str(source: Source) -> &'static str {
     match source {
@@ -285,7 +276,7 @@ fn source_str(source: Source) -> &'static str {
 /// Evaluates a `field:value` term against a record (shared by the query AST).
 fn field_matches(rec: &LogRecord, field: &str, value: &str) -> bool {
     match field.to_ascii_lowercase().as_str() {
-        "kind" => kind_str(rec.kind).eq_ignore_ascii_case(value),
+        "kind" => rec.kind.as_str().eq_ignore_ascii_case(value),
         "source" => rec
             .source
             .is_some_and(|s| source_str(s).eq_ignore_ascii_case(value)),
@@ -539,6 +530,7 @@ impl Parser {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::request_log::RecordKind;
 
     fn http(status: Option<u16>, service: &str, method: &str) -> LogRecord {
         LogRecord {
