@@ -503,7 +503,7 @@ pub struct WorktreesService {
     /// they are still fresh. `None` disables persistence — the default from
     /// [`new`](Self::new), keeping the bare service I/O-free for unit tests; the
     /// daemon wires it via [`load_pr_cache`](Self::load_pr_cache) at startup. Same
-    /// `std::Mutex`-only-to-set-on-`&self` role as [`polling_prefs_path`].
+    /// `std::Mutex`-only-to-set-on-`&self` role as [`Self::polling_prefs_path`].
     pr_cache_path: Mutex<Option<PathBuf>>,
     /// The warm-start state restored from the persisted cache (#1389, fix 4),
     /// taken by [`start_pr_poller_with`](Self::start_pr_poller_with) when the loop
@@ -5022,6 +5022,116 @@ mod tests {
         assert_eq!(back.entries[0].resolution.clone().into_resolution(), badge);
     }
 
+    #[test]
+    fn pr_cache_prefs_round_trip_an_explicit_no_pr_verdict() {
+        // The explicit negative must survive persistence too: restoring `NoPr`
+        // as "absent" would lose the #1370 distinction across a restart and
+        // re-ask GitHub for branches already known to have no PR.
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "feature".into(),
+        };
+        let prefs = pr_cache_prefs_from(vec![(target, PrResolution::NoPr)], &[], Utc::now());
+        let json = serde_json::to_vec(&prefs).unwrap();
+        let back: PrCachePrefs = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.entries[0].resolution, PersistedResolution::NoPr);
+        assert_eq!(
+            back.entries[0].resolution.clone().into_resolution(),
+            PrResolution::NoPr
+        );
+    }
+
+    #[test]
+    fn load_pr_cache_without_polled_at_restores_badges_but_no_warm_start() {
+        // A file with verdicts but no `polled_at` (an older shape, or a
+        // hand-edited one) still renders badges, but must not arm the warm
+        // start: without a poll time there is nothing to age the verdicts
+        // against, so the poller re-polls immediately (#1389, fix 4).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-cache.json");
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "main".into(),
+        };
+        let mut prefs = pr_cache_prefs_from(
+            vec![(target, PrResolution::Pr(pending_badge(7, "abc")))],
+            &[watch("main", None)],
+            Utc::now(),
+        );
+        prefs.polled_at = None;
+        write_pr_cache(&path, &prefs).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(path);
+        assert!(
+            svc.pr_cache.get("rust-works", "omni-dev", "main").is_some(),
+            "the badge itself must still restore"
+        );
+        assert!(
+            svc.pr_warm_start
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "no poll time means a cold start, not a trusted warm one"
+        );
+    }
+
+    /// Installs a thread-local WARN-level subscriber for the duration of a
+    /// test, so degraded-path `tracing::warn!` sites actually format their
+    /// fields instead of short-circuiting on "nobody is listening".
+    fn warn_subscriber() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
+    #[test]
+    fn load_pr_cache_tolerates_a_corrupt_or_unreadable_file() {
+        // The best-effort contract: a mangled cache is logged and treated as
+        // empty — never a panic — and the path is stored regardless, so the
+        // next successful poll rewrites a clean file (#1389, fix 4).
+        let _trace = warn_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("pr-cache.json");
+        std::fs::write(&corrupt, b"not json").unwrap();
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(corrupt.clone());
+        assert!(svc.pr_cache.entries().is_empty());
+        assert_eq!(
+            svc.pr_cache_path
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_deref(),
+            Some(corrupt.as_path()),
+            "the path must be stored even when the load fails, so persistence recovers"
+        );
+
+        // A directory: `read` fails with a non-NotFound error (the distinct
+        // "could not read" arm), with the same treated-as-empty outcome.
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(dir.path().to_path_buf());
+        assert!(svc.pr_cache.entries().is_empty());
+    }
+
+    #[test]
+    fn persist_pr_cache_swallows_a_write_failure() {
+        // Best-effort: an unwritable path is logged at WARN and swallowed — the
+        // in-memory cache stays authoritative, and losing the warm start only
+        // costs one extra poll after the next restart.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        // The parent is a regular file, so creating the runtime dir must fail.
+        let path = blocker.join("pr-cache.json");
+        persist_pr_cache(&path, &PrStatusCache::new(), &[], Utc::now());
+        assert!(!path.exists());
+    }
+
     #[tokio::test]
     async fn tree_snapshot_folds_cached_pr_badges_onto_matching_branches() {
         let dir = tempfile::tempdir().unwrap();
@@ -5873,6 +5983,10 @@ mod tests {
         )
         .await
         .unwrap();
+        // A beat between the two, so the first bump has (all but certainly)
+        // woken the poller into its settle window before the second arrives —
+        // exercising the debounce *restart*, not just a single coalesced wake.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         svc.handle(
             "register",
             json!({ "key": "b", "folders": [dir_b.path()], "repo": "other-repo" }),
@@ -5903,6 +6017,40 @@ mod tests {
             gh_spawn_count(&counter),
             1,
             "the registration storm must collapse into exactly one fetch (#1389, fix 2)"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_debounce_deadline_bounds_a_steady_drip_of_changes() {
+        // The settle loop is bounded: a drip of registry bumps, each landing
+        // inside the debounce window, must not postpone the poll forever — the
+        // overall deadline (4× the debounce) forces the snapshot mid-storm
+        // (#1389, fix 2).
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(bin_dir.path(), "{}");
+        let svc = WorktreesService::new();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        // `base` far larger than the test, so only the grew-trigger — released
+        // by the deadline — can fetch.
+        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(50), fake);
+        let register = json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" });
+        svc.handle("register", register.clone()).await.unwrap();
+        // Re-register (an upsert, but still a bump) every 25ms — inside the
+        // 50ms debounce — for well past the 200ms deadline. A deadline-free
+        // loop would still be settling when the drip ends.
+        for _ in 0..24 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            svc.handle("register", register.clone()).await.unwrap();
+        }
+        let spawned_mid_drip = gh_spawn_count(&counter);
+        svc.shutdown().await;
+        assert!(
+            spawned_mid_drip >= 1,
+            "the deadline must force a fetch while the drip is still running (#1389, fix 2)"
         );
     }
 
@@ -5980,6 +6128,76 @@ mod tests {
     #[tokio::test]
     // Holds the shim guard across awaits; see the note above.
     #[allow(clippy::await_holding_lock)]
+    async fn pr_poller_persists_fresh_verdicts_for_the_next_warm_start() {
+        // #1389, fix 4, write side (the twin of the skip test above, which reads
+        // a hand-written file): a successful resolve persists the cache —
+        // creating the runtime dir if needed — so the *next* daemon restart
+        // warm-starts from it.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}},
+                "associatedPullRequests":{"nodes":[{"number":41,"isDraft":false,"url":"u"}]}
+            }}}}"#,
+        );
+        let svc = WorktreesService::new();
+        // No file yet, and no parent dir either: the load takes the benign
+        // NotFound arm, and the write must create the `0700` runtime dir.
+        let cache_path = bin_dir.path().join("runtime").join("pr-cache.json");
+        svc.load_pr_cache(cache_path.clone());
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.start_pr_poller_with(Duration::from_millis(50), Duration::from_millis(10), fake);
+
+        // A partially-written or not-yet-written file simply retries: only a
+        // fully parseable cache ends the wait.
+        let prefs = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&cache_path) {
+                    if let Ok(prefs) = serde_json::from_slice::<PrCachePrefs>(&bytes) {
+                        if !prefs.entries.is_empty() {
+                            return prefs;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a successful resolve should persist the cache file");
+        svc.shutdown().await;
+
+        assert_eq!(prefs.entries[0].target.branch, "main");
+        assert!(
+            matches!(&prefs.entries[0].resolution, PersistedResolution::Pr(b) if b.number == 41),
+            "{:?}",
+            prefs.entries[0].resolution
+        );
+        assert_eq!(
+            prefs.watched,
+            vec![PersistedWatch {
+                target: prefs.entries[0].target.clone(),
+                upstream_sha: None
+            }]
+        );
+        assert!(
+            prefs.polled_at.is_some(),
+            "the poll time is what ages the next warm start"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn open_prs_op_serves_from_gh_then_dedupes_within_the_ttl() {
         // #1389, fix 7: the daemon serves "Open Pull Request…" so N windows dedupe
         // to one counted `gh pr list` per repo. A generous TTL, so the second call
@@ -6026,6 +6244,35 @@ mod tests {
             .handle("open-prs", json!({ "owner": "  ", "name": "x" }))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn open_pr_list_surfaces_a_missing_binary_a_failed_run_and_bad_json() {
+        // The three degraded shapes a real `gh` presents — not installed, a
+        // nonzero exit (auth/network), and output that is not the JSON array
+        // the menu indexes into — must each be a distinct, actionable error
+        // rather than a panic or a silently empty list (#1389, fix 7).
+        let err = open_pr_list(Path::new("/nonexistent/gh"), "rust-works/omni-dev").unwrap_err();
+        assert!(
+            err.to_string().contains("is the GitHub CLI installed"),
+            "{err:#}"
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let _guard = shim_lock();
+        let failing = bin_dir.path().join("fake-gh-fails");
+        write_exec_script(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
+        let err = open_pr_list(&failing, "rust-works/omni-dev").unwrap_err();
+        assert!(err.to_string().contains("gh pr list failed"), "{err:#}");
+        assert!(err.to_string().contains("boom"), "{err:#}");
+
+        let object = bin_dir.path().join("fake-gh-object");
+        write_exec_script(&object, "#!/bin/sh\necho '{}'\n");
+        let err = open_pr_list(&object, "rust-works/omni-dev").unwrap_err();
+        assert!(
+            err.to_string().contains("did not return a JSON array"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
