@@ -352,7 +352,59 @@ fn build_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
             frags.join("\n")
         ));
     }
-    Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
+    // Fold the graphql budget into every poll (#1389, fix 8): `rateLimit` is a
+    // meta-field GitHub answers for free (it does not add to the query's own
+    // `cost`), so each PR poll doubles as a live budget reading — and its `cost`
+    // reveals the actual per-call point price, verifying the "1 point" assumption at
+    // scale instead of taking it on faith.
+    Some((
+        format!(
+            "query{{\nrateLimit{{ limit cost remaining used resetAt }}\n{}\n}}",
+            repos.join("\n")
+        ),
+        index,
+    ))
+}
+
+/// The `rateLimit` block folded into every PR-poll reply (#1389, fix 8).
+///
+/// Carries the query's own point `cost` plus the live graphql budget. Every field
+/// is what GitHub's `rateLimit` object reports; `reset` is `resetAt` (ISO-8601)
+/// parsed to a Unix epoch so it drops straight into a
+/// [`RateLimitResource`](crate::github_rate_limit::RateLimitResource).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryRateLimit {
+    /// The point cost GitHub charged for *this* query.
+    pub cost: u64,
+    /// Points spent in the current graphql window.
+    pub used: u64,
+    /// The window ceiling (5,000/hour today).
+    pub limit: u64,
+    /// Points remaining in the window.
+    pub remaining: u64,
+    /// When the window resets, as a Unix epoch (seconds); `0` if `resetAt` was
+    /// absent or unparseable.
+    pub reset: i64,
+}
+
+/// Reads the `rateLimit` block from a poll reply, or `None` when it is absent
+/// (an older query shape, or a reply that carried none). Best-effort: a partial
+/// block missing any of `cost`/`used`/`limit`/`remaining` yields `None` rather
+/// than a half-populated reading.
+fn parse_rate_limit(body: &Value) -> Option<QueryRateLimit> {
+    let rl = body.get("data")?.get("rateLimit")?;
+    let reset = rl
+        .get("resetAt")
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map_or(0, |dt| dt.timestamp());
+    Some(QueryRateLimit {
+        cost: rl.get("cost")?.as_u64()?,
+        used: rl.get("used")?.as_u64()?,
+        limit: rl.get("limit")?.as_u64()?,
+        remaining: rl.get("remaining")?.as_u64()?,
+        reset,
+    })
 }
 
 /// Reads one resolved `ref` node into a badge. `None` for a node without a
@@ -510,8 +562,31 @@ fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
 /// and a failed call (`Err`, including a GraphQL 200 carrying `errors`) yields no
 /// map at all — so a failed poll can never manufacture negatives.
 pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget, PrResolution>> {
+    resolve_inner(bin, targets).map(|(resolutions, _budget)| resolutions)
+}
+
+/// [`resolve_with`] that **also** returns the poll's folded-in graphql budget
+/// reading (#1389, fix 8).
+///
+/// For the daemon poller to feed the shared
+/// [`RateLimitCache`](crate::github_rate_limit::RateLimitCache). The budget is
+/// `None` when there were no targets (no query ran) or the reply carried no
+/// `rateLimit` block; the resolutions are exactly what [`resolve_with`] returns.
+pub fn resolve_with_budget(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<(HashMap<PrTarget, PrResolution>, Option<QueryRateLimit>)> {
+    resolve_inner(bin, targets)
+}
+
+/// The shared body of [`resolve_with`] / [`resolve_with_budget`]: one `gh api
+/// graphql` call, parsed into resolutions **and** the optional budget reading.
+fn resolve_inner(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<(HashMap<PrTarget, PrResolution>, Option<QueryRateLimit>)> {
     let Some((query, index)) = build_query(targets) else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     };
     let body = run_gh_graphql(bin, &query)?;
     // A GraphQL 200 can still carry errors; surface them rather than silently
@@ -521,7 +596,7 @@ pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget
             bail!("gh api graphql returned errors: {errors:?}");
         }
     }
-    Ok(parse_response(&body, &index))
+    Ok((parse_response(&body, &index), parse_rate_limit(&body)))
 }
 
 /// The poller-written, snapshot-read resolution cache.
@@ -821,6 +896,35 @@ mod tests {
     fn build_query_asks_for_the_backing_suite_status() {
         let (query, _) = build_query(&[target("main")]).unwrap();
         assert!(query.contains("checkSuite{ status }"), "{query}");
+    }
+
+    #[test]
+    fn build_query_folds_in_the_rate_limit_block() {
+        // #1389, fix 8: every poll carries a free budget reading.
+        let (query, _) = build_query(&[target("main")]).unwrap();
+        assert!(
+            query.contains("rateLimit{ limit cost remaining used resetAt }"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn parse_rate_limit_reads_the_folded_budget_block() {
+        let body = json!({"data":{"rateLimit":
+            {"limit":5000,"cost":1,"remaining":4970,"used":30,"resetAt":"2026-07-21T16:00:00Z"}}});
+        let rl = parse_rate_limit(&body).expect("a complete block should parse");
+        assert_eq!(rl.cost, 1);
+        assert_eq!(rl.used, 30);
+        assert_eq!(rl.limit, 5000);
+        assert_eq!(rl.remaining, 4970);
+        assert!(rl.reset > 0, "resetAt should parse to an epoch");
+        // An older query shape (no block) reads as `None`, not a zeroed budget.
+        assert!(parse_rate_limit(&json!({"data":{"r0":{}}})).is_none());
+        // A partial block (missing `used`) is `None`, never half-populated.
+        assert!(parse_rate_limit(
+            &json!({"data":{"rateLimit":{"limit":5000,"cost":1,"remaining":4970}}})
+        )
+        .is_none());
     }
 
     // --- Query shape ---

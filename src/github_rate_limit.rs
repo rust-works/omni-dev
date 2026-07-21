@@ -93,6 +93,20 @@ impl RateLimitResource {
     pub fn over_warn(&self) -> bool {
         self.percent >= WARN_PERCENT
     }
+
+    /// Builds a resource from parts, computing [`percent`](Self::percent). Used to
+    /// fold a graphql budget reading carried by a PR poll (#1389, fix 8) into the
+    /// cache without re-parsing a `/rate_limit` reply.
+    #[must_use]
+    pub fn new(used: u64, limit: u64, remaining: u64, reset: i64) -> Self {
+        Self {
+            used,
+            limit,
+            remaining,
+            percent: percent_of(used, limit),
+            reset,
+        }
+    }
 }
 
 /// `used / limit * 100`, rounded to one decimal, guarding `limit == 0` → `0.0`.
@@ -316,6 +330,24 @@ impl RateLimitCache {
         changed
     }
 
+    /// Folds a `graphql` budget reading carried by a PR poll (#1389, fix 8) into the
+    /// cache, updating **only** the graphql resource and preserving the `core` /
+    /// `search` readings from the standalone `/rate_limit` poller. Returns whether
+    /// the snapshot changed.
+    ///
+    /// Every PR poll ships the graphql budget for free (the query's own `rateLimit`
+    /// block), so this keeps that reading fresh between — or instead of — standalone
+    /// polls, which lets the standalone poller idle when nothing is being watched
+    /// (fix 8b) without the graphql figure going stale while polling is active.
+    pub fn observe_graphql(&self, graphql: RateLimitResource) -> bool {
+        let mut guard = self.lock();
+        let mut snap = (*guard).unwrap_or_default();
+        let changed = snap.graphql != Some(graphql);
+        snap.graphql = Some(graphql);
+        *guard = Some(snap);
+        changed
+    }
+
     /// Poison-tolerant lock: a panicking holder must not wedge the monitor, which is
     /// best-effort decoration.
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<RateLimitSnapshot>> {
@@ -494,6 +526,29 @@ mod tests {
             "graphql": {"limit": 5000, "used": 4200, "remaining": 800, "reset": 1}
         }}));
         assert!(cache.replace(b));
+    }
+
+    #[test]
+    fn observe_graphql_updates_only_graphql_and_preserves_core_search() {
+        // #1389, fix 8: a PR poll folds its graphql budget in without clobbering the
+        // `core`/`search` readings the standalone poller supplied.
+        let cache = RateLimitCache::new();
+        cache.replace(RateLimitSnapshot {
+            graphql: Some(RateLimitResource::new(10, 5000, 4990, 0)),
+            core: Some(RateLimitResource::new(3, 5000, 4997, 0)),
+            search: Some(RateLimitResource::new(0, 30, 30, 0)),
+        });
+        assert!(cache.observe_graphql(RateLimitResource::new(45, 5000, 4955, 0)));
+        let snap = cache.get().unwrap();
+        assert_eq!(snap.graphql.unwrap().used, 45, "graphql updated");
+        assert_eq!(snap.core.unwrap().used, 3, "core preserved");
+        assert_eq!(snap.search.unwrap().used, 0, "search preserved");
+        // Idempotent: the same reading reports no change.
+        assert!(!cache.observe_graphql(RateLimitResource::new(45, 5000, 4955, 0)));
+        // Into an empty cache it seeds just graphql (core/search stay absent).
+        let empty = RateLimitCache::new();
+        assert!(empty.observe_graphql(RateLimitResource::new(1, 5000, 4999, 0)));
+        assert!(empty.get().unwrap().core.is_none());
     }
 
     // --- resolve_rate_limit_with: the degradation contract ---
