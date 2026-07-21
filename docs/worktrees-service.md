@@ -416,9 +416,15 @@ active mode as `pr_source` on every snapshot). Both sources feed the **same**
     The buffer is the source of truth; the reconcile then fills what the window cannot
     (checks that finished before retention; metadata for a branch with no captured
     `pull_request` event).
-- **The reconcile is cost-split by webhook-backed-ness.** `register` marks a repo
-  **webhook-backed** (a per-repo set persisted in `webhook-backed.json`, set via the
-  `set-webhook-backed` op); `remove` unmarks it. A backed repo's reconcile uses a
+- **The reconcile is cost-split by webhook-backed-ness.** A repo is **effectively
+  backed** if the daemon has events for it (the `webhook_activity` map, populated
+  from the KV including the restart re-walk) **or** it is explicitly marked. Activity
+  *proves* a working hook — events only arrive from one — so a **delivering repo is
+  auto-backed with no manual step**, and it self-heals (a repo that stops delivering
+  ages out of the activity map across restarts and reverts to the full reconcile).
+  `register` (or the `set-webhook-backed` op) additionally marks a repo backed even
+  while quiet, persisted in `webhook-backed.json`; `remove` unmarks it. A backed
+  repo's reconcile uses a
   **metadata-only** query — `associatedPullRequests` + the commit `oid`, but **no**
   `statusCheckRollup` (the up-to-100-node-per-ref cost driver) — because its CI verdict
   already arrives via webhooks; only repos with **no** webhook get the full rollup as
@@ -694,7 +700,7 @@ Ops:
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `set-pr-source`   | `{ source: "poll" \| "webhook" }`              | `{ ok: true }`                             |
 | `set-webhook-backed` | `{ owner, name, backed }`                   | `{ ok: true }`                             |
-| `webhook-status`  | `null`                                         | `{ pr_source, configured, repos: [{owner,name,backed,watched,last_event_ms}] }` |
+| `webhook-status`  | `null`                                         | `{ pr_source, configured, last_pull_ms, last_pull_error, repos: [{owner,name,backed,marked,watched,last_event_ms}] }` |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
 The first thirteen ops are strictly **request → one reply**. `subscribe` is the one

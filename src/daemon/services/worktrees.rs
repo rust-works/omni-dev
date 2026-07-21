@@ -1068,7 +1068,20 @@ impl WorktreesService {
                 let reconcile_due = last_reconcile.map_or(true, |at| at.elapsed() >= reconcile);
                 if reconcile_due {
                     let bin = gh_bin.clone();
-                    let backed = registry.webhook_backed_repos();
+                    // Effective backed set = the explicit marker ∪ repos the daemon
+                    // has events for (#1384). Activity *proves* a working hook —
+                    // events only arrive from one — so a delivering repo is treated
+                    // as backed with no manual `set-webhook-backed`. Self-healing:
+                    // a repo that stops delivering ages out of `webhook_activity`
+                    // across restarts and reverts to the full rollup.
+                    let mut backed = registry.webhook_backed_repos();
+                    backed.extend(
+                        activity
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .keys()
+                            .cloned(),
+                    );
                     let (full, metadata) = partition_reconcile_targets(&targets, &backed);
                     let resolved = tokio::task::spawn_blocking(move || {
                         let mut map = crate::pr_status::resolve_with(&bin, &full)?;
@@ -1485,10 +1498,14 @@ impl DaemonService for WorktreesService {
                     .iter()
                     .map(|key| {
                         let (owner, name) = key.split_once('/').unwrap_or((key.as_str(), ""));
+                        // Effective backed = the explicit marker OR the daemon has
+                        // events for it (a delivering repo is auto-backed, #1384).
+                        let marked = backed.contains(key);
                         json!({
                             "owner": owner,
                             "name": name,
-                            "backed": backed.contains(key),
+                            "backed": marked || activity.contains_key(key),
+                            "marked": marked,
                             "watched": watched.contains(key),
                             "last_event_ms": activity.get(key).copied(),
                         })
@@ -5339,16 +5356,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_status_reports_backed_marker_and_delivery_activity() {
+    async fn webhook_status_auto_backs_delivering_repos_and_reports_the_marker() {
         let svc = WorktreesService::new();
+        // Delivering + explicitly marked.
         svc.registry
             .set_webhook_backed("rust-works", "succinctly", true);
-        // Simulate a delivered event (the pull loop populates this map).
         svc.webhook_activity
             .lock()
             .unwrap()
             .insert("rust-works/succinctly".to_string(), 1_784_559_250_627);
-        // Backed but never delivered — a misconfiguration (or just quiet CI).
+        // Delivering but NOT marked → effective-backed purely from activity (#1384).
+        svc.webhook_activity
+            .lock()
+            .unwrap()
+            .insert("rust-works/omni-dev".to_string(), 1_784_559_300_000);
+        // Marked but never delivered (a known-hooked but quiet repo).
         svc.registry.set_webhook_backed("rust-works", "quiet", true);
 
         let out = svc.handle("webhook-status", Value::Null).await.unwrap();
@@ -5357,11 +5379,19 @@ mod tests {
 
         let repos = out["repos"].as_array().unwrap();
         let find = |name: &str| repos.iter().find(|r| r["name"] == name).unwrap();
-        let succ = find("succinctly");
+
+        let succ = find("succinctly"); // marked + delivering
         assert_eq!(succ["backed"], json!(true));
+        assert_eq!(succ["marked"], json!(true));
         assert_eq!(succ["last_event_ms"], json!(1_784_559_250_627u64));
-        let quiet = find("quiet");
+
+        let auto = find("omni-dev"); // delivering, not marked → auto-backed
+        assert_eq!(auto["backed"], json!(true), "activity implies backed");
+        assert_eq!(auto["marked"], json!(false));
+
+        let quiet = find("quiet"); // marked, no activity
         assert_eq!(quiet["backed"], json!(true));
+        assert_eq!(quiet["marked"], json!(true));
         assert!(quiet["last_event_ms"].is_null(), "no activity → null");
     }
 
