@@ -21,6 +21,7 @@ exclude = [
     "assets/",
     "scratch/",
     "editors/",
+    "deploy/",
 ]
 
 [dependencies]
