@@ -140,6 +140,18 @@ export function aheadBehindEnvelope(paths: string[]): Envelope {
 }
 
 /**
+ * Builds an `open-prs` envelope — fetches a repo's open pull requests from the
+ * daemon's shared, TTL-cached `gh pr list` (#1389, fix 7). Serving "Open Pull
+ * Request…" (and the transient badge fallback) from the daemon means N windows
+ * dedupe to **one** counted `gh` per repo instead of each shelling its own. The
+ * reply payload is `{ pull_requests: [...] }`; an older daemon without the op
+ * comes back `{ ok: false }`, so the caller falls back to its own `gh`.
+ */
+export function openPrsEnvelope(owner: string, name: string): Envelope {
+  return { service: WORKTREES_SERVICE, op: "open-prs", payload: { owner, name } };
+}
+
+/**
  * Builds an `open` envelope — focuses (or opens) a worktree folder in VS Code
  * via the daemon's launcher. The daemon guards `path` to an absolute, existing
  * directory, so a relative/nonexistent path comes back as `{ ok: false }`.

@@ -11,16 +11,16 @@ import {
   discoverPullRequests,
   parsePrList,
   prFallbackBadge,
-  prListArgsForBranch,
   prListArgsForRepo,
   prOverviewUri,
   prQuickPickDescription,
   prQuickPickLabel,
   prScopeForNode,
   prScopesForNodes,
+  pullRequestFromBadge,
   scopeLabel,
 } from "./github";
-import { Node, TreeGithubIdentity, TreeRepoPayload } from "./tree";
+import { Node, PrBadge, TreeGithubIdentity, TreeRepoPayload } from "./tree";
 
 const REPO: TreeGithubIdentity = { owner: "rust-works", name: "omni-dev" };
 
@@ -41,23 +41,6 @@ test("prListArgsForRepo lists all open PRs of the repo", () => {
     "list",
     "--repo",
     "rust-works/omni-dev",
-    "--state",
-    "open",
-    "--json",
-    PR_JSON_FIELDS,
-    "--limit",
-    PR_LIST_LIMIT,
-  ]);
-});
-
-test("prListArgsForBranch scopes to the head branch with --head", () => {
-  assert.deepEqual(prListArgsForBranch(REPO, "issue-1300"), [
-    "pr",
-    "list",
-    "--repo",
-    "rust-works/omni-dev",
-    "--head",
-    "issue-1300",
     "--state",
     "open",
     "--json",
@@ -116,42 +99,85 @@ test("prQuickPickDescription shows head→base, then draft and author when prese
   assert.equal(prQuickPickDescription({ ...PR, author: undefined }), "issue-1299-open-pr-from-worktrees-view → main");
 });
 
-test("discoverPullRequests lists all PRs for a repo scope", async () => {
-  const calls: string[][] = [];
-  const runner = async (args: string[]) => {
-    calls.push(args);
-    return JSON.stringify([PR]);
+/** A `RepoPrFetcher` that records the repos it was asked about and returns `prs`. */
+function recordingFetcher(prs: PullRequest[]): {
+  fetch: (repo: TreeGithubIdentity) => Promise<PullRequest[]>;
+  calls: TreeGithubIdentity[];
+} {
+  const calls: TreeGithubIdentity[] = [];
+  return {
+    calls,
+    fetch: async (repo) => {
+      calls.push(repo);
+      return prs;
+    },
   };
-  const prs = await discoverPullRequests({ kind: "repo", repo: REPO }, runner);
-  assert.equal(prs.length, 1);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0], prListArgsForRepo(REPO));
+}
+
+const BADGE: PrBadge = {
+  number: 1299,
+  isDraft: false,
+  checks: "success",
+  url: "https://github.com/rust-works/omni-dev/pull/1299",
+};
+
+test("discoverPullRequests lists all PRs for a repo scope via the fetcher", async () => {
+  const { fetch, calls } = recordingFetcher([PR]);
+  const prs = await discoverPullRequests({ kind: "repo", repo: REPO }, fetch);
+  assert.deepEqual(prs, [PR]);
+  assert.deepEqual(calls, [REPO]);
 });
 
-test("discoverPullRequests scopes a worktree to its --head branch", async () => {
-  const calls: string[][] = [];
-  const runner = async (args: string[]) => {
-    calls.push(args);
-    return "[]";
-  };
+test("discoverPullRequests answers a badged worktree from the snapshot with no fetch (#1389)", async () => {
+  const { fetch, calls } = recordingFetcher([PR]);
   const prs = await discoverPullRequests(
-    { kind: "worktree", repo: REPO, branch: "issue-1300" },
-    runner,
+    { kind: "worktree", repo: REPO, branch: "issue-1299", badge: BADGE },
+    fetch,
+  );
+  assert.deepEqual(prs, [pullRequestFromBadge(BADGE, "issue-1299")]);
+  assert.equal(calls.length, 0, "a resolved badge must not spend a fetch");
+});
+
+test("discoverPullRequests returns [] for an explicit pr_none without fetching (#1389)", async () => {
+  const { fetch, calls } = recordingFetcher([PR]);
+  const prs = await discoverPullRequests(
+    { kind: "worktree", repo: REPO, branch: "issue-1300", prNone: true },
+    fetch,
   );
   assert.deepEqual(prs, []);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0], prListArgsForBranch(REPO, "issue-1300"));
+  assert.equal(calls.length, 0);
 });
 
-test("discoverPullRequests returns [] for a detached worktree without calling gh", async () => {
-  let called = false;
-  const runner = async (_args: string[]) => {
-    called = true;
-    return JSON.stringify([PR]);
-  };
-  const prs = await discoverPullRequests({ kind: "worktree", repo: REPO }, runner);
+test("discoverPullRequests filters an unresolved worktree's repo list to its branch", async () => {
+  // Not-polled repo / old daemon: no badge, no pr_none — fall through to the shared
+  // repo list and keep only the head-matching PR.
+  const other: PullRequest = { ...PR, number: 7, headRefName: "other", url: "u7" };
+  const { fetch, calls } = recordingFetcher([PR, other]);
+  const prs = await discoverPullRequests(
+    { kind: "worktree", repo: REPO, branch: PR.headRefName },
+    fetch,
+  );
+  assert.deepEqual(prs, [PR]);
+  assert.deepEqual(calls, [REPO]);
+});
+
+test("discoverPullRequests returns [] for a detached worktree without fetching", async () => {
+  const { fetch, calls } = recordingFetcher([PR]);
+  const prs = await discoverPullRequests({ kind: "worktree", repo: REPO }, fetch);
   assert.deepEqual(prs, []);
-  assert.equal(called, false);
+  assert.equal(calls.length, 0);
+});
+
+test("pullRequestFromBadge synthesises an openable PR from a snapshot badge", () => {
+  assert.deepEqual(pullRequestFromBadge(BADGE, "issue-1299"), {
+    number: 1299,
+    title: "",
+    url: "https://github.com/rust-works/omni-dev/pull/1299",
+    headRefName: "issue-1299",
+    baseRefName: "",
+    isDraft: false,
+    state: "OPEN",
+  });
 });
 
 // --- PR badge (#1296): checks rollup + branch matching -----------------------
@@ -218,6 +244,8 @@ const SCOPE_REPO: TreeRepoPayload = {
     { path: "/home/me/omni-dev", branch: "main", is_main: true, open: true },
     { path: "/home/me/wt/a", branch: "a", is_main: false, open: true },
     { path: "/home/me/wt/detached", is_main: false, open: true },
+    // A branch the daemon already resolved to an open PR (#1389, fix 7).
+    { path: "/home/me/wt/feat", branch: "feat", is_main: false, open: true, pr: BADGE },
   ],
 };
 
@@ -244,12 +272,26 @@ test("prScopeForNode maps a worktree node to its branch's scope", () => {
     kind: "worktree",
     repo: REPO,
     branch: "a",
+    badge: undefined,
+    prNone: undefined,
   });
   // Detached/unborn: a scope with no branch, which discovery resolves to `[]`.
   assert.deepEqual(prScopeForNode(wtNode(SCOPE_REPO, 2)), {
     kind: "worktree",
     repo: REPO,
     branch: undefined,
+    badge: undefined,
+    prNone: undefined,
+  });
+});
+
+test("prScopeForNode carries the daemon's resolved badge for a branch (#1389)", () => {
+  assert.deepEqual(prScopeForNode(wtNode(SCOPE_REPO, 3)), {
+    kind: "worktree",
+    repo: REPO,
+    branch: "feat",
+    badge: BADGE,
+    prNone: undefined,
   });
 });
 
@@ -260,7 +302,9 @@ test("prScopeForNode yields nothing for a repo with no GitHub identity", () => {
 
 test("prScopesForNodes drops nodes with no GitHub identity", () => {
   const scopes = prScopesForNodes([wtNode(NO_GITHUB_REPO, 0), wtNode(SCOPE_REPO, 1)]);
-  assert.deepEqual(scopes, [{ kind: "worktree", repo: REPO, branch: "a" }]);
+  assert.deepEqual(scopes, [
+    { kind: "worktree", repo: REPO, branch: "a", badge: undefined, prNone: undefined },
+  ]);
   assert.deepEqual(prScopesForNodes([repoNode(NO_GITHUB_REPO)]), []);
   assert.deepEqual(prScopesForNodes([]), []);
 });
@@ -275,7 +319,7 @@ test("prScopesForNodes collapses identical scopes to one `gh` call", () => {
   ]);
   assert.deepEqual(scopes, [
     { kind: "repo", repo: REPO },
-    { kind: "worktree", repo: REPO, branch: "a" },
+    { kind: "worktree", repo: REPO, branch: "a", badge: undefined, prNone: undefined },
   ]);
 });
 

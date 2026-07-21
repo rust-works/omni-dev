@@ -163,6 +163,32 @@ fn pr_debounce_interval() -> Duration {
     crate::daemon::server::duration_secs_from_env(ENV_PR_DEBOUNCE, DEFAULT_PR_DEBOUNCE)
 }
 
+/// Environment override for [`open_pr_ttl`] — how long the daemon reuses a repo's
+/// `gh pr list` result before re-fetching (whole seconds; a blank, non-numeric, or
+/// `0` value falls back to [`DEFAULT_OPEN_PR_TTL`]).
+const ENV_OPEN_PR_TTL: &str = "OMNI_DEV_DAEMON_OPEN_PR_TTL";
+
+/// Default TTL for the shared open-PR cache (#1389, fix 7). Matches the extension's
+/// former per-window `gh pr list` cache (#1296): serving "Open Pull Request…" — and
+/// the extension's transient badge fallback — from the daemon means N windows now
+/// dedupe to **one** counted `gh` per repo per TTL, rather than one per window.
+const DEFAULT_OPEN_PR_TTL: Duration = Duration::from_secs(60);
+
+/// The `--json` fields the daemon requests from `gh pr list`, mirroring the
+/// extension's `PR_JSON_FIELDS` so the forwarded array parses into its
+/// `PullRequest` shape unchanged.
+const OPEN_PR_JSON_FIELDS: &str = "number,title,url,headRefName,baseRefName,isDraft,state,author";
+
+/// The `gh pr list --limit` cap — high enough to list a repo's open PRs in one call
+/// (parity with the extension's `PR_LIST_LIMIT`).
+const OPEN_PR_LIST_LIMIT: &str = "100";
+
+/// The resolved open-PR cache TTL: `OMNI_DEV_DAEMON_OPEN_PR_TTL` (whole seconds)
+/// when valid, else [`DEFAULT_OPEN_PR_TTL`].
+fn open_pr_ttl() -> Duration {
+    crate::daemon::server::duration_secs_from_env(ENV_OPEN_PR_TTL, DEFAULT_OPEN_PR_TTL)
+}
+
 /// Environment override for [`rate_limit_poll_interval`] — the cadence at which
 /// the GitHub rate-limit monitor re-reads `/rate_limit` (whole seconds; a blank,
 /// non-numeric, or `0` value falls back to [`DEFAULT_RATE_LIMIT_POLL_INTERVAL`]).
@@ -484,6 +510,11 @@ pub struct WorktreesService {
     /// spawns. `None` on a cold start (no file, or persistence disabled), in which
     /// case the poller does its normal first fetch.
     pr_warm_start: Mutex<Option<PrWarmStart>>,
+    /// Shared TTL cache of `gh pr list` results per repo, backing the daemon-served
+    /// `open-prs` op (#1389, fix 7) so N windows' "Open Pull Request…" lookups
+    /// dedupe to one counted `gh` per repo instead of one per window. Behind an
+    /// `Arc` for parity with the other caches.
+    open_pr_cache: Arc<OpenPrCache>,
 }
 
 impl WorktreesService {
@@ -508,6 +539,7 @@ impl WorktreesService {
             polling_prefs_path: Mutex::new(None),
             pr_cache_path: Mutex::new(None),
             pr_warm_start: Mutex::new(None),
+            open_pr_cache: Arc::new(OpenPrCache::new(open_pr_ttl())),
         }
     }
 
@@ -630,6 +662,35 @@ impl WorktreesService {
             .pr_cache_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Resolves a repo's open pull requests for the `open-prs` op (#1389, fix 7),
+    /// served from the shared TTL cache when fresh, else **one** counted `gh pr
+    /// list`. The `gh` runs on a blocking thread (never an async worker), routed
+    /// through the #1387-counted [`run_gh`](crate::github_metrics::run_gh) choke
+    /// point so the call is still counted exactly once — the constraint the whole
+    /// of #1389 preserves. The result is forwarded to the extension verbatim.
+    async fn open_prs(&self, owner: &str, name: &str) -> Result<Vec<Value>> {
+        // The `gh` binary is resolved once here (the env read is process-stable),
+        // then handed to the seam below — the poller's "bin as a param" pattern, so
+        // a test injects a stub without mutating the process environment (#1030).
+        self.open_prs_with(owner, name, crate::pr_status::resolve_gh_binary())
+            .await
+    }
+
+    /// [`open_prs`](Self::open_prs) with an explicit `gh` binary, so a test drives
+    /// the cache against a stub without touching the environment.
+    async fn open_prs_with(&self, owner: &str, name: &str, bin: PathBuf) -> Result<Vec<Value>> {
+        let key = format!("{owner}/{name}");
+        if let Some(prs) = self.open_pr_cache.fresh(&key) {
+            return Ok(prs);
+        }
+        let slug = key.clone();
+        let prs = tokio::task::spawn_blocking(move || open_pr_list(&bin, &slug))
+            .await
+            .unwrap_or_else(|err| Err(anyhow!("blocking open-prs task failed: {err}")))?;
+        self.open_pr_cache.store(key, prs.clone());
+        Ok(prs)
     }
 
     /// A handle to the GitHub rate-limit snapshot cache (#1375), so the daemon can
@@ -1243,6 +1304,21 @@ impl DaemonService for WorktreesService {
                 }
                 Ok(json!({ "ok": true }))
             }
+            "open-prs" => {
+                // Serve "Open Pull Request…" (and the extension's transient badge
+                // fallback) from the daemon (#1389, fix 7): one shared, TTL-cached,
+                // #1387-counted `gh pr list` per repo, so N windows dedupe to one
+                // call instead of each shelling its own (the per-window burn
+                // #1370/#1389 target). Repo-wide; the client filters by branch for a
+                // worktree-scoped lookup, and answers a badged branch straight from
+                // the snapshot (zero `gh`) without ever reaching here.
+                let owner = require_str(&payload, "owner", "open-prs")?;
+                let name = require_str(&payload, "name", "open-prs")?;
+                if owner.trim().is_empty() || name.trim().is_empty() {
+                    bail!("`open-prs` requires a non-empty `owner` and `name`");
+                }
+                Ok(json!({ "pull_requests": self.open_prs(owner, name).await? }))
+            }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
                 // arbitrary worktree folder supplied by a socket client, reusing
@@ -1635,6 +1711,104 @@ struct PrWarmStart {
     /// When those verdicts were resolved, used to age the warm start against the
     /// backoff (a stale-enough file just re-polls).
     polled_at: DateTime<Utc>,
+}
+
+// --- Shared open-PR cache for the daemon-served "Open PR" op (#1389, fix 7) -----
+
+/// One cached `gh pr list` result: the forwarded JSON PR array and when it was
+/// fetched, for TTL expiry.
+#[derive(Debug, Clone)]
+struct OpenPrEntry {
+    at: Instant,
+    prs: Vec<Value>,
+}
+
+/// A shared, TTL'd cache of `gh pr list` results per repo (#1389, fix 7).
+///
+/// Serving "Open Pull Request…" — and the extension's transient badge fallback —
+/// from the daemon means N windows asking about one repo dedupe to a single counted
+/// `gh pr list` within the TTL, instead of each window shelling its own (the
+/// per-window burn #1370/#1389 target). A plain temporal cache, **no single-flight**:
+/// the access pattern is a manual action (or a brief post-enable transient), so two
+/// exactly-concurrent misses for the same repo — costing one extra `gh` — are rare
+/// and harmless, while the common repeat-within-TTL is served for free. The lock is
+/// never held across an `.await`.
+#[derive(Debug)]
+struct OpenPrCache {
+    entries: Mutex<HashMap<String, OpenPrEntry>>,
+    ttl: Duration,
+}
+
+impl OpenPrCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// The cached PRs for `key` (`owner/name`) while still within the TTL, else
+    /// `None` (a miss that the caller resolves with a fresh `gh`).
+    fn fresh(&self, key: &str) -> Option<Vec<Value>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .filter(|e| e.at.elapsed() < self.ttl)
+            .map(|e| e.prs.clone())
+    }
+
+    /// Records a freshly-fetched PR list for `key`.
+    fn store(&self, key: String, prs: Vec<Value>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                key,
+                OpenPrEntry {
+                    at: Instant::now(),
+                    prs,
+                },
+            );
+    }
+}
+
+/// Runs `gh pr list` for `slug` (`owner/name`) through the #1387-counted `run_gh`
+/// choke point and parses the JSON array of open PRs. **Blocking** (a subprocess) —
+/// call on a blocking thread, never an async worker. The array is forwarded to the
+/// extension verbatim, which parses it into its `PullRequest` shape.
+fn open_pr_list(bin: &Path, slug: &str) -> Result<Vec<Value>> {
+    let output = crate::github_metrics::run_gh(
+        bin,
+        [
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--state",
+            "open",
+            "--json",
+            OPEN_PR_JSON_FIELDS,
+            "--limit",
+            OPEN_PR_LIST_LIMIT,
+        ],
+        "pr list",
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to run {} (is the GitHub CLI installed?)",
+            bin.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gh pr list failed: {}", stderr.trim());
+    }
+    match serde_json::from_slice(&output.stdout).context("gh pr list returned invalid JSON")? {
+        Value::Array(arr) => Ok(arr),
+        _ => bail!("gh pr list did not return a JSON array"),
+    }
 }
 
 /// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
@@ -5801,6 +5975,57 @@ mod tests {
             0,
             "a fresh warm cache must skip the immediate re-poll (#1389, fix 4)"
         );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn open_prs_op_serves_from_gh_then_dedupes_within_the_ttl() {
+        // #1389, fix 7: the daemon serves "Open Pull Request…" so N windows dedupe
+        // to one counted `gh pr list` per repo. A generous TTL, so the second call
+        // is served from the cache and spawns **no** second `gh` — the whole point.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"[{"number":42,"title":"T","url":"http://x/42","headRefName":"feat",
+                "baseRefName":"main","isDraft":false,"state":"OPEN","author":{"login":"me"}}]"#,
+        );
+        let svc = WorktreesService::new();
+
+        let prs = svc
+            .open_prs_with("rust-works", "omni-dev", fake.clone())
+            .await
+            .expect("gh pr list should resolve");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0]["number"], json!(42));
+        assert_eq!(prs[0]["url"], json!("http://x/42"));
+        assert_eq!(gh_spawn_count(&counter), 1, "first call spends one gh");
+
+        // A second window asking the same repo is served from the shared cache.
+        let again = svc
+            .open_prs_with("rust-works", "omni-dev", fake.clone())
+            .await
+            .expect("cache hit should resolve");
+        assert_eq!(again, prs);
+        assert_eq!(
+            gh_spawn_count(&counter),
+            1,
+            "the second lookup must dedupe to the cached result, not a new gh (#1389, fix 7)"
+        );
+
+        // The op wrapper shapes the reply and validates the payload.
+        let reply = svc
+            .handle(
+                "open-prs",
+                json!({ "owner": "rust-works", "name": "omni-dev" }),
+            )
+            .await
+            .expect("open-prs op should route");
+        assert_eq!(reply["pull_requests"][0]["number"], json!(42));
+        assert!(svc
+            .handle("open-prs", json!({ "owner": "  ", "name": "x" }))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

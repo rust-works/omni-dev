@@ -16,10 +16,10 @@
 
 import * as vscode from "vscode";
 
-import { runGh } from "./gh";
 import {
   PrScope,
   PullRequest,
+  RepoPrFetcher,
   dedupePullRequests,
   discoverPullRequests,
   prOverviewUri,
@@ -46,8 +46,12 @@ const BULK_OPEN_CONFIRM_THRESHOLD = 5;
  * VS Code** (never a browser) — see `openPullRequestInBrowser` for the sibling
  * that opens `github.com` instead.
  */
-export async function openPullRequest(clicked?: Node, selection?: Node[]): Promise<void> {
-  const selected = await selectPullRequests(selectionTargets(clicked, selection));
+export async function openPullRequest(
+  clicked: Node | undefined,
+  selection: Node[] | undefined,
+  fetchRepoPrs: RepoPrFetcher,
+): Promise<void> {
+  const selected = await selectPullRequests(selectionTargets(clicked, selection), fetchRepoPrs);
   if (!selected) {
     return;
   }
@@ -74,10 +78,11 @@ export async function openPullRequest(clicked?: Node, selection?: Node[]): Promi
  * or fall back to.
  */
 export async function openPullRequestInBrowser(
-  clicked?: Node,
-  selection?: Node[],
+  clicked: Node | undefined,
+  selection: Node[] | undefined,
+  fetchRepoPrs: RepoPrFetcher,
 ): Promise<void> {
-  const selected = await selectPullRequests(selectionTargets(clicked, selection));
+  const selected = await selectPullRequests(selectionTargets(clicked, selection), fetchRepoPrs);
   if (!selected) {
     return;
   }
@@ -101,7 +106,10 @@ export async function openPullRequestInBrowser(
  *   the answer, so asking again would contradict it — subject only to the
  *   {@link BULK_OPEN_CONFIRM_THRESHOLD} blast-radius confirm.
  */
-async function selectPullRequests(targets: Node[]): Promise<PullRequest[] | undefined> {
+async function selectPullRequests(
+  targets: Node[],
+  fetchRepoPrs: RepoPrFetcher,
+): Promise<PullRequest[] | undefined> {
   const scopes = prScopesForNodes(targets);
   if (scopes.length === 0) {
     return undefined;
@@ -112,7 +120,7 @@ async function selectPullRequests(targets: Node[]): Promise<PullRequest[] | unde
       location: vscode.ProgressLocation.Notification,
       title: discoveryTitle(scopes),
     },
-    () => Promise.allSettled(scopes.map((scope) => discoverPullRequests(scope, runGh))),
+    () => Promise.allSettled(scopes.map((scope) => discoverPullRequests(scope, fetchRepoPrs))),
   );
 
   // A failing `gh` takes down only its own scope: report the failures once and

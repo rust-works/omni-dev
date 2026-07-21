@@ -296,13 +296,20 @@ open in others (and closed worktrees when shown) — and the hover tooltip adds 
 `PR #<n> · open/draft · checks …` line.
 
 Two right-click actions on any GitHub worktree (or repo) open its PR, sharing one
-discovery flow — `gh` finds the PR(s) (a quick-pick when several match) — and
+discovery flow — the daemon finds the PR(s) (a quick-pick when several match) — and
 differing only in where they open it. **"Open Pull Request…"** opens it **as a tab
 inside the editor**, never a browser: it hands off to the **GitHub Pull Requests**
 extension (`GitHub.vscode-pull-request-github`), and if that extension is absent it
 offers to install it or copy the PR URL. **"Open Pull Request in Browser…"** is the
 explicit way to ask for a browser instead — it opens the PR's `github.com` page in
 the OS default browser and needs no extension.
+
+Discovery is **daemon-served** (#1389, fix 7): a worktree already resolved
+daemon-side opens straight from the snapshot badge (**zero `gh`**), and a repo-wide
+lookup goes through the daemon's shared, TTL-cached [`open-prs`](#companion-contract-for-the-extension-and-other-clients)
+op — so N windows dedupe to **one** counted `gh pr list` per repo instead of each
+window shelling its own (the per-window burn #1370/#1389 target). Only a daemon too
+old to serve the op makes the extension fall back to its own `gh`.
 
 - **Resolved by the daemon, and kept live (#1337).** PR state rides the `tree`
   payload as a per-worktree `pr` object, resolved by a background poller in the
@@ -391,11 +398,19 @@ the OS default browser and needs no extension.
   windows × repos GitHub cost #1337 removed. Both fields absent still means "not
   resolved".
 - **Older daemons degrade.** Against a daemon predating #1337 — which omits `pr` —
-  the extension falls back to its own `gh pr list` and shows the PR number and
-  draft marker **without** a check glyph: nothing extension-side polls, so a verdict
-  there could not refresh, and a stale `✓` is worse than none. The fallback covers
-  only branches with **neither** `pr` nor `pr_none` (#1370), so against a current
-  daemon it runs no `gh` at all.
+  the extension falls back to its own PR list and shows the PR number and draft
+  marker **without** a check glyph: nothing extension-side polls, so a verdict there
+  could not refresh, and a stale `✓` is worse than none. The fallback covers only
+  branches with **neither** `pr` nor `pr_none` (#1370), so against a current daemon
+  it runs no `gh` at all.
+- **A not-polled repo issues zero `gh`, from the daemon *and* the extension
+  (#1389).** The badge fallback is now gated on `polling_enabled`: a repo you have
+  not enabled polling for (#1376) resolves no badges daemon-side **and** the
+  extension no longer shells `gh pr list` per window for it — the opt-out is honoured
+  end-to-end, closing the gap where disabling polling merely *moved* a repo's cost
+  from one shared daemon call to one `gh` per window. The only fallback that survives
+  — a *polled* repo's brief pre-first-poll transient — routes through the shared
+  `open-prs` op, so even that is one `gh`, not one per window.
 - **The check state is colored, not monochrome (#1324).** The `✓`/`✗`/`●` is a VS
   Code `FileDecoration` (the same mechanism git status uses to color `M`/`U`
   badges), painted from a custom `omnidev-worktree:` `resourceUri` the extension
@@ -571,6 +586,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is pending and fresh** (#1337), and how often it wakes to look. While pending it holds this fast rate for ~2 minutes after a push, then escalates ×2 toward a 60 s ceiling (#1389); once every badge is terminal it backs off ×2 to a 30-minute ceiling, and it asks nothing while no window is registered — so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a **grown** watch (an added branch, or a moved upstream — you pushed, #1344) makes it ask immediately regardless of the backoff, but a **local commit** (#1389) and a pure **removal** (#1389) do not. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 | `OMNI_DEV_DAEMON_PR_DEBOUNCE` | `2` | How long the PR poller waits for the change-notify to go quiet before snapshotting (#1389), so a VS Code or daemon restart's one-window-at-a-time re-registration storm collapses into a single fetch on the final watch set instead of one per window. Bounded (~4× this) so a steady drip of changes cannot postpone a poll forever. |
 | `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
+| `OMNI_DEV_DAEMON_OPEN_PR_TTL` | `60` | How long the daemon reuses a repo's `gh pr list` result before re-fetching, backing the shared [`open-prs`](#companion-contract-for-the-extension-and-other-clients) op (#1389, fix 7). Within the TTL, every window's "Open Pull Request…" lookup for that repo — and any transient badge fallback — is served from the one cached list, so N windows cost one counted `gh`, not N. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
@@ -656,12 +672,20 @@ Ops:
 | `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
 | `ahead-behind`    | `{ paths: [path, …] }`                         | `{ results: { "<path>": { ahead, behind } } }` |
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
+| `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first ten ops are strictly **request → one reply**. `subscribe` is the one
+`open-prs` (#1389, fix 7) serves "Open Pull Request…" from the daemon: it returns a
+repo's open PRs (`number, title, url, headRefName, baseRefName, isDraft, state,
+author`, forwarded from `gh pr list --json`) from a **shared, TTL-cached** result
+(default 60 s, `OMNI_DEV_DAEMON_OPEN_PR_TTL`) so N windows dedupe to one counted
+`gh` per repo. The client answers a branch already carrying a `pr` badge straight
+from the snapshot without ever calling it.
+
+The first eleven ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
