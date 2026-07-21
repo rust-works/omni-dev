@@ -9,7 +9,7 @@
 // labels, the URI, and the scope→discovery mapping — is here behind an injected
 // runner so it can be exercised without a real `gh` or a real editor.
 
-import { Node, PrBadge, TreeGithubIdentity } from "./tree";
+import { Node, TreeGithubIdentity } from "./tree";
 
 
 /**
@@ -246,30 +246,4 @@ export function prQuickPickDescription(pr: PullRequest): string {
 export function prOverviewUri(scheme: string, prWebUrl: string): string {
   const query = new URLSearchParams({ uri: prWebUrl }).toString();
   return `${scheme}://github.vscode-pull-request-github/open-pull-request-webview?${query}`;
-}
-
-/**
- * The **degraded** PR badge for `branch`, for when the daemon does not supply one
- * (#1337).
- *
- * Check state is resolved daemon-side now — one `gh api graphql` for every repo
- * and branch at once, kept live by a background poller — so this exists only for a
- * daemon older than #1337, which omits `pr` from the tree payload. It reports the
- * PR itself (`#65`, `#65 draft`) from the quick-pick's rollup-free `gh pr list`,
- * with `checks: "none"` so no ✓/✗/● is rendered: a badge with no poller behind it
- * could never refresh, and a stale verdict is worse than none. Matching a PR by
- * head branch mirrors the daemon's `Ref.associatedPullRequests(states:OPEN)`.
- *
- * Returns `undefined` for a detached/unborn worktree (no `branch`) or when no open
- * PR heads that branch.
- */
-export function prFallbackBadge(prs: PullRequest[], branch?: string): PrBadge | undefined {
-  if (!branch) {
-    return undefined;
-  }
-  const pr = prs.find((p) => p.headRefName === branch);
-  if (!pr) {
-    return undefined;
-  }
-  return { number: pr.number, isDraft: pr.isDraft, checks: "none", url: pr.url };
 }
