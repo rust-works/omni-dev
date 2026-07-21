@@ -43,6 +43,17 @@ pub fn worktrees_polling_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("worktrees-polling.json"))
 }
 
+/// Default resolved-PR-badge cache path: `<runtime_dir>/worktrees-pr-cache.json`.
+///
+/// The worktrees service persists the last polled PR badges (number / URL /
+/// check-state / draft flag) here (`0600`), so a daemon restart serves badges
+/// instantly and can skip its immediate re-poll when the verdicts are still fresh
+/// (#1389, fix 4). Non-secret — the same badge data already rides the tree wire —
+/// but co-located with the other `0600` runtime state for a consistent posture.
+pub fn worktrees_pr_cache_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("worktrees-pr-cache.json"))
+}
+
 /// The bridge token file co-located with a control socket
 /// (`<socket dir>/bridge.token`), so a custom `--socket` keeps its token beside
 /// it. For the default socket this equals [`token_path`].

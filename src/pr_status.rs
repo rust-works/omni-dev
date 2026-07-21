@@ -51,12 +51,12 @@
 //!
 //! [ADR-0050]: ../../docs/adrs/adr-0050.md
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Environment override for the `gh` binary, for when the daemon runs under
@@ -91,7 +91,7 @@ const FAILURE_STATES: &[&str] = &[
 const SUCCESS_STATES: &[&str] = &["SUCCESS", "NEUTRAL", "SKIPPED"];
 
 /// The rolled-up CI verdict for a pull request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrCheckState {
     /// Every reported check passed (or was skipped/neutral).
@@ -155,7 +155,11 @@ impl PrBadge {
 
 /// One (repo, branch) pair to resolve a badge for. Derived from the tree — a repo
 /// contributes a target per worktree that has a branch.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `Serialize`/`Deserialize` so the daemon can persist the resolved badge cache
+/// across restarts (#1389, fix 4); on the tree wire the target is implicit in the
+/// worktree row, so this shape appears only in that `0600` cache file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrTarget {
     /// The GitHub owner, e.g. `rust-works`.
     pub owner: String,
@@ -565,6 +569,48 @@ impl PrStatusCache {
         }
         *guard = next;
         true
+    }
+
+    /// Drops every cached resolution whose target is absent from `keep`, returning
+    /// whether anything was removed.
+    ///
+    /// Lets the poller prune the verdicts of worktrees that closed (or repos whose
+    /// lease lapsed) **without** spending a `gh` call to re-resolve the survivors
+    /// (#1389, fix 1) — the wholesale [`replace`](Self::replace) only prunes as a
+    /// side effect of a fetch, which a pure removal must never trigger. No caller
+    /// bumps on the return today (a removed target's row is already gone from the
+    /// tree, so nothing re-renders), but the bool is reported for symmetry with
+    /// `replace` and to keep the prune observable in tests.
+    pub fn retain_targets(&self, keep: &HashSet<PrTarget>) -> bool {
+        let mut guard = self.lock();
+        let before = guard.len();
+        guard.retain(|target, _| keep.contains(target));
+        guard.len() != before
+    }
+
+    /// Every cached (target, resolution) pair, cloned out for persistence (#1389,
+    /// fix 4). Ordering is unspecified (a `HashMap`); the caller sorts if it needs
+    /// a stable on-disk form.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(PrTarget, PrResolution)> {
+        self.lock()
+            .iter()
+            .map(|(t, r)| (t.clone(), r.clone()))
+            .collect()
+    }
+
+    /// Seeds the cache from a persisted set, **without** bumping any change-notify.
+    ///
+    /// Called once at daemon startup (before any window subscribes) so restored
+    /// badges render on the first tree snapshot rather than after the first poll
+    /// (#1389, fix 4) — the [`crate::pr_status`] analogue of
+    /// `WorktreesRegistry::seed_polling`. Existing entries with the same target are
+    /// overwritten; the cache is empty at that point, so in practice this inserts.
+    pub fn seed(&self, entries: impl IntoIterator<Item = (PrTarget, PrResolution)>) {
+        let mut guard = self.lock();
+        for (target, resolution) in entries {
+            guard.insert(target, resolution);
+        }
     }
 
     /// Whether any cached badge is still pending — the poller's cadence signal. A
@@ -1237,5 +1283,47 @@ mod tests {
         }
         cache.replace(map);
         assert!(!cache.any_pending());
+    }
+
+    #[test]
+    fn cache_retain_targets_drops_only_the_vanished_entries() {
+        // A pure removal (a worktree closed) must prune its verdict without a fetch
+        // (#1389, fix 1), leaving the survivors untouched.
+        let cache = PrStatusCache::new();
+        let mut map = HashMap::new();
+        map.insert(target("keep"), pending_pr(1));
+        map.insert(target("drop"), pending_pr(2));
+        cache.replace(map);
+
+        let keep: HashSet<PrTarget> = std::iter::once(target("keep")).collect();
+        assert!(cache.retain_targets(&keep), "a target was removed");
+        assert!(cache.get("rust-works", "omni-dev", "keep").is_some());
+        assert!(cache.get("rust-works", "omni-dev", "drop").is_none());
+        // Idempotent: nothing left to remove reports no change.
+        assert!(!cache.retain_targets(&keep));
+    }
+
+    #[test]
+    fn cache_seed_then_entries_round_trips_without_a_bump() {
+        // A warm start seeds restored verdicts so they render before the first poll
+        // (#1389, fix 4); `entries` reads them back for the next persist.
+        let cache = PrStatusCache::new();
+        cache.seed([
+            (target("f"), pending_pr(7)),
+            (target("g"), PrResolution::NoPr),
+        ]);
+        assert!(matches!(
+            cache.get("rust-works", "omni-dev", "f"),
+            Some(PrResolution::Pr(b)) if b.number == 7
+        ));
+        assert!(matches!(
+            cache.get("rust-works", "omni-dev", "g"),
+            Some(PrResolution::NoPr)
+        ));
+        let mut entries = cache.entries();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, target("f"));
+        assert_eq!(entries[1].0, target("g"));
     }
 }
