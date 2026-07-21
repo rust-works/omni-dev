@@ -51,12 +51,12 @@ impl InfoCommand {
         repo_root: &Path,
     ) -> Result<Vec<crate::data::PullRequest>> {
         use serde_json::Value;
-        use std::process::Command;
 
-        // Use gh CLI to get PRs for the branch
-        let output = Command::new("gh")
-            .current_dir(repo_root)
-            .args([
+        // Use gh CLI to get PRs for the branch, routed through the metrics choke
+        // point so the invocation is counted (#1387).
+        let output = crate::github_metrics::run_gh(
+            &crate::pr_status::resolve_gh_binary(),
+            [
                 "pr",
                 "list",
                 "--head",
@@ -65,9 +65,11 @@ impl InfoCommand {
                 "number,title,state,url,body,baseRefName",
                 "--limit",
                 "50",
-            ])
-            .output()
-            .context("Failed to execute gh command")?;
+            ],
+            "pr list",
+            Some(repo_root),
+        )
+        .context("Failed to execute gh command")?;
 
         if !output.status.success() {
             anyhow::bail!(

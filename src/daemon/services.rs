@@ -9,6 +9,7 @@
 
 pub mod bridge;
 pub mod echo;
+pub mod github_counters;
 pub mod sessions;
 pub mod snowflake;
 pub mod worktrees;
