@@ -78,3 +78,4 @@ by Michael Nygard.
 | [ADR-0052](adr-0052.md)  | ✅ Accepted                              | 2026-07-15 | Cross-Window Claude Code Sessions Tracker as a Daemon Service Fed by Three Feeds            |
 | [ADR-0053](adr-0053.md)  | ✅ Accepted                              | 2026-07-15 | Worktree PR Badges Resolved in the Daemon via `gh api graphql`                              |
 | [ADR-0054](adr-0054.md)  | ✅ Accepted                              | 2026-07-20 | Native Windows Daemon Control Plane on a Per-User Named Pipe with Detached-Spawn Activation |
+| [ADR-0055](adr-0055.md)  | ✅ Accepted                              | 2026-07-20 | Daemon-Held Read Token for the Non-Polling (Webhook) PR-Status Source                       |

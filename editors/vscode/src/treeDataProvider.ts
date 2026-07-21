@@ -8,19 +8,14 @@ import * as vscode from "vscode";
 import {
   AheadBehindMap,
   Node,
-  PrBadge,
-  TreeGithubIdentity,
   TreeRepoPayload,
   isCurrentWindow,
-  needsPrFallback,
   nodeId,
   repoContextValue,
   repoLabel,
   repoPollingEnabled,
   reposToNodes,
-  unbadgedBranches,
   withAheadBehind,
-  withPr,
   worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
@@ -37,20 +32,6 @@ import { worktreeResourceUri } from "./decorations";
  * unreachable or has no such op, in which case the tree renders without sync.
  */
 export type AheadBehindFetcher = (paths: string[]) => Promise<AheadBehindMap>;
-
-/**
- * Resolves the open PR badge for each of a GitHub repo's branches on demand — one
- * `gh pr list` per repo-expand (#1296). Injected like {@link AheadBehindFetcher}
- * so the provider stays `vscode`-testable; the returned map is keyed by branch
- * name (only branches with an open PR appear). Invoked only for branches the
- * daemon left unresolved (`needsPrFallback`, #1370). Resolves to an empty map —
- * so the tree renders without PR badges — when `gh` is missing, the feature is
- * disabled, or the lookup fails.
- */
-export type PrBadgeFetcher = (
-  repo: TreeGithubIdentity,
-  branches: string[],
-) => Promise<Record<string, PrBadge>>;
 
 /**
  * The command every worktree item fires on a (single) click. The TreeView API
@@ -71,6 +52,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * `visibleRepos`). Defaults on.
    */
   private showPr = true;
+  /**
+   * The daemon's active PR-status source (#1384). Recolours the GitHub repo icon:
+   * in `webhook` mode every owned repo is backed the same way, so the green/gray
+   * poll distinction is meaningless and the icon goes **blue** instead. Defaults
+   * `poll` until the first snapshot drives {@link setPrSource}.
+   */
+  private prSource: "poll" | "webhook" = "poll";
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -79,13 +67,10 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * `window_key` matches can be marked distinctly from worktrees open elsewhere.
    * @param fetchAheadBehind fetches per-worktree divergence on demand (#1306); when
    * omitted (tests, or the daemon lacking the op) the tree renders without sync.
-   * @param fetchPrBadges resolves per-branch PR badges on demand (#1296); when
-   * omitted (tests, or the feature disabled) the tree renders without PR badges.
    */
   constructor(
     private readonly windowKey?: string,
     private readonly fetchAheadBehind?: AheadBehindFetcher,
-    private readonly fetchPrBadges?: PrBadgeFetcher,
   ) {}
 
   /** Replaces the snapshot and refreshes the whole tree. */
@@ -113,6 +98,31 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     this.emitter.fire(undefined);
   }
 
+  /**
+   * Sets the active PR-status source (#1384), then refreshes so GitHub repo icons
+   * recolour — blue in `webhook` mode, else the poll-state green/gray.
+   */
+  setPrSource(source: "poll" | "webhook"): void {
+    this.prSource = source;
+    this.emitter.fire(undefined);
+  }
+
+  /**
+   * The icon for a GitHub repo node. Master switch off → neutral. `webhook`
+   * mode → blue (every owned repo is backed the same way, so the poll distinction
+   * does not apply). `poll` mode → green while the daemon is polling this repo,
+   * else neutral.
+   */
+  private githubRepoIcon(repo: TreeRepoPayload): vscode.ThemeIcon {
+    if (!this.showPr) return new vscode.ThemeIcon("github");
+    if (this.prSource === "webhook") {
+      return new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.blue"));
+    }
+    return repoPollingEnabled(repo)
+      ? new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.green"))
+      : new vscode.ThemeIcon("github");
+  }
+
   async getChildren(element?: Node): Promise<Node[]> {
     if (!element) {
       return reposToNodes(this.repos);
@@ -128,35 +138,19 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     // not carry ahead/behind (#1306), which is fetched via the daemon's
     // `ahead-behind` op. Best-effort: a failure leaves just that indicator off.
     //
-    // PR badges are **not** in the same boat since #1337. The daemon resolves them
-    // and pushes them on the snapshot, kept live by its own poller — which is the
-    // whole point, because a re-render only happens when the *worktree* state
-    // changes, and CI moves without it. A current daemon marks every checked
-    // branch with either a badge (`pr`) or the explicit negative (`pr_none`,
-    // #1370), so the fallback list is empty and no `gh` runs at all; only a
-    // pre-#1370 daemon — or a branch it has not yet resolved — lands here.
+    // PR badges are **not** fetched here: the daemon is the sole resolver
+    // (#1337/#1384) and pushes them on the snapshot as `pr`/`pr_none`, shared by
+    // every window. The extension no longer runs its own `gh pr list` — a branch
+    // the daemon has not resolved yet just shows no badge until the daemon does.
     const paths = nodes.flatMap((n) => (n.kind === "worktree" ? [n.wt.path] : []));
-    const unbadged = unbadgedBranches(nodes);
-    const abPromise: Promise<AheadBehindMap> = this.fetchAheadBehind
-      ? this.fetchAheadBehind(paths).catch(() => ({}))
-      : Promise.resolve({});
-    const prPromise: Promise<Record<string, PrBadge>> =
-      this.fetchPrBadges && element.repo.github && unbadged.length > 0
-        ? this.fetchPrBadges(element.repo.github, unbadged).catch(() => ({}))
-        : Promise.resolve({});
-    const [ab, prBadges] = await Promise.all([abPromise, prPromise]);
+    const ab: AheadBehindMap = this.fetchAheadBehind
+      ? await this.fetchAheadBehind(paths).catch(() => ({}))
+      : {};
     return nodes.map((n) => {
       if (n.kind !== "worktree") {
         return n;
       }
-      // `withPr(wt, undefined)` is a no-op, so a daemon-supplied badge — or its
-      // explicit `pr_none` negative — is never overwritten by the (checks-less)
-      // fallback. Guarded by the same predicate as the collection above.
-      const wt = withPr(
-        withAheadBehind(n.wt, ab[n.wt.path]),
-        n.wt.branch && needsPrFallback(n.wt) ? prBadges[n.wt.branch] : undefined,
-      );
-      return { ...n, wt };
+      return { ...n, wt: withAheadBehind(n.wt, ab[n.wt.path]) };
     });
   }
 
@@ -167,13 +161,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
         vscode.TreeItemCollapsibleState.Expanded,
       );
       item.id = nodeId(node);
-      // The GitHub repo icon reflects PR-poll state (#1376): green when the
-      // daemon is polling this repo *and* the global master is on, else the
-      // default gray. A non-GitHub repo keeps the plain `repo` glyph.
+      // The GitHub repo icon reflects the live PR source: blue in `webhook` mode
+      // (#1384), else the #1376 poll state — green when the daemon is polling this
+      // repo and the master is on, otherwise gray. A non-GitHub repo keeps `repo`.
       item.iconPath = node.repo.github
-        ? this.showPr && repoPollingEnabled(node.repo)
-          ? new vscode.ThemeIcon("github", new vscode.ThemeColor("charts.green"))
-          : new vscode.ThemeIcon("github")
+        ? this.githubRepoIcon(node.repo)
         : new vscode.ThemeIcon("repo");
       // Encodes GitHub identity (gates "Open Pull Request…") and poll state (gates
       // "Enable/Disable PR Polling"); the plain `repo` value is unchanged for

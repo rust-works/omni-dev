@@ -43,7 +43,9 @@ use chrono::{DateTime, Utc};
 use crate::github_rate_limit::{
     resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
 };
+use crate::pr_status::webhook::WebhookAggregator;
 use crate::pr_status::{PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget};
+use crate::webhook_buffer::{WebhookBufferClient, WebhookBufferConfig};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
@@ -56,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 use crate::daemon::service::{
     DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus, ServiceStream,
 };
-use crate::worktrees::{RegisterRequest, WindowEntry, WorktreesRegistry};
+use crate::worktrees::{PrSourceMode, RegisterRequest, WindowEntry, WorktreesRegistry};
 
 /// The worktrees service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "worktrees";
@@ -142,6 +144,46 @@ fn rate_limit_poll_interval() -> Duration {
     crate::daemon::server::duration_secs_from_env(
         ENV_RATE_LIMIT_POLL_INTERVAL,
         DEFAULT_RATE_LIMIT_POLL_INTERVAL,
+    )
+}
+
+/// Environment override for [`webhook_pull_interval`] — how often the webhook PR
+/// source pulls the buffer's `/events` (whole seconds; blank/non-numeric/`0`
+/// falls back to [`DEFAULT_WEBHOOK_PULL_INTERVAL`]).
+const ENV_WEBHOOK_PULL_INTERVAL: &str = "OMNI_DEV_DAEMON_WEBHOOK_PULL";
+
+/// Default webhook buffer-pull cadence (#1384). A short 10 s: webhook deliveries
+/// are free and the pull is a cheap outbound KV read, so a tight loop is what makes
+/// badges feel real-time. This is the loop period; the expensive reconcile within
+/// it runs far less often ([`DEFAULT_WEBHOOK_RECONCILE_INTERVAL`]).
+const DEFAULT_WEBHOOK_PULL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The resolved buffer-pull cadence.
+fn webhook_pull_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(
+        ENV_WEBHOOK_PULL_INTERVAL,
+        DEFAULT_WEBHOOK_PULL_INTERVAL,
+    )
+}
+
+/// Environment override for [`webhook_reconcile_interval`] — how often the webhook
+/// source runs a full GraphQL reconcile (whole seconds; blank/non-numeric/`0`
+/// falls back to [`DEFAULT_WEBHOOK_RECONCILE_INTERVAL`]).
+const ENV_WEBHOOK_RECONCILE_INTERVAL: &str = "OMNI_DEV_DAEMON_WEBHOOK_RECONCILE";
+
+/// Default webhook reconcile cadence (#1384): a fixed 15 minutes, deliberately
+/// **not** adaptive and **not** user-tunable through any UI — that is the point of
+/// webhook mode (nothing to throttle). It is far below the buffer's ~3-day KV
+/// retention, so a daemon offline beyond retention self-heals from the reconcile
+/// rather than showing stale badges; it also fills `isDraft`/`html_url` for
+/// CI-only targets and covers repos with no webhook installed.
+const DEFAULT_WEBHOOK_RECONCILE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// The resolved reconcile cadence.
+fn webhook_reconcile_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(
+        ENV_WEBHOOK_RECONCILE_INTERVAL,
+        DEFAULT_WEBHOOK_RECONCILE_INTERVAL,
     )
 }
 
@@ -307,6 +349,39 @@ fn pr_targets_from_snapshot(snapshot: &Value) -> Vec<PrTarget> {
         .collect()
 }
 
+/// Splits the webhook source's reconcile `targets` into `(full, metadata)` (#1384):
+/// a target whose repo is in `backed` (`"owner/name"`) reconciles with the **cheap
+/// metadata-only** query — its CI verdict comes from webhook events — and the rest
+/// with the full rollup query, the genuine GraphQL fallback. Pure, so the routing
+/// (the thing that bounds webhook-mode cost) is unit-testable directly.
+fn partition_reconcile_targets(
+    targets: &[PrTarget],
+    backed: &HashSet<String>,
+) -> (Vec<PrTarget>, Vec<PrTarget>) {
+    targets
+        .iter()
+        .cloned()
+        .partition(|t| !backed.contains(&format!("{}/{}", t.owner, t.name)))
+}
+
+/// The distinct GitHub `"owner/name"` repos in a tree snapshot — the currently
+/// open (watched) repos, so `webhook-status` can flag which open repos are **not**
+/// yet webhook-backed (still on the full reconcile).
+fn github_repos_from_snapshot(snapshot: &Value) -> HashSet<String> {
+    snapshot
+        .get("repos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|repo| {
+            let github = repo.get("github")?;
+            let owner = github.get("owner").and_then(Value::as_str)?;
+            let name = github.get("name").and_then(Value::as_str)?;
+            Some(format!("{owner}/{name}"))
+        })
+        .collect()
+}
+
 /// Hosts the cross-window [`WorktreesRegistry`] as a [`DaemonService`].
 pub struct WorktreesService {
     /// The cross-window registry this adapter routes ops to. Behind an `Arc` so
@@ -371,6 +446,47 @@ pub struct WorktreesService {
     /// `std::Mutex` only so `load_polling_prefs` can set it on `&self`; read
     /// briefly and never held across an `.await`.
     polling_prefs_path: Mutex<Option<PathBuf>>,
+    /// Buffer URL + read token for the `webhook` PR source (#1384). Empty by
+    /// default (the bare `new` service, and every unit test); the daemon injects
+    /// the resolved config via [`with_webhook_config`](Self::with_webhook_config).
+    /// When it is not [`is_configured`](WebhookBufferConfig::is_configured) the
+    /// webhook source runs reconcile-only.
+    webhook_config: WebhookBufferConfig,
+    /// The background `webhook` PR source task (pull + reconcile), once started
+    /// (`None` in `poll` mode, tests, and outside a runtime). The counterpart to
+    /// [`poller`](Self::poller) — exactly one of the two runs at a time, swapped by
+    /// [`apply_pr_source`](Self::apply_pr_source).
+    webhook_source: Mutex<Option<PollerTask>>,
+    /// Where the active PR-source mode is persisted (#1384), so the daemon-wide
+    /// choice survives a restart. `None` disables persistence (the bare service /
+    /// tests); the daemon wires it via
+    /// [`load_pr_source_pref`](Self::load_pr_source_pref) at startup. Same lock
+    /// discipline as [`polling_prefs_path`](Self::polling_prefs_path).
+    pr_source_pref_path: Mutex<Option<PathBuf>>,
+    /// Where the webhook-backed repo set is persisted (#1384). Same lock
+    /// discipline as [`polling_prefs_path`](Self::polling_prefs_path).
+    webhook_backed_pref_path: Mutex<Option<PathBuf>>,
+    /// Per-repo (`"owner/name"`) arrival time (epoch ms) of the most recent webhook
+    /// event the pull loop has ingested (#1384). The **positive** "this repo's hook
+    /// is actually delivering" signal `daemon webhook status` reads — distinct from
+    /// the `webhook_backed` *marker* (intent). Shared `Arc` so the spawned pull task
+    /// writes it and the `webhook-status` op reads it; the lock is held only briefly.
+    webhook_activity: Arc<Mutex<HashMap<String, u64>>>,
+    /// The pull loop's connectivity state (#1384): when the last buffer pull
+    /// **succeeded** (epoch ms) and the last pull error, if the most recent attempt
+    /// failed. This is the honest "is the buffer connected?" signal — a successful
+    /// pull with **zero** new events still updates `last_success_ms`, so a quiet CI
+    /// period no longer reads as "disconnected" (the per-repo `webhook_activity`
+    /// map, by contrast, only moves when real events arrive). Shared `Arc`.
+    webhook_pull: Arc<Mutex<WebhookPullState>>,
+}
+
+/// The webhook pull loop's connectivity state (#1384). `last_error` is cleared on
+/// the next success, so a present error always means the *most recent* pull failed.
+#[derive(Debug, Default, Clone)]
+struct WebhookPullState {
+    last_success_ms: Option<u64>,
+    last_error: Option<String>,
 }
 
 impl WorktreesService {
@@ -393,7 +509,31 @@ impl WorktreesService {
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
             prune_lock: tokio::sync::Mutex::new(()),
             polling_prefs_path: Mutex::new(None),
+            webhook_config: WebhookBufferConfig::default(),
+            webhook_source: Mutex::new(None),
+            pr_source_pref_path: Mutex::new(None),
+            webhook_backed_pref_path: Mutex::new(None),
+            webhook_activity: Arc::new(Mutex::new(HashMap::new())),
+            webhook_pull: Arc::new(Mutex::new(WebhookPullState::default())),
         }
+    }
+
+    /// Injects the resolved webhook-buffer connection config (#1384). Consumed
+    /// before the service is `Arc`-wrapped, so the config is fixed for the process
+    /// (env is resolved once at startup, the poller precedent). The daemon calls
+    /// this; the bare [`new`](Self::new) service keeps an empty config and never
+    /// runs the fast pull.
+    #[must_use]
+    pub fn with_webhook_config(mut self, config: WebhookBufferConfig) -> Self {
+        self.webhook_config = config;
+        self
+    }
+
+    /// The active PR-source mode (#1384). The daemon reads this at startup to start
+    /// the matching source via [`apply_pr_source`](Self::apply_pr_source).
+    #[must_use]
+    pub fn pr_source(&self) -> PrSourceMode {
+        self.registry.pr_source()
     }
 
     /// Seeds the per-repo PR-poll enable set from the persisted `0600` prefs file
@@ -453,6 +593,104 @@ impl WorktreesService {
         if let Err(err) = write_polling_prefs(&path, &prefs) {
             tracing::warn!(
                 "could not persist worktrees polling prefs to {}: {err:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// Seeds the active PR-source mode from the persisted `pr-source.json` and
+    /// remembers `path` so a later `set-pr-source` change persists back (#1384).
+    /// Called once at startup, before any window subscribes — so
+    /// [`seed_pr_source`](WorktreesRegistry::seed_pr_source) does not bump. Same
+    /// best-effort posture as [`load_polling_prefs`](Self::load_polling_prefs): a
+    /// missing file is the `poll` default, a corrupt one is logged and ignored.
+    pub fn load_pr_source_pref(&self, path: PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<PrSourcePref>(&bytes) {
+                Ok(pref) => self.registry.seed_pr_source(pref.pr_source),
+                Err(err) => tracing::warn!(
+                    "ignoring unreadable pr-source pref at {}: {err:#}",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    "could not read pr-source pref at {}: {err:#}",
+                    path.display()
+                );
+            }
+        }
+        *self
+            .pr_source_pref_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Writes the current PR-source mode to the pref file, if persistence is
+    /// configured. Best-effort: a write failure is logged and swallowed (the
+    /// in-memory mode is authoritative for the running daemon). A no-op in tests.
+    fn persist_pr_source_pref(&self) {
+        let Some(path) = self
+            .pr_source_pref_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let pref = PrSourcePref {
+            pr_source: self.registry.pr_source(),
+        };
+        if let Err(err) = write_pr_source_pref(&path, &pref) {
+            tracing::warn!(
+                "could not persist pr-source pref to {}: {err:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// Seeds the webhook-backed repo set from its persisted file and remembers
+    /// `path` so `set-webhook-backed` changes persist back (#1384). Same best-effort
+    /// posture as [`load_polling_prefs`](Self::load_polling_prefs).
+    pub fn load_webhook_backed_pref(&self, path: PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<WebhookBackedPref>(&bytes) {
+                Ok(pref) => self.registry.seed_webhook_backed(pref.repos),
+                Err(err) => tracing::warn!(
+                    "ignoring unreadable webhook-backed pref at {}: {err:#}",
+                    path.display()
+                ),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                "could not read webhook-backed pref at {}: {err:#}",
+                path.display()
+            ),
+        }
+        *self
+            .webhook_backed_pref_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Writes the current webhook-backed set to its pref file, if persistence is
+    /// configured. Best-effort; a no-op in tests.
+    fn persist_webhook_backed_pref(&self) {
+        let Some(path) = self
+            .webhook_backed_pref_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let mut repos: Vec<String> = self.registry.webhook_backed_repos().into_iter().collect();
+        repos.sort(); // deterministic file
+        let pref = WebhookBackedPref { repos };
+        if let Err(err) = write_webhook_backed_pref(&path, &pref) {
+            tracing::warn!(
+                "could not persist webhook-backed pref to {}: {err:#}",
                 path.display()
             );
         }
@@ -665,6 +903,239 @@ impl WorktreesService {
             }
         });
         *guard = Some(PollerTask { token, handle });
+    }
+
+    /// Starts the `webhook` PR source (#1384): the non-polling counterpart to
+    /// [`start_pr_poller`](Self::start_pr_poller). One task drives both a fast
+    /// buffer pull and a slow reconcile, merging them into the shared cache — a
+    /// **single writer**, so the two never clobber each other on
+    /// [`PrStatusCache::replace`] (which swaps the whole map). Resolves the config,
+    /// cadences, and `gh` binary once at spawn.
+    pub fn start_webhook_source(&self) {
+        self.start_webhook_source_with(
+            self.webhook_config.clone(),
+            webhook_pull_interval(),
+            webhook_reconcile_interval(),
+            crate::pr_status::resolve_gh_binary(),
+        );
+    }
+
+    /// [`start_webhook_source`](Self::start_webhook_source) with explicit config,
+    /// cadences, and `gh` binary — the test seam, mirroring
+    /// [`start_pr_poller_with`](Self::start_pr_poller_with). Idempotent and a no-op
+    /// outside a tokio runtime.
+    fn start_webhook_source_with(
+        &self,
+        config: WebhookBufferConfig,
+        pull: Duration,
+        reconcile: Duration,
+        gh_bin: PathBuf,
+    ) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; worktrees webhook source not started");
+            return;
+        }
+        let mut guard = self
+            .webhook_source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let registry = self.registry.clone();
+        let tree_cache = self.tree_cache.clone();
+        let pr_cache = self.pr_cache.clone();
+        let activity = self.webhook_activity.clone();
+        let pull_state = self.webhook_pull.clone();
+        let mut changes = self.registry.subscribe_changes();
+        let handle = tokio::spawn(async move {
+            // Bounds a single iteration's page drain — a pathological backlog cannot
+            // pin the loop pulling forever before it next serves the cache.
+            const MAX_PULL_PAGES: usize = 50;
+
+            // A missing/invalid buffer config degrades to reconcile-only: badges
+            // still work (via the GraphQL fallback), just without the real-time push.
+            let client = if let (Some(url), Some(tok)) =
+                (config.base_url.as_deref(), config.read_token.as_deref())
+            {
+                match WebhookBufferClient::new(url, tok) {
+                    Ok(client) => Some(client),
+                    Err(err) => {
+                        tracing::warn!(
+                            "webhook buffer client unavailable: {err:#}; reconcile-only"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("webhook buffer not configured; PR source runs reconcile-only");
+                None
+            };
+
+            let mut agg = WebhookAggregator::new();
+            // Start from the beginning of the retained window (`since=""`) so the
+            // first drain **re-walks the whole KV buffer** into the aggregator,
+            // rebuilding as much verdict/metadata/activity state as the buffer still
+            // holds (#1384). This is deliberately *not* resumed from a persisted
+            // cursor: the aggregator is in-memory, so resuming would start it cold
+            // and throw away exactly the history a restart should recover. The buffer
+            // is the source of truth; the cursor only advances in-session from here.
+            // (The reconcile fills what the window cannot: checks that finished before
+            // retention, and metadata for repos with no captured `pull_request` event.)
+            let mut cursor = String::new();
+            // The reconcile result is the base map for every watched target; it is
+            // refreshed only every `reconcile`, and reused between refreshes.
+            let mut reconcile_map: HashMap<PrTarget, PrResolution> = HashMap::new();
+            let mut last_reconcile: Option<Instant> = None;
+            loop {
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(pull) => {}
+                    result = changes.changed() => {
+                        // A closed channel would spin the loop; break instead
+                        // (the poll loop's guard, same reasoning).
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let snapshot = tree_cache.snapshot().await;
+                let watch = pr_watch_from_snapshot(&snapshot);
+                if watch.is_empty() {
+                    reconcile_map.clear();
+                    last_reconcile = None;
+                    continue;
+                }
+                let targets: Vec<PrTarget> = watch.iter().map(|w| w.target.clone()).collect();
+
+                // 1. Fast pull: drain the buffer into the aggregator, advancing and
+                // persisting the cursor as we go. A failure leaves the aggregator's
+                // prior state intact — the reconcile below still refreshes badges.
+                if let Some(client) = &client {
+                    for _ in 0..MAX_PULL_PAGES {
+                        match client.fetch_events(&cursor).await {
+                            Ok(page) => {
+                                for event in &page.events {
+                                    agg.ingest(event);
+                                    // Record the repo's most recent delivery time, the
+                                    // positive "hook is delivering" signal for status.
+                                    if let Some((owner, name)) = event.repo() {
+                                        let mut seen =
+                                            activity.lock().unwrap_or_else(PoisonError::into_inner);
+                                        let entry =
+                                            seen.entry(format!("{owner}/{name}")).or_insert(0);
+                                        *entry = (*entry).max(event.received);
+                                    }
+                                }
+                                cursor = page.cursor;
+                                // A successful pull — even an empty one — is the
+                                // "connected" signal; record it and clear any error.
+                                {
+                                    let mut st =
+                                        pull_state.lock().unwrap_or_else(PoisonError::into_inner);
+                                    st.last_success_ms = Some(now_epoch_ms());
+                                    st.last_error = None;
+                                }
+                                if !page.more {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!("webhook buffer pull failed: {err:#}");
+                                pull_state
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .last_error = Some(format!("{err:#}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Reconcile on the slow cadence (and once at startup): the
+                // universal GraphQL fallback that self-heals, fills `isDraft`/`url`
+                // for CI-only targets, and covers repos with no webhook installed.
+                // Blocking `gh`, so never on an async worker.
+                //
+                // Split by webhook-backed-ness (#1384): a webhook-backed repo's CI
+                // verdict already arrives via events, so it only needs the **cheap
+                // metadata-only** query (one node per ref); non-backed repos get the
+                // full rollup as the genuine fallback. This is what keeps webhook
+                // mode near-zero-cost — without it the reconcile rolled up every
+                // branch of every open repo, which is the whole cost regression.
+                let reconcile_due = last_reconcile.map_or(true, |at| at.elapsed() >= reconcile);
+                if reconcile_due {
+                    let bin = gh_bin.clone();
+                    // Effective backed set = the explicit marker ∪ repos the daemon
+                    // has events for (#1384). Activity *proves* a working hook —
+                    // events only arrive from one — so a delivering repo is treated
+                    // as backed with no manual `set-webhook-backed`. Self-healing:
+                    // a repo that stops delivering ages out of `webhook_activity`
+                    // across restarts and reverts to the full rollup.
+                    let mut backed = registry.webhook_backed_repos();
+                    backed.extend(
+                        activity
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .keys()
+                            .cloned(),
+                    );
+                    let (full, metadata) = partition_reconcile_targets(&targets, &backed);
+                    let resolved = tokio::task::spawn_blocking(move || {
+                        let mut map = crate::pr_status::resolve_with(&bin, &full)?;
+                        map.extend(crate::pr_status::resolve_metadata_with(&bin, &metadata)?);
+                        Ok::<_, anyhow::Error>(map)
+                    })
+                    .await
+                    .unwrap_or_else(|err| Err(anyhow!("blocking reconcile task failed: {err}")));
+                    match resolved {
+                        Ok(map) => reconcile_map = map,
+                        Err(err) => tracing::debug!("webhook reconcile poll failed: {err:#}"),
+                    }
+                    last_reconcile = Some(Instant::now());
+                }
+
+                // 3. Merge and publish: reconcile is the base for every target; the
+                // webhook overlay wins for the (owned, PR-metadata-known) targets it
+                // covers, since it is the freshest. Bump only on a real change.
+                let webhook_map = agg.resolve(&targets);
+                let mut map = reconcile_map.clone();
+                map.extend(webhook_map);
+                if pr_cache.replace(map) {
+                    registry.bump();
+                }
+            }
+        });
+        *guard = Some(PollerTask { token, handle });
+    }
+
+    /// Switches the live PR source to `mode`: stops the inactive source's task and
+    /// starts the active one (both idempotent). The single place the poll↔webhook
+    /// swap happens — driven by the `set-pr-source` op and by the daemon at startup.
+    pub async fn apply_pr_source(&self, mode: PrSourceMode) {
+        match mode {
+            PrSourceMode::Poll => {
+                Self::stop_task(&self.webhook_source).await;
+                self.start_pr_poller();
+            }
+            PrSourceMode::Webhook => {
+                Self::stop_task(&self.poller).await;
+                self.start_webhook_source();
+            }
+        }
+    }
+
+    /// Cancels and joins a background task, taking it out from under its `std::Mutex`
+    /// **before** awaiting so the lock is never held across the `.await` (the
+    /// [`shutdown`](Self::shutdown) discipline).
+    async fn stop_task(slot: &Mutex<Option<PollerTask>>) {
+        let task = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(task) = task {
+            task.token.cancel();
+            let _ = task.handle.await;
+        }
     }
 
     /// Starts the background task that keeps the GitHub API rate-limit reading
@@ -960,6 +1431,94 @@ impl DaemonService for WorktreesService {
                 }
                 Ok(json!({ "ok": true }))
             }
+            "set-pr-source" => {
+                // Selects the live PR-status source (#1384). Mirrors
+                // `set-show-closed`: the extension forwards its
+                // `omniDevWorktrees.prStatusSource` setting here, the daemon becomes
+                // the authority, and a real change bumps so every window re-pushes a
+                // snapshot carrying the new `pr_source`. A changed value swaps the
+                // active source task and is persisted so it survives a restart.
+                let source = require_str(&payload, "source", "set-pr-source")?;
+                let mode = PrSourceMode::from_wire(source).ok_or_else(|| {
+                    anyhow!("`set-pr-source` requires `source` to be \"poll\" or \"webhook\"")
+                })?;
+                if self.registry.set_pr_source(mode) {
+                    self.persist_pr_source_pref();
+                    self.apply_pr_source(mode).await;
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "set-webhook-backed" => {
+                // Marks a repo as having a buffer webhook installed (#1384), sent by
+                // `daemon webhook register`/`remove`. In `webhook` mode the reconcile
+                // poll then skips this repo's expensive rollup query (its CI verdict
+                // comes from webhook events). Persisted so it survives a restart.
+                let owner = require_str(&payload, "owner", "set-webhook-backed")?;
+                let name = require_str(&payload, "name", "set-webhook-backed")?;
+                let backed = payload
+                    .get("backed")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| anyhow!("`set-webhook-backed` requires a boolean `backed`"))?;
+                if owner.trim().is_empty() || name.trim().is_empty() {
+                    bail!("`set-webhook-backed` requires a non-empty `owner` and `name`");
+                }
+                if self.registry.set_webhook_backed(owner, name, backed) {
+                    self.persist_webhook_backed_pref();
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "webhook-status" => {
+                // Reports, per repo the daemon knows about webhook-wise (#1384): the
+                // `backed` **marker** (intent), whether it is a currently-open
+                // (`watched`) repo, and `last_event_ms` — the arrival time of the most
+                // recent webhook event actually pulled, the positive "the hook is
+                // delivering" signal. Backed-but-no-events flags a misconfiguration
+                // (or just quiet CI — the daemon cannot tell those apart, so `status`
+                // is a positive signal, not proof a hook is broken).
+                let backed = self.registry.webhook_backed_repos();
+                let activity = self
+                    .webhook_activity
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let pull = self
+                    .webhook_pull
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let snapshot = tree_snapshot(&self.registry, self.pr_cache.clone()).await;
+                let watched = github_repos_from_snapshot(&snapshot);
+
+                // Union of every webhook-relevant repo, sorted for a stable table.
+                let mut keys: BTreeSet<String> = BTreeSet::new();
+                keys.extend(backed.iter().cloned());
+                keys.extend(activity.keys().cloned());
+                keys.extend(watched.iter().cloned());
+                let repos: Vec<Value> = keys
+                    .iter()
+                    .map(|key| {
+                        let (owner, name) = key.split_once('/').unwrap_or((key.as_str(), ""));
+                        // Effective backed = the explicit marker OR the daemon has
+                        // events for it (a delivering repo is auto-backed, #1384).
+                        let marked = backed.contains(key);
+                        json!({
+                            "owner": owner,
+                            "name": name,
+                            "backed": marked || activity.contains_key(key),
+                            "marked": marked,
+                            "watched": watched.contains(key),
+                            "last_event_ms": activity.get(key).copied(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "pr_source": self.registry.pr_source().as_wire(),
+                    "configured": self.webhook_config.is_configured(),
+                    "last_pull_ms": pull.last_success_ms,
+                    "last_pull_error": pull.last_error,
+                    "repos": repos,
+                }))
+            }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
                 // arbitrary worktree folder supplied by a socket client, reusing
@@ -1083,6 +1642,8 @@ impl DaemonService for WorktreesService {
             poller.token.cancel();
             let _ = poller.handle.await;
         }
+        // And the webhook PR source (#1384), if it is the active source.
+        Self::stop_task(&self.webhook_source).await;
     }
 }
 
@@ -1183,6 +1744,55 @@ fn write_polling_prefs(path: &Path, prefs: &PollingPrefs) -> Result<()> {
     }
     let json = serde_json::to_vec_pretty(prefs).context("failed to serialize polling prefs")?;
     crate::daemon::paths::write_file_0600(path, &json)
+}
+
+/// The on-disk shape of the PR-source-mode pref (#1384): which live source the
+/// daemon feeds badges from. `#[serde(default)]` so a missing/older file decodes
+/// to the `poll` default.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrSourcePref {
+    #[serde(default)]
+    pr_source: PrSourceMode,
+}
+
+/// Writes the PR-source pref to `path` as pretty JSON with `0600` perms — the
+/// [`write_polling_prefs`] pattern.
+fn write_pr_source_pref(path: &Path, pref: &PrSourcePref) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::daemon::paths::ensure_dir_0700(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(pref).context("failed to serialize pr-source pref")?;
+    crate::daemon::paths::write_file_0600(path, &json)
+}
+
+/// The on-disk shape of the webhook-backed repo set (#1384): the `"owner/name"`
+/// repos with a buffer webhook installed. `#[serde(default)]` so a missing/older
+/// file decodes to "none backed".
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WebhookBackedPref {
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// Writes the webhook-backed pref to `path` as pretty JSON with `0600` perms.
+fn write_webhook_backed_pref(path: &Path, pref: &WebhookBackedPref) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::daemon::paths::ensure_dir_0700(parent)?;
+    }
+    let json =
+        serde_json::to_vec_pretty(pref).context("failed to serialize webhook-backed pref")?;
+    crate::daemon::paths::write_file_0600(path, &json)
+}
+
+/// Current time in epoch-ms (0 if the clock predates the epoch). Used to stamp the
+/// webhook pull loop's last-success time for `webhook-status` (#1384).
+fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
@@ -1602,10 +2212,16 @@ fn worktree_entry(
 /// enabled carries neither the flag nor any badge. Purely a set membership check —
 /// no I/O — so it is safe on the snapshot's hot path. A non-GitHub repo has no key
 /// and stays `false`; it never polls anyway.
-fn stamp_polling(repos: &mut [TreeRepo], enabled: &HashSet<String>) {
+fn stamp_polling(repos: &mut [TreeRepo], enabled: &HashSet<String>, webhook_mode: bool) {
     for repo in repos {
         if let Some(github) = &repo.github {
-            repo.polling_enabled = enabled.contains(&format!("{}/{}", github.owner, github.name));
+            // In `webhook` mode the #1376 per-repo lease is moot — its UI is hidden
+            // and there is no poll volume to manage — so every GitHub repo is
+            // badge-eligible: the webhook source resolves the owned ones in real
+            // time and the reconcile poll covers the rest. In `poll` mode this is
+            // exactly the #1376 enable-set membership check, unchanged.
+            repo.polling_enabled =
+                webhook_mode || enabled.contains(&format!("{}/{}", github.owner, github.name));
         }
     }
 }
@@ -1716,12 +2332,14 @@ async fn tree_repos(
     windows: Vec<WindowEntry>,
     pr_cache: Arc<PrStatusCache>,
     enabled_polling: HashSet<String>,
+    webhook_mode: bool,
 ) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
         let mut repos = build_tree(folders, windows);
         // Stamp per-repo poll state first so `fold_pr_badges` can skip a
         // not-polled repo — a disabled repo carries neither the flag nor a badge.
-        stamp_polling(&mut repos, &enabled_polling);
+        // In webhook mode this marks every GitHub repo eligible (see `stamp_polling`).
+        stamp_polling(&mut repos, &enabled_polling, webhook_mode);
         fold_pr_badges(&mut repos, &pr_cache);
         repos
             .iter()
@@ -1940,10 +2558,16 @@ async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache
     let folders = registry.open_folders();
     let windows = registry.list();
     let show_closed = registry.show_closed();
+    let pr_source = registry.pr_source();
+    let webhook_mode = pr_source == PrSourceMode::Webhook;
     let enabled_polling = registry.enabled_polling_repos();
     json!({
-        "repos": tree_repos(folders, windows, pr_cache, enabled_polling).await,
+        "repos": tree_repos(folders, windows, pr_cache, enabled_polling, webhook_mode).await,
         "show_closed": show_closed,
+        // Additive (#1384): the active live PR source, echoed so every window
+        // renders the same mode and gates its poll-volume UI. Older clients ignore
+        // the unknown key and keep polling.
+        "pr_source": pr_source.as_wire(),
     })
 }
 
@@ -2952,10 +3576,10 @@ mod tests {
             .subscribe("subscribe", &Value::Null)
             .expect("subscribe stream");
         // No windows yet → no repos derived; the toggle rides along at its
-        // default (show all).
+        // default (show all), as does the PR-source mode (poll).
         assert_eq!(
             stream.snapshot().await,
-            json!({ "repos": [], "show_closed": true })
+            json!({ "repos": [], "show_closed": true, "pr_source": "poll" })
         );
 
         // A window opens on the repo → the snapshot carries it, byte-identical to
@@ -3156,6 +3780,64 @@ mod tests {
             .expect("changed should resolve after a toggle flip");
         // The pushed snapshot now reflects the new toggle.
         assert_eq!(stream.snapshot().await["show_closed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn set_pr_source_op_rejects_unknown_or_missing_source() {
+        let svc = WorktreesService::new();
+        assert!(svc.handle("set-pr-source", json!({})).await.is_err());
+        assert!(svc
+            .handle("set-pr-source", json!({ "source": "sideways" }))
+            .await
+            .is_err());
+        // A rejected op leaves the default in place.
+        assert_eq!(
+            svc.handle("tree", Value::Null).await.unwrap()["pr_source"],
+            json!("poll")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pr_source_op_accepts_a_noop_poll() {
+        let svc = WorktreesService::new();
+        // Selecting the already-active source is a no-op that neither errors nor
+        // spawns a source (no change → no apply).
+        let reply = svc
+            .handle("set-pr-source", json!({ "source": "poll" }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "ok": true }));
+        assert_eq!(
+            svc.handle("tree", Value::Null).await.unwrap()["pr_source"],
+            json!("poll")
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_mode_marks_github_repos_eligible_without_a_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+
+        // Poll mode: a never-toggled repo is not badge-eligible (#1376 default-off,
+        // so `polling_enabled` is skipped on the wire).
+        let tree = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(tree["pr_source"], json!("poll"));
+        assert!(repos_of(&tree)[0].get("polling_enabled").is_none());
+
+        // Webhook mode: every GitHub repo becomes eligible (the lease is moot) and
+        // the snapshot advertises the mode. Set on the registry directly so no live
+        // source is spawned (which would shell out to a real `gh`).
+        svc.registry.set_pr_source(PrSourceMode::Webhook);
+        let tree = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(tree["pr_source"], json!("webhook"));
+        assert_eq!(repos_of(&tree)[0]["polling_enabled"], json!(true));
     }
 
     #[tokio::test]
@@ -4591,6 +5273,129 @@ mod tests {
     }
 
     #[tokio::test]
+    // Same shim-guard discipline as the poller tests: the guard spans both the
+    // stub's write and the source's exec of it.
+    #[allow(clippy::await_holding_lock)]
+    async fn webhook_source_reconcile_populates_the_cache_without_a_polling_lease() {
+        // In webhook mode with no buffer configured the source is reconcile-only,
+        // so the stub `gh` is the whole badge path — and crucially no `set-polling`
+        // lease is needed, because webhook mode marks every GitHub repo eligible.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":123,"isDraft":false,"url":"u"}]}
+            }}}}"#,
+        );
+
+        let svc = WorktreesService::new();
+        svc.registry.set_pr_source(PrSourceMode::Webhook);
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // Start the source directly (test seam): empty config → reconcile-only,
+        // millisecond cadence.
+        svc.start_webhook_source_with(
+            WebhookBufferConfig::default(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            fake,
+        );
+
+        let badge = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(PrResolution::Pr(badge)) =
+                    svc.pr_cache.get("rust-works", "omni-dev", "main")
+                {
+                    return badge;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("webhook-mode reconcile must resolve the badge with no polling lease");
+        assert_eq!(badge.number, 123);
+        svc.shutdown().await;
+    }
+
+    #[test]
+    fn partition_reconcile_targets_keeps_backed_repos_out_of_the_full_rollup() {
+        let t = |owner: &str, name: &str, branch: &str| PrTarget {
+            owner: owner.into(),
+            name: name.into(),
+            branch: branch.into(),
+        };
+        let targets = vec![
+            t("rust-works", "omni-dev", "main"),
+            t("rust-works", "omni-dev", "feature"),
+            t("other", "repo", "main"),
+        ];
+        let mut backed = HashSet::new();
+        backed.insert("rust-works/omni-dev".to_string());
+
+        let (full, metadata) = partition_reconcile_targets(&targets, &backed);
+        // The webhook-backed repo's branches skip the costly rollup query …
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.iter().all(|t| t.owner == "rust-works"));
+        // … and only repos with no webhook get the full reconcile.
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].name, "repo");
+
+        // No backed repos → everything is a full reconcile (poll-mode parity).
+        let (full2, meta2) = partition_reconcile_targets(&targets, &HashSet::new());
+        assert_eq!(full2.len(), 3);
+        assert!(meta2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_status_auto_backs_delivering_repos_and_reports_the_marker() {
+        let svc = WorktreesService::new();
+        // Delivering + explicitly marked.
+        svc.registry
+            .set_webhook_backed("rust-works", "succinctly", true);
+        svc.webhook_activity
+            .lock()
+            .unwrap()
+            .insert("rust-works/succinctly".to_string(), 1_784_559_250_627);
+        // Delivering but NOT marked → effective-backed purely from activity (#1384).
+        svc.webhook_activity
+            .lock()
+            .unwrap()
+            .insert("rust-works/omni-dev".to_string(), 1_784_559_300_000);
+        // Marked but never delivered (a known-hooked but quiet repo).
+        svc.registry.set_webhook_backed("rust-works", "quiet", true);
+
+        let out = svc.handle("webhook-status", Value::Null).await.unwrap();
+        assert_eq!(out["pr_source"], json!("poll")); // default in tests
+        assert_eq!(out["configured"], json!(false)); // no buffer config in tests
+
+        let repos = out["repos"].as_array().unwrap();
+        let find = |name: &str| repos.iter().find(|r| r["name"] == name).unwrap();
+
+        let succ = find("succinctly"); // marked + delivering
+        assert_eq!(succ["backed"], json!(true));
+        assert_eq!(succ["marked"], json!(true));
+        assert_eq!(succ["last_event_ms"], json!(1_784_559_250_627u64));
+
+        let auto = find("omni-dev"); // delivering, not marked → auto-backed
+        assert_eq!(auto["backed"], json!(true), "activity implies backed");
+        assert_eq!(auto["marked"], json!(false));
+
+        let quiet = find("quiet"); // marked, no activity
+        assert_eq!(quiet["backed"], json!(true));
+        assert_eq!(quiet["marked"], json!(true));
+        assert!(quiet["last_event_ms"].is_null(), "no activity → null");
+    }
+
+    #[tokio::test]
     async fn a_commit_invalidates_the_previous_verdict_without_a_poll() {
         // The acceptance criterion: "pushing a new commit invalidates the badge
         // rather than leaving the previous head's verdict standing."
@@ -5385,7 +6190,7 @@ mod tests {
         // No windows → an empty repo set (not an error), toggle at its default.
         assert_eq!(
             svc.handle("tree", Value::Null).await.unwrap(),
-            json!({ "repos": [], "show_closed": true })
+            json!({ "repos": [], "show_closed": true, "pr_source": "poll" })
         );
         // A plain non-repo folder is skipped rather than sinking the op.
         let plain = tempfile::tempdir().unwrap();

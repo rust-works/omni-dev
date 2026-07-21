@@ -43,6 +43,35 @@ pub fn worktrees_polling_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("worktrees-polling.json"))
 }
 
+/// Default webhook-buffer read-token path: `<runtime_dir>/webhook.token`.
+///
+/// When the daemon runs the #1378 webhook (non-polling) PR source it holds a
+/// read/pull token for the buffer. Persisted here (`0600`, the `bridge.token`
+/// precedent) so it stays out of the process table and `settings.json` — a
+/// deliberate departure from ADR-0040's no-secret posture, recorded in ADR-0055.
+pub fn webhook_token_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("webhook.token"))
+}
+
+/// Default PR-source-mode preference path: `<runtime_dir>/pr-source.json`.
+///
+/// The worktrees service persists which live PR-status source is active
+/// (`poll`|`webhook`) here so the daemon-authoritative choice survives a restart
+/// (#1384), mirroring `worktrees-polling.json` (#1376).
+pub fn pr_source_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("pr-source.json"))
+}
+
+/// Default webhook-backed-repos path: `<runtime_dir>/webhook-backed.json`.
+///
+/// The set of GitHub repos with a buffer webhook installed (#1384), so in
+/// `webhook` mode the reconcile poll can skip their expensive rollup query. Set by
+/// `omni-dev daemon webhook register`/`remove`; persisted so it survives a restart,
+/// mirroring `worktrees-polling.json` (#1376).
+pub fn webhook_backed_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("webhook-backed.json"))
+}
+
 /// The bridge token file co-located with a control socket
 /// (`<socket dir>/bridge.token`), so a custom `--socket` keeps its token beside
 /// it. For the default socket this equals [`token_path`].

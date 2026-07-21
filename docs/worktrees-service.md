@@ -386,6 +386,69 @@ the OS default browser and needs no extension.
   gray regardless of per-repo state, and the "Enable/Disable PR Polling" menu items
   are hidden.
 
+#### Live source: `poll` vs. `webhook` (#1384)
+
+The poller above is one of **two** interchangeable live sources behind the same
+badge cache; the `omniDevWorktrees.prStatusSource` VS Code setting selects which is
+active, daemon-wide (the `set-show-closed` authority pattern — the extension sends
+`set-pr-source`, the daemon persists the mode in `pr-source.json`, and echoes the
+active mode as `pr_source` on every snapshot). Both sources feed the **same**
+`PrStatusCache` + change-notify, so the client/tree/tray fan-out is identical.
+
+- **`poll` (default).** Everything above — the adaptive GraphQL poller. Byte-identical
+  to a pre-#1384 daemon.
+- **`webhook`.** For repos **you own**, GitHub webhooks land in an operator-deployed
+  Cloudflare Worker + KV buffer ([`deploy/webhook-buffer/`](../deploy/webhook-buffer/));
+  the daemon **pulls** them outbound (`OMNI_DEV_DAEMON_WEBHOOK_PULL`, default 10 s) and
+  reconstructs the badge from the per-check deltas using the *same* reducer as the poll,
+  so a webhook verdict equals the poll's. A fixed, non-tunable **reconcile poll**
+  (`OMNI_DEV_DAEMON_WEBHOOK_RECONCILE`, default 15 min — well below the buffer's ~3-day
+  KV retention) runs alongside it as the universal fallback: it fills `isDraft`/`url` for
+  CI-only targets, covers repos with no webhook installed, and self-heals a daemon that
+  was offline beyond retention. Configure it with `OMNI_DEV_WEBHOOK_BUFFER_URL` and
+  `OMNI_DEV_WEBHOOK_READ_TOKEN` (or `…_PATH`); install the webhook with
+  [`omni-dev daemon webhook register`](#cli).
+  - **On (re)start the source re-walks the whole retained KV window** (`since=""`),
+    replaying every retained delivery into the aggregator, so it rebuilds as much
+    verdict/metadata/activity state as the buffer still holds rather than starting cold.
+    The aggregator is in-memory, so the pull cursor is deliberately **not** persisted —
+    resuming from a saved cursor would skip exactly the history a restart should recover.
+    The buffer is the source of truth; the reconcile then fills what the window cannot
+    (checks that finished before retention; metadata for a branch with no captured
+    `pull_request` event).
+- **The reconcile is cost-split by webhook-backed-ness.** A repo is **effectively
+  backed** if the daemon has events for it (the `webhook_activity` map, populated
+  from the KV including the restart re-walk) **or** it is explicitly marked. Activity
+  *proves* a working hook — events only arrive from one — so a **delivering repo is
+  auto-backed with no manual step**, and it self-heals (a repo that stops delivering
+  ages out of the activity map across restarts and reverts to the full reconcile).
+  `register` (or the `set-webhook-backed` op) additionally marks a repo backed even
+  while quiet, persisted in `webhook-backed.json`; `remove` unmarks it. A backed
+  repo's reconcile uses a
+  **metadata-only** query — `associatedPullRequests` + the commit `oid`, but **no**
+  `statusCheckRollup` (the up-to-100-node-per-ref cost driver) — because its CI verdict
+  already arrives via webhooks; only repos with **no** webhook get the full rollup as
+  the genuine fallback. Without this split the reconcile rolled up every branch of
+  every open repo, which for a large working set (dozens of repos, hundreds of
+  branches) spends a big slice of the GraphQL budget each cadence — defeating the
+  near-zero-cost premise. **`omni-dev daemon webhook status`** (the `webhook-status`
+  op — queries the daemon only, no GitHub calls) shows, per repo, whether it is
+  `backed` (the marker) and whether the daemon is actually **receiving events** for
+  it (`last_event_ms`); a backed repo with no events is a misconfiguration to chase
+  (or just quiet CI — the daemon cannot tell those apart).
+- **The poll-volume UI disappears in `webhook` mode.** There is no poll volume to
+  manage, so the #1376 **Enable/Disable PR Polling** menu items and green/gray polling
+  icons are hidden (the extension mirrors `pr_source` into a `when`-clause context key);
+  every GitHub repo is badge-eligible. The badge itself renders identically regardless
+  of source.
+- **Secret posture ([ADR-0055](adrs/adr-0055.md)).** `webhook` mode is the one place the
+  worktrees service holds a secret — a **read/pull token**, persisted `0600` at
+  `<data-dir>/omni-dev/webhook.token` (the `bridge.token` precedent), a deliberate,
+  bounded departure from ADR-0040's *"no secret"*. The pull is **outbound-only** (no new
+  local surface — ADR-0036 preserved), the token is redacted from the request log
+  (ADR-0043), and the webhook **HMAC secret never reaches the daemon** — it lives only in
+  the Worker, which verifies each delivery before storing.
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -539,6 +602,14 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
 | `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed), a moved upstream (you pushed — #1344), or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 | `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
+| `OMNI_DEV_DAEMON_WEBHOOK_PULL` | `10` | In [`webhook` mode](#live-source-poll-vs-webhook-1384) (#1384), how often the daemon pulls the buffer's `/events`. A cheap outbound KV read, so a tight loop is what makes badges feel real-time. |
+| `OMNI_DEV_DAEMON_WEBHOOK_RECONCILE` | `900` | In `webhook` mode, how often the fixed reconcile poll runs a full GraphQL resolve — deliberately not adaptive and not user-tunable through any UI. Far below the buffer's ~3-day KV retention, so an offline-beyond-retention daemon self-heals rather than showing stale badges. |
+
+The `webhook` source's connection is resolved separately (via `Settings::get_env_var`,
+not the direct-env pattern above): `OMNI_DEV_WEBHOOK_BUFFER_URL` (the Worker base URL)
+and `OMNI_DEV_WEBHOOK_READ_TOKEN` **or** `OMNI_DEV_WEBHOOK_READ_TOKEN_PATH` (the read
+token inline or from a file). See [`deploy/webhook-buffer/README.md`](../deploy/webhook-buffer/README.md)
+and [ADR-0055](adrs/adr-0055.md).
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
@@ -621,17 +692,20 @@ Ops:
 | `heartbeat`       | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
 | `unregister`      | `{ key }`                                      | `{ removed: <bool> }`                      |
 | `list`            | `null`                                         | `{ windows: [entry, …] }`                  |
-| `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
+| `tree`            | `null`                                         | `{ repos: [repo, …], show_closed, pr_source }` |
 | `ahead-behind`    | `{ paths: [path, …] }`                         | `{ results: { "<path>": { ahead, behind } } }` |
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
+| `set-pr-source`   | `{ source: "poll" \| "webhook" }`              | `{ ok: true }`                             |
+| `set-webhook-backed` | `{ owner, name, backed }`                   | `{ ok: true }`                             |
+| `webhook-status`  | `null`                                         | `{ pr_source, configured, last_pull_ms, last_pull_error, repos: [{owner,name,backed,marked,watched,last_event_ms}] }` |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first ten ops are strictly **request → one reply**. `subscribe` is the one
+The first thirteen ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
-sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
+sequence of `{ ok: true, payload: { repos: …, show_closed, pr_source } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
 not a single reply. It uses no new wire type, so a client that only ever sends the
 other ops is wire-identical to the ADR-0040 contract.

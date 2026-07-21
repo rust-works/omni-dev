@@ -9,6 +9,7 @@ pub(crate) mod service;
 pub(crate) mod start;
 pub(crate) mod status;
 pub(crate) mod stop;
+pub(crate) mod webhook;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -41,6 +42,8 @@ pub enum DaemonSubcommands {
     Logs(logs::LogsCommand),
     /// Controls the daemon-hosted browser bridge (restart, disconnect a tab, …).
     Bridge(bridge::BridgeCommand),
+    /// Manages the non-polling PR-status webhook (register/list/remove/config).
+    Webhook(webhook::WebhookCommand),
     /// Sends an arbitrary operation to any daemon service (low-level escape hatch).
     Service(service::ServiceCommand),
 }
@@ -139,6 +142,7 @@ impl DaemonCommand {
             DaemonSubcommands::Status(cmd) => cmd.execute().await,
             DaemonSubcommands::Logs(cmd) => cmd.execute().await,
             DaemonSubcommands::Bridge(cmd) => cmd.execute().await,
+            DaemonSubcommands::Webhook(cmd) => cmd.execute().await,
             DaemonSubcommands::Service(cmd) => cmd.execute().await,
         }
     }

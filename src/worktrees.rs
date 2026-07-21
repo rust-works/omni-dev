@@ -49,6 +49,48 @@ const DEFAULT_POLL_LEASE: Duration = Duration::from_secs(15 * 60);
 /// companion.
 const MAX_WINDOWS: usize = 256;
 
+/// Which live PR-status source the daemon feeds the badge cache from (#1384).
+///
+/// The VS Code `omniDevWorktrees.prStatusSource` setting selects it and the daemon
+/// is the authority — every window renders the same mode, exactly like
+/// [`show_closed`](WorktreesRegistry::show_closed). `poll` is the default and is
+/// byte-identical to a pre-#1384 daemon; `webhook` swaps the GraphQL poller for the
+/// #1378 buffer pull plus a minimal reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrSourceMode {
+    /// Today's adaptive GraphQL poller ([`crate::pr_status::resolve_with`]).
+    #[default]
+    Poll,
+    /// The webhook buffer: outbound pull → reconstruct → cache, plus a fixed
+    /// low-cadence reconcile poll that self-heals and fills PR metadata.
+    Webhook,
+}
+
+impl PrSourceMode {
+    /// The on-the-wire token (`"poll"`/`"webhook"`), matching the serde encoding
+    /// and the VS Code setting's enum values.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    /// Parses a wire token back to a mode; `None` for anything unrecognised (an
+    /// older/garbled client), so the caller can reject rather than silently pick a
+    /// mode.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "poll" => Some(Self::Poll),
+            "webhook" => Some(Self::Webhook),
+            _ => None,
+        }
+    }
+}
+
 /// A `register` request from a companion extension.
 ///
 /// The companion owns its `key` (a per-`activate()` UUID) so the registry never
@@ -165,6 +207,22 @@ pub struct WorktreesRegistry {
     /// `#[cfg(test)]` `with_poll_ttl` constructor (not linked — it does not exist
     /// in a non-test doc build).
     poll_ttl: Duration,
+    /// The active live PR-status source (#1384), daemon-authoritative like
+    /// [`show_closed`]. Persisted by the service and seeded at startup; a
+    /// `set-pr-source` op flips it and [`bump`](Self::bump)s so every window
+    /// re-renders under the new mode. Behind its own `Mutex`, taken briefly and
+    /// never nested or held across an `.await`.
+    ///
+    /// [`show_closed`]: Self::show_closed
+    pr_source: Mutex<PrSourceMode>,
+    /// GitHub repos (`"owner/name"`) that have a buffer webhook installed (#1384),
+    /// so in `webhook` mode the reconcile poll can **skip their expensive
+    /// `statusCheckRollup`** — their CI verdict arrives via webhook events, and the
+    /// reconcile need only fill PR metadata cheaply. Set by
+    /// [`omni-dev daemon webhook register`](crate) via the `set-webhook-backed` op
+    /// and persisted so it survives a restart. Behind its own `Mutex`, never nested
+    /// or held across an `.await`.
+    webhook_backed: Mutex<HashSet<String>>,
 }
 
 impl WorktreesRegistry {
@@ -179,6 +237,8 @@ impl WorktreesRegistry {
             show_closed: AtomicBool::new(true),
             polling_enabled: Mutex::new(HashMap::new()),
             poll_ttl: DEFAULT_POLL_LEASE,
+            pr_source: Mutex::new(PrSourceMode::default()),
+            webhook_backed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -357,6 +417,87 @@ impl WorktreesRegistry {
             self.bump();
         }
         changed
+    }
+
+    /// The active live PR-status source (#1384), read into every `tree`/`subscribe`
+    /// snapshot so every window renders the same mode and gates its poll-volume UI
+    /// consistently.
+    #[must_use]
+    pub fn pr_source(&self) -> PrSourceMode {
+        *self.pr_source_lock()
+    }
+
+    /// Switches the active PR-status source, returning whether it changed. A real
+    /// change [`bump`](Self::bump)s the change-notify so every subscriber re-pushes
+    /// a snapshot carrying the new `pr_source` — the same cross-window sync the
+    /// [`set_show_closed`](Self::set_show_closed) toggle relies on. Bumps only after
+    /// the guard is released, so the two locks never nest.
+    pub fn set_pr_source(&self, mode: PrSourceMode) -> bool {
+        let mut guard = self.pr_source_lock();
+        let changed = *guard != mode;
+        *guard = mode;
+        drop(guard);
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// Seeds the PR-source mode from the persisted preference at startup, before
+    /// any window subscribes — so unlike [`set_pr_source`](Self::set_pr_source) it
+    /// does **not** bump (there is no one to notify yet, and the service applies
+    /// the source once, directly).
+    pub fn seed_pr_source(&self, mode: PrSourceMode) {
+        *self.pr_source_lock() = mode;
+    }
+
+    /// Locks the PR-source cell, recovering from a poisoned mutex.
+    fn pr_source_lock(&self) -> MutexGuard<'_, PrSourceMode> {
+        self.pr_source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Marks (or unmarks) the GitHub repo `owner/name` as webhook-backed (#1384),
+    /// returning whether the set changed. A real change [`bump`](Self::bump)s so any
+    /// snapshot stamp re-renders. Set by `daemon webhook register`/`remove`.
+    pub fn set_webhook_backed(&self, owner: &str, name: &str, backed: bool) -> bool {
+        let key = polling_key(owner, name);
+        let mut set = self
+            .webhook_backed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let changed = if backed {
+            set.insert(key)
+        } else {
+            set.remove(&key)
+        };
+        drop(set);
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// The webhook-backed repos as a set of `"owner/name"` keys — what the webhook
+    /// source's reconcile reads to route each repo to the cheap metadata-only query
+    /// (backed) or the full rollup query (not backed). Cloned out so the lock is
+    /// never held across the reconcile.
+    #[must_use]
+    pub fn webhook_backed_repos(&self) -> HashSet<String> {
+        self.webhook_backed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Seeds the webhook-backed set from the persisted file at startup, before any
+    /// window subscribes — so it does not bump.
+    pub fn seed_webhook_backed(&self, repos: impl IntoIterator<Item = String>) {
+        *self
+            .webhook_backed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = repos.into_iter().collect();
     }
 
     /// Locks the per-repo PR-poll lease map (`"owner/name"` → lease-expiry
@@ -992,6 +1133,59 @@ mod tests {
             rx.has_changed().unwrap(),
             "flipping the toggle should bump the change-notify"
         );
+    }
+
+    #[test]
+    fn pr_source_defaults_to_poll() {
+        let reg = WorktreesRegistry::new();
+        assert_eq!(reg.pr_source(), PrSourceMode::Poll);
+        // Wire round-trip: the default token is `"poll"`.
+        assert_eq!(PrSourceMode::default().as_wire(), "poll");
+        assert_eq!(
+            PrSourceMode::from_wire("webhook"),
+            Some(PrSourceMode::Webhook)
+        );
+        assert_eq!(PrSourceMode::from_wire("nope"), None);
+    }
+
+    #[test]
+    fn set_pr_source_reports_change_bumps_only_on_change_and_seed_is_silent() {
+        let reg = WorktreesRegistry::new();
+        let rx = reg.subscribe_changes();
+        // A no-op set (already poll) neither reports a change nor wakes anyone.
+        assert!(!reg.set_pr_source(PrSourceMode::Poll));
+        assert!(!rx.has_changed().unwrap());
+        // A real switch reports a change and bumps.
+        assert!(reg.set_pr_source(PrSourceMode::Webhook));
+        assert_eq!(reg.pr_source(), PrSourceMode::Webhook);
+        assert!(rx.has_changed().unwrap());
+        // Seeding at startup replaces the value without bumping (no subscribers yet).
+        let seeded = WorktreesRegistry::new();
+        let srx = seeded.subscribe_changes();
+        seeded.seed_pr_source(PrSourceMode::Webhook);
+        assert_eq!(seeded.pr_source(), PrSourceMode::Webhook);
+        assert!(!srx.has_changed().unwrap(), "seeding must not bump");
+    }
+
+    #[test]
+    fn set_webhook_backed_tracks_repos_bumps_on_change_and_seeds_silently() {
+        let reg = WorktreesRegistry::new();
+        let rx = reg.subscribe_changes();
+        assert!(reg.webhook_backed_repos().is_empty());
+        // Marking a repo backed reports a change and bumps.
+        assert!(reg.set_webhook_backed("rust-works", "omni-dev", true));
+        assert!(reg.webhook_backed_repos().contains("rust-works/omni-dev"));
+        assert!(rx.has_changed().unwrap());
+        // Re-marking is a no-op; unmarking reports a change.
+        assert!(!reg.set_webhook_backed("rust-works", "omni-dev", true));
+        assert!(reg.set_webhook_backed("rust-works", "omni-dev", false));
+        assert!(reg.webhook_backed_repos().is_empty());
+        // Seeding replaces without bumping.
+        let seeded = WorktreesRegistry::new();
+        let srx = seeded.subscribe_changes();
+        seeded.seed_webhook_backed(["a/b".to_string(), "c/d".to_string()]);
+        assert_eq!(seeded.webhook_backed_repos().len(), 2);
+        assert!(!srx.has_changed().unwrap(), "seeding must not bump");
     }
 
     #[test]

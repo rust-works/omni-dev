@@ -67,6 +67,8 @@ use crate::browser::BridgeConfig;
 #[cfg(unix)]
 use crate::snowflake::SnowflakeEngineConfig;
 #[cfg(unix)]
+use crate::webhook_buffer::WebhookBufferConfig;
+#[cfg(unix)]
 use registry::ServiceRegistry;
 #[cfg(unix)]
 use server::DaemonOptions;
@@ -123,9 +125,25 @@ pub async fn build_default_registry(
     registry.register(Arc::new(bridge));
     let snowflake = SnowflakeService::new(SnowflakeEngineConfig::from_env_and_settings()?);
     registry.register(Arc::new(snowflake));
+    // Resolve the webhook-buffer connection (#1384). The daemon holds a read/pull
+    // token in `webhook` mode — a deliberate departure from ADR-0040's no-secret
+    // posture (see ADR-0055) — persisted `0600` like `bridge.token` so it stays out
+    // of the process table and settings.json. The HMAC secret never reaches the
+    // daemon (it lives only in the Worker).
+    let webhook_config = WebhookBufferConfig::from_env_and_settings()?;
+    if let Some(token) = webhook_config.read_token.as_deref() {
+        match crate::daemon::paths::webhook_token_path() {
+            Ok(path) => {
+                if let Err(err) = persist_webhook_token(&path, token) {
+                    tracing::warn!("could not persist webhook read token: {err:#}");
+                }
+            }
+            Err(err) => tracing::warn!("webhook token path unavailable: {err:#}"),
+        }
+    }
     // Start the off-thread menu-refresh loop so the tray serves a cached menu
     // instead of running git enrichment on the macOS GUI thread (#1186 fix).
-    let worktrees = WorktreesService::new();
+    let worktrees = WorktreesService::new().with_webhook_config(webhook_config);
     // Seed the per-repo PR-poll enable set from its persisted `0600` file so the
     // user's choices survive a restart; the poller reads it below (#1376). A path
     // that cannot be resolved (no data dir) just disables persistence.
@@ -133,10 +151,24 @@ pub async fn build_default_registry(
         Ok(path) => worktrees.load_polling_prefs(path),
         Err(err) => tracing::warn!("worktrees polling prefs disabled: {err:#}"),
     }
+    // Seed the active PR-source mode (#1384) so the daemon-wide poll↔webhook choice
+    // survives a restart; `apply_pr_source` below starts the matching source.
+    match crate::daemon::paths::pr_source_path() {
+        Ok(path) => worktrees.load_pr_source_pref(path),
+        Err(err) => tracing::warn!("pr-source pref disabled: {err:#}"),
+    }
+    // Seed the webhook-backed repo set (#1384) so `webhook` mode's reconcile can
+    // skip the rollup for repos with a webhook installed, across a restart.
+    match crate::daemon::paths::webhook_backed_path() {
+        Ok(path) => worktrees.load_webhook_backed_pref(path),
+        Err(err) => tracing::warn!("webhook-backed pref disabled: {err:#}"),
+    }
     worktrees.start_menu_refresh();
-    // Keep PR check badges fresh for every open window from one `gh` call, rather
-    // than each window resolving its own and none of them ever re-asking (#1337).
-    worktrees.start_pr_poller();
+    // Start the selected live PR source (#1384): `poll` keeps one `gh` call fresh
+    // for every open window (#1337); `webhook` swaps it for the buffer pull + a
+    // low-cadence reconcile. Both feed the same badge cache, so the tree/tray
+    // fan-out is identical. Default is `poll` — byte-identical to a pre-#1384 daemon.
+    worktrees.apply_pr_source(worktrees.pr_source()).await;
     // Watch the GitHub API budget the PR poller (and every other `gh` on the box)
     // spends, so `daemon status` / the tray surface an approaching exhaustion before
     // it rate-limits everything — polling `/rate_limit` is exempt, so this is free
@@ -158,6 +190,17 @@ pub async fn build_default_registry(
     github_counters.start_counter_logger();
     registry.register(Arc::new(github_counters));
     Ok(registry)
+}
+
+/// Persists the webhook-buffer read token to `path` (`0600`, parent dir `0700`) —
+/// the `BridgeService` token-at-rest pattern (#1384 / ADR-0055). The `0600` writer
+/// contributes its own error context.
+#[cfg(unix)]
+fn persist_webhook_token(path: &Path, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::daemon::paths::ensure_dir_0700(parent)?;
+    }
+    crate::daemon::paths::write_file_0600(path, token.as_bytes())
 }
 
 /// Runs the daemon headlessly (no tray).

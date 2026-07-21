@@ -1,0 +1,25 @@
+{
+  "event": "status",
+  "delivery": "sample-status",
+  "received": 1721433615000,
+  "payload": {
+    "id": 8888888,
+    "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+    "state": "success",
+    "context": "ci/deploy-preview",
+    "description": "Deploy preview ready",
+    "target_url": "https://example.com/deploy/logs",
+    "branches": [
+      {
+        "name": "feature/spike",
+        "commit": { "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112" }
+      }
+    ],
+    "repository": {
+      "name": "widget",
+      "full_name": "acme/widget",
+      "owner": { "login": "acme" }
+    },
+    "sender": { "login": "octocat" }
+  }
+}

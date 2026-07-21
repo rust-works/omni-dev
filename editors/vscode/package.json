@@ -198,12 +198,12 @@
         },
         {
           "command": "omniDevWorktrees.enablePolling",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-off/ && omniDevWorktrees.showPullRequests",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-off/ && omniDevWorktrees.showPullRequests && omniDevWorktrees.prStatusSource != webhook",
           "group": "1_pr@0"
         },
         {
           "command": "omniDevWorktrees.disablePolling",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-on/ && omniDevWorktrees.showPullRequests",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^repo\\.github\\.polling-on/ && omniDevWorktrees.showPullRequests && omniDevWorktrees.prStatusSource != webhook",
           "group": "1_pr@0"
         },
         {
@@ -267,6 +267,17 @@
           "type": "string",
           "default": "claude",
           "markdownDescription": "Command run in the terminal opened by the **Open Claude Code** title-bar button (default `claude`). A shell prefix is allowed, e.g. `proxy && claude`."
+        },
+        "omniDevWorktrees.prStatusSource": {
+          "type": "string",
+          "enum": ["poll", "webhook"],
+          "enumDescriptions": [
+            "Resolve PR/CI badges with the daemon's GraphQL poller (the default). ~Free and works for any repo.",
+            "Drive badges in real time from a webhook buffer for repos you own, with a low-cadence reconcile poll as the fallback. Requires a deployed buffer (deploy/webhook-buffer/) and an installed webhook on each owned repo; other repos fall back to the reconcile poll."
+          ],
+          "default": "poll",
+          "scope": "application",
+          "markdownDescription": "Which live source resolves the PR/CI badges (#1384). `poll` (default) uses the daemon's GraphQL poller. `webhook` drives badges in real time from a webhook buffer for repos **you own** — it requires a deployed buffer (`deploy/webhook-buffer/`) and a webhook installed on each owned repo (`omni-dev daemon webhook register`); repos without a webhook fall back to a low-cadence reconcile poll. In `webhook` mode the per-repo **Enable/Disable PR Polling** controls are hidden, since there is no poll volume to manage. The daemon is the authority, so this applies to every window."
         }
       }
     }

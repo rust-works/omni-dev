@@ -11,7 +11,6 @@ import {
   WorktreeNode,
   checkStateDecoration,
   isCurrentWindow,
-  needsPrFallback,
   nodeDirectories,
   nodeId,
   partitionByRole,
@@ -22,9 +21,7 @@ import {
   repoPollingEnabled,
   reposToNodes,
   selectionTargets,
-  unbadgedBranches,
   withAheadBehind,
-  withPr,
   withoutPrBadges,
   worktreeCheckDecoration,
   worktreeContextValue,
@@ -298,16 +295,6 @@ test("checkStateDecoration maps a bare check state, undefined for none", () => {
   assert.equal(checkStateDecoration("none"), undefined);
 });
 
-test("withPr folds a badge in, and no-ops when absent", () => {
-  const base = REPOS[0].worktrees[0]; // carries no pr
-  const merged = withPr(base, OPEN_PR);
-  assert.deepEqual(merged.pr, OPEN_PR);
-  // The original is not mutated (a fresh object is returned).
-  assert.equal(base.pr, undefined);
-  // An absent badge leaves the worktree untouched — same reference.
-  assert.equal(withPr(base, undefined), base);
-});
-
 test("worktreeDescription shows sync and PR together, each only when present", () => {
   // Sync only (no PR) — byte-for-byte the pre-#1296 behavior.
   assert.equal(worktreeDescription(REPOS[0].worktrees[0]), "↑2 ↓0");
@@ -413,45 +400,6 @@ test("withoutPrBadges returns the input unchanged when there is nothing to strip
 });
 
 // --- The explicit "no open PR" negative (#1370) ------------------------------
-
-test("needsPrFallback is off for a daemon-reported badge or negative", () => {
-  const base: TreeWorktreePayload = { path: "/r", branch: "main", is_main: true, open: true };
-  // Both absent: the daemon never resolved this branch (or is pre-#1370) — the
-  // only case the degraded gh fallback should cover.
-  assert.equal(needsPrFallback(base), true);
-  // A badge answers the question.
-  assert.equal(needsPrFallback({ ...base, pr: OPEN_PR }), false);
-  // So does the explicit negative — this is the #1370 fix.
-  assert.equal(needsPrFallback({ ...base, pr_none: true }), false);
-  // No branch → nothing to look up, regardless of the rest.
-  assert.equal(needsPrFallback({ path: "/r", is_main: true, open: true }), false);
-});
-
-test("unbadgedBranches lists only branches the daemon left unresolved", () => {
-  const repo: TreeRepoPayload = {
-    main_repo: "omni-dev",
-    github: { owner: "rust-works", name: "omni-dev" },
-    root: "/r",
-    worktrees: [
-      // Badged by the daemon: needs nothing.
-      { path: "/r", branch: "main", is_main: true, open: true, pr: OPEN_PR },
-      // Checked, no PR: the negative keeps it out of the fallback.
-      { path: "/w1", branch: "quiet", is_main: false, open: true, pr_none: true },
-      // Neither: unresolved (a pre-#1370 daemon, or the poll has not landed).
-      { path: "/w2", branch: "pending-branch", is_main: false, open: false },
-      // Branchless (detached): nothing to look up.
-      { path: "/w3", is_main: false, open: false },
-    ],
-  };
-  assert.deepEqual(unbadgedBranches(worktreeNodes(repo)), ["pending-branch"]);
-  // With every branch badged or negative, the fallback has nothing to do — the
-  // provider's `unbadged.length > 0` gate then never invokes the gh fetcher.
-  const allAnswered: TreeRepoPayload = {
-    ...repo,
-    worktrees: repo.worktrees.filter((wt) => wt.branch !== "pending-branch"),
-  };
-  assert.deepEqual(unbadgedBranches(worktreeNodes(allAnswered)), []);
-});
 
 test("a pr_none worktree renders no badge, decoration, or tooltip PR line", () => {
   const wt: TreeWorktreePayload = {

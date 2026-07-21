@@ -153,31 +153,6 @@ export function withoutPrBadges(repos: TreeRepoPayload[]): TreeRepoPayload[] {
   }));
 }
 
-/**
- * Folds a lazily-resolved {@link PrBadge} into a worktree payload, returning a new
- * payload carrying it (#1296) — the PR counterpart of {@link withAheadBehind}. An
- * absent badge (no GitHub identity, no matching PR, or not yet fetched) leaves the
- * worktree unchanged, so it renders with no PR indicator.
- */
-export function withPr(wt: TreeWorktreePayload, pr?: PrBadge): TreeWorktreePayload {
-  if (pr === undefined) {
-    return wt;
-  }
-  return { ...wt, pr };
-}
-
-/**
- * Whether the daemon left this worktree's PR state **unresolved** — a branch
- * carrying neither a badge (`pr`) nor the explicit negative (`pr_none`, #1370).
- * Only these branches go to the degraded per-window `gh pr list` fallback:
- * against a current daemon every checked branch carries one or the other, so the
- * fallback runs no `gh` at all. Shared by the provider's fallback collection and
- * its merge guard so the two sites cannot drift.
- */
-export function needsPrFallback(wt: TreeWorktreePayload): boolean {
-  return wt.branch !== undefined && !wt.pr && !wt.pr_none;
-}
-
 /** One repository with **all** its worktrees, as it appears in the `tree` payload. */
 export interface TreeRepoPayload {
   /** The main repository's directory name (daemon-computed). */
@@ -209,6 +184,13 @@ export interface TreeSnapshot {
    * read as `true` (show all, the original behavior).
    */
   show_closed?: boolean;
+  /**
+   * The daemon's active live PR-status source (#1384): `"poll"` (default) or
+   * `"webhook"`. Carried on every snapshot so all windows render the same mode and
+   * gate the poll-volume UI in lock-step. Optional for forward-compatibility: an
+   * older daemon that omits it is read as `"poll"`.
+   */
+  pr_source?: "poll" | "webhook";
 }
 
 /**
@@ -237,18 +219,6 @@ export function reposToNodes(repos: TreeRepoPayload[]): Node[] {
 export function worktreeNodes(repo: TreeRepoPayload, showClosed = true): Node[] {
   const worktrees = showClosed ? repo.worktrees : repo.worktrees.filter((wt) => wt.open);
   return worktrees.map((wt) => ({ kind: "worktree", repo, wt }));
-}
-
-/**
- * The branches among `nodes` that {@link needsPrFallback} — the only ones handed
- * to the degraded `gh pr list` fallback (#1370), in tree order.
- */
-export function unbadgedBranches(nodes: Node[]): string[] {
-  return nodes.flatMap((n) =>
-    n.kind === "worktree" && n.wt.branch !== undefined && needsPrFallback(n.wt)
-      ? [n.wt.branch]
-      : [],
-  );
 }
 
 /** A repo's display label: `owner/name` for GitHub repos, else its `main_repo`. */

@@ -21,12 +21,11 @@ import {
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
   setPollingEnvelope,
+  setPrSourceEnvelope,
   setShowClosedEnvelope,
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
-import { runGh } from "./gh";
-import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
 import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
@@ -34,8 +33,6 @@ import { moveClaudeSessionHere } from "./moveSessionCommand";
 import {
   AheadBehindMap,
   Node,
-  PrBadge,
-  TreeGithubIdentity,
   TreeRepoPayload,
   WorktreeNode,
   isCurrentWindow,
@@ -77,6 +74,15 @@ const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
  * activation and on every configuration change (see {@link applyShowPullRequests}).
  */
 const SHOW_PR_KEY = "omniDevWorktrees.showPullRequests";
+
+/**
+ * The `when`-clause context key mirroring the daemon's active PR-status source
+ * (#1384). Driven from every pushed `tree` snapshot's `pr_source` (see
+ * {@link applyPrSource}), so the poll-volume UI — the #1376 Enable/Disable PR
+ * Polling items — is hidden in `webhook` mode, where there is no poll volume to
+ * manage. Defaults to `"poll"` until the first snapshot lands.
+ */
+const PR_SOURCE_KEY = "omniDevWorktrees.prStatusSource";
 
 /**
  * How close (ms) two clicks on the same item must be to count as a double-click.
@@ -125,6 +131,15 @@ function heartbeatMs(): number {
 /** Whether to show each worktree's GitHub PR badge (#1296). */
 function showPullRequests(): boolean {
   return config().get<boolean>("showPullRequests") ?? true;
+}
+
+/**
+ * The live PR-status source this user selects (#1384): `"poll"` (default) or
+ * `"webhook"`. Forwarded to the daemon (the authority) via `set-pr-source`; the
+ * daemon then echoes the active mode on every snapshot's `pr_source`.
+ */
+function prStatusSource(): "poll" | "webhook" {
+  return config().get<string>("prStatusSource") === "webhook" ? "webhook" : "poll";
 }
 
 /**
@@ -180,78 +195,13 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
   return results ?? {};
 }
 
-/** How long a repo's open-PR list is reused before a fresh `gh` fetch (#1296). */
-const PR_CACHE_TTL_MS = 60_000;
-
-interface PrCacheEntry {
-  /** When this repo's PRs were fetched (`Date.now()`). */
-  at: number;
-  /** The repo's open PRs, or `[]` (also cached on a `gh` failure — see below). */
-  prs: PullRequest[];
-}
-
-/** Per-repo (`owner/name`) cache of the last `gh pr list`, TTL'd by {@link PR_CACHE_TTL_MS}. */
-const prCache = new Map<string, PrCacheEntry>();
-
-/**
- * The repo's open PRs, from cache when fresh, else one `gh pr list`. A `gh`
- * failure — missing binary, not authed, unknown repo — is **cached as an empty
- * list** for the TTL and logged once, so a missing `gh` is not re-spawned on every
- * pushed snapshot; the explicit "Open Pull Request…" action still surfaces the
- * real error.
- */
-async function cachedRepoPrs(repo: TreeGithubIdentity): Promise<PullRequest[]> {
-  const key = `${repo.owner}/${repo.name}`;
-  const now = Date.now();
-  const hit = prCache.get(key);
-  if (hit && now - hit.at < PR_CACHE_TTL_MS) {
-    return hit.prs;
-  }
-  try {
-    const prs = parsePrList(await runGh(prListArgsForRepo(repo)));
-    prCache.set(key, { at: now, prs });
-    return prs;
-  } catch (err) {
-    prCache.set(key, { at: now, prs: [] });
-    output?.appendLine(
-      `pr badges skipped for ${key}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return [];
-  }
-}
-
-/**
- * Resolves a **degraded** PR badge for each branch the daemon left unresolved —
- * the {@link PrBadgeFetcher} injected into the tree provider.
- *
- * Badges are resolved daemon-side since #1337: one `gh api graphql` covers every
- * repo and branch, and a background poller keeps CI state live in every window.
- * A current daemon reports every checked branch as either a badge (`pr`) or the
- * explicit "no open PR" negative (`pr_none`, #1370), and the provider asks only
- * for branches carrying neither — so against a current daemon this runs no `gh`
- * at all. (Before #1370 a PR-less branch was indistinguishable from an unchecked
- * one, which kept this firing per window × repo × 60s forever.) Against a
- * pre-#1370 daemon the unresolved branches land here and it reports the PR
- * number without a checks glyph (see {@link prFallbackBadge}) — the intended
- * degraded path. A no-op when `showPullRequests` is off.
- */
-async function fetchPrBadges(
-  repo: TreeGithubIdentity,
-  branches: string[],
-): Promise<Record<string, PrBadge>> {
-  if (!showPullRequests()) {
-    return {};
-  }
-  const prs = await cachedRepoPrs(repo);
-  const badges: Record<string, PrBadge> = {};
-  for (const branch of branches) {
-    const badge = prFallbackBadge(prs, branch);
-    if (badge) {
-      badges[branch] = badge;
-    }
-  }
-  return badges;
-}
+// PR badges are resolved **only** by the daemon (#1337/#1384): one shared
+// `gh api graphql` (or the webhook buffer) covers every repo/branch for every
+// window, pushed on the tree snapshot as `pr`/`pr_none`. The extension no longer
+// runs its own `gh pr list` fallback — a per-window duplicate that isn't shared
+// and burst on every daemon (re)start. A branch the daemon has not resolved yet
+// simply shows no badge until the daemon resolves it and pushes an update; the
+// window waits for the daemon rather than self-serving.
 
 async function register(): Promise<void> {
   await send(registerEnvelope(registerPayload()));
@@ -370,9 +320,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 function setupTreeView(context: vscode.ExtensionContext): void {
   // `windowKey` is assigned in `activate()` before this runs, so the provider can
   // mark this window's own worktree distinctly from those open in other windows.
-  // The provider fetches ahead/behind (#1306) and PR badges (#1296) lazily on
-  // expand via the injected `fetchAheadBehind` / `fetchPrBadges`.
-  const treeProvider = new WorktreesTreeDataProvider(windowKey, fetchAheadBehind, fetchPrBadges);
+  // The provider fetches ahead/behind (#1306) lazily on expand via the injected
+  // `fetchAheadBehind`; PR badges come entirely from the daemon snapshot.
+  const treeProvider = new WorktreesTreeDataProvider(windowKey, fetchAheadBehind);
   provider = treeProvider;
 
   // Seed the button/filter to the default (show all) before the first render;
@@ -382,6 +332,11 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // Seed the PR-master context key + icon-colour flag from the current setting
   // (#1376), so the per-repo toggle menu and green icons reflect it from frame one.
   applyShowPullRequests();
+  // Seed the PR-source context key from the setting so the poll-volume UI is
+  // gated from frame one, and forward the setting to the daemon (the authority),
+  // which echoes the active mode back on every snapshot (#1384).
+  applyPrSource(prStatusSource());
+  void setPrSource();
 
   // `canSelectMany` makes every item command plural: VS Code then invokes them as
   // `(clicked, selected[])`, and each handler resolves its targets through
@@ -414,6 +369,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
       applyShowClosed(snapshot.show_closed);
+      // The active PR-source mode rides along too (#1384), so the poll-volume UI
+      // hides/shows in lock-step across every window.
+      applyPrSource(snapshot.pr_source);
       // A new snapshot re-runs the lazy PR-badge fetch, so re-evaluate every row's
       // check colour (state-keyed URIs already re-decorate; this covers the rest).
       decorations.refresh();
@@ -506,6 +464,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
         applyShowPullRequests();
         void refreshTree();
       }
+      // Selecting a new PR source (#1384) forwards it to the daemon; the pushed
+      // snapshot's `pr_source` then drives the context key everywhere. The local
+      // seed keeps this window's poll-volume UI in step without waiting a tick.
+      if (e.affectsConfiguration(`${CONFIG_SECTION}.prStatusSource`)) {
+        applyPrSource(prStatusSource());
+        void setPrSource();
+      }
     }),
   );
 }
@@ -547,6 +512,30 @@ function applyShowPullRequests(): void {
   const on = showPullRequests();
   void vscode.commands.executeCommand("setContext", SHOW_PR_KEY, on);
   provider?.setShowPullRequests(on);
+}
+
+/**
+ * Applies an authoritative PR-source mode — from a daemon snapshot or the
+ * pre-snapshot default — to this window's UI (#1384): flips the `when`-clause
+ * context key that hides the poll-volume UI (the #1376 Enable/Disable PR Polling
+ * items) while the source is `webhook`. Never persists or sends; the daemon owns
+ * the state. A `pr_source` omitted by an older daemon degrades to `"poll"`.
+ */
+function applyPrSource(source: "poll" | "webhook" = "poll"): void {
+  void vscode.commands.executeCommand("setContext", PR_SOURCE_KEY, source);
+  provider?.setPrSource(source);
+}
+
+/**
+ * Forwards this window's `omniDevWorktrees.prStatusSource` setting to the daemon
+ * via `set-pr-source` (#1384). The daemon is the authority and pushes a fresh
+ * `tree` snapshot carrying the new `pr_source` to every window, whose `onSnapshot`
+ * then drives {@link applyPrSource} — the `set-show-closed` reconcile pattern.
+ * Sent on activation and on every configuration change; a missing daemon is a
+ * silent no-op (the shared `send` logs it).
+ */
+async function setPrSource(): Promise<void> {
+  await send(setPrSourceEnvelope(prStatusSource()));
 }
 
 /**
@@ -1098,6 +1087,8 @@ async function refreshTree(): Promise<void> {
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
     applyShowClosed(reply.payload.show_closed);
+    // …and `pr_source` (#1384), so the poll-volume UI stays correctly gated.
+    applyPrSource(reply.payload.pr_source);
     // Re-evaluate the PR-check colours for the freshly-fetched rows (#1324).
     decorationProvider?.refresh();
     if (treeView) {

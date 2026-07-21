@@ -10,7 +10,6 @@ import {
   dedupePullRequests,
   discoverPullRequests,
   parsePrList,
-  prFallbackBadge,
   prListArgsForBranch,
   prListArgsForRepo,
   prOverviewUri,
@@ -154,59 +153,11 @@ test("discoverPullRequests returns [] for a detached worktree without calling gh
   assert.equal(called, false);
 });
 
-// --- PR badge (#1296): checks rollup + branch matching -----------------------
-
-// The rollup reducer moved to the daemon with #1337 (badges are resolved there
-// now, and kept live by its poller); its coverage moved with it, to the Rust unit
-// tests in `src/pr_status.rs`. What remains extension-side is the degraded
-// fallback used only against a daemon too old to supply `pr`.
-
-const FALLBACK_PRS: PullRequest[] = [
-  {
-    number: 65,
-    title: "Add thing",
-    url: "https://github.com/o/r/pull/65",
-    headRefName: "feature",
-    baseRefName: "main",
-    isDraft: true,
-    state: "OPEN",
-  },
-  {
-    number: 66,
-    title: "Other",
-    url: "https://github.com/o/r/pull/66",
-    headRefName: "other",
-    baseRefName: "main",
-    isDraft: false,
-    state: "OPEN",
-  },
-];
-
-test("prFallbackBadge matches the head branch and carries the PR, never a check state", () => {
-  const badge = prFallbackBadge(FALLBACK_PRS, "feature");
-  assert.deepEqual(badge, {
-    number: 65,
-    isDraft: true,
-    // Deliberately never a verdict: nothing extension-side polls, so a checks
-    // glyph here could not refresh and a stale one is worse than none (#1337).
-    checks: "none",
-    url: "https://github.com/o/r/pull/65",
-  });
-});
-
-test("prFallbackBadge returns undefined for no branch or no head match", () => {
-  assert.equal(prFallbackBadge(FALLBACK_PRS, undefined), undefined);
-  assert.equal(prFallbackBadge(FALLBACK_PRS, "nope"), undefined);
-  assert.equal(prFallbackBadge([], "feature"), undefined);
-});
-
-test("prFallbackBadge takes the first head match", () => {
-  const dupes: PullRequest[] = [
-    { ...FALLBACK_PRS[0], number: 1 },
-    { ...FALLBACK_PRS[0], number: 2 },
-  ];
-  assert.equal(prFallbackBadge(dupes, "feature")?.number, 1);
-});
+// PR badges (#1296) are resolved entirely by the daemon now (#1337/#1384) and
+// pushed on the tree snapshot; the extension no longer has a `gh pr list` badge
+// fallback, so its former coverage lives in the Rust unit tests in
+// `src/pr_status.rs`. `gh pr list` remains only for the user-triggered "Open Pull
+// Request…" discovery, covered by the parse/scope tests above and below.
 
 // --- Scope mapping and multi-select fan-out (#1357) --------------------------
 
