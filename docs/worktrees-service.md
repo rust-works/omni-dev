@@ -492,6 +492,23 @@ the monitor costs nothing against the very budget it watches, and needs no adapt
 backoff (unlike the PR poller). It lives alongside the PR poller in the worktrees
 service because that is the daemon's `gh` consumer, but the reading is machine-wide.
 
+Two refinements ride #1389 (fix 8):
+
+- **Every PR poll is a free budget reading (8a).** The badge query carries a
+  `rateLimit { limit cost remaining used resetAt }` block — a meta-field GitHub
+  answers *without* adding to the query's own `cost` — so each poll folds a fresh
+  **graphql** reading into the shared cache (`observe_graphql`, preserving the
+  standalone poller's `core`/`search`). The block's `cost` also reports the poll's
+  **actual** point price, which is how the "1 point per poll" claim is verified at
+  scale rather than assumed (measured `cost: 1` at 37 branches; it rises to 2 near
+  100 branches, 4 near 200 — see [pr_status.rs](../src/pr_status.rs)). The poll logs
+  it at debug: `PR poll cost 1 point(s); graphql 123/5000 used, 4877 remaining`.
+- **The standalone poller idles when nothing is watched (8b).** Because the graphql
+  figure now stays fresh from the PR polls, the `/rate_limit` loop only spends a
+  subprocess while a window is registered **or** a polling lease is active; a
+  fully-idle daemon leaves the last reading in place. The read is free against the
+  budget, but the wakeups are not.
+
 It surfaces three ways:
 
 - **`omni-dev daemon status`** gains a top-level line above the per-service rows,
@@ -585,7 +602,7 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
 | `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is pending and fresh** (#1337), and how often it wakes to look. While pending it holds this fast rate for ~2 minutes after a push, then escalates ×2 toward a 60 s ceiling (#1389); once every badge is terminal it backs off ×2 to a 30-minute ceiling, and it asks nothing while no window is registered — so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a **grown** watch (an added branch, or a moved upstream — you pushed, #1344) makes it ask immediately regardless of the backoff, but a **local commit** (#1389) and a pure **removal** (#1389) do not. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
 | `OMNI_DEV_DAEMON_PR_DEBOUNCE` | `2` | How long the PR poller waits for the change-notify to go quiet before snapshotting (#1389), so a VS Code or daemon restart's one-window-at-a-time re-registration storm collapses into a single fetch on the final watch set instead of one per window. Bounded (~4× this) so a steady drip of changes cannot postpone a poll forever. |
-| `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
+| `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A fixed cadence with no backoff (the read is exempt), but **gated on activity** (#1389, fix 8b): it only spends a subprocess while a window is registered or a polling lease is active — an idle daemon leaves the last reading in place, and the graphql figure stays fresh from each PR poll's folded-in budget (fix 8a). One free `gh` subprocess per interval while active. |
 | `OMNI_DEV_DAEMON_OPEN_PR_TTL` | `60` | How long the daemon reuses a repo's `gh pr list` result before re-fetching, backing the shared [`open-prs`](#companion-contract-for-the-extension-and-other-clients) op (#1389, fix 7). Within the TTL, every window's "Open Pull Request…" lookup for that repo — and any transient badge fallback — is served from the one cached list, so N windows cost one counted `gh`, not N. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency

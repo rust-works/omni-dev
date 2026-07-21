@@ -647,16 +647,19 @@ impl WorktreesService {
                             Some(PrWarmStart { watched, polled_at });
                     }
                 }
-                Err(err) => tracing::warn!(
-                    "ignoring unreadable worktrees PR cache at {}: {err:#}",
-                    path.display()
-                ),
+                // Bind the path so it is formatted whenever the branch runs — not
+                // only when a WARN subscriber is installed — so coverage sees it
+                // (the `let summary = …` pattern the rate-limit warn uses).
+                Err(err) => {
+                    let at = path.display();
+                    tracing::warn!("ignoring unreadable worktrees PR cache at {at}: {err:#}");
+                }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!(
-                "could not read worktrees PR cache at {}: {err:#}",
-                path.display()
-            ),
+            Err(err) => {
+                let at = path.display();
+                tracing::warn!("could not read worktrees PR cache at {at}: {err:#}");
+            }
         }
         *self
             .pr_cache_path
@@ -961,7 +964,7 @@ impl WorktreesService {
                 // badges this round", and neither deserves its own handling.
                 let bin = gh_bin.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    crate::pr_status::resolve_with(&bin, &targets)
+                    crate::pr_status::resolve_with_budget(&bin, &targets)
                 })
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("blocking poll task failed: {err}")));
@@ -972,7 +975,27 @@ impl WorktreesService {
                 // blanking every row, and is not "pending", so it backs off rather
                 // than hammers.
                 let (pending, resolved_ok) = match resolved {
-                    Ok(resolutions) => {
+                    Ok((resolutions, budget)) => {
+                        // Fold the free budget reading this poll carried into the
+                        // shared cache (#1389, fix 8): the graphql figure stays fresh
+                        // whenever polling is active, which lets the standalone
+                        // `/rate_limit` poller idle (fix 8b), and the poll's `cost`
+                        // reveals the real per-call point price.
+                        if let Some(b) = budget {
+                            tracing::debug!(
+                                "PR poll cost {} point(s); graphql {}/{} used, {} remaining",
+                                b.cost,
+                                b.used,
+                                b.limit,
+                                b.remaining
+                            );
+                            rate_limit_cache.observe_graphql(RateLimitResource::new(
+                                b.used,
+                                b.limit,
+                                b.remaining,
+                                b.reset,
+                            ));
+                        }
                         // Bump only on a real change, or the server's diff-and-drop
                         // is defeated and every window re-renders on every poll.
                         if pr_cache.replace(resolutions) {
@@ -1056,46 +1079,59 @@ impl WorktreesService {
         let token = CancellationToken::new();
         let loop_token = token.clone();
         let cache = self.rate_limit_cache.clone();
+        let registry = self.registry.clone();
         let handle = tokio::spawn(async move {
             // Remembers the previous reading so a WARN fires only on the *rising*
             // edge across the threshold, not every poll while usage stays high.
             let mut prev: Option<RateLimitSnapshot> = None;
             loop {
-                // Poll first, so `status` has a reading soon after boot rather than
-                // one interval later. `gh` is a blocking subprocess: never on an
-                // async worker. A join failure folds into the same channel as a
-                // `gh` failure — both mean "no fresh reading this round".
-                let bin = gh_bin.clone();
-                let resolved = tokio::task::spawn_blocking(move || resolve_rate_limit_with(&bin))
-                    .await
-                    .unwrap_or_else(|err| {
-                        Err(anyhow!("blocking rate-limit poll task failed: {err}"))
-                    });
-                match resolved {
-                    Ok(snap) => {
-                        if rate_limit_crossed_warn(prev.as_ref(), &snap) {
-                            // Bound to a local (rather than inlined into the macro)
-                            // so it is computed whenever the branch is taken, not
-                            // only when a WARN-level subscriber is installed —
-                            // `tracing` skips evaluating macro args otherwise.
-                            let summary = snap.summary_line();
-                            tracing::warn!(
-                                "GitHub API rate limit high: {summary} (querying /rate_limit \
-                                 is free; the daemon's gh usage is not)"
-                            );
+                // Gate the poll on activity (#1389, fix 8b): a fully-idle daemon —
+                // no window registered and no polling lease active — has nothing to
+                // watch, so it spends no `/rate_limit` subprocess and lets the last
+                // reading stand. The read is free against the budget, but the
+                // wakeups are not; and while polling *is* active the graphql figure
+                // stays fresh from every PR poll's folded-in budget (fix 8a), so the
+                // standalone poll is only topping up `core`/`search`.
+                if !registry.list().is_empty() || !registry.polling_snapshot().is_empty() {
+                    // Poll first, so `status` has a reading soon after a window
+                    // appears rather than one interval later. `gh` is a blocking
+                    // subprocess: never on an async worker. A join failure folds into
+                    // the same channel as a `gh` failure — both mean "no fresh
+                    // reading this round".
+                    let bin = gh_bin.clone();
+                    let resolved =
+                        tokio::task::spawn_blocking(move || resolve_rate_limit_with(&bin))
+                            .await
+                            .unwrap_or_else(|err| {
+                                Err(anyhow!("blocking rate-limit poll task failed: {err}"))
+                            });
+                    match resolved {
+                        Ok(snap) => {
+                            if rate_limit_crossed_warn(prev.as_ref(), &snap) {
+                                // Bound to a local (rather than inlined into the
+                                // macro) so it is computed whenever the branch is
+                                // taken, not only when a WARN-level subscriber is
+                                // installed — `tracing` skips evaluating macro args
+                                // otherwise.
+                                let summary = snap.summary_line();
+                                tracing::warn!(
+                                    "GitHub API rate limit high: {summary} (querying \
+                                     /rate_limit is free; the daemon's gh usage is not)"
+                                );
+                            }
+                            // Update the cache only; deliberately no `registry.bump()`
+                            // — the rate limit is not tree topology, and bumping would
+                            // re-push an unchanged tree to every window. The tray
+                            // re-polls `menu()` at ~1 Hz and `status` reads on demand.
+                            cache.replace(snap);
+                            prev = Some(snap);
                         }
-                        // Update the cache only; deliberately no `registry.bump()`
-                        // — the rate limit is not tree topology, and bumping would
-                        // re-push an unchanged tree to every window. The tray
-                        // re-polls `menu()` at ~1 Hz and `status` reads on demand.
-                        cache.replace(snap);
-                        prev = Some(snap);
+                        // Best-effort decoration: a missing/unauthenticated `gh` or a
+                        // network blip leaves the last good reading in place rather
+                        // than blanking the line, and never affects the budget (the
+                        // read is free).
+                        Err(err) => tracing::debug!("GitHub rate-limit poll failed: {err:#}"),
                     }
-                    // Best-effort decoration: a missing/unauthenticated `gh` or a
-                    // network blip leaves the last good reading in place rather than
-                    // blanking the line, and never affects the budget (the read is
-                    // free).
-                    Err(err) => tracing::debug!("GitHub rate-limit poll failed: {err:#}"),
                 }
                 tokio::select! {
                     () = loop_token.cancelled() => break,
@@ -1692,10 +1728,8 @@ fn persist_pr_cache(
 ) {
     let prefs = pr_cache_prefs_from(pr_cache.entries(), watched, polled_at);
     if let Err(err) = write_pr_cache(path, &prefs) {
-        tracing::warn!(
-            "could not persist worktrees PR cache to {}: {err:#}",
-            path.display()
-        );
+        let at = path.display();
+        tracing::warn!("could not persist worktrees PR cache to {at}: {err:#}");
     }
 }
 
@@ -5760,6 +5794,9 @@ mod tests {
             }}"#,
         );
         let svc = WorktreesService::new();
+        // #1389, fix 8b: the poller only spends a `/rate_limit` call while something
+        // is being watched — a lease makes it active without needing a window/folder.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         svc.start_rate_limit_poller_with(Duration::from_millis(50), fake.clone());
 
         // Each poll spawns a real subprocess; wait on a generous deadline so a
@@ -5786,6 +5823,69 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_none());
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn rate_limit_poller_stays_idle_with_nothing_registered() {
+        // #1389, fix 8b: a fully-idle daemon (no window, no lease) spends no
+        // `/rate_limit` subprocess — the counting stub records zero spawns.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"{"resources":{"graphql":{"limit":5000,"used":1,"remaining":4999,"reset":1}}}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.start_rate_limit_poller_with(Duration::from_millis(20), fake);
+
+        // Give the loop several ticks; with nothing registered it must never poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            gh_spawn_count(&counter),
+            0,
+            "idle daemon must not poll (#1389, fix 8b)"
+        );
+        assert!(svc.rate_limit_cache.get().is_none());
+
+        // Once a lease is active, the next tick populates the cache.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.rate_limit_cache.get().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("an active lease should resume polling");
+        assert!(gh_spawn_count(&counter) >= 1);
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_poller_survives_a_failing_gh() {
+        // A missing/failing `gh` leaves the cache empty and never wedges the loop —
+        // the degraded branch keeps the last (here, absent) reading rather than
+        // crashing. Active via a lease so the gate (#1389, fix 8b) lets it try.
+        let svc = WorktreesService::new();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.start_rate_limit_poller_with(
+            Duration::from_millis(20),
+            PathBuf::from("/no/such/gh/xyzzy"),
+        );
+        // Let it fail a few times: the cache stays empty and the task stays alive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(svc.rate_limit_cache.get().is_none());
+        assert!(
+            svc.rate_limit_poller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some(),
+            "the loop must survive a failing gh, not panic out"
+        );
+        svc.shutdown().await;
     }
 
     #[test]
@@ -5882,6 +5982,61 @@ mod tests {
             generation,
             "no bumps after shutdown"
         );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_folds_its_graphql_budget_into_the_rate_limit_cache() {
+        // #1389, fix 8a: every PR poll carries a free graphql budget reading, which
+        // the poller folds into the shared cache — so the graphql figure stays fresh
+        // without a standalone `/rate_limit` call.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{
+                "rateLimit":{"limit":5000,"cost":1,"remaining":4877,"used":123,
+                             "resetAt":"2026-07-21T16:00:00Z"},
+                "r0":{"b0":{
+                  "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                    {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                  ]}}},
+                  "associatedPullRequests":{"nodes":[{"number":1337,"isDraft":false,"url":"http://x/1337"}]}
+                }}
+            }}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        // No rate-limit poller started: the only writer of the cache is the PR poll's
+        // folded-in budget, so a populated graphql reading proves fix 8a.
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            fake.clone(),
+        );
+
+        let graphql = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(g) = svc.rate_limit_cache.get().and_then(|s| s.graphql) {
+                    return g;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the PR poll should fold its budget into the cache");
+        assert_eq!(graphql.used, 123);
+        assert_eq!(graphql.limit, 5000);
+        assert_eq!(graphql.remaining, 4877);
+        svc.shutdown().await;
     }
 
     #[tokio::test]
