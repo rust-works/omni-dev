@@ -1142,8 +1142,6 @@ impl CreatePrCommand {
         is_draft: bool,
         new_base: Option<&str>,
     ) -> Result<()> {
-        use std::process::Command;
-
         // Get branch name
         let branch_name = repo_view
             .branch_info
@@ -1219,11 +1217,13 @@ impl CreatePrCommand {
             args.push("--draft");
         }
 
-        let pr_result = Command::new("gh")
-            .current_dir(repo_root)
-            .args(&args)
-            .output()
-            .context("Failed to create pull request")?;
+        let pr_result = crate::github_metrics::run_gh(
+            &crate::pr_status::resolve_gh_binary(),
+            args,
+            "pr create",
+            Some(repo_root),
+        )
+        .context("Failed to create pull request")?;
 
         if pr_result.status.success() {
             let pr_url = String::from_utf8_lossy(&pr_result.stdout);
@@ -1249,7 +1249,6 @@ impl CreatePrCommand {
         new_base: Option<&str>,
     ) -> Result<()> {
         use std::io::{self, Write};
-        use std::process::Command;
 
         // Get the first existing PR (assuming we're updating the most recent one)
         let existing_pr = repo_view
@@ -1314,11 +1313,13 @@ impl CreatePrCommand {
             "Executing gh command to update PR"
         );
 
-        let pr_result = Command::new("gh")
-            .current_dir(repo_root)
-            .args(&gh_args)
-            .output()
-            .context("Failed to update pull request")?;
+        let pr_result = crate::github_metrics::run_gh(
+            &crate::pr_status::resolve_gh_binary(),
+            gh_args,
+            "pr edit",
+            Some(repo_root),
+        )
+        .context("Failed to update pull request")?;
 
         if pr_result.status.success() {
             // Get the PR URL using the existing PR data

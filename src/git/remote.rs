@@ -156,24 +156,24 @@ impl RemoteInfo {
     /// explicit repo argument (so it is CWD-inert), but the directory is pinned
     /// for uniformity with the rest of the repo-anchored subprocess seams.
     fn get_github_default_branch(uri: &str, repo_root: &std::path::Path) -> Result<String> {
-        use std::process::Command;
-
         // Extract repository name from URI
         let repo_name = Self::extract_github_repo_name(uri)?;
 
-        // Use gh CLI to get default branch
-        let output = Command::new("gh")
-            .args([
+        // Use gh CLI to get default branch, via the metrics choke point (#1387).
+        let output = crate::github_metrics::run_gh(
+            &crate::pr_status::resolve_gh_binary(),
+            [
                 "repo",
                 "view",
-                &repo_name,
+                repo_name.as_str(),
                 "--json",
                 "defaultBranchRef",
                 "--jq",
                 ".defaultBranchRef.name",
-            ])
-            .current_dir(repo_root)
-            .output();
+            ],
+            "repo view",
+            Some(repo_root),
+        );
 
         match output {
             Ok(output) if output.status.success() => {
