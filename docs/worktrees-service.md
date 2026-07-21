@@ -323,14 +323,36 @@ the OS default browser and needs no extension.
   how many repos, worktrees, or windows are open — `repository()`/`ref()` are not
   GraphQL connections, so aliasing them is free. The poller **wakes** every ~10 s —
   a read of the coalescing snapshot cache, no subprocess and no network — but only
-  **asks GitHub** when the watched state moved or its backoff elapsed: ~10 s while a
-  badge is pending (matching `gh pr checks --watch`), doubling to a 30-minute
-  ceiling once everything is terminal, and nothing at all while no window is
-  registered. The two cadences are separate because the triggers arrive by different
-  routes: a window opening bumps the change-notify, but **nothing tells the daemon
-  you committed** — so the loop looks often and cheaply, and pays only on a change.
-  Override the fetch cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds). The
-  daemon pushes to windows only when a verdict actually moves.
+  **asks GitHub** when there is reason to:
+  - The watch set **grows** — a branch is added, or its **upstream moves** (a push,
+    which is what starts the CI run a badge reports) — or the backoff elapses.
+  - A pure **removal never asks** (#1389): a window closing, a VS Code or daemon
+    shutdown, a TTL reap, or a lapsing 15-minute lease cannot change any *surviving*
+    badge, so it spends nothing — it just prunes the dead entries locally.
+  - A **local commit does not ask** either (#1389): GitHub has not seen it, so the
+    answer would be the cached one; the badge stays correctly stale locally (below)
+    until you push.
+
+  Cadence while a badge is **pending** starts at ~10 s (matching `gh pr checks
+  --watch`) for the first ~2 minutes after a push, then **escalates** toward a 60 s
+  ceiling so a long CI run (or a zombie suite) stops pinning the fast rate; once
+  everything is **terminal** it doubles to a 30-minute ceiling, and it polls nothing
+  at all while no window is registered. A change-notify **storm** — the one a VS Code
+  restart makes as it re-registers its windows one-by-one — is **debounced** into a
+  single fetch on the final set (#1389). And because the daemon is the single `gh`
+  choke point for every window, the cadence is **capped** when the shared GitHub
+  budget crosses its warn threshold ([below](#github-rate-limit-monitor)), so no
+  runaway in this class can exhaust it. Override the fetch cadence with
+  `OMNI_DEV_DAEMON_PR_POLL` and the storm debounce with `OMNI_DEV_DAEMON_PR_DEBOUNCE`
+  (whole seconds). The daemon pushes to windows only when a verdict actually moves.
+- **Warm badges across a restart (#1389).** After each poll the resolved badges
+  (number / URL / check-state / draft marker — no secret; the same data the tree
+  wire already carries) are persisted to `worktrees-pr-cache.json` (`0600`, beside
+  `worktrees-polling.json`). On restart the daemon serves them on the **first**
+  snapshot and **skips its immediate re-poll** when every current target already has
+  a verdict younger than the backoff — so a daemon restart costs ~0 calls rather than
+  a fresh fetch. Best-effort: a missing or unreadable file simply re-polls, and the
+  next poll rewrites a clean one.
 - **Per-repository, off by default, and time-boxed (#1376).** Polling is opt-in
   **per repo**: the daemon polls a repo's badges only once you enable it
   (right-click the repo → **Enable PR Polling**), so a repo it is not polling
@@ -345,13 +367,15 @@ the OS default browser and needs no extension.
   repo's badges on the next snapshot. See the
   [`set-polling` / `polling_enabled`](#companion-contract-for-the-extension-and-other-clients)
   contract entry.
-- **A commit invalidates the verdict immediately.** Each badge records the commit
-  its verdict describes; when that differs from the worktree's `head_sha` the row
-  renders ● rather than the previous commit's ✓ — no network call, on the very next
-  snapshot. So committing or pushing never leaves a stale green standing, and the
-  poller (which notices the moved head on its next wake) refreshes it for real
-  shortly after. The same applies to unpushed work and to being behind the remote:
-  the verdict simply is not about the commit in front of you.
+- **A commit invalidates the verdict immediately, locally.** Each badge records the
+  commit its verdict describes; when that differs from the worktree's `head_sha` the
+  row renders ● rather than the previous commit's ✓ — no network call, on the very
+  next snapshot. So committing never leaves a stale green standing. The poller does
+  **not** spend a call to refresh a *local* commit, though (#1389): GitHub has not
+  seen it, so the verdict would be unchanged, and the badge stays correctly ● until
+  you **push** — which moves the upstream and *does* trigger one fetch, resolving the
+  CI run the push started. The same local-staleness applies to unpushed work and to
+  being behind the remote: the verdict simply is not about the commit in front of you.
 - **Best-effort, silent.** A worktree with no branch, no matching PR, or on a
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
@@ -476,6 +500,13 @@ The poller also logs a `WARN` (visible via `omni-dev daemon logs`) the moment a
 resource *crosses* ~80% — once per crossing, not every poll. Cadence is
 `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` whole seconds (default 60).
 
+Beyond surfacing the reading, the PR-badge poller now **consults** it (#1389): while
+any resource sits at or above the ~80% warn threshold, the poller holds its cadence at
+no less than 5 minutes and ignores even an immediate grown-watch fetch. Because the
+daemon is the single `gh` choke point for every window, this is the one place a
+machine-wide cap can be enforced — so no runaway in the PR-poll class can drain the
+shared budget, structurally rather than by convention.
+
 ## Git enrichment
 
 The companion reports only raw folder paths; the **daemon** computes the richer
@@ -537,7 +568,8 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | --- | --- | --- |
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
-| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed), a moved upstream (you pushed — #1344), or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is pending and fresh** (#1337), and how often it wakes to look. While pending it holds this fast rate for ~2 minutes after a push, then escalates ×2 toward a 60 s ceiling (#1389); once every badge is terminal it backs off ×2 to a 30-minute ceiling, and it asks nothing while no window is registered — so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a **grown** watch (an added branch, or a moved upstream — you pushed, #1344) makes it ask immediately regardless of the backoff, but a **local commit** (#1389) and a pure **removal** (#1389) do not. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_PR_DEBOUNCE` | `2` | How long the PR poller waits for the change-notify to go quiet before snapshotting (#1389), so a VS Code or daemon restart's one-window-at-a-time re-registration storm collapses into a single fetch on the final watch set instead of one per window. Bounded (~4× this) so a steady drip of changes cannot postpone a poll forever. |
 | `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
