@@ -1177,14 +1177,18 @@ impl WorktreesService {
             let path = req.path.clone();
             let git = tokio::task::spawn_blocking(move || git_safety(&path))
                 .await
-                .map_err(|e| anyhow!("safety check task panicked: {e}"))??;
+                .map_err(|e| anyhow!("safety check task panicked: {e}"))
+                .and_then(|inner| inner)
+                .map_err(|err| log_close_error(&req.path, "safety check", err))?;
             // Make the phase-1 verdict auditable in `omni-dev daemon logs`
-            // (#1364): the target, whether a window has it open, and the
-            // deletability verdict — with the blocking risk kinds that force a
-            // confirm dialog, so a later "why did the close prompt/refuse?" is
-            // answerable from the log alone.
+            // (#1364): the target, the owning window key (if any), whether a
+            // window has it open, and the deletability verdict — with the
+            // blocking risk kinds that force a confirm dialog, so a later "why did
+            // the close prompt/refuse?" is answerable from the log alone.
+            let window_key_str = window_key.as_deref().unwrap_or("-");
             tracing::info!(
                 path = %req.path.display(),
+                window_key = window_key_str,
                 removable = git.removable,
                 is_main = git.is_main,
                 open,
@@ -1219,8 +1223,10 @@ impl WorktreesService {
         // (#1364) so the execute's routing decision is auditable before the wait,
         // even if that wait then hangs or times out.
         let self_close = is_self_close(req.requester_key.as_deref(), &open_windows);
+        let requester = req.requester_key.as_deref().unwrap_or("-");
         tracing::info!(
             path = %req.path.display(),
+            requester,
             remove = req.remove,
             self_close,
             cross_window = others.len(),
@@ -1257,7 +1263,8 @@ impl WorktreesService {
             let _guard = self.prune_lock.lock().await;
             let removed = tokio::task::spawn_blocking(move || remove_worktree(&path))
                 .await
-                .map_err(|e| anyhow!("worktree removal task panicked: {e}"))?;
+                .map_err(|e| anyhow!("worktree removal task panicked: {e}"))
+                .map_err(|err| log_close_error(&req.path, "removal task", err))?;
             // The audit line + Result→reply mapping lives in a sync helper so the
             // destructive outcome is unit-testable off the runtime (#1364).
             log_and_map_removal(&req.path, removed)
@@ -2912,6 +2919,19 @@ fn note_kinds(notes: &[Note]) -> String {
 /// (#1364) reports is unit-testable.
 fn is_self_close(requester_key: Option<&str>, open_windows: &[(String, usize)]) -> bool {
     requester_key.is_some_and(|rk| open_windows.iter().any(|(k, _)| k == rk))
+}
+
+/// Logs a `close`-op failure at ERROR before propagating it. The phase-1/phase-2
+/// audit lines sit *past* the fallible `git_safety` / removal calls, so without
+/// this a failed safety check (a non-git-worktree target) or a panicked blocking
+/// task would early-return invisibly — the exact blind spot #1364 closes. Returns
+/// the error unchanged so callers keep using `?`.
+fn log_close_error(path: &Path, phase: &str, err: anyhow::Error) -> anyhow::Error {
+    tracing::error!(
+        path = %path.display(),
+        "worktrees close: {phase} failed: {err:#}"
+    );
+    err
 }
 
 /// Logs the outcome of a linked-worktree removal and maps it to the `close`
@@ -7362,6 +7382,35 @@ mod tests {
     }
 
     #[test]
+    fn log_close_error_logs_at_error_and_returns_the_error_unchanged() {
+        // ERROR is more severe than the INFO cap, so `capture_info` records it.
+        let logs = capture_info(|| {
+            let err = log_close_error(
+                Path::new("/wt/feature"),
+                "safety check",
+                anyhow!("not a git worktree"),
+            );
+            assert_eq!(
+                err.to_string(),
+                "not a git worktree",
+                "err propagates unchanged"
+            );
+        });
+        assert!(
+            logs.contains("worktrees close: safety check failed"),
+            "a failed phase must log an ERROR audit line, got: {logs}"
+        );
+        assert!(
+            logs.contains("not a git worktree"),
+            "the cause must ride the line, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the target path must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
     fn log_and_map_removal_warns_and_propagates_a_prune_failure() {
         let logs = capture_info(|| {
             let err = log_and_map_removal(Path::new("/wt/feature"), Err(anyhow!("locked")));
@@ -8096,6 +8145,23 @@ mod tests {
         assert!(info
             .iter()
             .any(|r| r.get("kind").and_then(Value::as_str) == Some("already-removed")));
+    }
+
+    #[tokio::test]
+    async fn close_phase1_errors_on_a_non_git_worktree_path() {
+        // An existing directory that is *not* a git worktree makes `git_safety`
+        // fail; the error must propagate (rather than delete an unknown dir),
+        // exercising the phase-1 `?` audit-and-return path (#1364). The ERROR
+        // audit line itself is unit-tested via `log_close_error`.
+        let dir = tempfile::tempdir().unwrap();
+        let svc = WorktreesService::new();
+        let result = svc
+            .handle("close", json!({ "path": dir.path(), "remove": true }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-git-worktree target must error the safety check, got: {result:?}"
+        );
     }
 
     #[tokio::test]
