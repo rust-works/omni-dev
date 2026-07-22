@@ -54,6 +54,10 @@ pub enum RecordKind {
     /// the token never enters our process, so these are subprocess records, not
     /// [`RecordKind::Http`]). See `crate::github_metrics`.
     Gh,
+    /// One per wrapped `git worktree` subprocess invocation, carrying
+    /// recovery-relevant metadata (path/branch/commit) in `context`.
+    /// See `crate::cli::git` worktree subcommands.
+    Worktree,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]
     Unknown,
@@ -68,6 +72,7 @@ impl RecordKind {
             Self::Invocation => "invocation",
             Self::Http => "http",
             Self::Gh => "gh",
+            Self::Worktree => "worktree",
             Self::Unknown => "unknown",
         }
     }
@@ -792,6 +797,56 @@ fn build_gh_record(outcome: GhOutcome, ctx: RequestLogContext) -> LogRecord {
     rec
 }
 
+/// The outcome of one wrapped `git worktree` subprocess, recorded by the
+/// `crate::cli::git` worktree subcommands after the process exits.
+#[derive(Debug, Clone)]
+pub struct WorktreeOutcome {
+    /// The verb (`add`/`remove`/`list`/`move`/`prune`/`repair`); the record's
+    /// `command` becomes `["git", "worktree", verb]` so `--command`/`command:`
+    /// queries work.
+    pub verb: String,
+    /// Full argv passed to `git` (without the binary path). Scrubbed before
+    /// write.
+    pub argv: Vec<String>,
+    /// Process exit code; `None` when the process could not be spawned.
+    pub exit_code: Option<i32>,
+    /// Wall time of the subprocess (metadata enrichment excluded).
+    pub duration: Duration,
+    /// Spawn/collection error, when the invocation did not complete.
+    pub error: Option<String>,
+    /// Recovery-relevant per-verb fields (`path`/`branch`/`commit`/
+    /// `had_uncommitted`/`used_force`/…), written to the record's `context`.
+    pub context: BTreeMap<String, String>,
+}
+
+/// Appends one `kind: "worktree"` record from the active context.
+///
+/// Best effort and exit-code-safe: it goes through [`record`], which swallows
+/// every error, so a logging failure can never change the wrapped git
+/// operation's result.
+pub fn record_worktree(outcome: WorktreeOutcome) {
+    record(&build_worktree_record(outcome, current_context()));
+}
+
+/// Builds the `kind: "worktree"` record for `outcome` under `ctx`. Split out
+/// from [`record_worktree`] so the record shape (source stamping, service tag,
+/// context passthrough, argv scrubbing) is unit-testable without touching the
+/// filesystem or environment.
+fn build_worktree_record(outcome: WorktreeOutcome, ctx: RequestLogContext) -> LogRecord {
+    let mut rec = LogRecord::new(RecordKind::Worktree, ctx.invocation_id);
+    rec.source = Some(ctx.source);
+    rec.mcp_tool = ctx.mcp_tool;
+    // The service tag makes `--service worktree` the canonical recovery query.
+    rec.service = Some("worktree".to_string());
+    rec.command = vec!["git".to_string(), "worktree".to_string(), outcome.verb];
+    rec.command_line = scrub_argv(&outcome.argv);
+    rec.exit_code = outcome.exit_code;
+    rec.error = outcome.error;
+    rec.duration_ms = Some(outcome.duration.as_millis() as u64);
+    rec.context = outcome.context;
+    rec
+}
+
 /// Optional, non-secret extras for an HTTP record. Bodies/headers are gated and
 /// redacted centrally in [`record_http_with`], so callers may pass them freely.
 #[derive(Debug, Clone, Default)]
@@ -1351,6 +1406,77 @@ mod tests {
             rec.command_line,
             argv(&["api", "--header", "Authorization: REDACTED"])
         );
+    }
+
+    #[test]
+    fn build_worktree_record_stamps_kind_service_command_and_context() {
+        let ctx = RequestLogContext {
+            invocation_id: "inv-2".to_string(),
+            source: Source::Mcp,
+            mcp_tool: Some("some_tool".to_string()),
+        };
+        let mut context = BTreeMap::new();
+        context.insert("path".to_string(), "/tmp/wt".to_string());
+        context.insert("branch".to_string(), "demo-wt".to_string());
+        context.insert("had_uncommitted".to_string(), "true".to_string());
+        let rec = build_worktree_record(
+            WorktreeOutcome {
+                verb: "remove".to_string(),
+                argv: argv(&["worktree", "remove", "--force", "/tmp/wt"]),
+                exit_code: Some(0),
+                duration: Duration::from_millis(42),
+                error: None,
+                context,
+            },
+            ctx,
+        );
+        assert_eq!(rec.kind, RecordKind::Worktree);
+        assert_eq!(rec.invocation_id, "inv-2");
+        assert_eq!(rec.source, Some(Source::Mcp));
+        assert_eq!(rec.mcp_tool.as_deref(), Some("some_tool"));
+        assert_eq!(rec.service.as_deref(), Some("worktree"));
+        assert_eq!(rec.command, argv(&["git", "worktree", "remove"]));
+        assert_eq!(
+            rec.command_line,
+            argv(&["worktree", "remove", "--force", "/tmp/wt"])
+        );
+        assert_eq!(rec.exit_code, Some(0));
+        assert_eq!(rec.duration_ms, Some(42));
+        assert_eq!(
+            rec.context.get("branch").map(String::as_str),
+            Some("demo-wt")
+        );
+        assert_eq!(
+            rec.context.get("had_uncommitted").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn record_kind_worktree_serializes_as_worktree_and_round_trips() {
+        let rec = build_worktree_record(
+            WorktreeOutcome {
+                verb: "add".to_string(),
+                argv: argv(&["worktree", "add", "wt"]),
+                exit_code: Some(1),
+                duration: Duration::from_millis(1),
+                error: Some("boom".to_string()),
+                context: BTreeMap::new(),
+            },
+            RequestLogContext::default(),
+        );
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(line.contains("\"kind\":\"worktree\""), "line was: {line}");
+        assert!(
+            line.contains("\"service\":\"worktree\""),
+            "line was: {line}"
+        );
+        // The display name matches the wire form.
+        assert_eq!(RecordKind::Worktree.as_str(), "worktree");
+        let back: LogRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.kind, RecordKind::Worktree);
+        assert_eq!(back.command, argv(&["git", "worktree", "add"]));
+        assert_eq!(back.error.as_deref(), Some("boom"));
     }
 
     #[test]

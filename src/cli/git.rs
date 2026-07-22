@@ -8,6 +8,7 @@ mod info;
 mod staged;
 mod twiddle;
 mod view;
+mod worktree;
 
 pub use amend::{run_amend, AmendCommand, AmendOutcome};
 pub use check::{run_check, CheckCommand, CheckOutcome};
@@ -16,6 +17,7 @@ pub use info::{run_info, InfoCommand};
 pub use staged::{run_staged, StagedCommand, StagedOutcome};
 pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
+pub use worktree::WorktreeCommand;
 
 use std::path::Path;
 
@@ -67,6 +69,8 @@ pub enum GitSubcommands {
     Commit(CommitCommand),
     /// Branch-related operations.
     Branch(BranchCommand),
+    /// Worktree operations: logged wrappers over `git worktree`.
+    Worktree(WorktreeCommand),
 }
 
 /// Commit operations.
@@ -149,6 +153,7 @@ impl GitCommand {
         match self.command {
             GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(repo).await,
             GitSubcommands::Branch(branch_cmd) => branch_cmd.execute(repo).await,
+            GitSubcommands::Worktree(worktree_cmd) => worktree_cmd.execute(repo),
         }
     }
 }

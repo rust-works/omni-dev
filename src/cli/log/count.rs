@@ -75,6 +75,7 @@ enum KindArg {
     Invocation,
     Http,
     Gh,
+    Worktree,
 }
 
 impl From<KindArg> for RecordKind {
@@ -83,6 +84,7 @@ impl From<KindArg> for RecordKind {
             KindArg::Invocation => Self::Invocation,
             KindArg::Http => Self::Http,
             KindArg::Gh => Self::Gh,
+            KindArg::Worktree => Self::Worktree,
         }
     }
 }
@@ -342,6 +344,18 @@ mod tests {
         DateTime::parse_from_rfc3339(ts)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn kind_arg_maps_onto_every_record_kind() {
+        for (arg, kind) in [
+            (KindArg::Invocation, RecordKind::Invocation),
+            (KindArg::Http, RecordKind::Http),
+            (KindArg::Gh, RecordKind::Gh),
+            (KindArg::Worktree, RecordKind::Worktree),
+        ] {
+            assert_eq!(RecordKind::from(arg), kind);
+        }
     }
 
     #[test]

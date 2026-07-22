@@ -74,6 +74,32 @@ fn oneline(rec: &LogRecord) -> String {
                 .map_or_else(String::new, |ms| format!(" {ms}ms"));
             format!("{time}  gh    {source:<14} gh {command}{exit}{dur}")
         }
+        RecordKind::Worktree => {
+            let source = source_str(rec.source);
+            let command = if rec.command.is_empty() {
+                "-".to_string()
+            } else {
+                rec.command.join(" ")
+            };
+            // The most recovery-relevant context, inline: the target path
+            // (`to_path` for move) and the branch that lived there.
+            let path = rec
+                .context
+                .get("path")
+                .or_else(|| rec.context.get("to_path"))
+                .map_or_else(String::new, |p| format!(" {p}"));
+            let branch = rec
+                .context
+                .get("branch")
+                .map_or_else(String::new, |b| format!(" branch={b}"));
+            let exit = rec
+                .exit_code
+                .map_or_else(String::new, |c| format!(" exit={c}"));
+            let dur = rec
+                .duration_ms
+                .map_or_else(String::new, |ms| format!(" {ms}ms"));
+            format!("{time}  wt    {source:<14} {command}{path}{branch}{exit}{dur}")
+        }
         RecordKind::Invocation | RecordKind::Unknown => {
             let source = source_str(rec.source);
             let command = if rec.command.is_empty() {
@@ -205,6 +231,45 @@ mod tests {
             ..LogRecord::default()
         };
         assert!(render(&bare, "", Format::Oneline).contains("gh -"));
+    }
+
+    #[test]
+    fn oneline_worktree_shows_path_branch_exit_and_duration() {
+        let mut rec = LogRecord {
+            kind: RecordKind::Worktree,
+            timestamp: "2026-06-22T12:34:56.789Z".to_string(),
+            command: vec![
+                "git".to_string(),
+                "worktree".to_string(),
+                "remove".to_string(),
+            ],
+            source: Some(Source::Cli),
+            exit_code: Some(0),
+            duration_ms: Some(33),
+            ..LogRecord::default()
+        };
+        rec.context
+            .insert("path".to_string(), "/tmp/wt".to_string());
+        rec.context
+            .insert("branch".to_string(), "demo-wt".to_string());
+        let line = render(&rec, "", Format::Oneline);
+        assert!(line.contains("wt"), "line was: {line}");
+        assert!(line.contains("git worktree remove"), "line was: {line}");
+        assert!(line.contains("/tmp/wt"), "line was: {line}");
+        assert!(line.contains("branch=demo-wt"), "line was: {line}");
+        assert!(line.contains("exit=0"), "line was: {line}");
+        assert!(line.contains("33ms"), "line was: {line}");
+
+        // A move record falls back to `to_path`; empty command renders "-".
+        let mut mv = LogRecord {
+            kind: RecordKind::Worktree,
+            ..LogRecord::default()
+        };
+        mv.context
+            .insert("to_path".to_string(), "/tmp/new-home".to_string());
+        let line = render(&mv, "", Format::Oneline);
+        assert!(line.contains("/tmp/new-home"), "line was: {line}");
+        assert!(line.contains(" -"), "line was: {line}");
     }
 
     #[test]
