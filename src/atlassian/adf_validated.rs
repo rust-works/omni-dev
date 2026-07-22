@@ -908,10 +908,13 @@ mod tests {
 
     #[test]
     fn markdown_to_validated_adf_reports_line_column_and_excerpt() {
-        // Issue #1087: bold-wrapping-inline-code yields a text node carrying
-        // both `strong` and `code`, rejected by the validator. The offending
-        // run sits on line 5 of the source.
-        let src = "# Heading\n\nIntro paragraph.\n\nHere is **`/api/v1/example`** in a sentence.\n";
+        // Issue #1087: an inline-code run carrying an illegal companion mark
+        // is rejected by the validator with the source location. Bold+code no
+        // longer reaches the validator (the converter splits it, issue #1391),
+        // so an explicit span-syntax `underline` keeps this path covered. The
+        // offending run sits on line 5 of the source.
+        let src =
+            "# Heading\n\nIntro paragraph.\n\nHere is [`/api/v1/example`]{underline} in a sentence.\n";
         let err = markdown_to_validated_adf(src).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("/api/v1/example"), "excerpt, got: {msg}");
@@ -923,5 +926,21 @@ mod tests {
     fn markdown_to_validated_adf_accepts_clean_document() {
         let v = markdown_to_validated_adf("# Title\n\nA clean paragraph.\n").unwrap();
         assert!(!v.content.is_empty());
+    }
+
+    #[test]
+    fn markdown_to_validated_adf_accepts_emphasis_around_inline_code() {
+        // Issue #1391: bold/italic/strike wrapping inline code used to abort
+        // the whole write here; the converter now splits the marks into legal
+        // adjacent runs, so validation succeeds end-to-end.
+        for src in [
+            "Here is **`/api/v1/example`** in a sentence.\n",
+            "*`x`* and ~~`y`~~\n",
+            "**foo `bar` baz** with **[`x`](https://e.com)**\n",
+        ] {
+            let v = markdown_to_validated_adf(src)
+                .unwrap_or_else(|e| panic!("expected {src:?} to validate, got: {e}"));
+            assert!(!v.content.is_empty());
+        }
     }
 }

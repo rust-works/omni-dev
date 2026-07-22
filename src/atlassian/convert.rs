@@ -39,6 +39,13 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
     let mut doc = AdfDocument::new();
     let mut parser = MarkdownParser::new(markdown);
     doc.content = parser.parse_blocks()?;
+    let split = split_emphasis_code_marks(&mut doc.content);
+    if split > 0 {
+        debug!(
+            "markdown_to_adf: dropped {split} emphasis mark(s) from inline-code runs \
+             (ADF forbids combining them with `code`; issue #1391)"
+        );
+    }
     debug!(
         "markdown_to_adf: produced {} top-level ADF nodes",
         doc.content.len()
@@ -2267,6 +2274,42 @@ fn strip_heading_code_marks(nodes: &mut [AdfNode]) -> usize {
         }
     }
     removed
+}
+
+/// Marks that markdown emphasis syntax can layer onto an inline-code run but
+/// that ADF forbids combining with `code` (issue #1391). Deliberately not the
+/// full complement of marks illegal with `code`: span-syntax marks
+/// (`underline`, `textColor`, …) are explicit author requests and are left
+/// for the validator to report.
+const EMPHASIS_MARKS_SPLIT_FROM_CODE: [&str; 3] = ["strong", "em", "strike"];
+
+/// Drops `strong`/`em`/`strike` marks from text runs that also carry `code`,
+/// returning the count dropped.
+///
+/// ADF allows `code` to combine only with `link` and `annotation`, so
+/// ``**`x`**``-shaped JFM used to fail validation at write time. Inline code
+/// always parses into its own run, so the sibling runs produced by the same
+/// emphasis span keep their marks — dropping the leaked marks here is the
+/// "split into adjacent legal runs" of issue #1391, and rendering is
+/// visually unchanged (the code font dominates inside a bold/italic
+/// sentence). Must run at the document level, after block building: heading
+/// runs are already code-free via [`strip_heading_code_marks`] by then, so
+/// a bold heading around inline code keeps its bold.
+fn split_emphasis_code_marks(nodes: &mut [AdfNode]) -> usize {
+    let mut dropped = 0;
+    for node in nodes.iter_mut() {
+        if let Some(marks) = node.marks.as_mut() {
+            if node.text.is_some() && marks.iter().any(|m| m.mark_type == "code") {
+                let before = marks.len();
+                marks.retain(|m| !EMPHASIS_MARKS_SPLIT_FROM_CODE.contains(&m.mark_type.as_str()));
+                dropped += before - marks.len();
+            }
+        }
+        if let Some(children) = node.content.as_mut() {
+            dropped += split_emphasis_code_marks(children);
+        }
+    }
+    dropped
 }
 
 /// Prepends a mark before existing marks to preserve outside-in ordering.
@@ -5144,6 +5187,135 @@ mod tests {
         let content = doc.content[0].content.as_ref().unwrap();
         let marks = content[0].marks.as_ref().unwrap();
         assert!(marks.iter().any(|m| m.mark_type == "code"));
+    }
+
+    // ── strong/em/strike around inline code split silently (issue #1391) ──
+
+    /// Returns the mark types on `node`, empty when unmarked.
+    fn mark_types(node: &AdfNode) -> Vec<&str> {
+        node.marks
+            .as_ref()
+            .map(|marks| marks.iter().map(|m| m.mark_type.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn split_strong_code_single_run() {
+        // `**`x`**` → one run carrying only `code`; the leaked `strong` is
+        // dropped so the ADF is legal and renders identically.
+        let doc = markdown_to_adf("**`x`**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("x"));
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_em_code_single_run() {
+        let doc = markdown_to_adf("*`x`*").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_strike_code_single_run() {
+        let doc = markdown_to_adf("~~`x`~~").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_strong_em_code_drops_both() {
+        let doc = markdown_to_adf("***`x`***").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_nested_code_keeps_sibling_strong() {
+        // `**foo `bar` baz**` → three runs; only the code run drops `strong`,
+        // so the bold prose around the identifier is preserved.
+        let doc = markdown_to_adf("**foo `bar` baz**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0].text.as_deref(), Some("foo "));
+        assert_eq!(mark_types(&content[0]), vec!["strong"]);
+        assert_eq!(content[1].text.as_deref(), Some("bar"));
+        assert_eq!(mark_types(&content[1]), vec!["code"]);
+        assert_eq!(content[2].text.as_deref(), Some(" baz"));
+        assert_eq!(mark_types(&content[2]), vec!["strong"]);
+    }
+
+    #[test]
+    fn split_multiple_hits_in_one_line() {
+        let doc = markdown_to_adf("**`x`** and **`y`**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+        assert_eq!(content[1].text.as_deref(), Some(" and "));
+        assert!(content[1].marks.is_none());
+        assert_eq!(mark_types(&content[2]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_leaves_separate_runs_untouched() {
+        // Marks already on separate runs never triggered the constraint.
+        let doc = markdown_to_adf("**foo** `bar`").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["strong"]);
+        assert_eq!(content[1].text.as_deref(), Some(" "));
+        assert_eq!(mark_types(&content[2]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_preserves_link_on_code_run() {
+        // `code+link` is legal ADF; only `strong` drops off the code run.
+        let doc = markdown_to_adf("**[`x`](https://e.com)**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["link", "code"]);
+    }
+
+    #[test]
+    fn split_keeps_span_syntax_marks_for_validator() {
+        // `[`x`]{underline}` is an explicit span-syntax request: the converter
+        // preserves it byte-faithfully (issue #554 fidelity) and the mark
+        // validator still reports the illegal combination at write time.
+        let doc = markdown_to_adf("[`x`]{underline}").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["underline", "code"]);
+    }
+
+    #[test]
+    fn split_runs_after_heading_strip_bold_kept() {
+        // Ordering guard: the heading builder strips `code` first (#1005), so
+        // the document-level split pass must leave the heading's bold intact
+        // rather than dropping `strong` before the strip runs.
+        let doc = markdown_to_adf("# **`x`**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["strong"]);
+    }
+
+    #[test]
+    fn split_applies_inside_containers() {
+        // The pass recurses through block containers, not just paragraphs.
+        let doc = markdown_to_adf("- **`x`**").unwrap();
+        let list_item = &doc.content[0].content.as_ref().unwrap()[0];
+        let paragraph = &list_item.content.as_ref().unwrap()[0];
+        let content = paragraph.content.as_ref().unwrap();
+        assert_eq!(mark_types(&content[0]), vec!["code"]);
+    }
+
+    #[test]
+    fn split_strong_code_passes_validation() {
+        // End-to-end guard: the issue #1391 reproducer no longer trips the
+        // mark validator that previously rejected the whole write.
+        let doc = markdown_to_adf(
+            "**Testing `exodus` itself is out of scope for this ticket** — coordinate \
+             with the team that owns the exodus credentials.",
+        )
+        .unwrap();
+        let violations = crate::atlassian::adf_schema::validate_document(&doc);
+        assert!(violations.is_empty(), "got: {violations:?}");
     }
 
     #[test]
