@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::net::UnixListener;
 
-use super::paths;
+use super::{paths, ServiceSelection};
 
 /// Reverse-DNS LaunchAgent label, derived from the project repository
 /// (`github.com/rust-works/omni-dev`).
@@ -64,7 +64,7 @@ pub fn plist_path() -> Result<PathBuf> {
 /// parse error. A non-UTF-8 path cannot be faithfully represented in the UTF-8
 /// plist, so it is rejected here rather than silently corrupted by
 /// `Path::display()`. See issue #991.
-fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
+fn render_plist(exe: &Path, socket: &Path, services: &ServiceSelection) -> Result<String> {
     // The log path is derived from the socket's parent, so it is UTF-8 whenever
     // the socket is; validate it explicitly all the same to keep the plist
     // strictly UTF-8. Computed before `socket` is shadowed to `&str` below.
@@ -78,6 +78,18 @@ fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
     let log = log
         .to_str()
         .with_context(|| format!("log path is not valid UTF-8: {}", log.display()))?;
+    // Bake the service subset as two extra `ProgramArguments` entries so it
+    // survives launchd's fixed-command, minimal-env exec. `All` bakes nothing,
+    // keeping a full-registry plist byte-identical to before (#1318). The CSV is
+    // fixed ASCII service names, but escape it anyway for uniformity with the
+    // other interpolated paths.
+    let services_args = match services.to_csv() {
+        Some(csv) => format!(
+            "\n        <string>--services</string>\n        <string>{}</string>",
+            quick_xml::escape::escape(&csv)
+        ),
+        None => String::new(),
+    };
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,7 +103,7 @@ fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
         <string>daemon</string>
         <string>run</string>
         <string>--socket</string>
-        <string>{socket}</string>
+        <string>{socket}</string>{services_args}
     </array>
     <key>Sockets</key>
     <dict>
@@ -138,14 +150,14 @@ fn service_target(domain: &str) -> String {
 
 /// Writes the plist and bootstraps the agent so launchd listens on the demand
 /// socket and spawns the daemon on the first client connect (and at login).
-pub fn install_and_load(socket: &Path) -> Result<()> {
+pub fn install_and_load(socket: &Path, services: &ServiceSelection) -> Result<()> {
     let exe = std::env::current_exe().context("could not resolve the current executable")?;
     let plist = plist_path()?;
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&plist, render_plist(&exe, socket)?)
+    std::fs::write(&plist, render_plist(&exe, socket, services)?)
         .with_context(|| format!("failed to write {}", plist.display()))?;
 
     // launchd creates the demand socket at `SockPathName` when it bootstraps the
@@ -328,6 +340,7 @@ pub(crate) fn launchd_listener(name: &str) -> Result<Option<UnixListener>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::daemon::DaemonServiceKind;
 
     /// Parses `xml` to the end, asserting it is well-formed (no quick-xml
     /// error). This is the property that actually matters: an unescaped `&` in a
@@ -353,6 +366,7 @@ mod tests {
         let plist = render_plist(
             Path::new("/Users/A&B/bin/omni-dev"),
             Path::new("/tmp/<sock>/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -371,6 +385,7 @@ mod tests {
         let plist = render_plist(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -394,6 +409,7 @@ mod tests {
         let plist = render_plist(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -423,6 +439,42 @@ mod tests {
     }
 
     #[test]
+    fn bakes_a_service_subset_into_program_arguments() {
+        // A subset selection appends `--services a,b` to ProgramArguments so it
+        // survives launchd's fixed-command exec (#1318).
+        let plist = render_plist(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::Only(vec![
+                DaemonServiceKind::Worktrees,
+                DaemonServiceKind::Sessions,
+            ]),
+        )
+        .expect("ASCII paths render");
+
+        assert!(
+            plist.contains(
+                "<string>--services</string>\n        <string>worktrees,sessions</string>"
+            ),
+            "{plist}"
+        );
+        assert_well_formed(&plist);
+    }
+
+    #[test]
+    fn omits_services_when_hosting_all() {
+        // `All` bakes no `--services`, keeping the full-registry plist identical
+        // to the pre-#1318 output.
+        let plist = render_plist(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
+        )
+        .expect("ASCII paths render");
+        assert!(!plist.contains("--services"), "{plist}");
+    }
+
+    #[test]
     fn sinks_stdio_to_the_daemon_log_beside_the_socket() {
         // Without a std-stream sink launchd discards the daemon's stdout/stderr to
         // /dev/null, so its lifecycle log lines never reach an operator (#1316).
@@ -431,6 +483,7 @@ mod tests {
         let plist = render_plist(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -486,7 +539,7 @@ mod tests {
         // 0xFF is not valid UTF-8; such a path cannot be placed in the UTF-8
         // plist, so it must be rejected rather than silently corrupted.
         let bad = Path::new(OsStr::from_bytes(b"/tmp/\xFF/omni-dev"));
-        assert!(render_plist(bad, Path::new("/tmp/daemon.sock")).is_err());
-        assert!(render_plist(Path::new("/usr/bin/omni-dev"), bad).is_err());
+        assert!(render_plist(bad, Path::new("/tmp/daemon.sock"), &ServiceSelection::All).is_err());
+        assert!(render_plist(Path::new("/usr/bin/omni-dev"), bad, &ServiceSelection::All).is_err());
     }
 }

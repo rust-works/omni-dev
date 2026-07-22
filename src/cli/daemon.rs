@@ -232,6 +232,43 @@ mod tests {
     }
 
     #[test]
+    fn services_flag_parses_a_subset_on_every_launcher() {
+        use crate::daemon::DaemonServiceKind;
+
+        let DaemonSubcommands::Run(cmd) = parse(&["run", "--services", "worktrees,sessions"])
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(
+            cmd.services,
+            vec![DaemonServiceKind::Worktrees, DaemonServiceKind::Sessions]
+        );
+
+        let DaemonSubcommands::Start(cmd) = parse(&["start", "--services", "browser-bridge"])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(cmd.services, vec![DaemonServiceKind::Bridge]);
+
+        let DaemonSubcommands::Restart(cmd) = parse(&["restart", "--services", "snowflake"]) else {
+            panic!("expected restart");
+        };
+        assert_eq!(cmd.services, vec![DaemonServiceKind::Snowflake]);
+    }
+
+    #[test]
+    fn services_flag_defaults_empty_and_rejects_unknown_values() {
+        let DaemonSubcommands::Run(cmd) = parse(&["run"]) else {
+            panic!("expected run");
+        };
+        assert!(cmd.services.is_empty());
+
+        // An unknown service name is rejected by clap at parse time (a typo fails
+        // loudly instead of silently baking a name the daemon can't host).
+        assert!(Wrapper::try_parse_from(["omni-dev", "run", "--services", "bogus"]).is_err());
+    }
+
+    #[test]
     fn warn_version_mismatch_covers_every_branch_without_panicking() {
         // Exercises the print branch (a commit mismatch) and the no-op branches
         // (matching, and a daemon advertising nothing). It writes to stderr, so
