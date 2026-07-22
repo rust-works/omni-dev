@@ -308,7 +308,10 @@ fn field_matches(rec: &LogRecord, field: &str, value: &str) -> bool {
         "system_user" | "user" => contains_ci(Some(&rec.system_user), value),
         "cwd" => contains_ci(Some(&rec.cwd), value),
         "auth_principal" | "principal" => contains_ci(rec.auth_principal.as_deref(), value),
-        _ => false,
+        // Unknown field names fall back to the free-form `context` map
+        // (worktree recovery fields like `branch`/`path`, HTTP correlation
+        // tags): case-insensitive substring, like `url`.
+        other => contains_ci(rec.context.get(other).map(String::as_str), value),
     }
 }
 
@@ -814,6 +817,33 @@ mod tests {
             ("err:absent", false),
             ("error:", true),
             ("unknownfield:x", false),
+        ];
+        for (q, expected) in cases {
+            let parsed = parse_query(q).unwrap();
+            assert_eq!(parsed.eval(&rec, &raw), expected, "query: {q}");
+        }
+    }
+
+    #[test]
+    fn query_unknown_field_falls_back_to_context_map() {
+        // Worktree recovery fields live in the free-form `context` map; an
+        // unknown field name looks them up there (case-insensitive substring).
+        let mut rec = LogRecord {
+            kind: RecordKind::Worktree,
+            ..LogRecord::default()
+        };
+        rec.context
+            .insert("branch".to_string(), "issue-1392-log".to_string());
+        rec.context
+            .insert("path".to_string(), "/tmp/demo-wt".to_string());
+        let raw = serde_json::to_string(&rec).unwrap().to_ascii_lowercase();
+
+        let cases = [
+            ("branch:issue-1392", true),
+            ("branch:ISSUE-1392", true),
+            ("branch:other-branch", false),
+            ("path:demo-wt", true),
+            ("commit:abc", false), // key absent from context
         ];
         for (q, expected) in cases {
             let parsed = parse_query(q).unwrap();

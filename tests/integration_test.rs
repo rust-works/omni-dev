@@ -1208,3 +1208,514 @@ fn log_filters_by_service_and_bounded_window() {
         "before --since excluded"
     );
 }
+
+// ── git worktree (#1392) ────────────────────────────────────────────────
+
+/// Parses the log file and returns the `kind: "worktree"` records, oldest first.
+fn worktree_records(log: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(log)
+        .expect("log file should exist")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|rec| rec["kind"] == "worktree")
+        .collect()
+}
+
+#[test]
+fn worktree_add_records_branch_and_commit() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-add");
+
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(wt.is_dir(), "worktree directory should exist");
+
+    let recs = worktree_records(&log);
+    assert_eq!(recs.len(), 1, "expected one worktree record: {recs:?}");
+    let rec = &recs[0];
+    assert_eq!(
+        rec["command"],
+        serde_json::json!(["git", "worktree", "add"])
+    );
+    assert_eq!(rec["service"], "worktree");
+    assert_eq!(rec["exit_code"], 0);
+    assert_eq!(rec["context"]["branch"], "wt-branch");
+    assert_eq!(
+        rec["context"]["commit"],
+        repo.get_commit_hash(0).unwrap(),
+        "commit should be the checked-out HEAD"
+    );
+    assert!(
+        rec["context"]["path"].as_str().unwrap().ends_with("wt-add"),
+        "path records the worktree target: {rec}"
+    );
+    assert!(rec["context"]["repo"].is_string(), "repo toplevel recorded");
+    Ok(())
+}
+
+#[test]
+fn worktree_remove_records_recovery_fields_and_is_queryable() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-rm");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    assert!(run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "doomed-branch",
+        ],
+    )
+    .status
+    .success());
+
+    // An untracked file makes the tree dirty — exactly what --force destroys.
+    fs::write(wt.join("scratch.txt"), "unsaved work")?;
+
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!wt.exists(), "worktree directory should be gone");
+
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a worktree remove record");
+    assert_eq!(
+        rec["command"],
+        serde_json::json!(["git", "worktree", "remove"])
+    );
+    assert_eq!(rec["context"]["branch"], "doomed-branch");
+    assert_eq!(rec["context"]["had_uncommitted"], "true");
+    assert_eq!(rec["context"]["used_force"], "true");
+    assert_eq!(
+        rec["context"]["commit"],
+        repo.get_commit_hash(0).unwrap(),
+        "pre-removal HEAD recorded for `git branch <branch> <commit>` recovery"
+    );
+
+    // Acceptance: the issue's recovery queries return the record.
+    for query_args in [
+        vec!["log", "--command", "git worktree remove", "-o", "json"],
+        vec!["log", "--service", "worktree", "-o", "json"],
+        vec!["log", "--query", "branch:doomed-branch", "-o", "json"],
+    ] {
+        let out = run_with_log(&log, &query_args);
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            stdout.contains("doomed-branch") && stdout.contains(r#""kind":"worktree""#),
+            "{query_args:?} should return the recovery record:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn worktree_list_output_json_is_machine_readable() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-list");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    assert!(run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "listed-branch",
+        ],
+    )
+    .status
+    .success());
+
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "list",
+            "--output-json",
+        ],
+    );
+    assert!(output.status.success());
+    let entries: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    let entries = entries.as_array().expect("JSON array");
+    assert_eq!(entries.len(), 2, "main + linked worktree: {entries:?}");
+    assert!(entries
+        .iter()
+        .all(|e| e["path"].is_string() && e["head"].is_string() && e["branch"].is_string()));
+    assert!(entries.iter().any(
+        |e| e["branch"] == "listed-branch" && e["path"].as_str().unwrap().ends_with("wt-list")
+    ));
+
+    let recs = worktree_records(&log);
+    assert_eq!(recs.last().unwrap()["context"]["count"], "2");
+    Ok(())
+}
+
+#[test]
+fn worktree_prune_records_pruned_paths() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-prune");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    assert!(run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "pruned-branch",
+        ],
+    )
+    .status
+    .success());
+
+    // Delete the working directory behind git's back, then prune.
+    fs::remove_dir_all(&wt)?;
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo", &repo_path, "git", "worktree", "prune", "--expire", "now",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "prune failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a worktree prune record");
+    assert_eq!(
+        rec["command"],
+        serde_json::json!(["git", "worktree", "prune"])
+    );
+    let pruned: serde_json::Value =
+        serde_json::from_str(rec["context"]["pruned"].as_str().expect("pruned recorded"))
+            .expect("pruned is JSON");
+    let pruned = pruned.as_array().expect("pruned is a JSON array");
+    assert_eq!(pruned.len(), 1, "one worktree pruned: {pruned:?}");
+    assert!(pruned[0]["path"].as_str().unwrap().ends_with("wt-prune"));
+    assert_eq!(pruned[0]["branch"], "pruned-branch");
+    assert_eq!(pruned[0]["commit"], repo.get_commit_hash(0).unwrap());
+    Ok(())
+}
+
+/// Like [`run_with_log`], but with an explicit working directory (for paths
+/// that must resolve against the cwd rather than `--repo`).
+fn run_with_log_in(
+    log: &std::path::Path,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(args)
+        .current_dir(cwd)
+        .env("OMNI_DEV_LOG_FILE", log)
+        .output()
+        .expect("failed to run binary")
+}
+
+#[test]
+fn worktree_move_records_from_to_and_branch() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-mv");
+    let wt2 = dir.path().join("wt-mv-new");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    assert!(run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "moved-branch",
+        ],
+    )
+    .status
+    .success());
+
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "move",
+            wt.to_str().unwrap(),
+            wt2.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "move failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!wt.exists(), "old path should be gone");
+    assert!(wt2.is_dir(), "new path should exist");
+
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a worktree move record");
+    assert_eq!(
+        rec["command"],
+        serde_json::json!(["git", "worktree", "move"])
+    );
+    assert!(rec["context"]["from_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("wt-mv"));
+    assert!(rec["context"]["to_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("wt-mv-new"));
+    assert_eq!(rec["context"]["branch"], "moved-branch");
+    Ok(())
+}
+
+#[test]
+fn worktree_repair_relinks_a_manually_moved_worktree() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let wt = dir.path().join("wt-rep");
+    let wt2 = dir.path().join("wt-rep-moved");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    assert!(run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "-b",
+            "repaired-branch",
+        ],
+    )
+    .status
+    .success());
+
+    // Move the worktree behind git's back: the main repo's gitdir pointer now
+    // points at the old location and needs `worktree repair` to re-link.
+    fs::rename(&wt, &wt2)?;
+
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "repair",
+            wt2.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "repair failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a worktree repair record");
+    assert_eq!(
+        rec["command"],
+        serde_json::json!(["git", "worktree", "repair"])
+    );
+    assert_eq!(rec["exit_code"], 0);
+
+    // Functional check: the repaired worktree lists at its new location.
+    let out = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "list",
+            "--output-json",
+        ],
+    );
+    let entries: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"].as_str().unwrap().ends_with("wt-rep-moved")),
+        "repaired worktree should list at the new path: {entries}"
+    );
+    Ok(())
+}
+
+#[test]
+fn worktree_list_plain_and_porcelain_record_count() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    // Plain form, driven by cwd rather than --repo (the base_dir fallback).
+    let output = run_with_log_in(&log, &repo.repo_path, &["git", "worktree", "list"]);
+    assert!(output.status.success());
+    assert!(!output.stdout.is_empty(), "plain list echoes git's output");
+    let recs = worktree_records(&log);
+    assert_eq!(recs.last().unwrap()["context"]["count"], "1");
+
+    // Porcelain form passes git's stanza output through verbatim.
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "list",
+            "--porcelain",
+        ],
+    );
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("worktree "));
+    let recs = worktree_records(&log);
+    assert_eq!(recs.last().unwrap()["context"]["count"], "1");
+    Ok(())
+}
+
+#[test]
+fn worktree_failures_still_record() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("Initial commit", "hello")?;
+    let dir = TempDir::new()?;
+    let log = dir.path().join("log.jsonl");
+    let repo_path = repo.repo_path.to_str().unwrap().to_string();
+
+    // A non-zero git exit: removing a path that is not a worktree. The record
+    // is written with the real exit code before omni-dev fails.
+    let missing = dir.path().join("not-a-worktree");
+    let output = run_with_log(
+        &log,
+        &[
+            "--repo",
+            &repo_path,
+            "git",
+            "worktree",
+            "remove",
+            missing.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("git worktree remove failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a failed remove record");
+    assert_ne!(rec["exit_code"], 0);
+    assert_eq!(rec["context"]["used_force"], "false");
+    assert!(
+        rec["context"].get("branch").is_none(),
+        "no snapshot fields for a non-repo path: {rec}"
+    );
+
+    // A spawn failure: with an empty PATH git cannot be found; the record
+    // carries the spawn error and no exit code.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["--repo", &repo_path, "git", "worktree", "list"])
+        .env("OMNI_DEV_LOG_FILE", &log)
+        .env("PATH", "")
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Failed to run git worktree list"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a spawn-failure record");
+    assert!(rec["exit_code"].is_null());
+    assert!(rec["error"].is_string());
+
+    // Outside any repository: git itself fails and no repo toplevel is
+    // resolvable, so the record has no `repo` context key.
+    let non_repo = TempDir::new()?;
+    let output = run_with_log_in(&log, non_repo.path(), &["git", "worktree", "list"]);
+    assert!(!output.status.success());
+    let recs = worktree_records(&log);
+    let rec = recs.last().expect("expected a non-repo failure record");
+    assert!(rec["context"].get("repo").is_none(), "rec: {rec}");
+    Ok(())
+}

@@ -25,9 +25,18 @@ types, so the log is a complete invocation history, not just an HTTP history:
   (`api graphql`, `pr list`, `repo view`, …) in `command`, the scrubbed argv in
   `command_line`, the `source`, the exit code, and the duration. This is what
   `omni-dev log count --kind gh` aggregates — see [Counting GitHub API calls](#counting-github-api-calls).
+- **`kind: "worktree"`** — one per `omni-dev git worktree <verb>` invocation
+  (thin logged wrappers over `git worktree add/remove/list/move/prune/repair`,
+  #1392). Tagged `service: "worktree"`, with `command` set to
+  `["git", "worktree", "<verb>"]` and the recovery-relevant metadata in the
+  free-form `context` map — for `remove`: the worktree's `path`, `branch`,
+  `commit` (HEAD *before* removal), `had_uncommitted`, and `used_force`; for
+  `prune`: a JSON `pruned` list of `{path, branch, commit}`. See
+  [Recovering a removed worktree](#recovering-a-removed-worktree).
 
-Every HTTP and `gh` record shares an `invocation_id` with the invocation that
-issued it, so you can pull a run and all of its requests with a single `--id`.
+Every HTTP, `gh`, and `worktree` record shares an `invocation_id` with the
+invocation that issued it, so you can pull a run and all of its requests with a
+single `--id`.
 
 **Coverage caveat:** `omni-dev`'s own in-process HTTP clients and its Rust `gh`
 calls (daemon *and* one-shot CLI) are recorded. The one gap left is the VS Code
@@ -112,6 +121,9 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
   accepts its class syntax (`5xx`).
 - **Text fields** (`url`, `hostname`, `system_user`, `cwd`, `auth_principal`)
   match a case-insensitive substring.
+- **Context fields:** any other field name falls back to the record's free-form
+  `context` map (case-insensitive substring), so worktree recovery fields query
+  directly: `branch:issue-1392`, `path:demo-wt`.
 - **Bare tokens** are fuzzy substring matches against the raw JSON line.
 - **Operators:** `AND` (also implicit between adjacent terms), `OR`, `NOT` (or a
   leading `-`), and parentheses. Use `"quotes"` for a value containing spaces.
@@ -148,6 +160,27 @@ omni-dev log -o json --service datadog | jq 'select(.status_code == 429)'
 omni-dev log -f --service browser-bridge
 ```
 
+### Recovering a removed worktree
+
+`omni-dev git worktree remove` records the worktree's branch, HEAD commit, and
+dirtiness *before* the removal, so an accidental remove is recoverable minutes
+later from the log alone:
+
+```bash
+# What worktree did I just remove?
+omni-dev log --command 'git worktree remove' --since 1d -o full
+
+# Or by any recovery field directly.
+omni-dev log --service worktree --since 30m
+omni-dev log --query 'branch:issue-1392'
+```
+
+The `full` record's `context` carries `path`, `branch`, `commit`,
+`had_uncommitted`, and `used_force` — enough to re-create the branch
+(`git branch <branch> <commit>`) and re-attach a worktree
+(`omni-dev git worktree add <path> <branch>`). `prune` records carry the same
+triple per pruned entry in a JSON `pruned` list.
+
 ## Counting records
 
 `omni-dev log count` aggregates the log by record **kind** and **source** over an
@@ -162,7 +195,7 @@ omni-dev log count [--since <DUR_OR_TS>] [--until <DUR_OR_TS>] [--source <SOURCE
 | `--since <DUR_OR_TS>` | Lower time bound — same forms as `omni-dev log --since` (`1h`, `2026-07-01`, RFC3339). |
 | `--until <DUR_OR_TS>` | Upper time bound (a relative value means that long ago). |
 | `--source <SOURCE>` | Restrict to `cli`, `daemon`, or `mcp`. |
-| `--kind <KIND>` | Restrict to `invocation`, `http`, or `gh`. `gh` unlocks the GitHub breakdown (below). |
+| `--kind <KIND>` | Restrict to `invocation`, `http`, `gh`, or `worktree`. `gh` unlocks the GitHub breakdown (below). |
 | `--json` | Emit JSON (string map keys, composes with `jq`) instead of the table. |
 
 With no `--kind` it reports the total and the split by kind and source:
