@@ -228,12 +228,28 @@ ADF v1.
 > `link`/`annotation`). Marks from the two groups cannot apply to the same
 > text — most commonly, `code` cannot combine with `strong`, `em`,
 > `textColor`, etc. So `` **`text`** `` (bold + monospace) is invalid ADF,
-> even though each mark is individually legal. The API rejects such a
-> document as an opaque `INVALID_INPUT`; the mark validator catches it at
-> write time (and under `--dry-run`) with a `cannot be combined with`
-> message naming the two conflicting marks (issue #1047). The groups are
-> transcribed from the `code_inline_node` / `formatted_text_inline_node`
-> variants in the pinned `@atlaskit/adf-schema`.
+> even though each mark is individually legal. The groups are transcribed
+> from the `code_inline_node` / `formatted_text_inline_node` variants in
+> the pinned `@atlaskit/adf-schema`.
+>
+> Emphasis syntax around inline code — `` **`text`** ``, `` *`text`* ``,
+> `` ~~`text`~~ `` — is nonetheless accepted: JFM→ADF conversion silently
+> drops the `strong`/`em`/`strike` mark from the code-marked run, splitting
+> the phrase into adjacent legal runs (issue #1391, option 1 of #1087).
+> The rendered output is unchanged — inline code always parses into its own
+> run, so `` **foo `bar` baz** `` becomes bold `foo `, monospace `bar`,
+> bold ` baz`, and the code font dominates inside the bold sentence exactly
+> as it would have with the (illegal) combined marks. A `link` on the code
+> run is kept (`code`+`link` is legal). The transform is conversion-time
+> only and silent — unlike the heading strip above, nothing is lost.
+>
+> Explicit span-syntax combinations — `` [`text`]{underline} ``,
+> `` :span[`text`]{color=#rrggbb} ``, etc. — are *not* rewritten: the
+> converter preserves the requested marks byte-faithfully (issue #554), and
+> the mark validator rejects the document at write time (and under
+> `--dry-run`) with a `cannot be combined with` message naming the two
+> conflicting marks (issue #1047). Without that validator the API would
+> reject such a document as an opaque `INVALID_INPUT`.
 
 ### Unsupported Node Handling
 
