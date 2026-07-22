@@ -750,6 +750,14 @@ Where:
   self-close (the requester owns the target) removes-then-replies and lets the
   extension close its own window, while a cross-window close signals the *other*
   window(s) and waits for them to `unregister` first.
+  Every close is **auditable** in `omni-dev daemon logs` (the journal on Linux,
+  #1364): the handler emits INFO `tracing` lines for the phase-1 verdict (target,
+  owning window key, open, `removable`/`is_main`, blocking risk kinds) and the
+  phase-2 execute (requesting window key, self-close vs. cross-window routing, then
+  the terminal outcome — a pruned worktree / closed window at INFO, a wait-timeout
+  or prune failure at WARN), plus an ERROR line if the safety check or the removal
+  task itself fails (a non-git-worktree target, a panicked task). Only the worktree
+  path and window keys are logged, never a secret.
 - `heartbeat` may carry an additive `close: true` when the daemon needs a specific
   window to close itself (a cross-window `close`) — the only channel it has to a
   window it can reply to but never call. It rides the reply exactly like the
