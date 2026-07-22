@@ -117,10 +117,76 @@ const DEFAULT_PR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// 1 point per poll the budget never binds.
 const MAX_PR_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// How long after fresh work (a push, or an added target) the poller holds its
+/// fast [`DEFAULT_PR_POLL_INTERVAL`] cadence before escalating *within* pending
+/// (#1389, fix 5). Two minutes covers the window where a just-pushed run is most
+/// likely to report; past it, a still-pending badge (a long build, a zombie suite)
+/// is watched more cheaply. See [`next_pr_poll_delay`].
+const PENDING_FAST_WINDOW: Duration = Duration::from_secs(2 * 60);
+
+/// The ceiling the poller escalates to *while still pending* once
+/// [`PENDING_FAST_WINDOW`] has passed (#1389, fix 5). Below the terminal
+/// [`MAX_PR_POLL_INTERVAL`] because a pending badge is expected to change soon,
+/// just not soon enough to justify pinning `base` — 60 s caps a 20-minute CI run
+/// at ~50 calls instead of ~120.
+const PENDING_MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The cadence floor the poller is held to while the shared GitHub budget is
+/// at/over [`WARN_PERCENT`](crate::github_rate_limit::WARN_PERCENT) (#1389, fix 6).
+/// Five minutes makes the daemon's contribution to an already-strained budget
+/// negligible while still recovering promptly once the window resets — a pause in
+/// all but name. See [`budget_throttled_delay`].
+const BUDGET_THROTTLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Environment override for [`pr_debounce_interval`] — the settle window the PR
+/// poller waits after the change-notify fires before snapshotting (whole seconds;
+/// a blank, non-numeric, or `0` value falls back to [`DEFAULT_PR_DEBOUNCE`]).
+const ENV_PR_DEBOUNCE: &str = "OMNI_DEV_DAEMON_PR_DEBOUNCE";
+
+/// Default settle window for the PR-poll change-notify debounce (#1389, fix 2).
+///
+/// A VS Code restart unregisters then re-registers its windows one-by-one over
+/// several seconds, each bump waking the poller; a daemon restart re-registers the
+/// same way. Waiting for ~2 s of quiet before snapshotting collapses the whole
+/// storm into **one** fetch on the final watch set instead of one per window.
+const DEFAULT_PR_DEBOUNCE: Duration = Duration::from_secs(2);
+
 /// The resolved PR-poll cadence: `OMNI_DEV_DAEMON_PR_POLL` (whole seconds) when
 /// valid, else [`DEFAULT_PR_POLL_INTERVAL`].
 fn pr_poll_interval() -> Duration {
     crate::daemon::server::duration_secs_from_env(ENV_PR_POLL_INTERVAL, DEFAULT_PR_POLL_INTERVAL)
+}
+
+/// The resolved PR-poll debounce settle window: `OMNI_DEV_DAEMON_PR_DEBOUNCE`
+/// (whole seconds) when valid, else [`DEFAULT_PR_DEBOUNCE`].
+fn pr_debounce_interval() -> Duration {
+    crate::daemon::server::duration_secs_from_env(ENV_PR_DEBOUNCE, DEFAULT_PR_DEBOUNCE)
+}
+
+/// Environment override for [`open_pr_ttl`] — how long the daemon reuses a repo's
+/// `gh pr list` result before re-fetching (whole seconds; a blank, non-numeric, or
+/// `0` value falls back to [`DEFAULT_OPEN_PR_TTL`]).
+const ENV_OPEN_PR_TTL: &str = "OMNI_DEV_DAEMON_OPEN_PR_TTL";
+
+/// Default TTL for the shared open-PR cache (#1389, fix 7). Matches the extension's
+/// former per-window `gh pr list` cache (#1296): serving "Open Pull Request…" — and
+/// the extension's transient badge fallback — from the daemon means N windows now
+/// dedupe to **one** counted `gh` per repo per TTL, rather than one per window.
+const DEFAULT_OPEN_PR_TTL: Duration = Duration::from_secs(60);
+
+/// The `--json` fields the daemon requests from `gh pr list`, mirroring the
+/// extension's `PR_JSON_FIELDS` so the forwarded array parses into its
+/// `PullRequest` shape unchanged.
+const OPEN_PR_JSON_FIELDS: &str = "number,title,url,headRefName,baseRefName,isDraft,state,author";
+
+/// The `gh pr list --limit` cap — high enough to list a repo's open PRs in one call
+/// (parity with the extension's `PR_LIST_LIMIT`).
+const OPEN_PR_LIST_LIMIT: &str = "100";
+
+/// The resolved open-PR cache TTL: `OMNI_DEV_DAEMON_OPEN_PR_TTL` (whole seconds)
+/// when valid, else [`DEFAULT_OPEN_PR_TTL`].
+fn open_pr_ttl() -> Duration {
+    crate::daemon::server::duration_secs_from_env(ENV_OPEN_PR_TTL, DEFAULT_OPEN_PR_TTL)
 }
 
 /// Environment override for [`rate_limit_poll_interval`] — the cadence at which
@@ -157,31 +223,93 @@ struct RefreshTask {
 ///
 /// The poller wakes far more often than it fetches — waking is a cached snapshot
 /// read, fetching is a subprocess and a network round trip. Two things justify the
-/// call: the watched state **moved** (a window opened, or a commit landed — the
-/// latter being invisible to the change-notify, so only looking finds it), or the
+/// call: the watch set **grew** (a target was added, or a branch's upstream moved —
+/// a push, invisible to the change-notify, so only looking finds it), or the
 /// **backoff elapsed** and it is simply time to look again.
+///
+/// A pure *removal* is deliberately not a reason (#1389): a window closing, a
+/// worktree going away, a lease lapsing, or a TTL reap can never change any
+/// **surviving** badge, so `grew` is false and the poll skips — see
+/// [`pr_watch_grew`]. That kills the close-side of every burn scenario.
 ///
 /// Pure so the policy is testable directly: from outside, the only evidence of it
 /// is *when* a subprocess runs, which a test cannot pin down without either flaking
 /// or passing for the wrong reason.
-fn pr_should_fetch(moved: bool, since_last_fetch: Option<Duration>, backoff: Duration) -> bool {
+fn pr_should_fetch(grew: bool, since_last_fetch: Option<Duration>, backoff: Duration) -> bool {
     // `map_or(true, ..)` rather than `is_none_or`: the latter is stable only
     // since 1.82 and this crate's MSRV is 1.80.
-    moved || since_last_fetch.map_or(true, |elapsed| elapsed >= backoff)
+    grew || since_last_fetch.map_or(true, |elapsed| elapsed >= backoff)
 }
 
-/// The next PR-poll delay: `base` while something is still pending, else double
-/// the current delay up to [`MAX_PR_POLL_INTERVAL`].
+/// Whether `next` holds a watch the poller has not already resolved for its
+/// current upstream — an **addition** (a new (repo, branch) target) or an
+/// **upstream that moved** (a push — the #1344 case that starts the CI run a badge
+/// reports). Either warrants asking GitHub *now*.
 ///
-/// A pure function rather than three copies inline, because the cadence is the part
-/// worth pinning: it is only observable from outside as timing, which is exactly
-/// what a test cannot assert without flaking. A failed poll passes `pending: false`,
-/// so a persistent failure backs off instead of being retried hard.
-fn next_pr_poll_delay(current: Duration, base: Duration, pending: bool) -> Duration {
-    if pending {
-        base
+/// A pure removal is never "grew": [`PrWatch`] equality is `(target, upstream_sha)`
+/// only, so a shrunk `next` that is otherwise a subset of `prev` returns `false`
+/// and the poll coalesces (#1389). Head-only moves are excluded by construction —
+/// [`PrWatch`] carries no head — because a local commit GitHub has not seen returns
+/// exactly the cached verdict, and the badge stays correctly stale through
+/// [`PrBadge::is_stale_for`](crate::pr_status::PrBadge::is_stale_for) with no
+/// network call (#1389, fix 3).
+///
+/// Pure so the fetch trigger is testable without driving a live subprocess.
+fn pr_watch_grew(prev: &[PrWatch], next: &[PrWatch]) -> bool {
+    next.iter().any(|w| !prev.contains(w))
+}
+
+/// The next PR-poll delay.
+///
+/// - **Terminal** (`pending` false): double `current` up to [`MAX_PR_POLL_INTERVAL`]
+///   — nothing is expected to change, so this is a slow liveness heartbeat. A failed
+///   poll passes `pending: false`, so a persistent failure backs off here rather
+///   than being retried hard.
+/// - **Pending** (`pending` true): hold `base` (~10 s) for the first
+///   [`PENDING_FAST_WINDOW`] after the watch last moved, then escalate — double
+///   `current` up to [`PENDING_MAX_INTERVAL`] (#1389, fix 5). A single 20-minute CI
+///   run used to pin `base` for its whole duration (360 calls/hour); escalating
+///   *within* pending caps that while a verdict arriving a cadence-tick late stays
+///   invisible in the tray. `since_moved` is time since fresh work was last seen (a
+///   push or an added target), or `None` when nothing has moved yet — treated as
+///   past the fast window so a stale-from-boot pending state does not pin `base`.
+///
+/// A pure function rather than copies inline, because the cadence is only
+/// observable from outside as timing, which a test cannot assert without flaking.
+fn next_pr_poll_delay(
+    current: Duration,
+    base: Duration,
+    pending: bool,
+    since_moved: Option<Duration>,
+) -> Duration {
+    if !pending {
+        return current.saturating_mul(2).min(MAX_PR_POLL_INTERVAL);
+    }
+    match since_moved {
+        // Fresh work: watch it closely at `base` while it is likely to resolve.
+        Some(elapsed) if elapsed < PENDING_FAST_WINDOW => base,
+        // Still pending well after the move (a long CI run, or a zombie suite):
+        // escalate so the cadence stops burning, bounded below the terminal ceiling.
+        _ => current.saturating_mul(2).min(PENDING_MAX_INTERVAL),
+    }
+}
+
+/// Stretches a computed poll delay when the shared GitHub budget is under pressure.
+///
+/// The daemon is the **single** `gh` choke point for every open window, so this is
+/// the one place a machine-wide cap can actually be enforced (#1389, fix 6). When
+/// any tracked resource is at/over
+/// [`WARN_PERCENT`](crate::github_rate_limit::WARN_PERCENT), the cadence is held at
+/// no less than [`BUDGET_THROTTLE_INTERVAL`] so a runaway in this class cannot drain
+/// the budget the whole machine shares — structurally, not just by convention. Below
+/// the threshold (or with no reading yet) the delay is returned unchanged.
+///
+/// Pure so the throttle is testable without a live rate-limit poll.
+fn budget_throttled_delay(delay: Duration, rate_limit: Option<&RateLimitSnapshot>) -> Duration {
+    if rate_limit.is_some_and(RateLimitSnapshot::over_warn) {
+        delay.max(BUDGET_THROTTLE_INTERVAL)
     } else {
-        current.saturating_mul(2).min(MAX_PR_POLL_INTERVAL)
+        delay
     }
 }
 
@@ -214,23 +342,26 @@ struct PollerTask {
     handle: JoinHandle<()>,
 }
 
-/// One thing the PR poller watches: a badge target, the commit the worktree
-/// carrying it currently has checked out, and the commit its upstream points at.
+/// One thing the PR poller watches: a badge target and the commit its upstream
+/// points at.
 ///
-/// The two OIDs are what make local work observable to the poller. A window
+/// The upstream OID is what makes a **push** observable to the poller. A window
 /// opening bumps the registry's change-notify, but nothing notifies the daemon
-/// when you commit or push — so the poller compares this against the previous
-/// tick's and treats any move as "go and ask now". Both are needed because they
-/// move on different actions: committing moves the head, while pushing moves
-/// **only** the upstream (#1344). Without the upstream, a push — the very thing
-/// that starts the CI run a badge reports — did not re-ask, and the badge sat at
-/// `●` until the backoff elapsed, up to its 30-minute ceiling.
+/// when you push — so the poller compares this against the previous tick's and
+/// treats an added target or a moved upstream as "go and ask now" (see
+/// [`pr_watch_grew`]). A push moves **only** the upstream (#1344), and it is the
+/// very thing that starts the CI run a badge reports, so the upstream must be here.
+///
+/// The local HEAD is deliberately **not** watched (#1389, fix 3): a local commit
+/// GitHub has not seen would return exactly the cached verdict, so asking wastes a
+/// call, and the badge stays correctly stale through
+/// [`PrBadge::is_stale_for`](crate::pr_status::PrBadge::is_stale_for) — a local
+/// comparison, no network — until the branch is actually pushed. Equality is thus
+/// `(target, upstream_sha)`, which is exactly the key [`pr_watch_grew`] compares.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PrWatch {
     /// The (repo, branch) to resolve a badge for.
     target: PrTarget,
-    /// That worktree's HEAD, or `None` for an unborn one.
-    head_sha: Option<String>,
     /// That branch's upstream tip, or `None` when it tracks no upstream.
     upstream_sha: Option<String>,
 }
@@ -275,10 +406,6 @@ fn pr_watch_from_snapshot(snapshot: &Value) -> Vec<PrWatch> {
         {
             if let Some(branch) = wt.get("branch").and_then(Value::as_str) {
                 out.push(PrWatch {
-                    head_sha: wt
-                        .get("head_sha")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
                     upstream_sha: wt
                         .get("upstream_sha")
                         .and_then(Value::as_str)
@@ -371,6 +498,23 @@ pub struct WorktreesService {
     /// `std::Mutex` only so `load_polling_prefs` can set it on `&self`; read
     /// briefly and never held across an `.await`.
     polling_prefs_path: Mutex<Option<PathBuf>>,
+    /// Where the resolved PR-badge cache is persisted (#1389, fix 4), so badges
+    /// survive a daemon restart and the poller can skip its immediate re-poll when
+    /// they are still fresh. `None` disables persistence — the default from
+    /// [`new`](Self::new), keeping the bare service I/O-free for unit tests; the
+    /// daemon wires it via [`load_pr_cache`](Self::load_pr_cache) at startup. Same
+    /// `std::Mutex`-only-to-set-on-`&self` role as [`Self::polling_prefs_path`].
+    pr_cache_path: Mutex<Option<PathBuf>>,
+    /// The warm-start state restored from the persisted cache (#1389, fix 4),
+    /// taken by [`start_pr_poller_with`](Self::start_pr_poller_with) when the loop
+    /// spawns. `None` on a cold start (no file, or persistence disabled), in which
+    /// case the poller does its normal first fetch.
+    pr_warm_start: Mutex<Option<PrWarmStart>>,
+    /// Shared TTL cache of `gh pr list` results per repo, backing the daemon-served
+    /// `open-prs` op (#1389, fix 7) so N windows' "Open Pull Request…" lookups
+    /// dedupe to one counted `gh` per repo instead of one per window. Behind an
+    /// `Arc` for parity with the other caches.
+    open_pr_cache: Arc<OpenPrCache>,
 }
 
 impl WorktreesService {
@@ -393,6 +537,9 @@ impl WorktreesService {
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
             prune_lock: tokio::sync::Mutex::new(()),
             polling_prefs_path: Mutex::new(None),
+            pr_cache_path: Mutex::new(None),
+            pr_warm_start: Mutex::new(None),
+            open_pr_cache: Arc::new(OpenPrCache::new(open_pr_ttl())),
         }
     }
 
@@ -456,6 +603,97 @@ impl WorktreesService {
                 path.display()
             );
         }
+    }
+
+    /// Seeds the resolved PR-badge cache from the persisted `0600` file and
+    /// remembers `path` so each poll persists back to it (#1389, fix 4). Called
+    /// once by the daemon at startup, before any window subscribes and before the
+    /// poller spawns, so restored badges render on the first tree snapshot and the
+    /// poller can skip its immediate re-poll for verdicts still fresh.
+    ///
+    /// Best-effort throughout (the [`load_polling_prefs`](Self::load_polling_prefs)
+    /// contract): a missing file is the cold-start default, and a corrupt/unreadable
+    /// one is logged and treated as empty — the poller simply re-resolves. The path
+    /// is stored regardless, so the next poll rewrites a clean file. Restores both
+    /// the badges (into [`pr_cache`](Self::pr_cache)) and the
+    /// [`PrWarmStart`](PrWarmStart) the poller reads at spawn.
+    pub fn load_pr_cache(&self, path: PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<PrCachePrefs>(&bytes) {
+                Ok(prefs) => {
+                    self.pr_cache.seed(
+                        prefs
+                            .entries
+                            .into_iter()
+                            .map(|e| (e.target, e.resolution.into_resolution())),
+                    );
+                    // A warm start needs both a watch set to compare against and a
+                    // poll time to age it; without `polled_at` the file is too old a
+                    // shape to trust, so treat it as a cold start (badges still
+                    // render, the poller just re-polls immediately).
+                    if let Some(polled_at) = prefs.polled_at {
+                        let watched = prefs
+                            .watched
+                            .into_iter()
+                            .map(|w| PrWatch {
+                                target: w.target,
+                                upstream_sha: w.upstream_sha,
+                            })
+                            .collect();
+                        *self
+                            .pr_warm_start
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            Some(PrWarmStart { watched, polled_at });
+                    }
+                }
+                // Bind the path so it is formatted whenever the branch runs — not
+                // only when a WARN subscriber is installed — so coverage sees it
+                // (the `let summary = …` pattern the rate-limit warn uses).
+                Err(err) => {
+                    let at = path.display();
+                    tracing::warn!("ignoring unreadable worktrees PR cache at {at}: {err:#}");
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                let at = path.display();
+                tracing::warn!("could not read worktrees PR cache at {at}: {err:#}");
+            }
+        }
+        *self
+            .pr_cache_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Resolves a repo's open pull requests for the `open-prs` op (#1389, fix 7),
+    /// served from the shared TTL cache when fresh, else **one** counted `gh pr
+    /// list`. The `gh` runs on a blocking thread (never an async worker), routed
+    /// through the #1387-counted [`run_gh`](crate::github_metrics::run_gh) choke
+    /// point so the call is still counted exactly once — the constraint the whole
+    /// of #1389 preserves. The result is forwarded to the extension verbatim.
+    async fn open_prs(&self, owner: &str, name: &str) -> Result<Vec<Value>> {
+        // The `gh` binary is resolved once here (the env read is process-stable),
+        // then handed to the seam below — the poller's "bin as a param" pattern, so
+        // a test injects a stub without mutating the process environment (#1030).
+        self.open_prs_with(owner, name, crate::pr_status::resolve_gh_binary())
+            .await
+    }
+
+    /// [`open_prs`](Self::open_prs) with an explicit `gh` binary, so a test drives
+    /// the cache against a stub without touching the environment.
+    async fn open_prs_with(&self, owner: &str, name: &str, bin: PathBuf) -> Result<Vec<Value>> {
+        let key = format!("{owner}/{name}");
+        if let Some(prs) = self.open_pr_cache.fresh(&key) {
+            return Ok(prs);
+        }
+        let slug = key.clone();
+        let prs = tokio::task::spawn_blocking(move || open_pr_list(&bin, &slug))
+            .await
+            .unwrap_or_else(|err| Err(anyhow!("blocking open-prs task failed: {err}")))?;
+        self.open_pr_cache.store(key, prs.clone());
+        Ok(prs)
     }
 
     /// A handle to the GitHub rate-limit snapshot cache (#1375), so the daemon can
@@ -529,27 +767,43 @@ impl WorktreesService {
     /// verdict actually moved** — so the server's diff pushes to every open window
     /// exactly when CI state changes, and never otherwise.
     ///
-    /// Cadence adapts: [`pr_poll_interval`] (~10 s) while any badge is pending,
-    /// doubling to [`MAX_PR_POLL_INTERVAL`] once everything is terminal, and it
-    /// polls nothing at all while no window is registered. That is a battery and
-    /// wakeup concern rather than a budget one.
+    /// Cadence adapts: [`pr_poll_interval`] (~10 s) while a badge is pending and
+    /// fresh, escalating to [`PENDING_MAX_INTERVAL`] once a pending phase runs long
+    /// (#1389, fix 5) and doubling to [`MAX_PR_POLL_INTERVAL`] once everything is
+    /// terminal; it polls nothing at all while no window is registered.
+    ///
+    /// It spends a `gh` call only when the watch set **grows** — a target added or
+    /// an upstream pushed (#1389, fixes 1/3) — or the backoff elapses; a pure
+    /// removal (window close, VS Code/daemon shutdown, TTL reap, lease lapse) never
+    /// fetches. A change-notify storm is debounced ([`pr_debounce_interval`],
+    /// #1389 fix 2) into one fetch, restored badges survive a restart (#1389 fix
+    /// 4), and the cadence is capped when the shared GitHub budget is strained
+    /// (#1389 fix 6).
     ///
     /// Idempotent, and a no-op outside a tokio runtime (mirroring
     /// [`start_menu_refresh`](Self::start_menu_refresh) and the Snowflake keep-alive
     /// heartbeat), so unit tests build a bare service that never spawns `gh`.
     pub fn start_pr_poller(&self) {
-        // Both resolved once at spawn: process-stable env config (the
-        // menu-refresh precedent), never re-read per poll.
-        self.start_pr_poller_with(pr_poll_interval(), crate::pr_status::resolve_gh_binary());
+        // Resolved once at spawn: process-stable env config (the menu-refresh
+        // precedent), never re-read per poll.
+        self.start_pr_poller_with(
+            pr_poll_interval(),
+            pr_debounce_interval(),
+            crate::pr_status::resolve_gh_binary(),
+        );
     }
 
-    /// [`start_pr_poller`](Self::start_pr_poller) with an explicit cadence and
-    /// `gh` binary, so tests drive the loop at millisecond speed against a stub
-    /// **without mutating the process environment** — one global env var cannot
-    /// serve two parallel tests pointing at different fakes. Mirrors the
-    /// [`TreeSnapshotCache::with_ttl`] seam and the Snowflake heartbeat's
-    /// "interval via config, not env" rule.
-    fn start_pr_poller_with(&self, base: Duration, gh_bin: PathBuf) {
+    /// [`start_pr_poller`](Self::start_pr_poller) with an explicit cadence,
+    /// debounce settle window, and `gh` binary, so tests drive the loop at
+    /// millisecond speed against a stub **without mutating the process
+    /// environment** — one global env var cannot serve two parallel tests pointing
+    /// at different fakes. Mirrors the [`TreeSnapshotCache::with_ttl`] seam and the
+    /// Snowflake heartbeat's "interval via config, not env" rule.
+    ///
+    /// Reads the rate-limit cache, the persistence path, and the warm-start state
+    /// off `self` at spawn (all `#1389` inputs), so its signature stays close to
+    /// the original two-cadence seam.
+    fn start_pr_poller_with(&self, base: Duration, debounce: Duration, gh_bin: PathBuf) {
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::debug!("no tokio runtime; worktrees PR poller not started");
             return;
@@ -563,41 +817,93 @@ impl WorktreesService {
         let registry = self.registry.clone();
         let tree_cache = self.tree_cache.clone();
         let pr_cache = self.pr_cache.clone();
+        // The shared budget reading (#1389, fix 6) and the `0600` persistence path +
+        // restored warm start (#1389, fix 4). The warm start is *taken* — it seeds
+        // the loop once and must not be reused by a later restart of the poller.
+        let rate_limit_cache = self.rate_limit_cache.clone();
+        let pr_cache_path = self
+            .pr_cache_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let warm_start = self
+            .pr_warm_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // Captured here, before the task's first sleep, so a window that registers
         // while the loop is starting still wakes it rather than being missed.
         let mut changes = self.registry.subscribe_changes();
         let handle = tokio::spawn(async move {
             // Two independent cadences. The loop *wakes* every `base` — cheap: a read
             // of the coalescing snapshot cache, no subprocess, no network. It only
-            // *asks GitHub* when there is reason to: the watched state moved, or the
-            // backoff has elapsed.
+            // *asks GitHub* when there is reason to: the watch set grew (a target
+            // added, or an upstream pushed), or the backoff has elapsed.
             //
             // They have to be separate because the two things that should trigger a
             // fetch arrive by different routes. A window opening bumps the registry's
-            // change-notify, but **a commit does not** — nothing in the daemon is
+            // change-notify, but **a push does not** — nothing in the daemon is
             // notified when you `git push`. The only way to notice is to look, so the
-            // loop looks often and cheaply, and pays only when something changed.
+            // loop looks often and cheaply, and pays only when something grew.
             let mut backoff = base;
-            let mut last_poll: Option<Instant> = None;
-            let mut watched: Option<Vec<PrWatch>> = None;
-            loop {
+            // Warm start (#1389, fix 4): resume what the previous daemon last
+            // resolved and when, so a restart within the backoff window skips the
+            // immediate re-poll for verdicts already restored into `pr_cache`.
+            // `last_poll` is reconstructed as an `Instant` that many seconds ago; a
+            // reboot (monotonic epoch reset) or a future timestamp collapses to
+            // "never polled", which just re-polls — the safe direction.
+            let (mut watched, mut last_poll): (Option<Vec<PrWatch>>, Option<Instant>) =
+                match warm_start {
+                    Some(ws) => {
+                        let elapsed = (Utc::now() - ws.polled_at)
+                            .to_std()
+                            .unwrap_or(Duration::ZERO);
+                        (Some(ws.watched), Instant::now().checked_sub(elapsed))
+                    }
+                    None => (None, None),
+                };
+            // When fresh work (a push or an added target) was last seen, so the
+            // pending cadence can escalate once it goes quiet (#1389, fix 5).
+            let mut moved_at: Option<Instant> = None;
+            'poll: loop {
                 // Wait first: at startup no window has registered yet, and the
                 // first snapshot would be empty anyway.
                 tokio::select! {
                     () = loop_token.cancelled() => break,
                     () = tokio::time::sleep(base) => {}
                     // A window opened or closed — look now rather than at the next
-                    // tick.
+                    // tick, but debounce first.
                     result = changes.changed() => {
                         // Unreachable today: this task owns an `Arc` of the registry
                         // that holds the sender, so it cannot be dropped while we are
                         // here. Kept anyway because the alternative is worse — a
                         // closed channel makes `changed()` return `Ready` forever, so
                         // ignoring the error would spin this loop at full speed,
-                        // re-snapshotting and re-running `gh` every iteration. One
-                        // unreachable line is a cheap guard against that.
+                        // re-snapshotting and re-running `gh` every iteration.
                         if result.is_err() {
                             break;
+                        }
+                        // Debounce (#1389, fix 2): a VS Code restart unregisters then
+                        // re-registers its windows one-by-one over several seconds,
+                        // each bump waking us; a daemon restart re-registers the same
+                        // way. Wait for `debounce` of quiet before snapshotting so the
+                        // whole storm collapses to **one** fetch on the final watch
+                        // set. Bounded by an overall deadline so a steady drip of
+                        // changes cannot postpone the poll forever.
+                        let overall_deadline = Instant::now() + debounce.saturating_mul(4);
+                        loop {
+                            tokio::select! {
+                                () = loop_token.cancelled() => break 'poll,
+                                () = tokio::time::sleep(debounce) => break,
+                                r = changes.changed() => {
+                                    if r.is_err() {
+                                        break 'poll;
+                                    }
+                                    if Instant::now() >= overall_deadline {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -607,24 +913,49 @@ impl WorktreesService {
                 let watch = pr_watch_from_snapshot(&snapshot);
                 if watch.is_empty() {
                     // No windows, or nothing on GitHub: ask nothing, and forget any
-                    // backoff so the next tree starts fresh rather than inheriting a
-                    // ceiling earned on a tree that no longer exists.
+                    // backoff so the next tree starts fresh. But **keep** `watched`
+                    // (#1389, fix 4): a VS Code restart momentarily empties the watch
+                    // mid-storm, and nulling it here would make the re-registered set
+                    // look brand-new and re-fetch. A genuinely gone tree simply has
+                    // nothing to compare against on the next non-empty tick.
                     backoff = base;
                     last_poll = None;
-                    watched = None;
+                    moved_at = None;
                     continue;
                 }
-                // Did anything we care about move? A new commit shows up here as a
-                // changed head — which is exactly the push case the change-notify
-                // cannot see.
-                let moved = watched.as_ref() != Some(&watch);
-                if !pr_should_fetch(moved, last_poll.map(|at| at.elapsed()), backoff) {
+                // Did the watched set **grow** (an addition, or an upstream pushed)?
+                // A pure removal is not a reason to fetch (#1389, fix 1); a local
+                // commit is not either (#1389, fix 3, `PrWatch` carries no head).
+                let grew = pr_watch_grew(watched.as_deref().unwrap_or(&[]), &watch);
+                // Prune verdicts for targets that vanished, so a closed worktree's
+                // badge does not linger in the cache (#1389, fix 1) — local, no
+                // network, and correct whether or not this tick goes on to fetch.
+                let keep: HashSet<PrTarget> = watch.iter().map(|w| w.target.clone()).collect();
+                pr_cache.retain_targets(&keep);
+                // Budget-aware cap (#1389, fix 6): the daemon is the single `gh`
+                // choke point, so throttling here is the one place a machine-wide cap
+                // works. Over WARN_PERCENT, hold the stretched cadence *and* ignore an
+                // immediate `grew`, so no runaway in this class can drain the shared
+                // budget — structurally, not by convention.
+                let rate_limit = rate_limit_cache.get();
+                let over_budget = rate_limit.is_some_and(|s| s.over_warn());
+                let effective_backoff = budget_throttled_delay(backoff, rate_limit.as_ref());
+                let trigger = grew && !over_budget;
+                if !pr_should_fetch(trigger, last_poll.map(|at| at.elapsed()), effective_backoff) {
+                    // Not fetching this tick. Advance `watched` only for a pure shrink
+                    // or a quiet identical tick — an addition/push (`grew`) must stay
+                    // unresolved so it is still fetched once the cadence or budget
+                    // allows, rather than being silently consumed here.
+                    if !grew {
+                        watched = Some(watch);
+                    }
                     continue;
                 }
-                if moved {
-                    // Fresh work: watch it closely rather than serving out a backoff
-                    // earned while it was quiet.
+                if grew {
+                    // Fresh work: watch it closely and restart the escalation clock
+                    // rather than serving out a backoff earned while it was quiet.
                     backoff = base;
+                    moved_at = Some(Instant::now());
                 }
                 let targets: Vec<PrTarget> = watch.iter().map(|w| w.target.clone()).collect();
                 // `gh` is a blocking subprocess: never on an async worker. A join
@@ -633,7 +964,7 @@ impl WorktreesService {
                 // badges this round", and neither deserves its own handling.
                 let bin = gh_bin.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    crate::pr_status::resolve_with(&bin, &targets)
+                    crate::pr_status::resolve_with_budget(&bin, &targets)
                 })
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("blocking poll task failed: {err}")));
@@ -643,25 +974,61 @@ impl WorktreesService {
                 // negatives, and it mints no new negatives (#1370) — rather than
                 // blanking every row, and is not "pending", so it backs off rather
                 // than hammers.
-                let pending = match resolved {
-                    Ok(resolutions) => {
+                let (pending, resolved_ok) = match resolved {
+                    Ok((resolutions, budget)) => {
+                        // Fold the free budget reading this poll carried into the
+                        // shared cache (#1389, fix 8): the graphql figure stays fresh
+                        // whenever polling is active, which lets the standalone
+                        // `/rate_limit` poller idle (fix 8b), and the poll's `cost`
+                        // reveals the real per-call point price.
+                        if let Some(b) = budget {
+                            tracing::debug!(
+                                "PR poll cost {} point(s); graphql {}/{} used, {} remaining",
+                                b.cost,
+                                b.used,
+                                b.limit,
+                                b.remaining
+                            );
+                            rate_limit_cache.observe_graphql(RateLimitResource::new(
+                                b.used,
+                                b.limit,
+                                b.remaining,
+                                b.reset,
+                            ));
+                        }
                         // Bump only on a real change, or the server's diff-and-drop
                         // is defeated and every window re-renders on every poll.
                         if pr_cache.replace(resolutions) {
                             registry.bump();
                         }
-                        pr_cache.any_pending()
+                        (pr_cache.any_pending(), true)
                     }
                     Err(err) => {
                         tracing::debug!("PR badge poll failed: {err:#}");
-                        false
+                        (false, false)
                     }
                 };
                 last_poll = Some(Instant::now());
                 // Record what this verdict was about, so the *next* tick can tell a
                 // genuine change from a quiet tree.
                 watched = Some(watch);
-                backoff = next_pr_poll_delay(backoff, base, pending);
+                let since_moved = moved_at.map(|at| at.elapsed());
+                backoff = next_pr_poll_delay(backoff, base, pending, since_moved);
+                // Persist the fresh verdicts (#1389, fix 4) so the next restart
+                // serves them and can skip its immediate re-poll. Only on a real
+                // resolution — a failed poll must not advance the persisted poll time
+                // past the last *good* one. Best-effort; a write failure costs at
+                // most one extra poll after the next restart.
+                if resolved_ok {
+                    if let Some(path) = &pr_cache_path {
+                        persist_pr_cache(
+                            path,
+                            &pr_cache,
+                            watched.as_deref().unwrap_or(&[]),
+                            Utc::now(),
+                        );
+                    }
+                }
             }
         });
         *guard = Some(PollerTask { token, handle });
@@ -712,46 +1079,59 @@ impl WorktreesService {
         let token = CancellationToken::new();
         let loop_token = token.clone();
         let cache = self.rate_limit_cache.clone();
+        let registry = self.registry.clone();
         let handle = tokio::spawn(async move {
             // Remembers the previous reading so a WARN fires only on the *rising*
             // edge across the threshold, not every poll while usage stays high.
             let mut prev: Option<RateLimitSnapshot> = None;
             loop {
-                // Poll first, so `status` has a reading soon after boot rather than
-                // one interval later. `gh` is a blocking subprocess: never on an
-                // async worker. A join failure folds into the same channel as a
-                // `gh` failure — both mean "no fresh reading this round".
-                let bin = gh_bin.clone();
-                let resolved = tokio::task::spawn_blocking(move || resolve_rate_limit_with(&bin))
-                    .await
-                    .unwrap_or_else(|err| {
-                        Err(anyhow!("blocking rate-limit poll task failed: {err}"))
-                    });
-                match resolved {
-                    Ok(snap) => {
-                        if rate_limit_crossed_warn(prev.as_ref(), &snap) {
-                            // Bound to a local (rather than inlined into the macro)
-                            // so it is computed whenever the branch is taken, not
-                            // only when a WARN-level subscriber is installed —
-                            // `tracing` skips evaluating macro args otherwise.
-                            let summary = snap.summary_line();
-                            tracing::warn!(
-                                "GitHub API rate limit high: {summary} (querying /rate_limit \
-                                 is free; the daemon's gh usage is not)"
-                            );
+                // Gate the poll on activity (#1389, fix 8b): a fully-idle daemon —
+                // no window registered and no polling lease active — has nothing to
+                // watch, so it spends no `/rate_limit` subprocess and lets the last
+                // reading stand. The read is free against the budget, but the
+                // wakeups are not; and while polling *is* active the graphql figure
+                // stays fresh from every PR poll's folded-in budget (fix 8a), so the
+                // standalone poll is only topping up `core`/`search`.
+                if !registry.list().is_empty() || !registry.polling_snapshot().is_empty() {
+                    // Poll first, so `status` has a reading soon after a window
+                    // appears rather than one interval later. `gh` is a blocking
+                    // subprocess: never on an async worker. A join failure folds into
+                    // the same channel as a `gh` failure — both mean "no fresh
+                    // reading this round".
+                    let bin = gh_bin.clone();
+                    let resolved =
+                        tokio::task::spawn_blocking(move || resolve_rate_limit_with(&bin))
+                            .await
+                            .unwrap_or_else(|err| {
+                                Err(anyhow!("blocking rate-limit poll task failed: {err}"))
+                            });
+                    match resolved {
+                        Ok(snap) => {
+                            if rate_limit_crossed_warn(prev.as_ref(), &snap) {
+                                // Bound to a local (rather than inlined into the
+                                // macro) so it is computed whenever the branch is
+                                // taken, not only when a WARN-level subscriber is
+                                // installed — `tracing` skips evaluating macro args
+                                // otherwise.
+                                let summary = snap.summary_line();
+                                tracing::warn!(
+                                    "GitHub API rate limit high: {summary} (querying \
+                                     /rate_limit is free; the daemon's gh usage is not)"
+                                );
+                            }
+                            // Update the cache only; deliberately no `registry.bump()`
+                            // — the rate limit is not tree topology, and bumping would
+                            // re-push an unchanged tree to every window. The tray
+                            // re-polls `menu()` at ~1 Hz and `status` reads on demand.
+                            cache.replace(snap);
+                            prev = Some(snap);
                         }
-                        // Update the cache only; deliberately no `registry.bump()`
-                        // — the rate limit is not tree topology, and bumping would
-                        // re-push an unchanged tree to every window. The tray
-                        // re-polls `menu()` at ~1 Hz and `status` reads on demand.
-                        cache.replace(snap);
-                        prev = Some(snap);
+                        // Best-effort decoration: a missing/unauthenticated `gh` or a
+                        // network blip leaves the last good reading in place rather
+                        // than blanking the line, and never affects the budget (the
+                        // read is free).
+                        Err(err) => tracing::debug!("GitHub rate-limit poll failed: {err:#}"),
                     }
-                    // Best-effort decoration: a missing/unauthenticated `gh` or a
-                    // network blip leaves the last good reading in place rather than
-                    // blanking the line, and never affects the budget (the read is
-                    // free).
-                    Err(err) => tracing::debug!("GitHub rate-limit poll failed: {err:#}"),
                 }
                 tokio::select! {
                     () = loop_token.cancelled() => break,
@@ -959,6 +1339,21 @@ impl DaemonService for WorktreesService {
                     self.persist_polling_prefs();
                 }
                 Ok(json!({ "ok": true }))
+            }
+            "open-prs" => {
+                // Serve "Open Pull Request…" (and the extension's transient badge
+                // fallback) from the daemon (#1389, fix 7): one shared, TTL-cached,
+                // #1387-counted `gh pr list` per repo, so N windows dedupe to one
+                // call instead of each shelling its own (the per-window burn
+                // #1370/#1389 target). Repo-wide; the client filters by branch for a
+                // worktree-scoped lookup, and answers a badged branch straight from
+                // the snapshot (zero `gh`) without ever reaching here.
+                let owner = require_str(&payload, "owner", "open-prs")?;
+                let name = require_str(&payload, "name", "open-prs")?;
+                if owner.trim().is_empty() || name.trim().is_empty() {
+                    bail!("`open-prs` requires a non-empty `owner` and `name`");
+                }
+                Ok(json!({ "pull_requests": self.open_prs(owner, name).await? }))
             }
             "open" => {
                 // Focus (or open — VS Code reuses an already-open window) an
@@ -1183,6 +1578,271 @@ fn write_polling_prefs(path: &Path, prefs: &PollingPrefs) -> Result<()> {
     }
     let json = serde_json::to_vec_pretty(prefs).context("failed to serialize polling prefs")?;
     crate::daemon::paths::write_file_0600(path, &json)
+}
+
+// --- PR-badge cache persistence (#1389, fix 4) -----------------------------
+
+/// A persisted badge — the disk twin of [`PrBadge`](crate::pr_status::PrBadge).
+///
+/// A distinct DTO rather than reusing `PrBadge`'s derive because the two shapes
+/// disagree: `PrBadge` renders onto the **tree wire**, where `head_oid` is
+/// `#[serde(skip)]` (it is a local staleness key, never sent) and `is_draft` is
+/// `isDraft`. The cache file must round-trip `head_oid` — a restored verdict is
+/// compared against the worktree's current HEAD via
+/// [`PrBadge::is_stale_for`](crate::pr_status::PrBadge::is_stale_for), and a lost
+/// `head_oid` would render every restored badge stale — so it carries the field
+/// explicitly under a stable snake_case name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedBadge {
+    number: u64,
+    is_draft: bool,
+    checks: PrCheckState,
+    url: String,
+    head_oid: String,
+}
+
+/// A persisted resolution — the disk twin of
+/// [`PrResolution`](crate::pr_status::PrResolution). Externally tagged so the
+/// no-PR negative (#1370) round-trips as a plain `"NoPr"` and a badge as
+/// `{ "Pr": { … } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedResolution {
+    Pr(PersistedBadge),
+    NoPr,
+}
+
+/// One persisted cache entry: which target, and the verdict last resolved for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedEntry {
+    target: PrTarget,
+    resolution: PersistedResolution,
+}
+
+/// A persisted watch — the `(target, upstream_sha)` the poller compared at the
+/// last fetch. Lets a warm start tell "same set, verdicts still fresh → skip the
+/// immediate re-poll" from "a target was added or a branch pushed while we were
+/// down → fetch" (the [`pr_watch_grew`] comparison, restored across a restart).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedWatch {
+    target: PrTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_sha: Option<String>,
+}
+
+/// The on-disk shape of the resolved PR-badge cache (#1389, fix 4): the badges,
+/// the watch set they were resolved for, and when. `#[serde(default)]` throughout
+/// so an empty/older/partial file decodes to "nothing restored" rather than
+/// failing the load — best-effort, exactly like [`PollingPrefs`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrCachePrefs {
+    #[serde(default)]
+    entries: Vec<PersistedEntry>,
+    #[serde(default)]
+    watched: Vec<PersistedWatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    polled_at: Option<DateTime<Utc>>,
+}
+
+impl PersistedResolution {
+    /// The disk form of a live resolution.
+    fn from_resolution(r: &PrResolution) -> Self {
+        match r {
+            PrResolution::Pr(b) => Self::Pr(PersistedBadge {
+                number: b.number,
+                is_draft: b.is_draft,
+                checks: b.checks,
+                url: b.url.clone(),
+                head_oid: b.head_oid.clone(),
+            }),
+            PrResolution::NoPr => Self::NoPr,
+        }
+    }
+
+    /// The live form of a restored resolution.
+    fn into_resolution(self) -> PrResolution {
+        match self {
+            Self::Pr(b) => PrResolution::Pr(PrBadge {
+                number: b.number,
+                is_draft: b.is_draft,
+                checks: b.checks,
+                url: b.url,
+                head_oid: b.head_oid,
+            }),
+            Self::NoPr => PrResolution::NoPr,
+        }
+    }
+}
+
+/// Assembles the on-disk cache from the live cache entries, the watch they were
+/// resolved for, and the poll time.
+fn pr_cache_prefs_from(
+    entries: Vec<(PrTarget, PrResolution)>,
+    watched: &[PrWatch],
+    polled_at: DateTime<Utc>,
+) -> PrCachePrefs {
+    let mut entries: Vec<PersistedEntry> = entries
+        .into_iter()
+        .map(|(target, resolution)| PersistedEntry {
+            target,
+            resolution: PersistedResolution::from_resolution(&resolution),
+        })
+        .collect();
+    // Stable on-disk order so the file does not churn on rewrite from `HashMap`
+    // iteration order alone (the same reason `PollingPrefs` sorts).
+    entries.sort_by(|a, b| a.target.cmp(&b.target));
+    let mut watched: Vec<PersistedWatch> = watched
+        .iter()
+        .map(|w| PersistedWatch {
+            target: w.target.clone(),
+            upstream_sha: w.upstream_sha.clone(),
+        })
+        .collect();
+    watched.sort_by(|a, b| a.target.cmp(&b.target));
+    PrCachePrefs {
+        entries,
+        watched,
+        polled_at: Some(polled_at),
+    }
+}
+
+/// Writes `prefs` to `path` as pretty JSON with `0600` perms, creating the parent
+/// runtime dir (`0700`) if needed — the [`write_polling_prefs`] pattern.
+fn write_pr_cache(path: &Path, prefs: &PrCachePrefs) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::daemon::paths::ensure_dir_0700(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(prefs).context("failed to serialize PR cache")?;
+    crate::daemon::paths::write_file_0600(path, &json)
+}
+
+/// Persists the current PR-badge cache to `path` (best-effort). Reads the live
+/// entries off `pr_cache`, pairs them with the `watched` set and `polled_at`, and
+/// writes the `0600` file; a failure is logged at WARN and swallowed, since the
+/// in-memory cache is authoritative for the running daemon and losing the warm
+/// start only costs one extra poll after the next restart.
+fn persist_pr_cache(
+    path: &Path,
+    pr_cache: &PrStatusCache,
+    watched: &[PrWatch],
+    polled_at: DateTime<Utc>,
+) {
+    let prefs = pr_cache_prefs_from(pr_cache.entries(), watched, polled_at);
+    if let Err(err) = write_pr_cache(path, &prefs) {
+        let at = path.display();
+        tracing::warn!("could not persist worktrees PR cache to {at}: {err:#}");
+    }
+}
+
+/// Warm-start state restored from the persisted PR-badge cache (#1389, fix 4):
+/// the watch set the previous daemon last resolved and when it last polled. The
+/// poller seeds its loop from this so a restart within the backoff window skips
+/// the immediate re-poll for verdicts it already holds, instead of spending a `gh`
+/// call to re-derive what the `0600` file already carries.
+#[derive(Debug, Clone)]
+struct PrWarmStart {
+    /// The `(target, upstream_sha)` set the persisted verdicts describe.
+    watched: Vec<PrWatch>,
+    /// When those verdicts were resolved, used to age the warm start against the
+    /// backoff (a stale-enough file just re-polls).
+    polled_at: DateTime<Utc>,
+}
+
+// --- Shared open-PR cache for the daemon-served "Open PR" op (#1389, fix 7) -----
+
+/// One cached `gh pr list` result: the forwarded JSON PR array and when it was
+/// fetched, for TTL expiry.
+#[derive(Debug, Clone)]
+struct OpenPrEntry {
+    at: Instant,
+    prs: Vec<Value>,
+}
+
+/// A shared, TTL'd cache of `gh pr list` results per repo (#1389, fix 7).
+///
+/// Serving "Open Pull Request…" — and the extension's transient badge fallback —
+/// from the daemon means N windows asking about one repo dedupe to a single counted
+/// `gh pr list` within the TTL, instead of each window shelling its own (the
+/// per-window burn #1370/#1389 target). A plain temporal cache, **no single-flight**:
+/// the access pattern is a manual action (or a brief post-enable transient), so two
+/// exactly-concurrent misses for the same repo — costing one extra `gh` — are rare
+/// and harmless, while the common repeat-within-TTL is served for free. The lock is
+/// never held across an `.await`.
+#[derive(Debug)]
+struct OpenPrCache {
+    entries: Mutex<HashMap<String, OpenPrEntry>>,
+    ttl: Duration,
+}
+
+impl OpenPrCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// The cached PRs for `key` (`owner/name`) while still within the TTL, else
+    /// `None` (a miss that the caller resolves with a fresh `gh`).
+    fn fresh(&self, key: &str) -> Option<Vec<Value>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .filter(|e| e.at.elapsed() < self.ttl)
+            .map(|e| e.prs.clone())
+    }
+
+    /// Records a freshly-fetched PR list for `key`.
+    fn store(&self, key: String, prs: Vec<Value>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                key,
+                OpenPrEntry {
+                    at: Instant::now(),
+                    prs,
+                },
+            );
+    }
+}
+
+/// Runs `gh pr list` for `slug` (`owner/name`) through the #1387-counted `run_gh`
+/// choke point and parses the JSON array of open PRs. **Blocking** (a subprocess) —
+/// call on a blocking thread, never an async worker. The array is forwarded to the
+/// extension verbatim, which parses it into its `PullRequest` shape.
+fn open_pr_list(bin: &Path, slug: &str) -> Result<Vec<Value>> {
+    let output = crate::github_metrics::run_gh(
+        bin,
+        [
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--state",
+            "open",
+            "--json",
+            OPEN_PR_JSON_FIELDS,
+            "--limit",
+            OPEN_PR_LIST_LIMIT,
+        ],
+        "pr list",
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to run {} (is the GitHub CLI installed?)",
+            bin.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gh pr list failed: {}", stderr.trim());
+    }
+    match serde_json::from_slice(&output.stdout).context("gh pr list returned invalid JSON")? {
+        Value::Array(arr) => Ok(arr),
+        _ => bail!("gh pr list did not return a JSON array"),
+    }
 }
 
 /// Computes the **full** [`GitStatus`] of `folder` — branch, repo identity, and
@@ -3441,7 +4101,7 @@ mod tests {
         .await
         .unwrap();
         // Deliberately NOT enabling polling for the repo.
-        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        svc.start_pr_poller_with(Duration::from_millis(20), Duration::from_millis(10), fake);
         tokio::time::sleep(Duration::from_millis(200)).await;
         svc.shutdown().await;
         assert!(
@@ -4071,13 +4731,54 @@ mod tests {
         (path, guard)
     }
 
+    /// A [`fake_gh`] that also records **ground truth**: each invocation appends a
+    /// byte to a counter file before printing `stdout`. The returned counter path
+    /// lets a test assert how many `gh` subprocesses actually ran, independent of
+    /// the #1387 request-log counter — so the two can be compared (#1389).
+    fn counting_fake_gh(dir: &Path, stdout: &str) -> (PathBuf, MutexGuard<'static, ()>, PathBuf) {
+        let guard = shim_lock();
+        let path = dir.join("fake-gh");
+        let counter = dir.join("gh-calls");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\nprintf x >> {counter:?}\ncat <<'JSON'\n{stdout}\nJSON\n",
+                counter = counter.display()
+            ),
+        );
+        (path, guard, counter)
+    }
+
+    /// The number of `gh` subprocesses the counting stub recorded (0 if it never
+    /// ran) — the length of the counter file.
+    fn gh_spawn_count(counter: &Path) -> usize {
+        std::fs::read(counter).map_or(0, |b| b.len())
+    }
+
+    /// The number of **successful** `kind: "gh"` records the #1387 choke point
+    /// wrote to `log` — one NDJSON line per `gh` that ran to a `0` exit. Filtering
+    /// on the exit code matches the ground-truth counter (which is written when the
+    /// stub *runs*), so a rare failed spawn cannot desync the two.
+    fn counted_gh_records(log: &Path) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(r#""kind":"gh""#) && l.contains(r#""exit_code":0"#))
+            .count()
+    }
+
     /// A repo with a GitHub origin and one commit on `main`.
     fn github_repo(dir: &Path) -> Repository {
+        github_repo_with_remote(dir, "git@github.com:rust-works/omni-dev.git")
+    }
+
+    /// A repo with a specific GitHub `origin` URL and one commit on `main`, so a
+    /// test can register **distinct** targets (owner/name) across windows.
+    fn github_repo_with_remote(dir: &Path, url: &str) -> Repository {
         let repo = init_repo(dir);
         empty_commit(&repo, Some("refs/heads/main"), &[], "A");
         repo.set_head("refs/heads/main").unwrap();
-        repo.remote("origin", "git@github.com:rust-works/omni-dev.git")
-            .unwrap();
+        repo.remote("origin", url).unwrap();
         repo
     }
 
@@ -4201,7 +4902,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_should_fetch_on_a_moved_tree_or_an_elapsed_backoff() {
+    fn pr_should_fetch_when_the_watch_grew_or_the_backoff_elapsed() {
         let backoff = Duration::from_secs(600);
         // Never fetched: go.
         assert!(pr_should_fetch(false, None, backoff));
@@ -4215,9 +4916,9 @@ mod tests {
         // Quiet tree, backoff elapsed: time to look again.
         assert!(pr_should_fetch(false, Some(backoff), backoff));
         assert!(pr_should_fetch(false, Some(backoff * 2), backoff));
-        // The load-bearing case: the tree moved (a commit landed), so fetch **now**
-        // regardless of how deep the backoff had grown. Without this a push waits out
-        // the full ceiling on a stale badge.
+        // The load-bearing case: the watch grew (a target added, or an upstream
+        // pushed), so fetch **now** regardless of how deep the backoff had grown.
+        // Without this a push waits out the full ceiling on a stale badge.
         assert!(pr_should_fetch(true, Some(Duration::ZERO), backoff));
         assert!(pr_should_fetch(
             true,
@@ -4227,24 +4928,246 @@ mod tests {
     }
 
     #[test]
-    fn next_pr_poll_delay_holds_fast_while_pending_and_backs_off_to_the_ceiling() {
+    fn next_pr_poll_delay_escalates_within_pending_and_backs_off_when_terminal() {
         let base = Duration::from_secs(10);
-        // Something is still running: keep the watch cadence, however long we had
-        // backed off for.
-        assert_eq!(next_pr_poll_delay(base, base, true), base);
-        assert_eq!(next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, true), base);
+        let fresh = Some(Duration::ZERO);
+        let stale = Some(PENDING_FAST_WINDOW);
+        // Pending and fresh (within the fast window): hold `base`, however long we
+        // had backed off for.
+        assert_eq!(next_pr_poll_delay(base, base, true, fresh), base);
+        assert_eq!(
+            next_pr_poll_delay(PENDING_MAX_INTERVAL, base, true, fresh),
+            base
+        );
+        // Pending but past the fast window (a long CI run): escalate — double up to
+        // the pending ceiling, never to the terminal one.
+        assert_eq!(next_pr_poll_delay(base, base, true, stale), base * 2);
+        assert_eq!(
+            next_pr_poll_delay(PENDING_MAX_INTERVAL, base, true, stale),
+            PENDING_MAX_INTERVAL
+        );
+        // Pending with nothing having moved yet (`None`) is treated as past the fast
+        // window, so a stale-from-boot pending state does not pin `base`.
+        assert_eq!(next_pr_poll_delay(base, base, true, None), base * 2);
         // Everything terminal: double…
-        assert_eq!(next_pr_poll_delay(base, base, false), base * 2);
-        assert_eq!(next_pr_poll_delay(base * 2, base, false), base * 4);
-        // …but never past the ceiling, and never overflow off it.
+        assert_eq!(next_pr_poll_delay(base, base, false, fresh), base * 2);
+        assert_eq!(next_pr_poll_delay(base * 2, base, false, fresh), base * 4);
+        // …up to the terminal ceiling (above the pending one), and never overflow.
         assert_eq!(
-            next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, false),
+            next_pr_poll_delay(MAX_PR_POLL_INTERVAL, base, false, fresh),
             MAX_PR_POLL_INTERVAL
         );
         assert_eq!(
-            next_pr_poll_delay(Duration::MAX, base, false),
+            next_pr_poll_delay(Duration::MAX, base, false, None),
             MAX_PR_POLL_INTERVAL
         );
+    }
+
+    /// A watch on one branch with the given upstream tip.
+    fn watch(branch: &str, upstream: Option<&str>) -> PrWatch {
+        PrWatch {
+            target: PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: branch.into(),
+            },
+            upstream_sha: upstream.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pr_watch_grew_fires_on_additions_and_pushes_but_never_on_removals() {
+        let a = watch("a", Some("111"));
+        let b = watch("b", Some("222"));
+        let ab = [a.clone(), b.clone()];
+        let just_a = std::slice::from_ref(&a);
+        let just_b = std::slice::from_ref(&b);
+        // Nothing new: quiet tick.
+        assert!(!pr_watch_grew(&ab, &ab));
+        // Addition: a new target appeared.
+        assert!(pr_watch_grew(just_a, &ab));
+        // Pure removal: a window/worktree went away — must NOT fetch (#1389, fix 1).
+        assert!(!pr_watch_grew(&ab, just_a));
+        // First sight (empty prev, from `None`): everything is new.
+        assert!(pr_watch_grew(&[], just_a));
+        // A push moves only the upstream — still "grew".
+        let a_pushed = [watch("a", Some("999"))];
+        assert!(pr_watch_grew(just_a, &a_pushed));
+        // Gaining a target while losing another still fetches (the gain wins).
+        assert!(pr_watch_grew(just_a, just_b));
+    }
+
+    #[test]
+    fn budget_throttled_delay_holds_the_floor_only_when_over_warn() {
+        let base = Duration::from_secs(10);
+        let over = RateLimitSnapshot {
+            graphql: Some(rl_resource(90)),
+            core: Some(rl_resource(3)),
+            search: None,
+        };
+        let under = RateLimitSnapshot {
+            graphql: Some(rl_resource(50)),
+            core: Some(rl_resource(3)),
+            search: None,
+        };
+        // No reading yet: unchanged.
+        assert_eq!(budget_throttled_delay(base, None), base);
+        // Under the warn threshold: unchanged.
+        assert_eq!(budget_throttled_delay(base, Some(&under)), base);
+        // Over: raised to at least the throttle floor…
+        assert_eq!(
+            budget_throttled_delay(base, Some(&over)),
+            BUDGET_THROTTLE_INTERVAL
+        );
+        // …but a delay already above the floor is left alone (never shortened).
+        let long = BUDGET_THROTTLE_INTERVAL * 2;
+        assert_eq!(budget_throttled_delay(long, Some(&over)), long);
+    }
+
+    #[test]
+    fn pr_cache_prefs_round_trips_through_json_including_head_oid() {
+        // The persisted cache must survive a JSON round trip with `head_oid` intact
+        // — it is the staleness key the tree wire drops, and losing it would render
+        // every restored badge stale (#1389, fix 4).
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "main".into(),
+        };
+        let badge = PrResolution::Pr(PrBadge {
+            number: 1337,
+            is_draft: true,
+            checks: PrCheckState::Pending,
+            url: "http://x/1337".into(),
+            head_oid: "deadbeef".into(),
+        });
+        let watched = vec![watch("main", Some("abc"))];
+        let polled_at = DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let prefs = pr_cache_prefs_from(vec![(target, badge.clone())], &watched, polled_at);
+
+        let json = serde_json::to_vec(&prefs).unwrap();
+        let back: PrCachePrefs = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, prefs);
+        assert_eq!(back.polled_at, Some(polled_at));
+        assert_eq!(back.watched[0].upstream_sha.as_deref(), Some("abc"));
+        // The restored resolution equals the original — head_oid and all.
+        assert_eq!(back.entries[0].resolution.clone().into_resolution(), badge);
+    }
+
+    #[test]
+    fn pr_cache_prefs_round_trip_an_explicit_no_pr_verdict() {
+        // The explicit negative must survive persistence too: restoring `NoPr`
+        // as "absent" would lose the #1370 distinction across a restart and
+        // re-ask GitHub for branches already known to have no PR.
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "feature".into(),
+        };
+        let prefs = pr_cache_prefs_from(vec![(target, PrResolution::NoPr)], &[], Utc::now());
+        let json = serde_json::to_vec(&prefs).unwrap();
+        let back: PrCachePrefs = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.entries[0].resolution, PersistedResolution::NoPr);
+        assert_eq!(
+            back.entries[0].resolution.clone().into_resolution(),
+            PrResolution::NoPr
+        );
+    }
+
+    #[test]
+    fn load_pr_cache_without_polled_at_restores_badges_but_no_warm_start() {
+        // A file with verdicts but no `polled_at` (an older shape, or a
+        // hand-edited one) still renders badges, but must not arm the warm
+        // start: without a poll time there is nothing to age the verdicts
+        // against, so the poller re-polls immediately (#1389, fix 4).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-cache.json");
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "main".into(),
+        };
+        let mut prefs = pr_cache_prefs_from(
+            vec![(target, PrResolution::Pr(pending_badge(7, "abc")))],
+            &[watch("main", None)],
+            Utc::now(),
+        );
+        prefs.polled_at = None;
+        write_pr_cache(&path, &prefs).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(path);
+        assert!(
+            svc.pr_cache.get("rust-works", "omni-dev", "main").is_some(),
+            "the badge itself must still restore"
+        );
+        assert!(
+            svc.pr_warm_start
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "no poll time means a cold start, not a trusted warm one"
+        );
+    }
+
+    /// Installs a thread-local WARN-level subscriber for the duration of a
+    /// test, so degraded-path `tracing::warn!` sites actually format their
+    /// fields instead of short-circuiting on "nobody is listening".
+    fn warn_subscriber() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
+    #[test]
+    fn load_pr_cache_tolerates_a_corrupt_or_unreadable_file() {
+        // The best-effort contract: a mangled cache is logged and treated as
+        // empty — never a panic — and the path is stored regardless, so the
+        // next successful poll rewrites a clean file (#1389, fix 4).
+        let _trace = warn_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("pr-cache.json");
+        std::fs::write(&corrupt, b"not json").unwrap();
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(corrupt.clone());
+        assert!(svc.pr_cache.entries().is_empty());
+        assert_eq!(
+            svc.pr_cache_path
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_deref(),
+            Some(corrupt.as_path()),
+            "the path must be stored even when the load fails, so persistence recovers"
+        );
+
+        // A directory: `read` fails with a non-NotFound error (the distinct
+        // "could not read" arm), with the same treated-as-empty outcome.
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(dir.path().to_path_buf());
+        assert!(svc.pr_cache.entries().is_empty());
+    }
+
+    #[test]
+    fn persist_pr_cache_swallows_a_write_failure() {
+        // Best-effort: an unwritable path is logged at WARN and swallowed — the
+        // in-memory cache stays authoritative, and losing the warm start only
+        // costs one extra poll after the next restart.
+        let _trace = warn_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        // The parent is a regular file, so creating the runtime dir must fail.
+        let path = blocker.join("pr-cache.json");
+        persist_pr_cache(&path, &PrStatusCache::new(), &[], Utc::now());
+        assert!(!path.exists());
+        // The root has no parent at all — nothing to create, and the write
+        // itself fails (it is a directory); still swallowed.
+        persist_pr_cache(Path::new("/"), &PrStatusCache::new(), &[], Utc::now());
     }
 
     #[tokio::test]
@@ -4467,7 +5390,7 @@ mod tests {
         std::fs::set_permissions(&fake, perms).unwrap();
 
         let svc = WorktreesService::new();
-        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        svc.start_pr_poller_with(Duration::from_millis(20), Duration::from_millis(10), fake);
         tokio::time::sleep(Duration::from_millis(200)).await;
         svc.shutdown().await;
         assert!(
@@ -4517,7 +5440,7 @@ mod tests {
         );
         svc.pr_cache.replace(seeded);
 
-        svc.start_pr_poller_with(Duration::from_millis(20), fake);
+        svc.start_pr_poller_with(Duration::from_millis(20), Duration::from_millis(10), fake);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // The tree still serves, and the seeded badge survived the failing polls —
@@ -4557,7 +5480,7 @@ mod tests {
 
         let svc = WorktreesService::new();
         // Poller first, with nothing registered — it backs off on the empty tree.
-        svc.start_pr_poller_with(Duration::from_millis(50), fake);
+        svc.start_pr_poller_with(Duration::from_millis(50), Duration::from_millis(10), fake);
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Now an editor opens.
@@ -4663,7 +5586,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_watch_tracks_the_head_so_a_commit_is_visible_to_the_poller() {
+    fn pr_watch_ignores_the_head_so_a_local_commit_asks_nothing() {
+        // #1389, fix 3. A local commit moves only the head — GitHub has not seen
+        // it — so asking would return exactly the cached verdict, and the badge
+        // stays correctly stale via `is_stale_for` with no network. So a snapshot
+        // that differs *only* in `head_sha` must compare **equal** as a watch.
         let snap = |sha: &str| {
             json!({"repos":[{
                 "main_repo":"omni-dev",
@@ -4675,20 +5602,18 @@ mod tests {
         };
         let before = pr_watch_from_snapshot(&snap("aaa"));
         let after = pr_watch_from_snapshot(&snap("bbb"));
-        // Same target, different head — the poller's "something moved" signal.
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].target, after[0].target);
-        assert_ne!(before, after);
-        // Identical trees compare equal, so a quiet tick asks nothing.
-        assert_eq!(before, pr_watch_from_snapshot(&snap("aaa")));
+        // The head moved, but the watch did not — no fetch trigger, no `gh` call.
+        assert_eq!(before, after);
+        assert!(!pr_watch_grew(&before, &after));
     }
 
     #[test]
     fn pr_watch_tracks_the_upstream_so_a_push_is_visible_to_the_poller() {
         // #1344's bonus. A push is what *starts* the CI run a badge reports, yet
-        // it moves no local head — so watching only `head_sha` left the poller
-        // blind to it and the badge sat at `●` until the backoff elapsed, up to
-        // its 30-minute ceiling.
+        // it moves no local head — so an upstream move alone must register as "go
+        // and ask now", or the badge sits at `●` until the backoff elapses.
         let snap = |upstream: &str| {
             json!({"repos":[{
                 "main_repo":"omni-dev",
@@ -4701,14 +5626,17 @@ mod tests {
         };
         let before = pr_watch_from_snapshot(&snap("aaa"));
         let after = pr_watch_from_snapshot(&snap("bbb"));
-        // Same target, same head — only the upstream moved, and that alone must
-        // register as "go and ask now".
+        // Same target, only the upstream moved — a genuine "grew" signal.
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].target, after[0].target);
-        assert_eq!(before[0].head_sha, after[0].head_sha);
         assert_ne!(before, after);
+        assert!(pr_watch_grew(&before, &after));
         // A quiet tick still asks nothing.
         assert_eq!(before, pr_watch_from_snapshot(&snap("aaa")));
+        assert!(!pr_watch_grew(
+            &before,
+            &pr_watch_from_snapshot(&snap("aaa"))
+        ));
     }
 
     #[test]
@@ -4725,7 +5653,6 @@ mod tests {
         let watch = pr_watch_from_snapshot(&snap);
         assert_eq!(watch.len(), 1);
         assert_eq!(watch[0].upstream_sha, None);
-        assert_eq!(watch[0].head_sha.as_deref(), Some("aaa"));
     }
 
     #[test]
@@ -4742,7 +5669,11 @@ mod tests {
     #[tokio::test]
     async fn start_pr_poller_is_idempotent_and_shutdown_stops_it() {
         let svc = WorktreesService::new();
-        svc.start_pr_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            PathBuf::from("/bin/true"),
+        );
         let token = svc
             .poller
             .lock()
@@ -4754,7 +5685,11 @@ mod tests {
         // Cancel the live task, then start again: if `start` spawned a replacement
         // it would orphan this one, so the token staying cancelled proves it did not.
         token.cancel();
-        svc.start_pr_poller_with(Duration::from_millis(50), PathBuf::from("/bin/true"));
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            PathBuf::from("/bin/true"),
+        );
         assert!(svc
             .poller
             .lock()
@@ -4859,6 +5794,9 @@ mod tests {
             }}"#,
         );
         let svc = WorktreesService::new();
+        // #1389, fix 8b: the poller only spends a `/rate_limit` call while something
+        // is being watched — a lease makes it active without needing a window/folder.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
         svc.start_rate_limit_poller_with(Duration::from_millis(50), fake.clone());
 
         // Each poll spawns a real subprocess; wait on a generous deadline so a
@@ -4885,6 +5823,69 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_none());
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn rate_limit_poller_stays_idle_with_nothing_registered() {
+        // #1389, fix 8b: a fully-idle daemon (no window, no lease) spends no
+        // `/rate_limit` subprocess — the counting stub records zero spawns.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"{"resources":{"graphql":{"limit":5000,"used":1,"remaining":4999,"reset":1}}}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.start_rate_limit_poller_with(Duration::from_millis(20), fake);
+
+        // Give the loop several ticks; with nothing registered it must never poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            gh_spawn_count(&counter),
+            0,
+            "idle daemon must not poll (#1389, fix 8b)"
+        );
+        assert!(svc.rate_limit_cache.get().is_none());
+
+        // Once a lease is active, the next tick populates the cache.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.rate_limit_cache.get().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("an active lease should resume polling");
+        assert!(gh_spawn_count(&counter) >= 1);
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_poller_survives_a_failing_gh() {
+        // A missing/failing `gh` leaves the cache empty and never wedges the loop —
+        // the degraded branch keeps the last (here, absent) reading rather than
+        // crashing. Active via a lease so the gate (#1389, fix 8b) lets it try.
+        let svc = WorktreesService::new();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.start_rate_limit_poller_with(
+            Duration::from_millis(20),
+            PathBuf::from("/no/such/gh/xyzzy"),
+        );
+        // Let it fail a few times: the cache stays empty and the task stays alive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(svc.rate_limit_cache.get().is_none());
+        assert!(
+            svc.rate_limit_poller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some(),
+            "the loop must survive a failing gh, not panic out"
+        );
+        svc.shutdown().await;
     }
 
     #[test]
@@ -4944,7 +5945,11 @@ mod tests {
         // Polling defaults off (#1376): enable it for this repo so the poller/fold
         // act on it, as if the user had toggled it on.
         svc.registry.set_polling("rust-works", "omni-dev", true);
-        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            fake.clone(),
+        );
 
         // Wait on a generous wall-clock deadline: each poll spawns a real
         // subprocess, and under a loaded machine (a full `build.sh` runs a build
@@ -4982,6 +5987,507 @@ mod tests {
     #[tokio::test]
     // Holds the shim guard across awaits; see the note above.
     #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_folds_its_graphql_budget_into_the_rate_limit_cache() {
+        // #1389, fix 8a: every PR poll carries a free graphql budget reading, which
+        // the poller folds into the shared cache — so the graphql figure stays fresh
+        // without a standalone `/rate_limit` call.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{
+                "rateLimit":{"limit":5000,"cost":1,"remaining":4877,"used":123,
+                             "resetAt":"2026-07-21T16:00:00Z"},
+                "r0":{"b0":{
+                  "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                    {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                  ]}}},
+                  "associatedPullRequests":{"nodes":[{"number":1337,"isDraft":false,"url":"http://x/1337"}]}
+                }}
+            }}"#,
+        );
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        // No rate-limit poller started: the only writer of the cache is the PR poll's
+        // folded-in budget, so a populated graphql reading proves fix 8a.
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            fake.clone(),
+        );
+
+        let graphql = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(g) = svc.rate_limit_cache.get().and_then(|s| s.graphql) {
+                    return g;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the PR poll should fold its budget into the cache");
+        assert_eq!(graphql.used, 123);
+        assert_eq!(graphql.limit, 5000);
+        assert_eq!(graphql.remaining, 4877);
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_counts_every_gh_call_exactly_once() {
+        // #1389's non-negotiable constraint (#1387): fewer calls, but every call
+        // still counted. Compares the ground-truth number of `gh` subprocesses the
+        // poll actually spawned against the number of successful `kind:"gh"` records
+        // the counted `run_gh` choke point wrote — they must be equal, so a future
+        // refactor cannot add an uncounted `gh` path (counted < spawns) without
+        // failing here.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{"number":1337,"isDraft":false,"url":"http://x/1337"}]}
+            }}}}"#,
+        );
+        let log = bin_dir.path().join("log.jsonl");
+        std::env::set_var("OMNI_DEV_LOG_FILE", &log);
+
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.start_pr_poller_with(Duration::from_millis(30), Duration::from_millis(10), fake);
+
+        // Wait for at least one fetch to land.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if svc.pr_cache.get("rust-works", "omni-dev", "main").is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("poller should fetch through the fake gh");
+
+        // Stop the loop so both counts are final (no in-flight gh), then compare.
+        svc.shutdown().await;
+        let spawns = gh_spawn_count(&counter);
+        let counted = counted_gh_records(&log);
+        std::env::remove_var("OMNI_DEV_LOG_FILE");
+        assert!(
+            spawns >= 1,
+            "the poll should have spent at least one gh call"
+        );
+        assert_eq!(
+            counted, spawns,
+            "#1387: every gh call ({spawns}) must be counted exactly once, got {counted}"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_debounces_a_registration_storm_into_one_fetch() {
+        // #1389, fix 2: a burst of registrations (a VS Code restart re-registering
+        // its windows) that each *grow* the watch must collapse into ONE fetch on
+        // the final set, not one per window. Two distinct repos appear back-to-back
+        // inside the debounce window; a debounce-free loop would fetch twice.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        github_repo(dir_a.path()); // rust-works/omni-dev → alias r0
+        github_repo_with_remote(dir_b.path(), "git@github.com:rust-works/other-repo.git"); // r1
+        let bin_dir = tempfile::tempdir().unwrap();
+        // Both terminal, so no fast pending cadence can add a second fetch.
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"{"data":{
+                "r0":{"b0":{"target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}},
+                  "associatedPullRequests":{"nodes":[{"number":1,"isDraft":false,"url":"http://x/1"}]}}},
+                "r1":{"b0":{"target":{"oid":"b","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}},
+                  "associatedPullRequests":{"nodes":[{"number":2,"isDraft":false,"url":"http://x/2"}]}}}
+            }}"#,
+        );
+        let svc = WorktreesService::new();
+        // Enable polling for both before they register, so the first snapshot after
+        // the storm already counts them.
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.registry.set_polling("rust-works", "other-repo", true);
+        // `base` far larger than the test so only the storm — never the cadence —
+        // can trigger a fetch; a generous debounce so the two registers land inside
+        // one settle window even on a loaded machine.
+        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(200), fake);
+        // The burst: both windows register back-to-back.
+        svc.handle(
+            "register",
+            json!({ "key": "a", "folders": [dir_a.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // A beat between the two, so the first bump has (all but certainly)
+        // woken the poller into its settle window before the second arrives —
+        // exercising the debounce *restart*, not just a single coalesced wake.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        svc.handle(
+            "register",
+            json!({ "key": "b", "folders": [dir_b.path()], "repo": "other-repo" }),
+        )
+        .await
+        .unwrap();
+
+        // Wait until both badges resolve — proving the single fetch covered the full
+        // final set, not just the first window.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let a = svc.pr_cache.get("rust-works", "omni-dev", "main").is_some();
+                let b = svc
+                    .pr_cache
+                    .get("rust-works", "other-repo", "main")
+                    .is_some();
+                if a && b {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the debounced fetch should resolve both repos");
+
+        svc.shutdown().await;
+        assert_eq!(
+            gh_spawn_count(&counter),
+            1,
+            "the registration storm must collapse into exactly one fetch (#1389, fix 2)"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poll_debounce_deadline_bounds_a_steady_drip_of_changes() {
+        // The settle loop is bounded: a drip of registry bumps, each landing
+        // inside the debounce window, must not postpone the poll forever — the
+        // overall deadline (4× the debounce) forces the snapshot mid-storm
+        // (#1389, fix 2).
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(bin_dir.path(), "{}");
+        let svc = WorktreesService::new();
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        // `base` far larger than the test, so only the grew-trigger — released
+        // by the deadline — can fetch.
+        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(50), fake);
+        let register = json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" });
+        svc.handle("register", register.clone()).await.unwrap();
+        // Re-register (an upsert, but still a bump) every 25ms — inside the
+        // 50ms debounce — for well past the 200ms deadline. A deadline-free
+        // loop would still be settling when the drip ends.
+        for _ in 0..24 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            svc.handle("register", register.clone()).await.unwrap();
+        }
+        let spawned_mid_drip = gh_spawn_count(&counter);
+        svc.shutdown().await;
+        assert!(
+            spawned_mid_drip >= 1,
+            "the deadline must force a fetch while the drip is still running (#1389, fix 2)"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poller_skips_the_immediate_fetch_when_the_warm_cache_is_fresh() {
+        // #1389, fix 4: a daemon restart within the backoff window serves badges
+        // from the persisted cache and spends **no** gh call, because every current
+        // target already has a fresh verdict.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = github_repo(dir.path());
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let bin_dir = tempfile::tempdir().unwrap();
+        // If the poller wrongly fetched, this empty reply would still spawn the stub
+        // and bump the counter — which is exactly what the assertion catches.
+        let (fake, _shim, counter) = counting_fake_gh(bin_dir.path(), "{}");
+
+        // Persist a fresh cache the way the previous daemon would have: a badge for
+        // `main` whose verdict is about the current head (so it is not stale),
+        // watched at `(main, no upstream)`, resolved just now.
+        let cache_path = bin_dir.path().join("pr-cache.json");
+        let target = PrTarget {
+            owner: "rust-works".into(),
+            name: "omni-dev".into(),
+            branch: "main".into(),
+        };
+        let prefs = pr_cache_prefs_from(
+            vec![(target, PrResolution::Pr(pending_badge(1337, &head)))],
+            &[watch("main", None)],
+            Utc::now(),
+        );
+        write_pr_cache(&cache_path, &prefs).unwrap();
+
+        let svc = WorktreesService::new();
+        svc.load_pr_cache(cache_path);
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // `base` far larger than the test: the only fetch that could happen is the
+        // immediate one we expect the warm cache to skip.
+        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(10), fake);
+
+        // The restored badge renders on the wire without a gh call.
+        let number = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let tree = svc.handle("tree", Value::Null).await.unwrap();
+                if let Some(n) = repos_of(&tree)
+                    .first()
+                    .and_then(|r| r["worktrees"][0]["pr"]["number"].as_u64())
+                {
+                    return n;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the restored badge should render from the warm cache");
+        assert_eq!(number, 1337);
+
+        // Let the poller run a while, then confirm it stayed quiet.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        svc.shutdown().await;
+        assert_eq!(
+            gh_spawn_count(&counter),
+            0,
+            "a fresh warm cache must skip the immediate re-poll (#1389, fix 4)"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poller_persists_fresh_verdicts_for_the_next_warm_start() {
+        // #1389, fix 4, write side (the twin of the skip test above, which reads
+        // a hand-written file): a successful resolve persists the cache —
+        // creating the runtime dir if needed — so the *next* daemon restart
+        // warm-starts from it.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim) = fake_gh(
+            bin_dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"abc","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}}},
+                "associatedPullRequests":{"nodes":[{"number":41,"isDraft":false,"url":"u"}]}
+            }}}}"#,
+        );
+        let svc = WorktreesService::new();
+        // No file yet, and no parent dir either: the load takes the benign
+        // NotFound arm, and the write must create the `0700` runtime dir.
+        let cache_path = bin_dir.path().join("runtime").join("pr-cache.json");
+        svc.load_pr_cache(cache_path.clone());
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        svc.start_pr_poller_with(Duration::from_millis(50), Duration::from_millis(10), fake);
+
+        // A partially-written or not-yet-written file simply retries: only a
+        // fully parseable cache ends the wait.
+        let prefs = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&cache_path) {
+                    if let Ok(prefs) = serde_json::from_slice::<PrCachePrefs>(&bytes) {
+                        if !prefs.entries.is_empty() {
+                            return prefs;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a successful resolve should persist the cache file");
+        svc.shutdown().await;
+
+        assert_eq!(prefs.entries[0].target.branch, "main");
+        assert!(
+            matches!(&prefs.entries[0].resolution, PersistedResolution::Pr(b) if b.number == 41),
+            "{:?}",
+            prefs.entries[0].resolution
+        );
+        assert_eq!(
+            prefs.watched,
+            vec![PersistedWatch {
+                target: prefs.entries[0].target.clone(),
+                upstream_sha: None
+            }]
+        );
+        assert!(
+            prefs.polled_at.is_some(),
+            "the poll time is what ages the next warm start"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn open_prs_op_serves_from_gh_then_dedupes_within_the_ttl() {
+        // #1389, fix 7: the daemon serves "Open Pull Request…" so N windows dedupe
+        // to one counted `gh pr list` per repo. A generous TTL, so the second call
+        // is served from the cache and spawns **no** second `gh` — the whole point.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(
+            bin_dir.path(),
+            r#"[{"number":42,"title":"T","url":"http://x/42","headRefName":"feat",
+                "baseRefName":"main","isDraft":false,"state":"OPEN","author":{"login":"me"}}]"#,
+        );
+        let svc = WorktreesService::new();
+
+        let prs = svc
+            .open_prs_with("rust-works", "omni-dev", fake.clone())
+            .await
+            .expect("gh pr list should resolve");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0]["number"], json!(42));
+        assert_eq!(prs[0]["url"], json!("http://x/42"));
+        assert_eq!(gh_spawn_count(&counter), 1, "first call spends one gh");
+
+        // A second window asking the same repo is served from the shared cache.
+        let again = svc
+            .open_prs_with("rust-works", "omni-dev", fake.clone())
+            .await
+            .expect("cache hit should resolve");
+        assert_eq!(again, prs);
+        assert_eq!(
+            gh_spawn_count(&counter),
+            1,
+            "the second lookup must dedupe to the cached result, not a new gh (#1389, fix 7)"
+        );
+
+        // The op wrapper shapes the reply and validates the payload.
+        let reply = svc
+            .handle(
+                "open-prs",
+                json!({ "owner": "rust-works", "name": "omni-dev" }),
+            )
+            .await
+            .expect("open-prs op should route");
+        assert_eq!(reply["pull_requests"][0]["number"], json!(42));
+        assert!(svc
+            .handle("open-prs", json!({ "owner": "  ", "name": "x" }))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn open_pr_list_surfaces_a_missing_binary_a_failed_run_and_bad_json() {
+        // The three degraded shapes a real `gh` presents — not installed, a
+        // nonzero exit (auth/network), and output that is not the JSON array
+        // the menu indexes into — must each be a distinct, actionable error
+        // rather than a panic or a silently empty list (#1389, fix 7).
+        let err = open_pr_list(Path::new("/nonexistent/gh"), "rust-works/omni-dev").unwrap_err();
+        assert!(
+            err.to_string().contains("is the GitHub CLI installed"),
+            "{err:#}"
+        );
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let _guard = shim_lock();
+        let failing = bin_dir.path().join("fake-gh-fails");
+        write_exec_script(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
+        let err = open_pr_list(&failing, "rust-works/omni-dev").unwrap_err();
+        assert!(err.to_string().contains("gh pr list failed"), "{err:#}");
+        assert!(err.to_string().contains("boom"), "{err:#}");
+
+        let object = bin_dir.path().join("fake-gh-object");
+        write_exec_script(&object, "#!/bin/sh\necho '{}'\n");
+        let err = open_pr_list(&object, "rust-works/omni-dev").unwrap_err();
+        assert!(
+            err.to_string().contains("did not return a JSON array"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
+    async fn pr_poller_throttles_when_the_budget_is_over_warn() {
+        // #1389, fix 6: over the ~80% warn threshold the poller holds its stretched
+        // cadence and ignores even a grown watch, so no runaway can drain the shared
+        // budget. A recent warm `last_poll` is seeded so the "first sight always
+        // fetches" base case cannot mask the throttle — the only thing that could
+        // fetch here is the grew-trigger, which the throttle suppresses.
+        let dir = tempfile::tempdir().unwrap();
+        github_repo(dir.path());
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (fake, _shim, counter) = counting_fake_gh(bin_dir.path(), "{}");
+
+        let svc = WorktreesService::new();
+        // Warm start with an *empty* watch but a fresh poll time: the registered
+        // repo then reads as a grown watch, while `last_poll` is recent enough that
+        // only the grew-trigger — not an elapsed backoff — could drive a fetch.
+        *svc.pr_warm_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(PrWarmStart {
+            watched: vec![],
+            polled_at: Utc::now(),
+        });
+        // Budget over the warn threshold before the poller starts.
+        svc.rate_limit_cache.replace(RateLimitSnapshot {
+            graphql: Some(rl_resource(90)),
+            core: Some(rl_resource(3)),
+            search: None,
+        });
+        svc.registry.set_polling("rust-works", "omni-dev", true);
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" }),
+        )
+        .await
+        .unwrap();
+        // `base` far larger than the test, so a fetch could only come from the
+        // grew-trigger the throttle is meant to suppress.
+        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(10), fake);
+
+        // Let the poller wake on the registration and run a while.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        svc.shutdown().await;
+        assert_eq!(
+            gh_spawn_count(&counter),
+            0,
+            "over WARN_PERCENT the poller must not fetch a grown watch (#1389, fix 6)"
+        );
+    }
+
+    #[tokio::test]
+    // Holds the shim guard across awaits; see the note above.
+    #[allow(clippy::await_holding_lock)]
     async fn pr_poller_bumps_only_when_a_verdict_actually_moves() {
         // The diff-and-drop contract: an unchanged poll must not bump, or every
         // window re-renders on every tick — the cost this design exists to avoid.
@@ -5007,7 +6513,11 @@ mod tests {
         // Polling defaults off (#1376): enable it for this repo so the poller/fold
         // act on it, as if the user had toggled it on.
         svc.registry.set_polling("rust-works", "omni-dev", true);
-        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            fake.clone(),
+        );
 
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -5059,7 +6569,11 @@ mod tests {
         // Polling defaults off (#1376): enable it for this repo so the poller/fold
         // act on it, as if the user had toggled it on.
         svc.registry.set_polling("rust-works", "omni-dev", true);
-        svc.start_pr_poller_with(Duration::from_millis(50), fake.clone());
+        svc.start_pr_poller_with(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            fake.clone(),
+        );
 
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
