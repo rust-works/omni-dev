@@ -142,8 +142,10 @@ impl TreeCommand {
 
 /// Follows the daemon's `subscribe` push stream, re-rendering the tree on each
 /// snapshot until the daemon closes the stream or the user interrupts (Ctrl-C).
-/// Each table frame is enriched with on-demand ahead/behind, exactly like the
-/// one-shot path, so a followed view matches a plain `tree`.
+///
+/// Each frame is enriched with on-demand ahead/behind, exactly like the one-shot
+/// path, so a followed view — table **or** JSON — carries the same shape as a
+/// plain `tree` (the JSON stream stays one compact NDJSON frame per snapshot).
 async fn follow_tree_stream(socket: &Path, output: TableOrJson) -> Result<()> {
     let mut sub = DaemonClient::new(socket)
         .subscribe(DaemonEnvelope::service(SERVICE, "subscribe", Value::Null))
@@ -154,13 +156,14 @@ async fn follow_tree_stream(socket: &Path, output: TableOrJson) -> Result<()> {
                 // `None` = the daemon closed the stream (shutdown); we are done.
                 let Some(frame) = frame else { break };
                 let mut payload = reply_payload(frame?)?;
+                // Enrich before either renderer so `tree --follow` matches the
+                // one-shot `tree` byte-for-byte in JSON and column-for-column in
+                // the table (the one-shot enriches ahead of both branches too).
+                enrich_ahead_behind(socket, &mut payload).await;
                 match output {
                     // A compact one-line frame per snapshot (an NDJSON stream).
                     TableOrJson::Json => println!("{}", serde_json::to_string(&payload)?),
-                    TableOrJson::Table => {
-                        enrich_ahead_behind(socket, &mut payload).await;
-                        println!("{}", render_tree(&payload));
-                    }
+                    TableOrJson::Table => println!("{}", render_tree(&payload)),
                 }
             }
             // Ctrl-C ends the follow; dropping `sub` closes the connection,
@@ -241,8 +244,16 @@ impl CloseCommand {
         let socket = server::resolve_socket(self.socket)?;
 
         // "Close Window": non-destructive, no safety check — the daemon closes the
-        // owning window(s) and never inspects git.
+        // owning window(s) and never inspects git. `--dry-run` is honoured here
+        // too, so the combination never has a side effect.
         if self.window_only {
+            if self.dry_run {
+                println!(
+                    "Would close the window for {} (dry run; nothing closed)",
+                    path.display()
+                );
+                return Ok(());
+            }
             call(
                 &socket,
                 "close",
@@ -274,7 +285,7 @@ impl CloseCommand {
                 path.display()
             );
         }
-        if !self.yes && !confirm_removal(&report) {
+        if !self.yes && !confirm_removal(&report).await {
             println!("Aborted; nothing was deleted.");
             return Ok(());
         }
@@ -489,26 +500,36 @@ fn render_notes(label: &str, notes: Option<&Value>) -> String {
 }
 
 /// Prompts on stderr for confirmation before a destructive delete and returns
-/// whether the user assented. Reads one line from stdin; any read error (e.g. a
-/// closed stdin) is treated as "no", so the delete never proceeds unattended.
-fn confirm_removal(report: &Value) -> bool {
+/// whether the user assented.
+///
+/// The blocking `stdin().read_line` runs on a dedicated thread (`spawn_blocking`)
+/// so it never stalls an async worker while it waits for input. Any read error,
+/// a closed stdin (EOF), or a join failure is treated as "no", so the delete
+/// never proceeds unattended.
+async fn confirm_removal(report: &Value) -> bool {
     let has_risks = report
         .get("risks")
         .and_then(Value::as_array)
         .is_some_and(|r| !r.is_empty());
-    let prompt = if has_risks {
+    use std::io::Write;
+    eprint!("{}", confirm_prompt(has_risks));
+    let _ = std::io::stderr().flush();
+    let read = tokio::task::spawn_blocking(|| {
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map(|_| answer)
+    })
+    .await;
+    matches!(read, Ok(Ok(answer)) if answer_is_yes(&answer))
+}
+
+/// The confirmation prompt shown before a delete — it names the risks when the
+/// safety report flagged any. Pure, so the wording is unit-testable.
+fn confirm_prompt(has_risks: bool) -> &'static str {
+    if has_risks {
         "Delete this worktree despite the risks above? [y/N] "
     } else {
         "Delete this worktree? [y/N] "
-    };
-    use std::io::Write;
-    eprint!("{prompt}");
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
     }
-    answer_is_yes(&answer)
 }
 
 /// Whether a confirmation answer is an affirmative (`y`/`yes`, case-insensitive).
@@ -1407,6 +1428,23 @@ mod tests {
     }
 
     #[test]
+    fn confirm_prompt_mentions_risks_only_when_present() {
+        assert!(
+            confirm_prompt(true).contains("risks"),
+            "{}",
+            confirm_prompt(true)
+        );
+        assert!(
+            !confirm_prompt(false).contains("risks"),
+            "{}",
+            confirm_prompt(false)
+        );
+        // Both wordings default to No.
+        assert!(confirm_prompt(true).contains("[y/N]"));
+        assert!(confirm_prompt(false).contains("[y/N]"));
+    }
+
+    #[test]
     fn render_safety_report_renders_fields_and_notes() {
         let report = json!({
             "removable": true,
@@ -1458,11 +1496,17 @@ mod tests {
     }
 
     /// Spawns a fake daemon that answers `replies.len()` sequential connections,
-    /// each with the next reply — for the multi-round-trip flows (`close` phase-1
-    /// then phase-2). Same short-path `/tmp` socket as `fake_daemon_reply`.
+    /// each with the next reply, and **returns the request envelope(s) it
+    /// received** (via the join handle) so a test can assert the exact wire shape
+    /// — op and payload — that the client sent, not just the round-trip. Same
+    /// short-path `/tmp` socket as `fake_daemon_reply`.
     fn fake_daemon_seq(
         replies: Vec<Value>,
-    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::task::JoinHandle<Vec<Value>>,
+    ) {
         use futures::{SinkExt, StreamExt};
         use tokio::net::UnixListener;
         use tokio_util::codec::{Framed, LinesCodec};
@@ -1471,15 +1515,18 @@ mod tests {
         let sock = dir.path().join("d.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
             for reply in replies {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut framed = Framed::new(stream, LinesCodec::new());
-                let _req = framed.next().await.unwrap().unwrap();
+                let req = framed.next().await.unwrap().unwrap();
+                requests.push(serde_json::from_str::<Value>(&req).unwrap());
                 framed
                     .send(serde_json::to_string(&reply).unwrap())
                     .await
                     .unwrap();
             }
+            requests
         });
         (dir, sock, server)
     }
@@ -1487,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn close_window_only_sends_remove_false() {
         let (_dir, sock, server) =
-            fake_daemon_reply(json!({ "ok": true, "payload": { "closed": true } }));
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "closed": true } })]);
         let target = tempfile::tempdir().unwrap();
         CloseCommand {
             path: target.path().to_path_buf(),
@@ -1499,17 +1546,47 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        // Exactly one op, and it is a non-destructive close: remove:false, never
+        // confirmed. A payload-field rename would fail here.
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["op"], "close");
+        assert_eq!(reqs[0]["payload"]["remove"], json!(false));
+        assert!(
+            reqs[0]["payload"].get("confirmed").is_none(),
+            "{:?}",
+            reqs[0]
+        );
+        // The path is canonicalized client-side before it is sent.
+        let want = std::fs::canonicalize(target.path()).unwrap();
+        assert_eq!(reqs[0]["payload"]["path"], json!(want.to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn close_window_only_dry_run_never_contacts_the_daemon() {
+        // `--window-only --dry-run` must have no side effect: it prints what would
+        // happen and returns without a socket call, so a nonexistent socket is fine.
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: true,
+            dry_run: true,
+            yes: false,
+            socket: Some(PathBuf::from("/nonexistent/omni-dev-close-dry.sock")),
+        }
+        .execute()
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn close_dry_run_only_runs_phase_one() {
         // A single connection: the safety check. `--dry-run` never sends phase-2.
-        let (_dir, sock, server) = fake_daemon_reply(json!({
+        let (_dir, sock, server) = fake_daemon_seq(vec![json!({
             "ok": true,
             "payload": { "removable": true, "is_main": false, "open": false,
                          "window_folder_count": 0, "risks": [], "info": [] }
-        }));
+        })]);
         let target = tempfile::tempdir().unwrap();
         CloseCommand {
             path: target.path().to_path_buf(),
@@ -1521,7 +1598,16 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        // Only the phase-1 safety check: remove:true, unconfirmed. No phase-2.
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["op"], "close");
+        assert_eq!(reqs[0]["payload"]["remove"], json!(true));
+        assert!(
+            reqs[0]["payload"].get("confirmed").is_none(),
+            "{:?}",
+            reqs[0]
+        );
     }
 
     #[tokio::test]
@@ -1543,18 +1629,36 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        // Phase 1 is the unconfirmed safety check; phase 2 carries confirmed:true.
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["op"], "close");
+        assert_eq!(reqs[0]["payload"]["remove"], json!(true));
+        assert!(
+            reqs[0]["payload"].get("confirmed").is_none(),
+            "{:?}",
+            reqs[0]
+        );
+        assert_eq!(reqs[1]["op"], "close");
+        assert_eq!(reqs[1]["payload"]["remove"], json!(true));
+        assert_eq!(reqs[1]["payload"]["confirmed"], json!(true));
+        // A CLI is never a VS Code window, so it never claims a requester_key.
+        assert!(
+            reqs[1]["payload"].get("requester_key").is_none(),
+            "{:?}",
+            reqs[1]
+        );
     }
 
     #[tokio::test]
     async fn close_refuses_a_non_removable_target() {
         // Phase-1 reports not-removable (e.g. the main tree); the command prints
         // the report then errors without a phase-2 execute (one connection only).
-        let (_dir, sock, server) = fake_daemon_reply(json!({
+        let (_dir, sock, server) = fake_daemon_seq(vec![json!({
             "ok": true,
             "payload": { "removable": false, "is_main": true, "open": false,
                          "window_folder_count": 0, "risks": [], "info": [] }
-        }));
+        })]);
         let target = tempfile::tempdir().unwrap();
         let err = CloseCommand {
             path: target.path().to_path_buf(),
@@ -1570,7 +1674,8 @@ mod tests {
             err.to_string().contains("not a removable worktree"),
             "{err}"
         );
-        server.await.unwrap();
+        // Only the phase-1 check ran — no destructive phase-2 was sent.
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1595,7 +1700,7 @@ mod tests {
     async fn show_closed_sets_and_reads() {
         // Set: one connection acknowledging set-show-closed.
         let (_dir, sock, server) =
-            fake_daemon_reply(json!({ "ok": true, "payload": { "ok": true } }));
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
         ShowClosedCommand {
             value: Some(false),
             socket: Some(sock),
@@ -1603,12 +1708,14 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs[0]["op"], "set-show-closed");
+        assert_eq!(reqs[0]["payload"]["show_closed"], json!(false));
 
         // Read: one connection returning a `tree` snapshot's `show_closed`.
-        let (_dir, sock, server) = fake_daemon_reply(
+        let (_dir, sock, server) = fake_daemon_seq(vec![
             json!({ "ok": true, "payload": { "repos": [], "show_closed": false } }),
-        );
+        ]);
         ShowClosedCommand {
             value: None,
             socket: Some(sock),
@@ -1616,13 +1723,14 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        // The no-arg read is served by a plain `tree` fetch, not a dedicated op.
+        assert_eq!(server.await.unwrap()[0]["op"], "tree");
     }
 
     #[tokio::test]
     async fn register_heartbeat_unregister_send_their_ops() {
         let (_dir, sock, server) =
-            fake_daemon_reply(json!({ "ok": true, "payload": { "ok": true } }));
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
         RegisterCommand {
             key: "w1".to_string(),
             folders: vec![PathBuf::from("/a")],
@@ -1634,10 +1742,17 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        // The RegisterRequest wire shape: op + every field the daemon reads.
+        assert_eq!(reqs[0]["op"], "register");
+        assert_eq!(reqs[0]["payload"]["key"], json!("w1"));
+        assert_eq!(reqs[0]["payload"]["folders"], json!(["/a"]));
+        assert_eq!(reqs[0]["payload"]["repo"], json!("r"));
+        assert_eq!(reqs[0]["payload"]["pid"], json!(7));
 
-        let (_dir, sock, server) =
-            fake_daemon_reply(json!({ "ok": true, "payload": { "known": true, "close": true } }));
+        let (_dir, sock, server) = fake_daemon_seq(vec![
+            json!({ "ok": true, "payload": { "known": true, "close": true } }),
+        ]);
         HeartbeatCommand {
             key: "w1".to_string(),
             socket: Some(sock),
@@ -1645,10 +1760,12 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs[0]["op"], "heartbeat");
+        assert_eq!(reqs[0]["payload"]["key"], json!("w1"));
 
         let (_dir, sock, server) =
-            fake_daemon_reply(json!({ "ok": true, "payload": { "removed": true } }));
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "removed": true } })]);
         UnregisterCommand {
             key: "w1".to_string(),
             socket: Some(sock),
@@ -1656,7 +1773,9 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs[0]["op"], "unregister");
+        assert_eq!(reqs[0]["payload"]["key"], json!("w1"));
     }
 
     #[tokio::test]

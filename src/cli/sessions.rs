@@ -1063,6 +1063,31 @@ mod tests {
         (dir, sock, server)
     }
 
+    /// Like [`fake_daemon`] but **returns the request envelope it received** so a
+    /// test can assert the exact op/payload wire shape the client sent.
+    fn fake_daemon_capture(
+        reply: Value,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<Value>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let req = framed.next().await.unwrap().unwrap();
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&req).unwrap()
+        });
+        (dir, sock, server)
+    }
+
     #[tokio::test]
     async fn list_command_execute_renders_from_a_socket() {
         let payload = json!({
@@ -1159,7 +1184,8 @@ mod tests {
 
     #[tokio::test]
     async fn window_and_window_unregister_send_their_ops() {
-        let (_dir, sock, server) = fake_daemon(json!({ "ok": true, "payload": { "ok": true } }));
+        let (_dir, sock, server) =
+            fake_daemon_capture(json!({ "ok": true, "payload": { "ok": true } }));
         WindowCommand {
             key: "w1".to_string(),
             folders: vec![PathBuf::from("/a")],
@@ -1170,11 +1196,17 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        // The WindowReport wire shape: op + every field the daemon reads.
+        let req = server.await.unwrap();
+        assert_eq!(req["op"], "window");
+        assert_eq!(req["payload"]["key"], json!("w1"));
+        assert_eq!(req["payload"]["folders"], json!(["/a"]));
+        assert_eq!(req["payload"]["tabs"], json!(1));
+        assert_eq!(req["payload"]["terminals"], json!(0));
 
         // `window-unregister` replies `{removed}` (not `{ok}`); the client reads it.
         let (_dir, sock, server) =
-            fake_daemon(json!({ "ok": true, "payload": { "removed": true } }));
+            fake_daemon_capture(json!({ "ok": true, "payload": { "removed": true } }));
         WindowUnregisterCommand {
             key: "w1".to_string(),
             socket: Some(sock),
@@ -1182,6 +1214,8 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        server.await.unwrap();
+        let req = server.await.unwrap();
+        assert_eq!(req["op"], "window-unregister");
+        assert_eq!(req["payload"]["key"], json!("w1"));
     }
 }
