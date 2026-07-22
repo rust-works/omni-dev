@@ -115,6 +115,25 @@ omni-dev sessions list --socket /path/to/daemon.sock
 
 `list` is a read-only client, Unix-only (`#[cfg(unix)]`), like `worktrees list`.
 
+### Window feed ops (companion parity)
+
+The companion `window` / `window-unregister` feed ops — normally spoken by the
+VS Code extension — are exposed as typed commands so scripted/headless companions
+and integration tests can report a window's Claude embedding the way the extension
+does (#1361). Each takes a caller-supplied window `--key`:
+
+```bash
+# Report this window's Claude editor-tab and terminal counts (mirrors WindowReport).
+omni-dev sessions window --key <KEY> [--folder /abs/path]... [--tabs N] [--terminals N]
+
+# Remove the window's embedding report (fired on the companion's deactivate()).
+omni-dev sessions window-unregister --key <KEY>   # prints whether an entry was removed
+```
+
+Both accept `--socket`. The daemon joins a session to a window by `cwd`, so the
+`--folder` paths are what tag a session's `source` as `vscode`. The underlying ops
+are documented in the [companion contract](#companion-contract-for-the-extension-and-other-clients).
+
 ### Installing the hooks (Feed 1)
 
 ```bash

@@ -383,6 +383,7 @@ async fn worktrees_cli_tree_against_live_daemon() {
     TreeCommand {
         socket: Some(socket.clone()),
         output: TableOrJson::Table,
+        follow: false,
     }
     .execute()
     .await
@@ -390,6 +391,7 @@ async fn worktrees_cli_tree_against_live_daemon() {
     TreeCommand {
         socket: Some(socket.clone()),
         output: TableOrJson::Json,
+        follow: false,
     }
     .execute()
     .await
@@ -400,6 +402,7 @@ async fn worktrees_cli_tree_against_live_daemon() {
         command: WorktreesSubcommands::Tree(TreeCommand {
             socket: Some(socket.clone()),
             output: TableOrJson::Table,
+            follow: false,
         }),
     }
     .execute()
@@ -430,6 +433,7 @@ async fn worktrees_cli_tree_against_live_daemon() {
     assert!(TreeCommand {
         socket: Some(missing),
         output: TableOrJson::Table,
+        follow: false,
     }
     .execute()
     .await
