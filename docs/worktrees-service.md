@@ -166,6 +166,58 @@ doesn't exist), then sends the daemon's **`open`** op, which runs `code <path>` 
 the shared launcher resolution (`OMNI_DEV_VSCODE_BIN` → well-known paths → `code`);
 VS Code reuses the already-open window rather than opening a second one.
 
+`worktrees close` closes a worktree's window and, for a **linked** worktree,
+deletes it — the daemon's two-phase `close` op driven from the CLI (#1361). It is
+the one destructive command; all git logic stays in the daemon ([ADR-0049](adrs/adr-0049.md)):
+
+```bash
+# Safety check only — print the report, delete nothing.
+omni-dev worktrees close /path/to/worktree --dry-run
+
+# Delete a linked worktree (interactive y/N confirm unless --yes).
+omni-dev worktrees close /path/to/worktree --yes
+
+# Only close the owning window(s); never delete (the main-tree case).
+omni-dev worktrees close /path/to/worktree --window-only
+```
+
+The path is resolved client-side. For a delete, the command first runs the
+side-effect-free **phase-1** safety check and prints the report (whether the target
+is `removable`, whether it is the main working tree, whether a window has it open,
+and any `risks`/`info` notes); it then confirms interactively (unless `--yes`) and
+sends the **phase-2** execute. A non-removable target (e.g. the main working tree,
+which the daemon refuses to delete) prints the report and stops. A CLI process is
+never a VS Code window, so it omits `requester_key`: the daemon treats the close as
+cross-window, signals every owning window to close, waits (bounded ~20s) for them to
+unregister, then prunes.
+
+`worktrees show-closed` reads or sets the cross-window "show closed worktrees"
+toggle (`set-show-closed`; the value rides the `tree` snapshot's `show_closed`):
+
+```bash
+omni-dev worktrees show-closed          # read the current value
+omni-dev worktrees show-closed false    # hide closed worktrees everywhere
+```
+
+`worktrees tree --follow` (`-f`) streams live snapshots via the daemon's
+`subscribe` push op, re-rendering the tree on every change until interrupted
+(Ctrl-C) — the terminal equivalent of the editor tree view. It honours `-o json`
+(one compact frame per line, an NDJSON stream).
+
+Finally, the **companion feed ops** — normally spoken by the VS Code extension —
+are exposed as typed commands so scripted/headless companions and integration tests
+can drive the registry's full lifecycle without VS Code (#1361). Each takes a
+caller-supplied window `--key`:
+
+```bash
+omni-dev worktrees register --key <KEY> --folder /abs/path [--repo R] [--title T] [--pid N]
+omni-dev worktrees heartbeat --key <KEY>    # prints `known` and any pending `close`
+omni-dev worktrees unregister --key <KEY>   # prints whether an entry was removed
+```
+
+Every command accepts `--socket` to target a non-default control socket. The
+underlying ops are documented in the [companion contract](#companion-contract-for-the-extension-and-other-clients).
+
 ## Tray
 
 On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:
