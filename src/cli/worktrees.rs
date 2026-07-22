@@ -2,11 +2,12 @@
 //! registry.
 //!
 //! Lifecycle stays on `omni-dev daemon` (`start`/`stop`/`status`/`restart`);
-//! this command only sends the `worktrees` service's read ops (`list` for the
-//! open windows, `tree` for the repos-and-all-their-worktrees view) over the
-//! daemon's Unix control socket. The companion VS Code extension is what *feeds*
-//! the registry (`register`/`heartbeat`/`unregister`), talking to the same
-//! socket directly from each window.
+//! this command sends the `worktrees` service's ops over the daemon's Unix
+//! control socket: the read views (`list`, `tree`, `tree --follow`), the actions
+//! (`focus`, `close`, `show-closed`), and — for typed parity with the companion
+//! (#1361) — the window feed ops (`register`/`heartbeat`/`unregister`) that let a
+//! scripted/headless reporter or an integration test drive the registry the way
+//! the VS Code extension does from each window.
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,16 @@ pub enum WorktreesSubcommands {
     Tree(TreeCommand),
     /// Focus (raise) the VS Code window for a worktree folder.
     Focus(FocusCommand),
+    /// Close a worktree's window and, for a linked worktree, delete it.
+    Close(CloseCommand),
+    /// Show or set whether closed worktrees are shown across all windows.
+    ShowClosed(ShowClosedCommand),
+    /// Register a window's open worktree folders (companion feed op).
+    Register(RegisterCommand),
+    /// Refresh a window's liveness and read any pending close directive.
+    Heartbeat(HeartbeatCommand),
+    /// Remove a window's registration (companion feed op).
+    Unregister(UnregisterCommand),
 }
 
 impl WorktreesCommand {
@@ -50,6 +61,11 @@ impl WorktreesCommand {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
             WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
             WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Close(cmd) => cmd.execute().await,
+            WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Register(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Unregister(cmd) => cmd.execute().await,
         }
     }
 }
@@ -96,12 +112,19 @@ pub struct TreeCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
     pub output: TableOrJson,
+    /// Stream live snapshots: re-render on every change until interrupted
+    /// (Ctrl-C). Uses the daemon's `subscribe` push op.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
 }
 
 impl TreeCommand {
     /// Executes the tree command.
     pub async fn execute(self) -> Result<()> {
         let socket = server::resolve_socket(self.socket)?;
+        if self.follow {
+            return follow_tree_stream(&socket, self.output).await;
+        }
         let mut result = call(&socket, "tree", Value::Null).await?;
         // Ahead/behind is no longer part of the (cheap) streamed `tree` snapshot
         // (#1306); fetch it on demand for the worktrees we are about to render and
@@ -115,6 +138,37 @@ impl TreeCommand {
         }
         Ok(())
     }
+}
+
+/// Follows the daemon's `subscribe` push stream, re-rendering the tree on each
+/// snapshot until the daemon closes the stream or the user interrupts (Ctrl-C).
+/// Each table frame is enriched with on-demand ahead/behind, exactly like the
+/// one-shot path, so a followed view matches a plain `tree`.
+async fn follow_tree_stream(socket: &Path, output: TableOrJson) -> Result<()> {
+    let mut sub = DaemonClient::new(socket)
+        .subscribe(DaemonEnvelope::service(SERVICE, "subscribe", Value::Null))
+        .await?;
+    loop {
+        tokio::select! {
+            frame = sub.next() => {
+                // `None` = the daemon closed the stream (shutdown); we are done.
+                let Some(frame) = frame else { break };
+                let mut payload = reply_payload(frame?)?;
+                match output {
+                    // A compact one-line frame per snapshot (an NDJSON stream).
+                    TableOrJson::Json => println!("{}", serde_json::to_string(&payload)?),
+                    TableOrJson::Table => {
+                        enrich_ahead_behind(socket, &mut payload).await;
+                        println!("{}", render_tree(&payload));
+                    }
+                }
+            }
+            // Ctrl-C ends the follow; dropping `sub` closes the connection,
+            // which the daemon reads as the stream's teardown.
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    Ok(())
 }
 
 /// Focuses (raises) the VS Code window for a worktree folder.
@@ -146,6 +200,321 @@ impl FocusCommand {
         println!("Focused {}", path.display());
         Ok(())
     }
+}
+
+/// Closes a worktree's window and, for a linked worktree, deletes it — the
+/// daemon's two-phase `close` op driven from the CLI.
+///
+/// A CLI process is never a VS Code window, so it omits `requester_key`: the
+/// daemon then treats the close as cross-window, signalling every owning window
+/// to close and waiting (bounded ~20s) for them to unregister before it prunes.
+/// All destructive/git logic (the `git2` prune, the main-tree refusal) stays in
+/// the daemon (ADR-0049); the CLI adds no new authority.
+#[derive(Parser)]
+pub struct CloseCommand {
+    /// Worktree folder to close. A linked worktree is deleted; the main working
+    /// tree only has its window closed (never deleted).
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+    /// Only close the worktree's window(s); never delete the worktree.
+    #[arg(long)]
+    pub window_only: bool,
+    /// Run the safety check and print the report, but do not close or delete.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the interactive confirmation before deleting.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl CloseCommand {
+    /// Executes the close command.
+    pub async fn execute(self) -> Result<()> {
+        // Resolve to an absolute path client-side (like `focus`): the daemon runs
+        // in a different cwd and matches the target by canonical path.
+        let path = std::fs::canonicalize(&self.path)
+            .with_context(|| format!("cannot resolve worktree path: {}", self.path.display()))?;
+        let path_str = path.to_string_lossy().to_string();
+        let socket = server::resolve_socket(self.socket)?;
+
+        // "Close Window": non-destructive, no safety check — the daemon closes the
+        // owning window(s) and never inspects git.
+        if self.window_only {
+            call(
+                &socket,
+                "close",
+                json!({ "path": path_str, "remove": false }),
+            )
+            .await?;
+            println!("Closed the window for {}", path.display());
+            return Ok(());
+        }
+
+        // Phase 1: the side-effect-free safety check (remove:true, unconfirmed).
+        let report = call(
+            &socket,
+            "close",
+            json!({ "path": path_str, "remove": true }),
+        )
+        .await?;
+        println!("{}", render_safety_report(&path, &report));
+
+        if self.dry_run {
+            return Ok(());
+        }
+        // The daemon refuses to remove the main working tree; fail fast rather than
+        // send a phase-2 execute it would reject.
+        if report.get("removable").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "{} is not a removable worktree (nothing deleted); \
+                 use --window-only to just close its window",
+                path.display()
+            );
+        }
+        if !self.yes && !confirm_removal(&report) {
+            println!("Aborted; nothing was deleted.");
+            return Ok(());
+        }
+
+        // Phase 2: execute the delete.
+        call(
+            &socket,
+            "close",
+            json!({ "path": path_str, "remove": true, "confirmed": true }),
+        )
+        .await?;
+        println!("Deleted worktree {}", path.display());
+        Ok(())
+    }
+}
+
+/// Shows or sets the cross-window "show closed worktrees" toggle.
+///
+/// With a boolean argument it sets the daemon-backed value (`set-show-closed`),
+/// which every subscribed window re-reads; with no argument it reads the current
+/// value from the top-level `show_closed` of a `tree` snapshot.
+#[derive(Parser)]
+pub struct ShowClosedCommand {
+    /// New value (`true`/`false`). Omit to read the current value.
+    #[arg(value_name = "BOOL", value_parser = clap::builder::BoolishValueParser::new())]
+    pub value: Option<bool>,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl ShowClosedCommand {
+    /// Executes the show-closed command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        if let Some(show_closed) = self.value {
+            call(
+                &socket,
+                "set-show-closed",
+                json!({ "show_closed": show_closed }),
+            )
+            .await?;
+            println!("show-closed: {show_closed}");
+        } else {
+            // The value is not a dedicated op — it rides the `tree` snapshot.
+            let tree = call(&socket, "tree", Value::Null).await?;
+            let current = tree
+                .get("show_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            println!("show-closed: {current}");
+        }
+        Ok(())
+    }
+}
+
+/// Registers a window's open worktree folders (a companion feed op).
+///
+/// Exposed as a typed command so scripted/headless reporters and integration
+/// tests can drive the registry the way the VS Code companion does. Mirrors
+/// `RegisterRequest`.
+#[derive(Parser)]
+pub struct RegisterCommand {
+    /// Stable per-window identity (the companion generates a per-activate UUID).
+    #[arg(long, value_name = "KEY")]
+    pub key: String,
+    /// A workspace-folder path (repeatable).
+    #[arg(long = "folder", value_name = "PATH")]
+    pub folders: Vec<PathBuf>,
+    /// Repository root or name, when the window has one.
+    #[arg(long, value_name = "REPO")]
+    pub repo: Option<String>,
+    /// Window title, for display.
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+    /// Reporting process id.
+    #[arg(long, value_name = "PID")]
+    pub pid: Option<u32>,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl RegisterCommand {
+    /// Executes the register command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let payload = json!({
+            "key": self.key,
+            "folders": self.folders,
+            "repo": self.repo,
+            "title": self.title,
+            "pid": self.pid,
+        });
+        call(&socket, "register", payload).await?;
+        println!("Registered {}", self.key);
+        Ok(())
+    }
+}
+
+/// Refreshes a window's liveness and reports the daemon's reply.
+///
+/// A companion feed op made typed: the reply carries `known` (false asks the
+/// window to re-register after a daemon restart) and, when present, `close` (a
+/// cross-window close directive).
+#[derive(Parser)]
+pub struct HeartbeatCommand {
+    /// The window key to heartbeat.
+    #[arg(long, value_name = "KEY")]
+    pub key: String,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl HeartbeatCommand {
+    /// Executes the heartbeat command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let reply = call(&socket, "heartbeat", json!({ "key": self.key })).await?;
+        let known = reply.get("known").and_then(Value::as_bool).unwrap_or(false);
+        // `close` is omitted from the reply when false; treat absent as false.
+        let close = reply.get("close").and_then(Value::as_bool).unwrap_or(false);
+        println!("known: {known}");
+        println!("close: {close}");
+        Ok(())
+    }
+}
+
+/// Removes a window's registration — a companion feed op made typed. Prints
+/// whether an entry was actually removed.
+#[derive(Parser)]
+pub struct UnregisterCommand {
+    /// The window key to unregister.
+    #[arg(long, value_name = "KEY")]
+    pub key: String,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl UnregisterCommand {
+    /// Executes the unregister command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let reply = call(&socket, "unregister", json!({ "key": self.key })).await?;
+        let removed = reply
+            .get("removed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        println!("removed: {removed}");
+        Ok(())
+    }
+}
+
+/// Renders a phase-1 `close` [`SafetyReport`] as a human-readable block: whether
+/// the target is removable, whether it is the main tree, whether a window has it
+/// open (and which), and any `risks`/`info` notes. Every daemon-supplied string is
+/// `sanitize`d (#1137); the booleans/counts are daemon-computed and safe.
+fn render_safety_report(path: &Path, report: &Value) -> String {
+    let removable = report
+        .get("removable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_main = report
+        .get("is_main")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let open = report.get("open").and_then(Value::as_bool).unwrap_or(false);
+    let mut out = format!("Worktree: {}", path.display());
+    out.push_str(&format!("\n  removable:        {removable}"));
+    out.push_str(&format!("\n  main working tree: {is_main}"));
+    if open {
+        let key = sanitize(
+            report
+                .get("window_key")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+        );
+        let count = report
+            .get("window_folder_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "\n  open in a window:  yes (key {key}, {count} folder(s))"
+        ));
+    } else {
+        out.push_str("\n  open in a window:  no");
+    }
+    out.push_str(&render_notes("risks", report.get("risks")));
+    out.push_str(&render_notes("info", report.get("info")));
+    out
+}
+
+/// Renders a labelled list of `close` safety notes (`risks` or `info`), each a
+/// `- [kind] detail` line with both fields `sanitize`d. Empty when there are none.
+fn render_notes(label: &str, notes: Option<&Value>) -> String {
+    let notes = notes
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n  {label}:");
+    for note in notes {
+        let kind = sanitize(note.get("kind").and_then(Value::as_str).unwrap_or("-"));
+        let detail = sanitize(note.get("detail").and_then(Value::as_str).unwrap_or(""));
+        out.push_str(&format!("\n    - [{kind}] {detail}"));
+    }
+    out
+}
+
+/// Prompts on stderr for confirmation before a destructive delete and returns
+/// whether the user assented. Reads one line from stdin; any read error (e.g. a
+/// closed stdin) is treated as "no", so the delete never proceeds unattended.
+fn confirm_removal(report: &Value) -> bool {
+    let has_risks = report
+        .get("risks")
+        .and_then(Value::as_array)
+        .is_some_and(|r| !r.is_empty());
+    let prompt = if has_risks {
+        "Delete this worktree despite the risks above? [y/N] "
+    } else {
+        "Delete this worktree? [y/N] "
+    };
+    use std::io::Write;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    answer_is_yes(&answer)
+}
+
+/// Whether a confirmation answer is an affirmative (`y`/`yes`, case-insensitive).
+/// Split out so the yes/no decision is unit-testable without real stdin.
+fn answer_is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// Fetches ahead/behind on demand for every worktree in a `tree` reply and folds
@@ -926,5 +1295,388 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("unknown error"), "{err}");
+    }
+
+    // --- #1361 typed op-parity commands -------------------------------------
+
+    #[test]
+    fn new_subcommands_route_and_require_their_args() {
+        assert!(matches!(
+            parse(&["close", "/home/me/wt"]),
+            WorktreesSubcommands::Close(_)
+        ));
+        assert!(matches!(
+            parse(&["show-closed"]),
+            WorktreesSubcommands::ShowClosed(_)
+        ));
+        assert!(matches!(
+            parse(&["register", "--key", "w1"]),
+            WorktreesSubcommands::Register(_)
+        ));
+        assert!(matches!(
+            parse(&["heartbeat", "--key", "w1"]),
+            WorktreesSubcommands::Heartbeat(_)
+        ));
+        assert!(matches!(
+            parse(&["unregister", "--key", "w1"]),
+            WorktreesSubcommands::Unregister(_)
+        ));
+
+        // Required args are enforced.
+        assert!(CloseCommand::try_parse_from(["close"]).is_err());
+        assert!(RegisterCommand::try_parse_from(["register"]).is_err());
+        assert!(HeartbeatCommand::try_parse_from(["heartbeat"]).is_err());
+        assert!(UnregisterCommand::try_parse_from(["unregister"]).is_err());
+    }
+
+    #[test]
+    fn close_parses_flags() {
+        let cmd = CloseCommand::try_parse_from([
+            "close",
+            "/home/me/wt",
+            "--window-only",
+            "--dry-run",
+            "-y",
+            "--socket",
+            "/tmp/d.sock",
+        ])
+        .unwrap();
+        assert_eq!(cmd.path, Path::new("/home/me/wt"));
+        assert!(cmd.window_only && cmd.dry_run && cmd.yes);
+        assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
+
+        // Defaults: no flags set.
+        let cmd = CloseCommand::try_parse_from(["close", "/home/me/wt"]).unwrap();
+        assert!(!cmd.window_only && !cmd.dry_run && !cmd.yes);
+    }
+
+    #[test]
+    fn tree_follow_flag_parses() {
+        let cmd = TreeCommand::try_parse_from(["tree", "--follow"]).unwrap();
+        assert!(cmd.follow);
+        let cmd = TreeCommand::try_parse_from(["tree", "-f", "-o", "json"]).unwrap();
+        assert!(cmd.follow);
+        assert_eq!(cmd.output, TableOrJson::Json);
+        let cmd = TreeCommand::try_parse_from(["tree"]).unwrap();
+        assert!(!cmd.follow);
+    }
+
+    #[test]
+    fn show_closed_parses_optional_bool() {
+        assert!(ShowClosedCommand::try_parse_from(["show-closed"])
+            .unwrap()
+            .value
+            .is_none());
+        assert_eq!(
+            ShowClosedCommand::try_parse_from(["show-closed", "false"])
+                .unwrap()
+                .value,
+            Some(false)
+        );
+        assert_eq!(
+            ShowClosedCommand::try_parse_from(["show-closed", "true"])
+                .unwrap()
+                .value,
+            Some(true)
+        );
+        // A non-boolean value is rejected.
+        assert!(ShowClosedCommand::try_parse_from(["show-closed", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn register_collects_repeated_folders() {
+        let cmd = RegisterCommand::try_parse_from([
+            "register", "--key", "w1", "--folder", "/a", "--folder", "/b", "--repo", "r", "--pid",
+            "42",
+        ])
+        .unwrap();
+        assert_eq!(cmd.key, "w1");
+        assert_eq!(cmd.folders, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(cmd.repo.as_deref(), Some("r"));
+        assert_eq!(cmd.pid, Some(42));
+    }
+
+    #[test]
+    fn answer_is_yes_accepts_only_affirmatives() {
+        for yes in ["y", "Y", "yes", "YES", " yes \n"] {
+            assert!(answer_is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "nope", "true", "\n"] {
+            assert!(!answer_is_yes(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn render_safety_report_renders_fields_and_notes() {
+        let report = json!({
+            "removable": true,
+            "is_main": false,
+            "open": true,
+            "window_key": "w1",
+            "window_folder_count": 2,
+            "risks": [{ "kind": "dirty", "detail": "uncommitted changes" }],
+            "info": [{ "kind": "unpushed", "detail": "2 unpushed commits" }],
+        });
+        let out = render_safety_report(Path::new("/home/me/wt"), &report);
+        assert!(out.contains("/home/me/wt"), "{out}");
+        assert!(out.contains("removable:        true"), "{out}");
+        assert!(
+            out.contains("open in a window:  yes (key w1, 2 folder(s))"),
+            "{out}"
+        );
+        assert!(out.contains("[dirty] uncommitted changes"), "{out}");
+        assert!(out.contains("[unpushed] 2 unpushed commits"), "{out}");
+    }
+
+    #[test]
+    fn render_safety_report_handles_no_window_and_no_notes() {
+        let report = json!({ "removable": false, "is_main": true, "open": false });
+        let out = render_safety_report(Path::new("/r"), &report);
+        assert!(out.contains("removable:        false"), "{out}");
+        assert!(out.contains("main working tree: true"), "{out}");
+        assert!(out.contains("open in a window:  no"), "{out}");
+        // No risks/info sections are emitted when both are absent.
+        assert!(!out.contains("risks:"), "{out}");
+        assert!(!out.contains("info:"), "{out}");
+    }
+
+    #[test]
+    fn render_safety_report_strips_control_bytes() {
+        // Daemon-supplied strings (window key, note kind/detail) must not inject
+        // terminal escapes (#1137).
+        let report = json!({
+            "removable": true, "is_main": false, "open": true,
+            "window_key": "w\x1b[31m1", "window_folder_count": 1,
+            "risks": [{ "kind": "di\x07rty", "detail": "lost\r\nrow" }],
+            "info": [],
+        });
+        let out = render_safety_report(Path::new("/r"), &report);
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+    }
+
+    /// Spawns a fake daemon that answers `replies.len()` sequential connections,
+    /// each with the next reply — for the multi-round-trip flows (`close` phase-1
+    /// then phase-2). Same short-path `/tmp` socket as `fake_daemon_reply`.
+    fn fake_daemon_seq(
+        replies: Vec<Value>,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            for reply in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(stream, LinesCodec::new());
+                let _req = framed.next().await.unwrap().unwrap();
+                framed
+                    .send(serde_json::to_string(&reply).unwrap())
+                    .await
+                    .unwrap();
+            }
+        });
+        (dir, sock, server)
+    }
+
+    #[tokio::test]
+    async fn close_window_only_sends_remove_false() {
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "closed": true } }));
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: true,
+            dry_run: false,
+            yes: false,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_dry_run_only_runs_phase_one() {
+        // A single connection: the safety check. `--dry-run` never sends phase-2.
+        let (_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "removable": true, "is_main": false, "open": false,
+                         "window_folder_count": 0, "risks": [], "info": [] }
+        }));
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: false,
+            dry_run: true,
+            yes: false,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_yes_executes_phase_two() {
+        // Two connections: phase-1 safety report (removable), then phase-2 delete.
+        let (_dir, sock, server) = fake_daemon_seq(vec![
+            json!({ "ok": true, "payload": { "removable": true, "is_main": false,
+                    "open": false, "window_folder_count": 0, "risks": [], "info": [] } }),
+            json!({ "ok": true, "payload": { "removed": true } }),
+        ]);
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: false,
+            dry_run: false,
+            yes: true,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_non_removable_target() {
+        // Phase-1 reports not-removable (e.g. the main tree); the command prints
+        // the report then errors without a phase-2 execute (one connection only).
+        let (_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "removable": false, "is_main": true, "open": false,
+                         "window_folder_count": 0, "risks": [], "info": [] }
+        }));
+        let target = tempfile::tempdir().unwrap();
+        let err = CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: false,
+            dry_run: false,
+            yes: true,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a removable worktree"),
+            "{err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_errors_on_a_nonexistent_path_before_any_socket_call() {
+        let err = CloseCommand {
+            path: PathBuf::from("/nonexistent/omni-dev-close-xyz"),
+            window_only: false,
+            dry_run: false,
+            yes: true,
+            socket: Some(PathBuf::from("/nonexistent/omni-dev-close.sock")),
+        }
+        .execute()
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve worktree path"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_closed_sets_and_reads() {
+        // Set: one connection acknowledging set-show-closed.
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "ok": true } }));
+        ShowClosedCommand {
+            value: Some(false),
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        // Read: one connection returning a `tree` snapshot's `show_closed`.
+        let (_dir, sock, server) = fake_daemon_reply(
+            json!({ "ok": true, "payload": { "repos": [], "show_closed": false } }),
+        );
+        ShowClosedCommand {
+            value: None,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_heartbeat_unregister_send_their_ops() {
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "ok": true } }));
+        RegisterCommand {
+            key: "w1".to_string(),
+            folders: vec![PathBuf::from("/a")],
+            repo: Some("r".to_string()),
+            title: None,
+            pid: Some(7),
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "known": true, "close": true } }));
+        HeartbeatCommand {
+            key: "w1".to_string(),
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let (_dir, sock, server) =
+            fake_daemon_reply(json!({ "ok": true, "payload": { "removed": true } }));
+        UnregisterCommand {
+            key: "w1".to_string(),
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_follow_renders_each_pushed_frame() {
+        use crate::daemon::testutil::fake_daemon_stream;
+
+        // JSON follow: two non-empty frames printed as an NDJSON stream, then EOF.
+        let (_dir, sock, server) = fake_daemon_stream(vec![
+            json!({ "ok": true, "payload": { "repos": [], "show_closed": true } }),
+            json!({ "ok": true, "payload": { "repos": [], "show_closed": false } }),
+        ]);
+        follow_tree_stream(&sock, TableOrJson::Json).await.unwrap();
+        server.await.unwrap();
+
+        // Table follow: empty-repos frames render "No repositories open." and never
+        // trigger an ahead/behind socket call (the enrich guard early-returns).
+        let (_dir, sock, server) = fake_daemon_stream(vec![
+            json!({ "ok": true, "payload": { "repos": [], "show_closed": true } }),
+        ]);
+        follow_tree_stream(&sock, TableOrJson::Table).await.unwrap();
+        server.await.unwrap();
     }
 }
