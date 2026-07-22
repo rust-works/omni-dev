@@ -1471,6 +1471,8 @@ mod tests {
             line.contains("\"service\":\"worktree\""),
             "line was: {line}"
         );
+        // The display name matches the wire form.
+        assert_eq!(RecordKind::Worktree.as_str(), "worktree");
         let back: LogRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back.kind, RecordKind::Worktree);
         assert_eq!(back.command, argv(&["git", "worktree", "add"]));
