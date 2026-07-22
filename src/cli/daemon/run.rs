@@ -8,7 +8,7 @@ use clap::Parser;
 use crate::browser::bridge::{DEFAULT_CONTROL_PORT, DEFAULT_WS_PORT};
 use crate::browser::BridgeConfig;
 use crate::daemon::server;
-use crate::daemon::{self, paths, DaemonRunConfig};
+use crate::daemon::{self, paths, DaemonRunConfig, DaemonServiceKind, ServiceSelection};
 
 /// Runs the daemon in the foreground.
 ///
@@ -51,6 +51,12 @@ pub struct RunCommand {
     /// or non-`menu-bar` builds, which are always headless).
     #[arg(long)]
     pub no_menu: bool,
+
+    /// Host only this comma-separated subset of services (default: all).
+    /// Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake,
+    /// worktrees, sessions.
+    #[arg(long, value_name = "SVC", value_delimiter = ',')]
+    pub services: Vec<DaemonServiceKind>,
 }
 
 impl RunCommand {
@@ -78,6 +84,7 @@ impl RunCommand {
             bridge_config,
             bridge_token_file: self.bridge_token_file,
             bridge_token_path,
+            services: ServiceSelection::from_flag_or_env(&self.services),
         })
     }
 }

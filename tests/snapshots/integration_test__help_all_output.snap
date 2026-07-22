@@ -3116,8 +3116,9 @@ Restarts the daemon
 Usage: restart [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-  -h, --help           Print help
+      --socket <PATH>   Control-socket path. Defaults to the per-user runtime location
+      --services <SVC>  Re-bake this comma-separated subset of services (default: preserve whatever the running daemon currently hosts). Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================
@@ -3141,8 +3142,10 @@ Options:
           Read the bridge session token from this `0600` file instead of generating one
       --no-menu
           Run headless: never show the macOS menu-bar tray (no effect on non-macOS or non-`menu-bar` builds, which are always headless)
+      --services <SVC>
+          Host only this comma-separated subset of services (default: all). Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
   -h, --help
-          Print help
+          Print help (see more with '--help')
 
 
 ================================================================================
@@ -3172,8 +3175,9 @@ Starts the daemon in the background
 Usage: start [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-  -h, --help           Print help
+      --socket <PATH>   Control-socket path. Defaults to the per-user runtime location
+      --services <SVC>  Host only this comma-separated subset of services (default: all), baked into the generated launchd plist / systemd unit so it survives the service-manager exec. Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================

@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::net::UnixListener;
 
-use super::paths;
+use super::{paths, ServiceSelection};
 
 /// The socket-activated `.service` unit filename.
 pub const SERVICE_UNIT: &str = "omni-dev-daemon.service";
@@ -129,9 +129,18 @@ fn escape_value(s: &str) -> String {
 /// no-`KeepAlive` socket-activation model). The `--socket` argument mirrors the
 /// `.socket` unit's `ListenStream` path so the daemon resolves the same path for
 /// its co-located bridge token file even though it binds the inherited fd.
-fn render_service(exe: &Path, socket: &Path) -> Result<String> {
+fn render_service(exe: &Path, socket: &Path, services: &ServiceSelection) -> Result<String> {
     let exe = validate_path(exe, "executable")?;
     let socket = validate_path(socket, "socket")?;
+    // Bake the service subset onto `ExecStart` so it survives systemd's
+    // fixed-command, minimal-env exec. `All` appends nothing, keeping a
+    // full-registry unit byte-identical to before (#1318). The CSV is fixed
+    // ASCII service names (no spaces), but route it through `exec_arg` for
+    // uniformity with the other arguments.
+    let services_arg = match services.to_csv() {
+        Some(csv) => format!(" --services {}", exec_arg(&csv)),
+        None => String::new(),
+    };
     Ok(format!(
         r"[Unit]
 Description=omni-dev daemon
@@ -139,7 +148,7 @@ Requires={socket_unit}
 After={socket_unit}
 
 [Service]
-ExecStart={exe} daemon run --socket {socket}
+ExecStart={exe} daemon run --socket {socket}{services_arg}
 ",
         socket_unit = SOCKET_UNIT,
         exe = exec_arg(exe),
@@ -224,11 +233,11 @@ fn enable_now(run: &Systemctl) -> Result<()> {
 /// Writes the `.service` + `.socket` unit files into `dir` (creating it if
 /// absent). Split from [`install_and_load`] so the rendering and on-disk layout
 /// are testable without invoking `systemctl`.
-fn write_units(dir: &Path, exe: &Path, socket: &Path) -> Result<()> {
+fn write_units(dir: &Path, exe: &Path, socket: &Path, services: &ServiceSelection) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let service_unit = dir.join(SERVICE_UNIT);
     let socket_unit = dir.join(SOCKET_UNIT);
-    std::fs::write(&service_unit, render_service(exe, socket)?)
+    std::fs::write(&service_unit, render_service(exe, socket, services)?)
         .with_context(|| format!("failed to write {}", service_unit.display()))?;
     std::fs::write(&socket_unit, render_socket(socket)?)
         .with_context(|| format!("failed to write {}", socket_unit.display()))?;
@@ -237,9 +246,9 @@ fn write_units(dir: &Path, exe: &Path, socket: &Path) -> Result<()> {
 
 /// Writes the unit files and enables the socket so systemd listens on the demand
 /// socket and spawns the daemon on the first client connect (and at login).
-pub fn install_and_load(socket: &Path) -> Result<()> {
+pub fn install_and_load(socket: &Path, services: &ServiceSelection) -> Result<()> {
     let exe = std::env::current_exe().context("could not resolve the current executable")?;
-    write_units(&unit_dir()?, &exe, socket)?;
+    write_units(&unit_dir()?, &exe, socket, services)?;
 
     // systemd creates the demand socket at `ListenStream` when the socket unit
     // starts — *before* our process runs — and does not create missing parent
@@ -365,6 +374,7 @@ pub(crate) fn systemd_listener() -> Result<Option<UnixListener>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::daemon::DaemonServiceKind;
 
     /// Asserts a rendered unit is structurally well-formed: every non-blank line
     /// is a `[Section]` header or a `Key=Value` directive. This is the property
@@ -389,6 +399,7 @@ mod tests {
         let service = render_service(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -406,12 +417,50 @@ mod tests {
     }
 
     #[test]
+    fn bakes_a_service_subset_onto_exec_start() {
+        // A subset selection appends `--services a,b` to `ExecStart` so it
+        // survives systemd's fixed-command exec (#1318). The CSV has no spaces,
+        // so `exec_arg` still wraps it in quotes for uniformity.
+        let service = render_service(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::Only(vec![
+                DaemonServiceKind::Worktrees,
+                DaemonServiceKind::Sessions,
+            ]),
+        )
+        .expect("ASCII paths render");
+
+        assert!(
+            service.contains(
+                "daemon run --socket \"/tmp/omni-dev/daemon.sock\" --services \"worktrees,sessions\""
+            ),
+            "{service}"
+        );
+        assert_well_formed(&service);
+    }
+
+    #[test]
+    fn omits_services_when_hosting_all() {
+        // `All` appends no `--services`, keeping the full-registry unit identical
+        // to the pre-#1318 output.
+        let service = render_service(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
+        )
+        .expect("ASCII paths render");
+        assert!(!service.contains("--services"), "{service}");
+    }
+
+    #[test]
     fn service_has_no_install_or_restart() {
         // Activation is the socket's job: the service must not restart on its own
         // or install itself into a login target.
         let service = render_service(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("ASCII paths render");
 
@@ -427,6 +476,7 @@ mod tests {
         let service = render_service(
             Path::new("/opt/A B/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("spaced path renders");
 
@@ -443,6 +493,7 @@ mod tests {
         let service = render_service(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/50%/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("percent path renders");
         assert!(
@@ -466,6 +517,7 @@ mod tests {
         let service = render_service(
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/a&b<c>d/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("renders");
         assert!(service.contains("/tmp/a&b<c>d/daemon.sock"), "{service}");
@@ -492,15 +544,21 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let bad = Path::new(OsStr::from_bytes(b"/tmp/\xFF/omni-dev"));
-        assert!(render_service(bad, Path::new("/tmp/daemon.sock")).is_err());
-        assert!(render_service(Path::new("/usr/bin/omni-dev"), bad).is_err());
+        assert!(
+            render_service(bad, Path::new("/tmp/daemon.sock"), &ServiceSelection::All).is_err()
+        );
+        assert!(
+            render_service(Path::new("/usr/bin/omni-dev"), bad, &ServiceSelection::All).is_err()
+        );
         assert!(render_socket(bad).is_err());
     }
 
     #[test]
     fn rejects_newline_in_path() {
         let bad = Path::new("/tmp/a\nb/daemon.sock");
-        assert!(render_service(Path::new("/usr/bin/omni-dev"), bad).is_err());
+        assert!(
+            render_service(Path::new("/usr/bin/omni-dev"), bad, &ServiceSelection::All).is_err()
+        );
         assert!(render_socket(bad).is_err());
     }
 
@@ -531,6 +589,7 @@ mod tests {
             &unit_dir,
             Path::new("/usr/local/bin/omni-dev"),
             Path::new("/tmp/omni-dev/daemon.sock"),
+            &ServiceSelection::All,
         )
         .expect("units are written");
 

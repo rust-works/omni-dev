@@ -50,6 +50,7 @@ pub fn run(cfg: DaemonRunConfig) -> Result<()> {
             cfg.bridge_config,
             cfg.bridge_token_file.as_deref(),
             cfg.bridge_token_path,
+            &cfg.services,
         ))
         .context("failed to start the daemon services")?;
     let registry = Arc::new(registry);
