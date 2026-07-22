@@ -135,13 +135,23 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     // branch with either a badge (`pr`) or the explicit negative (`pr_none`,
     // #1370), so the fallback list is empty and no `gh` runs at all; only a
     // pre-#1370 daemon — or a branch it has not yet resolved — lands here.
+    //
+    // The fallback is now gated on `repoPollingEnabled` (#1389): a repo the daemon
+    // is **not** polling deliberately resolves no badges, and the extension must
+    // honour that opt-out rather than quietly shelling `gh pr list` per window for
+    // it — the very per-window burn #1370/#1389 target. So a not-polled repo issues
+    // zero `gh` from here too; only a *polled* repo's transient pre-first-poll
+    // window still falls back (and that goes through the shared daemon op).
     const paths = nodes.flatMap((n) => (n.kind === "worktree" ? [n.wt.path] : []));
     const unbadged = unbadgedBranches(nodes);
     const abPromise: Promise<AheadBehindMap> = this.fetchAheadBehind
       ? this.fetchAheadBehind(paths).catch(() => ({}))
       : Promise.resolve({});
     const prPromise: Promise<Record<string, PrBadge>> =
-      this.fetchPrBadges && element.repo.github && unbadged.length > 0
+      this.fetchPrBadges &&
+      element.repo.github &&
+      repoPollingEnabled(element.repo) &&
+      unbadged.length > 0
         ? this.fetchPrBadges(element.repo.github, unbadged).catch(() => ({}))
         : Promise.resolve({});
     const [ab, prBadges] = await Promise.all([abPromise, prPromise]);

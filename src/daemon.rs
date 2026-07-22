@@ -133,6 +133,15 @@ pub async fn build_default_registry(
         Ok(path) => worktrees.load_polling_prefs(path),
         Err(err) => tracing::warn!("worktrees polling prefs disabled: {err:#}"),
     }
+    // Seed the resolved PR-badge cache from its persisted `0600` file so a restart
+    // serves badges instantly and the poller can skip its immediate re-poll when
+    // they are still fresh (#1389, fix 4). Before `start_pr_poller` so the warm
+    // start is in place when the loop spawns; a path that cannot be resolved just
+    // disables persistence.
+    match crate::daemon::paths::worktrees_pr_cache_path() {
+        Ok(path) => worktrees.load_pr_cache(path),
+        Err(err) => tracing::warn!("worktrees PR cache disabled: {err:#}"),
+    }
     worktrees.start_menu_refresh();
     // Keep PR check badges fresh for every open window from one `gh` call, rather
     // than each window resolving its own and none of them ever re-asking (#1337).

@@ -36,21 +36,27 @@ export const PR_JSON_FIELDS = "number,title,url,headRefName,baseRefName,isDraft,
 export const PR_LIST_LIMIT = "100";
 
 /**
- * A `gh` invocation: given an argv (no leading `gh`), resolve with its stdout,
- * or reject with an actionable error. The real implementation is in `gh.ts`;
- * tests inject a fake so discovery can be exercised without a subprocess.
- */
-export type GhRunner = (args: string[]) => Promise<string>;
-
-/**
  * What to look for. A **repo** scope lists every open PR of the repository; a
  * **worktree** scope lists only the PR(s) whose head branch is the worktree's
  * checked-out branch (and yields nothing for a detached/unborn worktree, whose
  * `branch` is absent).
+ *
+ * A worktree scope also carries what the daemon snapshot already knows about the
+ * branch (#1389, fix 7): `badge` is its resolved open-PR badge, and `prNone` is the
+ * explicit "no open PR" negative (#1370). When either is present the lookup is
+ * answered with **zero `gh`** — the daemon poller already resolved it — so only an
+ * unresolved worktree (a not-polled repo, or an old daemon) reaches the shared
+ * `gh pr list`.
  */
 export type PrScope =
   | { kind: "repo"; repo: TreeGithubIdentity }
-  | { kind: "worktree"; repo: TreeGithubIdentity; branch?: string };
+  | {
+      kind: "worktree";
+      repo: TreeGithubIdentity;
+      branch?: string;
+      badge?: PrBadge;
+      prNone?: boolean;
+    };
 
 /** The `owner/name` slug `gh --repo` expects. */
 function repoSlug(repo: TreeGithubIdentity): string {
@@ -66,7 +72,15 @@ export function prScopeForNode(node: Node): PrScope | undefined {
   if (node.kind === "repo") {
     return { kind: "repo", repo: github };
   }
-  return { kind: "worktree", repo: github, branch: node.wt.branch };
+  // Carry the daemon's own verdict for this branch (#1389, fix 7), so a resolved
+  // worktree is opened straight from the snapshot without any `gh`.
+  return {
+    kind: "worktree",
+    repo: github,
+    branch: node.wt.branch,
+    badge: node.wt.pr,
+    prNone: node.wt.pr_none,
+  };
 }
 
 /** A human label for the scope, used in progress and info messages. */
@@ -141,25 +155,6 @@ export function prListArgsForRepo(repo: TreeGithubIdentity): string[] {
   ];
 }
 
-/** Builds the `gh pr list` argv for the open PR(s) whose head is `branch`. */
-export function prListArgsForBranch(repo: TreeGithubIdentity, branch: string): string[] {
-  return [
-    "pr",
-    "list",
-    "--repo",
-    repoSlug(repo),
-    "--head",
-    branch,
-    "--state",
-    "open",
-    "--json",
-    PR_JSON_FIELDS,
-    "--limit",
-    PR_LIST_LIMIT,
-  ];
-}
-
-
 /**
  * Parses `gh pr list --json` stdout into a `PullRequest[]`, defensively: empty
  * stdout (never emitted by `gh`, but cheap to tolerate) is an empty list, and
@@ -184,24 +179,60 @@ export function parsePrList(stdout: string): PullRequest[] {
 }
 
 /**
- * Discovers the open PR(s) in scope, running `gh` through the injected runner.
- * A worktree with no branch (detached/unborn) can have no head-matching PR, so
- * it resolves to `[]` **without** invoking the runner at all.
+ * Fetches **every** open PR of a repo. The extension backs this with the daemon's
+ * shared, TTL-cached `open-prs` op (#1389, fix 7) — falling back to this window's
+ * own `gh pr list` only against a daemon too old to serve it — so N windows dedupe
+ * to one counted call. Injected so {@link discoverPullRequests} stays pure and
+ * unit-testable without a socket or a subprocess.
+ */
+export type RepoPrFetcher = (repo: TreeGithubIdentity) => Promise<PullRequest[]>;
+
+/**
+ * A minimal {@link PullRequest} synthesised from a snapshot {@link PrBadge}
+ * (#1389, fix 7): enough to **open** (`url`) and dedupe a branch already resolved
+ * daemon-side, with **zero `gh`**. `title`/`baseRefName`/`author` are unknown from a
+ * badge, but a worktree scope yields a single PR that opens directly, so they are
+ * never shown; `state` is `OPEN` because a badge is only minted for an open PR.
+ */
+export function pullRequestFromBadge(badge: PrBadge, branch: string): PullRequest {
+  return {
+    number: badge.number,
+    title: "",
+    url: badge.url,
+    headRefName: branch,
+    baseRefName: "",
+    isDraft: badge.isDraft,
+    state: "OPEN",
+  };
+}
+
+/**
+ * Discovers the open PR(s) in scope (#1389, fix 7). A **worktree** scope is
+ * answered from the daemon's own verdict with **no `gh`** wherever possible: an
+ * explicit `pr_none` is nothing to open, a resolved `badge` opens straight from the
+ * snapshot, and a detached/unborn worktree (no `branch`) has nothing to open. Only
+ * an *unresolved* worktree — a not-polled repo, or an old daemon — falls through to
+ * the repo's PR list (via the shared {@link RepoPrFetcher}) and is filtered to its
+ * head branch. A **repo** scope always lists the whole repo through the fetcher.
  */
 export async function discoverPullRequests(
   scope: PrScope,
-  runner: GhRunner,
+  fetchRepoPrs: RepoPrFetcher,
 ): Promise<PullRequest[]> {
-  let args: string[];
-  if (scope.kind === "repo") {
-    args = prListArgsForRepo(scope.repo);
-  } else {
+  if (scope.kind === "worktree") {
+    if (scope.prNone) {
+      return [];
+    }
+    if (scope.badge && scope.branch) {
+      return [pullRequestFromBadge(scope.badge, scope.branch)];
+    }
     if (!scope.branch) {
       return [];
     }
-    args = prListArgsForBranch(scope.repo, scope.branch);
+    const branch = scope.branch;
+    return (await fetchRepoPrs(scope.repo)).filter((pr) => pr.headRefName === branch);
   }
-  return parsePrList(await runner(args));
+  return fetchRepoPrs(scope.repo);
 }
 
 /** The quick-pick label for a PR: `#<number> <title>`. */

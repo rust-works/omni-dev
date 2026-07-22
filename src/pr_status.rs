@@ -51,12 +51,12 @@
 //!
 //! [ADR-0050]: ../../docs/adrs/adr-0050.md
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Environment override for the `gh` binary, for when the daemon runs under
@@ -91,7 +91,7 @@ const FAILURE_STATES: &[&str] = &[
 const SUCCESS_STATES: &[&str] = &["SUCCESS", "NEUTRAL", "SKIPPED"];
 
 /// The rolled-up CI verdict for a pull request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrCheckState {
     /// Every reported check passed (or was skipped/neutral).
@@ -155,7 +155,11 @@ impl PrBadge {
 
 /// One (repo, branch) pair to resolve a badge for. Derived from the tree — a repo
 /// contributes a target per worktree that has a branch.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `Serialize`/`Deserialize` so the daemon can persist the resolved badge cache
+/// across restarts (#1389, fix 4); on the tree wire the target is implicit in the
+/// worktree row, so this shape appears only in that `0600` cache file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrTarget {
     /// The GitHub owner, e.g. `rust-works`.
     pub owner: String,
@@ -348,7 +352,59 @@ fn build_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
             frags.join("\n")
         ));
     }
-    Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
+    // Fold the graphql budget into every poll (#1389, fix 8): `rateLimit` is a
+    // meta-field GitHub answers for free (it does not add to the query's own
+    // `cost`), so each PR poll doubles as a live budget reading — and its `cost`
+    // reveals the actual per-call point price, verifying the "1 point" assumption at
+    // scale instead of taking it on faith.
+    Some((
+        format!(
+            "query{{\nrateLimit{{ limit cost remaining used resetAt }}\n{}\n}}",
+            repos.join("\n")
+        ),
+        index,
+    ))
+}
+
+/// The `rateLimit` block folded into every PR-poll reply (#1389, fix 8).
+///
+/// Carries the query's own point `cost` plus the live graphql budget. Every field
+/// is what GitHub's `rateLimit` object reports; `reset` is `resetAt` (ISO-8601)
+/// parsed to a Unix epoch so it drops straight into a
+/// [`RateLimitResource`](crate::github_rate_limit::RateLimitResource).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryRateLimit {
+    /// The point cost GitHub charged for *this* query.
+    pub cost: u64,
+    /// Points spent in the current graphql window.
+    pub used: u64,
+    /// The window ceiling (5,000/hour today).
+    pub limit: u64,
+    /// Points remaining in the window.
+    pub remaining: u64,
+    /// When the window resets, as a Unix epoch (seconds); `0` if `resetAt` was
+    /// absent or unparseable.
+    pub reset: i64,
+}
+
+/// Reads the `rateLimit` block from a poll reply, or `None` when it is absent
+/// (an older query shape, or a reply that carried none). Best-effort: a partial
+/// block missing any of `cost`/`used`/`limit`/`remaining` yields `None` rather
+/// than a half-populated reading.
+fn parse_rate_limit(body: &Value) -> Option<QueryRateLimit> {
+    let rl = body.get("data")?.get("rateLimit")?;
+    let reset = rl
+        .get("resetAt")
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map_or(0, |dt| dt.timestamp());
+    Some(QueryRateLimit {
+        cost: rl.get("cost")?.as_u64()?,
+        used: rl.get("used")?.as_u64()?,
+        limit: rl.get("limit")?.as_u64()?,
+        remaining: rl.get("remaining")?.as_u64()?,
+        reset,
+    })
 }
 
 /// Reads one resolved `ref` node into a badge. `None` for a node without a
@@ -506,8 +562,31 @@ fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
 /// and a failed call (`Err`, including a GraphQL 200 carrying `errors`) yields no
 /// map at all — so a failed poll can never manufacture negatives.
 pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget, PrResolution>> {
+    resolve_inner(bin, targets).map(|(resolutions, _budget)| resolutions)
+}
+
+/// [`resolve_with`] that **also** returns the poll's folded-in graphql budget
+/// reading (#1389, fix 8).
+///
+/// For the daemon poller to feed the shared
+/// [`RateLimitCache`](crate::github_rate_limit::RateLimitCache). The budget is
+/// `None` when there were no targets (no query ran) or the reply carried no
+/// `rateLimit` block; the resolutions are exactly what [`resolve_with`] returns.
+pub fn resolve_with_budget(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<(HashMap<PrTarget, PrResolution>, Option<QueryRateLimit>)> {
+    resolve_inner(bin, targets)
+}
+
+/// The shared body of [`resolve_with`] / [`resolve_with_budget`]: one `gh api
+/// graphql` call, parsed into resolutions **and** the optional budget reading.
+fn resolve_inner(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<(HashMap<PrTarget, PrResolution>, Option<QueryRateLimit>)> {
     let Some((query, index)) = build_query(targets) else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     };
     let body = run_gh_graphql(bin, &query)?;
     // A GraphQL 200 can still carry errors; surface them rather than silently
@@ -517,7 +596,7 @@ pub fn resolve_with(bin: &Path, targets: &[PrTarget]) -> Result<HashMap<PrTarget
             bail!("gh api graphql returned errors: {errors:?}");
         }
     }
-    Ok(parse_response(&body, &index))
+    Ok((parse_response(&body, &index), parse_rate_limit(&body)))
 }
 
 /// The poller-written, snapshot-read resolution cache.
@@ -565,6 +644,48 @@ impl PrStatusCache {
         }
         *guard = next;
         true
+    }
+
+    /// Drops every cached resolution whose target is absent from `keep`, returning
+    /// whether anything was removed.
+    ///
+    /// Lets the poller prune the verdicts of worktrees that closed (or repos whose
+    /// lease lapsed) **without** spending a `gh` call to re-resolve the survivors
+    /// (#1389, fix 1) — the wholesale [`replace`](Self::replace) only prunes as a
+    /// side effect of a fetch, which a pure removal must never trigger. No caller
+    /// bumps on the return today (a removed target's row is already gone from the
+    /// tree, so nothing re-renders), but the bool is reported for symmetry with
+    /// `replace` and to keep the prune observable in tests.
+    pub fn retain_targets(&self, keep: &HashSet<PrTarget>) -> bool {
+        let mut guard = self.lock();
+        let before = guard.len();
+        guard.retain(|target, _| keep.contains(target));
+        guard.len() != before
+    }
+
+    /// Every cached (target, resolution) pair, cloned out for persistence (#1389,
+    /// fix 4). Ordering is unspecified (a `HashMap`); the caller sorts if it needs
+    /// a stable on-disk form.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(PrTarget, PrResolution)> {
+        self.lock()
+            .iter()
+            .map(|(t, r)| (t.clone(), r.clone()))
+            .collect()
+    }
+
+    /// Seeds the cache from a persisted set, **without** bumping any change-notify.
+    ///
+    /// Called once at daemon startup (before any window subscribes) so restored
+    /// badges render on the first tree snapshot rather than after the first poll
+    /// (#1389, fix 4) — the [`crate::pr_status`] analogue of
+    /// `WorktreesRegistry::seed_polling`. Existing entries with the same target are
+    /// overwritten; the cache is empty at that point, so in practice this inserts.
+    pub fn seed(&self, entries: impl IntoIterator<Item = (PrTarget, PrResolution)>) {
+        let mut guard = self.lock();
+        for (target, resolution) in entries {
+            guard.insert(target, resolution);
+        }
     }
 
     /// Whether any cached badge is still pending — the poller's cadence signal. A
@@ -775,6 +896,35 @@ mod tests {
     fn build_query_asks_for_the_backing_suite_status() {
         let (query, _) = build_query(&[target("main")]).unwrap();
         assert!(query.contains("checkSuite{ status }"), "{query}");
+    }
+
+    #[test]
+    fn build_query_folds_in_the_rate_limit_block() {
+        // #1389, fix 8: every poll carries a free budget reading.
+        let (query, _) = build_query(&[target("main")]).unwrap();
+        assert!(
+            query.contains("rateLimit{ limit cost remaining used resetAt }"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn parse_rate_limit_reads_the_folded_budget_block() {
+        let body = json!({"data":{"rateLimit":
+            {"limit":5000,"cost":1,"remaining":4970,"used":30,"resetAt":"2026-07-21T16:00:00Z"}}});
+        let rl = parse_rate_limit(&body).expect("a complete block should parse");
+        assert_eq!(rl.cost, 1);
+        assert_eq!(rl.used, 30);
+        assert_eq!(rl.limit, 5000);
+        assert_eq!(rl.remaining, 4970);
+        assert!(rl.reset > 0, "resetAt should parse to an epoch");
+        // An older query shape (no block) reads as `None`, not a zeroed budget.
+        assert!(parse_rate_limit(&json!({"data":{"r0":{}}})).is_none());
+        // A partial block (missing `used`) is `None`, never half-populated.
+        assert!(parse_rate_limit(
+            &json!({"data":{"rateLimit":{"limit":5000,"cost":1,"remaining":4970}}})
+        )
+        .is_none());
     }
 
     // --- Query shape ---
@@ -1237,5 +1387,47 @@ mod tests {
         }
         cache.replace(map);
         assert!(!cache.any_pending());
+    }
+
+    #[test]
+    fn cache_retain_targets_drops_only_the_vanished_entries() {
+        // A pure removal (a worktree closed) must prune its verdict without a fetch
+        // (#1389, fix 1), leaving the survivors untouched.
+        let cache = PrStatusCache::new();
+        let mut map = HashMap::new();
+        map.insert(target("keep"), pending_pr(1));
+        map.insert(target("drop"), pending_pr(2));
+        cache.replace(map);
+
+        let keep: HashSet<PrTarget> = std::iter::once(target("keep")).collect();
+        assert!(cache.retain_targets(&keep), "a target was removed");
+        assert!(cache.get("rust-works", "omni-dev", "keep").is_some());
+        assert!(cache.get("rust-works", "omni-dev", "drop").is_none());
+        // Idempotent: nothing left to remove reports no change.
+        assert!(!cache.retain_targets(&keep));
+    }
+
+    #[test]
+    fn cache_seed_then_entries_round_trips_without_a_bump() {
+        // A warm start seeds restored verdicts so they render before the first poll
+        // (#1389, fix 4); `entries` reads them back for the next persist.
+        let cache = PrStatusCache::new();
+        cache.seed([
+            (target("f"), pending_pr(7)),
+            (target("g"), PrResolution::NoPr),
+        ]);
+        assert!(matches!(
+            cache.get("rust-works", "omni-dev", "f"),
+            Some(PrResolution::Pr(b)) if b.number == 7
+        ));
+        assert!(matches!(
+            cache.get("rust-works", "omni-dev", "g"),
+            Some(PrResolution::NoPr)
+        ));
+        let mut entries = cache.entries();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, target("f"));
+        assert_eq!(entries[1].0, target("g"));
     }
 }

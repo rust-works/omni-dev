@@ -296,13 +296,20 @@ open in others (and closed worktrees when shown) — and the hover tooltip adds 
 `PR #<n> · open/draft · checks …` line.
 
 Two right-click actions on any GitHub worktree (or repo) open its PR, sharing one
-discovery flow — `gh` finds the PR(s) (a quick-pick when several match) — and
+discovery flow — the daemon finds the PR(s) (a quick-pick when several match) — and
 differing only in where they open it. **"Open Pull Request…"** opens it **as a tab
 inside the editor**, never a browser: it hands off to the **GitHub Pull Requests**
 extension (`GitHub.vscode-pull-request-github`), and if that extension is absent it
 offers to install it or copy the PR URL. **"Open Pull Request in Browser…"** is the
 explicit way to ask for a browser instead — it opens the PR's `github.com` page in
 the OS default browser and needs no extension.
+
+Discovery is **daemon-served** (#1389, fix 7): a worktree already resolved
+daemon-side opens straight from the snapshot badge (**zero `gh`**), and a repo-wide
+lookup goes through the daemon's shared, TTL-cached [`open-prs`](#companion-contract-for-the-extension-and-other-clients)
+op — so N windows dedupe to **one** counted `gh pr list` per repo instead of each
+window shelling its own (the per-window burn #1370/#1389 target). Only a daemon too
+old to serve the op makes the extension fall back to its own `gh`.
 
 - **Resolved by the daemon, and kept live (#1337).** PR state rides the `tree`
   payload as a per-worktree `pr` object, resolved by a background poller in the
@@ -323,14 +330,36 @@ the OS default browser and needs no extension.
   how many repos, worktrees, or windows are open — `repository()`/`ref()` are not
   GraphQL connections, so aliasing them is free. The poller **wakes** every ~10 s —
   a read of the coalescing snapshot cache, no subprocess and no network — but only
-  **asks GitHub** when the watched state moved or its backoff elapsed: ~10 s while a
-  badge is pending (matching `gh pr checks --watch`), doubling to a 30-minute
-  ceiling once everything is terminal, and nothing at all while no window is
-  registered. The two cadences are separate because the triggers arrive by different
-  routes: a window opening bumps the change-notify, but **nothing tells the daemon
-  you committed** — so the loop looks often and cheaply, and pays only on a change.
-  Override the fetch cadence with `OMNI_DEV_DAEMON_PR_POLL` (whole seconds). The
-  daemon pushes to windows only when a verdict actually moves.
+  **asks GitHub** when there is reason to:
+  - The watch set **grows** — a branch is added, or its **upstream moves** (a push,
+    which is what starts the CI run a badge reports) — or the backoff elapses.
+  - A pure **removal never asks** (#1389): a window closing, a VS Code or daemon
+    shutdown, a TTL reap, or a lapsing 15-minute lease cannot change any *surviving*
+    badge, so it spends nothing — it just prunes the dead entries locally.
+  - A **local commit does not ask** either (#1389): GitHub has not seen it, so the
+    answer would be the cached one; the badge stays correctly stale locally (below)
+    until you push.
+
+  Cadence while a badge is **pending** starts at ~10 s (matching `gh pr checks
+  --watch`) for the first ~2 minutes after a push, then **escalates** toward a 60 s
+  ceiling so a long CI run (or a zombie suite) stops pinning the fast rate; once
+  everything is **terminal** it doubles to a 30-minute ceiling, and it polls nothing
+  at all while no window is registered. A change-notify **storm** — the one a VS Code
+  restart makes as it re-registers its windows one-by-one — is **debounced** into a
+  single fetch on the final set (#1389). And because the daemon is the single `gh`
+  choke point for every window, the cadence is **capped** when the shared GitHub
+  budget crosses its warn threshold ([below](#github-rate-limit-monitor)), so no
+  runaway in this class can exhaust it. Override the fetch cadence with
+  `OMNI_DEV_DAEMON_PR_POLL` and the storm debounce with `OMNI_DEV_DAEMON_PR_DEBOUNCE`
+  (whole seconds). The daemon pushes to windows only when a verdict actually moves.
+- **Warm badges across a restart (#1389).** After each poll the resolved badges
+  (number / URL / check-state / draft marker — no secret; the same data the tree
+  wire already carries) are persisted to `worktrees-pr-cache.json` (`0600`, beside
+  `worktrees-polling.json`). On restart the daemon serves them on the **first**
+  snapshot and **skips its immediate re-poll** when every current target already has
+  a verdict younger than the backoff — so a daemon restart costs ~0 calls rather than
+  a fresh fetch. Best-effort: a missing or unreadable file simply re-polls, and the
+  next poll rewrites a clean one.
 - **Per-repository, off by default, and time-boxed (#1376).** Polling is opt-in
   **per repo**: the daemon polls a repo's badges only once you enable it
   (right-click the repo → **Enable PR Polling**), so a repo it is not polling
@@ -345,13 +374,15 @@ the OS default browser and needs no extension.
   repo's badges on the next snapshot. See the
   [`set-polling` / `polling_enabled`](#companion-contract-for-the-extension-and-other-clients)
   contract entry.
-- **A commit invalidates the verdict immediately.** Each badge records the commit
-  its verdict describes; when that differs from the worktree's `head_sha` the row
-  renders ● rather than the previous commit's ✓ — no network call, on the very next
-  snapshot. So committing or pushing never leaves a stale green standing, and the
-  poller (which notices the moved head on its next wake) refreshes it for real
-  shortly after. The same applies to unpushed work and to being behind the remote:
-  the verdict simply is not about the commit in front of you.
+- **A commit invalidates the verdict immediately, locally.** Each badge records the
+  commit its verdict describes; when that differs from the worktree's `head_sha` the
+  row renders ● rather than the previous commit's ✓ — no network call, on the very
+  next snapshot. So committing never leaves a stale green standing. The poller does
+  **not** spend a call to refresh a *local* commit, though (#1389): GitHub has not
+  seen it, so the verdict would be unchanged, and the badge stays correctly ● until
+  you **push** — which moves the upstream and *does* trigger one fetch, resolving the
+  CI run the push started. The same local-staleness applies to unpushed work and to
+  being behind the remote: the verdict simply is not about the commit in front of you.
 - **Best-effort, silent.** A worktree with no branch, no matching PR, or on a
   non-GitHub repo shows nothing extra. If `gh` is absent or not authenticated,
   badges are simply omitted — no error dialog (the explicit "Open Pull Request…"
@@ -367,11 +398,19 @@ the OS default browser and needs no extension.
   windows × repos GitHub cost #1337 removed. Both fields absent still means "not
   resolved".
 - **Older daemons degrade.** Against a daemon predating #1337 — which omits `pr` —
-  the extension falls back to its own `gh pr list` and shows the PR number and
-  draft marker **without** a check glyph: nothing extension-side polls, so a verdict
-  there could not refresh, and a stale `✓` is worse than none. The fallback covers
-  only branches with **neither** `pr` nor `pr_none` (#1370), so against a current
-  daemon it runs no `gh` at all.
+  the extension falls back to its own PR list and shows the PR number and draft
+  marker **without** a check glyph: nothing extension-side polls, so a verdict there
+  could not refresh, and a stale `✓` is worse than none. The fallback covers only
+  branches with **neither** `pr` nor `pr_none` (#1370), so against a current daemon
+  it runs no `gh` at all.
+- **A not-polled repo issues zero `gh`, from the daemon *and* the extension
+  (#1389).** The badge fallback is now gated on `polling_enabled`: a repo you have
+  not enabled polling for (#1376) resolves no badges daemon-side **and** the
+  extension no longer shells `gh pr list` per window for it — the opt-out is honoured
+  end-to-end, closing the gap where disabling polling merely *moved* a repo's cost
+  from one shared daemon call to one `gh` per window. The only fallback that survives
+  — a *polled* repo's brief pre-first-poll transient — routes through the shared
+  `open-prs` op, so even that is one `gh`, not one per window.
 - **The check state is colored, not monochrome (#1324).** The `✓`/`✗`/`●` is a VS
   Code `FileDecoration` (the same mechanism git status uses to color `M`/`U`
   badges), painted from a custom `omnidev-worktree:` `resourceUri` the extension
@@ -453,6 +492,23 @@ the monitor costs nothing against the very budget it watches, and needs no adapt
 backoff (unlike the PR poller). It lives alongside the PR poller in the worktrees
 service because that is the daemon's `gh` consumer, but the reading is machine-wide.
 
+Two refinements ride #1389 (fix 8):
+
+- **Every PR poll is a free budget reading (8a).** The badge query carries a
+  `rateLimit { limit cost remaining used resetAt }` block — a meta-field GitHub
+  answers *without* adding to the query's own `cost` — so each poll folds a fresh
+  **graphql** reading into the shared cache (`observe_graphql`, preserving the
+  standalone poller's `core`/`search`). The block's `cost` also reports the poll's
+  **actual** point price, which is how the "1 point per poll" claim is verified at
+  scale rather than assumed (measured `cost: 1` at 37 branches; it rises to 2 near
+  100 branches, 4 near 200 — see [pr_status.rs](../src/pr_status.rs)). The poll logs
+  it at debug: `PR poll cost 1 point(s); graphql 123/5000 used, 4877 remaining`.
+- **The standalone poller idles when nothing is watched (8b).** Because the graphql
+  figure now stays fresh from the PR polls, the `/rate_limit` loop only spends a
+  subprocess while a window is registered **or** a polling lease is active; a
+  fully-idle daemon leaves the last reading in place. The read is free against the
+  budget, but the wakeups are not.
+
 It surfaces three ways:
 
 - **`omni-dev daemon status`** gains a top-level line above the per-service rows,
@@ -475,6 +531,13 @@ It surfaces three ways:
 The poller also logs a `WARN` (visible via `omni-dev daemon logs`) the moment a
 resource *crosses* ~80% — once per crossing, not every poll. Cadence is
 `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` whole seconds (default 60).
+
+Beyond surfacing the reading, the PR-badge poller now **consults** it (#1389): while
+any resource sits at or above the ~80% warn threshold, the poller holds its cadence at
+no less than 5 minutes and ignores even an immediate grown-watch fetch. Because the
+daemon is the single `gh` choke point for every window, this is the one place a
+machine-wide cap can be enforced — so no runaway in the PR-poll class can drain the
+shared budget, structurally rather than by convention.
 
 ## Git enrichment
 
@@ -537,8 +600,10 @@ lower idle CPU. A blank, non-numeric, or `0` value falls back to the default.
 | --- | --- | --- |
 | `OMNI_DEV_DAEMON_STREAM_TICK` | `10` | How often a `subscribe` stream re-samples on-disk git state absent a registry change. The coalescing snapshot cache (#1303) is sized to the same value, so the shared `build_tree` runs at most once per tick no matter how many windows subscribe. |
 | `OMNI_DEV_DAEMON_MENU_REFRESH` | `10` | How often the background task recomputes the tray menu snapshot. This is an independent per-window git walk (it does **not** read the coalescing cache and still computes `ahead`/`behind` inline), so it dominates idle CPU on a large tree — relaxing it is the biggest single win. |
-| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is still pending** (#1337), and how often it wakes to look. It backs off ×2 to a 30-minute ceiling once every badge is terminal, and asks nothing while no window is registered, so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a moved HEAD (you committed), a moved upstream (you pushed — #1344), or a window opening makes it ask immediately, regardless of the backoff. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
-| `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A plain fixed cadence — no backoff, no window-gating — because querying `/rate_limit` is exempt (spends nothing against any budget), so a current reading is kept available for `daemon status` and the tray at all times. One free `gh` subprocess per interval. |
+| `OMNI_DEV_DAEMON_PR_POLL` | `10` | How often the PR badge poller re-asks GitHub **while a badge is pending and fresh** (#1337), and how often it wakes to look. While pending it holds this fast rate for ~2 minutes after a push, then escalates ×2 toward a 60 s ceiling (#1389); once every badge is terminal it backs off ×2 to a 30-minute ceiling, and it asks nothing while no window is registered — so this is the *fast* end of the range, not a sustained rate. A wake is only a cached-snapshot read; a **grown** watch (an added branch, or a moved upstream — you pushed, #1344) makes it ask immediately regardless of the backoff, but a **local commit** (#1389) and a pure **removal** (#1389) do not. Each poll is one `gh api graphql` costing **1 point** of GitHub's 5,000/hour budget regardless of how many repos, worktrees, or windows are open — so this knob is about battery and wakeups, not quota. |
+| `OMNI_DEV_DAEMON_PR_DEBOUNCE` | `2` | How long the PR poller waits for the change-notify to go quiet before snapshotting (#1389), so a VS Code or daemon restart's one-window-at-a-time re-registration storm collapses into a single fetch on the final watch set instead of one per window. Bounded (~4× this) so a steady drip of changes cannot postpone a poll forever. |
+| `OMNI_DEV_DAEMON_RATE_LIMIT_POLL` | `60` | How often the [GitHub rate-limit monitor](#github-rate-limit-monitor) (#1375) re-reads `gh api rate_limit`. A fixed cadence with no backoff (the read is exempt), but **gated on activity** (#1389, fix 8b): it only spends a subprocess while a window is registered or a polling lease is active — an idle daemon leaves the last reading in place, and the graphql figure stays fresh from each PR poll's folded-in budget (fix 8a). One free `gh` subprocess per interval while active. |
+| `OMNI_DEV_DAEMON_OPEN_PR_TTL` | `60` | How long the daemon reuses a repo's `gh pr list` result before re-fetching, backing the shared [`open-prs`](#companion-contract-for-the-extension-and-other-clients) op (#1389, fix 7). Within the TTL, every window's "Open Pull Request…" lookup for that repo — and any transient badge fallback — is served from the one cached list, so N windows cost one counted `gh`, not N. |
 
 Both were relaxed from their original 2–3 s (#1305). Neither affects the latency
 of a user action: a window open/close or show-closed toggle still pushes
@@ -624,12 +689,20 @@ Ops:
 | `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
 | `ahead-behind`    | `{ paths: [path, …] }`                         | `{ results: { "<path>": { ahead, behind } } }` |
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
+| `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
 
-The first ten ops are strictly **request → one reply**. `subscribe` is the one
+`open-prs` (#1389, fix 7) serves "Open Pull Request…" from the daemon: it returns a
+repo's open PRs (`number, title, url, headRefName, baseRefName, isDraft, state,
+author`, forwarded from `gh pr list --json`) from a **shared, TTL-cached** result
+(default 60 s, `OMNI_DEV_DAEMON_OPEN_PR_TTL`) so N windows dedupe to one counted
+`gh` per repo. The client answers a branch already carrying a `pr` badge straight
+from the snapshot without ever calling it.
+
+The first eleven ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
