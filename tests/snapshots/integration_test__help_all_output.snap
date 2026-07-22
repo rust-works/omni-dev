@@ -3649,9 +3649,10 @@ Git-related operations
 Usage: git <COMMAND>
 
 Commands:
-  commit  Commit-related operations
-  branch  Branch-related operations
-  help    Print this message or the help of the given subcommand(s)
+  commit    Commit-related operations
+  branch    Branch-related operations
+  worktree  Worktree operations: logged wrappers over `git worktree`
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -3880,6 +3881,123 @@ Options:
 
 ================================================================================
 
+omni-dev git worktree - Worktree operations: logged wrappers over `git worktree`
+
+Worktree operations: logged wrappers over `git worktree`
+
+Usage: worktree <COMMAND>
+
+Commands:
+  add     Creates a worktree at `<path>` (wraps `git worktree add`)
+  remove  Removes a worktree, recording branch/commit/dirtiness first (wraps `git worktree remove`)
+  list    Lists worktrees (wraps `git worktree list`)
+  move    Moves a worktree to a new location (wraps `git worktree move`)
+  prune   Prunes stale worktree metadata, recording what was pruned (wraps `git worktree prune`)
+  repair  Repairs worktree administrative files (wraps `git worktree repair`)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git worktree add - Creates a worktree at `<path>` (wraps `git worktree add`)
+
+Creates a worktree at `<path>` (wraps `git worktree add`)
+
+Usage: add [OPTIONS] <PATH> [COMMIT_ISH]
+
+Arguments:
+  <PATH>        Path for the new worktree
+  [COMMIT_ISH]  Commit-ish to check out (defaults to HEAD)
+
+Options:
+  -b, --branch <BRANCH>  Create a new branch for the worktree
+  -f, --force            Checkout even if another worktree holds the branch
+      --detach           Detach HEAD in the new worktree
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev git worktree list - Lists worktrees (wraps `git worktree list`)
+
+Lists worktrees (wraps `git worktree list`)
+
+Usage: list [OPTIONS]
+
+Options:
+      --porcelain    Emit git's machine-readable porcelain output verbatim
+      --output-json  Emit the porcelain data as JSON
+  -h, --help         Print help
+
+
+================================================================================
+
+omni-dev git worktree move - Moves a worktree to a new location (wraps `git worktree move`)
+
+Moves a worktree to a new location (wraps `git worktree move`)
+
+Usage: move [OPTIONS] <FROM> <TO>
+
+Arguments:
+  <FROM>  Current path of the worktree
+  <TO>    New path for the worktree
+
+Options:
+  -f, --force  Move even if the worktree is dirty or locked
+  -h, --help   Print help
+
+
+================================================================================
+
+omni-dev git worktree prune - Prunes stale worktree metadata, recording what was pruned (wraps `git worktree prune`)
+
+Prunes stale worktree metadata, recording what was pruned (wraps `git worktree prune`)
+
+Usage: prune [OPTIONS]
+
+Options:
+  -n, --dry-run        Do not remove anything; report what would be removed
+  -v, --verbose        Report all removals
+      --expire <TIME>  Expire working trees older than TIME
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev git worktree remove - Removes a worktree, recording branch/commit/dirtiness first (wraps `git worktree remove`)
+
+Removes a worktree, recording branch/commit/dirtiness first (wraps `git worktree remove`)
+
+Usage: remove [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  Path of the worktree to remove
+
+Options:
+  -f, --force  Remove even if the worktree is dirty or locked
+  -h, --help   Print help
+
+
+================================================================================
+
+omni-dev git worktree repair - Repairs worktree administrative files (wraps `git worktree repair`)
+
+Repairs worktree administrative files (wraps `git worktree repair`)
+
+Usage: repair [PATHS]...
+
+Arguments:
+  [PATHS]...  Worktree paths to repair (all, when omitted)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
 omni-dev help-all - Displays comprehensive help for all commands
 
 Displays comprehensive help for all commands
@@ -3933,7 +4051,7 @@ Options:
       --since <DUR_OR_TS>  Lower time bound: relative (`30m`, `2h`, `1d`, `1w`) or absolute (`2026-07-01`, RFC3339). Same forms as `omni-dev log --since`
       --until <DUR_OR_TS>  Upper time bound (same forms as `--since`; a relative value means that long ago)
       --source <SOURCE>    Restrict to records from one source [possible values: cli, daemon, mcp]
-      --kind <KIND>        Restrict to one record kind (`--kind gh` shows the GitHub breakdown) [possible values: invocation, http, gh]
+      --kind <KIND>        Restrict to one record kind (`--kind gh` shows the GitHub breakdown) [possible values: invocation, http, gh, worktree]
       --json               Emit JSON instead of a table
   -h, --help               Print help
 
