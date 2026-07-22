@@ -75,6 +75,7 @@ enum KindArg {
     Invocation,
     Http,
     Gh,
+    Worktree,
 }
 
 impl From<KindArg> for RecordKind {
@@ -83,6 +84,7 @@ impl From<KindArg> for RecordKind {
             KindArg::Invocation => Self::Invocation,
             KindArg::Http => Self::Http,
             KindArg::Gh => Self::Gh,
+            KindArg::Worktree => Self::Worktree,
         }
     }
 }
