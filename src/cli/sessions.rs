@@ -1186,12 +1186,16 @@ mod tests {
     async fn window_and_window_unregister_send_their_ops() {
         let (_dir, sock, server) =
             fake_daemon_capture(json!({ "ok": true, "payload": { "ok": true } }));
-        WindowCommand {
-            key: "w1".to_string(),
-            folders: vec![PathBuf::from("/a")],
-            tabs: 1,
-            terminals: 0,
-            socket: Some(sock),
+        // Routed through the outer `SessionsCommand::execute` so the `Window`
+        // dispatch arm is covered too.
+        SessionsCommand {
+            command: SessionsSubcommands::Window(WindowCommand {
+                key: "w1".to_string(),
+                folders: vec![PathBuf::from("/a")],
+                tabs: 1,
+                terminals: 0,
+                socket: Some(sock),
+            }),
         }
         .execute()
         .await
@@ -1205,11 +1209,14 @@ mod tests {
         assert_eq!(req["payload"]["terminals"], json!(0));
 
         // `window-unregister` replies `{removed}` (not `{ok}`); the client reads it.
+        // Also routed through the wrapper to cover the `WindowUnregister` arm.
         let (_dir, sock, server) =
             fake_daemon_capture(json!({ "ok": true, "payload": { "removed": true } }));
-        WindowUnregisterCommand {
-            key: "w1".to_string(),
-            socket: Some(sock),
+        SessionsCommand {
+            command: SessionsSubcommands::WindowUnregister(WindowUnregisterCommand {
+                key: "w1".to_string(),
+                socket: Some(sock),
+            }),
         }
         .execute()
         .await
