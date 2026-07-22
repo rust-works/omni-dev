@@ -1177,7 +1177,15 @@ impl WorktreesService {
             let path = req.path.clone();
             let git = tokio::task::spawn_blocking(move || git_safety(&path))
                 .await
-                .map_err(|e| anyhow!("safety check task panicked: {e}"))??;
+                .map_err(|e| anyhow!("safety check task panicked: {e}"))
+                .and_then(|inner| inner)
+                .map_err(|err| log_close_error(&req.path, "safety check", err))?;
+            // Make the phase-1 verdict auditable in `omni-dev daemon logs`
+            // (#1364): the target, the owning window key (if any), whether a
+            // window has it open, and the deletability verdict — with the
+            // blocking risk kinds that force a confirm dialog, so a later "why did
+            // the close prompt/refuse?" is answerable from the log alone.
+            log_safety_check(&req.path, window_key.as_deref(), &git, open);
             return Ok(serde_json::to_value(SafetyReport {
                 removable: git.removable,
                 is_main: git.is_main,
@@ -1201,18 +1209,34 @@ impl WorktreesService {
             .map(|(k, _)| k.clone())
             .filter(|k| req.requester_key.as_deref() != Some(k))
             .collect();
+        // A self-close is the requester closing a window it owns: it never rides
+        // the cross-window signal (it acts on our `ok:true` reply instead). Logged
+        // (#1364) so the execute's routing decision is auditable before the wait,
+        // even if that wait then hangs or times out.
+        let self_close = is_self_close(req.requester_key.as_deref(), &open_windows);
+        log_executing(
+            &req.path,
+            req.requester_key.as_deref(),
+            req.remove,
+            self_close,
+            others.len(),
+        );
         for key in &others {
             self.registry.mark_close_pending(key);
         }
         if !others.is_empty() {
-            await_windows_closed(
+            if let Err(err) = await_windows_closed(
                 &self.registry,
                 &req.path,
                 req.requester_key.as_deref(),
                 CLOSE_WAIT_TIMEOUT,
                 CLOSE_WAIT_POLL,
             )
-            .await?;
+            .await
+            {
+                log_close_abort(&req.path, &err);
+                return Err(err);
+            }
         }
 
         if req.remove {
@@ -1223,13 +1247,17 @@ impl WorktreesService {
             // `await_windows_closed` would restack the waits and undo the whole
             // point. Pinned by `concurrent_closes_overlap_their_heartbeat_waits`.
             let _guard = self.prune_lock.lock().await;
-            tokio::task::spawn_blocking(move || remove_worktree(&path))
+            let removed = tokio::task::spawn_blocking(move || remove_worktree(&path))
                 .await
-                .map_err(|e| anyhow!("worktree removal task panicked: {e}"))??;
-            Ok(json!({ "removed": true }))
+                .map_err(|e| anyhow!("worktree removal task panicked: {e}"))
+                .map_err(|err| log_close_error(&req.path, "removal task", err))?;
+            // The audit line + Result→reply mapping lives in a sync helper so the
+            // destructive outcome is unit-testable off the runtime (#1364).
+            log_and_map_removal(&req.path, removed)
         } else {
             // "Close Window" with no owning window is a no-op success; a
             // self-close replies and the extension closes its own window.
+            log_window_closed(&req.path);
             Ok(json!({ "closed": true }))
         }
     }
@@ -2852,6 +2880,123 @@ impl Note {
             detail: detail.into(),
         }
     }
+}
+
+/// Joins a set of [`Note`]s' machine slugs into a compact `a,b` string (empty →
+/// `-`) for a single structured log field. Used by the `close` op's audit lines
+/// (#1364) so a verdict's risk kinds ride one field rather than a `Debug` dump.
+fn note_kinds(notes: &[Note]) -> String {
+    if notes.is_empty() {
+        return "-".to_string();
+    }
+    notes
+        .iter()
+        .map(|n| n.kind.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Whether a `close` execute is a **self-close**: the requesting window owns the
+/// target, so it acts on our `ok:true` reply and never rides the cross-window
+/// signal. Split out as a pure predicate so the routing decision the audit line
+/// (#1364) reports is unit-testable.
+fn is_self_close(requester_key: Option<&str>, open_windows: &[(String, usize)]) -> bool {
+    requester_key.is_some_and(|rk| open_windows.iter().any(|(k, _)| k == rk))
+}
+
+/// Logs a `close`-op failure at ERROR before propagating it. The phase-1/phase-2
+/// audit lines sit *past* the fallible `git_safety` / removal calls, so without
+/// this a failed safety check (a non-git-worktree target) or a panicked blocking
+/// task would early-return invisibly — the exact blind spot #1364 closes. Returns
+/// the error unchanged so callers keep using `?`.
+fn log_close_error(path: &Path, phase: &str, err: anyhow::Error) -> anyhow::Error {
+    tracing::error!(
+        path = %path.display(),
+        "worktrees close: {phase} failed: {err:#}"
+    );
+    err
+}
+
+/// Logs the outcome of a linked-worktree removal and maps it to the `close`
+/// reply. Split out of [`WorktreesService::close`] so the destructive op's audit
+/// line (#1364) is unit-testable without a tokio runtime or the `spawn_blocking`
+/// the real prune runs behind. A successful prune is INFO; a failure is WARN
+/// (a destructive op that did not complete) and propagates the error.
+fn log_and_map_removal(path: &Path, removed: Result<()>) -> Result<Value> {
+    match removed {
+        Ok(()) => {
+            tracing::info!(
+                path = %path.display(),
+                "worktrees close: linked worktree pruned"
+            );
+            Ok(json!({ "removed": true }))
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                "worktrees close: worktree prune failed: {err:#}"
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Emits the phase-1 audit line for a `close` safety check (#1364): the target,
+/// the owning window key (if any), the open flag, and the deletability verdict
+/// with the blocking risk kinds. Split out so the audit line is unit-testable off
+/// the runtime — a `tracing` event fired right after the `git_safety`
+/// `spawn_blocking` is not reliably captured under the parallel suite.
+fn log_safety_check(path: &Path, window_key: Option<&str>, git: &GitSafety, open: bool) {
+    tracing::info!(
+        path = %path.display(),
+        window_key = window_key.unwrap_or("-"),
+        removable = git.removable,
+        is_main = git.is_main,
+        open,
+        risks = %note_kinds(&git.risks),
+        "worktrees close: safety check"
+    );
+}
+
+/// Emits the phase-2 audit line for a `close` execute (#1364): the requesting
+/// window key and the routing decision (self-close vs. how many cross-window
+/// targets are being signalled), logged before the wait so it is auditable even
+/// if that wait then hangs. Sync so it is unit-testable off the runtime.
+fn log_executing(
+    path: &Path,
+    requester: Option<&str>,
+    remove: bool,
+    self_close: bool,
+    cross_window: usize,
+) {
+    tracing::info!(
+        path = %path.display(),
+        requester = requester.unwrap_or("-"),
+        remove,
+        self_close,
+        cross_window,
+        "worktrees close: executing"
+    );
+}
+
+/// Emits the phase-2 audit WARN when a `close` execute aborts because a signalled
+/// window never closed (#1364): the op leaves the worktree intact. Sync so it is
+/// unit-testable off the runtime.
+fn log_close_abort(path: &Path, err: &anyhow::Error) {
+    tracing::warn!(
+        path = %path.display(),
+        "worktrees close: aborted — signalled window(s) did not close: {err:#}"
+    );
+}
+
+/// Emits the phase-2 audit line for a non-destructive `close` — "Close Window":
+/// the window is closed and nothing is deleted (#1364). Sync so it is
+/// unit-testable off the runtime.
+fn log_window_closed(path: &Path) {
+    tracing::info!(
+        path = %path.display(),
+        "worktrees close: window closed, no removal"
+    );
 }
 
 /// The phase-1 safety report the extension reads to decide whether to prompt.
@@ -7197,6 +7342,236 @@ mod tests {
         );
     }
 
+    // --- Close-op audit logging (#1364) ------------------------------------
+
+    /// Thread-scoped log buffer for asserting on the `close` op's audit lines.
+    /// Mirrors the WARN capture in `claude_cli.rs`: a shared buffer installed via
+    /// `with_default`, so it never disturbs a global subscriber other tests set.
+    /// The audit-line tests drive the sync helpers directly (no runtime, no
+    /// `spawn_blocking`), so the captured events fire on this thread where the
+    /// subscriber lives — a `tracing` event emitted after a heavy `spawn_blocking`
+    /// under the parallel suite is *not* reliably captured this way.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` under a thread-local INFO-level subscriber and returns everything
+    /// it logged. `f` must be fully synchronous on this thread.
+    fn capture_info(f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+        logs
+    }
+
+    #[test]
+    fn note_kinds_joins_slugs_and_maps_empty_to_a_dash() {
+        assert_eq!(note_kinds(&[]), "-");
+        assert_eq!(
+            note_kinds(&[Note::new("dirty", "x"), Note::new("untracked", "y")]),
+            "dirty,untracked"
+        );
+    }
+
+    #[test]
+    fn is_self_close_true_only_when_requester_owns_an_open_window() {
+        let windows = vec![("w1".to_string(), 1usize), ("w2".to_string(), 2)];
+        assert!(is_self_close(Some("w1"), &windows));
+        assert!(
+            !is_self_close(Some("w3"), &windows),
+            "requester owns no window"
+        );
+        assert!(!is_self_close(None, &windows), "no requester");
+        assert!(!is_self_close(Some("w1"), &[]), "no open windows");
+    }
+
+    #[test]
+    fn log_and_map_removal_logs_and_maps_a_successful_prune() {
+        let logs = capture_info(|| {
+            let reply = log_and_map_removal(Path::new("/wt/feature"), Ok(())).unwrap();
+            assert_eq!(reply, json!({ "removed": true }));
+        });
+        assert!(
+            logs.contains("worktrees close: linked worktree pruned"),
+            "a successful prune must log an INFO audit line, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the target path must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_close_error_logs_at_error_and_returns_the_error_unchanged() {
+        // ERROR is more severe than the INFO cap, so `capture_info` records it.
+        let logs = capture_info(|| {
+            let err = log_close_error(
+                Path::new("/wt/feature"),
+                "safety check",
+                anyhow!("not a git worktree"),
+            );
+            assert_eq!(
+                err.to_string(),
+                "not a git worktree",
+                "err propagates unchanged"
+            );
+        });
+        assert!(
+            logs.contains("worktrees close: safety check failed"),
+            "a failed phase must log an ERROR audit line, got: {logs}"
+        );
+        assert!(
+            logs.contains("not a git worktree"),
+            "the cause must ride the line, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the target path must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_and_map_removal_warns_and_propagates_a_prune_failure() {
+        let logs = capture_info(|| {
+            let err = log_and_map_removal(Path::new("/wt/feature"), Err(anyhow!("locked")));
+            assert!(err.is_err(), "a prune failure must propagate");
+        });
+        assert!(
+            logs.contains("worktrees close: worktree prune failed"),
+            "a prune failure must log a WARN audit line, got: {logs}"
+        );
+        assert!(
+            logs.contains("locked"),
+            "the failure cause must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_safety_check_logs_the_verdict_and_owning_window_key() {
+        let git = GitSafety {
+            is_main: false,
+            removable: true,
+            risks: vec![Note::new("dirty", "x"), Note::new("untracked", "y")],
+            info: vec![],
+        };
+        let logs = capture_info(|| {
+            log_safety_check(Path::new("/wt/feature"), Some("win-42"), &git, true);
+        });
+        assert!(
+            logs.contains("worktrees close: safety check"),
+            "phase-1 must log a safety-check line, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the path must ride the line, got: {logs}"
+        );
+        assert!(
+            logs.contains("window_key=\"win-42\""),
+            "the owning window key must ride the line, got: {logs}"
+        );
+        assert!(logs.contains("removable=true"), "got: {logs}");
+        assert!(logs.contains("is_main=false"), "got: {logs}");
+        assert!(logs.contains("open=true"), "got: {logs}");
+        assert!(
+            logs.contains("risks=dirty,untracked"),
+            "the blocking risk kinds must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_safety_check_renders_a_dash_when_no_window_owns_the_target() {
+        let git = GitSafety {
+            is_main: false,
+            removable: true,
+            risks: vec![],
+            info: vec![],
+        };
+        let logs = capture_info(|| {
+            log_safety_check(Path::new("/wt/feature"), None, &git, false);
+        });
+        assert!(
+            logs.contains("window_key=\"-\""),
+            "no owning window → dash, got: {logs}"
+        );
+        assert!(logs.contains("risks=-"), "no risks → dash, got: {logs}");
+    }
+
+    #[test]
+    fn log_executing_logs_the_routing_decision() {
+        let logs = capture_info(|| {
+            log_executing(Path::new("/wt/feature"), Some("win-7"), true, false, 3);
+        });
+        assert!(
+            logs.contains("worktrees close: executing"),
+            "phase-2 must log the execute routing, got: {logs}"
+        );
+        assert!(
+            logs.contains("requester=\"win-7\""),
+            "the requester key must ride the line, got: {logs}"
+        );
+        assert!(logs.contains("remove=true"), "got: {logs}");
+        assert!(logs.contains("self_close=false"), "got: {logs}");
+        assert!(logs.contains("cross_window=3"), "got: {logs}");
+    }
+
+    #[test]
+    fn log_close_abort_warns_that_a_signalled_window_did_not_close() {
+        let logs = capture_info(|| {
+            log_close_abort(
+                Path::new("/wt/feature"),
+                &anyhow!("window(s) did not close in time: win-9"),
+            );
+        });
+        assert!(
+            logs.contains("worktrees close: aborted"),
+            "an abort must log a WARN audit line, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the path must ride the line, got: {logs}"
+        );
+        assert!(
+            logs.contains("win-9"),
+            "the still-open window must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_window_closed_logs_the_no_removal_outcome() {
+        let logs = capture_info(|| {
+            log_window_closed(Path::new("/wt/feature"));
+        });
+        assert!(
+            logs.contains("worktrees close: window closed, no removal"),
+            "a remove:false close must log the no-removal outcome, got: {logs}"
+        );
+        assert!(
+            logs.contains("/wt/feature"),
+            "the path must ride the line, got: {logs}"
+        );
+    }
+
     #[test]
     fn remove_worktree_deletes_the_directory_and_prunes_the_admin_metadata() {
         // The reorder (#1315) must still fully remove a worktree: both the
@@ -7916,6 +8291,23 @@ mod tests {
         assert!(info
             .iter()
             .any(|r| r.get("kind").and_then(Value::as_str) == Some("already-removed")));
+    }
+
+    #[tokio::test]
+    async fn close_phase1_errors_on_a_non_git_worktree_path() {
+        // An existing directory that is *not* a git worktree makes `git_safety`
+        // fail; the error must propagate (rather than delete an unknown dir),
+        // exercising the phase-1 `?` audit-and-return path (#1364). The ERROR
+        // audit line itself is unit-tested via `log_close_error`.
+        let dir = tempfile::tempdir().unwrap();
+        let svc = WorktreesService::new();
+        let result = svc
+            .handle("close", json!({ "path": dir.path(), "remove": true }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-git-worktree target must error the safety check, got: {result:?}"
+        );
     }
 
     #[tokio::test]
