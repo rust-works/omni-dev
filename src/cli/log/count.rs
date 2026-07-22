@@ -347,6 +347,18 @@ mod tests {
     }
 
     #[test]
+    fn kind_arg_maps_onto_every_record_kind() {
+        for (arg, kind) in [
+            (KindArg::Invocation, RecordKind::Invocation),
+            (KindArg::Http, RecordKind::Http),
+            (KindArg::Gh, RecordKind::Gh),
+            (KindArg::Worktree, RecordKind::Worktree),
+        ] {
+            assert_eq!(RecordKind::from(arg), kind);
+        }
+    }
+
+    #[test]
     fn aggregate_tallies_by_kind_and_source_ignoring_junk() {
         let f = write_log(SAMPLE);
         let counts = aggregate(f.path(), None, None, None, None);
