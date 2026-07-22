@@ -60,6 +60,10 @@ pub enum SessionsSubcommands {
     InstallHooks(InstallHooksCommand),
     /// Remove the sessions-tracker hooks from `~/.claude/settings.json`.
     UninstallHooks(UninstallHooksCommand),
+    /// Report a window's Claude tab/terminal counts (companion feed op).
+    Window(WindowCommand),
+    /// Remove a window's embedding report (companion feed op).
+    WindowUnregister(WindowUnregisterCommand),
 }
 
 impl SessionsCommand {
@@ -70,6 +74,8 @@ impl SessionsCommand {
             SessionsSubcommands::Hook(cmd) => cmd.execute().await,
             SessionsSubcommands::InstallHooks(cmd) => cmd.execute(),
             SessionsSubcommands::UninstallHooks(cmd) => cmd.execute(),
+            SessionsSubcommands::Window(cmd) => cmd.execute().await,
+            SessionsSubcommands::WindowUnregister(cmd) => cmd.execute().await,
         }
     }
 }
@@ -96,6 +102,74 @@ impl ListCommand {
             TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
             TableOrJson::Table => println!("{}", render_sessions(&result)),
         }
+        Ok(())
+    }
+}
+
+// --- window feed -------------------------------------------------------------
+
+/// Reports a window's Claude embedding counts (the companion `window` feed op).
+///
+/// Exposed as a typed command so scripted/headless reporters and integration
+/// tests can drive the sessions registry the way the VS Code companion does.
+/// Mirrors `WindowReport`.
+#[derive(Parser)]
+pub struct WindowCommand {
+    /// Stable per-window identity (the companion generates a per-activate UUID).
+    #[arg(long, value_name = "KEY")]
+    pub key: String,
+    /// A workspace-folder path (repeatable) — used to join sessions by `cwd`.
+    #[arg(long = "folder", value_name = "PATH")]
+    pub folders: Vec<PathBuf>,
+    /// How many Claude editor tabs the window has.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub tabs: usize,
+    /// How many Claude Code integrated terminals the window has.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub terminals: usize,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl WindowCommand {
+    /// Executes the window command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let payload = json!({
+            "key": self.key,
+            "folders": self.folders,
+            "tabs": self.tabs,
+            "terminals": self.terminals,
+        });
+        call(&socket, "window", payload).await?;
+        println!("Reported window {}", self.key);
+        Ok(())
+    }
+}
+
+/// Removes a window's embedding report — the companion `window-unregister` feed
+/// op made typed. Prints whether an entry was actually removed.
+#[derive(Parser)]
+pub struct WindowUnregisterCommand {
+    /// The window key to unregister.
+    #[arg(long, value_name = "KEY")]
+    pub key: String,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl WindowUnregisterCommand {
+    /// Executes the window-unregister command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let reply = call(&socket, "window-unregister", json!({ "key": self.key })).await?;
+        let removed = reply
+            .get("removed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        println!("removed: {removed}");
         Ok(())
     }
 }
@@ -989,6 +1063,31 @@ mod tests {
         (dir, sock, server)
     }
 
+    /// Like [`fake_daemon`] but **returns the request envelope it received** so a
+    /// test can assert the exact op/payload wire shape the client sent.
+    fn fake_daemon_capture(
+        reply: Value,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<Value>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let req = framed.next().await.unwrap().unwrap();
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&req).unwrap()
+        });
+        (dir, sock, server)
+    }
+
     #[tokio::test]
     async fn list_command_execute_renders_from_a_socket() {
         let payload = json!({
@@ -1038,5 +1137,92 @@ mod tests {
         // A per-event value that is not an array is skipped, not indexed.
         assert_eq!(merge_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 6);
         assert_eq!(remove_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 0);
+    }
+
+    // --- #1361 typed window feed commands -----------------------------------
+
+    #[test]
+    fn window_subcommands_route_and_require_key() {
+        assert!(matches!(
+            parse(&["window", "--key", "w1"]),
+            SessionsSubcommands::Window(_)
+        ));
+        assert!(matches!(
+            parse(&["window-unregister", "--key", "w1"]),
+            SessionsSubcommands::WindowUnregister(_)
+        ));
+        // `--key` is required for both.
+        assert!(WindowCommand::try_parse_from(["window"]).is_err());
+        assert!(WindowUnregisterCommand::try_parse_from(["window-unregister"]).is_err());
+    }
+
+    #[test]
+    fn window_parses_counts_and_folders() {
+        let cmd = WindowCommand::try_parse_from([
+            "window",
+            "--key",
+            "w1",
+            "--folder",
+            "/a",
+            "--folder",
+            "/b",
+            "--tabs",
+            "2",
+            "--terminals",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(cmd.key, "w1");
+        assert_eq!(cmd.folders, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(cmd.tabs, 2);
+        assert_eq!(cmd.terminals, 3);
+        // Counts default to zero.
+        let cmd = WindowCommand::try_parse_from(["window", "--key", "w1"]).unwrap();
+        assert_eq!(cmd.tabs, 0);
+        assert_eq!(cmd.terminals, 0);
+    }
+
+    #[tokio::test]
+    async fn window_and_window_unregister_send_their_ops() {
+        let (_dir, sock, server) =
+            fake_daemon_capture(json!({ "ok": true, "payload": { "ok": true } }));
+        // Routed through the outer `SessionsCommand::execute` so the `Window`
+        // dispatch arm is covered too.
+        SessionsCommand {
+            command: SessionsSubcommands::Window(WindowCommand {
+                key: "w1".to_string(),
+                folders: vec![PathBuf::from("/a")],
+                tabs: 1,
+                terminals: 0,
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        // The WindowReport wire shape: op + every field the daemon reads.
+        let req = server.await.unwrap();
+        assert_eq!(req["op"], "window");
+        assert_eq!(req["payload"]["key"], json!("w1"));
+        assert_eq!(req["payload"]["folders"], json!(["/a"]));
+        assert_eq!(req["payload"]["tabs"], json!(1));
+        assert_eq!(req["payload"]["terminals"], json!(0));
+
+        // `window-unregister` replies `{removed}` (not `{ok}`); the client reads it.
+        // Also routed through the wrapper to cover the `WindowUnregister` arm.
+        let (_dir, sock, server) =
+            fake_daemon_capture(json!({ "ok": true, "payload": { "removed": true } }));
+        SessionsCommand {
+            command: SessionsSubcommands::WindowUnregister(WindowUnregisterCommand {
+                key: "w1".to_string(),
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        let req = server.await.unwrap();
+        assert_eq!(req["op"], "window-unregister");
+        assert_eq!(req["payload"]["key"], json!("w1"));
     }
 }

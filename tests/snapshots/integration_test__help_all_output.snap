@@ -4128,11 +4128,13 @@ Sessions: track Claude Code sessions running across all terminals and windows
 Usage: sessions <COMMAND>
 
 Commands:
-  list             List the Claude Code sessions currently running across all windows
-  hook             Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
-  install-hooks    Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
-  uninstall-hooks  Remove the sessions-tracker hooks from `~/.claude/settings.json`
-  help             Print this message or the help of the given subcommand(s)
+  list               List the Claude Code sessions currently running across all windows
+  hook               Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+  install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+  uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json`
+  window             Report a window's Claude tab/terminal counts (companion feed op)
+  window-unregister  Remove a window's embedding report (companion feed op)
+  help               Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -4189,6 +4191,37 @@ Usage: uninstall-hooks [OPTIONS]
 Options:
       --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
   -h, --help             Print help
+
+
+================================================================================
+
+omni-dev sessions window - Report a window's Claude tab/terminal counts (companion feed op)
+
+Report a window's Claude tab/terminal counts (companion feed op)
+
+Usage: window [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>      Stable per-window identity (the companion generates a per-activate UUID)
+      --folder <PATH>  A workspace-folder path (repeatable) — used to join sessions by `cwd`
+      --tabs <N>       How many Claude editor tabs the window has [default: 0]
+      --terminals <N>  How many Claude Code integrated terminals the window has [default: 0]
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev sessions window-unregister - Remove a window's embedding report (companion feed op)
+
+Remove a window's embedding report (companion feed op)
+
+Usage: window-unregister [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>      The window key to unregister
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================
@@ -4434,13 +4467,37 @@ Worktrees: list the repos/worktrees open across all VS Code windows
 Usage: worktrees <COMMAND>
 
 Commands:
-  list   List the repos/worktrees currently open across all windows
-  tree   Show every repository and all its worktrees, grouped by repository
-  focus  Focus (raise) the VS Code window for a worktree folder
-  help   Print this message or the help of the given subcommand(s)
+  list         List the repos/worktrees currently open across all windows
+  tree         Show every repository and all its worktrees, grouped by repository
+  focus        Focus (raise) the VS Code window for a worktree folder
+  close        Close a worktree's window and, for a linked worktree, delete it
+  show-closed  Show or set whether closed worktrees are shown across all windows
+  register     Register a window's open worktree folders (companion feed op)
+  heartbeat    Refresh a window's liveness and read any pending close directive
+  unregister   Remove a window's registration (companion feed op)
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev worktrees close - Close a worktree's window and, for a linked worktree, delete it
+
+Close a worktree's window and, for a linked worktree, delete it
+
+Usage: close [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  Worktree folder to close. A linked worktree is deleted; the main working tree only has its window closed (never deleted)
+
+Options:
+      --window-only    Only close the worktree's window(s); never delete the worktree
+      --dry-run        Run the safety check and print the report, but do not close or delete
+  -y, --yes            Skip the interactive confirmation before deleting
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================
@@ -4461,6 +4518,20 @@ Options:
 
 ================================================================================
 
+omni-dev worktrees heartbeat - Refresh a window's liveness and read any pending close directive
+
+Refresh a window's liveness and read any pending close directive
+
+Usage: heartbeat [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>      The window key to heartbeat
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
 omni-dev worktrees list - List the repos/worktrees currently open across all windows
 
 List the repos/worktrees currently open across all windows
@@ -4475,6 +4546,40 @@ Options:
 
 ================================================================================
 
+omni-dev worktrees register - Register a window's open worktree folders (companion feed op)
+
+Register a window's open worktree folders (companion feed op)
+
+Usage: register [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>      Stable per-window identity (the companion generates a per-activate UUID)
+      --folder <PATH>  A workspace-folder path (repeatable)
+      --repo <REPO>    Repository root or name, when the window has one
+      --title <TITLE>  Window title, for display
+      --pid <PID>      Reporting process id
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev worktrees show-closed - Show or set whether closed worktrees are shown across all windows
+
+Show or set whether closed worktrees are shown across all windows
+
+Usage: show-closed [OPTIONS] [BOOL]
+
+Arguments:
+  [BOOL]  New value (`true`/`false`). Omit to read the current value [possible values: true, false]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
 omni-dev worktrees tree - Show every repository and all its worktrees, grouped by repository
 
 Show every repository and all its worktrees, grouped by repository
@@ -4484,4 +4589,19 @@ Usage: tree [OPTIONS]
 Options:
       --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -f, --follow           Stream live snapshots: re-render on every change until interrupted (Ctrl-C). Uses the daemon's `subscribe` push op
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev worktrees unregister - Remove a window's registration (companion feed op)
+
+Remove a window's registration (companion feed op)
+
+Usage: unregister [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>      The window key to unregister
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
