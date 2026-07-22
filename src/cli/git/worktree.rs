@@ -764,6 +764,89 @@ prunable gitdir file points to non-existent location";
         assert_eq!(json, r#"[{"path":"/repo","branch":"main"}]"#);
     }
 
+    #[test]
+    fn porcelain_ignores_attributes_before_the_first_stanza() {
+        // A stray attribute line with no open stanza is dropped, not a panic.
+        let entries = parse_worktree_porcelain("HEAD 9999\nworktree /a\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/a");
+        assert!(entries[0].head.is_none());
+    }
+
+    // --- metadata capture ---
+
+    #[test]
+    fn snapshot_degrades_on_non_repo_unborn_and_detached_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Not a repository: every field degrades to absent.
+        let snap = snapshot(tmp.path());
+        assert!(snap.branch.is_none());
+        assert!(snap.commit.is_none());
+        assert!(snap.dirty.is_none());
+        assert!(!snap.detached);
+
+        // Unborn HEAD (init, no commit): head() fails, statuses still answer.
+        let unborn = tmp.path().join("unborn");
+        git2::Repository::init(&unborn).unwrap();
+        let snap = snapshot(&unborn);
+        assert!(snap.branch.is_none());
+        assert!(snap.commit.is_none());
+        assert_eq!(snap.dirty, Some(false));
+
+        // Detached HEAD: branch omitted, detached flagged, commit present.
+        let detached = tmp.path().join("detached");
+        let repo = git2::Repository::init(&detached).unwrap();
+        let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        repo.set_head_detached(oid).unwrap();
+        let snap = snapshot(&detached);
+        assert!(snap.detached);
+        assert!(snap.branch.is_none());
+        assert_eq!(snap.commit, Some(oid.to_string()));
+    }
+
+    #[test]
+    fn insert_snapshot_records_detached_and_gates_dirty() {
+        let snap = WtSnapshot {
+            branch: None,
+            detached: true,
+            commit: Some("abc".to_string()),
+            dirty: Some(false),
+        };
+        let mut ctx = BTreeMap::new();
+        insert_snapshot(&mut ctx, &snap, false);
+        assert_eq!(ctx.get("detached").map(String::as_str), Some("true"));
+        assert_eq!(ctx.get("commit").map(String::as_str), Some("abc"));
+        assert!(!ctx.contains_key("branch"));
+        assert!(!ctx.contains_key("had_uncommitted"));
+
+        insert_snapshot(&mut ctx, &snap, true);
+        assert_eq!(
+            ctx.get("had_uncommitted").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn absolutize_and_display_canonical_handle_relative_and_missing_paths() {
+        let base = Path::new("/base");
+        assert_eq!(absolutize(base, Path::new("/abs")), PathBuf::from("/abs"));
+        assert_eq!(
+            absolutize(base, Path::new("rel")),
+            PathBuf::from("/base/rel")
+        );
+        // A nonexistent path falls back to the un-canonicalized form verbatim.
+        assert_eq!(
+            display_canonical(Path::new("/no/such/dir/x")),
+            "/no/such/dir/x"
+        );
+    }
+
     // --- argv builders ---
 
     #[test]
@@ -816,6 +899,14 @@ prunable gitdir file points to non-existent location";
                 force: false,
             }),
             argv(&["worktree", "move", "a", "b"])
+        );
+        assert_eq!(
+            move_argv(&MoveArgs {
+                from: PathBuf::from("a"),
+                to: PathBuf::from("b"),
+                force: true,
+            }),
+            argv(&["worktree", "move", "--force", "a", "b"])
         );
         assert_eq!(
             prune_argv(&PruneArgs {
