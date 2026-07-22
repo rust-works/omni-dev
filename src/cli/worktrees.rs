@@ -543,13 +543,19 @@ async fn confirm_removal_with(
 /// stalls an async worker while it waits for input. Returns `None` on any read
 /// error, EOF, or join failure.
 async fn read_stdin_line() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).ok().map(|_| answer)
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(|| read_line_from(&mut std::io::stdin().lock()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Reads one line from `reader`, mapping EOF and read errors to the same
+/// `Option<String>` the stdin caller consumes. Split out of [`read_stdin_line`]
+/// so the read logic is testable with an in-memory reader — real stdin can't be
+/// driven from a test without blocking on a TTY.
+fn read_line_from(reader: &mut impl std::io::BufRead) -> Option<String> {
+    let mut answer = String::new();
+    reader.read_line(&mut answer).ok().map(|_| answer)
 }
 
 /// The confirmation prompt shown before a delete — it names the risks when the
@@ -1459,19 +1465,30 @@ mod tests {
 
     #[test]
     fn confirm_prompt_mentions_risks_only_when_present() {
-        assert!(
-            confirm_prompt(true).contains("risks"),
-            "{}",
-            confirm_prompt(true)
-        );
-        assert!(
-            !confirm_prompt(false).contains("risks"),
-            "{}",
-            confirm_prompt(false)
-        );
-        // Both wordings default to No.
+        // The risky wording names the risks; the clean one does not. Both default
+        // to No. (No failure-message args — the conditions are self-describing, and
+        // an unevaluated arg would just read as an uncovered line.)
+        assert!(confirm_prompt(true).contains("risks"));
+        assert!(!confirm_prompt(false).contains("risks"));
         assert!(confirm_prompt(true).contains("[y/N]"));
         assert!(confirm_prompt(false).contains("[y/N]"));
+    }
+
+    #[test]
+    fn read_line_from_maps_input_and_eof() {
+        use std::io::Cursor;
+        // A line (with or without a trailing newline) comes back verbatim; EOF is
+        // an empty read (`Ok(0)`), which maps to `Some("")` — the decision layer
+        // then treats it as "no".
+        assert_eq!(
+            read_line_from(&mut Cursor::new("y\n")).as_deref(),
+            Some("y\n")
+        );
+        assert_eq!(read_line_from(&mut Cursor::new("")).as_deref(), Some(""));
+        assert_eq!(
+            read_line_from(&mut Cursor::new("no-newline")).as_deref(),
+            Some("no-newline")
+        );
     }
 
     #[test]
