@@ -56,6 +56,30 @@ impl DaemonClient {
         serde_json::from_str(&response).context("failed to decode daemon reply")
     }
 
+    /// Opens a streaming subscription: sends `envelope` once and returns a
+    /// handle over which the daemon pushes **many** replies on the same
+    /// connection (an initial snapshot then a fresh one on each change) until the
+    /// daemon or the client closes it. Per the control-socket protocol the client
+    /// must only *read* after this — sending any further line is interpreted as an
+    /// explicit cancel — so [`DaemonSubscription`] exposes reads only.
+    pub async fn subscribe(&self, envelope: DaemonEnvelope) -> Result<DaemonSubscription> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to daemon socket {} (is the daemon running?)",
+                    self.socket_path.display()
+                )
+            })?;
+        let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+        let line = serde_json::to_string(&envelope).context("failed to encode daemon request")?;
+        framed
+            .send(line)
+            .await
+            .context("failed to send daemon subscription request")?;
+        Ok(DaemonSubscription { framed })
+    }
+
     /// Sends an envelope and returns its payload, turning an `ok: false` reply
     /// into an `Err`.
     async fn request_ok(&self, envelope: DaemonEnvelope) -> Result<serde_json::Value> {
@@ -104,11 +128,38 @@ impl DaemonClient {
     }
 }
 
+/// A live push subscription opened by [`DaemonClient::subscribe`].
+///
+/// The daemon keeps sending [`DaemonReply`] frames on the connection; call
+/// [`next`](Self::next) in a loop to consume them. It exposes reads only — the
+/// protocol treats any further write as a cancel — and dropping it (e.g. on
+/// Ctrl-C) ends the stream.
+#[derive(Debug)]
+pub struct DaemonSubscription {
+    framed: Framed<UnixStream, LinesCodec>,
+}
+
+impl DaemonSubscription {
+    /// Reads the next pushed reply, `None` once the daemon closes the stream
+    /// (EOF), or `Some(Err(..))` on a read/decode failure.
+    pub async fn next(&mut self) -> Option<Result<DaemonReply>> {
+        match self.framed.next().await {
+            Some(Ok(line)) => {
+                Some(serde_json::from_str(&line).context("failed to decode daemon stream frame"))
+            }
+            Some(Err(e)) => Some(Err(
+                anyhow::Error::new(e).context("failed to read daemon stream")
+            )),
+            None => None,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::daemon::testutil::fake_daemon_reply;
+    use crate::daemon::testutil::{fake_daemon_reply, fake_daemon_stream};
 
     #[tokio::test]
     async fn version_reads_the_version_from_a_ping_reply() {
@@ -138,5 +189,46 @@ mod tests {
         let err = DaemonClient::new(&sock).version().await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_yields_each_pushed_frame_then_none_on_close() {
+        // The daemon pushes two snapshot frames then closes; `next()` returns each
+        // decoded reply in order and finally `None` at EOF.
+        let (_dir, sock, server) = fake_daemon_stream(vec![
+            serde_json::json!({ "ok": true, "payload": { "repos": [], "show_closed": true } }),
+            serde_json::json!({ "ok": true, "payload": { "repos": [], "show_closed": false } }),
+        ]);
+        let mut sub = DaemonClient::new(&sock)
+            .subscribe(DaemonEnvelope::service(
+                "worktrees",
+                "subscribe",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+
+        let first = sub.next().await.unwrap().unwrap();
+        assert!(first.ok);
+        assert_eq!(first.payload["show_closed"], serde_json::json!(true));
+        let second = sub.next().await.unwrap().unwrap();
+        assert_eq!(second.payload["show_closed"], serde_json::json!(false));
+        // The daemon has closed the connection: the stream ends.
+        assert!(sub.next().await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_errors_when_the_daemon_is_unreachable() {
+        // No daemon at the socket → the connect fails with the usual context.
+        let err = DaemonClient::new("/nonexistent/omni-dev-sub.sock")
+            .subscribe(DaemonEnvelope::service(
+                "worktrees",
+                "subscribe",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to connect"), "{err}");
     }
 }
