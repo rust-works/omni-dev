@@ -371,13 +371,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_jfm_rejects_forbidden_mark_combination() {
-        // Issue #1047: a body with `**`text`**` produces a text node carrying
-        // both `strong` and `code` marks, which ADF rejects. It must be
-        // caught at resolve time, before the API call.
+    fn resolve_from_jfm_splits_strong_code_marks() {
+        // Issue #1391 (previously #1047): a body with `**`text`**` used to be
+        // rejected at resolve time because the text node carried both `strong`
+        // and `code`. The converter now splits the marks into legal adjacent
+        // runs, so resolve succeeds and the code run carries `code` alone.
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("issue.md");
-        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: Bad\n---\n\nThis is **`bolded code`** in a sentence.\n";
+        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: Ok\n---\n\nThis is **`bolded code`** in a sentence.\n";
         fs::write(&file_path, content).unwrap();
 
         let cmd = CreateCommand {
@@ -389,10 +390,20 @@ mod tests {
             set_fields: vec![],
             dry_run: false,
         };
-        let err = cmd.resolve_params().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("invalid ADF mark combination"), "got: {msg}");
-        assert!(msg.contains("cannot be combined with"), "got: {msg}");
+        let params = cmd.resolve_params().unwrap();
+        let runs = params.adf.content[0].content.as_ref().unwrap();
+        let code_run = runs
+            .iter()
+            .find(|n| n.text.as_deref() == Some("bolded code"))
+            .expect("code run present");
+        let marks: Vec<&str> = code_run
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(marks, vec!["code"], "strong must be dropped from the run");
     }
 
     #[test]
