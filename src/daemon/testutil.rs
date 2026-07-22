@@ -39,3 +39,32 @@ pub(crate) fn fake_daemon_reply(reply: Value) -> (TempDir, PathBuf, JoinHandle<(
     });
     (dir, sock, server)
 }
+
+/// Spawns a fake daemon that reads one request line, then pushes each value in
+/// `replies` as its own NDJSON line (each a full `DaemonReply`-shaped JSON), and
+/// finally closes the connection — modelling a streaming subscription that ends.
+/// The client sees the frames in order followed by EOF (its `next()` returns
+/// `None`). Uses the same short-path `/tmp` socket as [`fake_daemon_reply`].
+pub(crate) fn fake_daemon_stream(replies: Vec<Value>) -> (TempDir, PathBuf, JoinHandle<()>) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::UnixListener;
+    use tokio_util::codec::{Framed, LinesCodec};
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let sock = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, LinesCodec::new());
+        let _req = framed.next().await.unwrap().unwrap();
+        for reply in replies {
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+        }
+        // Dropping `framed` (and `listener`) closes the connection: the client's
+        // stream reader then sees EOF and ends the subscription.
+    });
+    (dir, sock, server)
+}
