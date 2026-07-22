@@ -71,6 +71,10 @@ scopes:
     description: "VS Code companion extension for the worktrees service"
     examples: ["vscode: add worktrees tree view", "vscode: add close-worktree menu"]
     file_patterns: ["editors/vscode/**", "editors/**"]
+  - name: "deploy"
+    description: "Deployment tooling and self-hosted infrastructure (e.g. Cloudflare Worker + KV)"
+    examples: ["deploy: add webhook buffer worker", "deploy: add field-presence verifier"]
+    file_patterns: ["deploy/**"]
   - name: "website"
     description: "Project promo site sources under website/"
     examples: ["website: add landing page", "website: tweak SCSS theme"]

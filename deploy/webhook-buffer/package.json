@@ -1,0 +1,20 @@
+{
+  "name": "omni-dev-webhook-buffer-spike",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SPIKE (#1378): Cloudflare Worker that captures GitHub webhook deliveries for feasibility analysis. Not the production buffer.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "verify": "node verify-fields.mjs",
+    "verify:samples": "node verify-fields.mjs --dir samples"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

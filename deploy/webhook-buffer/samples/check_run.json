@@ -1,0 +1,80 @@
+[
+  {
+    "event": "check_run",
+    "delivery": "sample-check-run-build",
+    "received": 1721433600000,
+    "payload": {
+      "action": "completed",
+      "check_run": {
+        "id": 100001,
+        "name": "build",
+        "head_sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/acme/widget/runs/100001",
+        "check_suite": {
+          "id": 200001,
+          "head_branch": "feature/spike",
+          "head_sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+          "status": "completed",
+          "conclusion": "success",
+          "app": { "id": 15368, "slug": "github-actions" }
+        },
+        "app": { "id": 15368, "slug": "github-actions" },
+        "pull_requests": [
+          {
+            "number": 42,
+            "url": "https://api.github.com/repos/acme/widget/pulls/42",
+            "head": { "ref": "feature/spike", "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112" },
+            "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+          }
+        ]
+      },
+      "repository": {
+        "name": "widget",
+        "full_name": "acme/widget",
+        "owner": { "login": "acme" }
+      },
+      "sender": { "login": "octocat" }
+    }
+  },
+  {
+    "event": "check_run",
+    "delivery": "sample-check-run-lint",
+    "received": 1721433605000,
+    "payload": {
+      "action": "created",
+      "check_run": {
+        "id": 100002,
+        "name": "lint",
+        "head_sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/acme/widget/runs/100002",
+        "check_suite": {
+          "id": 200001,
+          "head_branch": "feature/spike",
+          "head_sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112",
+          "status": "in_progress",
+          "conclusion": null,
+          "app": { "id": 15368, "slug": "github-actions" }
+        },
+        "app": { "id": 15368, "slug": "github-actions" },
+        "pull_requests": [
+          {
+            "number": 42,
+            "url": "https://api.github.com/repos/acme/widget/pulls/42",
+            "head": { "ref": "feature/spike", "sha": "9a7c1f0e2b3d4c5f60718293a4b5c6d7e8f90112" },
+            "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+          }
+        ]
+      },
+      "repository": {
+        "name": "widget",
+        "full_name": "acme/widget",
+        "owner": { "login": "acme" }
+      },
+      "sender": { "login": "octocat" }
+    }
+  }
+]

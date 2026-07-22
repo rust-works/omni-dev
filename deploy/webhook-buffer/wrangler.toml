@@ -1,0 +1,28 @@
+# SPIKE capture Worker for issue #1378 — see ../../docs/plan/webhook-buffer-spike.md
+#
+# Deploy is operator-run (needs YOUR Cloudflare account); the daemon side is not
+# built here. Fill `id` after `wrangler kv namespace create GITHUB_EVENTS`, then set the
+# two secrets (never committed) and `wrangler deploy`. Full runbook: README.md.
+
+name = "omni-dev-webhook-buffer-spike"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+# Buffered events land here. Create with:
+#   wrangler kv namespace create GITHUB_EVENTS
+# then paste the printed id below (and, if you want a `wrangler dev` store,
+# `wrangler kv namespace create GITHUB_EVENTS --preview` for preview_id).
+[[kv_namespaces]]
+binding = "GITHUB_EVENTS"
+id = "71210c852eac4f57b19206e1c7af27cb"
+# preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
+
+[vars]
+# Optional: how long a stored event survives (seconds, KV floor is 60).
+# Overrides the worker's built-in 3-day default.
+RETENTION_SECONDS = "259200"
+
+# Secrets are NOT set here — they are `wrangler secret put`s so they never touch
+# the repo:
+#   wrangler secret put WEBHOOK_SECRET   # the GitHub webhook HMAC secret
+#   wrangler secret put READ_TOKEN       # the daemon's outbound pull token
