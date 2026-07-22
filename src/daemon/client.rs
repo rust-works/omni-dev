@@ -219,6 +219,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_next_surfaces_a_read_error_on_an_oversized_frame() {
+        // A frame longer than MAX_LINE_BYTES trips the client codec's max-length
+        // guard, exercising the read-error arm of `DaemonSubscription::next`.
+        let big = "x".repeat(crate::daemon::protocol::MAX_LINE_BYTES + 1);
+        let (_dir, sock, server) = fake_daemon_stream(vec![serde_json::Value::String(big)]);
+        let mut sub = DaemonClient::new(&sock)
+            .subscribe(DaemonEnvelope::service(
+                "worktrees",
+                "subscribe",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        let frame = sub.next().await;
+        assert!(
+            matches!(frame, Some(Err(_))),
+            "an oversized frame should surface as a read error"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn subscribe_errors_when_the_daemon_is_unreachable() {
         // No daemon at the socket → the connect fails with the usual context.
         let err = DaemonClient::new("/nonexistent/omni-dev-sub.sock")

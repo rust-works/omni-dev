@@ -234,8 +234,20 @@ pub struct CloseCommand {
 }
 
 impl CloseCommand {
-    /// Executes the close command.
+    /// Executes the close command, confirming a delete interactively via stdin.
     pub async fn execute(self) -> Result<()> {
+        self.execute_with(confirm_removal).await
+    }
+
+    /// The close core, with the destructive-confirm decision injected as
+    /// `confirm(has_risks) -> bool`. Splitting it this way keeps the abort and
+    /// confirmed-execute branches unit-testable without driving real stdin (which
+    /// would block a test on a TTY); production wires in [`confirm_removal`].
+    async fn execute_with<F, Fut>(self, confirm: F) -> Result<()>
+    where
+        F: FnOnce(bool) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         // Resolve to an absolute path client-side (like `focus`): the daemon runs
         // in a different cwd and matches the target by canonical path.
         let path = std::fs::canonicalize(&self.path)
@@ -285,7 +297,11 @@ impl CloseCommand {
                 path.display()
             );
         }
-        if !self.yes && !confirm_removal(&report).await {
+        let has_risks = report
+            .get("risks")
+            .and_then(Value::as_array)
+            .is_some_and(|r| !r.is_empty());
+        if !self.yes && !confirm(has_risks).await {
             println!("Aborted; nothing was deleted.");
             return Ok(());
         }
@@ -500,26 +516,40 @@ fn render_notes(label: &str, notes: Option<&Value>) -> String {
 }
 
 /// Prompts on stderr for confirmation before a destructive delete and returns
-/// whether the user assented.
+/// whether the user assented, reading the answer from real stdin.
 ///
-/// The blocking `stdin().read_line` runs on a dedicated thread (`spawn_blocking`)
-/// so it never stalls an async worker while it waits for input. Any read error,
-/// a closed stdin (EOF), or a join failure is treated as "no", so the delete
-/// never proceeds unattended.
-async fn confirm_removal(report: &Value) -> bool {
-    let has_risks = report
-        .get("risks")
-        .and_then(Value::as_array)
-        .is_some_and(|r| !r.is_empty());
+/// A thin wrapper over [`confirm_removal_with`] that supplies the live stdin
+/// reader; the prompt-and-decide logic is factored out so it stays testable
+/// without driving real stdin.
+async fn confirm_removal(has_risks: bool) -> bool {
+    confirm_removal_with(has_risks, read_stdin_line()).await
+}
+
+/// Prints the confirmation prompt and resolves the (already-injected) read of the
+/// user's answer into a yes/no decision. Any read error, a closed stdin (EOF), or
+/// a join failure surfaces as `None` and is treated as "no", so a delete never
+/// proceeds unattended.
+async fn confirm_removal_with(
+    has_risks: bool,
+    read: impl std::future::Future<Output = Option<String>>,
+) -> bool {
     use std::io::Write;
     eprint!("{}", confirm_prompt(has_risks));
     let _ = std::io::stderr().flush();
-    let read = tokio::task::spawn_blocking(|| {
+    read.await.as_deref().is_some_and(answer_is_yes)
+}
+
+/// Reads one line from stdin on a dedicated thread (`spawn_blocking`) so it never
+/// stalls an async worker while it waits for input. Returns `None` on any read
+/// error, EOF, or join failure.
+async fn read_stdin_line() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
         let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).map(|_| answer)
+        std::io::stdin().read_line(&mut answer).ok().map(|_| answer)
     })
-    .await;
-    matches!(read, Ok(Ok(answer)) if answer_is_yes(&answer))
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The confirmation prompt shown before a delete — it names the risks when the
@@ -1797,5 +1827,161 @@ mod tests {
         ]);
         follow_tree_stream(&sock, TableOrJson::Table).await.unwrap();
         server.await.unwrap();
+
+        // Through `TreeCommand::execute` with `--follow`, covering the follow-dispatch
+        // branch (not just the free `follow_tree_stream`).
+        let (_dir, sock, server) = fake_daemon_stream(vec![
+            json!({ "ok": true, "payload": { "repos": [], "show_closed": true } }),
+        ]);
+        TreeCommand {
+            socket: Some(sock),
+            output: TableOrJson::Json,
+            follow: true,
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktrees_command_routes_each_new_subcommand() {
+        // Route every new variant through the outer `WorktreesCommand::execute` so
+        // its dispatch arms are exercised (the wire-shape tests drive the leaf
+        // `execute` directly).
+        let target = tempfile::tempdir().unwrap();
+        // Close: `--window-only --dry-run` contacts no daemon.
+        WorktreesCommand {
+            command: WorktreesSubcommands::Close(CloseCommand {
+                path: target.path().to_path_buf(),
+                window_only: true,
+                dry_run: true,
+                yes: false,
+                socket: Some(PathBuf::from("/nonexistent/omni-dev-route.sock")),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        // ShowClosed (set).
+        let (_d, sock, server) =
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::ShowClosed(ShowClosedCommand {
+                value: Some(true),
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        // Register.
+        let (_d, sock, server) =
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Register(RegisterCommand {
+                key: "w1".to_string(),
+                folders: vec![],
+                repo: None,
+                title: None,
+                pid: None,
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        // Heartbeat.
+        let (_d, sock, server) =
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "known": true } })]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Heartbeat(HeartbeatCommand {
+                key: "w1".to_string(),
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        // Unregister.
+        let (_d, sock, server) =
+            fake_daemon_seq(vec![json!({ "ok": true, "payload": { "removed": true } })]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Unregister(UnregisterCommand {
+                key: "w1".to_string(),
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_aborts_when_confirmation_is_declined() {
+        // Phase-1 says removable; the injected confirmer declines → the "Aborted"
+        // branch runs and no phase-2 delete is sent (one connection only). This
+        // covers the interactive-decline path without driving real stdin.
+        let (_dir, sock, server) = fake_daemon_seq(vec![json!({
+            "ok": true,
+            "payload": { "removable": true, "is_main": false, "open": false,
+                         "window_folder_count": 0, "risks": [], "info": [] }
+        })]);
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: false,
+            dry_run: false,
+            yes: false,
+            socket: Some(sock),
+        }
+        .execute_with(|_has_risks| async { false })
+        .await
+        .unwrap();
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_deletes_when_confirmation_is_accepted() {
+        // Phase-1 removable, the injected confirmer accepts → phase-2 executes with
+        // confirmed:true.
+        let (_dir, sock, server) = fake_daemon_seq(vec![
+            json!({ "ok": true, "payload": { "removable": true, "is_main": false,
+                    "open": false, "window_folder_count": 0, "risks": [], "info": [] } }),
+            json!({ "ok": true, "payload": { "removed": true } }),
+        ]);
+        let target = tempfile::tempdir().unwrap();
+        CloseCommand {
+            path: target.path().to_path_buf(),
+            window_only: false,
+            dry_run: false,
+            yes: false,
+            socket: Some(sock),
+        }
+        .execute_with(|_has_risks| async { true })
+        .await
+        .unwrap();
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1]["payload"]["confirmed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn confirm_removal_with_decides_from_the_answer() {
+        // A "yes"/"y" answer confirms; "no", an empty line, and a `None` (EOF/read
+        // error) all decline — for both the risky and clean prompt wordings.
+        assert!(confirm_removal_with(false, async { Some("y\n".to_string()) }).await);
+        assert!(confirm_removal_with(true, async { Some("YES".to_string()) }).await);
+        assert!(!confirm_removal_with(false, async { Some("n".to_string()) }).await);
+        assert!(!confirm_removal_with(true, async { Some(String::new()) }).await);
+        assert!(!confirm_removal_with(false, async { None }).await);
     }
 }
