@@ -457,7 +457,7 @@ impl UnregisterCommand {
     }
 }
 
-/// Renders a phase-1 `close` [`SafetyReport`] as a human-readable block: whether
+/// Renders a phase-1 `close` `SafetyReport` as a human-readable block: whether
 /// the target is removable, whether it is the main tree, whether a window has it
 /// open (and which), and any `risks`/`info` notes. Every daemon-supplied string is
 /// `sanitize`d (#1137); the booleans/counts are daemon-computed and safe.
