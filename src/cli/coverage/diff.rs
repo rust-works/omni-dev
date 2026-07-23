@@ -7,10 +7,15 @@ use clap::{Parser, ValueEnum};
 use git2::Repository;
 use regex::RegexSet;
 
+use crate::claude::context::{load_config_content, resolve_context_dir_at};
 use crate::coverage::{
     analyze, default_base_ref, parse, render, DiffModel, DiffScope, Format, OutputFormat,
     RenderOptions,
 };
+
+/// Config file (under the discovered `.omni-dev/` dir) that declares persistent
+/// `coverage diff` settings, unioned with the CLI flags. Missing ⇒ no-op.
+const COVERAGE_CONFIG_FILE: &str = "coverage.yaml";
 
 /// Coverage report format selector (CLI mirror of [`Format`] plus auto-detect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -117,6 +122,16 @@ pub struct DiffCommand {
     #[arg(long, value_name = "REGEX", value_delimiter = ',')]
     pub ignore_filename_regex: Vec<String>,
 
+    /// Path to the config directory searched for `coverage.yaml` (defaults to
+    /// the discovered `.omni-dev/`, honoring `OMNI_DEV_CONFIG_DIR`).
+    ///
+    /// `coverage.yaml`'s `diff.ignore-filename-regex` list is unioned with any
+    /// `--ignore-filename-regex` passed here, so a repo can declare its
+    /// CPU-conditional / run-to-run-nondeterministic files once in version
+    /// control instead of threading the flag through every invocation.
+    #[arg(long, value_name = "PATH")]
+    pub context_dir: Option<PathBuf>,
+
     /// Collapse consecutive uncovered new lines into ranges (e.g. `9-11`).
     #[arg(long)]
     pub collapse_ranges: bool,
@@ -150,6 +165,28 @@ pub struct DiffCommand {
     /// Commit-URL prefix for linking SHAs (e.g. `https://…/<repo>/commit`).
     #[arg(long, value_name = "URL")]
     pub commit_url: Option<String>,
+}
+
+/// Persistent `coverage diff` settings read from `.omni-dev/coverage.yaml`.
+///
+/// Forward-compatible: unknown top-level keys are ignored, so a newer schema
+/// stays readable by an older binary. A missing `diff` block defaults to empty.
+#[derive(Debug, Default, serde::Deserialize)]
+struct CoverageConfig {
+    /// Settings for the `diff` subcommand.
+    #[serde(default)]
+    diff: CoverageDiffConfig,
+}
+
+/// The `diff:` block of `coverage.yaml`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct CoverageDiffConfig {
+    /// Repo-relative path regexes excluded from both head and baseline reports,
+    /// unioned with `--ignore-filename-regex` and applied after `--strip-prefix`
+    /// normalisation. Same unanchored semantics as the flag.
+    #[serde(default)]
+    ignore_filename_regex: Vec<String>,
 }
 
 /// The result of running `coverage diff`, separated from printing so it can be
@@ -208,9 +245,11 @@ impl DiffCommand {
             .clone()
             .or_else(|| repo.workdir().map(std::path::Path::to_path_buf));
 
-        // Compiled once so an invalid pattern is a single up-front error rather
-        // than failing separately per report.
-        let ignore = self.compile_ignore()?;
+        // Union the repo-config ignore-list with the CLI flag, then compile once
+        // so an invalid pattern is a single up-front error rather than failing
+        // separately per report.
+        let config_ignore = self.load_config_ignore(&repo_path)?;
+        let ignore = self.compile_ignore(&config_ignore)?;
 
         let head = self.load_report(
             &self.report,
@@ -288,24 +327,51 @@ impl DiffCommand {
         Ok(report)
     }
 
-    /// Compiles `--ignore-filename-regex` into a [`RegexSet`], or `None` when it
-    /// was not supplied. A file is excluded when it matches *any* pattern.
+    /// Loads the repo-config ignore-list (`coverage.yaml`'s
+    /// `diff.ignore-filename-regex`) from the discovered `.omni-dev/` directory.
+    ///
+    /// Discovery mirrors the other config-consuming commands: `--context-dir`
+    /// wins, else `OMNI_DEV_CONFIG_DIR`, else walk-up from `repo_root`. A missing
+    /// file is a no-op (`Ok(Vec::new())`); a present-but-malformed file is a hard
+    /// error, matching the CLI flag's invalid-pattern behavior rather than
+    /// silently letting the excluded noise back in.
+    fn load_config_ignore(&self, repo_root: &Path) -> Result<Vec<String>> {
+        let context_dir = resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
+        let Some(content) = load_config_content(&context_dir, COVERAGE_CONFIG_FILE)? else {
+            return Ok(Vec::new());
+        };
+        let config: CoverageConfig = serde_yaml::from_str(&content).with_context(|| {
+            format!(
+                "could not parse coverage config {}/{COVERAGE_CONFIG_FILE}",
+                context_dir.display()
+            )
+        })?;
+        Ok(config.diff.ignore_filename_regex)
+    }
+
+    /// Compiles the union of `--ignore-filename-regex` and the repo-config
+    /// ignore-list into a [`RegexSet`], or `None` when neither supplied any
+    /// pattern. A file is excluded when it matches *any* pattern.
     ///
     /// Empty patterns are dropped: comma-splitting a trailing or doubled comma
     /// (`foo,` / `a,,b`) yields an empty element, and an empty regex matches
     /// *every* path — which would silently exclude the whole report (and make a
     /// `--fail-under-patch` gate pass vacuously). Treating it as a no-op is the
     /// safe reading of an obvious typo.
-    fn compile_ignore(&self) -> Result<Option<RegexSet>> {
-        let patterns: Vec<&String> = self
+    fn compile_ignore(&self, config_patterns: &[String]) -> Result<Option<RegexSet>> {
+        let patterns: Vec<&str> = self
             .ignore_filename_regex
             .iter()
+            .chain(config_patterns)
+            .map(String::as_str)
             .filter(|p| !p.is_empty())
             .collect();
         if patterns.is_empty() {
             return Ok(None);
         }
-        let set = RegexSet::new(patterns).context("invalid --ignore-filename-regex pattern")?;
+        let set = RegexSet::new(patterns).context(
+            "invalid ignore-filename-regex pattern (--ignore-filename-regex or coverage.yaml)",
+        )?;
         Ok(Some(set))
     }
 
@@ -405,6 +471,7 @@ mod tests {
             fail_under_patch: None,
             strip_prefix: None,
             ignore_filename_regex: Vec::new(),
+            context_dir: None,
             collapse_ranges: false,
             all_files: false,
             artifact_url: None,
@@ -413,6 +480,27 @@ mod tests {
             head_sha: None,
             commit_url: None,
         }
+    }
+
+    /// Writes `<repo>/.omni-dev/coverage.yaml` declaring `diff.ignore-filename-regex`
+    /// and returns the config-dir path to pass as `context_dir`. An empty
+    /// `patterns` emits an explicit `[]` (a bare `key:` would deserialize as
+    /// `null`, not an empty sequence).
+    fn write_coverage_config(repo: &Path, patterns: &[&str]) -> PathBuf {
+        use std::fmt::Write as _;
+        let config_dir = repo.join(".omni-dev");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut body = String::from("diff:\n");
+        if patterns.is_empty() {
+            body.push_str("  ignore-filename-regex: []\n");
+        } else {
+            body.push_str("  ignore-filename-regex:\n");
+            for p in patterns {
+                let _ = writeln!(body, "    - '{p}'");
+            }
+        }
+        fs::write(config_dir.join("coverage.yaml"), body).unwrap();
+        config_dir
     }
 
     #[test]
@@ -641,6 +729,170 @@ mod tests {
         let report = write_head_lcov(&repo);
         let mut cmd = command(report, &base);
         cmd.ignore_filename_regex = vec!["(unclosed".to_string()];
+        assert!(cmd.run(Some(&repo)).is_err());
+    }
+
+    // ── .omni-dev/coverage.yaml ignore-list (#1398) ──────────────────────
+
+    #[test]
+    fn coverage_config_parses_ignore_list() {
+        let yaml = "diff:\n  ignore-filename-regex:\n    - 'src/bits/popcount\\.rs'\n    - 'src/dsv/simd/.*'\n";
+        let config: CoverageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.diff.ignore_filename_regex,
+            vec![
+                r"src/bits/popcount\.rs".to_string(),
+                "src/dsv/simd/.*".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn coverage_config_ignores_unknown_keys() {
+        // Forward-compat: a newer top-level or `diff` key is ignored, not an
+        // error, so a newer schema stays readable by an older binary.
+        let yaml =
+            "future-top: 1\ndiff:\n  future-diff-key: true\n  ignore-filename-regex:\n    - 'x'\n";
+        let config: CoverageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.diff.ignore_filename_regex, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn coverage_config_defaults_to_empty() {
+        let config: CoverageConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(config.diff.ignore_filename_regex.is_empty());
+    }
+
+    #[test]
+    fn config_ignore_drops_file_from_both_reports() {
+        // Acceptance criterion: a file matched ONLY via `.omni-dev/coverage.yaml`
+        // is excluded from BOTH head and baseline, so it cannot surface in the
+        // delta table nor the "unchanged files also moved" note. Config-only
+        // analogue of `ignore_filename_regex_drops_file_from_both_reports`.
+        let (_dir, repo, base) = repo_with_added_file();
+        let head = format!(
+            "SF:{a}\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n\
+             SF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, head).unwrap();
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!(
+                "SF:{}\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+
+        let config_dir = write_coverage_config(&repo, &[r"a\.rs"]);
+        let mut cmd = command(report, &base);
+        cmd.baseline_report = Some(baseline);
+        cmd.all_files = true;
+        cmd.context_dir = Some(config_dir);
+        let md = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            !md.contains("`a.rs`"),
+            "config-ignored a.rs must not appear in the delta table"
+        );
+        assert!(md.contains("`b.rs"), "un-ignored added file still reported");
+    }
+
+    #[test]
+    fn config_and_cli_ignore_lists_union() {
+        // The config ignores `a.rs`; the CLI flag ignores `b.rs`. Both take
+        // effect — proving the two sources are set-unioned, neither replacing
+        // the other.
+        let (_dir, repo, base) = repo_with_added_file();
+        let head = format!(
+            "SF:{a}\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n\
+             SF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, head).unwrap();
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!(
+                "SF:{}\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+
+        let config_dir = write_coverage_config(&repo, &[r"a\.rs"]);
+        let mut cmd = command(report, &base);
+        cmd.baseline_report = Some(baseline);
+        cmd.all_files = true;
+        cmd.context_dir = Some(config_dir);
+        cmd.ignore_filename_regex = vec![r"b\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        // `b.rs` (the only added file) dropped via the CLI flag ⇒ no patch lines.
+        assert_eq!(outcome.patch_percent, None);
+        // `a.rs` dropped via config ⇒ absent from the delta table.
+        assert!(!outcome.rendered.contains("`a.rs`"));
+    }
+
+    #[test]
+    fn empty_config_ignore_is_noop() {
+        // An empty `diff.ignore-filename-regex: []` changes nothing: b.rs is
+        // still measured at 2/3, exactly as with no config at all.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let config_dir = write_coverage_config(&repo, &[]);
+        let mut cmd = command(report, &base);
+        cmd.context_dir = Some(config_dir);
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn missing_config_is_noop() {
+        // A context dir with no `coverage.yaml` leaves behavior unchanged.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let empty_dir = repo.join(".omni-dev-empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let mut cmd = command(report, &base);
+        cmd.context_dir = Some(empty_dir);
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn malformed_config_errors() {
+        // A present-but-malformed `coverage.yaml` (scalar where a list is
+        // expected) is a hard error — fail loudly rather than silently letting
+        // the excluded noise back in.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let config_dir = repo.join(".omni-dev");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("coverage.yaml"),
+            "diff:\n  ignore-filename-regex: 'not-a-list'\n",
+        )
+        .unwrap();
+        let mut cmd = command(report, &base);
+        cmd.context_dir = Some(config_dir);
+        assert!(cmd.run(Some(&repo)).is_err());
+    }
+
+    #[test]
+    fn invalid_config_pattern_errors() {
+        // An unclosed group from config is an up-front error, same as the flag.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let config_dir = write_coverage_config(&repo, &["(unclosed"]);
+        let mut cmd = command(report, &base);
+        cmd.context_dir = Some(config_dir);
         assert!(cmd.run(Some(&repo)).is_err());
     }
 

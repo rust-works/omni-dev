@@ -169,6 +169,10 @@ impl OmniDevServer {
             fail_under_patch: params.fail_under_patch,
             strip_prefix: params.strip_prefix.map(PathBuf::from),
             ignore_filename_regex: params.ignore_filename_regex,
+            // Config discovery walks up from `repo_path`; MCP callers get the
+            // repo's declarative `coverage.yaml` ignore-list without an explicit
+            // override flag.
+            context_dir: None,
             collapse_ranges: params.collapse_ranges,
             all_files: params.all_files,
             artifact_url: params.artifact_url,
