@@ -4473,6 +4473,7 @@ Commands:
   tree         Show every repository and all its worktrees, grouped by repository
   focus        Focus (raise) the VS Code window for a worktree folder
   close        Close a worktree's window and, for a linked worktree, delete it
+  merge-queue  Enqueue eligible worktrees' PRs into the GitHub merge queue
   show-closed  Show or set whether closed worktrees are shown across all windows
   register     Register a window's open worktree folders (companion feed op)
   heartbeat    Refresh a window's liveness and read any pending close directive
@@ -4544,6 +4545,24 @@ Options:
       --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev worktrees merge-queue - Enqueue eligible worktrees' PRs into the GitHub merge queue
+
+Enqueue eligible worktrees' PRs into the GitHub merge queue
+
+Usage: merge-queue [OPTIONS] <PATH>...
+
+Arguments:
+  <PATH>...  Worktree folder(s) to consider. Each is canonicalized client-side, as the daemon runs in a different cwd and matches targets by canonical path
+
+Options:
+      --check          Print the eligibility report and exit; never enqueue
+  -y, --yes            Skip the interactive confirmation before enqueuing
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================
