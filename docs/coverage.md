@@ -91,6 +91,62 @@ prefix. Override the stripped prefix with `--strip-prefix <PATH>` when the repor
 was generated under a different root (for example, a container build path that
 differs from the checkout location).
 
+## Excluding files (CPU-conditional / non-deterministic coverage)
+
+Some source files have coverage that is **inherently non-deterministic across
+runs** — a region gated on a *runtime* CPU-feature check (`is_x86_feature_detected!`,
+runtime SIMD-level dispatch) is compiled and counted in the denominator but only
+*executed* on a host whose CPU has the instruction. When the baseline and head
+runs draw different runner CPUs, the file's coverage swings with no source
+change, surfacing as phantom deltas or in the "unchanged files also moved" note.
+
+`--ignore-filename-regex <REGEX>` excludes files whose repo-relative path matches
+any of the given regexes from **both** the head and baseline reports before the
+diff. Filtering both sides symmetrically keeps the total, per-file deltas, patch
+coverage, indirect-change list, and the `--fail-under-patch` gate computed over
+the same denominator, so an excluded file can never produce a spurious "moved"
+entry. Matching is **unanchored** (partial), the same semantics as
+`cargo llvm-cov --ignore-filename-regex`, and is applied **after** `--strip-prefix`
+normalisation, so patterns match the repo-relative path. The flag is repeatable
+and comma-separated; an empty pattern is treated as a no-op (a bare regex would
+match every path).
+
+### Declaring the ignore-list persistently in repo config
+
+Because these files are CPU-conditional forever — a property of the
+*repository*, not of a single command line — the ignore-list can be declared once
+in version control under the same `.omni-dev/` directory omni-dev already
+discovers. Create `.omni-dev/coverage.yaml`:
+
+```yaml
+# .omni-dev/coverage.yaml
+diff:
+  # repo-relative path regexes; same unanchored semantics as
+  # --ignore-filename-regex, applied after --strip-prefix normalisation
+  ignore-filename-regex:
+    - 'src/bits/popcount\.rs'   # AVX-512 VPOPCNTDQ path is CPU-gated
+    - 'src/dsv/simd/.*'         # runtime SIMD dispatch fallback arms
+    - 'src/yaml/simd/.*'
+```
+
+- **Discovery** follows the standard config resolution used by the other
+  commands: `--context-dir <PATH>` wins, else `OMNI_DEV_CONFIG_DIR`, else a
+  walk-up for the nearest `.omni-dev/` from the repo root, plus the usual
+  `local/` override and XDG/home fallbacks.
+- **Union, not replacement.** The config list is set-unioned with any
+  `--ignore-filename-regex` passed on the command line, so the flag still works
+  and only ever *adds* to the config list.
+- **Empty / missing is a no-op** — behavior is unchanged when the file is absent
+  or its list is empty. A present-but-malformed `coverage.yaml`, or an invalid
+  regex from either source, is a hard error (it fails loudly rather than
+  silently letting the excluded noise back in). Unknown keys are ignored, so the
+  schema can grow without breaking older binaries.
+
+This is the recommended path when omni-dev runs **through a wrapper** (such as
+the `action-works/omni-dev-coverage-check` action) that does not thread the flag
+through: omni-dev reads `.omni-dev/coverage.yaml` directly from the checkout, so
+no wrapper change is needed.
+
 ## CI usage
 
 In CI, prefer the reusable
@@ -115,6 +171,8 @@ wires it up.
 | `--collapse-ranges` | Collapse consecutive uncovered new lines into ranges |
 | `--all-files` | Report deltas/indirect changes for all files, not just touched ones |
 | `--strip-prefix <PATH>` | Prefix stripped from report paths to make them repo-relative |
+| `--ignore-filename-regex <REGEX>` | Exclude matching files from both reports (repeatable/comma-separated); unioned with `.omni-dev/coverage.yaml` |
+| `--context-dir <PATH>` | Config dir searched for `coverage.yaml` (default: discovered `.omni-dev/`, honoring `OMNI_DEV_CONFIG_DIR`) |
 | `-C, --repo <PATH>` | Operate as if started in `<PATH>` (like `git -C`) |
 | `--artifact-url` / `--run-url` / `--commit-url` | Markdown-footer CI links |
 | `--base-sha` / `--head-sha` | SHAs shown in the markdown `Comparing` line |
