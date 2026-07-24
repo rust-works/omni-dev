@@ -20,6 +20,9 @@ use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
+use crate::git::worktree_rebase::{
+    self, FetchOutcome, RebaseOptions, RebaseResult, Selection, SkipReason, WorktreeOutcome,
+};
 
 /// The `worktrees` service routing key on the daemon control socket.
 const SERVICE: &str = "worktrees";
@@ -44,6 +47,8 @@ pub enum WorktreesSubcommands {
     Focus(FocusCommand),
     /// Close a worktree's window and, for a linked worktree, delete it.
     Close(CloseCommand),
+    /// Rebase worktrees onto the remote default branch, fetching it once per repo.
+    Rebase(RebaseCommand),
     /// Show or set whether closed worktrees are shown across all windows.
     ShowClosed(ShowClosedCommand),
     /// Register a window's open worktree folders (companion feed op).
@@ -56,12 +61,18 @@ pub enum WorktreesSubcommands {
 
 impl WorktreesCommand {
     /// Executes the worktrees command.
-    pub async fn execute(self) -> Result<()> {
+    ///
+    /// `repo` is the global `-C/--repo` location, resolved once in [`crate::cli`]
+    /// and threaded down rather than re-read from the ambient CWD. Only `rebase`
+    /// uses it (it is the one subcommand that acts on the local repository); the
+    /// daemon-client subcommands address worktrees by absolute path instead.
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
             WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
             WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
             WorktreesSubcommands::Close(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Rebase(cmd) => cmd.execute(repo).await,
             WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
@@ -316,6 +327,296 @@ impl CloseCommand {
         println!("Deleted worktree {}", path.display());
         Ok(())
     }
+}
+
+/// Rebases worktrees onto the repository's remote default branch, fetching that
+/// branch **exactly once per repository** (#1400).
+///
+/// Unlike every other `worktrees` subcommand this runs **entirely locally** and
+/// never talks to the daemon: the fetch needs the user's `ssh-agent` /
+/// credential-helper environment, which the daemon — spawned by launchd/systemd
+/// with a minimal environment — does not have, so a daemon-side fetch could not
+/// authenticate to an SSH remote. The git work lives in
+/// [`crate::git::worktree_rebase`]; see ADR-0055 and ADR-0003.
+///
+/// A rebase rewrites branch history, so it confirms by default (`--dry-run` to
+/// preview, `-y` to skip the prompt) in the spirit of ADR-0027.
+#[derive(Parser)]
+pub struct RebaseCommand {
+    /// Worktree folders to rebase. Omit these and pass `--all` to rebase every
+    /// linked worktree of the current repository.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+    /// Rebase every linked worktree of the current repository (never the main
+    /// working tree).
+    #[arg(long)]
+    pub all: bool,
+    /// Rebase onto this ref instead of the remote default branch. A
+    /// `<remote>/<branch>` value is still fetched once up front.
+    #[arg(long, value_name = "REF")]
+    pub onto: Option<String>,
+    /// Stash uncommitted changes around each rebase instead of skipping the
+    /// worktree.
+    #[arg(long)]
+    pub autostash: bool,
+    /// Fetch and report what would be rebased, but rebase nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the interactive confirmation before rebasing.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+}
+
+impl RebaseCommand {
+    /// Executes the rebase command, confirming interactively via stdin.
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+        self.execute_with(repo, confirm_rebase).await
+    }
+
+    /// The rebase core, with the confirm decision injected as
+    /// `confirm(pending) -> bool`. Splitting it this way keeps the abort and
+    /// confirmed branches unit-testable without driving real stdin (which would
+    /// block a test on a TTY); production wires in [`confirm_rebase`].
+    async fn execute_with<F, Fut>(self, repo: Option<&Path>, confirm: F) -> Result<()>
+    where
+        F: FnOnce(usize) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let selection = self.selection(repo)?;
+        let opts = RebaseOptions {
+            onto: self.onto.clone(),
+            autostash: self.autostash,
+            dry_run: self.dry_run,
+        };
+
+        // Planning shells out to `git fetch` (once per repo) and walks the object
+        // database, so it runs on a blocking thread rather than an async worker.
+        let plan_opts = opts.clone();
+        let plan =
+            tokio::task::spawn_blocking(move || worktree_rebase::plan(&selection, &plan_opts))
+                .await
+                .context("rebase planning task panicked")??;
+
+        let json = matches!(self.output, TableOrJson::Json);
+        // A dry run, or a plan with nothing left to do, reports and stops. The
+        // fetch has still happened — that is what pins the snapshot every worktree
+        // was measured against.
+        if self.dry_run || !plan.has_pending_rebases() {
+            self.print(json, &plan.fetches, &plan.worktrees)?;
+            return Ok(());
+        }
+
+        // Show what is about to happen, then confirm: a rebase rewrites history.
+        if !json {
+            println!("{}", render_fetches(&plan.fetches));
+            println!("{}", render_outcomes(&plan.worktrees));
+        }
+        let pending = plan.worktrees.iter().filter(|w| is_pending(w)).count();
+        if !self.yes && !confirm(pending).await {
+            println!("Aborted; no worktree was rebased.");
+            return Ok(());
+        }
+
+        let fetches = plan.fetches.clone();
+        let outcomes = tokio::task::spawn_blocking(move || worktree_rebase::execute(plan, &opts))
+            .await
+            .context("rebase task panicked")?;
+        if !json {
+            println!();
+        }
+        self.print(json, &fetches, &outcomes)
+    }
+
+    /// Resolves the CLI's target selection, rejecting an empty one rather than
+    /// silently rebasing everything.
+    ///
+    /// `repo` is the global `-C/--repo` location: it is both the repository
+    /// `--all` enumerates and the base that relative `<PATH>` arguments resolve
+    /// against, so the command behaves "as if started in `<PATH>`". With no
+    /// `-C` the base is `.`, which git resolves against the process CWD.
+    fn selection(&self, repo: Option<&Path>) -> Result<Selection> {
+        let base = repo.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        if self.all {
+            if !self.paths.is_empty() {
+                bail!("pass either <PATH>... or --all, not both");
+            }
+            return Ok(Selection::All { base });
+        }
+        if self.paths.is_empty() {
+            bail!(
+                "specify one or more <PATH> arguments, or --all to rebase \
+                 every linked worktree of this repository"
+            );
+        }
+        let paths = self
+            .paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    base.join(path)
+                }
+            })
+            .collect();
+        Ok(Selection::Paths(paths))
+    }
+
+    /// Prints a report as either pretty JSON or the human table.
+    fn print(
+        &self,
+        json: bool,
+        fetches: &[FetchOutcome],
+        outcomes: &[WorktreeOutcome],
+    ) -> Result<()> {
+        if json {
+            let value = json!({
+                "dry_run": self.dry_run,
+                "fetches": fetches,
+                "worktrees": outcomes,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!("{}", render_fetches(fetches));
+            println!("{}", render_outcomes(outcomes));
+        }
+        Ok(())
+    }
+}
+
+/// Whether an outcome is still awaiting a rebase (drives the confirm count).
+fn is_pending(outcome: &WorktreeOutcome) -> bool {
+    matches!(outcome.result, RebaseResult::WouldRebase { .. })
+}
+
+/// Renders the per-repository fetch lines — one per repo, which is the visible
+/// proof of the fetch-once-per-repo contract.
+fn render_fetches(fetches: &[FetchOutcome]) -> String {
+    if fetches.is_empty() {
+        return "No repository selected.".to_string();
+    }
+    fetches
+        .iter()
+        .map(fetch_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One repository's fetch line.
+fn fetch_line(fetch: &FetchOutcome) -> String {
+    let root = sanitize(&fetch.repo_root.display().to_string());
+    let onto = sanitize(&fetch.onto);
+    if !fetch.fetched {
+        return format!("Using {onto} in {root} (local ref; nothing fetched)");
+    }
+    if fetch.ok {
+        format!("Fetched {onto} once for {root}")
+    } else {
+        let detail = brief(fetch.detail.as_deref().unwrap_or(""));
+        format!("Fetch of {onto} FAILED for {root}: {detail}")
+    }
+}
+
+/// Renders the per-worktree result table.
+fn render_outcomes(outcomes: &[WorktreeOutcome]) -> String {
+    if outcomes.is_empty() {
+        return "No worktrees selected.".to_string();
+    }
+    let mut out = format!(
+        "{:<12} {:<24} {:<16} {}",
+        "STATUS", "BRANCH", "ONTO", "WORKTREE"
+    );
+    for outcome in outcomes {
+        out.push('\n');
+        out.push_str(&outcome_row(outcome));
+    }
+    out
+}
+
+/// One worktree row: status, branch, target ref, path, and a parenthesised detail.
+fn outcome_row(outcome: &WorktreeOutcome) -> String {
+    let (status, detail) = status_and_detail(&outcome.result);
+    let branch = sanitize(outcome.branch.as_deref().unwrap_or("-"));
+    let onto = sanitize(&outcome.onto);
+    let path = sanitize(&outcome.path.display().to_string());
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("  ({detail})")
+    };
+    format!("{status:<12} {branch:<24} {onto:<16} {path}{suffix}")
+}
+
+/// The status word and human detail for one outcome.
+fn status_and_detail(result: &RebaseResult) -> (&'static str, String) {
+    match result {
+        RebaseResult::Rebased { behind } => ("rebased", format!("was {behind} behind")),
+        RebaseResult::WouldRebase { behind } => ("would-rebase", format!("{behind} behind")),
+        RebaseResult::UpToDate => ("up-to-date", String::new()),
+        RebaseResult::Skipped { reason } => ("skipped", skip_reason_text(*reason).to_string()),
+        RebaseResult::Conflict { detail } => ("conflict", brief(detail)),
+        RebaseResult::FetchFailed { detail } => ("fetch-failed", brief(detail)),
+    }
+}
+
+/// The human explanation for why a worktree was skipped.
+fn skip_reason_text(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::MainWorkingTree => "main working tree",
+        SkipReason::DetachedHead => "detached HEAD",
+        SkipReason::Dirty => "uncommitted changes; pass --autostash",
+        SkipReason::OperationInProgress => "a rebase/merge is already in progress",
+        SkipReason::NotAWorktree => "not a git worktree",
+        SkipReason::NoOntoRef => "could not resolve the target ref",
+    }
+}
+
+/// A one-line, control-character-free, length-capped summary of a multi-line git
+/// error, so a long conflict message cannot wreck the table layout.
+fn brief(detail: &str) -> String {
+    let first = detail
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let clean = sanitize(first.trim());
+    if clean.chars().count() > 100 {
+        let truncated: String = clean.chars().take(97).collect();
+        format!("{truncated}...")
+    } else {
+        clean
+    }
+}
+
+/// Prompts on stderr before rewriting branch history, reading from real stdin.
+async fn confirm_rebase(pending: usize) -> bool {
+    confirm_rebase_with(pending, read_stdin_line()).await
+}
+
+/// Prints the rebase confirmation prompt and resolves the (injected) read into a
+/// yes/no decision. Any read error, EOF, or join failure is treated as "no", so a
+/// rebase never proceeds unattended.
+async fn confirm_rebase_with(
+    pending: usize,
+    read: impl std::future::Future<Output = Option<String>>,
+) -> bool {
+    use std::io::Write;
+    eprint!("{}", rebase_prompt(pending));
+    let _ = std::io::stderr().flush();
+    read.await.as_deref().is_some_and(answer_is_yes)
+}
+
+/// The confirmation prompt, naming how many worktrees would be rewritten. Pure, so
+/// the wording is unit-testable.
+fn rebase_prompt(pending: usize) -> String {
+    let noun = if pending == 1 {
+        "worktree"
+    } else {
+        "worktrees"
+    };
+    format!("Rebase {pending} {noun} (this rewrites branch history)? [y/N] ")
 }
 
 /// Shows or sets the cross-window "show closed worktrees" toggle.
@@ -950,7 +1251,7 @@ mod tests {
                 socket: Some(sock),
             }),
         };
-        cmd.execute().await.unwrap();
+        cmd.execute(None).await.unwrap();
         server.await.unwrap();
     }
 
@@ -1877,7 +2178,20 @@ mod tests {
                 socket: Some(PathBuf::from("/nonexistent/omni-dev-route.sock")),
             }),
         }
-        .execute()
+        .execute(None)
+        .await
+        .unwrap();
+
+        // Rebase: a non-worktree path with `--dry-run` reaches no daemon and no
+        // remote (it classifies as `not a git worktree` and stops).
+        WorktreesCommand {
+            command: WorktreesSubcommands::Rebase(RebaseCommand {
+                paths: vec![target.path().to_path_buf()],
+                dry_run: true,
+                ..rebase_cmd()
+            }),
+        }
+        .execute(None)
         .await
         .unwrap();
 
@@ -1890,7 +2204,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute()
+        .execute(None)
         .await
         .unwrap();
         server.await.unwrap();
@@ -1908,7 +2222,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute()
+        .execute(None)
         .await
         .unwrap();
         server.await.unwrap();
@@ -1922,7 +2236,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute()
+        .execute(None)
         .await
         .unwrap();
         server.await.unwrap();
@@ -1936,7 +2250,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute()
+        .execute(None)
         .await
         .unwrap();
         server.await.unwrap();
@@ -2000,5 +2314,300 @@ mod tests {
         assert!(!confirm_removal_with(false, async { Some("n".to_string()) }).await);
         assert!(!confirm_removal_with(true, async { Some(String::new()) }).await);
         assert!(!confirm_removal_with(false, async { None }).await);
+    }
+
+    // ── worktrees rebase (#1400) ──────────────────────────────────────────
+
+    /// A `RebaseCommand` with every field defaulted, for terse test construction.
+    fn rebase_cmd() -> RebaseCommand {
+        RebaseCommand {
+            paths: Vec::new(),
+            all: false,
+            onto: None,
+            autostash: false,
+            dry_run: false,
+            yes: false,
+            output: TableOrJson::Table,
+        }
+    }
+
+    #[test]
+    fn rebase_parses_paths_and_flags() {
+        let cmd = RebaseCommand::try_parse_from([
+            "rebase",
+            "/wt/a",
+            "/wt/b",
+            "--onto",
+            "origin/release",
+            "--autostash",
+            "--dry-run",
+            "-y",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd.paths,
+            vec![PathBuf::from("/wt/a"), PathBuf::from("/wt/b")]
+        );
+        assert_eq!(cmd.onto.as_deref(), Some("origin/release"));
+        assert!(cmd.autostash && cmd.dry_run && cmd.yes);
+        assert!(matches!(cmd.output, TableOrJson::Json));
+    }
+
+    #[test]
+    fn rebase_defaults_are_conservative() {
+        let cmd = RebaseCommand::try_parse_from(["rebase", "/wt/a"]).unwrap();
+        assert!(!cmd.all && !cmd.autostash && !cmd.dry_run && !cmd.yes);
+        assert_eq!(cmd.onto, None);
+        assert!(matches!(cmd.output, TableOrJson::Table));
+    }
+
+    #[test]
+    fn rebase_requires_a_target() {
+        // A bare `rebase` parses, but resolving its selection refuses rather than
+        // silently rebasing everything.
+        let err = rebase_cmd().selection(None).unwrap_err().to_string();
+        assert!(err.contains("--all"), "expected a usage hint, got: {err}");
+    }
+
+    #[test]
+    fn rebase_rejects_paths_together_with_all() {
+        let cmd = RebaseCommand {
+            paths: vec![PathBuf::from("/wt/a")],
+            all: true,
+            ..rebase_cmd()
+        };
+        let err = cmd.selection(None).unwrap_err().to_string();
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    #[test]
+    fn rebase_selection_maps_paths_and_all() {
+        let cmd = RebaseCommand {
+            paths: vec![PathBuf::from("/wt/a")],
+            ..rebase_cmd()
+        };
+        assert!(matches!(cmd.selection(None).unwrap(), Selection::Paths(p) if p.len() == 1));
+        let all = RebaseCommand {
+            all: true,
+            ..rebase_cmd()
+        };
+        assert!(matches!(
+            all.selection(None).unwrap(),
+            Selection::All { .. }
+        ));
+    }
+
+    #[test]
+    fn rebase_prompt_agrees_in_number() {
+        assert!(rebase_prompt(1).contains("1 worktree ("));
+        assert!(rebase_prompt(3).contains("3 worktrees ("));
+        // Always names the consequence.
+        assert!(rebase_prompt(2).contains("rewrites branch history"));
+    }
+
+    #[tokio::test]
+    async fn confirm_rebase_with_decides_from_the_answer() {
+        assert!(confirm_rebase_with(1, async { Some("y\n".to_string()) }).await);
+        assert!(confirm_rebase_with(2, async { Some("YES".to_string()) }).await);
+        assert!(!confirm_rebase_with(1, async { Some("n".to_string()) }).await);
+        assert!(!confirm_rebase_with(1, async { Some(String::new()) }).await);
+        assert!(!confirm_rebase_with(1, async { None }).await);
+    }
+
+    #[test]
+    fn fetch_line_reports_each_repos_single_fetch() {
+        let ok = FetchOutcome {
+            repo_root: PathBuf::from("/repo"),
+            onto: "origin/main".to_string(),
+            fetched: true,
+            ok: true,
+            detail: None,
+        };
+        assert!(fetch_line(&ok).contains("Fetched origin/main once for /repo"));
+
+        let failed = FetchOutcome {
+            detail: Some("host unreachable".to_string()),
+            ok: false,
+            ..ok.clone()
+        };
+        assert!(fetch_line(&failed).contains("FAILED"));
+
+        let local = FetchOutcome {
+            fetched: false,
+            onto: "develop".to_string(),
+            ..ok
+        };
+        assert!(fetch_line(&local).contains("nothing fetched"));
+    }
+
+    #[test]
+    fn outcome_rows_render_each_status() {
+        let row = |result| {
+            outcome_row(&WorktreeOutcome {
+                path: PathBuf::from("/wt"),
+                branch: Some("feature".to_string()),
+                onto: "origin/main".to_string(),
+                result,
+            })
+        };
+        assert!(row(RebaseResult::Rebased { behind: 2 }).contains("rebased"));
+        assert!(row(RebaseResult::Rebased { behind: 2 }).contains("was 2 behind"));
+        assert!(row(RebaseResult::WouldRebase { behind: 1 }).contains("would-rebase"));
+        assert!(row(RebaseResult::UpToDate).contains("up-to-date"));
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::Dirty
+        })
+        .contains("--autostash"));
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::MainWorkingTree
+        })
+        .contains("main working tree"));
+        assert!(row(RebaseResult::Conflict {
+            detail: "CONFLICT (content)".to_string()
+        })
+        .contains("conflict"));
+    }
+
+    #[test]
+    fn brief_collapses_a_multiline_git_error_to_one_capped_line() {
+        assert_eq!(brief("\n\nfirst line\nsecond line\n"), "first line");
+        let long = "x".repeat(200);
+        let out = brief(&long);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with("..."));
+        // Control characters are stripped (the table is untrusted-string safe).
+        assert_eq!(brief("a\u{7}b"), "ab");
+    }
+
+    #[test]
+    fn empty_report_renders_placeholders() {
+        assert_eq!(render_fetches(&[]), "No repository selected.");
+        assert_eq!(render_outcomes(&[]), "No worktrees selected.");
+    }
+
+    // The serialization guard is a `std::sync::Mutex` held across the `.await`
+    // below on purpose: the git fetch it serializes runs *during* that await (on a
+    // `spawn_blocking` thread inside `execute_with`). It is deadlock-safe — the
+    // awaited work never re-acquires this lock — so the general "no std mutex
+    // across await" rule does not apply to this test-only load limiter.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rebase_declined_confirmation_leaves_the_branch_untouched() {
+        // The safety-critical branch of a history-rewriting command: declining the
+        // prompt must return before `worktree_rebase::execute` is ever reached.
+        // Shares the engine tests' git-load lock so the whole suite's concurrent
+        // `git` spawns never starve the daemon's timing-sensitive poller tests.
+        let _guard = worktree_rebase::test_serial_lock();
+        let Some(scenario) = BehindScenario::build() else {
+            return; // git unavailable — the engine tests cover the git behaviour.
+        };
+        let before = scenario.worktree_head();
+        RebaseCommand {
+            paths: vec![scenario.worktree.clone()],
+            ..rebase_cmd()
+        }
+        .execute_with(None, |pending| async move {
+            assert_eq!(pending, 1, "one worktree is behind and awaiting a rebase");
+            false
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scenario.worktree_head(),
+            before,
+            "declining the confirm must not rebase"
+        );
+    }
+
+    /// A repo whose one linked worktree is a commit behind `origin/main`, built with
+    /// the real `git` CLI (the command under test shells out too). Returns `None` if
+    /// any setup step fails, so the suite degrades rather than flaking.
+    struct BehindScenario {
+        _root: tempfile::TempDir,
+        worktree: PathBuf,
+    }
+
+    impl BehindScenario {
+        fn build() -> Option<Self> {
+            use git2::Repository;
+            let root = tempfile::tempdir().ok()?;
+            let origin = root.path().join("origin.git");
+            let local = root.path().join("local");
+            let worktree = root.path().join("feature");
+            std::fs::create_dir_all(&origin).ok()?;
+            std::fs::create_dir_all(&local).ok()?;
+            run(&origin, &["init", "--bare", "-b", "main"])?;
+            run(&local, &["init", "-b", "main"])?;
+            Self::identity(&local)?;
+            std::fs::write(local.join("f.txt"), "one\n").ok()?;
+            run(&local, &["add", "f.txt"])?;
+            run(&local, &["commit", "-m", "one"])?;
+            run(&local, &["remote", "add", "origin", origin.to_str()?])?;
+            run(&local, &["push", "-u", "origin", "main"])?;
+            run(
+                &local,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature",
+                    worktree.to_str()?,
+                    "main",
+                ],
+            )?;
+            // Advance origin/main in-process with git2 (no `git clone` subprocess),
+            // so `local` only learns of it when the command under test fetches.
+            let repo = Repository::open_bare(&origin).ok()?;
+            let parent = repo
+                .find_commit(repo.refname_to_id("refs/heads/main").ok()?)
+                .ok()?;
+            let mut builder = repo.treebuilder(Some(&parent.tree().ok()?)).ok()?;
+            let blob = repo.blob(b"two\n").ok()?;
+            builder.insert("f.txt", blob, 0o100_644).ok()?;
+            let tree = repo.find_tree(builder.write().ok()?).ok()?;
+            let sig = git2::Signature::now("Other", "other@example.com").ok()?;
+            repo.commit(
+                Some("refs/heads/main"),
+                &sig,
+                &sig,
+                "two",
+                &tree,
+                &[&parent],
+            )
+            .ok()?;
+            Some(Self {
+                _root: root,
+                worktree,
+            })
+        }
+
+        /// Pins identity and disables commit signing, so a developer's global
+        /// `commit.gpgsign = true` cannot make these repos depend on gpg.
+        fn identity(dir: &Path) -> Option<()> {
+            run(dir, &["config", "user.name", "Test"])?;
+            run(dir, &["config", "user.email", "test@example.com"])?;
+            run(dir, &["config", "commit.gpgsign", "false"])
+        }
+
+        fn worktree_head(&self) -> String {
+            let out = std::process::Command::new("git")
+                .current_dir(&self.worktree)
+                .args(["rev-parse", "HEAD"])
+                .output();
+            out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Runs `git` in `dir`, returning `None` on any failure.
+    fn run(dir: &Path, args: &[&str]) -> Option<()> {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .ok()?;
+        output.status.success().then_some(())
     }
 }

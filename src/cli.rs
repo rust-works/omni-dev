@@ -326,7 +326,7 @@ impl Cli {
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::Worktrees(cmd) => cmd.execute().await,
+            Commands::Worktrees(cmd) => cmd.execute(repo).await,
             #[cfg(unix)]
             Commands::Sessions(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
