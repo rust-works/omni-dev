@@ -305,7 +305,7 @@ async fn worktrees_cli_list_against_live_daemon() {
             json: false,
         }),
     }
-    .execute()
+    .execute(None)
     .await
     .unwrap();
 
@@ -405,7 +405,7 @@ async fn worktrees_cli_tree_against_live_daemon() {
             follow: false,
         }),
     }
-    .execute()
+    .execute(None)
     .await
     .unwrap();
 
