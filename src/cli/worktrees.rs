@@ -2468,6 +2468,52 @@ mod tests {
             detail: "CONFLICT (content)".to_string()
         })
         .contains("conflict"));
+        assert!(row(RebaseResult::FetchFailed {
+            detail: "host unreachable".to_string()
+        })
+        .contains("fetch-failed"));
+        // The remaining skip reasons render their human text.
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::DetachedHead
+        })
+        .contains("detached HEAD"));
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::OperationInProgress
+        })
+        .contains("in progress"));
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::NotAWorktree
+        })
+        .contains("not a git worktree"));
+        assert!(row(RebaseResult::Skipped {
+            reason: SkipReason::NoOntoRef
+        })
+        .contains("resolve the target ref"));
+    }
+
+    #[test]
+    fn print_emits_both_json_and_table_without_error() {
+        let fetches = vec![FetchOutcome {
+            repo_root: PathBuf::from("/r"),
+            onto: "origin/main".to_string(),
+            fetched: true,
+            ok: true,
+            detail: None,
+        }];
+        let outcomes = vec![WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: Some("feature".to_string()),
+            onto: "origin/main".to_string(),
+            result: RebaseResult::UpToDate,
+        }];
+        // The JSON branch (serializes the whole report) and the table branch.
+        let json_cmd = RebaseCommand {
+            dry_run: true,
+            output: TableOrJson::Json,
+            ..rebase_cmd()
+        };
+        json_cmd.print(true, &fetches, &outcomes).unwrap();
+        rebase_cmd().print(false, &fetches, &outcomes).unwrap();
     }
 
     #[test]
@@ -2518,6 +2564,35 @@ mod tests {
             scenario.worktree_head(),
             before,
             "declining the confirm must not rebase"
+        );
+    }
+
+    // Holds the git-load lock across `.await` for the same deadlock-safe reason as
+    // the declined-confirm test above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn rebase_confirmed_rebases_the_behind_worktree() {
+        // The accepted branch: confirming drives plan → execute → report, and the
+        // behind worktree fast-forwards onto the freshly fetched origin/main.
+        let _guard = worktree_rebase::test_serial_lock();
+        let Some(scenario) = BehindScenario::build() else {
+            return; // git unavailable — the engine tests cover the git behaviour.
+        };
+        let before = scenario.worktree_head();
+        RebaseCommand {
+            paths: vec![scenario.worktree.clone()],
+            ..rebase_cmd()
+        }
+        .execute_with(None, |pending| async move {
+            assert_eq!(pending, 1);
+            true
+        })
+        .await
+        .unwrap();
+        assert_ne!(
+            scenario.worktree_head(),
+            before,
+            "confirming the prompt must rebase the worktree"
         );
     }
 

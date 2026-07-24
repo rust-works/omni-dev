@@ -931,6 +931,212 @@ mod tests {
         assert_eq!(value["onto"], "origin/main");
     }
 
+    // ── classify branches (pure — no git, no subprocess) ──────────────────
+
+    /// An `Inspected::Ok` with a fake (never-opened) repo root, for exercising the
+    /// classification branches that return before any repo is opened.
+    fn inspected(
+        branch: Option<&str>,
+        head: Option<Oid>,
+        is_main: bool,
+        state_clean: bool,
+        dirty: bool,
+    ) -> Inspected {
+        Inspected::Ok(Inspection {
+            path: PathBuf::from("/wt"),
+            repo_root: PathBuf::from("/repo"),
+            branch: branch.map(str::to_string),
+            head_oid: head,
+            is_main,
+            state_clean,
+            dirty,
+        })
+    }
+
+    fn onto_map() -> BTreeMap<PathBuf, OntoSpec> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            PathBuf::from("/repo"),
+            OntoSpec {
+                display: "origin/main".to_string(),
+                fetch: Some(("origin".to_string(), "main".to_string())),
+            },
+        );
+        map
+    }
+
+    fn ok_map(ok: bool) -> BTreeMap<PathBuf, bool> {
+        let mut map = BTreeMap::new();
+        map.insert(PathBuf::from("/repo"), ok);
+        map
+    }
+
+    fn classify_reason(
+        inspected: &Inspected,
+        onto: &BTreeMap<PathBuf, OntoSpec>,
+        autostash: bool,
+    ) -> RebaseResult {
+        inspected.classify(onto, &ok_map(true), autostash).result
+    }
+
+    #[test]
+    fn classify_skips_the_main_working_tree() {
+        let out = classify_reason(
+            &inspected(Some("main"), Some(Oid::ZERO_SHA1), true, true, false),
+            &onto_map(),
+            false,
+        );
+        assert_eq!(
+            out,
+            RebaseResult::Skipped {
+                reason: SkipReason::MainWorkingTree
+            }
+        );
+    }
+
+    #[test]
+    fn classify_skips_a_detached_head() {
+        let out = classify_reason(
+            &inspected(None, Some(Oid::ZERO_SHA1), false, true, false),
+            &onto_map(),
+            false,
+        );
+        assert_eq!(
+            out,
+            RebaseResult::Skipped {
+                reason: SkipReason::DetachedHead
+            }
+        );
+    }
+
+    #[test]
+    fn classify_skips_an_in_progress_operation() {
+        let out = classify_reason(
+            &inspected(Some("f"), Some(Oid::ZERO_SHA1), false, false, false),
+            &onto_map(),
+            false,
+        );
+        assert_eq!(
+            out,
+            RebaseResult::Skipped {
+                reason: SkipReason::OperationInProgress
+            }
+        );
+    }
+
+    #[test]
+    fn classify_skips_dirty_only_without_autostash() {
+        let dirty = inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, true);
+        assert_eq!(
+            classify_reason(&dirty, &onto_map(), false),
+            RebaseResult::Skipped {
+                reason: SkipReason::Dirty
+            }
+        );
+        // With autostash the dirty gate is passed; the fake repo root then yields no
+        // onto commit, so it lands on the later `NoOntoRef` rather than `Dirty`.
+        assert_eq!(
+            classify_reason(&dirty, &onto_map(), true),
+            RebaseResult::Skipped {
+                reason: SkipReason::NoOntoRef
+            }
+        );
+    }
+
+    #[test]
+    fn classify_reports_no_onto_ref_when_the_repo_is_unresolved() {
+        let out = classify_reason(
+            &inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, false),
+            &BTreeMap::new(),
+            false,
+        );
+        assert_eq!(
+            out,
+            RebaseResult::Skipped {
+                reason: SkipReason::NoOntoRef
+            }
+        );
+    }
+
+    #[test]
+    fn classify_reports_fetch_failed_when_the_repos_fetch_failed() {
+        let out = inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, false)
+            .classify(&onto_map(), &ok_map(false), false)
+            .result;
+        assert!(matches!(out, RebaseResult::FetchFailed { .. }));
+    }
+
+    #[test]
+    fn classify_reports_not_a_worktree_for_an_unresolvable_path() {
+        let out = Inspected::Unresolvable {
+            path: PathBuf::from("/x"),
+        }
+        .classify(&onto_map(), &ok_map(true), false)
+        .result;
+        assert_eq!(
+            out,
+            RebaseResult::Skipped {
+                reason: SkipReason::NotAWorktree
+            }
+        );
+    }
+
+    #[test]
+    fn head_branch_reports_branch_detached_and_unborn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        config_identity(&repo);
+        // Unborn: HEAD points at an unborn branch, no commit yet.
+        assert_eq!(head_branch(&repo), (None, None));
+        // On a branch.
+        let oid = empty_commit(&repo, "refs/heads/main", &[]);
+        repo.set_head("refs/heads/main").unwrap();
+        let (branch, head) = head_branch(&repo);
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(head, Some(oid));
+        // Detached.
+        repo.set_head_detached(oid).unwrap();
+        assert_eq!(head_branch(&repo), (None, Some(oid)));
+    }
+
+    #[test]
+    fn resolve_onto_honours_an_override() {
+        let (_dir, repo) = repo_with_origin();
+        assert_eq!(
+            resolve_onto(&repo, Some("origin/main")).fetch,
+            Some(("origin".to_string(), "main".to_string()))
+        );
+        assert_eq!(resolve_onto(&repo, Some("develop")).fetch, None);
+    }
+
+    #[test]
+    fn fetch_all_skips_the_fetch_for_a_local_onto() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            PathBuf::from("/repo"),
+            OntoSpec {
+                display: "HEAD~1".to_string(),
+                fetch: None,
+            },
+        );
+        let (fetches, ok) = fetch_all(&map);
+        assert_eq!(fetches.len(), 1);
+        assert!(!fetches[0].fetched && fetches[0].ok);
+        assert_eq!(ok.get(Path::new("/repo")), Some(&true));
+    }
+
+    #[test]
+    fn fetch_once_errors_when_the_remote_is_missing() {
+        let _guard = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        config_identity(&repo);
+        let err = fetch_once(dir.path(), "origin", "main")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git fetch"), "got: {err}");
+    }
+
     // ── test scaffolding ──────────────────────────────────────────────────
 
     /// A repo with a bare `origin` (so `resolve_onto` sees a real remote) and one
