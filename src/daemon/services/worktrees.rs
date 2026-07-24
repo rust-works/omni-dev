@@ -1284,9 +1284,17 @@ impl WorktreesService {
     /// never under the registry lock. No lock is taken: each enqueue mutates a
     /// distinct remote PR, not a shared local resource.
     async fn merge_queue(&self, req: MergeQueueRequest) -> Result<Value> {
-        // Resolved once (the env read is process-stable), then handed to the
-        // blocking evaluation — the `open_prs` "bin as a param" seam (#1030).
-        let bin = crate::pr_status::resolve_gh_binary();
+        // Resolved once here (the env read is process-stable), then handed to the
+        // seam below — the `open_prs`/`open_prs_with` "bin as a param" pattern, so a
+        // test drives the eligibility + enqueue paths against a fake `gh` without
+        // touching the environment (#1030).
+        self.merge_queue_with(req, crate::pr_status::resolve_gh_binary())
+            .await
+    }
+
+    /// [`merge_queue`](Self::merge_queue) with an explicit `gh` binary, so a test
+    /// exercises the phase-1 network resolve and the phase-2 enqueue against a stub.
+    async fn merge_queue_with(&self, req: MergeQueueRequest, bin: PathBuf) -> Result<Value> {
         // Report-only unless explicitly confirmed; an explicit `check` request
         // always reports and never enqueues.
         let report_only = req.check || !req.confirmed;
@@ -4015,7 +4023,7 @@ fn prune_orphaned_admin(path: &Path, candidate_main_repos: &[PathBuf]) -> Result
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::shim::{shim_lock, write_exec_script};
+    use crate::test_support::shim::{retry_on_etxtbsy, shim_lock, write_exec_script};
     use std::sync::MutexGuard;
 
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
@@ -8005,6 +8013,227 @@ mod tests {
         );
         assert!(reply
             .get("eligible")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A clean, pushed, github worktree on `feature` plus its HEAD sha — the shape
+    /// that clears the local gates, so a test can drive the *network* gates by
+    /// varying the fake `gh` reply. Returns the temp dir (kept alive) and the sha.
+    fn ready_worktree() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = pushed_github_repo(
+            dir.path(),
+            "https://github.com/rust-works/omni-dev.git",
+            "feature",
+        );
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        (dir, head)
+    }
+
+    /// The resolve reply a fake `gh` returns for branch alias r0/b0: a rollup with
+    /// one check of `conclusion`, and one PR node `pr`.
+    fn merge_resolve_reply(head: &str, conclusion: &str, pr: &str) -> String {
+        format!(
+            r#"{{"data":{{"r0":{{"b0":{{
+                "target":{{"oid":"{head}","statusCheckRollup":{{"contexts":{{"nodes":[
+                  {{"__typename":"CheckRun","status":"COMPLETED","conclusion":"{conclusion}"}}
+                ]}}}}}},
+                "associatedPullRequests":{{"nodes":[{pr}]}}
+            }}}}}}}}"#
+        )
+    }
+
+    /// Runs [`evaluate_batch`] for a `ready_worktree` against a fake `gh` returning
+    /// `reply`, retrying the subprocess on the shim `ETXTBSY` race. Returns the
+    /// single worktree's outcome as `Ok(number)` when eligible or `Err(skip.kind)`.
+    fn network_gate_outcome(head_dir: &Path, reply: &str) -> std::result::Result<u64, String> {
+        let ghdir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(ghdir.path(), reply);
+        let paths = vec![head_dir.to_path_buf()];
+        let (eligible, mut skipped) = retry_on_etxtbsy(|| evaluate_batch(&bin, &paths)).unwrap();
+        if let Some(e) = eligible.first() {
+            return Ok(e.number);
+        }
+        Err(skipped.remove(0).kind)
+    }
+
+    #[test]
+    fn evaluate_batch_marks_a_ready_pr_eligible() {
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"PR_9","number":9,"isDraft":false,"url":"u9","headRefOid":"{head}","mergeStateStatus":"CLEAN","mergeQueueEntry":null}}"#
+        );
+        assert_eq!(
+            network_gate_outcome(dir.path(), &merge_resolve_reply(&head, "SUCCESS", &pr)),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_skips_a_draft_pr() {
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"P","number":1,"isDraft":true,"url":"u","headRefOid":"{head}","mergeStateStatus":"CLEAN","mergeQueueEntry":null}}"#
+        );
+        assert_eq!(
+            network_gate_outcome(dir.path(), &merge_resolve_reply(&head, "SUCCESS", &pr)),
+            Err("draft".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_skips_a_conflicting_pr() {
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"P","number":1,"isDraft":false,"url":"u","headRefOid":"{head}","mergeStateStatus":"CONFLICTING","mergeQueueEntry":null}}"#
+        );
+        assert_eq!(
+            network_gate_outcome(dir.path(), &merge_resolve_reply(&head, "SUCCESS", &pr)),
+            Err("conflicting".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_skips_a_pr_with_failing_checks() {
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"P","number":1,"isDraft":false,"url":"u","headRefOid":"{head}","mergeStateStatus":"CLEAN","mergeQueueEntry":null}}"#
+        );
+        assert_eq!(
+            network_gate_outcome(dir.path(), &merge_resolve_reply(&head, "FAILURE", &pr)),
+            Err("checks-failing".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_skips_a_pr_whose_head_is_stale() {
+        let (dir, head) = ready_worktree();
+        // The remote PR head is a different commit than the local head.
+        let pr = r#"{"id":"P","number":1,"isDraft":false,"url":"u","headRefOid":"0000000000000000000000000000000000000000","mergeStateStatus":"CLEAN","mergeQueueEntry":null}"#;
+        assert_eq!(
+            network_gate_outcome(dir.path(), &merge_resolve_reply(&head, "SUCCESS", pr)),
+            Err("stale".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_skips_a_branch_with_no_open_pr() {
+        let (dir, head) = ready_worktree();
+        // The ref resolves but no open PR heads it.
+        let reply = format!(
+            r#"{{"data":{{"r0":{{"b0":{{"target":{{"oid":"{head}","statusCheckRollup":null}},"associatedPullRequests":{{"nodes":[]}}}}}}}}}}"#
+        );
+        assert_eq!(
+            network_gate_outcome(dir.path(), &reply),
+            Err("no-pr".to_string())
+        );
+    }
+
+    #[test]
+    fn enqueue_eligible_skips_already_queued_and_records_a_failed_enqueue() {
+        // A bogus binary makes the real enqueue fail (Err → `failed[]`); the
+        // already-queued PR needs no mutation and is reported queued.
+        let eligible = vec![
+            Eligible {
+                path: PathBuf::from("/wt/a"),
+                number: 1,
+                url: "u".into(),
+                branch: "a".into(),
+                pr_id: "PR_A".into(),
+                already_queued: true,
+            },
+            Eligible {
+                path: PathBuf::from("/wt/b"),
+                number: 2,
+                url: "u".into(),
+                branch: "b".into(),
+                pr_id: "PR_B".into(),
+                already_queued: false,
+            },
+        ];
+        let (queued, failed) = enqueue_eligible(Path::new("/no/such/gh/xyzzy"), eligible);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].number, 1);
+        assert!(queued[0].already_queued);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].number, 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the shim lock serializes subprocess execs
+    async fn merge_queue_with_reports_a_ready_worktree_as_eligible() {
+        // Phase 1 over a network-eligible worktree: the eligible list is non-empty,
+        // exercising the `PrRef` mapping the empty-selection tests cannot.
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"PR_9","number":9,"isDraft":false,"url":"u9","headRefOid":"{head}","mergeStateStatus":"CLEAN","mergeQueueEntry":null}}"#
+        );
+        let ghdir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(ghdir.path(), &merge_resolve_reply(&head, "SUCCESS", &pr));
+        let svc = WorktreesService::new();
+        let reply = svc
+            .merge_queue_with(
+                MergeQueueRequest {
+                    paths: vec![dir.path().to_path_buf()],
+                    requester_key: None,
+                    check: true,
+                    confirmed: false,
+                },
+                bin,
+            )
+            .await
+            .unwrap();
+        let eligible = reply.get("eligible").and_then(Value::as_array).unwrap();
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].get("number").and_then(Value::as_u64), Some(9));
+        assert_eq!(
+            eligible[0].get("branch").and_then(Value::as_str),
+            Some("feature")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the shim lock serializes subprocess execs
+    async fn merge_queue_with_enqueues_a_ready_worktree_on_confirm() {
+        // Phase 2 end-to-end: the argv-branching stub answers the resolve query and
+        // the enqueue mutation distinctly, so the ready worktree's PR is queued.
+        let (dir, head) = ready_worktree();
+        let pr = format!(
+            r#"{{"id":"PR_9","number":9,"isDraft":false,"url":"u9","headRefOid":"{head}","mergeStateStatus":"CLEAN","mergeQueueEntry":null}}"#
+        );
+        let resolve = merge_resolve_reply(&head, "SUCCESS", &pr);
+        let ghdir = tempfile::tempdir().unwrap();
+        let guard = shim_lock();
+        let bin = ghdir.path().join("fake-gh");
+        write_exec_script(
+            &bin,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *enqueuePullRequest*) cat <<'JSON'\n{enqueue}\nJSON\n  ;;\n  *) cat <<'JSON'\n{resolve}\nJSON\n  ;;\nesac\n",
+                enqueue =
+                    r#"{"data":{"enqueuePullRequest":{"mergeQueueEntry":{"state":"QUEUED"}}}}"#,
+            ),
+        );
+        let svc = WorktreesService::new();
+        let reply = svc
+            .merge_queue_with(
+                MergeQueueRequest {
+                    paths: vec![dir.path().to_path_buf()],
+                    requester_key: Some("w1".into()),
+                    check: false,
+                    confirmed: true,
+                },
+                bin,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        let queued = reply.get("queued").and_then(Value::as_array).unwrap();
+        assert_eq!(queued.len(), 1, "{reply}");
+        assert_eq!(queued[0].get("number").and_then(Value::as_u64), Some(9));
+        assert!(reply
+            .get("failed")
             .and_then(Value::as_array)
             .unwrap()
             .is_empty());
