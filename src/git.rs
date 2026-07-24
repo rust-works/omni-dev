@@ -6,6 +6,7 @@ pub mod diff_split;
 pub mod main_branches;
 pub mod remote;
 pub mod repository;
+pub mod worktree_rebase;
 
 pub use amendment::AmendmentHandler;
 pub use commit::{
