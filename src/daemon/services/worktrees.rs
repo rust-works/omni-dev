@@ -7873,6 +7873,77 @@ mod tests {
     }
 
     #[test]
+    fn prune_orphaned_admin_skips_a_candidate_that_is_not_a_repo() {
+        // A candidate root that does not open as a repo (a stale registry folder,
+        // a deleted repo) is skipped rather than fatal; the real owner that
+        // follows still prunes.
+        let (_main, main_root, _wtp, wt_path, admin) = orphaned_admin_worktree();
+        let junk = tempfile::tempdir().unwrap();
+
+        let removed =
+            prune_orphaned_admin(&wt_path, &[junk.path().to_path_buf(), main_root]).unwrap();
+
+        assert_eq!(removed, Removal::Pruned);
+        assert!(
+            !admin.exists(),
+            "the real owner must still prune the orphan"
+        );
+    }
+
+    #[test]
+    fn prune_orphaned_admin_skips_a_candidate_that_is_itself_a_worktree() {
+        // A candidate that opens as a repo but is a *linked* worktree carries no
+        // `.git/worktrees/` admin dir, so it is skipped; the main repo behind it
+        // is the real owner. (A live sibling worktree is exactly such a candidate.)
+        let main_dir = tempfile::tempdir().unwrap();
+        let main_root = main_dir.path().canonicalize().unwrap();
+        let repo = init_repo(&main_root);
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_root = wt_parent.path().canonicalize().unwrap();
+        let orphan = wt_root.join("orphan-wt");
+        let sibling = wt_root.join("sibling-wt");
+        add_worktree(&repo, a, &orphan, "orphan");
+        add_worktree(&repo, a, &sibling, "sibling");
+        let admin = main_root.join(".git").join("worktrees").join("orphan");
+        std::fs::remove_dir_all(&orphan).unwrap();
+
+        // The live sibling worktree first (opens, but `is_worktree()` → skip), the
+        // main repo second (the actual owner).
+        let removed = prune_orphaned_admin(&orphan, &[sibling, main_root]).unwrap();
+
+        assert_eq!(removed, Removal::Pruned);
+        assert!(
+            !admin.exists(),
+            "the orphan's admin metadata must be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_orphaned_admin_refuses_a_locked_orphan() {
+        // Locking is an admin-dir file, independent of the (gone) checkout, so an
+        // orphaned worktree can still be locked. The prune must refuse it —
+        // "unlock first" — rather than force past, mirroring the live path.
+        let (_main, main_root, _wtp, wt_path, admin) = orphaned_admin_worktree();
+        let main_repo = Repository::open(&main_root).unwrap();
+        let name = worktree_name_for_path(&main_repo, &canonical(&wt_path)).unwrap();
+        main_repo
+            .find_worktree(&name)
+            .unwrap()
+            .lock(Some("in use"))
+            .unwrap();
+
+        let err = prune_orphaned_admin(&wt_path, &[main_root]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("locked"),
+            "a locked orphan must be refused, got: {err:#}"
+        );
+        assert!(admin.exists(), "a refused prune must leave the admin entry");
+    }
+
+    #[test]
     fn is_orphaned_worktree_only_matches_a_dangling_linked_gitlink() {
         let (main, _wtp, wt_path) = repo_with_linked_worktree();
         // A live worktree: gitlink resolves → not an orphan.
