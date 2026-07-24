@@ -3103,4 +3103,26 @@ mod tests {
         cmd.execute_with(|_| async { true }).await.unwrap();
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn merge_queue_check_routes_through_the_worktrees_dispatch() {
+        // Drives `WorktreesCommand::execute` → `MergeQueue` arm → `execute` (the
+        // real-`confirm_enqueue` wiring), which `--check` returns from before any
+        // confirmation, so no stdin is touched.
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, sock, server) = fake_daemon_replies(vec![json!({
+            "ok": true,
+            "payload": { "eligible": [], "skipped": [] }
+        })]);
+        let cmd = WorktreesCommand {
+            command: WorktreesSubcommands::MergeQueue(MergeQueueCommand {
+                paths: vec![target.path().to_path_buf()],
+                check: true,
+                yes: false,
+                socket: Some(sock),
+            }),
+        };
+        cmd.execute(None).await.unwrap();
+        server.await.unwrap();
+    }
 }
