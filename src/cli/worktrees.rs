@@ -1677,6 +1677,33 @@ mod tests {
         (dir, sock, server)
     }
 
+    /// A [`fake_daemon_reply`] that answers a **sequence** of requests — one fresh
+    /// connection per reply, in order — so a two-phase client (a `merge-queue`
+    /// check then execute) can be driven end-to-end over one socket.
+    fn fake_daemon_replies(
+        replies: Vec<Value>,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            for reply in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(stream, LinesCodec::new());
+                let _req = framed.next().await.unwrap().unwrap();
+                framed
+                    .send(serde_json::to_string(&reply).unwrap())
+                    .await
+                    .unwrap();
+            }
+        });
+        (dir, sock, server)
+    }
+
     #[tokio::test]
     async fn enrich_ahead_behind_folds_counts_from_a_live_socket() {
         let (_dir, sock, server) = fake_daemon_reply(
@@ -2955,5 +2982,125 @@ mod tests {
         assert!(!confirm_enqueue_with(3, async { Some("n".to_string()) }).await);
         assert!(!confirm_enqueue_with(3, async { Some(String::new()) }).await);
         assert!(!confirm_enqueue_with(3, async { None }).await);
+    }
+
+    #[tokio::test]
+    async fn merge_queue_errors_on_a_nonexistent_path_before_any_socket_call() {
+        // Canonicalization fails for a path that does not exist, so the command
+        // reports a clear error without needing a daemon. Also drives `execute`.
+        let cmd = MergeQueueCommand {
+            paths: vec![PathBuf::from("/nonexistent/omni-dev-mq-xyz")],
+            check: true,
+            yes: false,
+            socket: Some(PathBuf::from("/nonexistent/omni-dev-mq.sock")),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve worktree path"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_queue_check_prints_the_report_and_never_confirms() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, sock, server) = fake_daemon_replies(vec![json!({
+            "ok": true,
+            "payload": {
+                "eligible": [{ "path": "/a", "number": 9, "url": "u", "branch": "feature" }],
+                "skipped": [{ "path": "/b", "kind": "dirty", "detail": "2 modified" }],
+            }
+        })]);
+        let cmd = MergeQueueCommand {
+            paths: vec![target.path().to_path_buf()],
+            check: true,
+            yes: false,
+            socket: Some(sock),
+        };
+        // `--check` returns after phase 1, so the confirm closure must never run.
+        cmd.execute_with(|_| async { panic!("must not confirm on --check") })
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_reports_nothing_to_enqueue_when_none_eligible() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, sock, server) = fake_daemon_replies(vec![json!({
+            "ok": true,
+            "payload": {
+                "eligible": [],
+                "skipped": [{ "path": "/b", "kind": "no-pr", "detail": "no open PR" }],
+            }
+        })]);
+        let cmd = MergeQueueCommand {
+            paths: vec![target.path().to_path_buf()],
+            check: false,
+            yes: false,
+            socket: Some(sock),
+        };
+        // Nothing eligible → no confirm, no phase-2 call.
+        cmd.execute_with(|_| async { panic!("must not confirm when nothing is eligible") })
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_aborts_when_confirmation_is_declined() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, sock, server) = fake_daemon_replies(vec![json!({
+            "ok": true,
+            "payload": {
+                "eligible": [{ "path": "/a", "number": 9, "url": "u", "branch": "feature" }],
+                "skipped": [],
+            }
+        })]);
+        let cmd = MergeQueueCommand {
+            paths: vec![target.path().to_path_buf()],
+            check: false,
+            yes: false,
+            socket: Some(sock),
+        };
+        // Declining aborts before the phase-2 call, so only one reply is consumed.
+        cmd.execute_with(|count| async move {
+            assert_eq!(count, 1);
+            false
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_enqueues_after_confirmation() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, sock, server) = fake_daemon_replies(vec![
+            json!({
+                "ok": true,
+                "payload": {
+                    "eligible": [{ "path": "/a", "number": 9, "url": "u", "branch": "feature" }],
+                    "skipped": [],
+                }
+            }),
+            json!({
+                "ok": true,
+                "payload": {
+                    "queued": [{ "path": "/a", "number": 9 }],
+                    "skipped": [],
+                    "failed": [],
+                }
+            }),
+        ]);
+        let cmd = MergeQueueCommand {
+            paths: vec![target.path().to_path_buf()],
+            check: false,
+            yes: false,
+            socket: Some(sock),
+        };
+        // Confirming drives the phase-2 execute, consuming the second reply.
+        cmd.execute_with(|_| async { true }).await.unwrap();
+        server.await.unwrap();
     }
 }

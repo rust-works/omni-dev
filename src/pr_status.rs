@@ -1811,4 +1811,102 @@ mod tests {
             "enqueue rejected by GitHub"
         );
     }
+
+    #[test]
+    fn parse_merge_response_tolerates_a_missing_data_block() {
+        // A reply with no `data` (e.g. a top-level error already handled upstream)
+        // yields no targets rather than panicking.
+        let (_, index) = build_merge_query(&[target("main")]).unwrap();
+        assert!(parse_merge_response(&json!({}), &index).is_empty());
+    }
+
+    #[test]
+    fn resolve_merge_targets_asks_nothing_for_no_targets() {
+        // No branches → no subprocess at all; the bogus binary would error if spawned.
+        let out = resolve_merge_targets(Path::new("/no/such/gh/xyzzy"), &[]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolve_merge_targets_reads_a_reply_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"data":{"r0":{"b0":{
+                "target":{"oid":"a","statusCheckRollup":{"contexts":{"nodes":[
+                  {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{
+                  "id":"PR_1","number":42,"isDraft":false,"url":"u42",
+                  "headRefOid":"a","mergeStateStatus":"CLEAN","mergeQueueEntry":null
+                }]}}}}}"#,
+            0,
+        );
+        let out = retry_on_etxtbsy(|| resolve_merge_targets(&bin, &[target("main")])).unwrap();
+        let info = out.get(&target("main")).expect("resolved");
+        assert_eq!(info.pr_id, "PR_1");
+        assert_eq!(info.number, 42);
+        assert_eq!(info.head_oid, "a");
+        assert_eq!(info.merge_state.as_deref(), Some("CLEAN"));
+        assert!(!info.already_queued);
+        assert_eq!(info.checks, PrCheckState::Success);
+    }
+
+    #[test]
+    fn resolve_merge_targets_errors_on_a_graphql_errors_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"errors":[{"message":"Something is wrong"}]}"#,
+            0,
+        );
+        let err = retry_on_etxtbsy(|| resolve_merge_targets(&bin, &[target("main")])).unwrap_err();
+        assert!(format!("{err:#}").contains("returned errors"), "{err:#}");
+    }
+
+    #[test]
+    fn enqueue_pull_request_reports_queued_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"data":{"enqueuePullRequest":{"mergeQueueEntry":{"state":"QUEUED"}}}}"#,
+            0,
+        );
+        let out = retry_on_etxtbsy(|| enqueue_pull_request(&bin, "PR_1")).unwrap();
+        assert_eq!(out, EnqueueOutcome::Queued(Some("QUEUED".to_string())));
+    }
+
+    #[test]
+    fn enqueue_pull_request_maps_a_nonzero_exit_to_rejected() {
+        // `gh` exits non-zero on a rejected mutation; the reason is read from the
+        // JSON `errors` body (preferred over stderr).
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"errors":[{"message":"Merge queue is not enabled on this repository"}]}"#,
+            1,
+        );
+        let out = retry_on_etxtbsy(|| enqueue_pull_request(&bin, "PR_1")).unwrap();
+        assert_eq!(
+            out,
+            EnqueueOutcome::Rejected("Merge queue is not enabled on this repository".to_string())
+        );
+    }
+
+    #[test]
+    fn enqueue_pull_request_maps_a_200_with_errors_to_rejected() {
+        // A GraphQL 200 can still carry errors (a partial success); treat it as a
+        // per-PR rejection, not a batch-sinking error.
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            r#"{"errors":[{"message":"Pull request is not mergeable"}]}"#,
+            0,
+        );
+        let out = retry_on_etxtbsy(|| enqueue_pull_request(&bin, "PR_1")).unwrap();
+        assert_eq!(
+            out,
+            EnqueueOutcome::Rejected("Pull request is not mergeable".to_string())
+        );
+    }
 }
