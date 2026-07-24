@@ -1309,13 +1309,7 @@ impl WorktreesService {
 
         if report_only {
             // Auditable in `omni-dev daemon logs` (ADR-0049 §6 precedent).
-            tracing::info!(
-                requester = req.requester_key.as_deref().unwrap_or("-"),
-                requested = req.paths.len(),
-                eligible = eligible.len(),
-                skipped = skipped.len(),
-                "merge-queue check"
-            );
+            log_merge_check(&req, eligible.len(), skipped.len());
             let eligible: Vec<PrRef> = eligible.iter().map(PrRef::from).collect();
             return Ok(
                 serde_json::to_value(EligibilityReport { eligible, skipped })
@@ -1329,13 +1323,7 @@ impl WorktreesService {
             tokio::task::spawn_blocking(move || enqueue_eligible(&enqueue_bin, eligible))
                 .await
                 .map_err(|e| anyhow!("merge-queue enqueue task panicked: {e}"))?;
-        tracing::info!(
-            requester = req.requester_key.as_deref().unwrap_or("-"),
-            queued = queued.len(),
-            failed = failed.len(),
-            skipped = skipped.len(),
-            "merge-queue enqueue"
-        );
+        log_merge_enqueue(&req, queued.len(), failed.len(), skipped.len());
         Ok(serde_json::to_value(EnqueueResult {
             queued,
             skipped,
@@ -3385,6 +3373,33 @@ fn check_label(state: PrCheckState) -> &'static str {
         PrCheckState::Pending => "still running",
         PrCheckState::None => "not reported",
     }
+}
+
+/// Emits the phase-1 audit line for a `merge-queue` check (ADR-0056; the ADR-0049
+/// §6 precedent): the requesting window key, how many worktrees were requested,
+/// and the eligible/skipped split. Sync so it is unit-testable off the runtime —
+/// and so its `tracing` field expressions are exercised under an INFO subscriber.
+fn log_merge_check(req: &MergeQueueRequest, eligible: usize, skipped: usize) {
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        requested = req.paths.len(),
+        eligible,
+        skipped,
+        "merge-queue check"
+    );
+}
+
+/// Emits the phase-2 audit line for a `merge-queue` enqueue: the requesting window
+/// key and the queued/failed/skipped counts. Sync, for the same reasons as
+/// [`log_merge_check`].
+fn log_merge_enqueue(req: &MergeQueueRequest, queued: usize, failed: usize, skipped: usize) {
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        queued,
+        failed,
+        skipped,
+        "merge-queue enqueue"
+    );
 }
 
 /// Evaluates every merge-queue gate for a batch of worktree paths and partitions
@@ -7912,6 +7927,51 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_local_skips_a_path_that_is_not_a_repo() {
+        // A path git cannot discover a repo from is refused up front (defensive:
+        // the UI only ever sends real worktrees). A nonexistent path is used so the
+        // result never depends on whether the temp dir sits inside a checkout.
+        assert_eq!(
+            evaluate_local(Path::new("/nonexistent/omni-dev-not-a-repo-xyz"))
+                .unwrap_err()
+                .kind,
+            "not-a-repo"
+        );
+    }
+
+    #[test]
+    fn log_merge_check_records_the_counts_under_an_info_subscriber() {
+        // The audit line's `tracing` field expressions only evaluate when an INFO
+        // subscriber is active — the sync helper makes that testable.
+        let req = MergeQueueRequest {
+            paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            requester_key: Some("win-9".into()),
+            check: true,
+            confirmed: false,
+        };
+        let logs = capture_info(|| log_merge_check(&req, 1, 1));
+        assert!(logs.contains("merge-queue check"), "{logs}");
+        assert!(logs.contains("win-9"), "{logs}");
+        assert!(logs.contains("requested=2"), "{logs}");
+        assert!(logs.contains("eligible=1"), "{logs}");
+    }
+
+    #[test]
+    fn log_merge_enqueue_records_the_counts_under_an_info_subscriber() {
+        // A CLI-style requester (no window key) logs the dash fallback.
+        let req = MergeQueueRequest {
+            paths: vec![PathBuf::from("/a")],
+            requester_key: None,
+            check: false,
+            confirmed: true,
+        };
+        let logs = capture_info(|| log_merge_enqueue(&req, 2, 1, 0));
+        assert!(logs.contains("merge-queue enqueue"), "{logs}");
+        assert!(logs.contains("queued=2"), "{logs}");
+        assert!(logs.contains("failed=1"), "{logs}");
+    }
+
+    #[test]
     fn evaluate_local_flags_dirty_then_untracked() {
         // A linked worktree with a real checked-out file, so status is meaningful.
         let main_dir = tempfile::tempdir().unwrap();
@@ -8159,6 +8219,33 @@ mod tests {
         assert!(queued[0].already_queued);
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].number, 2);
+    }
+
+    #[test]
+    fn enqueue_eligible_records_a_github_rejection_as_failed() {
+        // A fake `gh` returning a GraphQL rejection (a 200 with an `errors` body)
+        // drives the `EnqueueOutcome::Rejected` arm — the PR lands in `failed[]`
+        // rather than sinking the batch.
+        let ghdir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            ghdir.path(),
+            r#"{"errors":[{"message":"Pull request is not mergeable"}]}"#,
+        );
+        let eligible = vec![Eligible {
+            path: PathBuf::from("/wt/a"),
+            number: 7,
+            url: "u".into(),
+            branch: "a".into(),
+            pr_id: "PR_A".into(),
+            already_queued: false,
+        }];
+        let (queued, failed) = enqueue_eligible(&bin, eligible);
+        assert!(queued.is_empty(), "{queued:?}");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].number, 7);
+        // A rejection carries a non-empty reason (an `ETXTBSY` exec race would
+        // instead surface as an `Err`, still landing in `failed[]`).
+        assert!(!failed[0].error.is_empty(), "{}", failed[0].error);
     }
 
     #[tokio::test]
