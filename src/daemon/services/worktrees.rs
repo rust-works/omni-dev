@@ -1241,13 +1241,17 @@ impl WorktreesService {
 
         if req.remove {
             let path = req.path.clone();
+            // The live window set, so a working-tree-gone-but-admin-present orphan
+            // can find its owning main repo to prune (#1403); unused on the common
+            // path where the checkout still exists.
+            let entries = self.registry.list();
             // Taken *after* the wait above, so concurrent executes still overlap
             // their heartbeat waits (#1359) and only the prune itself serializes.
             // Load-bearing placement, not incidental: hoisting this above
             // `await_windows_closed` would restack the waits and undo the whole
             // point. Pinned by `concurrent_closes_overlap_their_heartbeat_waits`.
             let _guard = self.prune_lock.lock().await;
-            let removed = tokio::task::spawn_blocking(move || remove_worktree(&path))
+            let removed = tokio::task::spawn_blocking(move || remove_worktree(&path, &entries))
                 .await
                 .map_err(|e| anyhow!("worktree removal task panicked: {e}"))
                 .map_err(|err| log_close_error(&req.path, "removal task", err))?;
@@ -2920,20 +2924,35 @@ fn log_close_error(path: &Path, phase: &str, err: anyhow::Error) -> anyhow::Erro
 /// Logs the outcome of a linked-worktree removal and maps it to the `close`
 /// reply. Split out of [`WorktreesService::close`] so the destructive op's audit
 /// line (#1364) is unit-testable without a tokio runtime or the `spawn_blocking`
-/// the real prune runs behind. A successful prune is INFO; a failure is WARN
-/// (a destructive op that did not complete) and propagates the error.
-fn log_and_map_removal(path: &Path, removed: Result<()>) -> Result<Value> {
+/// the real prune runs behind.
+///
+/// The three outcomes are logged distinctly (#1403) so a future "the daemon says
+/// pruned but the row is still there" is diagnosable from the log alone: an
+/// actual prune and an already-gone no-op are both INFO (and both reply
+/// `removed: true` — the row should go either way), but carry different
+/// `outcome`/message text; a failure is WARN and propagates the error.
+fn log_and_map_removal(path: &Path, removed: Result<Removal>) -> Result<Value> {
     match removed {
-        Ok(()) => {
+        Ok(Removal::Pruned) => {
             tracing::info!(
                 path = %path.display(),
+                outcome = "pruned",
                 "worktrees close: linked worktree pruned"
+            );
+            Ok(json!({ "removed": true }))
+        }
+        Ok(Removal::AlreadyGone) => {
+            tracing::info!(
+                path = %path.display(),
+                outcome = "already-gone",
+                "worktrees close: nothing to prune, worktree already removed"
             );
             Ok(json!({ "removed": true }))
         }
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
+                outcome = "failed",
                 "worktrees close: worktree prune failed: {err:#}"
             );
             Err(err)
@@ -3379,6 +3398,18 @@ fn is_orphaned_worktree(path: &Path) -> bool {
     admin.components().any(|c| c.as_os_str() == "worktrees") && !admin.exists()
 }
 
+/// The outcome of a linked-worktree removal, so the audit log can tell "actually
+/// removed something" from "nothing was there" (#1403). Before this the
+/// working-tree-gone-but-admin-present case returned `Ok(())` and logged a
+/// `pruned` lie, leaving the row stuck in the tree view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// The admin metadata (and possibly the working tree) was actually removed.
+    Pruned,
+    /// Nothing was there to remove — a truly already-removed worktree.
+    AlreadyGone,
+}
+
 /// Removes a **linked** worktree at `path` via `git2` (no shell — avoiding the
 /// daemon-`PATH` problem the launcher fights): deletes both the checked-out
 /// directory and the admin metadata. Refuses the main working tree (the
@@ -3395,15 +3426,26 @@ fn is_orphaned_worktree(path: &Path) -> bool {
 /// is already gone). Doing the directory first means a transient failure leaves
 /// the worktree fully tracked and cleanly retryable; a pre-existing orphan from
 /// the old ordering is detected and its leftover directory cleaned up directly.
-fn remove_worktree(path: &Path) -> Result<()> {
+///
+/// A working directory that is *already gone* is **not** blindly treated as a
+/// no-op: a half-removal from outside the daemon (a manual `rm -rf`, an OS
+/// cleanup) can leave the main repo's `.git/worktrees/<name>/` admin entry behind
+/// (git marks it `prunable` and the tree view keeps showing the row). That path
+/// hands off to [`prune_orphaned_admin`], which locates the owning main repo from
+/// `windows` (or the path's ancestors) and prunes just that entry; only when no
+/// repo still tracks the path is it reported [`Removal::AlreadyGone`] (#1403).
+fn remove_worktree(path: &Path, windows: &[WindowEntry]) -> Result<Removal> {
     if !path.exists() {
-        return Ok(());
+        return prune_orphaned_admin(path, &candidate_main_repos(path, windows));
     }
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
         // Admin metadata already gone (a prior failed removal); git no longer
         // tracks this path, so no prune applies — just delete the leftover.
-        Err(_) if is_orphaned_worktree(path) => return remove_dir_all_retrying(path),
+        Err(_) if is_orphaned_worktree(path) => {
+            remove_dir_all_retrying(path)?;
+            return Ok(Removal::Pruned);
+        }
         Err(e) => return Err(e).context(format!("not a git worktree: {}", path.display())),
     };
     if !repo.is_worktree() {
@@ -3445,7 +3487,89 @@ fn remove_worktree(path: &Path) -> Result<()> {
     worktree
         .prune(Some(&mut opts))
         .with_context(|| format!("failed to prune worktree metadata for {}", path.display()))?;
-    Ok(())
+    Ok(Removal::Pruned)
+}
+
+/// The main-repo roots to search when pruning an orphaned worktree whose working
+/// directory is already gone (#1403). There is no on-disk breadcrumb from the
+/// vanished working tree back to its repo — the `.git` gitlink lived *inside* the
+/// deleted directory — so the owner has to be found by enumerating candidates:
+///
+/// - **the path's own ancestors**, covering a worktree nested under its repo
+///   (e.g. `<repo>/.claude/worktrees/<name>`): an existing ancestor that opens as
+///   the *main* checkout is the owner. `Repository::open` (not `discover`) so only
+///   a real repo-root ancestor matches, never an intermediate directory.
+/// - **every main repo the live `windows` resolve to**, covering an external
+///   worktree that shares no ancestor with its repo. These are the same repos
+///   whose `worktrees()` enumeration produced the orphaned row, so this is
+///   guaranteed to include the owner whenever the UI could show a row to close.
+///
+/// Deduped, order-preserving (ancestors first).
+fn candidate_main_repos(path: &Path, windows: &[WindowEntry]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |root: PathBuf| {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    };
+    // Skip `path` itself (gone) via `skip(1)`.
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(repo) = Repository::open(ancestor) {
+            if !repo.is_worktree() {
+                if let Some(root) = canonical(repo.commondir()).parent() {
+                    push(root.to_path_buf());
+                }
+            }
+        }
+    }
+    for folder in windows.iter().flat_map(|w| &w.folders) {
+        if let Ok(repo) = Repository::discover(folder) {
+            if let Some(root) = canonical(repo.commondir()).parent() {
+                push(root.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
+/// Prunes the leftover `.git/worktrees/<name>/` admin metadata of a worktree
+/// whose working directory is already gone (#1403). Searches
+/// `candidate_main_repos` for the main repo that still tracks a worktree
+/// registered at `path`, prunes just that entry's metadata (`working_tree(false)`
+/// — the checkout is already gone), and returns [`Removal::Pruned`]. When no
+/// candidate still tracks the path it is truly already-removed:
+/// [`Removal::AlreadyGone`]. A locked entry is refused, mirroring
+/// [`remove_worktree`]'s live path, rather than forced past.
+fn prune_orphaned_admin(path: &Path, candidate_main_repos: &[PathBuf]) -> Result<Removal> {
+    let target = canonical(path);
+    for root in candidate_main_repos {
+        let Ok(main_repo) = Repository::open(root) else {
+            continue;
+        };
+        // Only the main checkout carries the `.git/worktrees/<name>/` admin dir.
+        if main_repo.is_worktree() {
+            continue;
+        }
+        // Not the owner (or the entry is already pruned) — keep looking.
+        let Ok(name) = worktree_name_for_path(&main_repo, &target) else {
+            continue;
+        };
+        let worktree = main_repo.find_worktree(&name)?;
+        if let WorktreeLockStatus::Locked(reason) = worktree.is_locked()? {
+            let because = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            bail!("worktree is locked{because}; unlock it first (git worktree unlock)");
+        }
+        let mut opts = git2::WorktreePruneOptions::new();
+        opts.valid(true).working_tree(false);
+        worktree.prune(Some(&mut opts)).with_context(|| {
+            format!(
+                "failed to prune orphaned worktree metadata for {}",
+                path.display()
+            )
+        })?;
+        return Ok(Removal::Pruned);
+    }
+    Ok(Removal::AlreadyGone)
 }
 
 #[cfg(test)]
@@ -7409,7 +7533,7 @@ mod tests {
     #[test]
     fn log_and_map_removal_logs_and_maps_a_successful_prune() {
         let logs = capture_info(|| {
-            let reply = log_and_map_removal(Path::new("/wt/feature"), Ok(())).unwrap();
+            let reply = log_and_map_removal(Path::new("/wt/feature"), Ok(Removal::Pruned)).unwrap();
             assert_eq!(reply, json!({ "removed": true }));
         });
         assert!(
@@ -7419,6 +7543,27 @@ mod tests {
         assert!(
             logs.contains("/wt/feature"),
             "the target path must ride the line, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_and_map_removal_distinguishes_an_already_gone_no_op() {
+        // The #1403 fix: an already-removed worktree still replies `removed: true`
+        // (the row should go) but must NOT log the `pruned` line — it logs the
+        // distinct `already-gone` outcome so the audit trail stops conflating the
+        // two.
+        let logs = capture_info(|| {
+            let reply =
+                log_and_map_removal(Path::new("/wt/feature"), Ok(Removal::AlreadyGone)).unwrap();
+            assert_eq!(reply, json!({ "removed": true }));
+        });
+        assert!(
+            logs.contains("worktrees close: nothing to prune, worktree already removed"),
+            "an already-gone close must log its own outcome, got: {logs}"
+        );
+        assert!(
+            !logs.contains("linked worktree pruned"),
+            "an already-gone close must not claim it pruned, got: {logs}"
         );
     }
 
@@ -7581,7 +7726,7 @@ mod tests {
         let admin = main.path().join(".git").join("worktrees").join("feature");
         assert!(admin.exists(), "admin metadata should exist before removal");
 
-        remove_worktree(&wt_path).unwrap();
+        assert_eq!(remove_worktree(&wt_path, &[]).unwrap(), Removal::Pruned);
 
         assert!(!wt_path.exists(), "the working directory should be gone");
         assert!(!admin.exists(), "the admin metadata should be pruned");
@@ -7609,10 +7754,121 @@ mod tests {
             "the orphan should not open as a repo"
         );
 
-        remove_worktree(&wt_path).unwrap();
+        assert_eq!(remove_worktree(&wt_path, &[]).unwrap(), Removal::Pruned);
         assert!(
             !wt_path.exists(),
             "the leftover directory should be removed"
+        );
+    }
+
+    /// A linked worktree whose working directory has been deleted out-of-band,
+    /// leaving the main repo's `.git/worktrees/<name>/` admin entry behind — the
+    /// exact #1403 orphan. Roots are canonicalized up front so the gone-path
+    /// comparison in [`worktree_name_for_path`] (which cannot resolve a symlink on
+    /// a vanished path) stays exact on macOS's `/var`→`/private/var` links.
+    /// Returns `(main dir, canonical main root, wt parent dir, gone wt path,
+    /// admin dir)`.
+    fn orphaned_admin_worktree() -> (
+        tempfile::TempDir,
+        PathBuf,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+    ) {
+        let main_dir = tempfile::tempdir().unwrap();
+        let main_root = main_dir.path().canonicalize().unwrap();
+        let repo = init_repo(&main_root);
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().canonicalize().unwrap().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        let admin = main_root.join(".git").join("worktrees").join("feature");
+        assert!(admin.exists(), "admin metadata exists before the orphaning");
+        // Delete the checkout out-of-band, leaving the admin entry `prunable`.
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        (main_dir, main_root, wt_parent, wt_path, admin)
+    }
+
+    fn window_on(folder: &Path) -> WindowEntry {
+        WindowEntry {
+            key: "w".to_string(),
+            folders: vec![folder.to_path_buf()],
+            repo: None,
+            title: None,
+            pid: None,
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn remove_worktree_prunes_orphaned_admin_via_a_registered_window() {
+        // #1403: working tree gone, admin present. An external worktree shares no
+        // ancestor with its repo, so the owner is found via a live window on the
+        // main repo — the same window whose repo enumeration showed the stuck row.
+        let (_main, main_root, _wtp, wt_path, admin) = orphaned_admin_worktree();
+
+        let removed = remove_worktree(&wt_path, &[window_on(&main_root)]).unwrap();
+
+        assert_eq!(
+            removed,
+            Removal::Pruned,
+            "the orphaned admin must be pruned"
+        );
+        assert!(!admin.exists(), "the admin metadata should be gone");
+        let main_repo = Repository::open(&main_root).unwrap();
+        assert!(
+            main_repo.worktrees().unwrap().is_empty(),
+            "git should no longer track the orphaned worktree"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_prunes_orphaned_admin_of_a_nested_worktree_via_ancestors() {
+        // #1403 Option 1: a worktree nested under its own repo (the `.claude/
+        // worktrees/<name>` shape that produced the reported orphans) is located
+        // by walking the gone path's ancestors — no registered window needed.
+        let main_dir = tempfile::tempdir().unwrap();
+        let main_root = main_dir.path().canonicalize().unwrap();
+        let repo = init_repo(&main_root);
+        let a = empty_commit(&repo, Some("refs/heads/trunk"), &[], "A");
+        repo.set_head("refs/heads/trunk").unwrap();
+        // git2's `worktree()` creates the leaf but not intermediate parents.
+        std::fs::create_dir_all(main_root.join(".nested")).unwrap();
+        let wt_path = main_root.join(".nested").join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+        let admin = main_root.join(".git").join("worktrees").join("feature");
+        std::fs::remove_dir_all(main_root.join(".nested")).unwrap();
+
+        let removed = remove_worktree(&wt_path, &[]).unwrap();
+
+        assert_eq!(removed, Removal::Pruned);
+        assert!(!admin.exists(), "the admin metadata should be gone");
+    }
+
+    #[test]
+    fn remove_worktree_reports_already_gone_when_no_candidate_still_tracks_it() {
+        // The other side of #1403: working tree gone AND admin already pruned. No
+        // candidate repo tracks the path, so the honest outcome is `AlreadyGone`,
+        // never a `pruned` lie.
+        let (_main, main_root, _wtp, wt_path, admin) = orphaned_admin_worktree();
+        // Prune the admin entry too, so nothing remains to remove.
+        std::fs::remove_dir_all(&admin).unwrap();
+
+        let removed = remove_worktree(&wt_path, &[window_on(&main_root)]).unwrap();
+
+        assert_eq!(removed, Removal::AlreadyGone);
+    }
+
+    #[test]
+    fn candidate_main_repos_finds_the_owner_via_ancestors_and_windows() {
+        let (_main, main_root, _wtp, wt_path, _admin) = orphaned_admin_worktree();
+        // External worktree: no ancestor is the repo, so only the window feed finds
+        // it. The main root rides through, deduped to a single entry.
+        let roots = candidate_main_repos(&wt_path, &[window_on(&main_root)]);
+        assert!(
+            roots.contains(&main_root),
+            "the owning main repo must be a candidate, got: {roots:?}"
         );
     }
 
@@ -7746,7 +8002,7 @@ mod tests {
         let plain = tmp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
 
-        let err = remove_worktree(&plain).unwrap_err();
+        let err = remove_worktree(&plain, &[]).unwrap_err();
 
         assert!(
             err.to_string().contains("not a git worktree"),
@@ -7786,7 +8042,7 @@ mod tests {
             }
         });
 
-        let result = remove_worktree(&wt_path);
+        let result = remove_worktree(&wt_path, &[]);
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
 
@@ -7915,6 +8171,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, json!({ "removed": true }));
+    }
+
+    #[tokio::test]
+    async fn close_prunes_an_orphaned_admin_entry_and_the_row_disappears() {
+        // The #1403 end-to-end: working tree deleted out-of-band, admin entry left
+        // behind so the tree view keeps showing a `prunable` row. Closing it must
+        // actually prune the admin metadata (via the registered window's repo), not
+        // report a `pruned` no-op that leaves the row stuck.
+        let (_main, main_root, _wtp, wt_path, admin) = orphaned_admin_worktree();
+        let svc = WorktreesService::new();
+        // A live window on the main repo — the vantage point the stuck row is
+        // enumerated from, and the one the prune locates the owner through.
+        svc.handle(
+            "register",
+            register_payload("main-w", None, &main_root.display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Before: the orphaned linked worktree still shows alongside the main tree.
+        let before = svc.handle("tree", Value::Null).await.unwrap();
+        let worktrees_before = repos_of(&before)[0]["worktrees"].as_array().unwrap().len();
+        assert_eq!(
+            worktrees_before, 2,
+            "the orphaned row is present before close"
+        );
+
+        let reply = svc
+            .handle(
+                "close",
+                json!({ "path": wt_path, "remove": true, "confirmed": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "removed": true }));
+
+        // After: admin metadata pruned and the row is gone from the tree view.
+        assert!(!admin.exists(), "the admin metadata must be pruned");
+        let after = svc.handle("tree", Value::Null).await.unwrap();
+        let worktrees_after = repos_of(&after)[0]["worktrees"].as_array().unwrap().len();
+        assert_eq!(worktrees_after, 1, "only the main working tree remains");
     }
 
     #[tokio::test]
