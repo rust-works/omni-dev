@@ -44,6 +44,8 @@ pub enum WorktreesSubcommands {
     Focus(FocusCommand),
     /// Close a worktree's window and, for a linked worktree, delete it.
     Close(CloseCommand),
+    /// Enqueue eligible worktrees' PRs into the GitHub merge queue.
+    MergeQueue(MergeQueueCommand),
     /// Show or set whether closed worktrees are shown across all windows.
     ShowClosed(ShowClosedCommand),
     /// Register a window's open worktree folders (companion feed op).
@@ -62,6 +64,7 @@ impl WorktreesCommand {
             WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
             WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
             WorktreesSubcommands::Close(cmd) => cmd.execute().await,
+            WorktreesSubcommands::MergeQueue(cmd) => cmd.execute().await,
             WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
@@ -318,6 +321,94 @@ impl CloseCommand {
     }
 }
 
+/// Enqueues eligible worktrees' PRs into the GitHub merge queue — the daemon's
+/// two-phase `merge-queue` op driven from the CLI (#1401).
+///
+/// Only worktrees that pass every eligibility gate (clean, committed, pushed, with
+/// an open non-draft, conflict-free, CI-green PR) are enqueued; the rest are
+/// reported as skipped-with-reason. Like `close`, the daemon re-validates on
+/// execute, so the CLI adds no authority — enqueue authenticates through the
+/// user's own `gh`.
+#[derive(Parser)]
+pub struct MergeQueueCommand {
+    /// Worktree folder(s) to consider. Each is canonicalized client-side, as the
+    /// daemon runs in a different cwd and matches targets by canonical path.
+    #[arg(value_name = "PATH", required = true)]
+    pub paths: Vec<PathBuf>,
+    /// Print the eligibility report and exit; never enqueue.
+    #[arg(long)]
+    pub check: bool,
+    /// Skip the interactive confirmation before enqueuing.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl MergeQueueCommand {
+    /// Executes the merge-queue command, confirming the enqueue interactively via
+    /// stdin.
+    pub async fn execute(self) -> Result<()> {
+        self.execute_with(confirm_enqueue).await
+    }
+
+    /// The merge-queue core, with the confirm decision injected as
+    /// `confirm(eligible_count) -> bool`, so the abort and confirmed-execute
+    /// branches are unit-testable without driving real stdin (which would block a
+    /// test on a TTY); production wires in [`confirm_enqueue`].
+    async fn execute_with<F, Fut>(self, confirm: F) -> Result<()>
+    where
+        F: FnOnce(usize) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        // Canonicalize every path client-side (like `close`/`focus`): the daemon
+        // runs in a different cwd and matches targets by canonical path.
+        let mut paths = Vec::with_capacity(self.paths.len());
+        for p in &self.paths {
+            let abs = std::fs::canonicalize(p)
+                .with_context(|| format!("cannot resolve worktree path: {}", p.display()))?;
+            paths.push(abs.to_string_lossy().to_string());
+        }
+        let socket = server::resolve_socket(self.socket)?;
+
+        // Phase 1: the side-effect-free eligibility check.
+        let report = call(
+            &socket,
+            "merge-queue",
+            json!({ "paths": paths, "check": true }),
+        )
+        .await?;
+        println!("{}", render_eligibility_report(&report));
+
+        if self.check {
+            return Ok(());
+        }
+        let eligible = report
+            .get("eligible")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if eligible == 0 {
+            println!("Nothing to enqueue.");
+            return Ok(());
+        }
+        if !self.yes && !confirm(eligible).await {
+            println!("Aborted; nothing was enqueued.");
+            return Ok(());
+        }
+
+        // Phase 2: execute the enqueue (the daemon re-validates eligibility).
+        let result = call(
+            &socket,
+            "merge-queue",
+            json!({ "paths": paths, "confirmed": true }),
+        )
+        .await?;
+        println!("{}", render_enqueue_result(&result));
+        Ok(())
+    }
+}
+
 /// Shows or sets the cross-window "show closed worktrees" toggle.
 ///
 /// With a boolean argument it sets the daemon-backed value (`set-show-closed`),
@@ -515,6 +606,79 @@ fn render_notes(label: &str, notes: Option<&Value>) -> String {
     out
 }
 
+/// Renders a `merge-queue` phase-1 `EligibilityReport`: a summary count, then one
+/// line per enqueue-eligible worktree (`PR #N [branch] path`) and per
+/// skipped-with-reason worktree (`[kind] path — detail`). Every daemon-supplied
+/// string is `sanitize`d (#1137); the counts are daemon-computed and safe.
+fn render_eligibility_report(report: &Value) -> String {
+    let eligible = report
+        .get("eligible")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let skipped = report
+        .get("skipped")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out = format!("Eligible: {} / Skipped: {}", eligible.len(), skipped.len());
+    for pr in eligible {
+        let number = pr.get("number").and_then(Value::as_u64).unwrap_or(0);
+        let branch = sanitize(pr.get("branch").and_then(Value::as_str).unwrap_or("-"));
+        let path = sanitize(pr.get("path").and_then(Value::as_str).unwrap_or(""));
+        out.push_str(&format!("\n  eligible: PR #{number} [{branch}] {path}"));
+    }
+    for skip in skipped {
+        let kind = sanitize(skip.get("kind").and_then(Value::as_str).unwrap_or("-"));
+        let detail = sanitize(skip.get("detail").and_then(Value::as_str).unwrap_or(""));
+        let path = sanitize(skip.get("path").and_then(Value::as_str).unwrap_or(""));
+        out.push_str(&format!("\n  skipped [{kind}]: {path} — {detail}"));
+    }
+    out
+}
+
+/// Renders a `merge-queue` phase-2 `EnqueueResult`: a summary count, then one line
+/// per queued PR (`PR #N`, with `(already queued)` for an idempotent no-op) and per
+/// failed PR (`PR #N — error`). Skips (a worktree that became ineligible between
+/// phases) are folded into the summary count. Strings are `sanitize`d (#1137).
+fn render_enqueue_result(result: &Value) -> String {
+    let queued = result
+        .get("queued")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let failed = result
+        .get("failed")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let skipped = result
+        .get("skipped")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut out = format!(
+        "Queued: {} / Failed: {} / Skipped: {}",
+        queued.len(),
+        failed.len(),
+        skipped
+    );
+    for pr in queued {
+        let number = pr.get("number").and_then(Value::as_u64).unwrap_or(0);
+        let already = pr
+            .get("already_queued")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let suffix = if already { " (already queued)" } else { "" };
+        out.push_str(&format!("\n  queued: PR #{number}{suffix}"));
+    }
+    for pr in failed {
+        let number = pr.get("number").and_then(Value::as_u64).unwrap_or(0);
+        let error = sanitize(pr.get("error").and_then(Value::as_str).unwrap_or(""));
+        out.push_str(&format!("\n  failed: PR #{number} — {error}"));
+    }
+    out
+}
+
 /// Prompts on stderr for confirmation before a destructive delete and returns
 /// whether the user assented, reading the answer from real stdin.
 ///
@@ -535,6 +699,26 @@ async fn confirm_removal_with(
 ) -> bool {
     use std::io::Write;
     eprint!("{}", confirm_prompt(has_risks));
+    let _ = std::io::stderr().flush();
+    read.await.as_deref().is_some_and(answer_is_yes)
+}
+
+/// Prompts on stderr before enqueuing and returns whether the user assented,
+/// reading the answer from real stdin. A thin wrapper over [`confirm_enqueue_with`]
+/// supplying the live stdin reader.
+async fn confirm_enqueue(count: usize) -> bool {
+    confirm_enqueue_with(count, read_stdin_line()).await
+}
+
+/// Prints the enqueue confirmation prompt and resolves the (already-injected) read
+/// of the user's answer into a yes/no decision. A read error, closed stdin (EOF),
+/// or join failure is treated as "no", so an enqueue never proceeds unattended.
+async fn confirm_enqueue_with(
+    count: usize,
+    read: impl std::future::Future<Output = Option<String>>,
+) -> bool {
+    use std::io::Write;
+    eprint!("Add {count} PR(s) to the merge queue? [y/N] ");
     let _ = std::io::stderr().flush();
     read.await.as_deref().is_some_and(answer_is_yes)
 }
@@ -2000,5 +2184,92 @@ mod tests {
         assert!(!confirm_removal_with(false, async { Some("n".to_string()) }).await);
         assert!(!confirm_removal_with(true, async { Some(String::new()) }).await);
         assert!(!confirm_removal_with(false, async { None }).await);
+    }
+
+    // --- Merge-queue command (#1401) ---------------------------------------
+
+    #[test]
+    fn merge_queue_parses_paths_and_flags() {
+        // Routing: `worktrees merge-queue` maps to the MergeQueue variant.
+        assert!(matches!(
+            parse(&["merge-queue", "/a"]),
+            WorktreesSubcommands::MergeQueue(_)
+        ));
+        // Multiple positional paths plus `--check`.
+        let cmd =
+            MergeQueueCommand::try_parse_from(["merge-queue", "/a", "/b", "--check"]).unwrap();
+        assert_eq!(cmd.paths.len(), 2);
+        assert!(cmd.check);
+        assert!(!cmd.yes);
+        assert!(cmd.socket.is_none());
+        // `-y` and `--socket`.
+        let cmd = MergeQueueCommand::try_parse_from([
+            "merge-queue",
+            "/a",
+            "-y",
+            "--socket",
+            "/tmp/d.sock",
+        ])
+        .unwrap();
+        assert!(cmd.yes);
+        assert_eq!(cmd.socket.as_deref(), Some(Path::new("/tmp/d.sock")));
+        // At least one path is required.
+        assert!(MergeQueueCommand::try_parse_from(["merge-queue"]).is_err());
+    }
+
+    #[test]
+    fn render_eligibility_report_lists_eligible_and_skipped() {
+        let report = json!({
+            "eligible": [{ "number": 10, "branch": "feature", "url": "u", "path": "/wt/a" }],
+            "skipped": [{ "path": "/wt/b", "kind": "dirty", "detail": "2 modified" }],
+        });
+        let out = render_eligibility_report(&report);
+        assert!(out.contains("Eligible: 1 / Skipped: 1"), "{out}");
+        assert!(out.contains("PR #10 [feature] /wt/a"), "{out}");
+        assert!(out.contains("skipped [dirty]: /wt/b — 2 modified"), "{out}");
+    }
+
+    #[test]
+    fn render_enqueue_result_marks_already_queued_and_failures() {
+        let result = json!({
+            "queued": [
+                { "number": 10, "path": "/a" },
+                { "number": 11, "path": "/b", "already_queued": true },
+            ],
+            "failed": [{ "number": 12, "path": "/c", "error": "merge queue not enabled" }],
+            "skipped": [{ "path": "/d", "kind": "unpushed", "detail": "x" }],
+        });
+        let out = render_enqueue_result(&result);
+        assert!(out.contains("Queued: 2 / Failed: 1 / Skipped: 1"), "{out}");
+        assert!(out.contains("queued: PR #10"), "{out}");
+        assert!(out.contains("PR #11 (already queued)"), "{out}");
+        assert!(
+            out.contains("failed: PR #12 — merge queue not enabled"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn render_eligibility_report_strips_control_bytes() {
+        // Control bytes in every daemon-supplied string must not reach the terminal
+        // (#1137), matching the close/list/tree renderers.
+        let report = json!({
+            "eligible": [{ "number": 1, "branch": "br\x1b[31manch", "path": "/a\rb" }],
+            "skipped": [{ "path": "/e\x1b]0;x\x07vil", "kind": "d\x07irty", "detail": "l\u{9b}2J" }],
+        });
+        let out = render_eligibility_report(&report);
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_enqueue_with_decides_from_the_answer() {
+        assert!(confirm_enqueue_with(3, async { Some("y\n".to_string()) }).await);
+        assert!(confirm_enqueue_with(1, async { Some("YES".to_string()) }).await);
+        assert!(!confirm_enqueue_with(3, async { Some("n".to_string()) }).await);
+        assert!(!confirm_enqueue_with(3, async { Some(String::new()) }).await);
+        assert!(!confirm_enqueue_with(3, async { None }).await);
     }
 }

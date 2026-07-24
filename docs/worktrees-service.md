@@ -191,6 +191,26 @@ never a VS Code window, so it omits `requester_key`: the daemon treats the close
 cross-window, signals every owning window to close, waits (bounded ~20s) for them to
 unregister, then prunes.
 
+`worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
+merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
+It takes **any number** of paths, since the daemon evaluates and enqueues the whole
+selection in one op (see [Merge queue](#merge-queue) for the gates):
+
+```bash
+# Report eligibility only — enqueue nothing.
+omni-dev worktrees merge-queue /path/to/worktree --check
+
+# Enqueue several (interactive y/N confirm unless --yes).
+omni-dev worktrees merge-queue /path/to/wt-a /path/to/wt-b --yes
+```
+
+Each path is resolved client-side. The command first runs the side-effect-free
+**phase-1** check and prints the report — one line per eligible worktree (`PR #N
+[branch] path`) and per skipped one (`[kind] path — detail`) — then confirms
+interactively (unless `--yes`) and sends the **phase-2** execute, which re-validates
+every gate before enqueuing. `--check` stops after the report. The final summary
+counts queued/failed/skipped, marking any PR that was `(already queued)`.
+
 `worktrees show-closed` reads or sets the cross-window "show closed worktrees"
 toggle (`set-show-closed`; the value rides the `tree` snapshot's `show_closed`):
 
@@ -477,6 +497,84 @@ old to serve the op makes the extension fall back to its own `gh`.
   gray regardless of per-repo state, and the "Enable/Disable PR Polling" menu items
   are hidden.
 
+### Merge queue
+
+**Add to Merge Queue** (the `1_pr` context-menu group, on any GitHub-backed
+worktree row) enqueues the selected worktrees' pull requests into the repo's
+**GitHub merge queue** — but only the ones that are genuinely ready. Select any
+number of rows, act once: eligible PRs are queued, and everything else comes back
+**skipped with a reason** rather than being silently dropped or failing the batch.
+
+**Precondition:** the merge queue must already be **enabled on the repo** (a GitHub
+admin setting, on the target branch's ruleset). The daemon does not enable it; if
+it is off, GitHub's rejection is surfaced per-PR in `failed[]`.
+
+#### The gates
+
+A worktree is enqueued only if **every** gate holds. Each failure carries a stable
+machine `kind` plus a human-readable `detail`:
+
+| # | Gate                                       | Skip `kind`                 |
+| - | ------------------------------------------ | --------------------------- |
+| 1 | Clean working tree                         | `dirty` / `untracked`       |
+| 2 | Has a commit (non-unborn `HEAD`)           | `no-commits`                |
+| 3 | Fully pushed (`head == upstream`, 0 ahead) | `unpushed` / `no-upstream`  |
+| 4 | An open PR heads the branch                | `no-pr`                     |
+| 5 | The PR is not a draft                      | `draft`                     |
+| 6 | The PR is not conflicting                  | `conflicting`               |
+| 7 | The PR's checks are green                  | `checks-failing`            |
+| — | The PR head matches the local head         | `stale`                     |
+
+Two more are refused locally: a detached `HEAD` (`detached`) and a repo with no
+`github.com` remote (`no-github`).
+
+Gates 1–3 are pure local git and run **first**, so an ineligible worktree is
+reported with **zero** GitHub API calls. The survivors are then resolved in a
+**single** `gh api graphql` query (the same aliasing that keeps the badge poll at 1
+point), and gates 4–7 applied. Gates 5–7 are deliberately stricter than the merge
+queue itself requires — the point of a batch action is that you do not inspect each
+PR, so an enqueue that would predictably bounce is better reported as a skip.
+`BLOCKED` and `UNKNOWN` merge states are **not** treated as conflicts (the queue
+resolves those); only `CONFLICTING` and `DIRTY` are.
+
+#### Two phases, re-validated
+
+Like [`close`](#companion-contract-for-the-extension-and-other-clients), the op is
+two-phase and the daemon **never trusts the client's phase-1 result**:
+
+1. **Check** — `{ paths[], check: true }` (also any request without `confirmed`).
+   Side-effect-free. Replies `{ eligible: [{ path, number, url, branch }], skipped:
+   [{ path, kind, detail }] }`. The extension shows one modal for the whole
+   selection ("Enqueue N of M worktrees? (K skipped)").
+2. **Execute** — `{ paths[], confirmed: true }`. Re-runs the **entire** evaluation,
+   then enqueues what still passes. Replies `{ queued: [{ path, number,
+   already_queued? }], skipped: [...], failed: [{ path, number, error }] }`.
+
+So a worktree that became dirty, was force-pushed, or had its PR closed between
+render and click is skipped at execute time and reported — the UI gating is
+convenience, never the guard. Both phases also accept an optional `requester_key`
+(this window's key); unlike `close` it does not affect routing, and is only logged.
+
+A PR **already in the queue** is idempotent success (`already_queued: true`), not a
+failure. A per-PR rejection — queue disabled, PR unmergeable, insufficient
+permissions — lands in `failed[]` and never sinks the rest of the batch. Enqueue
+authenticates through the user's own `gh`, so **no credential enters the daemon**.
+
+#### From the CLI
+
+```bash
+# Report eligibility and stop — no side effects.
+omni-dev worktrees merge-queue ~/wrk/wt/issue-1401 --check
+
+# Enqueue (prints the report, then asks to confirm; -y skips the prompt).
+omni-dev worktrees merge-queue ~/wrk/wt/issue-1401 ~/wrk/wt/issue-1400 -y
+```
+
+Both phases are auditable in `omni-dev daemon logs` as `merge-queue check` /
+`merge-queue enqueue` INFO lines. See [ADR-0055](adrs/adr-0055.md) for the
+rationale — including why this uses a dedicated GraphQL query rather than widening
+the badge poll, and why it is the service's first op to mutate remote state.
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -743,6 +841,7 @@ Ops:
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
 | `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
+| `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |

@@ -290,6 +290,17 @@ fn suite_still_running(entry: &Value) -> bool {
         .is_some_and(|status| !status.is_empty() && !status.eq_ignore_ascii_case("COMPLETED"))
 }
 
+/// The `statusCheckRollup` sub-selection shared by the badge fragment
+/// ([`branch_fragment`]) and the merge-eligibility fragment
+/// ([`merge_branch_fragment`]): every check context, reduced to a verdict by
+/// [`rollup_check_state`]. Factored out so the two fragments cannot drift; kept to a
+/// single third-level connection so the query stays at 1 point (see the module docs).
+const ROLLUP_FRAGMENT: &str = "statusCheckRollup{ contexts(first:100){ nodes{
+          __typename
+          ...on CheckRun{ status conclusion checkSuite{ status } }
+          ...on StatusContext{ state }
+        } } }";
+
 /// The GraphQL fragment resolving one branch: its head OID, the rollup contexts
 /// the verdict is reduced from, and the open PR that heads it.
 ///
@@ -306,13 +317,34 @@ fn branch_fragment(alias: &str, branch: &str) -> String {
     format!(
         r"{alias}: ref(qualifiedName:{qualified}){{
       target{{ ...on Commit{{ oid
-        statusCheckRollup{{ contexts(first:100){{ nodes{{
-          __typename
-          ...on CheckRun{{ status conclusion checkSuite{{ status }} }}
-          ...on StatusContext{{ state }}
-        }} }} }}
+        {ROLLUP_FRAGMENT}
       }} }}
       associatedPullRequests(first:1, states:OPEN){{ nodes{{ number isDraft url }} }}
+    }}"
+    )
+}
+
+/// The GraphQL fragment resolving one branch for **merge-queue eligibility** (#1401).
+///
+/// A superset of [`branch_fragment`]'s PR selection: on top of the shared
+/// [`ROLLUP_FRAGMENT`] (for the CI gate) it fetches the fields `enqueuePullRequest`
+/// and the eligibility gates need but the badge cache never carries — the PR's
+/// GraphQL node `id` (the mutation input), `headRefOid` (compared to the local head
+/// to catch a stale UI), `mergeStateStatus` (the conflict gate), and
+/// `mergeQueueEntry` (already-queued ⇒ idempotent success). Kept **out** of the
+/// hot-path badge poll deliberately: this runs only for the handful of worktrees a
+/// user explicitly selects to enqueue, and the op needs fresh data anyway.
+fn merge_branch_fragment(alias: &str, branch: &str) -> String {
+    let qualified = Value::String(format!("refs/heads/{branch}"));
+    format!(
+        r"{alias}: ref(qualifiedName:{qualified}){{
+      target{{ ...on Commit{{ oid
+        {ROLLUP_FRAGMENT}
+      }} }}
+      associatedPullRequests(first:1, states:OPEN){{ nodes{{
+        id number isDraft url headRefOid mergeStateStatus
+        mergeQueueEntry{{ state }}
+      }} }}
     }}"
     )
 }
@@ -597,6 +629,235 @@ fn resolve_inner(
         }
     }
     Ok((parse_response(&body, &index), parse_rate_limit(&body)))
+}
+
+// --- Merge-queue eligibility & enqueue (#1401) --------------------------------
+
+/// What the merge-queue op needs to know about a branch's open PR.
+///
+/// Resolved **fresh** at enqueue time — never from the badge cache, which carries
+/// neither the PR node `id` the mutation needs nor the current merge state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeInfo {
+    /// The PR's GraphQL global node id — the `enqueuePullRequest` input.
+    pub pr_id: String,
+    /// The PR number, for display.
+    pub number: u64,
+    /// The PR's web URL.
+    pub url: String,
+    /// Whether the PR is a draft (GitHub refuses to queue a draft).
+    pub is_draft: bool,
+    /// The remote PR head commit — compared to the local head to catch a stale UI.
+    pub head_oid: String,
+    /// GitHub's mergeability verdict, upper-cased (`CLEAN`, `BLOCKED`, `DIRTY`,
+    /// `UNKNOWN`, …); `None` when the field was absent from the reply.
+    pub merge_state: Option<String>,
+    /// Whether the PR is already in the merge queue — an enqueue is then a no-op
+    /// (idempotent success, not a failure).
+    pub already_queued: bool,
+    /// The rolled-up CI verdict on the PR head.
+    pub checks: PrCheckState,
+}
+
+/// Builds the single aliased merge-eligibility query for every target, plus the
+/// alias→target index to read the reply back. Same repo-grouping and aliasing as
+/// [`build_query`], but with [`merge_branch_fragment`] and no `rateLimit` fold —
+/// this is a rare, explicit, small-N call, not the hot-path poll.
+fn build_merge_query(targets: &[PrTarget]) -> Option<(String, QueryIndex)> {
+    if targets.is_empty() {
+        return None;
+    }
+    let mut by_repo: BTreeMap<(&str, &str), Vec<&PrTarget>> = BTreeMap::new();
+    for t in targets {
+        by_repo
+            .entry((t.owner.as_str(), t.name.as_str()))
+            .or_default()
+            .push(t);
+    }
+    let mut index = HashMap::new();
+    let mut repos = Vec::new();
+    for (ri, ((owner, name), branches)) in by_repo.iter().enumerate() {
+        let mut frags = Vec::new();
+        for (bi, target) in branches.iter().enumerate() {
+            frags.push(merge_branch_fragment(&format!("b{bi}"), &target.branch));
+            index.insert((ri, bi), (*target).clone());
+        }
+        let owner = Value::String((*owner).to_string());
+        let name = Value::String((*name).to_string());
+        repos.push(format!(
+            "r{ri}: repository(owner:{owner}, name:{name}){{\n{}\n}}",
+            frags.join("\n")
+        ));
+    }
+    Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
+}
+
+/// Reads one resolved merge `ref` node into a [`MergeInfo`]. `None` — meaning
+/// *no readable open PR*, which the caller treats as "skip, no PR" — for a node
+/// whose PR list is absent/empty or is missing the load-bearing `id`/`number`.
+fn merge_info_from_ref(node: &Value) -> Option<MergeInfo> {
+    let pr = node
+        .get("associatedPullRequests")?
+        .get("nodes")?
+        .as_array()?
+        .first()?;
+    let contexts = node
+        .get("target")
+        .and_then(|t| t.get("statusCheckRollup"))
+        .and_then(|r| r.get("contexts"))
+        .and_then(|c| c.get("nodes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some(MergeInfo {
+        pr_id: pr.get("id").and_then(Value::as_str)?.to_string(),
+        number: pr.get("number").and_then(Value::as_u64)?,
+        url: pr
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        is_draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        head_oid: pr
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        merge_state: pr
+            .get("mergeStateStatus")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_uppercase),
+        already_queued: pr
+            .get("mergeQueueEntry")
+            .is_some_and(|entry| !entry.is_null()),
+        checks: rollup_check_state(&contexts),
+    })
+}
+
+/// Reads a merge-eligibility reply back into [`MergeInfo`]s, keyed by target. A
+/// target whose part of the reply is missing, null, or PR-less is simply **absent**
+/// — the caller reports that as a `no-pr` skip.
+fn parse_merge_response(body: &Value, index: &QueryIndex) -> HashMap<PrTarget, MergeInfo> {
+    let mut out = HashMap::new();
+    let Some(data) = body.get("data") else {
+        return out;
+    };
+    for ((ri, bi), target) in index {
+        let Some(repo) = data.get(format!("r{ri}")).filter(|r| !r.is_null()) else {
+            continue;
+        };
+        let Some(node) = repo.get(format!("b{bi}")).filter(|n| !n.is_null()) else {
+            continue;
+        };
+        if let Some(info) = merge_info_from_ref(node) {
+            out.insert(target.clone(), info);
+        }
+    }
+    out
+}
+
+/// Resolves merge-queue eligibility facts for every target in **one** `gh api
+/// graphql` call. **Blocking** — run on a blocking thread.
+///
+/// Only targets with a readable open PR appear in the map; an absent target means
+/// no open PR (or an unreadable reply), which the merge-queue op treats as a
+/// `no-pr` skip. A failed call (including a GraphQL 200 carrying `errors`) is `Err`,
+/// so the whole batch reports the error rather than silently enqueuing nothing.
+pub fn resolve_merge_targets(
+    bin: &Path,
+    targets: &[PrTarget],
+) -> Result<HashMap<PrTarget, MergeInfo>> {
+    let Some((query, index)) = build_merge_query(targets) else {
+        return Ok(HashMap::new());
+    };
+    let body = run_gh_graphql(bin, &query)?;
+    if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+        if !errors.is_empty() {
+            bail!("gh api graphql returned errors: {errors:?}");
+        }
+    }
+    Ok(parse_merge_response(&body, &index))
+}
+
+/// The outcome of a single `enqueuePullRequest` mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// The PR is now in the merge queue; the optional string is `mergeQueueEntry`'s
+    /// reported `state`.
+    Queued(Option<String>),
+    /// GitHub rejected the enqueue — merge queue disabled on the repo, the PR not
+    /// mergeable / conflicting, or insufficient permissions. The string is the
+    /// human-readable reason, surfaced to the caller as a per-PR failure (never a
+    /// panic, never a batch-sinking error).
+    Rejected(String),
+}
+
+/// Joins one-or-more GraphQL `errors[].message` strings into a single reason.
+fn enqueue_error_message(errors: &[Value]) -> String {
+    let joined = errors
+        .iter()
+        .filter_map(|e| e.get("message").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        "enqueue rejected by GitHub".to_string()
+    } else {
+        joined
+    }
+}
+
+/// Enqueues one PR into its repo's merge queue via the `enqueuePullRequest`
+/// mutation. **Blocking** — run on a blocking thread.
+///
+/// Unlike [`run_gh_graphql`], a GraphQL error here is **not** a hard `Err`: `gh`
+/// exits non-zero on a rejected mutation, and we map that (and a 200-with-`errors`)
+/// to [`EnqueueOutcome::Rejected`] so one un-enqueuable PR lands in the batch's
+/// `failed[]` list while the rest proceed. `Err` is reserved for "could not run
+/// `gh` at all" (e.g. the binary is missing).
+pub fn enqueue_pull_request(bin: &Path, pr_node_id: &str) -> Result<EnqueueOutcome> {
+    // JSON string escaping is valid GraphQL string escaping (as in `branch_fragment`).
+    let id_lit = Value::String(pr_node_id.to_string());
+    let mutation =
+        format!("mutation{{ enqueuePullRequest(input:{{pullRequestId:{id_lit}}}){{ mergeQueueEntry{{ state }} }} }}");
+    let query_arg = format!("query={mutation}");
+    let output = crate::github_metrics::run_gh(
+        bin,
+        ["api", "graphql", "-f", query_arg.as_str()],
+        "api graphql",
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to run {} (is the GitHub CLI installed?)",
+            bin.display()
+        )
+    })?;
+    if !output.status.success() {
+        // A rejected mutation exits non-zero; the reason is in the JSON `errors`
+        // body (preferred) or, failing that, stderr.
+        let msg = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|body| {
+                body.get("errors")
+                    .and_then(Value::as_array)
+                    .filter(|errs| !errs.is_empty())
+                    .map(|errs| enqueue_error_message(errs))
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Ok(EnqueueOutcome::Rejected(msg));
+    }
+    let body: Value =
+        serde_json::from_slice(&output.stdout).context("gh api graphql returned invalid JSON")?;
+    if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+        if !errors.is_empty() {
+            return Ok(EnqueueOutcome::Rejected(enqueue_error_message(errors)));
+        }
+    }
+    let state = body
+        .pointer("/data/enqueuePullRequest/mergeQueueEntry/state")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(EnqueueOutcome::Queued(state))
 }
 
 /// The poller-written, snapshot-read resolution cache.
@@ -1429,5 +1690,125 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, target("f"));
         assert_eq!(entries[1].0, target("g"));
+    }
+
+    // --- Merge-queue eligibility & enqueue (#1401) ---
+
+    #[test]
+    fn merge_query_asks_for_the_enqueue_fields() {
+        let (query, index) = build_merge_query(&[target("main")]).unwrap();
+        // The fields the badge poll never asks for but enqueue/eligibility need.
+        for field in [
+            "id",
+            "headRefOid",
+            "mergeStateStatus",
+            "mergeQueueEntry{ state }",
+        ] {
+            assert!(query.contains(field), "missing {field}: {query}");
+        }
+        // Still reads the open PR off the Ref (not the Commit) and reuses the rollup.
+        assert!(
+            query.contains("associatedPullRequests(first:1, states:OPEN)"),
+            "{query}"
+        );
+        assert!(query.contains("checkSuite{ status }"), "{query}");
+        // No `rateLimit` fold — this is not the hot-path poll.
+        assert!(!query.contains("rateLimit"), "{query}");
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn merge_query_is_none_without_targets() {
+        assert!(build_merge_query(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_merge_response_reads_pr_facts_and_already_queued() {
+        let (_, index) = build_merge_query(&[target("ready"), target("queued")]).unwrap();
+        // Aliases: BTreeMap by (owner,name) then input order → b0=ready, b1=queued.
+        let body = json!({"data":{"r0":{
+            "b0":{
+                "target":{"oid":"sha-ready","statusCheckRollup":{"contexts":{"nodes":[
+                    {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}
+                ]}}},
+                "associatedPullRequests":{"nodes":[{
+                    "id":"PR_ready","number":10,"isDraft":false,
+                    "url":"https://github.com/rust-works/omni-dev/pull/10",
+                    "headRefOid":"sha-ready","mergeStateStatus":"CLEAN","mergeQueueEntry":null
+                }]}
+            },
+            "b1":{
+                "target":{"oid":"sha-q","statusCheckRollup":null},
+                "associatedPullRequests":{"nodes":[{
+                    "id":"PR_queued","number":11,"isDraft":true,
+                    "url":"https://github.com/rust-works/omni-dev/pull/11",
+                    "headRefOid":"sha-q","mergeStateStatus":"BLOCKED",
+                    "mergeQueueEntry":{"state":"QUEUED"}
+                }]}
+            }
+        }}});
+        let out = parse_merge_response(&body, &index);
+
+        let ready = out.get(&target("ready")).expect("ready resolved");
+        assert_eq!(ready.pr_id, "PR_ready");
+        assert_eq!(ready.number, 10);
+        assert_eq!(ready.head_oid, "sha-ready");
+        assert_eq!(ready.merge_state.as_deref(), Some("CLEAN"));
+        assert!(!ready.is_draft);
+        assert!(!ready.already_queued);
+        assert_eq!(ready.checks, PrCheckState::Success);
+
+        let queued = out.get(&target("queued")).expect("queued resolved");
+        assert!(queued.is_draft);
+        assert!(queued.already_queued);
+        assert_eq!(queued.merge_state.as_deref(), Some("BLOCKED"));
+        // No rollup nodes → no checks reported.
+        assert_eq!(queued.checks, PrCheckState::None);
+    }
+
+    #[test]
+    fn parse_merge_response_treats_absent_or_prless_refs_as_skips() {
+        let (_, index) = build_merge_query(&[target("null-ref"), target("no-pr")]).unwrap();
+        let body = json!({"data":{"r0":{
+            // A never-pushed branch: the aliased ref is null.
+            "b0": null,
+            // Pushed, but no open PR heads it.
+            "b1": {
+                "target":{"oid":"x","statusCheckRollup":null},
+                "associatedPullRequests":{"nodes":[]}
+            }
+        }}});
+        let out = parse_merge_response(&body, &index);
+        // Neither is enqueue-eligible, so neither appears — the caller maps the
+        // absence to a `no-pr` skip.
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn merge_info_requires_an_id_and_number() {
+        // A PR node missing `id` (a malformed/partial reply) is unresolved, never a
+        // half-built MergeInfo we might try to enqueue.
+        let node = json!({
+            "target":{"oid":"x","statusCheckRollup":null},
+            "associatedPullRequests":{"nodes":[{"number":9,"url":"u"}]}
+        });
+        assert!(merge_info_from_ref(&node).is_none());
+    }
+
+    #[test]
+    fn enqueue_error_message_joins_or_falls_back() {
+        let errs = vec![
+            json!({"message":"Merge queue is not enabled"}),
+            json!({"message":"Pull request is not mergeable"}),
+        ];
+        assert_eq!(
+            enqueue_error_message(&errs),
+            "Merge queue is not enabled; Pull request is not mergeable"
+        );
+        // No readable messages → a generic-but-non-empty reason.
+        assert_eq!(
+            enqueue_error_message(&[json!({"code":"X"})]),
+            "enqueue rejected by GitHub"
+        );
     }
 }

@@ -15,6 +15,8 @@ import {
   defaultDataDir,
   defaultSocketPath,
   heartbeatEnvelope,
+  mergeQueueCheckEnvelope,
+  mergeQueueEnvelope,
   openEnvelope,
   registerEnvelope,
   setPollingEnvelope,
@@ -181,5 +183,27 @@ test("close envelope builders match the two-phase worktrees wire contract", () =
     service: "worktrees",
     op: "close",
     payload: { path: "/repo", remove: false, requester_key: "k1" },
+  });
+});
+
+test("merge-queue envelope builders match the two-phase batched wire contract", () => {
+  // Phase 1: eligibility only — `check:true`, never `confirmed`. Unlike `close`,
+  // one envelope carries the whole selection as `paths`.
+  assert.deepEqual(mergeQueueCheckEnvelope(["/wt/a", "/wt/b"], "k1"), {
+    service: "worktrees",
+    op: "merge-queue",
+    payload: { paths: ["/wt/a", "/wt/b"], requester_key: "k1", check: true },
+  });
+  // Phase 2: execute — `confirmed:true`, never `check` (which would report only).
+  assert.deepEqual(mergeQueueEnvelope(["/wt/a", "/wt/b"], "k1"), {
+    service: "worktrees",
+    op: "merge-queue",
+    payload: { paths: ["/wt/a", "/wt/b"], requester_key: "k1", confirmed: true },
+  });
+  // A single-target selection is still a batch of one.
+  assert.deepEqual(mergeQueueEnvelope(["/wt/a"], "k1"), {
+    service: "worktrees",
+    op: "merge-queue",
+    payload: { paths: ["/wt/a"], requester_key: "k1", confirmed: true },
   });
 });

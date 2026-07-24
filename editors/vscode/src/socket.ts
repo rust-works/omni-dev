@@ -243,6 +243,46 @@ export function closeEnvelope(
 }
 
 /**
+ * The fields the extension sends on a `merge-queue` op — mirrors the daemon's
+ * `MergeQueueRequest` (`src/daemon/services/worktrees.rs`). Unlike `close`, this
+ * is a **single batched** op over `paths`: `check` reports eligibility only,
+ * `confirmed` enqueues the eligible ones. `requester_key` is this window's key,
+ * carried for parity with `close` (the daemon logs it).
+ */
+export interface MergeQueuePayload {
+  paths: string[];
+  requester_key: string;
+  check?: boolean;
+  confirmed?: boolean;
+}
+
+/**
+ * Builds a `merge-queue` **phase-1** eligibility-check envelope (`check:true`):
+ * the daemon evaluates every gate per path and reports which worktrees are
+ * enqueue-eligible and which are skipped-with-reason, without touching anything.
+ */
+export function mergeQueueCheckEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "merge-queue",
+    payload: { paths, requester_key: requesterKey, check: true },
+  };
+}
+
+/**
+ * Builds a `merge-queue` **phase-2** execute envelope (`confirmed:true`): the
+ * daemon re-validates eligibility and enqueues each still-eligible PR. One
+ * envelope for the whole selection — a batch confirms once (ADR-0049 §1).
+ */
+export function mergeQueueEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "merge-queue",
+    payload: { paths, requester_key: requesterKey, confirmed: true },
+  };
+}
+
+/**
  * The fields a window reports on the sessions `window` op (mirrors `WindowReport`
  * in `src/sessions.rs`) — how many Claude editor tabs / integrated terminals this
  * window has, plus its folders, so the daemon can tag a session's source as VS

@@ -43,7 +43,9 @@ use chrono::{DateTime, Utc};
 use crate::github_rate_limit::{
     resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
 };
-use crate::pr_status::{PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget};
+use crate::pr_status::{
+    EnqueueOutcome, PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget,
+};
 use async_trait::async_trait;
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
@@ -1261,6 +1263,74 @@ impl WorktreesService {
             Ok(json!({ "closed": true }))
         }
     }
+
+    /// Handles the `merge-queue` op (#1401): batch-enqueue the eligible worktrees'
+    /// PRs into the GitHub merge queue. Two-phase, keyed off `confirmed`:
+    ///
+    /// - **Phase 1** (`check:true`, or any un-`confirmed` request) — run the
+    ///   side-effect-free eligibility evaluation ([`evaluate_batch`]) and return an
+    ///   [`EligibilityReport`]: the enqueue-eligible worktrees and the skipped ones
+    ///   (each with a machine `kind` + human `detail`).
+    /// - **Phase 2** (`confirmed:true`) — **re-run** the same evaluation (never
+    ///   trust a phase-1 result the client sent, exactly as `close` re-validates on
+    ///   execute), then enqueue each still-eligible PR. A per-PR rejection lands in
+    ///   `failed[]`; the batch never fails as a whole.
+    ///
+    /// All git and `gh` I/O runs on a blocking thread — never the async worker and
+    /// never under the registry lock. No lock is taken: each enqueue mutates a
+    /// distinct remote PR, not a shared local resource.
+    async fn merge_queue(&self, req: MergeQueueRequest) -> Result<Value> {
+        // Resolved once (the env read is process-stable), then handed to the
+        // blocking evaluation — the `open_prs` "bin as a param" seam (#1030).
+        let bin = crate::pr_status::resolve_gh_binary();
+        // Report-only unless explicitly confirmed; an explicit `check` request
+        // always reports and never enqueues.
+        let report_only = req.check || !req.confirmed;
+
+        let eval_bin = bin.clone();
+        let eval_paths = req.paths.clone();
+        let (eligible, skipped) =
+            tokio::task::spawn_blocking(move || evaluate_batch(&eval_bin, &eval_paths))
+                .await
+                .map_err(|e| anyhow!("merge-queue eligibility task panicked: {e}"))
+                .and_then(|inner| inner)?;
+
+        if report_only {
+            // Auditable in `omni-dev daemon logs` (ADR-0049 §6 precedent).
+            tracing::info!(
+                requester = req.requester_key.as_deref().unwrap_or("-"),
+                requested = req.paths.len(),
+                eligible = eligible.len(),
+                skipped = skipped.len(),
+                "merge-queue check"
+            );
+            let eligible: Vec<PrRef> = eligible.iter().map(PrRef::from).collect();
+            return Ok(
+                serde_json::to_value(EligibilityReport { eligible, skipped })
+                    .unwrap_or_else(|_| json!({})),
+            );
+        }
+
+        // Phase 2: enqueue the freshly re-validated eligible set, sequentially.
+        let enqueue_bin = bin.clone();
+        let (queued, failed) =
+            tokio::task::spawn_blocking(move || enqueue_eligible(&enqueue_bin, eligible))
+                .await
+                .map_err(|e| anyhow!("merge-queue enqueue task panicked: {e}"))?;
+        tracing::info!(
+            requester = req.requester_key.as_deref().unwrap_or("-"),
+            queued = queued.len(),
+            failed = failed.len(),
+            skipped = skipped.len(),
+            "merge-queue enqueue"
+        );
+        Ok(serde_json::to_value(EnqueueResult {
+            queued,
+            skipped,
+            failed,
+        })
+        .unwrap_or_else(|_| json!({})))
+    }
 }
 
 impl Default for WorktreesService {
@@ -1405,6 +1475,17 @@ impl DaemonService for WorktreesService {
                 let req: CloseRequest =
                     serde_json::from_value(payload).context("invalid `close` payload")?;
                 self.close(req).await
+            }
+            "merge-queue" => {
+                // Batch-enqueue eligible worktrees' PRs into the GitHub merge
+                // queue (#1401). Two-phase like `close` (side-effect-free
+                // eligibility check → confirmed enqueue) and daemon-re-validated,
+                // but a single batched op over `paths`. All git/`gh` work runs on
+                // a blocking thread; enqueue authenticates through the user's own
+                // `gh`. See ADR-0055 and docs/worktrees-service.md.
+                let req: MergeQueueRequest =
+                    serde_json::from_value(payload).context("invalid `merge-queue` payload")?;
+                self.merge_queue(req).await
             }
             other => bail!("unknown worktrees op: {other}"),
         }
@@ -3033,6 +3114,364 @@ struct GitSafety {
     removable: bool,
     risks: Vec<Note>,
     info: Vec<Note>,
+}
+
+// --- Merge-queue op (#1401) --------------------------------------------------
+
+/// The `merge-queue` op payload: batch-enqueue eligible worktrees' PRs into the
+/// GitHub merge queue. Two-phase like [`CloseRequest`], keyed off `confirmed`, but
+/// a **single batched** op over `paths` rather than one op per target.
+#[derive(Debug, Clone, Deserialize)]
+struct MergeQueueRequest {
+    /// Absolute paths of the selected worktree folders.
+    paths: Vec<PathBuf>,
+    /// The requesting window's key — carried for parity with `close` and future
+    /// per-window routing; unused today.
+    #[serde(default)]
+    requester_key: Option<String>,
+    /// Phase 1: report eligibility only, never enqueue.
+    #[serde(default)]
+    check: bool,
+    /// Phase 2: enqueue the (re-validated) eligible PRs.
+    #[serde(default)]
+    confirmed: bool,
+}
+
+/// One enqueue-eligible worktree in an [`EligibilityReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PrRef {
+    /// The worktree folder.
+    path: String,
+    /// The open PR number.
+    number: u64,
+    /// The PR's web URL.
+    url: String,
+    /// The branch the PR heads.
+    branch: String,
+}
+
+impl From<&Eligible> for PrRef {
+    fn from(e: &Eligible) -> Self {
+        Self {
+            path: e.path.to_string_lossy().to_string(),
+            number: e.number,
+            url: e.url.clone(),
+            branch: e.branch.clone(),
+        }
+    }
+}
+
+/// One skipped worktree: which, and why — a machine `kind` slug plus a
+/// human-readable `detail`, mirroring [`Note`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Skip {
+    path: String,
+    kind: String,
+    detail: String,
+}
+
+impl Skip {
+    fn new(path: &Path, kind: &str, detail: impl Into<String>) -> Self {
+        Self {
+            path: path.to_string_lossy().to_string(),
+            kind: kind.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The phase-1 reply: which selected worktrees are enqueue-eligible and which are
+/// skipped-with-reason. The extension confirms once over the whole set, then sends
+/// the phase-2 execute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EligibilityReport {
+    eligible: Vec<PrRef>,
+    skipped: Vec<Skip>,
+}
+
+/// One PR successfully in the queue after phase 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueuedPr {
+    path: String,
+    number: u64,
+    /// True when the PR was already in the queue — an idempotent no-op, reported as
+    /// success. Omitted (false) on the wire for the common freshly-queued case.
+    #[serde(skip_serializing_if = "is_false")]
+    already_queued: bool,
+}
+
+/// One PR the enqueue mutation rejected (merge queue disabled, not mergeable,
+/// insufficient permissions, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EnqueueFailure {
+    path: String,
+    number: u64,
+    error: String,
+}
+
+/// The phase-2 reply: the enqueue outcome for the selected worktrees. `skipped` is
+/// the re-validated skip set (a worktree that became ineligible between phases).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EnqueueResult {
+    queued: Vec<QueuedPr>,
+    skipped: Vec<Skip>,
+    failed: Vec<EnqueueFailure>,
+}
+
+/// A worktree that cleared the local (git-only) gates 1–3, carrying what the
+/// network step needs to resolve its PR.
+#[derive(Debug)]
+struct LocalOk {
+    path: PathBuf,
+    target: PrTarget,
+    head_sha: String,
+}
+
+/// A worktree that cleared **every** gate and is ready to enqueue.
+#[derive(Debug)]
+struct Eligible {
+    path: PathBuf,
+    number: u64,
+    url: String,
+    branch: String,
+    /// The PR's GraphQL node id — the `enqueuePullRequest` input.
+    pr_id: String,
+    /// Already in the queue ⇒ phase 2 skips the mutation and reports success.
+    already_queued: bool,
+}
+
+/// Evaluates the **local** (git-only) merge-queue gates for one worktree — clean
+/// tree (1), a real commit (2), fully pushed (3) — and resolves the branch's
+/// [`PrTarget`] for the network step. Pure disk I/O; runs on a blocking thread.
+/// Returns the first failing gate as a [`Skip`] so an ineligible worktree never
+/// costs a GitHub call.
+fn evaluate_local(path: &Path) -> std::result::Result<LocalOk, Skip> {
+    let Ok(repo) = Repository::discover(path) else {
+        return Err(Skip::new(path, "not-a-repo", "not a git repository"));
+    };
+    // Gate 1: a clean working tree (reusing the `close` safety check's counter).
+    let (dirty, untracked) = count_dirty_untracked(&repo);
+    if dirty > 0 {
+        return Err(Skip::new(
+            path,
+            "dirty",
+            format!("{dirty} modified tracked file(s) — commit or stash first"),
+        ));
+    }
+    if untracked > 0 {
+        return Err(Skip::new(
+            path,
+            "untracked",
+            format!("{untracked} untracked file(s) — commit, remove, or ignore first"),
+        ));
+    }
+    // Gate 2: a real commit exists (a non-unborn HEAD). The deeper "commits beyond
+    // base" is proven by the open PR (gate 4) + GitHub's own enqueue validation.
+    let Ok(head) = repo.head() else {
+        return Err(Skip::new(
+            path,
+            "no-commits",
+            "the branch has no commits yet",
+        ));
+    };
+    let Some(head_sha) = head.target().map(|oid| oid.to_string()) else {
+        return Err(Skip::new(
+            path,
+            "no-commits",
+            "HEAD does not resolve to a commit",
+        ));
+    };
+    // A branch HEAD has a UTF-8 shorthand; a detached HEAD has no branch — and so
+    // no branch PR to enqueue. Read before `Branch::wrap` consumes `head`.
+    let Some(branch_name) = head
+        .shorthand()
+        .ok()
+        .filter(|_| head.is_branch())
+        .map(str::to_string)
+    else {
+        return Err(Skip::new(
+            path,
+            "detached",
+            "HEAD is detached — no branch to enqueue",
+        ));
+    };
+    let branch = git2::Branch::wrap(head);
+    // Gate 3: fully pushed — an upstream exists and matches the local head.
+    let Some(upstream_sha) = upstream_target(&branch) else {
+        return Err(Skip::new(
+            path,
+            "no-upstream",
+            "the branch tracks no upstream — push it first",
+        ));
+    };
+    if upstream_sha != head_sha {
+        return Err(Skip::new(
+            path,
+            "unpushed",
+            "local commits are not on the remote yet — push first",
+        ));
+    }
+    // Belt-and-suspenders: even with matching heads, a positive ahead count is
+    // unpushed work.
+    if let Some((ahead, _behind)) = upstream_ahead_behind(&repo, &branch) {
+        if ahead > 0 {
+            return Err(Skip::new(
+                path,
+                "unpushed",
+                format!("{ahead} unpushed commit(s) — push first"),
+            ));
+        }
+    }
+    // Gate 4 setup: the branch's GitHub identity, so the network step can resolve
+    // its PR. A non-github repo can never have a merge-queue PR.
+    let Some(id) = remote_github_identity(&repo) else {
+        return Err(Skip::new(
+            path,
+            "no-github",
+            "the repository has no github.com remote",
+        ));
+    };
+    Ok(LocalOk {
+        path: path.to_path_buf(),
+        target: PrTarget {
+            owner: id.owner,
+            name: id.name,
+            branch: branch_name,
+        },
+        head_sha,
+    })
+}
+
+/// Whether GitHub's `mergeStateStatus` says the PR cannot merge cleanly. `DIRTY`
+/// (merge conflicts) and the explicit `CONFLICTING` both block enqueue; other
+/// states (`BLOCKED` on a required review, `UNKNOWN` still computing, `CLEAN`) do
+/// not, since the merge queue itself resolves them.
+fn is_conflicting(state: Option<&str>) -> bool {
+    matches!(state, Some("CONFLICTING" | "DIRTY"))
+}
+
+/// A human-readable label for a rolled-up CI verdict, for a `checks-failing` skip.
+fn check_label(state: PrCheckState) -> &'static str {
+    match state {
+        PrCheckState::Success => "passing",
+        PrCheckState::Failure => "failing",
+        PrCheckState::Pending => "still running",
+        PrCheckState::None => "not reported",
+    }
+}
+
+/// Evaluates every merge-queue gate for a batch of worktree paths and partitions
+/// them into the enqueue-eligible and the skipped-with-reason. **Blocking** — run
+/// on a blocking thread.
+///
+/// Local gates 1–3 run first (per path); only survivors reach GitHub, so a dirty
+/// or unpushed worktree is skipped with **zero** API calls. The survivors' PRs are
+/// resolved in **one** batched `gh api graphql` call, then the network gates —
+/// an open PR (4), not a draft (5), not conflicting (6), CI green (7), and the
+/// remote head matching the local head — are applied. Shared by both phases: phase
+/// 2 re-runs it (never trusting a phase-1 result the client sent).
+fn evaluate_batch(bin: &Path, paths: &[PathBuf]) -> Result<(Vec<Eligible>, Vec<Skip>)> {
+    let mut skipped = Vec::new();
+    let mut locals = Vec::new();
+    for path in paths {
+        match evaluate_local(path) {
+            Ok(ok) => locals.push(ok),
+            Err(skip) => skipped.push(skip),
+        }
+    }
+    if locals.is_empty() {
+        return Ok((Vec::new(), skipped));
+    }
+    let targets: Vec<PrTarget> = locals.iter().map(|l| l.target.clone()).collect();
+    let resolved = crate::pr_status::resolve_merge_targets(bin, &targets)?;
+    let mut eligible = Vec::new();
+    for local in locals {
+        let Some(info) = resolved.get(&local.target) else {
+            skipped.push(Skip::new(
+                &local.path,
+                "no-pr",
+                "no open PR heads this branch",
+            ));
+            continue;
+        };
+        if info.head_oid != local.head_sha {
+            skipped.push(Skip::new(
+                &local.path,
+                "stale",
+                "the open PR's head differs from the local head — re-check",
+            ));
+        } else if info.is_draft {
+            skipped.push(Skip::new(
+                &local.path,
+                "draft",
+                format!("PR #{} is a draft", info.number),
+            ));
+        } else if is_conflicting(info.merge_state.as_deref()) {
+            skipped.push(Skip::new(
+                &local.path,
+                "conflicting",
+                format!("PR #{} has merge conflicts", info.number),
+            ));
+        } else if info.checks != PrCheckState::Success {
+            skipped.push(Skip::new(
+                &local.path,
+                "checks-failing",
+                format!(
+                    "PR #{} checks are {}",
+                    info.number,
+                    check_label(info.checks)
+                ),
+            ));
+        } else {
+            eligible.push(Eligible {
+                path: local.path,
+                number: info.number,
+                url: info.url.clone(),
+                branch: local.target.branch.clone(),
+                pr_id: info.pr_id.clone(),
+                already_queued: info.already_queued,
+            });
+        }
+    }
+    Ok((eligible, skipped))
+}
+
+/// Enqueues each eligible PR into its repo's merge queue, sequentially.
+/// **Blocking** — run on a blocking thread. An already-queued PR is reported as
+/// success without a mutation; a GitHub rejection or a failed `gh` invocation
+/// lands in `failed[]`, so one un-enqueuable PR never sinks the batch.
+fn enqueue_eligible(bin: &Path, eligible: Vec<Eligible>) -> (Vec<QueuedPr>, Vec<EnqueueFailure>) {
+    let mut queued = Vec::new();
+    let mut failed = Vec::new();
+    for e in eligible {
+        let path = e.path.to_string_lossy().to_string();
+        if e.already_queued {
+            queued.push(QueuedPr {
+                path,
+                number: e.number,
+                already_queued: true,
+            });
+            continue;
+        }
+        match crate::pr_status::enqueue_pull_request(bin, &e.pr_id) {
+            Ok(EnqueueOutcome::Queued(_)) => queued.push(QueuedPr {
+                path,
+                number: e.number,
+                already_queued: false,
+            }),
+            Ok(EnqueueOutcome::Rejected(msg)) => failed.push(EnqueueFailure {
+                path,
+                number: e.number,
+                error: msg,
+            }),
+            Err(err) => failed.push(EnqueueFailure {
+                path,
+                number: e.number,
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    (queued, failed)
 }
 
 /// Live windows (key, workspace-folder count) that currently have `path` open,
@@ -7233,6 +7672,218 @@ mod tests {
         // the two ops contend on.
         let repo = Repository::open(main_dir.path()).unwrap();
         assert!(repo.worktrees().unwrap().is_empty());
+    }
+
+    // --- Merge-queue op (#1401) --------------------------------------------
+
+    /// Builds a repo on `branch` with one clean commit whose `origin/<branch>`
+    /// upstream points at the **same** commit (nothing to push) and a github
+    /// `origin` URL — the shape [`evaluate_local`] accepts. The empty tree means an
+    /// empty (clean) working directory.
+    fn pushed_github_repo(dir: &Path, url: &str, branch: &str) -> Repository {
+        let repo = init_repo(dir);
+        let refname = format!("refs/heads/{branch}");
+        let head = empty_commit(&repo, Some(&refname), &[], "A");
+        repo.reference(&format!("refs/remotes/origin/{branch}"), head, true, "o")
+            .unwrap();
+        repo.set_head(&refname).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", url).unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str(&format!("branch.{branch}.remote"), "origin")
+            .unwrap();
+        cfg.set_str(&format!("branch.{branch}.merge"), &refname)
+            .unwrap();
+        repo
+    }
+
+    #[test]
+    fn evaluate_local_accepts_a_clean_pushed_github_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = pushed_github_repo(
+            dir.path(),
+            "https://github.com/rust-works/omni-dev.git",
+            "feature",
+        );
+        let ok = evaluate_local(dir.path()).expect("should be locally eligible");
+        assert_eq!(
+            ok.target,
+            PrTarget {
+                owner: "rust-works".into(),
+                name: "omni-dev".into(),
+                branch: "feature".into(),
+            }
+        );
+        assert!(!ok.head_sha.is_empty());
+    }
+
+    #[test]
+    fn evaluate_local_skips_an_unborn_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = init_repo(dir.path()); // no commits
+        assert_eq!(evaluate_local(dir.path()).unwrap_err().kind, "no-commits");
+    }
+
+    #[test]
+    fn evaluate_local_skips_a_branch_with_no_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        // A github URL but no tracking config → nothing was ever pushed.
+        repo.config()
+            .unwrap()
+            .set_str("remote.origin.url", "https://github.com/o/r.git")
+            .unwrap();
+        assert_eq!(evaluate_local(dir.path()).unwrap_err().kind, "no-upstream");
+    }
+
+    #[test]
+    fn evaluate_local_skips_unpushed_local_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        let a_commit = repo.find_commit(a).unwrap();
+        // origin/main stays at A; local advances to B → 1 ahead (unpushed).
+        repo.reference("refs/remotes/origin/main", a, true, "o")
+            .unwrap();
+        empty_commit(&repo, Some("refs/heads/main"), &[&a_commit], "B");
+        drop(a_commit);
+        repo.set_head("refs/heads/main").unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://github.com/o/r.git")
+            .unwrap();
+        // The fetch refspec is what lets git2 map the branch to its tracking ref;
+        // without it `upstream()` fails and the branch reads as having none.
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.main.remote", "origin").unwrap();
+        cfg.set_str("branch.main.merge", "refs/heads/main").unwrap();
+        assert_eq!(evaluate_local(dir.path()).unwrap_err().kind, "unpushed");
+    }
+
+    #[test]
+    fn evaluate_local_skips_a_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = pushed_github_repo(dir.path(), "https://github.com/o/r.git", "main");
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+        assert_eq!(evaluate_local(dir.path()).unwrap_err().kind, "detached");
+    }
+
+    #[test]
+    fn evaluate_local_skips_a_non_github_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = pushed_github_repo(dir.path(), "https://gitlab.com/o/r.git", "main");
+        assert_eq!(evaluate_local(dir.path()).unwrap_err().kind, "no-github");
+    }
+
+    #[test]
+    fn evaluate_local_flags_dirty_then_untracked() {
+        // A linked worktree with a real checked-out file, so status is meaningful.
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let a = commit_file(&repo, "refs/heads/main", "f.txt", b"hi", "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, a, &wt_path, "feature");
+
+        // Clean checkout → gate 1 passes (it trips a *later* gate, not dirty).
+        let clean = evaluate_local(&wt_path).unwrap_err();
+        assert_ne!(clean.kind, "dirty");
+        assert_ne!(clean.kind, "untracked");
+
+        // Modify the tracked file → dirty (gate 1, before any network call).
+        std::fs::write(wt_path.join("f.txt"), b"changed").unwrap();
+        assert_eq!(evaluate_local(&wt_path).unwrap_err().kind, "dirty");
+
+        // Restore it, add a new file → untracked.
+        std::fs::write(wt_path.join("f.txt"), b"hi").unwrap();
+        std::fs::write(wt_path.join("new.txt"), b"x").unwrap();
+        assert_eq!(evaluate_local(&wt_path).unwrap_err().kind, "untracked");
+    }
+
+    #[test]
+    fn is_conflicting_blocks_only_dirty_and_conflicting() {
+        assert!(is_conflicting(Some("CONFLICTING")));
+        assert!(is_conflicting(Some("DIRTY")));
+        assert!(!is_conflicting(Some("CLEAN")));
+        assert!(!is_conflicting(Some("BLOCKED")));
+        assert!(!is_conflicting(Some("UNKNOWN")));
+        assert!(!is_conflicting(None));
+    }
+
+    #[test]
+    fn merge_queue_request_parses_batch_and_phase_flags() {
+        let req: MergeQueueRequest = serde_json::from_value(json!({
+            "paths": ["/a", "/b"], "requester_key": "w1", "confirmed": true
+        }))
+        .unwrap();
+        assert_eq!(req.paths.len(), 2);
+        assert_eq!(req.requester_key.as_deref(), Some("w1"));
+        assert!(req.confirmed);
+        assert!(!req.check);
+        // Minimal payload: just paths; every other field defaults.
+        let req: MergeQueueRequest = serde_json::from_value(json!({ "paths": [] })).unwrap();
+        assert!(req.paths.is_empty());
+        assert!(!req.check && !req.confirmed && req.requester_key.is_none());
+    }
+
+    #[test]
+    fn queued_pr_omits_already_queued_when_false() {
+        let v = serde_json::to_value(QueuedPr {
+            path: "/a".into(),
+            number: 5,
+            already_queued: false,
+        })
+        .unwrap();
+        assert!(v.get("already_queued").is_none(), "{v}");
+        let v = serde_json::to_value(QueuedPr {
+            path: "/a".into(),
+            number: 5,
+            already_queued: true,
+        })
+        .unwrap();
+        assert_eq!(v.get("already_queued").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn merge_queue_check_on_empty_selection_reports_nothing() {
+        let svc = WorktreesService::new();
+        let reply = svc
+            .handle("merge-queue", json!({ "paths": [], "check": true }))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "eligible": [], "skipped": [] }));
+    }
+
+    #[tokio::test]
+    async fn merge_queue_check_skips_a_locally_ineligible_worktree_without_reaching_github() {
+        // An unborn repo is skipped by the *local* gates, so the op never shells
+        // `gh` — the check completes with no network stub.
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = init_repo(dir.path());
+        let svc = WorktreesService::new();
+        let reply = svc
+            .handle(
+                "merge-queue",
+                json!({ "paths": [dir.path()], "check": true }),
+            )
+            .await
+            .unwrap();
+        let skipped = reply.get("skipped").and_then(Value::as_array).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].get("kind").and_then(Value::as_str),
+            Some("no-commits")
+        );
+        assert!(reply
+            .get("eligible")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
