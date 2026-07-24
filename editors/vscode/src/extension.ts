@@ -15,6 +15,8 @@ import {
   closeEnvelope,
   defaultSocketPath,
   heartbeatEnvelope,
+  mergeQueueCheckEnvelope,
+  mergeQueueEnvelope,
   openEnvelope,
   openPrsEnvelope,
   registerEnvelope,
@@ -500,6 +502,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.openPullRequestInBrowser",
       (node?: Node, selected?: Node[]) =>
         void openPullRequestInBrowser(node, selected, repoOpenPrs),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.addToMergeQueue",
+      (node?: Node, selected?: Node[]) => void addToMergeQueue(node, selected),
     ),
     // A destination, not a subject — the menu hides it while a multi-selection is
     // active (`!listMultiSelection`), so it stays single-node here too.
@@ -1067,6 +1073,176 @@ async function closeWorktree(clicked?: Node, selected?: Node[]): Promise<void> {
       );
       reportFailures(failures, linked.length);
     },
+  );
+}
+
+/**
+ * Generous timeout for a `merge-queue` execute call: the daemon re-validates every
+ * target and then issues one `gh api graphql` mutation per eligible PR.
+ */
+const MERGE_QUEUE_EXECUTE_TIMEOUT_MS = 60_000;
+
+/** One enqueue-eligible worktree (mirrors `PrRef` in Rust). */
+interface MergeQueuePrRef {
+  path: string;
+  number: number;
+  url: string;
+  branch: string;
+}
+
+/** One skipped worktree and why (mirrors `Skip` in Rust). */
+interface MergeQueueSkip {
+  path: string;
+  kind: string;
+  detail: string;
+}
+
+/** The daemon's phase-1 report (mirrors `EligibilityReport` in Rust). */
+interface EligibilityReport {
+  eligible: MergeQueuePrRef[];
+  skipped: MergeQueueSkip[];
+}
+
+/** The daemon's phase-2 result (mirrors `EnqueueResult` in Rust). */
+interface EnqueueResult {
+  queued: { path: string; number: number; already_queued?: boolean }[];
+  skipped: MergeQueueSkip[];
+  failed: { path: string; number: number; error: string }[];
+}
+
+/**
+ * The **Add to Merge Queue** command: enqueues every selected worktree's PR into
+ * the GitHub merge queue — but only the ones that pass every eligibility gate
+ * (clean, committed, pushed, with an open non-draft, conflict-free, CI-green PR).
+ * Ineligible worktrees are reported as skipped-with-reason, never enqueued.
+ *
+ * Two-phase like {@link closeWorktree} (ADR-0049's shape), but the daemon op is a
+ * **single batched** call over all paths rather than a client-side fan-out, so
+ * this sends one check envelope and one execute envelope. The batch confirms once
+ * (ADR-0049 §1) — one gesture can enqueue N PRs, and the modal is the only place
+ * the user sees the full set.
+ *
+ * Repo nodes are filtered out here rather than trusted to the menu: `when` clauses
+ * see only the *clicked* row, so a mixed selection reaches this handler intact.
+ * The daemon re-validates every gate on execute; this gating is convenience only.
+ */
+async function addToMergeQueue(clicked?: Node, selected?: Node[]): Promise<void> {
+  const targets = worktreeTargets(selectionTargets(clicked, selected));
+  if (targets.length === 0) {
+    return;
+  }
+  const paths = targets.map((t) => t.wt.path);
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title:
+        targets.length === 1
+          ? `Checking “${worktreeLabel(targets[0].wt)}”…`
+          : `Checking ${targets.length} worktrees…`,
+    },
+    async (progress) => {
+      // Phase 1: eligibility. Side-effect-free, and one op for the whole batch.
+      const checked = await send(mergeQueueCheckEnvelope(paths, windowKey));
+      if (!checked) {
+        daemonDownError();
+        return;
+      }
+      if (!checked.ok) {
+        void vscode.window.showErrorMessage(
+          `omni-dev: could not check merge-queue eligibility — ${checked.error ?? "unknown error"}`,
+        );
+        return;
+      }
+      const report = checked.payload as EligibilityReport;
+      const eligible = report.eligible ?? [];
+      const skipped = report.skipped ?? [];
+
+      if (eligible.length === 0) {
+        void vscode.window.showWarningMessage(
+          `omni-dev: nothing to enqueue — ${describeSkips(skipped, targets.length)}`,
+        );
+        return;
+      }
+      if (!(await confirmEnqueue(eligible, skipped, targets.length))) {
+        return;
+      }
+
+      // Phase 2: execute. The daemon re-validates before enqueuing anything.
+      progress.report({ message: `Enqueuing ${eligible.length}…` });
+      const exec = await send(
+        mergeQueueEnvelope(paths, windowKey),
+        MERGE_QUEUE_EXECUTE_TIMEOUT_MS,
+      );
+      if (!exec) {
+        daemonDownError();
+        return;
+      }
+      if (!exec.ok) {
+        void vscode.window.showErrorMessage(
+          `omni-dev: merge-queue enqueue failed — ${exec.error ?? "unknown error"}`,
+        );
+        return;
+      }
+      reportEnqueueResult(exec.payload as EnqueueResult);
+    },
+  );
+}
+
+/** A compact "2 skipped (dirty, no-pr)" summary of why worktrees were skipped. */
+function describeSkips(skipped: MergeQueueSkip[], total: number): string {
+  if (skipped.length === 0) {
+    return `no eligible worktrees in the ${total} selected`;
+  }
+  const kinds = [...new Set(skipped.map((s) => s.kind))].join(", ");
+  return `${skipped.length} of ${total} skipped (${kinds})`;
+}
+
+/**
+ * The enqueue confirmation. Always shown — enqueuing mutates remote state on
+ * GitHub, and a batch is one gesture over N PRs — listing exactly which PRs will
+ * be queued and which were skipped, with reasons.
+ */
+async function confirmEnqueue(
+  eligible: MergeQueuePrRef[],
+  skipped: MergeQueueSkip[],
+  total: number,
+): Promise<boolean> {
+  const confirmLabel = eligible.length === 1 ? "Add to Merge Queue" : "Add All to Merge Queue";
+  const detail = [
+    ...eligible.map((e) => `• #${e.number} ${e.branch}`),
+    ...(skipped.length > 0
+      ? ["", "Skipped:", ...skipped.map((s) => `• ${s.detail} (${s.kind})`)]
+      : []),
+  ].join("\n");
+  const choice = await vscode.window.showWarningMessage(
+    skipped.length > 0
+      ? `Enqueue ${eligible.length} of ${total} worktrees? (${skipped.length} skipped)`
+      : `Enqueue ${eligible.length} ${eligible.length === 1 ? "pull request" : "pull requests"}?`,
+    { modal: true, detail },
+    confirmLabel,
+  );
+  return choice === confirmLabel;
+}
+
+/** Toasts the phase-2 outcome: how many queued, and any per-PR failures. */
+function reportEnqueueResult(result: EnqueueResult): void {
+  const queued = result.queued ?? [];
+  const failed = result.failed ?? [];
+  if (failed.length > 0) {
+    void vscode.window.showErrorMessage(
+      `omni-dev: ${failed.length} of ${queued.length + failed.length} failed — ${failed
+        .map((f) => `#${f.number}: ${f.error}`)
+        .join("; ")}`,
+    );
+    return;
+  }
+  const already = queued.filter((q) => q.already_queued).length;
+  const suffix = already > 0 ? ` (${already} already queued)` : "";
+  void vscode.window.showInformationMessage(
+    `omni-dev: ${queued.length} ${
+      queued.length === 1 ? "pull request" : "pull requests"
+    } in the merge queue${suffix}.`,
   );
 }
 

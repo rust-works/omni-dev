@@ -89,6 +89,12 @@
         "icon": "$(link-external)"
       },
       {
+        "command": "omniDevWorktrees.addToMergeQueue",
+        "title": "Add to Merge Queue",
+        "category": "omni-dev",
+        "icon": "$(git-merge)"
+      },
+      {
         "command": "omniDevWorktrees.moveClaudeSessionHere",
         "title": "Move Claude Session Here",
         "category": "omni-dev"
@@ -150,6 +156,10 @@
         },
         {
           "command": "omniDevWorktrees.openPullRequestInBrowser",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.addToMergeQueue",
           "when": "false"
         },
         {
@@ -215,6 +225,11 @@
           "command": "omniDevWorktrees.openPullRequestInBrowser",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /github/",
           "group": "1_pr@2"
+        },
+        {
+          "command": "omniDevWorktrees.addToMergeQueue",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^worktree\\..*github/",
+          "group": "1_pr@3"
         },
         {
           "command": "omniDevWorktrees.moveClaudeSessionHere",

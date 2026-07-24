@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Add to Merge Queue** ([#1401](https://github.com/rust-works/omni-dev/issues/1401)): a new context-menu action on any GitHub-backed worktree row in the **Worktrees** view adds the branch's pull request to the repo's **GitHub merge queue**. It is built for a multi-selection: pick any number of worktrees, act once, and only the ones genuinely ready to merge are queued — the rest are **skipped with a reason** shown up front, never silently included. Ready means: a clean working tree, commits that are all pushed, and an open pull request that is not a draft, has no merge conflicts, and has green checks. The daemon does the checking, so a dirty or unpushed worktree is filtered out without spending any GitHub API budget, and the whole selection resolves in a single API call. A confirmation lists exactly which PRs will be queued and why the others were skipped — enqueuing changes state on GitHub that other people can see, so it always asks, even for one row. The daemon re-checks everything after you confirm, so a worktree that went dirty or was force-pushed while the dialog was open is dropped rather than queued. A PR already in the queue counts as success, and a PR GitHub refuses (merge queue not enabled on the repo, conflicts, insufficient permissions) is reported individually without affecting the rest. **Requires** the merge queue to be enabled on the repository, and a daemon built with this release.
+
 ## [0.6.0] - 2026-07-22
 
 ### Added
