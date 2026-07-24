@@ -191,6 +191,43 @@ never a VS Code window, so it omits `requester_key`: the daemon treats the close
 cross-window, signals every owning window to close, waits (bounded ~20s) for them to
 unregister, then prunes.
 
+`worktrees rebase` rebases worktrees onto the repository's **remote default
+branch**, fetching that branch **exactly once per repository** up front (#1400,
+[ADR-0055](adrs/adr-0055.md)). Unlike every other subcommand it runs **entirely
+locally and never contacts the daemon**: the fetch needs the user's `ssh-agent` /
+credential-helper environment, which the daemon (spawned by launchd/systemd with a
+minimal environment) does not have — so a daemon-side fetch could not authenticate
+to an SSH remote. Following [ADR-0003](adrs/adr-0003.md), the fetch and rebase shell
+out to the user's `git` (git2 only reads); the batch logic lives in
+`src/git/worktree_rebase.rs`.
+
+```bash
+# Preview: fetch once per repo, report what would be rebased, change nothing.
+omni-dev worktrees rebase --all --dry-run
+
+# Rebase every linked worktree of the current repo (interactive y/N unless --yes).
+omni-dev worktrees rebase --all
+
+# Rebase specific worktrees onto an explicit ref (still fetched once up front).
+omni-dev worktrees rebase /path/to/wt-a /path/to/wt-b --onto origin/release
+
+# Stash uncommitted tracked changes around each rebase instead of skipping.
+omni-dev worktrees rebase --all --autostash
+```
+
+Selection is explicit: pass `<PATH>...` **or** `--all` (every linked worktree of the
+current repo, never the main working tree, keyed on the structural `is_main` fact as
+`close` is). A bare invocation with neither is a usage error, not a silent
+mass-rebase. Each worktree is reported as `rebased` / `up-to-date` /
+`skipped(<reason>)` / `conflict` / `fetch-failed` (`-o json` for the machine shape).
+A dirty worktree is skipped with a reason (unless `--autostash`); a detached HEAD or
+an in-progress rebase/merge is skipped; a rebase that hits conflicts is
+`git rebase --abort`-ed so the worktree is **left exactly as it was** and reported,
+and the batch continues for the rest. A rebase rewrites branch history, so the
+command confirms by default ([ADR-0027](adrs/adr-0027.md)); `--dry-run` still fetches
+(non-destructive) so the behind-count preview is accurate. This subcommand takes no
+`--socket` (it never opens the control socket).
+
 `worktrees show-closed` reads or sets the cross-window "show closed worktrees"
 toggle (`set-show-closed`; the value rides the `tree` snapshot's `show_closed`):
 
@@ -715,6 +752,17 @@ the `close` deletion, both same-user-bounded and guarded; see
 [ADR-0048](adrs/adr-0048.md) and [ADR-0049](adrs/adr-0049.md) for the full
 threat-model notes.
 
+The **`worktrees rebase`** command rewrites branch history and touches the network,
+but adds **no new socket capability**: it is a **pure CLI-side** operation that
+never opens the control socket ([ADR-0055](adrs/adr-0055.md)). It runs in the
+invoking user's own shell with their `git` credentials — deliberately *not* in the
+daemon, whose minimal launchd/systemd environment lacks `SSH_AUTH_SOCK` and could
+not authenticate an SSH fetch. It rewrites only branches the user names (or `--all`
+of their own repo's linked worktrees), refuses the main working tree on the same
+structural `is_main` guard as `close`, confirms by default, and aborts-and-restores
+rather than leaving a worktree dirty or half-rebased. No secret is read or
+persisted; the fetch relies entirely on the user's ambient `git` configuration.
+
 ## Companion contract (for the extension and other clients)
 
 The service is reachable directly over the daemon's Unix control socket
@@ -1026,7 +1074,10 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   deferred.
 - The tree view is **view + focus only**; worktree *management* actions
   (add/remove/prune) are out of scope for this iteration (except the destructive
-  **close** in [ADR-0049](adrs/adr-0049.md)).
+  **close** in [ADR-0049](adrs/adr-0049.md)). `worktrees rebase`
+  ([ADR-0055](adrs/adr-0055.md)) adds a *management* action too, but as a **CLI-only**
+  command rather than a tree-view/daemon op — a tray "rebase all" is a follow-up
+  blocked on the daemon's lack of the user's fetch credentials.
 - **PR badges are `gh`-based and GitHub-only (#1296):** the tree resolves open PRs
   via the GitHub CLI on repo-expand ([ADR-0050](adrs/adr-0050.md)). Other forges
   (GitLab/Bitbucket) and PR *creation/review/merge* are out of scope — the latter
