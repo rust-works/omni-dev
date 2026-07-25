@@ -81,3 +81,4 @@ by Michael Nygard.
 | [ADR-0055](adr-0055.md)  | ✅ Accepted                              | 2026-07-24 | Batch Worktree Rebase onto Remote Main, Fetch-Once-Per-Repository, CLI-Side                 |
 | [ADR-0056](adr-0056.md)  | ✅ Accepted                              | 2026-07-24 | Batch Merge-Queue Enqueue over the Daemon, Gated by Server-Side Eligibility                 |
 | [ADR-0057](adr-0057.md)  | ✅ Accepted                              | 2026-07-25 | Authoritative Claude Session State via a Stream-Tee Process Wrapper                         |
+| [ADR-0058](adr-0058.md)  | ✅ Accepted                              | 2026-07-25 | Repositioning VS Code Windows from the Daemon via the macOS Accessibility API               |

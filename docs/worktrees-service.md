@@ -253,6 +253,29 @@ interactively (unless `--yes`) and sends the **phase-2** execute, which re-valid
 every gate before enqueuing. `--check` stops after the report. The final summary
 counts queued/failed/skipped, marking any PR that was `(already queued)`.
 
+`worktrees reposition` moves and resizes worktrees' open VS Code windows to match a
+reference window, on macOS (#1407) — see
+[Window repositioning](#window-repositioning-macos) for the permission setup and the
+matching rules:
+
+```bash
+# Show which OS window each worktree resolves to; move nothing.
+omni-dev worktrees reposition --reference /path/to/ref /path/to/wt-a --dry-run
+
+# Move the named worktrees' windows onto the reference window's geometry.
+omni-dev worktrees reposition --reference /path/to/ref /path/to/wt-a /path/to/wt-b
+
+# Put back whatever the last reposition moved.
+omni-dev worktrees reposition --undo
+```
+
+`--reference` is required unless `--undo` is given, and the reference window is never
+itself moved. Paths are resolved client-side and then mapped to the keys of the
+windows that have them open — the op addresses *windows*, since geometry belongs to
+the OS window rather than to the worktree — so a worktree with no open window is an
+error here rather than a silent skip. All Accessibility work happens in the **daemon**,
+which is what holds the permission.
+
 `worktrees show-closed` reads or sets the cross-window "show closed worktrees"
 toggle (`set-show-closed`; the value rides the `tree` snapshot's `show_closed`):
 
@@ -669,6 +692,151 @@ would be quietly wrong — the real counts arrive in the terminal seconds later.
 as `skipped` in output the user is already reading, and a target other than the
 remote default branch is a CLI concern (#1409).
 
+### Window repositioning (macOS)
+
+**Reposition Windows to Match** (the `4_layout` context-menu group) moves and
+resizes every selected worktree's **already-open** VS Code window so it occupies
+the same position and size as the window you invoked the command from.
+
+- The **invoking window is the reference**: it supplies the geometry and is never
+  itself moved, even if it is part of the selection.
+- **Z-order does not change.** Nothing is raised, lowered, or activated — the
+  windows land on top of each other in whatever front-to-back order they already
+  had. This is a property of the mechanism, not a promise the daemon maintains:
+  setting a window's Accessibility position/size attributes does not raise it.
+- Worktrees with **no open window** are skipped and reported.
+- Fullscreen and minimized windows are **skipped**, not mangled: a resize has no
+  effect in native fullscreen, and geometry writes on a minimized window are
+  undefined.
+
+A VS Code extension cannot do any of this — there is no API for a window's OS
+position or size, and the upstream request is explicitly parked
+([microsoft/vscode#28150](https://github.com/microsoft/vscode/issues/28150),
+[#83170](https://github.com/microsoft/vscode/issues/83170),
+[#195406](https://github.com/microsoft/vscode/issues/195406)) — so the daemon does
+it through the macOS Accessibility API. See [ADR-0058](adrs/adr-0058.md).
+
+**macOS only.** Elsewhere the op reports the same "no permission" state as an
+un-granted macOS daemon, and the companion hides the menu item.
+
+#### Setup: the Accessibility permission
+
+This is the one omni-dev feature that needs an OS permission grant. Without it
+nothing is moved and the reply says so.
+
+1. Open **System Settings → Privacy & Security → Accessibility**.
+2. Click **+**. In the file picker press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd> and
+   type the path of the installed binary — `~/.cargo/bin/omni-dev` for a
+   `cargo install`, or the output of `which omni-dev`. (The picker hides dotted
+   directories, hence the Go-to-Folder step.)
+3. Ensure the new entry's toggle is **on**.
+4. Restart the daemon: `omni-dev daemon restart`.
+
+Step 4 is required, not belt-and-braces: macOS applies a grant when a process
+starts, so the already-running daemon will not pick it up.
+
+> **The grant does not survive an upgrade.** omni-dev installs unsigned, so its
+> code signature changes on every rebuild and macOS silently stops honouring the
+> grant — the entry stays listed but no longer works. After each
+> `cargo install omni-dev` (or `brew upgrade`), toggle the entry off and on again
+> (or remove and re-add it) and restart the daemon. A stable code-signing identity
+> would fix this and is a follow-up.
+
+The extension surfaces a missing grant with an **Open Accessibility Settings**
+button rather than an opaque failure. The daemon never raises the system permission
+prompt itself: a dialog from a background LaunchAgent is unreliable.
+
+#### How a worktree is matched to its window
+
+The registry stores no OS window id and no geometry, and its `pid` is the
+**extension-host** process — in Electron every window's native `NSWindow` belongs
+to the single **main** process, so the pid cannot locate a window. Resolution is
+therefore two steps:
+
+1. **Which application** — the extension host is a child of the VS Code main
+   process, so one batched `ps -o pid=,ppid=` names the owning app. This also keeps
+   Stable, Insiders, and VSCodium windows correctly separated.
+2. **Which window within it** — the registry's `title` (that is
+   `vscode.workspace.name`, normally the worktree's directory name) is matched
+   against each window's `AXTitle` through progressively looser rules — exact
+   equality, then suffix, then substring — where **each rule must isolate exactly
+   one window** to be accepted.
+
+If no rule isolates a single window the target is reported `ambiguous` and **left
+alone**. Moving the wrong window is a worse failure than moving none, so the daemon
+refuses to guess. Matching is reliable for VS Code's default window title; it
+degrades — always into a *reported skip*, never a mis-target — if you set a custom
+`window.title`, use a non-default profile, or have two worktrees with the same
+directory name open at once.
+
+Use `--dry-run` to see exactly what resolves to what before moving anything.
+
+#### Per-target outcomes
+
+| `outcome`     | Meaning                                                          |
+| ------------- | ---------------------------------------------------------------- |
+| `moved`       | The window now has the reference frame.                          |
+| `would-move`  | Dry run: resolved to one window, and would have been moved.       |
+| `unchanged`   | Already in that position; nothing was written.                    |
+| `partial`     | Moved, but settled elsewhere (a minimum size, or a display that refused the position). `detail` names where it landed. |
+| `reference`   | This is the invoking window, which never moves.                   |
+| `no-window`   | No window is open on this worktree any more (a stale row).         |
+| `no-title`    | The window reported no name to match on (a brand-new empty window). |
+| `no-pid`      | The window reported no process id.                                |
+| `not-found`   | No window of the owning application matched the name.             |
+| `ambiguous`   | Several windows matched, or an earlier selection entry claimed the same one. |
+| `minimized`   | The window is in the Dock.                                        |
+| `fullscreen`  | The window is in native fullscreen, where a resize is a no-op.     |
+| `failed`      | The window rejected the write; `detail` carries the `AXError`.      |
+
+A whole batch can also be refused before any target is attempted, with a
+`blocked.reason` of `reference-unidentifiable`, `reference-not-found`,
+`reference-ambiguous`, `reference-fullscreen`, or `reference-minimized` — all
+meaning there was no usable geometry to copy.
+
+#### Undoing
+
+Repositioning has no confirmation prompt: it creates, modifies and deletes nothing,
+and it is a layout command you repeat. What it does lose is the previous layout, so
+the daemon remembers where it moved each window from and offers **Undo** on the
+summary notification, plus an `omni-dev: Undo Reposition Windows` command in the
+palette.
+
+The record is **one level deep and in memory**: the next reposition replaces it, an
+undo consumes it (so it cannot be replayed onto a layout you have since redone by
+hand), and a daemon restart drops it. Undo re-resolves every window from scratch, so
+one that has closed or gone fullscreen in the meantime is reported rather than
+forced.
+
+#### From the CLI
+
+```bash
+# Show which OS window each worktree resolves to — moves nothing.
+omni-dev worktrees reposition --reference ~/wrk/wt/issue-1407 ~/wrk/wt/issue-1406 --dry-run
+
+# Move issue-1406's and issue-1401's windows onto issue-1407's geometry.
+omni-dev worktrees reposition --reference ~/wrk/wt/issue-1407 \
+  ~/wrk/wt/issue-1406 ~/wrk/wt/issue-1401
+
+# Put them back.
+omni-dev worktrees reposition --undo
+```
+
+Paths are the CLI's currency (as for `focus`/`close`); it maps each to the key of
+the window that has it open, and errors if a named worktree has no open window.
+Running it from a terminal needs no permission of its own — the CLI is a socket
+client, so the Accessibility calls happen in the **daemon's** process under the
+daemon's grant.
+
+Every invocation is auditable in `omni-dev daemon logs` as a `reposition` INFO line
+carrying `phase` (`check`/`apply`/`blocked`/`untrusted`), the counts, and the
+per-target outcome slugs — so "why did that window not move?" is answerable from the
+log alone.
+
+**Known limitation — Spaces.** A window on another macOS Space *is* moved (the
+coordinates apply) but stays on that Space, so you will not see the change until you
+switch to it.
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -925,6 +1093,27 @@ capability**. What it does add is a one-click path to a history rewrite, which i
 why it always confirms with a modal listing every branch it would rewrite, and why
 it is offered on **linked** worktrees only.
 
+The **`reposition`** op adds no socket capability but does introduce a new **OS**
+trust surface, the first in omni-dev ([ADR-0058](adrs/adr-0058.md)): moving another
+application's window requires the macOS **Accessibility** permission, which is
+coarse — a process holding it could in principle drive any application's UI. So the
+*capability the daemon holds* is far broader than the *capability it uses*, and the
+narrowness is enforced in our own code rather than by the OS: the Accessibility
+module reads only window titles, geometry and state flags, writes only position and
+size, and only for processes the caller named by pid. It never synthesises input,
+reads window contents, raises, activates, or closes a window. All of it is confined
+to one `#[allow(unsafe_code)]` module behind a four-method trait, with every
+Accessibility call bounded by an explicit messaging timeout so an unresponsive
+application cannot wedge a daemon thread.
+
+On the socket itself the addition is mild: a *writer* can rearrange the owning
+user's windows, which is annoying rather than dangerous, and already requires being
+that user. Nothing is persisted — the one-level undo record is in-memory like the
+close directive, so a daemon restart simply drops it. The grant is **opt-in** and
+must be added by hand; without it the op moves nothing and says so. Note that
+because omni-dev installs unsigned, the grant is invalidated by every upgrade and
+must be re-applied — see [Window repositioning](#window-repositioning-macos).
+
 ## Companion contract (for the extension and other clients)
 
 The service is reachable directly over the daemon's Unix control socket
@@ -954,6 +1143,8 @@ Ops:
 | `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
+| `reposition`      | `{ reference_key, target_keys[], check? }`     | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
+| `reposition-undo` | `null`                                         | *(same shape, without `reference`)*        |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
 | `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
 | `subscribe`       | `null`                                         | *(stream — see below)*                     |
@@ -965,7 +1156,7 @@ author`, forwarded from `gh pr list --json`) from a **shared, TTL-cached** resul
 `gh` per repo. The client answers a branch already carrying a `pr` badge straight
 from the snapshot without ever calling it.
 
-The first eleven ops are strictly **request → one reply**. `subscribe` is the one
+The first thirteen ops are strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
@@ -1227,6 +1418,15 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
   they run on Windows only under WSL2, and a native (non-WSL) Windows port is
   tracked with the broader daemon work (#1363).
+- **Window repositioning is macOS-only (v1)** ([ADR-0058](adrs/adr-0058.md)). The
+  platform sits behind a four-method trait, so Linux/X11 (EWMH title matching) and
+  Windows (`SetWindowPos`) would each be one additional implementation with no
+  change to any caller; Wayland is generally not possible. Two other follow-ups:
+  **code signing**, so the Accessibility grant survives an upgrade instead of being
+  invalidated on every rebuild, and — should title matching prove too weak in
+  practice — embedding the window key in `window.title` for exact matching, at the
+  cost of a visibly modified title bar. Arranging windows into a grid or cascade,
+  rather than copying one window's frame, is a separate feature.
 - **Open-window-derived repos (v1):** a repository appears in the `tree` only while
   at least one of its windows is open. **Configured repo roots** — so a repo shows
   with zero windows open — are a deliberate follow-up ([ADR-0048](adrs/adr-0048.md),
