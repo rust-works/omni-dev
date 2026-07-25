@@ -323,6 +323,15 @@ test("worktreeDescription shows sync and PR together, each only when present", (
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }), "");
 });
 
+test("worktreeDescription appends the Claude session glyphs last (#1406)", () => {
+  const wt = REPOS[0].worktrees[0];
+  assert.equal(worktreeDescription({ ...wt, pr: OPEN_PR }, "⚙2"), "↑2 ↓0  #65  ⚙2");
+  // Sessions alone, with neither sync nor PR to precede them.
+  assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }, "!1"), "!1");
+  // No sessions → byte-for-byte the pre-#1406 description.
+  assert.equal(worktreeDescription(wt, ""), worktreeDescription(wt));
+});
+
 test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
   const withPrTip = worktreeTooltip({ ...REPOS[0].worktrees[0], pr: OPEN_PR }, REPOS[0], "w1");
   assert.match(withPrTip, /PR #65 · open · checks passing/);
@@ -345,6 +354,15 @@ test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
 
   // No PR → no PR line at all.
   assert.doesNotMatch(worktreeTooltip(REPOS[0].worktrees[0], REPOS[0]), /PR #/);
+});
+
+test("worktreeTooltip adds a Claude line only when sessions are running (#1406)", () => {
+  const wt = REPOS[0].worktrees[0];
+  const withSessions = worktreeTooltip(wt, REPOS[0], "w1", "Claude: 1 waiting on you");
+  assert.match(withSessions, /Claude: 1 waiting on you/);
+  // It sits above the open line, which stays last.
+  assert.match(withSessions, /Claude: 1 waiting on you\n● this window$/);
+  assert.doesNotMatch(worktreeTooltip(wt, REPOS[0]), /Claude:/);
 });
 
 test("nodeId is stable and distinguishes repos from worktrees", () => {
