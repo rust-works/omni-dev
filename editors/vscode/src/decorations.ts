@@ -1,16 +1,25 @@
-// The `vscode`-facing file-decoration layer for the Worktrees tree: a
-// `FileDecorationProvider` that paints a colored badge (and tints the row label)
-// for a worktree's PR CI-check state (#1324) or its running Claude sessions
-// (#1406). Both color/glyph decisions are pure and unit-tested — in `tree.ts`
-// and `sessionCounts.ts` respectively; this file only owns the custom
-// `resourceUri` scheme, the priority between the two, and the mapping onto a
-// `vscode.FileDecoration`.
+// The `vscode`-facing file-decoration layer for the Worktrees tree: the badges
+// that carry a worktree's PR CI-check verdict (#1324) and its running Claude
+// sessions (#1406). Every glyph/colour decision is pure and unit-tested — in
+// `tree.ts` and `sessionCounts.ts`; this file owns only the custom `resourceUri`
+// scheme and the mapping onto a `vscode.FileDecoration`.
 //
 // A custom scheme (not `file:`) keeps these decorations from colliding with the
 // built-in git SCM provider, which decorates real folder URIs. Both states are
 // encoded in the URI query, so a change yields a new URI that re-decorates on
 // its own; `refresh()` additionally re-queries every visible row when a new
 // snapshot, PR-badge fetch, or session poll lands.
+//
+// **Why two providers.** A single `FileDecoration.badge` is capped at two
+// characters by the extension host, so one decoration cannot carry both a
+// session cue and a check verdict. VS Code does merge across providers — it
+// concatenates their badges (`⚙1, ✓`) and joins their tooltips — but it paints
+// the merged result in exactly *one* colour, chosen by an internal ordering an
+// extension cannot influence (`weight` is not on the API, and provider order is
+// registration order reversed). So both providers here compute the **same**
+// severity-ranked colour via `rowColorId`, which makes that choice moot: red
+// (checks failing) outranks yellow (checks pending, or a session waiting on you)
+// outranks green (checks passing, or a session working) outranks muted (idle).
 
 import * as vscode from "vscode";
 
@@ -20,21 +29,27 @@ import {
   encodeSessionTally,
   sessionDecoration,
 } from "./sessionCounts";
-import { CheckDecoration, PrCheckState, checkStateDecoration } from "./tree";
+import { CheckDecoration, PrCheckState, checkStateDecoration, rowColorId } from "./tree";
 
 /**
- * The custom URI scheme carried by every worktree row that has a check badge. Kept
+ * The custom URI scheme carried by every worktree row that has a badge. Kept
  * distinct from `file:` so the built-in git SCM decoration provider — which
  * decorates real folder URIs — never fights over these rows.
  */
 export const WORKTREE_URI_SCHEME = "omnidev-worktree";
 
 /**
+ * Which of the two badge dimensions a provider renders. Each gets its own
+ * provider because a decoration's badge holds at most two characters.
+ */
+export type BadgeDimension = "sessions" | "checks";
+
+/**
  * Builds a worktree row's decoratable `resourceUri`: the custom scheme, the
- * worktree path, and the decoratable state in the query — the PR `checks` state
- * and, since #1406, the row's Claude session tally. Encoding the state means a
- * change (e.g. `pending` → `success`, or a session starting to wait) produces a
- * **new** URI, which VS Code re-queries for a decoration on its own.
+ * worktree path, and both decoratable states in the query — the PR `checks`
+ * verdict and the row's Claude session tally. Encoding the state means a change
+ * (e.g. `pending` → `success`, or a session starting to wait) produces a **new**
+ * URI, which VS Code re-queries for a decoration on its own.
  */
 export function worktreeResourceUri(
   path: string,
@@ -48,60 +63,59 @@ export function worktreeResourceUri(
   return vscode.Uri.from({ scheme: WORKTREE_URI_SCHEME, path, query: query.toString() });
 }
 
-/**
- * The single decoration a worktree row gets, from the two dimensions its query
- * can carry.
- *
- * VS Code allows one `FileDecoration` per URI per provider, so when a row both
- * runs Claude sessions and has a PR, the sessions win: they are the live,
- * changing thing, and the PR's check state is still one hover away in the
- * tooltip. A row with neither gets no decoration at all.
- */
-function rowDecoration(query: string): CheckDecoration | undefined {
+/** Both dimensions, decoded back out of a row's `resourceUri` query. */
+function rowDecorations(query: string): {
+  sessions?: CheckDecoration;
+  checks?: CheckDecoration;
+} {
   const params = new URLSearchParams(query);
-  const sessions = sessionDecoration(decodeSessionTally(params.get("claude")));
-  if (sessions) {
-    return sessions;
-  }
   const checks = params.get("checks") as PrCheckState | null;
-  return checks ? checkStateDecoration(checks) : undefined;
+  return {
+    sessions: sessionDecoration(decodeSessionTally(params.get("claude"))),
+    checks: checks ? checkStateDecoration(checks) : undefined,
+  };
 }
 
 /**
- * Paints a worktree row's colored badge: its Claude session cue (#1406) or, when
- * it runs none, its PR CI-check verdict (#1324). For an `omnidev-worktree:` URI
- * it reads both states back from the query and maps the winner — via the pure
- * {@link sessionDecoration} / {@link checkStateDecoration} — to a
- * `vscode.FileDecoration` (badge + `ThemeColor`); every other scheme, and a row
- * with nothing to show, yields no decoration. `propagate = false` keeps the tint
- * on the worktree row and off its repo parent.
+ * Paints one dimension of a worktree row's badge, in the colour of whichever
+ * dimension is more severe.
+ *
+ * Two of these are registered, one per {@link BadgeDimension}; VS Code merges
+ * them onto the row. `propagate = false` keeps the tint on the worktree row and
+ * off its repo parent.
  */
 export class WorktreeDecorationProvider implements vscode.FileDecorationProvider {
   private readonly emitter = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
   readonly onDidChangeFileDecorations = this.emitter.event;
 
+  constructor(private readonly dimension: BadgeDimension) {}
+
   provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
     if (uri.scheme !== WORKTREE_URI_SCHEME) {
       return undefined;
     }
-    const decoration = rowDecoration(uri.query);
-    if (!decoration) {
+    const { sessions, checks } = rowDecorations(uri.query);
+    const mine = this.dimension === "sessions" ? sessions : checks;
+    if (!mine) {
       return undefined;
     }
-    const fileDecoration = new vscode.FileDecoration(
-      decoration.badge,
-      decoration.tooltip,
-      new vscode.ThemeColor(decoration.colorId),
+    // Deliberately not `mine.colorId`: the merged badge gets one colour, so both
+    // providers agree on the severity winner rather than racing for it.
+    const colorId = rowColorId(checks?.colorId, sessions?.colorId);
+    const decoration = new vscode.FileDecoration(
+      mine.badge,
+      mine.tooltip,
+      colorId ? new vscode.ThemeColor(colorId) : undefined,
     );
-    // Tint the worktree row only — never propagate up to (and colour) its repo row.
-    fileDecoration.propagate = false;
-    return fileDecoration;
+    decoration.propagate = false;
+    return decoration;
   }
 
   /**
-   * Re-evaluates the badge on every visible row. Fired when a new snapshot or a
-   * lazy PR-badge fetch may have changed a worktree's check state, so colours
-   * refresh even for a row whose `resourceUri` string is unchanged.
+   * Re-evaluates this dimension's badge on every visible row. Fired when a new
+   * snapshot, a lazy PR-badge fetch, or a session poll may have changed a
+   * worktree's state, so colours refresh even for a row whose `resourceUri`
+   * string is unchanged.
    */
   refresh(): void {
     this.emitter.fire(undefined);
