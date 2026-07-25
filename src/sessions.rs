@@ -25,6 +25,11 @@
 //! [`SessionState::for_event`]). `waiting_for_permission` / `waiting_for_input`
 //! are reliable (they come from a `Notification` hook); the transcript watcher
 //! backstops the "thinking window" where no hook fires.
+//!
+//! The one exception is Feed 4, the [`stream`] tracker behind
+//! `omni-dev claude-wrap`: it reads the exact state out of Claude's stream-json
+//! stdio and reports it as [`SessionEvent::StreamState`], which
+//! [`SessionState::for_event`] applies verbatim. See ADR-0057.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +39,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod stream;
 pub mod watcher;
 
 /// How long a session may go silent before it ages out of the registry.
