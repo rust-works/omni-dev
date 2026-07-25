@@ -51,6 +51,8 @@ pub enum WorktreesSubcommands {
     Rebase(RebaseCommand),
     /// Enqueue eligible worktrees' PRs into the GitHub merge queue.
     MergeQueue(MergeQueueCommand),
+    /// Move and resize worktrees' open windows to match a reference window.
+    Reposition(RepositionCommand),
     /// Show or set whether closed worktrees are shown across all windows.
     ShowClosed(ShowClosedCommand),
     /// Register a window's open worktree folders (companion feed op).
@@ -76,6 +78,7 @@ impl WorktreesCommand {
             WorktreesSubcommands::Close(cmd) => cmd.execute().await,
             WorktreesSubcommands::Rebase(cmd) => cmd.execute(repo).await,
             WorktreesSubcommands::MergeQueue(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Reposition(cmd) => cmd.execute().await,
             WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
@@ -708,6 +711,206 @@ impl MergeQueueCommand {
         println!("{}", render_enqueue_result(&result));
         Ok(())
     }
+}
+
+/// Moves and resizes worktrees' open VS Code windows to match a reference
+/// window's geometry (#1407).
+///
+/// The CLI counterpart of the tree view's "Reposition Windows to Match", and the
+/// diagnostic surface for it: `--dry-run` reports exactly which OS window each
+/// worktree resolved to without touching anything, which is how a title-matching
+/// problem is diagnosed.
+///
+/// Paths, not window keys, are the CLI's currency (as for `focus`/`close`), so a
+/// `list` call up front maps each folder to the key of the window that has it
+/// open. The daemon does all the OS work — it holds the macOS Accessibility grant,
+/// which a terminal-launched process would not.
+#[derive(Parser)]
+pub struct RepositionCommand {
+    /// Worktree folders whose windows to move. Each is canonicalized client-side,
+    /// as the daemon runs in a different cwd and matches by canonical path.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+    /// The worktree whose window supplies the target position and size. It is
+    /// never itself moved.
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "undo",
+        conflicts_with = "undo"
+    )]
+    pub reference: Option<PathBuf>,
+    /// Report which window each worktree resolves to and stop; move nothing.
+    #[arg(long, conflicts_with = "undo")]
+    pub dry_run: bool,
+    /// Put the windows the last reposition moved back where they were.
+    #[arg(long)]
+    pub undo: bool,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl RepositionCommand {
+    /// Executes the reposition command.
+    pub async fn execute(self) -> Result<()> {
+        let output = self.output;
+        let socket = server::resolve_socket(self.socket)?;
+        if self.undo {
+            let reply = call(&socket, "reposition-undo", Value::Null).await?;
+            return print_reposition(output, &reply);
+        }
+        // `required_unless_present` guarantees this on the non-undo path.
+        let Some(reference) = self.reference.as_deref() else {
+            bail!("`reposition` requires `--reference <PATH>`");
+        };
+
+        // Resolve folders to the keys of the windows that have them open. The op
+        // addresses *windows*, since geometry belongs to the OS window rather than
+        // to the worktree, and only the registry knows which window that is.
+        let windows = call(&socket, "list", Value::Null).await?;
+        let reference_key = window_key_for(&windows, reference)?;
+        let mut target_keys = Vec::with_capacity(self.paths.len());
+        for path in &self.paths {
+            target_keys.push(window_key_for(&windows, path)?);
+        }
+
+        let reply = call(
+            &socket,
+            "reposition",
+            json!({
+                "reference_key": reference_key,
+                "target_keys": target_keys,
+                "check": self.dry_run,
+            }),
+        )
+        .await?;
+        print_reposition(output, &reply)
+    }
+}
+
+/// Prints a `reposition` / `reposition-undo` reply in the requested format.
+fn print_reposition(output: TableOrJson, reply: &Value) -> Result<()> {
+    match output {
+        TableOrJson::Json => println!("{}", serde_json::to_string_pretty(reply)?),
+        TableOrJson::Table => println!("{}", render_reposition(reply)),
+    }
+    Ok(())
+}
+
+/// Finds the registry key of the window that has `path` open.
+///
+/// Canonicalizes client-side and compares against each window's canonicalized
+/// folders, the same convention `close`/`focus` use. A worktree with no open
+/// window is an error rather than a silent skip: the CLI names its targets one by
+/// one, so an unmatched one is a mistake worth reporting, unlike a multi-select in
+/// the tree view where a stale row is expected.
+fn window_key_for(windows: &Value, path: &Path) -> Result<String> {
+    let wanted = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve worktree path: {}", path.display()))?;
+    windows
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .find(|window| {
+            window
+                .get("folders")
+                .and_then(Value::as_array)
+                .is_some_and(|folders| {
+                    folders.iter().filter_map(Value::as_str).any(|folder| {
+                        std::fs::canonicalize(folder).is_ok_and(|folder| folder == wanted)
+                    })
+                })
+        })
+        .and_then(|window| window.get("key").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no VS Code window has {} open (only open windows can be repositioned)",
+                wanted.display()
+            )
+        })
+}
+
+/// Renders a `reposition` / `reposition-undo` reply as a human-readable report:
+/// the permission state, the reference geometry, a summary count, and one line per
+/// target with its outcome.
+fn render_reposition(reply: &Value) -> String {
+    if reply.get("trusted").and_then(Value::as_bool) == Some(false) {
+        return "omni-dev does not hold the macOS Accessibility permission, so no window \
+                was touched.\nGrant it in System Settings → Privacy & Security → \
+                Accessibility (add the omni-dev binary), then run `omni-dev daemon restart`."
+            .to_string();
+    }
+    if let Some(blocked) = reply.get("blocked") {
+        let reason = sanitize(blocked.get("reason").and_then(Value::as_str).unwrap_or("-"));
+        let detail = sanitize(blocked.get("detail").and_then(Value::as_str).unwrap_or(""));
+        return format!("Nothing was moved [{reason}]: {detail}");
+    }
+
+    let moved = reply.get("moved").and_then(Value::as_u64).unwrap_or(0);
+    let skipped = reply.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+    let mut out = String::new();
+    if let Some(reference) = reply.get("reference") {
+        let title = sanitize(
+            reference
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+        );
+        out.push_str(&format!(
+            "Reference: {title} {}\n",
+            render_frame(reference.get("frame"))
+        ));
+    }
+    out.push_str(&format!("Moved: {moved} / Skipped: {skipped}"));
+    let results = reply
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for result in results {
+        let outcome = sanitize(result.get("outcome").and_then(Value::as_str).unwrap_or("-"));
+        let title = sanitize(
+            result
+                .get("title")
+                .and_then(Value::as_str)
+                .or_else(|| result.get("key").and_then(Value::as_str))
+                .unwrap_or("-"),
+        );
+        let detail = sanitize(result.get("detail").and_then(Value::as_str).unwrap_or(""));
+        out.push_str(&format!("\n  {outcome}: {title} — {detail}"));
+    }
+    if results.is_empty() {
+        out.push_str("\n  (nothing to report)");
+    }
+    out
+}
+
+/// Renders a frame as `WxH at (X, Y)`, or `-` when absent.
+fn render_frame(frame: Option<&Value>) -> String {
+    let Some(frame) = frame else {
+        return "-".to_string();
+    };
+    let field = |name: &str| {
+        frame
+            .get(name)
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .round()
+    };
+    format!(
+        "{}×{} at ({}, {})",
+        field("width"),
+        field("height"),
+        field("x"),
+        field("y")
+    )
 }
 
 /// Shows or sets the cross-window "show closed worktrees" toggle.
