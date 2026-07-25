@@ -1280,6 +1280,56 @@ mod tests {
     }
 
     #[test]
+    fn restore_needs_the_permission_too() {
+        // The undo path checks `trusted` independently: losing the grant between a
+        // reposition and its undo must report, not half-restore.
+        let backend = FakeBackend {
+            trusted: false,
+            ..FakeBackend::new()
+        };
+        let report = restore(
+            &backend,
+            &[(
+                registered("t1", "target-tree", 12),
+                frame(0.0, 0.0, 10.0, 10.0),
+            )],
+        );
+        assert!(!report.trusted);
+        assert!(report.results.is_empty());
+        assert!(backend.writes().is_empty());
+    }
+
+    #[test]
+    fn a_target_whose_name_matches_several_windows_is_ambiguous() {
+        // Distinct from the "an earlier entry already claimed it" path: here the
+        // name itself resolves to more than one window and no rule separates them,
+        // so the planner refuses rather than picking one.
+        let mut backend = FakeBackend::new();
+        backend.windows.insert(
+            900,
+            vec![
+                win("a.rs — reference-tree", frame(0.0, 0.0, 800.0, 600.0)),
+                win("b.rs — main", frame(10.0, 10.0, 100.0, 100.0)),
+                win("c.rs — main", frame(20.0, 20.0, 200.0, 200.0)),
+            ],
+        );
+        let report = reposition(
+            &backend,
+            &registered("ref", "reference-tree", 11),
+            &[registered("t1", "main", 12)],
+            false,
+        );
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].outcome, OUTCOME_AMBIGUOUS);
+        assert!(
+            report.results[0].detail.contains("2 open windows match"),
+            "the detail should say how many: {}",
+            report.results[0].detail
+        );
+        assert!(backend.writes().is_empty());
+    }
+
+    #[test]
     fn restore_reports_a_window_that_has_since_closed() {
         let backend = FakeBackend::new();
         let entries = vec![(

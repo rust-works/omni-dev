@@ -602,4 +602,49 @@ mod unsupported {
             Err("window repositioning is only implemented on macOS".to_string())
         }
     }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod tests {
+        use super::*;
+
+        /// Pins the degradation contract, which is the whole point of this backend:
+        /// reporting **untrusted** is what makes every op short-circuit into the
+        /// same "no permission to move windows" reply a macOS daemon without the
+        /// Accessibility grant produces, rather than surfacing a novel error shape
+        /// that clients would have to special-case per platform.
+        #[test]
+        fn reports_itself_untrusted_so_callers_short_circuit() {
+            assert!(!AxBackend::new().trusted());
+        }
+
+        /// Every other method still has to be callable and still has to fail —
+        /// `reposition` checks `trusted` first, but nothing in the type system
+        /// enforces that ordering, so a future caller that skipped the check must
+        /// get an error rather than a plausible-looking empty success.
+        #[test]
+        fn every_other_method_fails_rather_than_faking_success() {
+            let backend = AxBackend::new();
+            assert!(backend.app_pids(&[1, 2, 3]).is_empty());
+            for err in [
+                backend.windows(1).expect_err("enumeration must fail"),
+                backend
+                    .set_frame(
+                        WindowId {
+                            app_pid: 1,
+                            index: 0,
+                        },
+                        Frame {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                        },
+                    )
+                    .expect_err("a write must fail"),
+            ] {
+                assert!(err.contains("only implemented on macOS"), "{err}");
+            }
+        }
+    }
 }
