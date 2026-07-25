@@ -47,8 +47,8 @@ window or open a worktree's folder. Two title-bar actions:
   same in every window and survives a reload.
 
 Right-click a leaf or repo for context-menu actions: **Open Worktree**, **Close
-Window**, **Close Worktree**, and — for a `github.com` repo — **Open Pull
-Request…** and **Open Pull Request in Browser…**.
+Window**, **Close Worktree**, **Rebase on main**, and — for a `github.com` repo —
+**Open Pull Request…** and **Open Pull Request in Browser…**.
 
 The three worktree verbs are deliberately separate, because closing a *window* and
 deleting a *worktree* are different things:
@@ -100,6 +100,28 @@ PR URL** — it never silently falls back to a browser. **Open Pull Request in
 Browser…** is the explicit way to ask for one: it opens the PR's `github.com` page
 with your OS default browser and needs no extension at all.
 
+### Rebase on main
+
+Right-click one or more **linked** worktrees and choose **Rebase on main** to rebase
+their branches onto the repository's **remote default branch**. Select as many as you
+like, across as many repositories as you like: each repository's default branch is
+**fetched once** for the whole batch, so keeping a fan-out of feature branches
+current is one gesture instead of one `cd` and one `git pull --rebase` each.
+
+- It **always confirms first**, listing exactly which branches would be rewritten —
+  a rebase rewrites history.
+- A repository's **main working tree is never a target**: the action is not offered
+  on one, and one caught up in a multi-selection is skipped and named.
+- Worktrees with uncommitted changes, a detached `HEAD`, or a rebase already in
+  progress are **reported and skipped**, not touched. A rebase that hits conflicts
+  is aborted, leaving that worktree exactly as it was; the rest of the batch
+  continues.
+- It runs in a **new terminal, in your own shell** — so you watch the fetch and the
+  per-worktree result table live, and can answer anything that prompts. That is also
+  why it needs no daemon but does need the `omni-dev` CLI (see
+  [Requirements](#requirements)): the fetch uses *your* SSH agent and credential
+  helper, which a daemon started by launchd/systemd does not have.
+
 ## Open Claude Code
 
 A **Claude-in-a-box** button in the **editor title bar** (the top-right icon
@@ -133,6 +155,11 @@ socket involved — so it works even when the omni-dev daemon is not running.
   Requests**](https://marketplace.visualstudio.com/items?itemName=GitHub.vscode-pull-request-github)
   extension (`GitHub.vscode-pull-request-github`) to render the PR in a tab.
   **Open Pull Request in Browser…** does not need it.
+- For **Rebase on main** only: the **`omni-dev` CLI** itself
+  (`cargo install omni-dev`) — this is the one action that runs the CLI in a
+  terminal rather than asking the daemon, so it needs the binary but **not** a
+  running daemon. It is found via `OMNI_DEV_BIN`, then the usual install locations
+  (`~/.cargo/bin`, Homebrew, `~/.local/bin`, …), then your `PATH`.
 
 ## Settings
 
