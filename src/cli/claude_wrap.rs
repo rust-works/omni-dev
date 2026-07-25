@@ -96,6 +96,14 @@ impl ClaudeWrapCommand {
     /// consequence is that a `claude-wrap` invocation writes no request-log
     /// record, which is deliberate: it is a process shim, not a user command.
     pub async fn execute(self) -> Result<()> {
+        let code = self.run().await?;
+        std::process::exit(code)
+    }
+
+    /// Runs the wrapped command and returns the exit code it should be reported
+    /// with. Split out of [`execute`](Self::execute) so everything but the
+    /// process-ending `exit` itself is testable.
+    async fn run(self) -> Result<i32> {
         let Some((program, args)) = self.argv.split_first() else {
             bail!(
                 "claude-wrap needs a command to run, e.g. \
@@ -111,8 +119,7 @@ impl ClaudeWrapCommand {
             return Err(exec_replace(program, args));
         }
 
-        let code = wrap(program, args, self.socket).await?;
-        std::process::exit(code)
+        wrap(program, args, self.socket).await
     }
 }
 
@@ -177,7 +184,7 @@ where
     let child_pid = child.id();
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
-    let observer = tokio::spawn(observe(lines, socket));
+    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL));
     let signals = tokio::spawn(forward_signals(child_pid));
 
     let from_child = tokio::spawn(pump(
@@ -269,12 +276,18 @@ fn tee_chunk(
 /// Consumes teed lines, tracks the session state, and reports every change to
 /// the daemon — plus a keep-alive while nothing changes, and an `end` once the
 /// stream is over.
-async fn observe(mut lines: mpsc::Receiver<(Direction, String)>, socket: Option<PathBuf>) {
+/// `every` is the keep-alive cadence, injected so tests can drive it without
+/// waiting out the real [`KEEPALIVE_INTERVAL`].
+async fn observe(
+    mut lines: mpsc::Receiver<(Direction, String)>,
+    socket: Option<PathBuf>,
+    every: Duration,
+) {
     let Ok(socket) = server::resolve_socket(socket) else {
         return;
     };
     let mut tracker = StreamTracker::new();
-    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    let mut keepalive = tokio::time::interval(every);
     // The first tick of a tokio interval completes immediately; consume it so
     // the keep-alive does not fire before anything has been observed.
     keepalive.tick().await;
@@ -463,8 +476,28 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_command_is_a_usage_error() {
-        let error = parse(&[]).execute().await.unwrap_err();
+        let error = parse(&[]).run().await.unwrap_err();
         assert!(error.to_string().contains("needs a command to run"));
+    }
+
+    // Note: there is deliberately no test that drives `run`/`wrap` to completion.
+    // Both join the *process's own* stdin and stdout, which a test must not take
+    // over — and `run`'s terminal branch would `exec`-replace the test binary
+    // outright when the suite is run from an interactive shell. They are thin
+    // delegations; `wrap_io` underneath them is covered directly.
+
+    // Note: `exec_replace` is deliberately untested. On success it never returns,
+    // and its failure path cannot be exercised in-process either: `exec` resets
+    // `SIGPIPE` to `SIG_DFL` before the `execve`, and a failed `exec` leaves that
+    // reset in place (the "broken state" its docs warn about). Calling it from a
+    // test poisons the whole binary — every later test that writes to a closed
+    // pipe dies on signal 13.
+
+    #[tokio::test]
+    async fn signal_forwarding_gives_up_when_there_is_no_child() {
+        // A child already reaped has no pid to signal; this must return rather
+        // than spin.
+        forward_signals(None).await;
     }
 
     #[tokio::test]
@@ -559,6 +592,72 @@ mod tests {
         let (direction, text) = lines.try_recv().unwrap();
         assert_eq!(direction, Direction::FromClaude);
         assert_eq!(text, r#"{"type":"result"}"#);
+        assert!(lines.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_re_reports_a_silent_session() {
+        // The wrapper's TTL-liveness guarantee: a session that says nothing more
+        // must keep being reported, or the registry ages it out at 5 minutes.
+        let (_dir, socket, seen) = fake_daemon();
+        let (tee, lines) = mpsc::channel(4);
+        let observer = tokio::spawn(observe(lines, Some(socket), Duration::from_millis(20)));
+        tee.send((
+            Direction::FromClaude,
+            r#"{"type":"system","subtype":"init","session_id":"ka-1"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(tee);
+        observer.await.unwrap();
+
+        let envelopes = seen.lock().await.clone();
+        let observes: Vec<_> = envelopes.iter().filter(|e| e["op"] == "observe").collect();
+        // One for the state change, then repeats carrying the same state.
+        assert!(observes.len() > 1, "expected keep-alives, got {observes:?}");
+        for envelope in &observes {
+            assert_eq!(envelope["payload"]["session_id"], "ka-1");
+            assert_eq!(envelope["payload"]["event"]["stream_state"], "idle");
+        }
+        assert_eq!(envelopes.last().unwrap()["op"], "end");
+    }
+
+    #[tokio::test]
+    async fn the_pump_stops_when_the_far_side_goes_away() {
+        // A closed peer (the editor exiting mid-turn) must end the copy, not
+        // spin on a writer that can never succeed again.
+        struct Closed;
+        impl AsyncWrite for Closed {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (tee, mut lines) = mpsc::channel(4);
+        // Returns rather than hanging, and tees nothing it could not forward.
+        pump(
+            &b"{\"type\":\"result\"}\n"[..],
+            Closed,
+            Direction::FromClaude,
+            tee,
+        )
+        .await;
         assert!(lines.try_recv().is_err());
     }
 

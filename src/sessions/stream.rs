@@ -455,6 +455,54 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_session_id_is_not_taken_as_identity() {
+        let mut tracker = StreamTracker::new();
+        assert!(tracker
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"assistant","session_id":"   "}"#,
+            )
+            .is_none());
+        assert_eq!(tracker.session_id(), None);
+        // …and a real id later still lands.
+        tracker.observe_line(Direction::FromClaude, INIT);
+        assert_eq!(tracker.session_id(), Some("sess-1"));
+    }
+
+    #[test]
+    fn control_messages_with_no_correlation_id_are_ignored() {
+        let mut tracker = tracker_after_init();
+        // A permission request that cannot be correlated is not tracked, rather
+        // than pinning the session on a prompt nothing can ever answer.
+        assert!(tracker
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"control_request","request":{"subtype":"can_use_tool"}}"#,
+            )
+            .is_none());
+        assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+        // Likewise an answer that names no request clears nothing.
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool"}}"#,
+        );
+        assert!(tracker
+            .observe_line(Direction::ToClaude, r#"{"type":"control_response"}"#)
+            .is_none());
+        assert_eq!(
+            state_of(&tracker.keepalive().unwrap()),
+            SessionState::WaitingForPermission
+        );
+    }
+
+    #[test]
+    fn default_matches_a_fresh_tracker() {
+        let tracker = StreamTracker::default();
+        assert_eq!(tracker.session_id(), None);
+        assert!(tracker.keepalive().is_none());
+    }
+
+    #[test]
     fn unparseable_and_unknown_lines_are_ignored() {
         let mut tracker = tracker_after_init();
         for line in [

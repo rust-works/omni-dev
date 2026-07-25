@@ -1310,6 +1310,16 @@ mod tests {
     }
 
     #[test]
+    fn set_and_clear_wrapper_tolerate_a_non_object_settings_value() {
+        // `read_settings` guarantees an object, but these degrade rather than
+        // panic if a caller hands them anything else (the `merge_hooks` rule).
+        let mut scalar = json!("not an object");
+        assert!(!set_wrapper(&mut scalar, "/shim"));
+        assert!(!clear_wrapper(&mut scalar, "/shim"));
+        assert_eq!(scalar, json!("not an object"));
+    }
+
+    #[test]
     fn the_wrapper_paths_default_outside_the_claude_config_dir() {
         // The shim lives beside the daemon socket; the setting lives in VS Code's
         // *config* directory, which is a different base on every platform.
@@ -1353,6 +1363,19 @@ mod tests {
             command: SessionsSubcommands::UninstallHooks(UninstallHooksCommand {
                 settings: Some(path.clone()),
             }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        let (install, uninstall) = wrapper_commands(tmp.path());
+        SessionsCommand {
+            command: SessionsSubcommands::InstallWrapper(install),
+        }
+        .execute()
+        .await
+        .unwrap();
+        SessionsCommand {
+            command: SessionsSubcommands::UninstallWrapper(uninstall),
         }
         .execute()
         .await
