@@ -101,6 +101,17 @@
         "icon": "$(git-branch)"
       },
       {
+        "command": "omniDevWorktrees.repositionWindowsToMatch",
+        "title": "Reposition Windows to Match",
+        "category": "omni-dev",
+        "icon": "$(multiple-windows)"
+      },
+      {
+        "command": "omniDevWorktrees.undoReposition",
+        "title": "Undo Reposition Windows",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.moveClaudeSessionHere",
         "title": "Move Claude Session Here",
         "category": "omni-dev"
@@ -170,6 +181,10 @@
         },
         {
           "command": "omniDevWorktrees.rebaseOnMain",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.repositionWindowsToMatch",
           "when": "false"
         },
         {
@@ -255,6 +270,11 @@
           "command": "omniDevWorktrees.rebaseOnMain",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
           "group": "4_git@1"
+        },
+        {
+          "command": "omniDevWorktrees.repositionWindowsToMatch",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.open\\./ && omniDevWorktrees.canReposition",
+          "group": "4_layout@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",
