@@ -95,6 +95,12 @@
         "icon": "$(git-merge)"
       },
       {
+        "command": "omniDevWorktrees.rebaseOnMain",
+        "title": "Rebase on main",
+        "category": "omni-dev",
+        "icon": "$(git-branch)"
+      },
+      {
         "command": "omniDevWorktrees.moveClaudeSessionHere",
         "title": "Move Claude Session Here",
         "category": "omni-dev"
@@ -160,6 +166,10 @@
         },
         {
           "command": "omniDevWorktrees.addToMergeQueue",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.rebaseOnMain",
           "when": "false"
         },
         {
@@ -240,6 +250,11 @@
           "command": "omniDevWorktrees.copyDirectory",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
           "group": "3_copy@1"
+        },
+        {
+          "command": "omniDevWorktrees.rebaseOnMain",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
+          "group": "4_git@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",
