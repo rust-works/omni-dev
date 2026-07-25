@@ -2447,6 +2447,7 @@ dependencies = [
  "insta",
  "mime_guess",
  "nix",
+ "objc2-core-foundation",
  "proptest",
  "quick-xml",
  "rand 0.10.2",

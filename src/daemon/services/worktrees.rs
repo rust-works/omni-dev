@@ -30,6 +30,8 @@
 //! "is a window open on it?" becomes a per-worktree attribute. All of this is
 //! git disk I/O, so it runs on a blocking thread, never under the registry lock.
 
+mod geometry;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -517,6 +519,22 @@ pub struct WorktreesService {
     /// dedupe to one counted `gh` per repo instead of one per window. Behind an
     /// `Arc` for parity with the other caches.
     open_pr_cache: Arc<OpenPrCache>,
+    /// Where the windows the **last** `reposition` moved were sitting beforehand,
+    /// so `reposition-undo` can put them back (#1407).
+    ///
+    /// Exactly one level of undo, deliberately: the affordance exists because
+    /// repositioning is otherwise irreversible (the previous layout is simply
+    /// gone), and "undo the thing I just did" is the whole of what that needs. A
+    /// deeper stack would raise questions — what does undoing an older batch mean
+    /// once a newer one has moved the same window? — that a one-level store cannot
+    /// pose. Each successful `reposition` replaces it; each `reposition-undo`
+    /// consumes it, so an undo cannot be replayed.
+    ///
+    /// In-memory only, like every other piece of registry state: a daemon restart
+    /// drops it, and the user is simply left with the layout they have. Behind its
+    /// **own** `std::Mutex`, taken independently of the registry's (neither nests)
+    /// and never held across an `.await`.
+    reposition_undo: Mutex<Vec<(String, geometry::Frame)>>,
 }
 
 impl WorktreesService {
@@ -542,6 +560,7 @@ impl WorktreesService {
             pr_cache_path: Mutex::new(None),
             pr_warm_start: Mutex::new(None),
             open_pr_cache: Arc::new(OpenPrCache::new(open_pr_ttl())),
+            reposition_undo: Mutex::new(Vec::new()),
         }
     }
 
@@ -1331,6 +1350,135 @@ impl WorktreesService {
         })
         .unwrap_or_else(|_| json!({})))
     }
+
+    /// Handles the `reposition` op (#1407): move and resize each target worktree's
+    /// **already-open** VS Code window to match the invoking window's geometry.
+    ///
+    /// The invoking window is the reference: it supplies the frame and is never
+    /// itself moved. A target with no open window, no resolvable OS window, or an
+    /// ambiguous name is reported rather than guessed at. Z-order is untouched —
+    /// see [`geometry::ax`] for why the Accessibility API gives that for free, and
+    /// why this must **not** reuse [`focus_window`], which deliberately raises.
+    ///
+    /// `check: true` is a dry run: everything resolves exactly as it would for a
+    /// real run, but nothing is written. That is the whole diagnostic surface for
+    /// title matching (`worktrees reposition --dry-run`).
+    ///
+    /// Not two-phase like `close`/`merge-queue`: nothing durable is created,
+    /// modified, or destroyed, so a confirmation on a routine layout command would
+    /// cost more than it protects. Reversibility is provided instead, by
+    /// [`reposition_undo`](Self::reposition_undo).
+    async fn reposition(&self, req: RepositionRequest) -> Result<Value> {
+        self.reposition_with(req, geometry::ax::AxBackend::new)
+            .await
+    }
+
+    /// [`reposition`](Self::reposition) with the platform backend injected as a
+    /// **factory**, so a test drives the whole op — key resolution, the undo
+    /// store, the reply shape — against a fake with no `unsafe` and no windows.
+    ///
+    /// A factory rather than the backend itself because the real backend holds
+    /// CoreFoundation references and so is neither `Send` nor `Sync`: it has to be
+    /// built *inside* the blocking closure. The `merge_queue_with` "seam as a
+    /// parameter" pattern, one level of indirection over.
+    async fn reposition_with<B, F>(&self, req: RepositionRequest, make_backend: F) -> Result<Value>
+    where
+        B: geometry::WindowBackend,
+        F: FnOnce() -> B + Send + 'static,
+    {
+        if req.reference_key.trim().is_empty() {
+            bail!("`reposition` requires a non-empty `reference_key`");
+        }
+        // Resolve keys against the registry *here*, so all AX work below deals in
+        // plain data and the registry lock is never held across the blocking join.
+        let entries = self.registry.list();
+        let reference = registered_window(&entries, &req.reference_key);
+        if !reference.live {
+            // Unlike a target, an unresolvable *reference* is a hard error: there
+            // is no geometry to copy, so the request cannot mean anything.
+            bail!(
+                "no open window with key {} (it may have closed)",
+                req.reference_key
+            );
+        }
+        // A target key with no live window is a reportable per-target outcome, not
+        // a failure of the batch — the tree row may simply be a tick stale.
+        let targets: Vec<geometry::RegisteredWindow> = req
+            .target_keys
+            .iter()
+            .map(|key| registered_window(&entries, key))
+            .collect();
+
+        let check = req.check;
+        let mut report = tokio::task::spawn_blocking(move || {
+            // The backend lives for exactly one op, so its enumeration cache can
+            // never serve a window that has since moved or closed.
+            let backend = make_backend();
+            geometry::reposition(&backend, &reference, &targets, check)
+        })
+        .await
+        .map_err(|e| anyhow!("reposition task panicked: {e}"))?;
+
+        // Taken out of the report rather than cloned: nothing downstream reads it,
+        // and the store is its only owner. A dry run leaves the previous batch's
+        // record intact — it changed nothing, so there is neither something new to
+        // undo nor something stale to discard.
+        let undo = std::mem::take(&mut report.undo);
+        let undoable = !check && !undo.is_empty();
+        if undoable {
+            *self
+                .reposition_undo
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = undo;
+        }
+        log_reposition(&req, &report);
+        Ok(reposition_reply(&report, undoable))
+    }
+
+    /// Handles the `reposition-undo` op (#1407): put the windows the last
+    /// `reposition` moved back where they were.
+    ///
+    /// Consumes the stored batch, so an undo cannot be replayed onto windows the
+    /// user has since arranged by hand. Every window is re-resolved from scratch —
+    /// one that has closed, been renamed, or gone fullscreen in the meantime is
+    /// reported, not forced.
+    async fn reposition_undo(&self) -> Result<Value> {
+        self.reposition_undo_with(geometry::ax::AxBackend::new)
+            .await
+    }
+
+    /// [`reposition_undo`](Self::reposition_undo) with the backend factory
+    /// injected, for the same reasons as
+    /// [`reposition_with`](Self::reposition_with).
+    async fn reposition_undo_with<B, F>(&self, make_backend: F) -> Result<Value>
+    where
+        B: geometry::WindowBackend,
+        F: FnOnce() -> B + Send + 'static,
+    {
+        let stored = std::mem::take(
+            &mut *self
+                .reposition_undo
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        if stored.is_empty() {
+            return Ok(json!({ "trusted": true, "results": [], "moved": 0, "skipped": 0 }));
+        }
+        let entries = self.registry.list();
+        let restore: Vec<(geometry::RegisteredWindow, geometry::Frame)> = stored
+            .into_iter()
+            .map(|(key, frame)| (registered_window(&entries, &key), frame))
+            .collect();
+
+        let report = tokio::task::spawn_blocking(move || {
+            let backend = make_backend();
+            geometry::restore(&backend, &restore)
+        })
+        .await
+        .map_err(|e| anyhow!("reposition-undo task panicked: {e}"))?;
+        log_reposition_undo(&report);
+        Ok(reposition_reply(&report, false))
+    }
 }
 
 impl Default for WorktreesService {
@@ -1486,6 +1634,24 @@ impl DaemonService for WorktreesService {
                 let req: MergeQueueRequest =
                     serde_json::from_value(payload).context("invalid `merge-queue` payload")?;
                 self.merge_queue(req).await
+            }
+            "reposition" => {
+                // Move each target's already-open VS Code window onto the invoking
+                // window's geometry (#1407). The one op that reaches outside the
+                // process to control another application's windows, so all of its
+                // OS interaction is confined to the `geometry::ax` module behind
+                // the macOS Accessibility permission — geometry only, never a
+                // raise, so Z-order is untouched. All AX I/O runs on a blocking
+                // thread. See ADR-0058 and docs/worktrees-service.md.
+                let req: RepositionRequest =
+                    serde_json::from_value(payload).context("invalid `reposition` payload")?;
+                self.reposition(req).await
+            }
+            "reposition-undo" => {
+                // Put the windows the last `reposition` moved back where they were
+                // (#1407). Payload-free: the daemon holds the one-level undo
+                // record, so the client cannot ask to restore arbitrary geometry.
+                self.reposition_undo().await
             }
             other => bail!("unknown worktrees op: {other}"),
         }
@@ -2917,6 +3083,131 @@ fn resolve_code_binary_from(
     PathBuf::from("code")
 }
 
+// --- Reposition op (#1407) ---------------------------------------------------
+
+/// The `reposition` op payload: move every target window onto the invoking
+/// window's geometry.
+///
+/// Keyed by **window key**, not worktree path, because the subject is a *window*:
+/// the geometry belongs to the OS window, and a path resolves to one only via the
+/// registry. The CLI (which naturally speaks paths) maps them to keys itself
+/// before sending.
+#[derive(Debug, Clone, Deserialize)]
+struct RepositionRequest {
+    /// The invoking window's key. Supplies the frame; never moved itself.
+    reference_key: String,
+    /// The windows to move. May include `reference_key` — a multi-selection
+    /// naturally contains the invoking window — which is reported and skipped.
+    #[serde(default)]
+    target_keys: Vec<String>,
+    /// Resolve and report only, writing nothing (`worktrees reposition
+    /// --dry-run`). The diagnostic surface for title matching.
+    #[serde(default)]
+    check: bool,
+}
+
+/// Distils the live registration for `key` into what [`geometry`] matches on.
+///
+/// A key with no live window still yields a value, flagged `live: false`, so it
+/// reports as a per-target `no-window` skip rather than vanishing from the batch —
+/// a tree row can be a tick stale, and the user needs to see which of their
+/// selection was ignored.
+fn registered_window(entries: &[WindowEntry], key: &str) -> geometry::RegisteredWindow {
+    entries.iter().find(|entry| entry.key == key).map_or_else(
+        || geometry::RegisteredWindow {
+            key: key.to_string(),
+            live: false,
+            title: None,
+            pid: None,
+        },
+        |entry| geometry::RegisteredWindow {
+            key: entry.key.clone(),
+            live: true,
+            title: entry.title.clone(),
+            pid: entry.pid,
+        },
+    )
+}
+
+/// Renders a [`geometry::RepositionReport`] as the op's reply.
+///
+/// `trusted` is a reply **field**, not an error, so the client can branch on the
+/// missing-permission case as data — offering the user a link to the Accessibility
+/// settings pane — rather than pattern-matching an error string.
+fn reposition_reply(report: &geometry::RepositionReport, undoable: bool) -> Value {
+    let mut reply = json!({
+        "trusted": report.trusted,
+        "results": report.results,
+        "moved": report.moved(),
+        "skipped": report.skipped(),
+    });
+    if let Some(reference) = &report.reference {
+        reply["reference"] = serde_json::to_value(reference).unwrap_or_else(|_| json!({}));
+    }
+    if let Some(blocked) = &report.blocked {
+        reply["blocked"] = serde_json::to_value(blocked).unwrap_or_else(|_| json!({}));
+    }
+    // Omitted unless true, so a client that only reads `results` sees a reply
+    // byte-identical to one from a daemon without the undo store.
+    if undoable {
+        reply["undoable"] = Value::Bool(true);
+    }
+    reply
+}
+
+/// Emits the audit line for a `reposition`, so `omni-dev daemon logs` can answer
+/// "why did that window not move?" from the log alone (the ADR-0049 §6 precedent).
+/// Sync, like [`log_merge_check`].
+fn log_reposition(req: &RepositionRequest, report: &geometry::RepositionReport) {
+    // `phase` is a structured field rather than three message literals, so a log
+    // filter can select checks from applies without matching on prose.
+    let phase = if !report.trusted {
+        "untrusted"
+    } else if report.blocked.is_some() {
+        "blocked"
+    } else if req.check {
+        "check"
+    } else {
+        "apply"
+    };
+    tracing::info!(
+        phase,
+        reference = req.reference_key.as_str(),
+        requested = req.target_keys.len(),
+        blocked = report.blocked.as_ref().map_or("-", |b| b.reason),
+        moved = report.moved(),
+        skipped = report.skipped(),
+        outcomes = outcome_kinds(report).as_str(),
+        "reposition"
+    );
+}
+
+/// Emits the audit line for a `reposition-undo`.
+fn log_reposition_undo(report: &geometry::RepositionReport) {
+    tracing::info!(
+        trusted = report.trusted,
+        restored = report.moved(),
+        skipped = report.skipped(),
+        outcomes = outcome_kinds(report).as_str(),
+        "reposition undo"
+    );
+}
+
+/// Joins a report's per-target outcome slugs into one compact `a,b,b` field, so a
+/// batch's verdict rides a single structured log value rather than a `Debug` dump —
+/// the [`note_kinds`] precedent.
+fn outcome_kinds(report: &geometry::RepositionReport) -> String {
+    if report.results.is_empty() {
+        return "-".to_string();
+    }
+    report
+        .results
+        .iter()
+        .map(|r| r.outcome)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 // --- Close op (#1277) --------------------------------------------------------
 
 /// The `close` op payload: close a worktree's window and (for a linked worktree)
@@ -4107,6 +4398,368 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, json!({ "removed": false }));
+    }
+
+    // --- Reposition op (#1407) ------------------------------------------------
+
+    /// A window backend over an in-memory window table that **actually applies**
+    /// writes, so the adapter's own responsibilities — key resolution, the undo
+    /// store, the reply shape — are testable with no `unsafe`, no real windows, and
+    /// no Accessibility grant. The planner/matcher itself is covered by
+    /// `geometry`'s own tests.
+    ///
+    /// Applying the writes is what makes a reposition-then-undo round trip mean
+    /// anything: against a fixed table the restore would find every window already
+    /// in its wanted position and correctly report `unchanged`.
+    #[derive(Clone)]
+    struct StubBackend {
+        trusted: bool,
+        /// One application's windows. `Arc` so every clone the factory hands out —
+        /// and every op in a test — shares the same mutating table.
+        windows: Arc<Mutex<Vec<geometry::OsWindow>>>,
+        /// Every frame written, in order.
+        writes: Arc<Mutex<Vec<geometry::Frame>>>,
+    }
+
+    impl StubBackend {
+        /// One application (pid 900) with two default-format VS Code windows, and
+        /// two ext-host pids (11, 12) mapping onto it.
+        fn new(trusted: bool) -> Self {
+            let window = |title: &str, x: f64, width: f64| geometry::OsWindow {
+                title: title.to_string(),
+                frame: geometry::Frame {
+                    x,
+                    y: 0.0,
+                    width,
+                    height: 600.0,
+                },
+                minimized: false,
+                fullscreen: false,
+                standard: true,
+                focused: false,
+            };
+            Self {
+                trusted,
+                windows: Arc::new(Mutex::new(vec![
+                    window("plan.md — ref-tree", 0.0, 800.0),
+                    window("main.rs — other-tree", 900.0, 500.0),
+                ])),
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn writes(&self) -> Vec<geometry::Frame> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// The frame a window currently occupies, after any applied writes.
+        fn frame_of(&self, index: usize) -> geometry::Frame {
+            self.windows.lock().unwrap_or_else(PoisonError::into_inner)[index].frame
+        }
+
+        /// A factory for the `*_with` seams, sharing this stub's table and recorder.
+        fn factory(&self) -> impl FnOnce() -> Self + Send + 'static {
+            let clone = self.clone();
+            move || clone
+        }
+    }
+
+    impl geometry::WindowBackend for StubBackend {
+        fn trusted(&self) -> bool {
+            self.trusted
+        }
+
+        fn app_pids(&self, pids: &[u32]) -> HashMap<u32, u32> {
+            pids.iter()
+                .filter(|p| **p == 11 || **p == 12)
+                .map(|p| (*p, 900))
+                .collect()
+        }
+
+        fn windows(&self, app_pid: u32) -> Result<Vec<geometry::OsWindow>, String> {
+            if app_pid != 900 {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .windows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone())
+        }
+
+        fn set_frame(
+            &self,
+            id: geometry::WindowId,
+            frame: geometry::Frame,
+        ) -> Result<geometry::Frame, String> {
+            self.writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(frame);
+            let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+            let window = windows
+                .get_mut(id.index)
+                .ok_or_else(|| format!("no window at index {}", id.index))?;
+            window.frame = frame;
+            Ok(frame)
+        }
+    }
+
+    /// Registers a window whose reported title is `title` and pid is `pid`, i.e.
+    /// one the stub backend can resolve to an OS window.
+    fn register_window(svc: &WorktreesService, key: &str, title: &str, pid: u32) {
+        svc.registry.register(
+            serde_json::from_value(json!({
+                "key": key,
+                "folders": [format!("/tmp/{key}")],
+                "title": title,
+                "pid": pid,
+            }))
+            .expect("valid register payload"),
+        );
+    }
+
+    #[tokio::test]
+    async fn reposition_requires_a_resolvable_reference() {
+        let svc = WorktreesService::new();
+        // A missing, blank, or unknown reference key is a hard error: with no
+        // reference there is no geometry to copy, so the request is meaningless.
+        assert!(svc.handle("reposition", json!({})).await.is_err());
+        assert!(svc
+            .handle("reposition", json!({ "reference_key": "  " }))
+            .await
+            .is_err());
+        assert!(svc
+            .handle("reposition", json!({ "reference_key": "ghost" }))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn reposition_moves_targets_and_records_an_undo() {
+        let svc = WorktreesService::new();
+        register_window(&svc, "ref", "ref-tree", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        let backend = StubBackend::new(true);
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    "target_keys": ["other"],
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply["trusted"], json!(true));
+        assert_eq!(reply["moved"], json!(1));
+        assert_eq!(reply["skipped"], json!(0));
+        assert_eq!(reply["undoable"], json!(true));
+        assert_eq!(reply["reference"]["title"], json!("ref-tree"));
+        assert_eq!(reply["results"][0]["key"], json!("other"));
+        assert_eq!(reply["results"][0]["outcome"], json!("moved"));
+        // Written the reference's own frame, read from the stub's window table.
+        assert_eq!(backend.writes().len(), 1);
+        assert_eq!(
+            backend.writes()[0],
+            backend.frame_of(0),
+            "wrote the reference window's own frame"
+        );
+        assert_eq!(
+            backend.frame_of(1),
+            backend.frame_of(0),
+            "the target now occupies the reference's frame"
+        );
+
+        // Undo puts it back where it was — the same backend, so it sees the window
+        // where the move left it — and consumes the record, so a second undo has
+        // nothing left to replay onto a layout the user may have since redone.
+        let undone = svc.reposition_undo_with(backend.factory()).await.unwrap();
+        assert_eq!(undone["moved"], json!(1));
+        assert_eq!(undone["results"][0]["outcome"], json!("moved"));
+        assert!(undone.get("reference").is_none(), "undo has no reference");
+        assert_eq!(
+            backend.frame_of(1),
+            geometry::Frame {
+                x: 900.0,
+                y: 0.0,
+                width: 500.0,
+                height: 600.0,
+            },
+            "restored to exactly the pre-move frame"
+        );
+
+        let again = svc.reposition_undo_with(backend.factory()).await.unwrap();
+        assert_eq!(
+            again,
+            json!({ "trusted": true, "results": [], "moved": 0, "skipped": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reposition_dry_run_writes_nothing_and_leaves_no_undo() {
+        let svc = WorktreesService::new();
+        register_window(&svc, "ref", "ref-tree", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        let backend = StubBackend::new(true);
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    "target_keys": ["other"],
+                    "check": true,
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply["results"][0]["outcome"], json!("would-move"));
+        assert!(
+            reply.get("undoable").is_none(),
+            "a dry run leaves nothing to undo"
+        );
+        assert!(
+            backend.writes().is_empty(),
+            "a dry run must not touch a window"
+        );
+    }
+
+    #[tokio::test]
+    async fn reposition_reports_a_missing_permission_as_data() {
+        let svc = WorktreesService::new();
+        register_window(&svc, "ref", "ref-tree", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        let backend = StubBackend::new(false);
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    "target_keys": ["other"],
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        // Not an error: the client branches on `trusted` to offer the user a link
+        // to the Accessibility settings pane.
+        assert_eq!(reply["trusted"], json!(false));
+        assert_eq!(reply["moved"], json!(0));
+        assert!(backend.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_target_key_is_skipped_not_fatal() {
+        let svc = WorktreesService::new();
+        register_window(&svc, "ref", "ref-tree", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        let backend = StubBackend::new(true);
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    // A window that closed since the tree row was rendered, the
+                    // reference itself, and a real target.
+                    "target_keys": ["closed-since", "ref", "other"],
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        let outcomes: Vec<&str> = reply["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, vec!["no-window", "reference", "moved"]);
+        assert_eq!(reply["moved"], json!(1));
+        assert_eq!(reply["skipped"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_reposition_carries_the_reason_and_records_no_undo() {
+        let svc = WorktreesService::new();
+        // Two windows share a root name, so the *reference* cannot be resolved and
+        // the whole batch is refused before any target is attempted.
+        register_window(&svc, "ref", "twin", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        // The window table is behind an `Arc<Mutex<…>>`, so retitling it needs no
+        // `mut` binding — and the same shared table backs the factory's clone.
+        let backend = StubBackend::new(true);
+        {
+            let mut windows = backend
+                .windows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            windows[0].title = "a.rs — twin".to_string();
+            windows[1].title = "b.rs — twin".to_string();
+        }
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    "target_keys": ["other"],
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply["trusted"], json!(true));
+        assert_eq!(reply["blocked"]["reason"], json!("reference-ambiguous"));
+        assert!(
+            reply["blocked"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("twin")),
+            "the reason should name the ambiguous title: {reply}"
+        );
+        assert_eq!(reply["results"], json!([]), "no target is attempted");
+        assert!(reply.get("undoable").is_none());
+        assert!(backend.writes().is_empty());
+
+        // And nothing was recorded, so a following undo has nothing to replay.
+        let undone = svc
+            .reposition_undo_with(StubBackend::new(true).factory())
+            .await
+            .unwrap();
+        assert_eq!(undone["moved"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn reposition_undo_is_a_no_op_with_nothing_recorded() {
+        let svc = WorktreesService::new();
+        let reply = svc.handle("reposition-undo", Value::Null).await.unwrap();
+        assert_eq!(reply["moved"], json!(0));
+        assert_eq!(reply["results"], json!([]));
+    }
+
+    #[test]
+    fn outcome_kinds_joins_slugs_and_dashes_an_empty_batch() {
+        let empty = geometry::RepositionReport {
+            trusted: true,
+            blocked: None,
+            reference: None,
+            results: Vec::new(),
+            undo: Vec::new(),
+        };
+        assert_eq!(outcome_kinds(&empty), "-");
     }
 
     #[tokio::test]
