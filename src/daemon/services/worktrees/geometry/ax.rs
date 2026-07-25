@@ -3,8 +3,10 @@
 //!
 //! The crate sets `unsafe_code = "deny"`, and STYLE-0013 allows an exception only
 //! when it is justified in an ADR ([ADR-0058]), isolated in a dedicated module
-//! (this one), and carries `SAFETY:` comments — the same shape as
-//! [`launchd_listener`](crate::daemon::launchd) and the `setsid` `pre_exec` hook.
+//! (this one), and carries `SAFETY:` comments — the same shape as the daemon's
+//! `launchd_listener` and the `setsid` `pre_exec` hook. (Those are named without
+//! doc links deliberately: both are macOS-only items, so linking them would break
+//! a documentation build on any other platform.)
 //!
 //! # Why the Accessibility API
 //!
@@ -38,43 +40,16 @@
 //!
 //! [ADR-0058]: https://github.com/rust-works/omni-dev/blob/main/docs/adrs/adr-0058.md
 
-use std::collections::HashMap;
-
-use super::{Frame, OsWindow, WindowBackend, WindowId};
+// Nothing is imported at this level, and both implementations below pull what
+// they need from the parent module themselves. That is deliberate: every item here
+// would otherwise be live on exactly one platform and dead — a `-D warnings`
+// failure — on the other.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::AxBackend;
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) use unsupported::AxBackend;
-
-/// Resolves `pid -> owning application pid` with one batched `ps` call.
-///
-/// An extension-host pid's parent is the VS Code main process that owns every
-/// `NSWindow`; see [`super::parse_ppids`] for why this is a shell-out rather than
-/// more FFI. A `ps` that fails outright yields an empty map, which every target
-/// then reports as not-found — never a silent mis-target.
-#[cfg(unix)]
-fn app_pids_via_ps(pids: &[u32]) -> HashMap<u32, u32> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let list = pids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    match std::process::Command::new("/bin/ps")
-        .args(["-o", "pid=,ppid=", "-p", &list])
-        .output()
-    {
-        Ok(out) => super::parse_ppids(&String::from_utf8_lossy(&out.stdout)),
-        Err(err) => {
-            tracing::warn!("cannot resolve owning applications via ps: {err}");
-            HashMap::new()
-        }
-    }
-}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -87,7 +62,55 @@ mod macos {
         CFArray, CFBoolean, CFEqual, CFRetained, CFString, CFType, CGPoint, CGSize, Type,
     };
 
-    use super::{app_pids_via_ps, Frame, OsWindow, WindowBackend, WindowId};
+    use super::super::{Frame, OsWindow, WindowBackend, WindowId};
+
+    /// Resolves `pid -> owning application pid` with one batched `ps` call.
+    ///
+    /// The only process introspection the op needs, and deliberately a shell-out
+    /// rather than more FFI: an extension-host pid's parent is the VS Code main
+    /// process that owns every `NSWindow`, so one `ps` resolves a whole selection.
+    /// A `ps` that fails outright yields an empty map, which every target then
+    /// reports as not-found — never a silent mis-target.
+    ///
+    /// Lives here, alongside its only caller, rather than in the platform-independent
+    /// parent: the whole `ppid` strategy is specific to how this backend locates a
+    /// window, and on any other platform it would simply be dead code.
+    fn app_pids_via_ps(pids: &[u32]) -> HashMap<u32, u32> {
+        if pids.is_empty() {
+            return HashMap::new();
+        }
+        let list = pids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        match std::process::Command::new("/bin/ps")
+            .args(["-o", "pid=,ppid=", "-p", &list])
+            .output()
+        {
+            Ok(out) => parse_ppids(&String::from_utf8_lossy(&out.stdout)),
+            Err(err) => {
+                tracing::warn!("cannot resolve owning applications via ps: {err}");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Parses `ps -o pid=,ppid= -p …` output into a `pid -> ppid` map.
+    ///
+    /// Unparseable lines are skipped rather than failing the batch — a pid that has
+    /// since exited simply gets no entry, which its target reports as not-found.
+    fn parse_ppids(stdout: &str) -> HashMap<u32, u32> {
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                let ppid = fields.next()?.parse().ok()?;
+                Some((pid, ppid))
+            })
+            .collect()
+    }
 
     /// How long to wait for an application to answer one AX request.
     ///
@@ -436,13 +459,114 @@ mod macos {
             }
         }
     }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_ps_output() {
+            // The real shape of `ps -o pid=,ppid= -p …`: right-aligned, leading
+            // spaces.
+            let out = "  28112  65488\n  28113  65488\n  65488      1\n";
+            let map = parse_ppids(out);
+            assert_eq!(map.get(&28112).copied(), Some(65488));
+            assert_eq!(map.get(&65488).copied(), Some(1));
+            assert_eq!(map.len(), 3);
+        }
+
+        #[test]
+        fn ignores_unparseable_ps_lines() {
+            // A pid that has exited makes `ps` emit a diagnostic line rather than a
+            // row; skipping it leaves that target reporting not-found instead of
+            // sinking the whole batch.
+            let out = "\n  ps: 999: no such process\n  10  20\nnotanumber x\n";
+            assert_eq!(parse_ppids(out), HashMap::from([(10, 20)]));
+        }
+
+        #[test]
+        fn resolving_no_pids_never_shells_out() {
+            assert!(app_pids_via_ps(&[]).is_empty());
+        }
+
+        #[test]
+        fn ps_resolves_this_process_to_its_real_parent() {
+            // The one test that exercises the real `ps` seam, using the only pids
+            // guaranteed to exist: this process and its parent.
+            let me = std::process::id();
+            let resolved = app_pids_via_ps(&[me]);
+            assert_eq!(
+                resolved.get(&me).copied(),
+                Some(std::os::unix::process::parent_id()),
+                "ps should report this test process's real parent"
+            );
+        }
+
+        #[test]
+        fn an_unknown_pid_simply_has_no_entry() {
+            // pid 0 is never reported by `ps -p`, so this exercises the "resolution
+            // failed for this pid" path that a target reports as not-found.
+            assert!(!app_pids_via_ps(&[0]).contains_key(&0));
+        }
+
+        /// Smoke-tests the Accessibility FFI itself against the live framework.
+        ///
+        /// This is the one test that can catch a wrong `extern "C"` signature, a
+        /// mis-declared `AXValueType`, a bad `downcast`, or an unbalanced retain — none
+        /// of which the fake-backend tests can see, since they never cross the FFI
+        /// boundary. It deliberately asserts nothing about the *result*: without the
+        /// Accessibility grant (CI, and any developer who has not opted in) enumeration
+        /// correctly fails, and with it the window list depends on what happens to be
+        /// running. What is being asserted is that **calling it is sound** — it returns
+        /// either way rather than crashing, hanging, or corrupting memory, which is
+        /// exactly what a signature or ownership mistake would do.
+        ///
+        /// Runs against this test process, so there is always a live pid to target.
+        #[test]
+        fn the_accessibility_ffi_is_callable_without_a_grant() {
+            use super::super::super::WindowBackend;
+
+            let backend = AxBackend::new();
+            // Reaches AXIsProcessTrusted; both answers are legitimate.
+            let _ = backend.trusted();
+            // Reaches AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
+            // AXUIElementCopyAttributeValue, the CFRetained ownership dance, and the
+            // CFArray/CFString downcasts. A test binary is not a GUI app, so `Ok` with
+            // no windows and `Err` are both expected outcomes.
+            match backend.windows(std::process::id()) {
+                Ok(windows) => assert!(
+                    windows.iter().all(|w| w.frame.width >= 0.0),
+                    "a window reported a negative width, so the CGSize decode is wrong"
+                ),
+                Err(err) => assert!(!err.is_empty(), "a failure should say why"),
+            }
+            // And the write path's own guard: an id this backend never enumerated must
+            // be refused rather than dereferenced.
+            let unknown = WindowId {
+                app_pid: std::process::id(),
+                index: 9_999,
+            };
+            assert!(backend
+                .set_frame(
+                    unknown,
+                    Frame {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                )
+                .is_err());
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod unsupported {
     use std::collections::HashMap;
 
-    use super::{Frame, OsWindow, WindowBackend, WindowId};
+    use super::super::{Frame, OsWindow, WindowBackend, WindowId};
 
     /// The non-macOS backend: reports itself untrusted so every op short-circuits
     /// with the same "no permission to move windows" reply path a macOS daemon
@@ -477,87 +601,5 @@ mod unsupported {
         fn set_frame(&self, _id: WindowId, _frame: Frame) -> Result<Frame, String> {
             Err("window repositioning is only implemented on macOS".to_string())
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolving_no_pids_never_shells_out() {
-        assert!(app_pids_via_ps(&[]).is_empty());
-    }
-
-    #[test]
-    fn ps_resolves_this_process_to_its_real_parent() {
-        // The one test that exercises the real `ps` seam, using the only pids
-        // guaranteed to exist: this process and its parent.
-        let me = std::process::id();
-        let resolved = app_pids_via_ps(&[me]);
-        assert_eq!(
-            resolved.get(&me).copied(),
-            Some(std::os::unix::process::parent_id()),
-            "ps should report this test process's real parent"
-        );
-    }
-
-    #[test]
-    fn an_unknown_pid_simply_has_no_entry() {
-        // pid 0 is never reported by `ps -p`, so this exercises the "resolution
-        // failed for this pid" path that a target reports as not-found.
-        assert!(!app_pids_via_ps(&[0]).contains_key(&0));
-    }
-
-    /// Smoke-tests the Accessibility FFI itself against the live framework.
-    ///
-    /// This is the one test that can catch a wrong `extern "C"` signature, a
-    /// mis-declared `AXValueType`, a bad `downcast`, or an unbalanced retain — none
-    /// of which the fake-backend tests can see, since they never cross the FFI
-    /// boundary. It deliberately asserts nothing about the *result*: without the
-    /// Accessibility grant (CI, and any developer who has not opted in) enumeration
-    /// correctly fails, and with it the window list depends on what happens to be
-    /// running. What is being asserted is that **calling it is sound** — it returns
-    /// either way rather than crashing, hanging, or corrupting memory, which is
-    /// exactly what a signature or ownership mistake would do.
-    ///
-    /// Runs against this test process, so there is always a live pid to target.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_accessibility_ffi_is_callable_without_a_grant() {
-        use super::super::WindowBackend;
-
-        let backend = AxBackend::new();
-        // Reaches AXIsProcessTrusted; both answers are legitimate.
-        let _ = backend.trusted();
-        // Reaches AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
-        // AXUIElementCopyAttributeValue, the CFRetained ownership dance, and the
-        // CFArray/CFString downcasts. A test binary is not a GUI app, so `Ok` with
-        // no windows and `Err` are both expected outcomes.
-        match backend.windows(std::process::id()) {
-            Ok(windows) => assert!(
-                windows.iter().all(|w| w.frame.width >= 0.0),
-                "a window reported a negative width, so the CGSize decode is wrong"
-            ),
-            Err(err) => assert!(!err.is_empty(), "a failure should say why"),
-        }
-        // And the write path's own guard: an id this backend never enumerated must
-        // be refused rather than dereferenced.
-        let unknown = WindowId {
-            app_pid: std::process::id(),
-            index: 9_999,
-        };
-        assert!(backend
-            .set_frame(
-                unknown,
-                Frame {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 100.0,
-                    height: 100.0,
-                },
-            )
-            .is_err());
     }
 }
