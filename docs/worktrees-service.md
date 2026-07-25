@@ -228,6 +228,11 @@ command confirms by default ([ADR-0027](adrs/adr-0027.md)); `--dry-run` still fe
 (non-destructive) so the behind-count preview is accurate. This subcommand takes no
 `--socket` (it never opens the control socket).
 
+The tree view surfaces the same engine as **Rebase on main** (#1409) — see
+[Rebase onto main](#rebase-onto-main). It is the one tree-view action that spawns
+this CLI in a terminal rather than sending a socket op, for exactly the credential
+reason above.
+
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
 It takes **any number** of paths, since the daemon evaluates and enqueues the whole
@@ -612,6 +617,58 @@ Both phases are auditable in `omni-dev daemon logs` as `merge-queue check` /
 rationale — including why this uses a dedicated GraphQL query rather than widening
 the badge poll, and why it is the service's first op to mutate remote state.
 
+### Rebase onto main
+
+**Rebase on main** (the `4_git` context-menu group, on **linked** worktree rows
+only) rebases the selected worktrees' branches onto their repository's remote
+default branch, fetching each repository's ref **once** for the whole batch (#1409).
+It is the tree-view entry point to the [`worktrees rebase`](#cli) engine — the same
+`Selection::Paths` code path, the same per-worktree reporting.
+
+**It is the one tree-view action that does not use the daemon.** Every other action
+sends a socket envelope; this one shells out to
+`omni-dev worktrees rebase <paths> -y` in a **new integrated terminal**. That is
+required, not stylistic: the fetch needs the user's `ssh-agent` /
+credential-helper environment, which the daemon does not have
+([ADR-0055](adrs/adr-0055.md), [ADR-0003](adrs/adr-0003.md), #903) — a `rebase`
+daemon op would reintroduce exactly the problem those ADRs avoid. Running in a
+terminal also makes the fetch, the result table, and any prompt visible and
+user-drivable, which is what a conflict-capable operation needs.
+
+Consequences of that choice, all of which differ from the socket-backed actions:
+
+- The action needs the **`omni-dev` CLI** on the machine but **not** a running
+  daemon. The binary is resolved `OMNI_DEV_BIN` → well-known install paths
+  (`~/.cargo/bin` first, then Homebrew, `/usr/bin`, `~/.local/bin`) → bare
+  `omni-dev` on `PATH`, mirroring how the extension resolves `gh`
+  (`editors/vscode/src/omniDev.ts`). A GUI-launched editor with a minimal
+  environment still resolves it, and the terminal's shell loads the user's profile
+  besides.
+- The **terminal is the error surface**: a failed fetch, a conflict, or a
+  `command not found` from an unresolvable binary lands there rather than in a
+  notification. Nothing about the run is auditable in `omni-dev daemon logs` —
+  the daemon is not involved.
+
+**Linked-only, and never silently widened.** The menu `when` clause is
+`viewItem =~ /worktree\..*linked/` (byte-for-byte **Close Worktree**'s gate), and
+the handler re-filters on the structural `is_main` fact, because a `when` clause is
+evaluated against the *clicked* row only and says nothing about the rest of a
+multi-selection. A main working tree carried in by a mixed selection is **named as
+skipped** in the confirmation, never quietly included — and the CLI refuses it on
+the same `is_main` guard regardless, so the UI gating is convenience, not the guard.
+
+**One confirm, always.** A rebase rewrites branch history and a batch is one gesture
+over N branches, so the modal is shown even for a single row, listing exactly which
+worktrees will be rewritten ([ADR-0049](adrs/adr-0049.md) §1's rule, as applied by
+[Add to Merge Queue](#merge-queue)). Confirming there is what lets the CLI run with
+`-y`. The list deliberately carries **no** behind-count: the tree's `behind` measures
+divergence from the branch's *upstream*, not from the rebase target, so showing it
+would be quietly wrong — the real counts arrive in the terminal seconds later.
+
+`--autostash` and `--onto <ref>` are **not** surfaced: a dirty worktree is reported
+as `skipped` in output the user is already reading, and a target other than the
+remote default branch is a CLI concern (#1409).
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -860,6 +917,13 @@ of their own repo's linked worktrees), refuses the main working tree on the same
 structural `is_main` guard as `close`, confirms by default, and aborts-and-restores
 rather than leaving a worktree dirty or half-rebased. No secret is read or
 persisted; the fetch relies entirely on the user's ambient `git` configuration.
+
+The tree view's **Rebase on main** action (#1409) changes none of that: it spawns
+that same CLI in a VS Code integrated terminal — the user's own shell, their own
+credentials — rather than sending an op, so it too adds **no new socket
+capability**. What it does add is a one-click path to a history rewrite, which is
+why it always confirms with a modal listing every branch it would rewrite, and why
+it is offered on **linked** worktrees only.
 
 ## Companion contract (for the extension and other clients)
 
@@ -1171,12 +1235,14 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   for on-disk changes, so a branch move is reflected within the tick rather than
   instantly. A polling fallback and a filesystem watcher were both considered and
   deferred.
-- The tree view is **view + focus only**; worktree *management* actions
-  (add/remove/prune) are out of scope for this iteration (except the destructive
-  **close** in [ADR-0049](adrs/adr-0049.md)). `worktrees rebase`
-  ([ADR-0055](adrs/adr-0055.md)) adds a *management* action too, but as a **CLI-only**
-  command rather than a tree-view/daemon op — a tray "rebase all" is a follow-up
-  blocked on the daemon's lack of the user's fetch credentials.
+- The tree view is **view + focus only**, apart from two management actions: the
+  destructive **close** ([ADR-0049](adrs/adr-0049.md)) and **Rebase on main**
+  ([Rebase onto main](#rebase-onto-main), #1409). The rest (add/prune) remain out of
+  scope for this iteration. Rebase is in the view but **not** in the daemon: the row
+  action spawns the [`worktrees rebase`](#cli) CLI in a terminal
+  ([ADR-0055](adrs/adr-0055.md)), so it inherits the user's fetch credentials. A
+  **tray** "rebase all" is still a follow-up for exactly that reason — the tray has
+  no terminal to spawn into and the daemon has no credentials to fetch with.
 - **PR badges are `gh`-based and GitHub-only (#1296):** the tree resolves open PRs
   via the GitHub CLI on repo-expand ([ADR-0050](adrs/adr-0050.md)). Other forges
   (GitLab/Bitbucket) and PR *creation/review/merge* are out of scope — the latter

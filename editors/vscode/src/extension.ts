@@ -36,6 +36,7 @@ import { SessionEntry, tallyByWorktree } from "./sessionCounts";
 import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
+import { rebaseOnMain } from "./rebaseCommand";
 import {
   AheadBehindMap,
   Node,
@@ -572,6 +573,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.addToMergeQueue",
       (node?: Node, selected?: Node[]) => void addToMergeQueue(node, selected),
+    ),
+    // The one item command that never touches the daemon: it shells out to the
+    // `omni-dev` CLI in a terminal, because the rebase's fetch needs the user's
+    // git credentials (ADR-0055). See `rebaseCommand.ts`.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.rebaseOnMain",
+      (node?: Node, selected?: Node[]) => void rebaseOnMain(node, selected),
     ),
     // A destination, not a subject — the menu hides it while a multi-selection is
     // active (`!listMultiSelection`), so it stays single-node here too.
