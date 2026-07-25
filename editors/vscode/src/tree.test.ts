@@ -20,6 +20,7 @@ import {
   repoContextValue,
   repoLabel,
   repoPollingEnabled,
+  rowColorId,
   reposToNodes,
   selectionTargets,
   unbadgedBranches,
@@ -276,7 +277,7 @@ test("worktreeCheckDecoration maps each PR check state to a colored badge (#1324
     tooltip: "checks failing",
   });
   assert.deepEqual(worktreeCheckDecoration({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), {
-    badge: "●",
+    badge: "⋯",
     colorId: "charts.yellow",
     tooltip: "checks pending",
   });
@@ -296,6 +297,31 @@ test("checkStateDecoration maps a bare check state, undefined for none", () => {
   assert.equal(checkStateDecoration("failure")?.colorId, "charts.red");
   assert.equal(checkStateDecoration("pending")?.tooltip, "checks pending");
   assert.equal(checkStateDecoration("none"), undefined);
+});
+
+test("every check glyph reads without its colour, since the badge shares one", () => {
+  const glyphs = (["success", "failure", "pending"] as const).map(
+    (state) => checkStateDecoration(state)?.badge,
+  );
+  assert.deepEqual(glyphs, ["✓", "✗", "⋯"]);
+  // Distinct from each other, and from the session cue's `⚙ ! ◦` (#1406) — in
+  // particular `⋯` replaces the old `●`, which collided with the idle `◦` once
+  // colour stopped distinguishing them.
+  assert.equal(new Set([...glyphs, "⚙", "!", "◦"]).size, 6);
+});
+
+test("rowColorId ranks red over yellow over green over muted", () => {
+  assert.equal(rowColorId("charts.red", "charts.yellow"), "charts.red");
+  assert.equal(rowColorId("charts.yellow", "charts.red"), "charts.red");
+  assert.equal(rowColorId("charts.green", "charts.yellow"), "charts.yellow");
+  assert.equal(rowColorId("charts.green", "descriptionForeground"), "charts.green");
+  // A single dimension keeps its own colour; absent ones are ignored.
+  assert.equal(rowColorId(undefined, "charts.green"), "charts.green");
+  assert.equal(rowColorId("charts.red", undefined), "charts.red");
+  assert.equal(rowColorId(undefined, undefined), undefined);
+  // An unranked colour sorts last but is still used when it is all there is.
+  assert.equal(rowColorId("some.other.color"), "some.other.color");
+  assert.equal(rowColorId("some.other.color", "charts.green"), "charts.green");
 });
 
 test("withPr folds a badge in, and no-ops when absent", () => {
