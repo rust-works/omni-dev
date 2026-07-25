@@ -9060,22 +9060,28 @@ mod tests {
         use std::sync::Arc;
 
         let (_main, _wtp, wt_path) = repo_with_linked_worktree();
-        let target = wt_path.join("target");
-        std::fs::create_dir_all(&target).unwrap();
+        // Created once, here — never inside the writer loop. `create_dir_all`
+        // rebuilds every *parent* component, so calling it per iteration let the
+        // writer resurrect the worktree root the instant removal won the race,
+        // failing the final assertion on a directory removal had correctly
+        // deleted and the test itself put back (#1410).
+        let nested = wt_path.join("target").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let writer_stop = Arc::clone(&stop);
-        let writer_dir = target;
+        let writer_dir = nested;
         let writer = std::thread::spawn(move || {
             let mut n = 0u64;
             // Churn hard for ~400ms (well under the ~2.75s retry budget), then
             // stop so a later removal pass finds the directory quiescent.
             let deadline = std::time::Instant::now() + Duration::from_millis(400);
             while !writer_stop.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-                let nested = writer_dir.join("nested");
-                // Best-effort: the parent may be mid-deletion — ignore failures.
-                let _ = std::fs::create_dir_all(&nested);
-                let _ = std::fs::write(nested.join(format!("artifact-{n}.tmp")), b"x");
+                // Best-effort, and deliberately creating no directory: `fs::write`
+                // is `File::create`, which never makes parents. While `target/`
+                // survives these keep it non-empty — the ENOTEMPTY removal has to
+                // retry past — and once removal wins they simply fail with ENOENT.
+                let _ = std::fs::write(writer_dir.join(format!("artifact-{n}.tmp")), b"x");
                 n += 1;
             }
         });
