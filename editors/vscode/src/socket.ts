@@ -283,6 +283,88 @@ export function mergeQueueEnvelope(paths: string[], requesterKey: string): Envel
 }
 
 /**
+ * The fields the extension sends on a `reposition` op — mirrors the daemon's
+ * `RepositionRequest` (`src/daemon/services/worktrees.rs`).
+ *
+ * Keyed by **window key**, not worktree path, unlike `close`/`merge-queue`: the
+ * subject is an OS window, and only the daemon's registry knows which window has a
+ * worktree open. `target_keys` may include `reference_key` — a multi-selection
+ * naturally contains the invoking window — which the daemon reports and skips.
+ */
+export interface RepositionPayload {
+  reference_key: string;
+  target_keys: string[];
+  check?: boolean;
+}
+
+/**
+ * One target's outcome in a `reposition` reply: a stable machine `outcome` slug
+ * (`moved`, `unchanged`, `partial`, `no-window`, `not-found`, `ambiguous`,
+ * `minimized`, `fullscreen`, `reference`, `failed`, …) plus a human `detail`, so a
+ * summary can be written without the client knowing every slug.
+ */
+export interface RepositionResult {
+  key: string;
+  title?: string;
+  outcome: string;
+  detail: string;
+}
+
+/**
+ * A `reposition` / `reposition-undo` reply.
+ *
+ * `trusted` is a **field, not an error**: a daemon lacking the macOS Accessibility
+ * permission replies `trusted: false` with nothing attempted, so the UI can offer
+ * the settings pane rather than pattern-matching an error string. `blocked` is set
+ * when the reference window itself could not be resolved, in which case no target
+ * was touched. `undoable` marks a reply whose moves the daemon recorded.
+ */
+export interface RepositionReply {
+  trusted?: boolean;
+  blocked?: { reason: string; detail: string };
+  reference?: { key: string; title: string };
+  results?: RepositionResult[];
+  moved?: number;
+  skipped?: number;
+  undoable?: boolean;
+}
+
+/**
+ * Builds a `reposition` envelope: move each target window onto the invoking
+ * window's geometry. `check` makes it a dry run that resolves everything and writes
+ * nothing.
+ *
+ * Not two-phase like `close`/`merge-queue` — nothing durable changes, so a
+ * confirmation on a routine layout command would cost more than it protects.
+ * Reversibility comes from {@link repositionUndoEnvelope} instead.
+ */
+export function repositionEnvelope(
+  referenceKey: string,
+  targetKeys: string[],
+  check = false,
+): Envelope {
+  const payload: RepositionPayload = {
+    reference_key: referenceKey,
+    target_keys: targetKeys,
+  };
+  if (check) {
+    payload.check = true;
+  }
+  return { service: WORKTREES_SERVICE, op: "reposition", payload };
+}
+
+/**
+ * Builds a `reposition-undo` envelope: put the windows the last `reposition` moved
+ * back where they were.
+ *
+ * Payload-free by design — the daemon holds the one-level undo record, so a client
+ * cannot ask it to move windows to arbitrary geometry.
+ */
+export function repositionUndoEnvelope(): Envelope {
+  return { service: WORKTREES_SERVICE, op: "reposition-undo" };
+}
+
+/**
  * The fields a window reports on the sessions `window` op (mirrors `WindowReport`
  * in `src/sessions.rs`) — how many Claude editor tabs / integrated terminals this
  * window has, plus its folders, so the daemon can tag a session's source as VS

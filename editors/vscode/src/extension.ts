@@ -20,6 +20,9 @@ import {
   openEnvelope,
   openPrsEnvelope,
   registerEnvelope,
+  RepositionReply,
+  repositionEnvelope,
+  repositionUndoEnvelope,
   sendEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
@@ -83,6 +86,17 @@ const SHOW_CLOSED_KEY = "omniDevWorktrees.showClosed";
  * activation and on every configuration change (see {@link applyShowPullRequests}).
  */
 const SHOW_PR_KEY = "omniDevWorktrees.showPullRequests";
+
+/**
+ * The `when`-clause context key gating the "Reposition Windows to Match" menu item
+ * on a platform where the daemon can actually move windows (#1407).
+ *
+ * Set once at activation from `process.platform`, which is sound because the daemon
+ * always runs on the same machine as this extension host — it is reached over a
+ * local Unix socket. Off macOS the op replies "untrusted" and moves nothing, so
+ * hiding the item is a courtesy rather than the guard.
+ */
+const CAN_REPOSITION_KEY = "omniDevWorktrees.canReposition";
 
 /**
  * How close (ms) two clicks on the same item must be to count as a double-click.
@@ -469,6 +483,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // Seed the PR-master context key + icon-colour flag from the current setting
   // (#1376), so the per-repo toggle menu and green icons reflect it from frame one.
   applyShowPullRequests();
+  // Window repositioning is macOS-only for now (ADR-0058), so hide its menu item
+  // elsewhere rather than offering an action that can only report "unsupported".
+  void vscode.commands.executeCommand(
+    "setContext",
+    CAN_REPOSITION_KEY,
+    process.platform === "darwin",
+  );
 
   // `canSelectMany` makes every item command plural: VS Code then invokes them as
   // `(clicked, selected[])`, and each handler resolves its targets through
@@ -580,6 +601,18 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.rebaseOnMain",
       (node?: Node, selected?: Node[]) => void rebaseOnMain(node, selected),
+    ),
+    // Geometry work happens in the daemon, which is the only process that can do
+    // it (#1407) — a VS Code extension has no API for its own window's bounds.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.repositionWindowsToMatch",
+      (node?: Node, selected?: Node[]) => void repositionWindowsToMatch(node, selected),
+    ),
+    // Deliberately not selection-scoped: the daemon holds the undo record, so this
+    // is reachable from the summary toast's action and the command palette alike.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.undoReposition",
+      () => void undoReposition(),
     ),
     // A destination, not a subject — the menu hides it while a multi-selection is
     // active (`!listMultiSelection`), so it stays single-node here too.
@@ -1380,6 +1413,180 @@ async function closeOneWindow(target: WorktreeNode): Promise<void> {
   }
   if (!reply.ok) {
     throw new Error(`could not close window — ${reply.error ?? "unknown error"}`);
+  }
+}
+
+// --- Reposition windows (#1407) ---------------------------------------------
+
+/**
+ * How long to wait for a `reposition`. Each target costs a handful of synchronous
+ * Accessibility round-trips into VS Code's main process, and the daemon caps each at
+ * ~2s, so a large selection against a busy app needs more than the default.
+ */
+const REPOSITION_TIMEOUT_MS = 30_000;
+
+/** The deep link to the Accessibility pane of System Settings. */
+const ACCESSIBILITY_SETTINGS_URL =
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/**
+ * Moves and resizes every selected worktree's already-open window to match **this**
+ * window's position and size (#1407).
+ *
+ * This window is the reference: it supplies the geometry and never moves, so it is
+ * filtered out of the targets here as well as being skipped daemon-side. Worktrees
+ * with no open window are dropped client-side and, if a row was stale, reported by
+ * the daemon as `no-window`.
+ *
+ * Fires immediately with no confirmation — this is a routine layout command, and a
+ * modal on every use would cost more than it protects. Reversibility comes from the
+ * **Undo** action offered on the summary, which is why the toast is worth showing
+ * even on complete success.
+ *
+ * Repo nodes are filtered out here rather than trusted to the menu: a `when` clause
+ * sees only the *clicked* row, so a mixed selection reaches this handler intact.
+ */
+async function repositionWindowsToMatch(clicked?: Node, selected?: Node[]): Promise<void> {
+  const { open } = partitionByWindow(worktreeTargets(selectionTargets(clicked, selected)));
+  // Splitting self out is not cosmetic: the reference must not be in its own
+  // target list, or the batch reports a confusing self-skip for the window the
+  // user invoked from.
+  const { others } = partitionSelfLast(open, windowKey);
+  const targets = others.filter((node) => node.wt.window_key);
+  if (targets.length === 0) {
+    void vscode.window.showWarningMessage(
+      "omni-dev: nothing to reposition — select worktrees other than this one that have a window open.",
+    );
+    return;
+  }
+  const keys = targets.map((node) => node.wt.window_key as string);
+
+  const reply = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title:
+        targets.length === 1
+          ? `Repositioning “${worktreeLabel(targets[0].wt)}”…`
+          : `Repositioning ${targets.length} windows…`,
+    },
+    () => send(repositionEnvelope(windowKey, keys), REPOSITION_TIMEOUT_MS),
+  );
+  if (!reply) {
+    daemonDownError();
+    return;
+  }
+  if (!reply.ok) {
+    void vscode.window.showErrorMessage(
+      `omni-dev: could not reposition windows — ${reply.error ?? "unknown error"}`,
+    );
+    return;
+  }
+  reportReposition(reply.payload as RepositionReply, targets.length);
+}
+
+/**
+ * Puts the windows the last reposition moved back where they were.
+ *
+ * The daemon holds the record, so this is deliberately reachable from anywhere —
+ * the summary toast's action button and the command palette — rather than being
+ * scoped to a selection. It is one level deep: once consumed, there is nothing to
+ * replay onto a layout the user may have since redone by hand.
+ */
+async function undoReposition(): Promise<void> {
+  const reply = await send(repositionUndoEnvelope(), REPOSITION_TIMEOUT_MS);
+  if (!reply) {
+    daemonDownError();
+    return;
+  }
+  if (!reply.ok) {
+    void vscode.window.showErrorMessage(
+      `omni-dev: could not undo the reposition — ${reply.error ?? "unknown error"}`,
+    );
+    return;
+  }
+  const payload = reply.payload as RepositionReply;
+  if (payload.trusted === false) {
+    void showAccessibilityError();
+    return;
+  }
+  const restored = payload.moved ?? 0;
+  if (restored === 0) {
+    void vscode.window.showInformationMessage("omni-dev: nothing to undo.");
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    `omni-dev: restored ${restored} ${restored === 1 ? "window" : "windows"}.`,
+  );
+}
+
+/**
+ * Toasts a `reposition` outcome, offering **Undo** when the daemon recorded one.
+ *
+ * The missing-permission and blocked-reference cases get their own messages: both
+ * mean *nothing* moved for a reason the user can act on, which a bare
+ * "0 repositioned" would hide.
+ */
+function reportReposition(payload: RepositionReply, requested: number): void {
+  if (payload.trusted === false) {
+    void showAccessibilityError();
+    return;
+  }
+  if (payload.blocked) {
+    void vscode.window.showErrorMessage(
+      `omni-dev: nothing was moved — ${payload.blocked.detail}.`,
+    );
+    return;
+  }
+
+  const moved = payload.moved ?? 0;
+  const skipped = payload.skipped ?? 0;
+  if (moved === 0) {
+    void vscode.window.showWarningMessage(
+      `omni-dev: no window was moved — ${describeSkippedReposition(payload)}`,
+    );
+    return;
+  }
+  const summary =
+    skipped > 0
+      ? `omni-dev: repositioned ${moved} of ${requested} windows (${describeSkippedReposition(payload)})`
+      : `omni-dev: repositioned ${moved} ${moved === 1 ? "window" : "windows"}.`;
+  if (payload.undoable) {
+    void vscode.window.showInformationMessage(summary, "Undo").then((choice) => {
+      if (choice === "Undo") {
+        void undoReposition();
+      }
+    });
+    return;
+  }
+  void vscode.window.showInformationMessage(summary);
+}
+
+/** A compact "2 skipped: ambiguous, fullscreen" summary of what was left alone. */
+function describeSkippedReposition(payload: RepositionReply): string {
+  const skipped = (payload.results ?? []).filter(
+    (result) => result.outcome !== "moved" && result.outcome !== "partial",
+  );
+  if (skipped.length === 0) {
+    return "nothing was skipped";
+  }
+  const kinds = [...new Set(skipped.map((result) => result.outcome))].join(", ");
+  return `${skipped.length} skipped: ${kinds}`;
+}
+
+/**
+ * Reports the missing Accessibility grant with a button that opens the pane the
+ * user needs. A restart is part of the instruction because macOS only applies a new
+ * grant to a freshly-spawned process, so the resident daemon will not pick it up.
+ */
+async function showAccessibilityError(): Promise<void> {
+  const open = "Open Accessibility Settings";
+  const choice = await vscode.window.showErrorMessage(
+    "omni-dev: moving windows needs the macOS Accessibility permission. Add the omni-dev " +
+      "binary under Privacy & Security → Accessibility, then run `omni-dev daemon restart`.",
+    open,
+  );
+  if (choice === open) {
+    await vscode.env.openExternal(vscode.Uri.parse(ACCESSIBILITY_SETTINGS_URL));
   }
 }
 
