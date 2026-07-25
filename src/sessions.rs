@@ -25,6 +25,11 @@
 //! [`SessionState::for_event`]). `waiting_for_permission` / `waiting_for_input`
 //! are reliable (they come from a `Notification` hook); the transcript watcher
 //! backstops the "thinking window" where no hook fires.
+//!
+//! The one exception is Feed 4, the [`stream`] tracker behind
+//! `omni-dev claude-wrap`: it reads the exact state out of Claude's stream-json
+//! stdio and reports it as [`SessionEvent::StreamState`], which
+//! [`SessionState::for_event`] applies verbatim. See ADR-0057.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +39,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod stream;
 pub mod watcher;
 
 /// How long a session may go silent before it ages out of the registry.
@@ -114,6 +120,8 @@ impl SessionState {
     /// - `TranscriptDiscovered` → the current state if known, else
     ///   [`Idle`](Self::Idle) (a passively-discovered session's activity is
     ///   unknown; a later hook or growth upgrades it)
+    /// - `StreamState(s)` → `s` verbatim (an authoritative stream-json report;
+    ///   the only non-inferred variant — see ADR-0057)
     #[must_use]
     pub fn for_event(event: &SessionEvent, current: Option<Self>) -> Self {
         match event {
@@ -123,6 +131,10 @@ impl SessionState {
             | SessionEvent::PostToolUse
             | SessionEvent::TranscriptGrew => Self::Working,
             SessionEvent::Stop => Self::Idle,
+            // An authoritative state from a stream-json observer wins outright,
+            // ignoring the inferred `current` — it read the exact state from the
+            // stream rather than guessing from a lifecycle event (ADR-0057).
+            SessionEvent::StreamState(state) => *state,
             SessionEvent::Notification(NotificationKind::PermissionPrompt) => {
                 Self::WaitingForPermission
             }
@@ -183,6 +195,14 @@ pub enum SessionEvent {
     /// The transcript watcher discovered a session's `.jsonl` it had not seen —
     /// a session that started before the daemon, or before hooks were installed.
     TranscriptDiscovered,
+    /// An **authoritative** state reported directly by a stream-json observer —
+    /// the `omni-dev claude-wrap` wrapper reading Claude's `--output-format
+    /// stream-json` stdout, where the exact state is first-class (`init` →
+    /// working, `result` → idle, `can_use_tool` → waiting-for-permission). Unlike
+    /// every other variant this is *not* inferred: [`SessionState::for_event`]
+    /// returns the carried state verbatim. Serialized as
+    /// `{"stream_state":"waiting_for_permission"}` (ADR-0057).
+    StreamState(SessionState),
 }
 
 /// Where a session is running, resolved at [`list`](SessionsRegistry::list) time
@@ -668,6 +688,12 @@ mod tests {
             (Notification(AgentNeedsInput), SessionState::WaitingForInput),
             (TranscriptGrew, SessionState::Working),
             (TranscriptDiscovered, SessionState::Idle),
+            // An authoritative stream-json report is returned verbatim.
+            (
+                StreamState(SessionState::WaitingForPermission),
+                SessionState::WaitingForPermission,
+            ),
+            (StreamState(SessionState::Idle), SessionState::Idle),
         ];
         for (event, expected) in cases {
             assert_eq!(
@@ -685,6 +711,15 @@ mod tests {
         assert_eq!(
             SessionState::for_event(&TranscriptDiscovered, Some(SessionState::Working)),
             SessionState::Working
+        );
+        // An authoritative StreamState overrides any current state — it read the
+        // exact state from the stream rather than inferring it.
+        assert_eq!(
+            SessionState::for_event(
+                &StreamState(SessionState::Idle),
+                Some(SessionState::Working)
+            ),
+            SessionState::Idle
         );
     }
 
@@ -930,6 +965,36 @@ mod tests {
         // Absent optional fields are omitted, not null.
         assert!(value.get("model").is_none());
         assert!(value.get("transcript_path").is_none());
+    }
+
+    #[test]
+    fn stream_state_is_authoritative_and_round_trips() {
+        // The `claude-wrap` wrapper reports the exact state; `observe` applies it
+        // verbatim and overrides whatever was inferred before.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s1", SessionEvent::PreToolUse, Some("/p")));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::StreamState(SessionState::WaitingForPermission),
+            None,
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        // The wire shape is a nested tuple variant, matching `{"notification":…}`.
+        let value = serde_json::to_value(SessionEvent::StreamState(
+            SessionState::WaitingForPermission,
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "stream_state": "waiting_for_permission" })
+        );
+        // …and deserializes back.
+        let event: SessionEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            event,
+            SessionEvent::StreamState(SessionState::WaitingForPermission)
+        );
     }
 
     #[test]

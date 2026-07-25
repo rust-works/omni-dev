@@ -1,7 +1,7 @@
 //! `omni-dev sessions` — track the Claude Code sessions running across every
 //! terminal and VS Code window, via the daemon's `sessions` service.
 //!
-//! Four subcommands, split by role:
+//! The subcommands split by role:
 //! - `list` is a **read** client (like `omni-dev worktrees list`): it asks the
 //!   daemon's `sessions` service for the live set and renders it.
 //! - `hook` is the **feed sink**: Claude Code runs it per hook event; it reads
@@ -11,6 +11,10 @@
 //!   exits 0.
 //! - `install-hooks` / `uninstall-hooks` idempotently merge (or remove) the hook
 //!   block in `~/.claude/settings.json`, preserving any hooks already there.
+//! - `install-wrapper` / `uninstall-wrapper` are the same idea for Feed 4: they
+//!   write the shim that VS Code's Claude extension launches
+//!   [`omni-dev claude-wrap`](crate::cli::claude_wrap) through, and point the
+//!   extension's `claudeCode.claudeProcessWrapper` setting at it.
 //!
 //! The register/heartbeat feed from the companion VS Code extension talks to the
 //! socket directly (like the worktrees companion), not through this CLI.
@@ -19,7 +23,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -27,6 +31,7 @@ use serde_json::{json, Value};
 
 use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
+use crate::daemon::paths;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
 use crate::sessions::{NotificationKind, ObserveRequest, SessionEvent};
@@ -60,6 +65,11 @@ pub enum SessionsSubcommands {
     InstallHooks(InstallHooksCommand),
     /// Remove the sessions-tracker hooks from `~/.claude/settings.json`.
     UninstallHooks(UninstallHooksCommand),
+    /// Install the `claude-wrap` shim and point VS Code's Claude extension at it
+    /// (idempotent).
+    InstallWrapper(InstallWrapperCommand),
+    /// Remove the `claude-wrap` shim and VS Code's wrapper setting.
+    UninstallWrapper(UninstallWrapperCommand),
     /// Report a window's Claude tab/terminal counts (companion feed op).
     Window(WindowCommand),
     /// Remove a window's embedding report (companion feed op).
@@ -74,6 +84,8 @@ impl SessionsCommand {
             SessionsSubcommands::Hook(cmd) => cmd.execute().await,
             SessionsSubcommands::InstallHooks(cmd) => cmd.execute(),
             SessionsSubcommands::UninstallHooks(cmd) => cmd.execute(),
+            SessionsSubcommands::InstallWrapper(cmd) => cmd.execute(),
+            SessionsSubcommands::UninstallWrapper(cmd) => cmd.execute(),
             SessionsSubcommands::Window(cmd) => cmd.execute().await,
             SessionsSubcommands::WindowUnregister(cmd) => cmd.execute().await,
         }
@@ -363,6 +375,190 @@ impl UninstallHooksCommand {
         );
         Ok(())
     }
+}
+
+// --- install-wrapper / uninstall-wrapper -------------------------------------
+
+/// The VS Code setting the Claude Code extension reads to decide what to launch
+/// Claude through. Machine-scoped, so it belongs in the *user* settings file.
+const WRAPPER_SETTING_KEY: &str = "claudeCode.claudeProcessWrapper";
+
+/// Filename of the shim written into omni-dev's runtime directory.
+const SHIM_NAME: &str = "claude-wrap";
+
+/// Installs the `claude-wrap` shim and points VS Code's Claude extension at it.
+#[derive(Parser)]
+pub struct InstallWrapperCommand {
+    /// Path to the VS Code user settings file. Defaults to the platform's
+    /// `Code/User/settings.json`.
+    #[arg(long, value_name = "PATH")]
+    pub settings: Option<PathBuf>,
+
+    /// Path to write the shim to. Defaults to `<data-dir>/omni-dev/claude-wrap`.
+    #[arg(long, value_name = "PATH")]
+    pub shim: Option<PathBuf>,
+}
+
+impl InstallWrapperCommand {
+    /// Executes the install: writes the shim, then idempotently sets the
+    /// extension's wrapper setting to point at it.
+    pub fn execute(self) -> Result<()> {
+        let shim = shim_path(self.shim)?;
+        write_shim(&shim)?;
+        let path = vscode_settings_path(self.settings)?;
+        let target = shim.display().to_string();
+
+        let mut settings =
+            read_settings(&path).map_err(|error| manual_setup_hint(&error, &target))?;
+        let changed = set_wrapper(&mut settings, &target);
+        write_settings(&path, &settings)?;
+
+        println!("wrapper shim: {target}");
+        if changed {
+            println!("set {WRAPPER_SETTING_KEY} in {}", path.display());
+            println!("reload VS Code; Claude tabs opened after that report their exact state");
+        } else {
+            println!(
+                "{WRAPPER_SETTING_KEY} already points there in {} (no change)",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Removes the wrapper setting and the shim it points at.
+#[derive(Parser)]
+pub struct UninstallWrapperCommand {
+    /// Path to the VS Code user settings file. Defaults to the platform's
+    /// `Code/User/settings.json`.
+    #[arg(long, value_name = "PATH")]
+    pub settings: Option<PathBuf>,
+
+    /// Path the shim was written to. Defaults to
+    /// `<data-dir>/omni-dev/claude-wrap`.
+    #[arg(long, value_name = "PATH")]
+    pub shim: Option<PathBuf>,
+}
+
+impl UninstallWrapperCommand {
+    /// Executes the uninstall: clears the setting when (and only when) it still
+    /// points at our shim, then removes the shim file.
+    pub fn execute(self) -> Result<()> {
+        let shim = shim_path(self.shim)?;
+        let target = shim.display().to_string();
+        let path = vscode_settings_path(self.settings)?;
+
+        if path.exists() {
+            let mut settings =
+                read_settings(&path).map_err(|error| manual_setup_hint(&error, &target))?;
+            if clear_wrapper(&mut settings, &target) {
+                write_settings(&path, &settings)?;
+                println!("cleared {WRAPPER_SETTING_KEY} in {}", path.display());
+            } else {
+                println!(
+                    "{WRAPPER_SETTING_KEY} in {} does not point at our shim; left alone",
+                    path.display()
+                );
+            }
+        } else {
+            println!("no settings file at {} (nothing to clear)", path.display());
+        }
+
+        if shim.exists() {
+            std::fs::remove_file(&shim)
+                .with_context(|| format!("failed to remove {}", shim.display()))?;
+            println!("removed {target}");
+        }
+        Ok(())
+    }
+}
+
+/// The shim's path: an explicit `--shim`, else `claude-wrap` in omni-dev's
+/// runtime directory (beside the daemon socket).
+fn shim_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(path) => Ok(path),
+        None => Ok(paths::runtime_dir()?.join(SHIM_NAME)),
+    }
+}
+
+/// The VS Code **user** settings path: an explicit `--settings`, else
+/// `<config-dir>/Code/User/settings.json` — `~/Library/Application Support/…` on
+/// macOS and `~/.config/…` on Linux, which is where a machine-scoped setting has
+/// to live. (The runtime directory is `data_dir()`; this one is deliberately
+/// `config_dir()`.)
+fn vscode_settings_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let base = dirs::config_dir().context("could not determine the user config directory")?;
+    Ok(base.join("Code").join("User").join("settings.json"))
+}
+
+/// The shim script's contents.
+///
+/// The extension spawns the configured wrapper directly — no shell, no argument
+/// splitting — so the setting has to name a single executable file. This is that
+/// file: a one-line `exec` into `omni-dev claude-wrap`, using the absolute path
+/// of the running binary so it does not depend on VS Code's `PATH`.
+fn shim_contents() -> String {
+    let exe = std::env::current_exe()
+        .map_or_else(|_| "omni-dev".to_string(), |exe| exe.display().to_string());
+    format!("#!/bin/sh\nexec \"{exe}\" claude-wrap -- \"$@\"\n")
+}
+
+/// Writes the shim, creating its directory and marking it owner-executable.
+fn write_shim(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        paths::ensure_dir_0700(parent)?;
+    }
+    std::fs::write(path, shim_contents())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to make {} executable", path.display()))
+}
+
+/// Points the wrapper setting at `shim`, returning whether anything changed.
+fn set_wrapper(settings: &mut Value, shim: &str) -> bool {
+    let Some(root) = settings.as_object_mut() else {
+        return false;
+    };
+    if root.get(WRAPPER_SETTING_KEY).and_then(Value::as_str) == Some(shim) {
+        return false;
+    }
+    root.insert(WRAPPER_SETTING_KEY.to_string(), json!(shim));
+    true
+}
+
+/// Clears the wrapper setting when it points at `shim`, returning whether it
+/// did. A setting pointing somewhere else is someone else's and is left alone.
+fn clear_wrapper(settings: &mut Value, shim: &str) -> bool {
+    let Some(root) = settings.as_object_mut() else {
+        return false;
+    };
+    if root.get(WRAPPER_SETTING_KEY).and_then(Value::as_str) != Some(shim) {
+        return false;
+    }
+    root.remove(WRAPPER_SETTING_KEY);
+    true
+}
+
+/// Turns an unparseable-settings error into one that tells the user what to do.
+///
+/// VS Code settings files are JSON**C** — comments and trailing commas are
+/// legal there and common in practice, and [`read_settings`] rightly refuses to
+/// rewrite what it cannot parse. The shim is already in place by then, so the
+/// only thing left is one line to paste.
+fn manual_setup_hint(error: &anyhow::Error, shim: &str) -> anyhow::Error {
+    anyhow!(
+        "{error:#}\n\n\
+         VS Code settings files may contain comments or trailing commas, which cannot be \
+         rewritten safely. The shim is installed, so add this line by hand instead:\n\n    \
+         \"{WRAPPER_SETTING_KEY}\": \"{shim}\""
+    )
 }
 
 /// The Claude Code hook events the tracker installs, paired with whether the
@@ -664,6 +860,14 @@ mod tests {
         assert!(matches!(
             parse(&["uninstall-hooks"]),
             SessionsSubcommands::UninstallHooks(_)
+        ));
+        assert!(matches!(
+            parse(&["install-wrapper"]),
+            SessionsSubcommands::InstallWrapper(_)
+        ));
+        assert!(matches!(
+            parse(&["uninstall-wrapper"]),
+            SessionsSubcommands::UninstallWrapper(_)
         ));
     }
 
@@ -990,6 +1194,163 @@ mod tests {
             .is_empty());
     }
 
+    // --- install-wrapper / uninstall-wrapper --------------------------------
+
+    /// An install/uninstall pair pointed entirely inside `tmp`, so nothing
+    /// touches the developer's real data or config directories.
+    fn wrapper_commands(tmp: &Path) -> (InstallWrapperCommand, UninstallWrapperCommand) {
+        let settings = tmp.join("settings.json");
+        let shim = tmp.join("bin").join("claude-wrap");
+        (
+            InstallWrapperCommand {
+                settings: Some(settings.clone()),
+                shim: Some(shim.clone()),
+            },
+            UninstallWrapperCommand {
+                settings: Some(settings),
+                shim: Some(shim),
+            },
+        )
+    }
+
+    #[test]
+    fn install_wrapper_writes_an_executable_shim_and_sets_the_setting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, _) = wrapper_commands(tmp.path());
+        let shim = install.shim.clone().unwrap();
+        let settings = install.settings.clone().unwrap();
+        install.execute().unwrap();
+
+        // The shim is a one-line exec into `claude-wrap`, owner-executable, and
+        // names an absolute binary so it does not depend on VS Code's PATH.
+        let script = std::fs::read_to_string(&shim).unwrap();
+        assert!(script.starts_with("#!/bin/sh\nexec \"/"), "{script}");
+        assert!(script.contains(" claude-wrap -- \"$@\""), "{script}");
+        let mode = std::fs::metadata(&shim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        assert_eq!(
+            read_settings(&settings).unwrap()[WRAPPER_SETTING_KEY],
+            json!(shim.display().to_string())
+        );
+    }
+
+    #[test]
+    fn install_wrapper_is_idempotent_and_preserves_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, _) = wrapper_commands(tmp.path());
+        let settings_path = install.settings.clone().unwrap();
+        write_settings(&settings_path, &json!({ "editor.fontSize": 13 })).unwrap();
+
+        install.execute().unwrap();
+        let (again, _) = wrapper_commands(tmp.path());
+        again.execute().unwrap();
+
+        let settings = read_settings(&settings_path).unwrap();
+        assert_eq!(settings["editor.fontSize"], json!(13));
+        assert!(settings[WRAPPER_SETTING_KEY].is_string());
+    }
+
+    #[test]
+    fn uninstall_wrapper_clears_only_our_own_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, uninstall) = wrapper_commands(tmp.path());
+        let settings_path = install.settings.clone().unwrap();
+        let shim = install.shim.clone().unwrap();
+        install.execute().unwrap();
+        uninstall.execute().unwrap();
+
+        assert!(read_settings(&settings_path).unwrap()[WRAPPER_SETTING_KEY].is_null());
+        assert!(!shim.exists());
+
+        // A setting someone else owns survives, and so does their file.
+        write_settings(
+            &settings_path,
+            &json!({ WRAPPER_SETTING_KEY: "/opt/someone-elses-wrapper" }),
+        )
+        .unwrap();
+        let (_, uninstall) = wrapper_commands(tmp.path());
+        uninstall.execute().unwrap();
+        assert_eq!(
+            read_settings(&settings_path).unwrap()[WRAPPER_SETTING_KEY],
+            json!("/opt/someone-elses-wrapper")
+        );
+    }
+
+    #[test]
+    fn uninstall_wrapper_on_a_missing_settings_file_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, uninstall) = wrapper_commands(tmp.path());
+        let settings = uninstall.settings.clone().unwrap();
+        uninstall.execute().unwrap();
+        assert!(!settings.exists());
+    }
+
+    #[test]
+    fn install_wrapper_on_a_jsonc_settings_file_explains_the_manual_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (install, _) = wrapper_commands(tmp.path());
+        let settings = install.settings.clone().unwrap();
+        let shim = install.shim.clone().unwrap();
+        // Comments are legal in VS Code settings and cannot be rewritten safely.
+        std::fs::write(
+            &settings,
+            "{\n  // a comment\n  \"editor.fontSize\": 13\n}\n",
+        )
+        .unwrap();
+
+        let error = format!("{:#}", install.execute().unwrap_err());
+        assert!(error.contains("not valid JSON"), "{error}");
+        assert!(error.contains(WRAPPER_SETTING_KEY), "{error}");
+        // The shim is written first, so the printed line is ready to paste.
+        assert!(error.contains(&shim.display().to_string()), "{error}");
+        assert!(shim.exists());
+    }
+
+    #[test]
+    fn install_wrapper_fails_when_the_shim_directory_cannot_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file where the shim's parent directory would have to go, so
+        // creating it cannot succeed — a mistyped `--shim` in practice.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let error = InstallWrapperCommand {
+            settings: Some(tmp.path().join("settings.json")),
+            shim: Some(blocker.join("claude-wrap")),
+        }
+        .execute()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not-a-dir"), "{error:#}");
+        // The settings file is left untouched when the shim cannot be written.
+        assert!(!tmp.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn set_and_clear_wrapper_tolerate_a_non_object_settings_value() {
+        // `read_settings` guarantees an object, but these degrade rather than
+        // panic if a caller hands them anything else (the `merge_hooks` rule).
+        let mut scalar = json!("not an object");
+        assert!(!set_wrapper(&mut scalar, "/shim"));
+        assert!(!clear_wrapper(&mut scalar, "/shim"));
+        assert_eq!(scalar, json!("not an object"));
+    }
+
+    #[test]
+    fn the_wrapper_paths_default_outside_the_claude_config_dir() {
+        // The shim lives beside the daemon socket; the setting lives in VS Code's
+        // *config* directory, which is a different base on every platform.
+        let shim = shim_path(None).unwrap();
+        assert_eq!(shim.file_name().unwrap(), SHIM_NAME);
+        assert_eq!(shim.parent().unwrap(), paths::runtime_dir().unwrap());
+        let settings = vscode_settings_path(None).unwrap();
+        assert!(
+            settings.ends_with("Code/User/settings.json"),
+            "{settings:?}"
+        );
+    }
+
     #[test]
     fn uninstall_command_on_a_missing_file_is_a_noop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1020,6 +1381,19 @@ mod tests {
             command: SessionsSubcommands::UninstallHooks(UninstallHooksCommand {
                 settings: Some(path.clone()),
             }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        let (install, uninstall) = wrapper_commands(tmp.path());
+        SessionsCommand {
+            command: SessionsSubcommands::InstallWrapper(install),
+        }
+        .execute()
+        .await
+        .unwrap();
+        SessionsCommand {
+            command: SessionsSubcommands::UninstallWrapper(uninstall),
         }
         .execute()
         .await

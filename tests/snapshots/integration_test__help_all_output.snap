@@ -9,23 +9,24 @@ AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluenc
 Usage: omni-dev [OPTIONS] <COMMAND>
 
 Commands:
-  ai          AI operations
-  git         Git-related operations
-  commands    Command template management
-  config      Configuration and model information
-  atlassian   Atlassian: JIRA and Confluence operations
-  browser     Browser bridge: drive authenticated requests through a browser tab
-  daemon      Daemon: host long-lived services (e.g. the browser bridge)
-  datadog     Datadog: read-only API operations
-  snowflake   Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
-  worktrees   Worktrees: list the repos/worktrees open across all VS Code windows
-  sessions    Sessions: track Claude Code sessions running across all terminals and windows
-  coverage    Coverage: diff/patch coverage analysis for PR comments
-  transcript  Transcript and caption fetching from media platforms
-  log         Search the local invocation + HTTP request log
-  resources   Embedded reference resources (specs, etc.)
-  help-all    Displays comprehensive help for all commands
-  help        Print this message or the help of the given subcommand(s)
+  ai           AI operations
+  git          Git-related operations
+  commands     Command template management
+  config       Configuration and model information
+  atlassian    Atlassian: JIRA and Confluence operations
+  browser      Browser bridge: drive authenticated requests through a browser tab
+  daemon       Daemon: host long-lived services (e.g. the browser bridge)
+  datadog      Datadog: read-only API operations
+  snowflake    Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
+  worktrees    Worktrees: list the repos/worktrees open across all VS Code windows
+  sessions     Sessions: track Claude Code sessions running across all terminals and windows
+  claude-wrap  Wrap the Claude process, reporting its exact session state to the daemon
+  coverage     Coverage: diff/patch coverage analysis for PR comments
+  transcript   Transcript and caption fetching from media platforms
+  log          Search the local invocation + HTTP request log
+  resources    Embedded reference resources (specs, etc.)
+  help-all     Displays comprehensive help for all commands
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
       --ai-backend <AI_BACKEND>
@@ -2762,6 +2763,22 @@ Options:
 
 ================================================================================
 
+omni-dev claude-wrap - Wrap the Claude process, reporting its exact session state to the daemon
+
+Wrap the Claude process, reporting its exact session state to the daemon
+
+Usage: claude-wrap [OPTIONS] [CMD]...
+
+Arguments:
+  [CMD]...  The command to run and its arguments, after a `--` separator
+
+Options:
+      --socket <PATH>  Path to the daemon control socket. Defaults to the standard per-user path
+  -h, --help           Print help
+
+
+================================================================================
+
 omni-dev commands - Command template management
 
 Command template management
@@ -4134,6 +4151,8 @@ Commands:
   hook               Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
   install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
   uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json`
+  install-wrapper    Install the `claude-wrap` shim and point VS Code's Claude extension at it (idempotent)
+  uninstall-wrapper  Remove the `claude-wrap` shim and VS Code's wrapper setting
   window             Report a window's Claude tab/terminal counts (companion feed op)
   window-unregister  Remove a window's embedding report (companion feed op)
   help               Print this message or the help of the given subcommand(s)
@@ -4170,6 +4189,20 @@ Options:
 
 ================================================================================
 
+omni-dev sessions install-wrapper - Install the `claude-wrap` shim and point VS Code's Claude extension at it (idempotent)
+
+Install the `claude-wrap` shim and point VS Code's Claude extension at it (idempotent)
+
+Usage: install-wrapper [OPTIONS]
+
+Options:
+      --settings <PATH>  Path to the VS Code user settings file. Defaults to the platform's `Code/User/settings.json`
+      --shim <PATH>      Path to write the shim to. Defaults to `<data-dir>/omni-dev/claude-wrap`
+  -h, --help             Print help
+
+
+================================================================================
+
 omni-dev sessions list - List the Claude Code sessions currently running across all windows
 
 List the Claude Code sessions currently running across all windows
@@ -4192,6 +4225,20 @@ Usage: uninstall-hooks [OPTIONS]
 
 Options:
       --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev sessions uninstall-wrapper - Remove the `claude-wrap` shim and VS Code's wrapper setting
+
+Remove the `claude-wrap` shim and VS Code's wrapper setting
+
+Usage: uninstall-wrapper [OPTIONS]
+
+Options:
+      --settings <PATH>  Path to the VS Code user settings file. Defaults to the platform's `Code/User/settings.json`
+      --shim <PATH>      Path the shim was written to. Defaults to `<data-dir>/omni-dev/claude-wrap`
   -h, --help             Print help
 
 

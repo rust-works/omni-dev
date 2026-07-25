@@ -337,12 +337,17 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
 }
 
 /**
- * The muted row description: the sync counts and the PR badge, each shown only
- * when present, separated by a gap. A worktree with neither (no upstream, no PR)
- * yields an empty description — byte-for-byte the pre-#1296 behavior.
+ * The muted row description: the sync counts, the PR badge, and the Claude
+ * session glyphs, each shown only when present, separated by a gap. A worktree
+ * with none of them yields an empty description — byte-for-byte the pre-#1296
+ * behavior.
+ *
+ * `sessions` is passed in already rendered (by `sessionCounts.ts`) rather than
+ * derived here: session state rides its own daemon op, not the tree snapshot,
+ * so it is side-data the provider folds in.
  */
-export function worktreeDescription(wt: TreeWorktreePayload): string {
-  return [syncCounts(wt), worktreePrBadge(wt)].filter(Boolean).join("  ");
+export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): string {
+  return [syncCounts(wt), worktreePrBadge(wt), sessions].filter(Boolean).join("  ");
 }
 
 /**
@@ -377,10 +382,48 @@ export function checkStateDecoration(checks: PrCheckState): CheckDecoration | un
     case "failure":
       return { badge: "✗", colorId: "charts.red", tooltip: "checks failing" };
     case "pending":
-      return { badge: "●", colorId: "charts.yellow", tooltip: "checks pending" };
+      // `⋯` rather than the `●` this used before #1406: the badge now shares one
+      // colour with the Claude session cue, so a glyph that only meant "pending"
+      // because it was yellow no longer reads. An ellipsis says "in progress" on
+      // its own, and does not collide with the session's `◦` idle dot.
+      return { badge: "⋯", colorId: "charts.yellow", tooltip: "checks pending" };
     case "none":
       return undefined;
   }
+}
+
+/**
+ * Severity order for a row's badge colour, most severe first. A row can carry a
+ * PR check verdict *and* a Claude session cue, and VS Code paints every merged
+ * decoration in a single colour (`_appendForMany` picks one), so the two have to
+ * agree on which one that is.
+ */
+const COLOR_SEVERITY = ["charts.red", "charts.yellow", "charts.green", "descriptionForeground"];
+
+/**
+ * The most severe of the given badge colours: red over yellow over green over
+ * muted, ignoring absent ones.
+ *
+ * Both decoration providers call this with the *same* inputs and hand VS Code
+ * the same colour, so the merged badge is coloured by severity rather than by
+ * whichever provider the workbench happens to iterate first. An unrecognized
+ * colour sorts last but is still returned when it is all there is.
+ */
+export function rowColorId(...colorIds: (string | undefined)[]): string | undefined {
+  let best: string | undefined;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const colorId of colorIds) {
+    if (colorId === undefined) {
+      continue;
+    }
+    const found = COLOR_SEVERITY.indexOf(colorId);
+    const rank = found === -1 ? COLOR_SEVERITY.length : found;
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = colorId;
+    }
+  }
+  return best;
 }
 
 /**
@@ -423,14 +466,18 @@ function worktreePrTooltipLine(wt: TreeWorktreePayload): string | undefined {
 
 /**
  * A multi-line hover tooltip: path, main/linked, branch+sync, the PR (when one is
- * resolved), parent repo, open state. The open line distinguishes the current
- * window (`● this window`) from a worktree merely open elsewhere (`● window open`)
- * when `windowKey` is supplied.
+ * resolved), the Claude sessions (when any are running), parent repo, open state.
+ * The open line distinguishes the current window (`● this window`) from a
+ * worktree merely open elsewhere (`● window open`) when `windowKey` is supplied.
+ *
+ * `sessionsLine` is rendered by `sessionCounts.ts` for the same reason
+ * {@link worktreeDescription} takes its glyphs pre-rendered.
  */
 export function worktreeTooltip(
   wt: TreeWorktreePayload,
   repo: TreeRepoPayload,
   windowKey?: string,
+  sessionsLine?: string,
 ): string {
   const kind = wt.is_main ? "main working tree" : "linked worktree";
   const branch = wt.branch ?? "(detached)";
@@ -445,6 +492,9 @@ export function worktreeTooltip(
   const prLine = worktreePrTooltipLine(wt);
   if (prLine) {
     lines.push(prLine);
+  }
+  if (sessionsLine) {
+    lines.push(sessionsLine);
   }
   lines.push(openLine);
   return lines.join("\n");
