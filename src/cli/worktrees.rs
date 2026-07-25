@@ -2623,6 +2623,26 @@ mod tests {
         .unwrap();
         server.await.unwrap();
 
+        // Reposition: `--undo` needs no path resolution, so one reply suffices.
+        let (_d, sock, server) = fake_daemon_seq(vec![json!({
+            "ok": true,
+            "payload": { "trusted": true, "moved": 0, "skipped": 0, "results": [] },
+        })]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Reposition(RepositionCommand {
+                paths: Vec::new(),
+                reference: None,
+                dry_run: false,
+                undo: true,
+                output: TableOrJson::Table,
+                socket: Some(sock),
+            }),
+        }
+        .execute(None)
+        .await
+        .unwrap();
+        server.await.unwrap();
+
         // Register.
         let (_d, sock, server) =
             fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
@@ -3326,6 +3346,298 @@ mod tests {
             }),
         };
         cmd.execute(None).await.unwrap();
+        server.await.unwrap();
+    }
+
+    // --- Reposition (#1407) ---------------------------------------------------
+
+    #[test]
+    fn reposition_parses_flags_and_enforces_the_undo_split() {
+        let WorktreesSubcommands::Reposition(cmd) = parse(&[
+            "reposition",
+            "--reference",
+            "/wt/ref",
+            "/wt/a",
+            "/wt/b",
+            "--dry-run",
+            "-o",
+            "json",
+        ]) else {
+            panic!("expected the Reposition variant");
+        };
+        assert_eq!(cmd.reference.as_deref(), Some(Path::new("/wt/ref")));
+        assert_eq!(
+            cmd.paths,
+            vec![PathBuf::from("/wt/a"), PathBuf::from("/wt/b")]
+        );
+        assert!(cmd.dry_run);
+        assert!(!cmd.undo);
+        assert_eq!(cmd.output, TableOrJson::Json);
+
+        // `--undo` stands alone: no reference needed.
+        let WorktreesSubcommands::Reposition(undo) = parse(&["reposition", "--undo"]) else {
+            panic!("expected the Reposition variant");
+        };
+        assert!(undo.undo);
+        assert!(undo.reference.is_none());
+    }
+
+    #[test]
+    fn reposition_rejects_a_missing_reference_and_undo_combinations() {
+        // Without `--undo`, a reference is mandatory — otherwise there is no
+        // geometry to copy and the request cannot mean anything.
+        assert!(RepositionCommand::try_parse_from(["reposition", "/wt/a"]).is_err());
+        // `--undo` restores a recorded batch, so pairing it with a reference or a
+        // dry run would be contradictory rather than merely redundant.
+        assert!(RepositionCommand::try_parse_from([
+            "reposition",
+            "--undo",
+            "--reference",
+            "/wt/ref",
+        ])
+        .is_err());
+        assert!(RepositionCommand::try_parse_from(["reposition", "--undo", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn window_key_for_matches_a_canonicalized_folder() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let wt = dir.path().join("tree");
+        std::fs::create_dir(&wt).unwrap();
+        let canonical = std::fs::canonicalize(&wt).unwrap();
+        let windows = json!({
+            "windows": [
+                { "key": "other", "folders": ["/definitely/not/here"] },
+                { "key": "wanted", "folders": [canonical.to_string_lossy()] },
+            ]
+        });
+        assert_eq!(window_key_for(&windows, &wt).unwrap(), "wanted");
+    }
+
+    #[test]
+    fn window_key_for_errors_when_no_window_has_it_open() {
+        // The CLI names its targets one at a time, so an unmatched one is a
+        // mistake worth reporting — unlike a tree multi-select, where a stale row
+        // is expected and skipped.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let err = window_key_for(&json!({ "windows": [] }), dir.path())
+            .expect_err("an unopened worktree must not resolve");
+        assert!(err.to_string().contains("no VS Code window has"), "{err:#}");
+        // A path that does not exist at all fails earlier, on canonicalization.
+        let missing = dir.path().join("gone");
+        let err = window_key_for(&json!({ "windows": [] }), &missing)
+            .expect_err("a nonexistent path must not resolve");
+        assert!(err.to_string().contains("cannot resolve"), "{err:#}");
+    }
+
+    #[test]
+    fn render_reposition_explains_a_missing_permission() {
+        let out = render_reposition(&json!({ "trusted": false, "results": [] }));
+        assert!(out.contains("Accessibility permission"), "{out}");
+        assert!(out.contains("daemon restart"), "{out}");
+    }
+
+    #[test]
+    fn render_reposition_reports_a_blocked_batch() {
+        let out = render_reposition(&json!({
+            "trusted": true,
+            "blocked": { "reason": "reference-ambiguous", "detail": "2 windows match “main”" },
+            "results": [],
+        }));
+        assert!(out.contains("Nothing was moved"), "{out}");
+        assert!(out.contains("reference-ambiguous"), "{out}");
+        assert!(out.contains("2 windows match"), "{out}");
+    }
+
+    #[test]
+    fn render_reposition_renders_the_reference_and_per_target_outcomes() {
+        let out = render_reposition(&json!({
+            "trusted": true,
+            "reference": {
+                "key": "r",
+                "title": "ref-tree",
+                "frame": { "x": 10.4, "y": 20.6, "width": 800.0, "height": 600.0 },
+            },
+            "moved": 1,
+            "skipped": 1,
+            "results": [
+                { "key": "a", "title": "a-tree", "outcome": "moved", "detail": "moved into position" },
+                { "key": "b", "title": "b-tree", "outcome": "ambiguous", "detail": "2 match" },
+            ],
+        }));
+        assert!(
+            out.contains("Reference: ref-tree 800×600 at (10, 21)"),
+            "{out}"
+        );
+        assert!(out.contains("Moved: 1 / Skipped: 1"), "{out}");
+        assert!(out.contains("moved: a-tree"), "{out}");
+        assert!(out.contains("ambiguous: b-tree"), "{out}");
+    }
+
+    #[test]
+    fn render_reposition_falls_back_to_the_key_and_notes_an_empty_batch() {
+        // A target the daemon could not name (no title reported) is still
+        // identified, by key.
+        let out = render_reposition(&json!({
+            "trusted": true,
+            "results": [{ "key": "keyless", "outcome": "no-window", "detail": "gone" }],
+        }));
+        assert!(out.contains("no-window: keyless"), "{out}");
+        // An undo with nothing recorded reports rather than printing a bare header.
+        let empty = render_reposition(&json!({ "trusted": true, "results": [] }));
+        assert!(empty.contains("(nothing to report)"), "{empty}");
+    }
+
+    #[test]
+    fn render_reposition_strips_control_bytes_from_daemon_strings() {
+        // A window title is companion-supplied metadata, so it cannot be allowed
+        // to inject escape sequences into the operator's terminal (#1137).
+        let out = render_reposition(&json!({
+            "trusted": true,
+            "results": [{
+                "key": "k",
+                "title": "evil\u{1b}[31mred",
+                "outcome": "moved",
+                "detail": "ok\u{7}",
+            }],
+        }));
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(!out.contains('\u{7}'), "{out:?}");
+    }
+
+    #[test]
+    fn render_frame_formats_or_dashes() {
+        assert_eq!(render_frame(None), "-");
+        assert_eq!(
+            render_frame(Some(
+                &json!({ "x": 1.5, "y": -2.4, "width": 100.0, "height": 50.0 })
+            )),
+            "100×50 at (2, -2)"
+        );
+        // A malformed frame degrades to zeroes rather than panicking.
+        assert_eq!(render_frame(Some(&json!({}))), "0×0 at (0, 0)");
+    }
+
+    #[test]
+    fn print_reposition_emits_both_formats() {
+        let reply = json!({ "trusted": true, "results": [], "moved": 0, "skipped": 0 });
+        print_reposition(TableOrJson::Table, &reply).unwrap();
+        print_reposition(TableOrJson::Json, &reply).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reposition_maps_paths_to_window_keys_and_sends_the_op() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let reference = dir.path().join("ref");
+        let target = dir.path().join("tgt");
+        std::fs::create_dir(&reference).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let (canon_ref, canon_tgt) = (
+            std::fs::canonicalize(&reference).unwrap(),
+            std::fs::canonicalize(&target).unwrap(),
+        );
+
+        // Two round trips: the `list` that resolves paths to window keys, then the
+        // op itself.
+        let (_sock_dir, sock, server) = fake_daemon_replies(vec![
+            json!({ "ok": true, "payload": { "windows": [
+                { "key": "ref-key", "folders": [canon_ref.to_string_lossy()] },
+                { "key": "tgt-key", "folders": [canon_tgt.to_string_lossy()] },
+            ] } }),
+            json!({ "ok": true, "payload": {
+                "trusted": true,
+                "moved": 1,
+                "skipped": 0,
+                "results": [{ "key": "tgt-key", "outcome": "moved", "detail": "moved into position" }],
+            } }),
+        ]);
+
+        RepositionCommand {
+            paths: vec![target],
+            reference: Some(reference),
+            dry_run: false,
+            undo: false,
+            output: TableOrJson::Json,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reposition_undo_skips_the_list_lookup_entirely() {
+        // Undo addresses whatever the daemon recorded, so it needs no path
+        // resolution and issues exactly one request.
+        let (_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "trusted": true, "moved": 2, "skipped": 0, "results": [] },
+        }));
+        RepositionCommand {
+            paths: Vec::new(),
+            reference: None,
+            dry_run: false,
+            undo: true,
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reposition_fails_before_the_op_when_a_target_has_no_window() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let reference = dir.path().join("ref");
+        let target = dir.path().join("tgt");
+        std::fs::create_dir(&reference).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let canon_ref = std::fs::canonicalize(&reference).unwrap();
+
+        // Only the reference is open, so the target cannot be resolved — and the
+        // `reposition` op is never sent, which is why one canned reply suffices.
+        let (_sock_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "windows": [
+                { "key": "ref-key", "folders": [canon_ref.to_string_lossy()] },
+            ] },
+        }));
+        let err = RepositionCommand {
+            paths: vec![target],
+            reference: Some(reference),
+            dry_run: true,
+            undo: false,
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an unopened target must abort the command");
+        assert!(err.to_string().contains("no VS Code window has"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reposition_surfaces_a_daemon_error() {
+        let (_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": false,
+            "error": "unknown worktrees op: reposition",
+        }));
+        let err = RepositionCommand {
+            paths: Vec::new(),
+            reference: None,
+            dry_run: false,
+            undo: true,
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an `ok:false` reply must not be reported as success");
+        assert!(err.to_string().contains("unknown worktrees op"), "{err:#}");
         server.await.unwrap();
     }
 }

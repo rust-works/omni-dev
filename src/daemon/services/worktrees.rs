@@ -4692,6 +4692,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blocked_reposition_carries_the_reason_and_records_no_undo() {
+        let svc = WorktreesService::new();
+        // Two windows share a root name, so the *reference* cannot be resolved and
+        // the whole batch is refused before any target is attempted.
+        register_window(&svc, "ref", "twin", 11);
+        register_window(&svc, "other", "other-tree", 12);
+        // The window table is behind an `Arc<Mutex<…>>`, so retitling it needs no
+        // `mut` binding — and the same shared table backs the factory's clone.
+        let backend = StubBackend::new(true);
+        {
+            let mut windows = backend
+                .windows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            windows[0].title = "a.rs — twin".to_string();
+            windows[1].title = "b.rs — twin".to_string();
+        }
+
+        let reply = svc
+            .reposition_with(
+                serde_json::from_value(json!({
+                    "reference_key": "ref",
+                    "target_keys": ["other"],
+                }))
+                .unwrap(),
+                backend.factory(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply["trusted"], json!(true));
+        assert_eq!(reply["blocked"]["reason"], json!("reference-ambiguous"));
+        assert!(
+            reply["blocked"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("twin")),
+            "the reason should name the ambiguous title: {reply}"
+        );
+        assert_eq!(reply["results"], json!([]), "no target is attempted");
+        assert!(reply.get("undoable").is_none());
+        assert!(backend.writes().is_empty());
+
+        // And nothing was recorded, so a following undo has nothing to replay.
+        let undone = svc
+            .reposition_undo_with(StubBackend::new(true).factory())
+            .await
+            .unwrap();
+        assert_eq!(undone["moved"], json!(0));
+    }
+
+    #[tokio::test]
     async fn reposition_undo_is_a_no_op_with_nothing_recorded() {
         let svc = WorktreesService::new();
         let reply = svc.handle("reposition-undo", Value::Null).await.unwrap();
