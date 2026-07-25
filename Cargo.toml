@@ -78,6 +78,21 @@ nix = { version = "0.31", default-features = false, features = ["fs", "hostname"
 arboard = { version = "3.6.1", optional = true }
 tao = { version = "0.35.3", optional = true }
 tray-icon = { version = "0.24.1", optional = true }
+# CoreFoundation types for the worktrees service's Accessibility backend
+# (`reposition`, #1407): CFString/CFArray/CFBoolean for AX attribute values,
+# CGPoint/CGSize for geometry, and CFRetained for CFRelease-on-drop ownership of
+# every AX object. Deliberately **not** optional — repositioning must work in the
+# default build, unlike the `menu-bar` tray. Already in the tree transitively via
+# the tray deps; the Accessibility C API itself is declared inline in
+# `src/daemon/services/worktrees/geometry/ax.rs` rather than pulled in as a whole
+# generated framework binding (ADR-0058).
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFArray",
+  "CFCGTypes",
+  "CFNumber",
+  "CFString",
+] }
 
 [features]
 mcp = ["dep:rmcp"]
