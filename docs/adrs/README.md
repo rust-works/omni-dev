@@ -80,3 +80,4 @@ by Michael Nygard.
 | [ADR-0054](adr-0054.md)  | ✅ Accepted                              | 2026-07-20 | Native Windows Daemon Control Plane on a Per-User Named Pipe with Detached-Spawn Activation |
 | [ADR-0055](adr-0055.md)  | ✅ Accepted                              | 2026-07-24 | Batch Worktree Rebase onto Remote Main, Fetch-Once-Per-Repository, CLI-Side                 |
 | [ADR-0056](adr-0056.md)  | ✅ Accepted                              | 2026-07-24 | Batch Merge-Queue Enqueue over the Daemon, Gated by Server-Side Eligibility                 |
+| [ADR-0057](adr-0057.md)  | ✅ Accepted                              | 2026-07-25 | Authoritative Claude Session State via a Stream-Tee Process Wrapper                         |

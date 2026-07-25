@@ -3,12 +3,13 @@
 Track, for the logged-in user and across **every** terminal and VS Code window,
 the Claude Code sessions running right now and each one's coarse live state
 (working, idle, or waiting on you). It is the omni-dev daemon's **fourth
-service** (after the browser bridge, Snowflake, and worktrees), fed by three
+service** (after the browser bridge, Snowflake, and worktrees), fed by four
 independent sources that each degrade gracefully.
 
 This guide is the operator-facing contract. The design rationale is
-[ADR-0052](adrs/adr-0052.md); the daemon framework is [ADR-0039](adrs/adr-0039.md)
-and the rendezvous pattern it reuses is [ADR-0040](adrs/adr-0040.md).
+[ADR-0052](adrs/adr-0052.md) — plus [ADR-0057](adrs/adr-0057.md) for the stream
+wrapper (Feed 4); the daemon framework is [ADR-0039](adrs/adr-0039.md) and the
+rendezvous pattern it reuses is [ADR-0040](adrs/adr-0040.md).
 
 > **Distinct from history search (#876).** That searches your *past*
 > conversations under `~/.claude/projects`; this tracks *currently-running*
@@ -22,9 +23,11 @@ No single vantage point sees all your sessions:
 - A **VS Code window** is sandboxed per extension host — it sees only its own
   tabs/terminals, never a sibling window's.
 - The **transcript files** are machine-wide but carry no live state on their own.
+- A **stream wrapper** sees one Claude process exactly, and only the ones it was
+  configured to launch.
 
 A single resident process — the daemon — is the rendezvous point that aggregates
-all three into one consistent view served back to the CLI, the tray, and the
+all four into one consistent view served back to the CLI, the tray, and the
 extension.
 
 ## Architecture
@@ -38,11 +41,17 @@ extension.
   │   ~/.claude/projects/<enc-cwd>/           (in-memory SessionsRegistry,
   │   <session-id>.jsonl (growth/mtime)        TTL reap-on-read, like worktrees)
   │                                                                 ▲
-  └─ Feed 3: companion VS Code extension ───────────────────────────┘
-      (editors/vscode, extended: reports its window's Claude
-       tab/terminal counts so the daemon can tag a session's source)
+  ├─ Feed 3: companion VS Code extension ───────────────────────────┤
+  │   (editors/vscode, extended: reports its window's Claude        │
+  │    tab/terminal counts so the daemon can tag a session's source)│
+  │                                                                 │
+  └─ Feed 4: stream wrapper ────────────────────────────────────────┘
+      omni-dev claude-wrap, launched by the Claude VS Code extension
+      in place of `claude`; tees its stream-json stdio and reports the
+      *exact* state (authoritative, unlike Feeds 1–3)
 
               daemon ──► `omni-dev sessions list` / tray submenu
+                     ──► the companion's Worktrees tree cues
 ```
 
 The **engine** ([`src/sessions.rs`](../src/sessions.rs), `SessionsRegistry`) is
@@ -70,8 +79,9 @@ started_at, last_seen, model
 
 ### State inference
 
-State is **inferred** — Claude Code ships no dedicated session-state event
-(anthropics/claude-code#43058, *not planned*), so this is best-effort:
+For Feeds 1–3 state is **inferred** — Claude Code ships no dedicated
+session-state event (anthropics/claude-code#43058, *not planned*), so this is
+best-effort:
 
 | Sighting | State |
 |---|---|
@@ -82,11 +92,16 @@ State is **inferred** — Claude Code ships no dedicated session-state event
 | `Notification` — idle/input prompt | `waiting_for_input` |
 | `Notification` — unclassified / transcript discovered | *unchanged* |
 | `SessionEnd` | `ended` (reaped shortly after) |
+| **stream state** (Feed 4) | **exactly what was reported** |
 
 `waiting_for_*` are **reliable** (a `Notification` hook fires them directly).
 `working` vs `idle` is best-effort, with the transcript-growth backstop covering
 the ~5–15s "thinking window" between a prompt and the first tool call, where no
 hook fires.
+
+Feed 4 is the exception: it reads the state out of Claude's own stream rather
+than guessing from a lifecycle event, so it wins outright over anything inferred
+before it. See [the stream wrapper](#the-stream-wrapper-feed-4).
 
 ### Liveness
 
@@ -162,6 +177,55 @@ exits 0**, so it can never block or fail a Claude turn.
 
 Once installed, restart is not required — the next Claude turn starts reporting.
 
+### The stream wrapper (Feed 4)
+
+Feeds 1–3 watch a session from the outside and *infer* what it is doing. Feed 4
+sits **inside** the stream Claude's VS Code extension already reads, so the state
+it reports is the real one — permission prompts included, with no hooks needed.
+
+```bash
+# Install the shim and point VS Code's Claude extension at it (idempotent).
+omni-dev sessions install-wrapper
+
+# Remove the shim and clear the setting again.
+omni-dev sessions uninstall-wrapper
+
+# Point at a specific settings file / shim location.
+omni-dev sessions install-wrapper --settings /path/to/settings.json --shim /path/to/shim
+```
+
+`install-wrapper` writes a `0700` shim next to the daemon socket
+(`<data-dir>/omni-dev/claude-wrap`) that `exec`s the absolute
+`omni-dev claude-wrap`, then sets `claudeCode.claudeProcessWrapper` in your VS
+Code **user** settings to that path. The shim exists because the extension spawns
+the configured wrapper directly — no shell, no argument splitting — so the setting
+has to name a single executable file.
+
+**Reload VS Code afterwards.** Only Claude tabs started after the setting is
+applied are wrapped; a window reload covers them all at once. Nothing about how
+you launch tabs changes.
+
+If your `settings.json` contains comments or trailing commas (both legal in VS
+Code, neither safely rewritable), the command says so and prints the exact line to
+paste — the shim is written first, so the hint is ready to use.
+
+The `claude-wrap` subcommand is the **wrapper** — the extension runs it, not you.
+It forwards the child's stdio byte-for-byte, tees complete lines to a parser, and
+exits with the child's own status. It is **fail-open by construction**: the byte
+forwarding never waits on the parser or the daemon, over-long or unparseable lines
+are simply not parsed, and a missing daemon is a silent no-op. The worst case is
+losing state visibility, never Claude failing to launch. It **never logs or
+persists conversation content** — only the state, `session_id`, `cwd` and model
+leave the process.
+
+It also re-reports the current state every 30s, so a wrapped session idle at the
+prompt does **not** age out on the 5-minute TTL the way a hook-fed one does.
+
+Coverage is the VS Code extension's Claude tabs. Terminal Claude
+(`claudeCode.useTerminal`, or `claude` in any shell) is not stream-json and is not
+wrapped — `claude-wrap` detects a terminal and gets out of the way entirely — so
+those sessions keep Feeds 1–3 and their limits.
+
 ## Tray
 
 The macOS menu bar gains a **"Claude Sessions"** submenu: one line per session
@@ -200,13 +264,18 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   local user.
 - Hooks are **opt-in** user config; `sessions hook` writes nothing except the
   fire-and-forget socket POST.
+- The stream wrapper is **opt-in** too, and is the one component that *sees* your
+  conversation as it streams. It extracts only the state, `session_id`, `cwd` and
+  model, and logs and persists nothing — a design constraint, not a convention
+  ([ADR-0057](adrs/adr-0057.md)). The only thing it writes is the same
+  fire-and-forget socket POST.
 
 This does not touch the browser-bridge ([ADR-0036](adrs/adr-0036.md)) or Snowflake
 trust models.
 
 ## Companion contract (for the extension and other clients)
 
-The companion speaks two additional ops to the same socket the worktrees service
+The companion speaks three additional ops to the same socket the worktrees service
 uses (`DaemonEnvelope { service: "sessions", op, payload }`, newline-delimited
 JSON):
 
@@ -214,6 +283,7 @@ JSON):
 |---|---|---|---|
 | `window` | `{ key, folders[], tabs, terminals }` | `{ ok: true }` | Report this window's Claude embedding counts + folders; refreshes the report's liveness (a 30s TTL, so ride it every ~10s). |
 | `window-unregister` | `{ key }` | `{ removed: bool }` | The window closed (fired on `deactivate()`). |
+| `list` | *(none)* | `{ sessions: [...] }` | The live set, for the Worktrees tree's per-worktree cues. Read-only; the companion tallies sessions onto rows by `cwd`. |
 
 `key` is the **same per-window UUID** the companion already uses for the worktrees
 `register` op, so the two services agree on window identity. The companion reports
@@ -232,15 +302,25 @@ The hook `observe`/`end` ops (for reference; the sink builds these, not you):
 
 where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
 `post_tool_use`, `stop`, `{ "notification": "permission_prompt" \| "idle_prompt" \|
-"agent_needs_input" \| "other" }`, `transcript_grew`, or `transcript_discovered`.
+"agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`, or
+`{ "stream_state": "<state>" }` — the authoritative Feed 4 form, applied verbatim
+rather than inferred.
 
 ## Scope and follow-ups
 
 - **Idle-session liveness.** Without a dedicated event, idle sessions age out on
-  the TTL. A future refinement could keep a VS Code-embedded session alive off its
-  window's heartbeat.
+  the TTL — for the feeds that lack one. A wrapped session (Feed 4) heartbeats
+  itself; a future refinement could keep the rest alive off their window's
+  heartbeat.
 - **Per-tab attribution** stays heuristic until (if ever) the Claude extension
-  exposes a tab↔session API.
+  exposes a tab↔session API. Note the wrapper does *not* fix this: it knows its
+  own session exactly, but still cannot say which tab is showing it.
+- **Terminal Claude is unwrapped.** Feed 4 covers the VS Code extension's
+  stream-json tabs only; a TUI `claude` keeps the inferred feeds. Wrapping it
+  would mean interposing on an interactive terminal, which is a different and much
+  riskier proposition.
+- **Only new tabs are wrapped.** Coverage is prospective — sessions already
+  running when the setting is applied keep the inferred feeds until they restart.
 - **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.
