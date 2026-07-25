@@ -4522,6 +4522,7 @@ Commands:
   close        Close a worktree's window and, for a linked worktree, delete it
   rebase       Rebase worktrees onto the remote default branch, fetching it once per repo
   merge-queue  Enqueue eligible worktrees' PRs into the GitHub merge queue
+  reposition   Move and resize worktrees' open windows to match a reference window
   show-closed  Show or set whether closed worktrees are shown across all windows
   register     Register a window's open worktree folders (companion feed op)
   heartbeat    Refresh a window's liveness and read any pending close directive
@@ -4650,6 +4651,26 @@ Options:
       --pid <PID>      Reporting process id
       --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev worktrees reposition - Move and resize worktrees' open windows to match a reference window
+
+Move and resize worktrees' open windows to match a reference window
+
+Usage: reposition [OPTIONS] [PATH]...
+
+Arguments:
+  [PATH]...  Worktree folders whose windows to move. Each is canonicalized client-side, as the daemon runs in a different cwd and matches by canonical path
+
+Options:
+      --reference <PATH>  The worktree whose window supplies the target position and size. It is never itself moved
+      --dry-run           Report which window each worktree resolves to and stop; move nothing
+      --undo              Put the windows the last reposition moved back where they were
+  -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json]
+      --socket <PATH>     Control-socket path. Defaults to the per-user runtime location
+  -h, --help              Print help (see more with '--help')
 
 
 ================================================================================
