@@ -17,6 +17,8 @@ import {
   heartbeatEnvelope,
   mergeQueueCheckEnvelope,
   mergeQueueEnvelope,
+  repositionEnvelope,
+  repositionUndoEnvelope,
   openEnvelope,
   registerEnvelope,
   setPollingEnvelope,
@@ -186,6 +188,38 @@ test("close envelope builders match the two-phase worktrees wire contract", () =
     service: "worktrees",
     op: "close",
     payload: { path: "/repo", remove: false, requester_key: "k1" },
+  });
+});
+
+test("reposition envelope carries window keys, not paths", () => {
+  // Keyed by window, unlike close/merge-queue: geometry belongs to the OS window,
+  // and only the daemon's registry knows which window has a worktree open.
+  assert.deepEqual(repositionEnvelope("ref", ["a", "b"]), {
+    service: "worktrees",
+    op: "reposition",
+    payload: { reference_key: "ref", target_keys: ["a", "b"] },
+  });
+  // `check` is omitted rather than sent as false, so a real run is byte-identical
+  // to what a client that never knew about dry runs would send.
+  assert.equal("check" in (repositionEnvelope("ref", ["a"]).payload as object), false);
+  assert.deepEqual(repositionEnvelope("ref", ["a"], true), {
+    service: "worktrees",
+    op: "reposition",
+    payload: { reference_key: "ref", target_keys: ["a"], check: true },
+  });
+  // An empty selection is still well-formed; the daemon reports zero moves.
+  assert.deepEqual(repositionEnvelope("ref", []).payload, {
+    reference_key: "ref",
+    target_keys: [],
+  });
+});
+
+test("reposition-undo envelope is payload-free", () => {
+  // No payload by design: the daemon holds the one-level undo record, so a client
+  // cannot ask it to move windows to arbitrary geometry.
+  assert.deepEqual(repositionUndoEnvelope(), {
+    service: "worktrees",
+    op: "reposition-undo",
   });
 });
 
