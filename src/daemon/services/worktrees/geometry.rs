@@ -26,7 +26,8 @@
 //! registry's `title`, i.e. `vscode.workspace.name`) against `AXTitle`, using the
 //! progressively-looser cascade in [`match_window`] that **refuses to guess**: an
 //! ambiguous target is reported, never moved. `ppid` resolution itself is one
-//! batched `ps` call ([`app_pids_via_ps`]) rather than more FFI.
+//! batched `ps` call rather than more FFI, and lives with the backend that needs
+//! it.
 //!
 //! [ADR-0058]: https://github.com/rust-works/omni-dev/blob/main/docs/adrs/adr-0058.md
 
@@ -802,25 +803,6 @@ fn in_request_order(mut results: Vec<TargetResult>) -> Vec<TargetResult> {
     results
 }
 
-/// Parses `ps -o pid=,ppid= -p …` output into a `pid -> ppid` map.
-///
-/// The op's only process introspection, deliberately a shell-out rather than more
-/// FFI: an extension-host pid's parent is the VS Code main process that owns every
-/// `NSWindow`. Unparseable lines are skipped rather than failing the batch — a pid
-/// that has since exited simply gets no entry, which its target reports as
-/// not-found. The `ps` invocation itself lives with its caller in [`ax`].
-pub(super) fn parse_ppids(stdout: &str) -> HashMap<u32, u32> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid = fields.next()?.parse().ok()?;
-            Some((pid, ppid))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1382,21 +1364,5 @@ mod tests {
             ..win("Open — some-tree", frame(0.0, 0.0, 10.0, 10.0))
         }];
         assert_eq!(match_window(&windows, "some-tree", true), Match::None);
-    }
-
-    #[test]
-    fn parses_ps_output() {
-        // The real shape of `ps -o pid=,ppid= -p …`: right-aligned, leading spaces.
-        let out = "  28112  65488\n  28113  65488\n  65488      1\n";
-        let map = parse_ppids(out);
-        assert_eq!(map.get(&28112).copied(), Some(65488));
-        assert_eq!(map.get(&65488).copied(), Some(1));
-        assert_eq!(map.len(), 3);
-    }
-
-    #[test]
-    fn ignores_unparseable_ps_lines() {
-        let out = "\n  ps: 999: no such process\n  10  20\nnotanumber x\n";
-        assert_eq!(parse_ppids(out), HashMap::from([(10, 20)]));
     }
 }
