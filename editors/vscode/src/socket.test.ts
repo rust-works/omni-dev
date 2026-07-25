@@ -23,6 +23,7 @@ import {
   setShowClosedEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
+  sessionsListEnvelope,
   subscribeEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -160,6 +161,8 @@ test("sessions window envelope builders route to the sessions service", () => {
     op: "window-unregister",
     payload: { key: "k1" },
   });
+  // The read side (#1406): no payload at all.
+  assert.deepEqual(sessionsListEnvelope(), { service: "sessions", op: "list" });
 });
 
 test("close envelope builders match the two-phase worktrees wire contract", () => {

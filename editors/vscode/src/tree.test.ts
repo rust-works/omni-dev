@@ -20,6 +20,7 @@ import {
   repoContextValue,
   repoLabel,
   repoPollingEnabled,
+  rowColorId,
   reposToNodes,
   selectionTargets,
   unbadgedBranches,
@@ -276,7 +277,7 @@ test("worktreeCheckDecoration maps each PR check state to a colored badge (#1324
     tooltip: "checks failing",
   });
   assert.deepEqual(worktreeCheckDecoration({ ...wt, pr: { ...OPEN_PR, checks: "pending" } }), {
-    badge: "●",
+    badge: "⋯",
     colorId: "charts.yellow",
     tooltip: "checks pending",
   });
@@ -296,6 +297,31 @@ test("checkStateDecoration maps a bare check state, undefined for none", () => {
   assert.equal(checkStateDecoration("failure")?.colorId, "charts.red");
   assert.equal(checkStateDecoration("pending")?.tooltip, "checks pending");
   assert.equal(checkStateDecoration("none"), undefined);
+});
+
+test("every check glyph reads without its colour, since the badge shares one", () => {
+  const glyphs = (["success", "failure", "pending"] as const).map(
+    (state) => checkStateDecoration(state)?.badge,
+  );
+  assert.deepEqual(glyphs, ["✓", "✗", "⋯"]);
+  // Distinct from each other, and from the session cue's `⚙ ! ◦` (#1406) — in
+  // particular `⋯` replaces the old `●`, which collided with the idle `◦` once
+  // colour stopped distinguishing them.
+  assert.equal(new Set([...glyphs, "⚙", "!", "◦"]).size, 6);
+});
+
+test("rowColorId ranks red over yellow over green over muted", () => {
+  assert.equal(rowColorId("charts.red", "charts.yellow"), "charts.red");
+  assert.equal(rowColorId("charts.yellow", "charts.red"), "charts.red");
+  assert.equal(rowColorId("charts.green", "charts.yellow"), "charts.yellow");
+  assert.equal(rowColorId("charts.green", "descriptionForeground"), "charts.green");
+  // A single dimension keeps its own colour; absent ones are ignored.
+  assert.equal(rowColorId(undefined, "charts.green"), "charts.green");
+  assert.equal(rowColorId("charts.red", undefined), "charts.red");
+  assert.equal(rowColorId(undefined, undefined), undefined);
+  // An unranked colour sorts last but is still used when it is all there is.
+  assert.equal(rowColorId("some.other.color"), "some.other.color");
+  assert.equal(rowColorId("some.other.color", "charts.green"), "charts.green");
 });
 
 test("withPr folds a badge in, and no-ops when absent", () => {
@@ -323,6 +349,15 @@ test("worktreeDescription shows sync and PR together, each only when present", (
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }), "");
 });
 
+test("worktreeDescription appends the Claude session glyphs last (#1406)", () => {
+  const wt = REPOS[0].worktrees[0];
+  assert.equal(worktreeDescription({ ...wt, pr: OPEN_PR }, "⚙2"), "↑2 ↓0  #65  ⚙2");
+  // Sessions alone, with neither sync nor PR to precede them.
+  assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }, "!1"), "!1");
+  // No sessions → byte-for-byte the pre-#1406 description.
+  assert.equal(worktreeDescription(wt, ""), worktreeDescription(wt));
+});
+
 test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
   const withPrTip = worktreeTooltip({ ...REPOS[0].worktrees[0], pr: OPEN_PR }, REPOS[0], "w1");
   assert.match(withPrTip, /PR #65 · open · checks passing/);
@@ -345,6 +380,15 @@ test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
 
   // No PR → no PR line at all.
   assert.doesNotMatch(worktreeTooltip(REPOS[0].worktrees[0], REPOS[0]), /PR #/);
+});
+
+test("worktreeTooltip adds a Claude line only when sessions are running (#1406)", () => {
+  const wt = REPOS[0].worktrees[0];
+  const withSessions = worktreeTooltip(wt, REPOS[0], "w1", "Claude: 1 waiting on you");
+  assert.match(withSessions, /Claude: 1 waiting on you/);
+  // It sits above the open line, which stays last.
+  assert.match(withSessions, /Claude: 1 waiting on you\n● this window$/);
+  assert.doesNotMatch(worktreeTooltip(wt, REPOS[0]), /Claude:/);
 });
 
 test("nodeId is stable and distinguishes repos from worktrees", () => {

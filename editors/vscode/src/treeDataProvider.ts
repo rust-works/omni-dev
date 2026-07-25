@@ -6,6 +6,13 @@
 import * as vscode from "vscode";
 
 import {
+  SessionTallyMap,
+  sameTallies,
+  sessionDecoration,
+  sessionGlyphs,
+  sessionTooltipLine,
+} from "./sessionCounts";
+import {
   AheadBehindMap,
   Node,
   PrBadge,
@@ -71,6 +78,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * `visibleRepos`). Defaults on.
    */
   private showPr = true;
+  /**
+   * Per-worktree Claude session tallies (#1406), keyed by worktree path. Unlike
+   * ahead/behind and PR badges — which `getChildren` pulls lazily — session state
+   * rides its own daemon op on a poll, so it is *pushed* in here and folded into
+   * the item at render time.
+   */
+  private sessionTallies: SessionTallyMap = {};
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -111,6 +125,25 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   setShowPullRequests(showPr: boolean): void {
     this.showPr = showPr;
     this.emitter.fire(undefined);
+  }
+
+  /**
+   * Replaces the per-worktree Claude session tallies (#1406), returning whether
+   * anything actually changed.
+   *
+   * Refreshing only on a real change is load-bearing, not an optimization:
+   * firing `onDidChangeTreeData` re-runs {@link getChildren}, which re-triggers
+   * the lazy ahead/behind and PR-badge fetches. An unchanged poll must therefore
+   * be a complete no-op, or a ~10s cue poll would turn those into a poll of
+   * their own.
+   */
+  setSessionTallies(tallies: SessionTallyMap): boolean {
+    if (sameTallies(this.sessionTallies, tallies)) {
+      return false;
+    }
+    this.sessionTallies = tallies;
+    this.emitter.fire(undefined);
+    return true;
   }
 
   async getChildren(element?: Node): Promise<Node[]> {
@@ -197,18 +230,26 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       worktreeLabel(node.wt),
       vscode.TreeItemCollapsibleState.None,
     );
+    const sessions = this.sessionTallies[node.wt.path];
     item.id = nodeId(node);
-    item.description = worktreeDescription(node.wt);
-    item.tooltip = worktreeTooltip(node.wt, node.repo, this.windowKey);
+    item.description = worktreeDescription(node.wt, sessionGlyphs(sessions));
+    item.tooltip = worktreeTooltip(
+      node.wt,
+      node.repo,
+      this.windowKey,
+      sessionTooltipLine(sessions),
+    );
     item.contextValue = worktreeContextValue(node.wt, this.windowKey, !!node.repo.github);
-    // A colored ✓/✗/● file decoration carries the PR CI-check state (#1324). Rows
-    // whose PR has a pass/fail/pending verdict get a custom-scheme `resourceUri`
-    // keyed by that state, which the `WorktreeDecorationProvider` paints (and which
-    // re-decorates on its own when the state — and so the URI — changes). Rows with
-    // no PR, or a PR with no checks, get none. `item.id` still keys row identity.
+    // A colored file decoration carries the row's Claude session cue (#1406) or,
+    // failing that, its PR CI-check state (#1324). Rows with either get a
+    // custom-scheme `resourceUri` keyed by both, which the
+    // `WorktreeDecorationProvider` paints (and which re-decorates on its own when
+    // the state — and so the URI — changes). Rows with neither get none.
+    // `item.id` still keys row identity.
     const pr = node.wt.pr;
-    if (pr && worktreeCheckDecoration(node.wt)) {
-      item.resourceUri = worktreeResourceUri(node.wt.path, pr.checks);
+    const checks = pr && worktreeCheckDecoration(node.wt) ? pr.checks : "none";
+    if (checks !== "none" || sessionDecoration(sessions)) {
+      item.resourceUri = worktreeResourceUri(node.wt.path, checks, sessions);
     }
     // The open badge, three-way: a blue tick for the worktree open in *this*
     // window, a green dot for one open in another window, else the plain branch

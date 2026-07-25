@@ -308,6 +308,15 @@ export function sessionWindowUnregisterEnvelope(key: string): Envelope {
 }
 
 /**
+ * Builds a sessions `list` envelope — every Claude session the daemon currently
+ * tracks, across every window and terminal (#1406). Read-only; the tree tallies
+ * the reply onto its worktree rows.
+ */
+export function sessionsListEnvelope(): Envelope {
+  return { service: SESSIONS_SERVICE, op: "list" };
+}
+
+/**
  * Sends one request envelope to the daemon and resolves with its reply.
  *
  * Opens a fresh connection, writes one `\n`-terminated JSON line, reads one

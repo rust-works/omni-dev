@@ -14,6 +14,8 @@ pub mod coverage;
 // Unix-domain control socket) are Unix-only; on Windows they run only under WSL2,
 // and a native (non-WSL) Windows port is future work (#1363).
 #[cfg(unix)]
+pub mod claude_wrap;
+#[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
 pub mod format;
@@ -193,6 +195,10 @@ pub enum Commands {
     /// Sessions: track Claude Code sessions running across all terminals and windows.
     #[cfg(unix)]
     Sessions(sessions::SessionsCommand),
+    /// Wrap the Claude process, reporting its exact session state to the daemon.
+    #[cfg(unix)]
+    #[command(name = "claude-wrap")]
+    ClaudeWrap(claude_wrap::ClaudeWrapCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
@@ -329,6 +335,8 @@ impl Cli {
             Commands::Worktrees(cmd) => cmd.execute(repo).await,
             #[cfg(unix)]
             Commands::Sessions(cmd) => cmd.execute().await,
+            #[cfg(unix)]
+            Commands::ClaudeWrap(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),

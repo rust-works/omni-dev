@@ -23,6 +23,7 @@ import {
   sendEnvelope,
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
+  sessionsListEnvelope,
   setPollingEnvelope,
   setShowClosedEnvelope,
   treeEnvelope,
@@ -31,6 +32,7 @@ import {
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
+import { SessionEntry, tallyByWorktree } from "./sessionCounts";
 import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
@@ -107,9 +109,21 @@ let output: vscode.OutputChannel | undefined;
 let treeView: vscode.TreeView<Node> | undefined;
 let provider: WorktreesTreeDataProvider | undefined;
 /** Paints each worktree row's colored PR-check badge (#1324); pulsed on snapshots. */
-let decorationProvider: WorktreeDecorationProvider | undefined;
+let decorationProviders: WorktreeDecorationProvider[] = [];
+
+/** Re-queries every worktree row's badges, on both decoration dimensions. */
+function refreshDecorations(): void {
+  for (const provider of decorationProviders) {
+    provider.refresh();
+  }
+}
 /** The last worktree click, for the manual double-click timer in `onItemClicked`. */
 let lastClick: { id: string; at: number } | undefined;
+/**
+ * The worktree paths from the latest snapshot, so the Claude session poll (#1406)
+ * can attribute sessions to rows without re-reading the tree.
+ */
+let worktreePaths: string[] = [];
 
 function config(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -128,6 +142,11 @@ function heartbeatMs(): number {
 /** Whether to show each worktree's GitHub PR badge (#1296). */
 function showPullRequests(): boolean {
   return config().get<boolean>("showPullRequests") ?? true;
+}
+
+/** Whether to show each worktree's Claude session cue (#1406). */
+function showClaudeSessions(): boolean {
+  return config().get<boolean>("showClaudeSessions") ?? true;
 }
 
 /**
@@ -181,6 +200,37 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
   const reply = await send(aheadBehindEnvelope(paths));
   const results = reply?.ok ? (reply.payload?.results as AheadBehindMap | undefined) : undefined;
   return results ?? {};
+}
+
+/**
+ * Polls the daemon for every live Claude session, tallies them onto the current
+ * worktree rows, and pushes the result into the tree (#1406).
+ *
+ * Cheap and best-effort: one socket round-trip whose failure leaves the tree
+ * exactly as it was, skipped entirely when the view is hidden or the cue is
+ * switched off, and a complete no-op when nothing changed — the provider's
+ * refresh re-runs the lazy ahead/behind and PR fetches, so it must only fire on
+ * a real change.
+ */
+async function refreshSessionCues(): Promise<void> {
+  if (!provider || !showClaudeSessions() || treeView?.visible === false) {
+    return;
+  }
+  const reply = await send(sessionsListEnvelope());
+  const sessions = reply?.ok ? (reply.payload?.sessions as SessionEntry[] | undefined) : undefined;
+  if (!Array.isArray(sessions)) {
+    return;
+  }
+  if (provider.setSessionTallies(tallyByWorktree(sessions, worktreePaths))) {
+    refreshDecorations();
+  }
+}
+
+/** Clears every session cue, e.g. when the setting is switched off. */
+function clearSessionCues(): void {
+  if (provider?.setSessionTallies({})) {
+    refreshDecorations();
+  }
 }
 
 /** How long a repo's open-PR list is reused before a fresh `gh` fetch (#1296). */
@@ -358,6 +408,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   heartbeatTimer = setInterval(() => {
     void heartbeat();
     void reportSessionWindow();
+    // The same tick refreshes the Claude session cues (#1406) — session state
+    // rides its own op, not the tree snapshot, so it needs its own poll.
+    void refreshSessionCues();
   }, heartbeatMs());
   context.subscriptions.push({
     dispose: () => {
@@ -430,26 +483,39 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   view.message = DAEMON_DOWN_MESSAGE;
   context.subscriptions.push(view, treeProvider);
 
-  // The colored PR-check badge (#1324): a file-decoration provider paints each
-  // worktree row off the custom-scheme `resourceUri` the tree items carry. It is
-  // `refresh()`ed on every snapshot so colours track the lazily-fetched PR state.
-  const decorations = new WorktreeDecorationProvider();
-  decorationProvider = decorations;
-  context.subscriptions.push(
-    decorations,
-    vscode.window.registerFileDecorationProvider(decorations),
-  );
+  // The colored badges: the PR CI-check verdict (#1324) and the Claude session
+  // cue (#1406), painted off the custom-scheme `resourceUri` the tree items
+  // carry. Two providers because one decoration's badge holds only two
+  // characters; VS Code concatenates them onto the row. They are `refresh()`ed
+  // on every snapshot so colours track the lazily-fetched PR and session state.
+  //
+  // Registration order sets the order of the merged glyphs — the workbench
+  // iterates providers most-recently-registered first — so the session cue is
+  // registered last to lead. Both share one severity-ranked colour regardless.
+  decorationProviders = [
+    new WorktreeDecorationProvider("checks"),
+    new WorktreeDecorationProvider("sessions"),
+  ];
+  for (const decorations of decorationProviders) {
+    context.subscriptions.push(
+      decorations,
+      vscode.window.registerFileDecorationProvider(decorations),
+    );
+  }
 
   const sub = new TreeSubscription(socketPath(), {
     onSnapshot: (snapshot) => {
       view.message = snapshot.repos.length === 0 ? EMPTY_MESSAGE : undefined;
       treeProvider.update(visibleRepos(snapshot.repos));
+      rememberWorktreePaths(snapshot.repos);
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
       applyShowClosed(snapshot.show_closed);
       // A new snapshot re-runs the lazy PR-badge fetch, so re-evaluate every row's
       // check colour (state-keyed URIs already re-decorate; this covers the rest).
-      decorations.refresh();
+      refreshDecorations();
+      // The row set just changed, so re-attribute the live sessions to it (#1406).
+      void refreshSessionCues();
     },
     onStatus: (connected) => {
       // A drop re-shows the hint; a (re)connect's message is set by the snapshot.
@@ -543,6 +609,21 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       if (e.affectsConfiguration(`${CONFIG_SECTION}.showPullRequests`)) {
         applyShowPullRequests();
         void refreshTree();
+      }
+      // Flipping the Claude cue on repopulates it now; flipping it off has to
+      // clear what is already rendered, since the poll simply stops (#1406).
+      if (e.affectsConfiguration(`${CONFIG_SECTION}.showClaudeSessions`)) {
+        if (showClaudeSessions()) {
+          void refreshSessionCues();
+        } else {
+          clearSessionCues();
+        }
+      }
+    }),
+    // A hidden tree is not polled, so catch it up the moment it is revealed.
+    view.onDidChangeVisibility((e) => {
+      if (e.visible) {
+        void refreshSessionCues();
       }
     }),
   );
@@ -1303,15 +1384,25 @@ async function refreshTree(): Promise<void> {
   if (reply?.ok && Array.isArray(reply.payload?.repos)) {
     const repos = reply.payload.repos as TreeRepoPayload[];
     provider?.update(visibleRepos(repos));
+    rememberWorktreePaths(repos);
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
     applyShowClosed(reply.payload.show_closed);
     // Re-evaluate the PR-check colours for the freshly-fetched rows (#1324).
-    decorationProvider?.refresh();
+    refreshDecorations();
+    void refreshSessionCues();
     if (treeView) {
       treeView.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
     }
   }
+}
+
+/**
+ * Records the worktree paths a fresh snapshot carries, which is what the Claude
+ * session poll attributes sessions to (#1406).
+ */
+function rememberWorktreePaths(repos: TreeRepoPayload[]): void {
+  worktreePaths = repos.flatMap((repo) => repo.worktrees.map((wt) => wt.path));
 }
 
 export async function deactivate(): Promise<void> {
@@ -1322,7 +1413,7 @@ export async function deactivate(): Promise<void> {
   // The tree view, provider, decoration provider, and subscription are torn down
   // via `context.subscriptions`; drop our references so a reactivation starts fresh.
   provider = undefined;
-  decorationProvider = undefined;
+  decorationProviders = [];
   treeView = undefined;
   lastClick = undefined;
   await send(unregisterEnvelope(windowKey));
