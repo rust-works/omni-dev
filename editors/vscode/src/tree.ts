@@ -337,12 +337,17 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
 }
 
 /**
- * The muted row description: the sync counts and the PR badge, each shown only
- * when present, separated by a gap. A worktree with neither (no upstream, no PR)
- * yields an empty description — byte-for-byte the pre-#1296 behavior.
+ * The muted row description: the sync counts, the PR badge, and the Claude
+ * session glyphs, each shown only when present, separated by a gap. A worktree
+ * with none of them yields an empty description — byte-for-byte the pre-#1296
+ * behavior.
+ *
+ * `sessions` is passed in already rendered (by `sessionCounts.ts`) rather than
+ * derived here: session state rides its own daemon op, not the tree snapshot,
+ * so it is side-data the provider folds in.
  */
-export function worktreeDescription(wt: TreeWorktreePayload): string {
-  return [syncCounts(wt), worktreePrBadge(wt)].filter(Boolean).join("  ");
+export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): string {
+  return [syncCounts(wt), worktreePrBadge(wt), sessions].filter(Boolean).join("  ");
 }
 
 /**
@@ -423,14 +428,18 @@ function worktreePrTooltipLine(wt: TreeWorktreePayload): string | undefined {
 
 /**
  * A multi-line hover tooltip: path, main/linked, branch+sync, the PR (when one is
- * resolved), parent repo, open state. The open line distinguishes the current
- * window (`● this window`) from a worktree merely open elsewhere (`● window open`)
- * when `windowKey` is supplied.
+ * resolved), the Claude sessions (when any are running), parent repo, open state.
+ * The open line distinguishes the current window (`● this window`) from a
+ * worktree merely open elsewhere (`● window open`) when `windowKey` is supplied.
+ *
+ * `sessionsLine` is rendered by `sessionCounts.ts` for the same reason
+ * {@link worktreeDescription} takes its glyphs pre-rendered.
  */
 export function worktreeTooltip(
   wt: TreeWorktreePayload,
   repo: TreeRepoPayload,
   windowKey?: string,
+  sessionsLine?: string,
 ): string {
   const kind = wt.is_main ? "main working tree" : "linked worktree";
   const branch = wt.branch ?? "(detached)";
@@ -445,6 +454,9 @@ export function worktreeTooltip(
   const prLine = worktreePrTooltipLine(wt);
   if (prLine) {
     lines.push(prLine);
+  }
+  if (sessionsLine) {
+    lines.push(sessionsLine);
   }
   lines.push(openLine);
   return lines.join("\n");

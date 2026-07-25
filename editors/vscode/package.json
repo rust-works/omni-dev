@@ -3,7 +3,7 @@
   "displayName": "omni-dev",
   "description": "A live tree view of every repository and git worktree open across all your VS Code windows, fed by the omni-dev daemon; double-click to focus or open a worktree's window.",
   "icon": "media/icon.png",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "rust-works",
   "license": "BSD-3-Clause",
   "repository": {
@@ -277,6 +277,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show each worktree's open GitHub pull request (number, draft, and CI-checks status) in the tree. Resolved by the omni-dev daemon, which runs the GitHub CLI (`gh`) for you and keeps CI state live in every window — so it needs `gh` installed and `gh auth login`; without it, badges are silently omitted. Disable to hide them."
+        },
+        "omniDevWorktrees.showClaudeSessions": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show each worktree's running Claude Code sessions in the tree — glyph counts in the row (`!` waiting on you, `⚙` working, `◦` idle) plus a colored badge for the most urgent one. Tracked by the omni-dev daemon's sessions service; state is exact for Claude tabs launched through `omni-dev sessions install-wrapper`, and inferred from hooks otherwise. Disable to hide them."
         },
         "omniDevWorktrees.claudeCommand": {
           "type": "string",
