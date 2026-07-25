@@ -604,6 +604,36 @@ async fn cli_execute_dispatches_git_branch_info() {
     let _ = cli.execute().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_execute_dispatches_claude_wrap() {
+    use omni_dev::cli::claude_wrap::ClaudeWrapCommand;
+    use omni_dev::cli::{Cli, Commands};
+
+    // An empty command list is the one `claude-wrap` path that returns rather
+    // than replacing or ending the process: it fails validation before it can
+    // reach the terminal check or `std::process::exit`. That makes it the only
+    // way to exercise the dispatch arm from a test at all.
+    let cli = Cli {
+        ai_backend: None,
+        model: None,
+        beta_header: None,
+        claude_cli_allow_tools: false,
+        claude_cli_allow_mcp: false,
+        claude_cli_max_budget_usd: None,
+        models_yaml: None,
+        repo: None,
+        profile: None,
+        instance: None,
+        command: Commands::ClaudeWrap(ClaudeWrapCommand {
+            socket: None,
+            argv: Vec::new(),
+        }),
+    };
+    let error = cli.execute().await.unwrap_err();
+    assert!(error.to_string().contains("needs a command to run"));
+}
+
 #[tokio::test]
 async fn cli_execute_dispatches_ai_chat() {
     use omni_dev::cli::ai::{AiCommand, AiSubcommands, ChatCommand};

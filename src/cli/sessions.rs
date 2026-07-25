@@ -1310,6 +1310,24 @@ mod tests {
     }
 
     #[test]
+    fn install_wrapper_fails_when_the_shim_directory_cannot_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file where the shim's parent directory would have to go, so
+        // creating it cannot succeed — a mistyped `--shim` in practice.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let error = InstallWrapperCommand {
+            settings: Some(tmp.path().join("settings.json")),
+            shim: Some(blocker.join("claude-wrap")),
+        }
+        .execute()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not-a-dir"), "{error:#}");
+        // The settings file is left untouched when the shim cannot be written.
+        assert!(!tmp.path().join("settings.json").exists());
+    }
+
+    #[test]
     fn set_and_clear_wrapper_tolerate_a_non_object_settings_value() {
         // `read_settings` guarantees an object, but these degrade rather than
         // panic if a caller hands them anything else (the `merge_hooks` rule).
