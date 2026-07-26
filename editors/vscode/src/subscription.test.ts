@@ -9,7 +9,8 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 
-import { TreeSubscription } from "./subscription";
+import { SessionEntry } from "./sessionCounts";
+import { SessionsSnapshot, SessionsSubscription, TreeSubscription } from "./subscription";
 import { TreeRepoPayload, TreeSnapshot } from "./tree";
 
 /** A short unix-socket path under the OS temp dir (well under the 104-byte cap). */
@@ -181,4 +182,151 @@ test("subscribe: a too-long socket path fails permanently without throwing", (t:
   sub.start(); // must not throw
   assert.equal(scheduled, 0, "a doomed path should not schedule reconnects");
   assert.match(errors[0], /104-byte limit/);
+});
+
+// --- The sessions stream (#1414) ---------------------------------------------
+
+/** One pushed `sessions` snapshot line, matching the daemon's `DaemonReply::ok`. */
+function sessionsLine(sessions: SessionEntry[]): string {
+  return JSON.stringify({ ok: true, payload: { sessions } }) + "\n";
+}
+
+test("sessions subscribe: sends a sessions subscribe line and delivers snapshots", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  let requestLine = "";
+  const srv = trackingServer((conn) => {
+    conn.on("data", (chunk: Buffer) => {
+      requestLine += chunk.toString("utf8");
+      conn.write(sessionsLine([{ session_id: "s1", cwd: "/w/a", state: "working" }]));
+      conn.write(sessionsLine([{ session_id: "s1", cwd: "/w/a", state: "idle" }]));
+    });
+  });
+  await srv.listen(socketPath);
+
+  const received: SessionsSnapshot[] = [];
+  const statuses: boolean[] = [];
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+    onStatus: (c) => statuses.push(c),
+    onUnsupported: () => {
+      throw new Error("a well-formed stream must not report unsupported");
+    },
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => received.length >= 2);
+
+  assert.match(requestLine, /"op":"subscribe"/);
+  assert.match(requestLine, /"service":"sessions"/);
+  // The state transition the tree renders arrives as its own pushed frame — the
+  // whole point of the stream over the per-window poll.
+  assert.equal(received[0].sessions[0].state, "working");
+  assert.equal(received[1].sessions[0].state, "idle");
+  assert.deepEqual(statuses, [true]);
+});
+
+test("sessions subscribe: an error reply reports unsupported and stops reconnecting", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  // A daemon too old to know the op: it answers, refuses, and holds the
+  // connection open — so without the unsupported path the client waits forever.
+  const srv = trackingServer((conn) => {
+    conn.on("data", () => {
+      conn.write(JSON.stringify({ ok: false, error: "unknown sessions op: subscribe" }) + "\n");
+    });
+  });
+  await srv.listen(socketPath);
+
+  const unsupported: string[] = [];
+  let scheduled = 0;
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: () => {
+      throw new Error("no snapshot should arrive from a daemon that refused");
+    },
+    onUnsupported: (m) => unsupported.push(m),
+    initialBackoffMs: 1,
+    setTimeoutFn: () => {
+      scheduled += 1;
+      return setTimeout(() => {}, 60_000);
+    },
+    random: () => 0,
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => unsupported.length >= 1);
+
+  assert.match(unsupported[0], /unknown sessions op/);
+  // Reconnecting would only re-earn the same refusal; the caller polls instead.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(scheduled, 0, "a refused op must not schedule a reconnect");
+  assert.equal(unsupported.length, 1, "the refusal should be reported exactly once");
+});
+
+test("sessions subscribe: start() after a refusal revives the subscription", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  // Refuse the first connection (the "old daemon"), serve the second — the
+  // daemon-restarted-after-an-upgrade path the tree's reconnect drives.
+  const srv = trackingServer((conn, index) => {
+    conn.on("data", () => {
+      if (index === 1) {
+        conn.write(JSON.stringify({ ok: false, error: "unknown sessions op: subscribe" }) + "\n");
+      } else {
+        conn.write(sessionsLine([{ session_id: "s1", state: "waiting_for_permission" }]));
+      }
+    });
+  });
+  await srv.listen(socketPath);
+
+  const received: SessionsSnapshot[] = [];
+  const unsupported: string[] = [];
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+    onUnsupported: (m) => unsupported.push(m),
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => unsupported.length >= 1);
+  // The caller re-`start()`s on the tree subscription's reconnect.
+  sub.start();
+  await waitFor(() => received.length >= 1);
+
+  assert.equal(received[0].sessions[0].state, "waiting_for_permission");
+});
+
+test("sessions subscribe: without onUnsupported an error reply is ignored, as before", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  const srv = trackingServer((conn) => {
+    conn.on("data", () => {
+      conn.write(JSON.stringify({ ok: false, error: "boom" }) + "\n");
+      conn.write(sessionsLine([{ session_id: "s1", state: "idle" }]));
+    });
+  });
+  await srv.listen(socketPath);
+
+  const received: SessionsSnapshot[] = [];
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => received.length >= 1);
+
+  // The stream survives the error frame and keeps delivering — the pre-#1414
+  // behaviour `TreeSubscription` still relies on.
+  assert.equal(received[0].sessions[0].session_id, "s1");
 });
