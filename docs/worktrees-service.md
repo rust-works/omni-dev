@@ -276,6 +276,23 @@ the OS window rather than to the worktree — so a worktree with no open window 
 error here rather than a silent skip. All Accessibility work happens in the **daemon**,
 which is what holds the permission.
 
+`worktrees reload` signals worktrees' open VS Code windows to reload themselves
+(#1417) — the batch form of `Developer: Reload Window`; see
+[Reloading windows](#reloading-windows):
+
+```bash
+# Reload the named worktrees' windows.
+omni-dev worktrees reload /path/to/wt-a /path/to/wt-b
+
+# Machine-readable: { requested, signalled, unknown[] }.
+omni-dev worktrees reload /path/to/wt-a -o json
+```
+
+Paths are mapped to window keys exactly as `reposition` does, and a worktree with no
+open window is an error rather than a silent skip. The daemon only *marks* a
+directive per target — each window acts on it on its next heartbeat, up to ~10s later
+— so the output reports how many windows were **signalled**, never how many reloaded.
+
 `worktrees show-closed` reads or sets the cross-window "show closed worktrees"
 toggle (`set-show-closed`; the value rides the `tree` snapshot's `show_closed`):
 
@@ -296,7 +313,7 @@ caller-supplied window `--key`:
 
 ```bash
 omni-dev worktrees register --key <KEY> --folder /abs/path [--repo R] [--title T] [--pid N]
-omni-dev worktrees heartbeat --key <KEY>    # prints `known` and any pending `close`
+omni-dev worktrees heartbeat --key <KEY>    # prints `known` and any pending `close`/`reload`
 omni-dev worktrees unregister --key <KEY>   # prints whether an entry was removed
 ```
 
@@ -401,17 +418,19 @@ file decoration, not description text), which also tints that row's branch label
   **clicked** row alone (so a mixed selection reaches any handler, and every
   handler re-validates each node rather than trusting `viewItem`); and repo nodes
   can appear in any selection (handlers filter to what they understand). The
-  ordering hazard is **self-close**: a batch containing *this* window's worktree
-  must close it last, or `workbench.action.closeWindow` kills the extension host
-  mid-loop and the remaining targets are silently skipped. Selection survives the
+  ordering hazard is **acting on self**: a batch containing *this* window's worktree
+  must handle it last and alone, or `workbench.action.closeWindow` (or, for **Reload
+  Window**, `workbench.action.reloadWindow`) kills the extension host mid-loop and
+  the remaining targets are silently skipped. Selection survives the
   live snapshot churn for free, since it is keyed by `TreeItem.id` — the stable
   repo-root/worktree-path identity — and not by node object identity.
-- **Three worktree verbs.** Window management and worktree deletion are separate
+- **Four worktree verbs.** Window management and worktree deletion are separate
   actions (#1357): **Open Worktree** opens/focuses a window per selected worktree;
   **Close Window** closes the window of any selected worktree — main *or* linked —
-  and deletes nothing; **Close Worktree** is the only destructive one, deleting
-  selected *linked* worktrees and skipping (never silently downgrading) any main
-  working tree in the batch. **Move Claude Session Here** takes a single
+  and deletes nothing; **Reload Window** reloads it instead (#1417), skipping any
+  selected worktree with no window open; **Close Worktree** is the only destructive
+  one, deleting selected *linked* worktrees and skipping (never silently downgrading)
+  any main working tree in the batch. **Move Claude Session Here** takes a single
   *destination* rather than a subject, so it is hidden while a multi-selection is
   active via the built-in `listMultiSelection` context key.
 
@@ -837,6 +856,62 @@ log alone.
 coordinates apply) but stays on that Space, so you will not see the change until you
 switch to it.
 
+### Reloading windows
+
+**Reload Window** reloads the VS Code window of every selected worktree — the batch
+form of `Developer: Reload Window`, which otherwise has to be run by hand in each
+window in turn. It is the standard remedy after an extension update, a settings
+change that needs a restart, a wedged language server, or a git operation that left
+the SCM view stale.
+
+Multi-select aware like the other batch actions: select any number of worktree rows,
+right-click, **Reload Window**. Selected worktrees with **no open window** are
+silently skipped — there is nothing to reload, so they are simply not targets — and
+the count still reaches the summary notification, so a batch is never *quietly*
+narrowed. Selecting only closed worktrees reports "nothing to reload" and sends no
+op at all.
+
+The invoking window reloads **last and alone**. `workbench.action.reloadWindow` kills
+the extension host, taking any in-flight request and the summary notification with
+it, so the others are signalled and reported first. That is the one real hazard in
+the feature, and it is why the summary appears a moment before your own window
+reloads.
+
+#### No confirmation, by design
+
+Reloading has no confirmation prompt. It creates, modifies and destroys nothing —
+VS Code's hot exit preserves dirty editors — so it follows the
+[reposition](#undoing) precedent of firing and reporting, **not** the two-phase
+confirm `close` needs ([ADR-0049](adrs/adr-0049.md)). The asymmetry is deliberate:
+`close` deletes a worktree, and a modal on a routine, repeatable command costs more
+than it protects. There is correspondingly nothing to undo — a reload has no previous
+state to restore, which is what `reposition`'s Undo exists for.
+
+#### Known limitation — the ~10s stagger
+
+A cross-window reload rides the target's next **heartbeat**, so it lands **up to ~10s
+later**, and reloads across a batch will visibly stagger as each window's tick comes
+round. This is inherent to the companion contract — the daemon has no push channel to
+a window outside the `subscribe` stream — and is the same latency `close` already
+accepts. It is also why the notification says how many windows were *signalled*
+rather than reloaded: when it appears, none of them have reloaded yet, and the daemon
+could not observe it if they had (a reloaded window re-registers under the same key).
+
+#### From the CLI
+
+```bash
+# Reload two worktrees' windows.
+omni-dev worktrees reload ~/wrk/wt/issue-1417 ~/wrk/wt/issue-1415
+
+# Machine-readable: { requested, signalled, unknown[] }.
+omni-dev worktrees reload ~/wrk/wt/issue-1417 -o json
+```
+
+Paths are the CLI's currency (as for `focus`/`close`/`reposition`); it maps each to
+the key of the window that has it open. Unlike the tree view, a named worktree with
+**no** open window is an **error**, not a silent skip: there the selection is a sweep,
+here you named each target explicitly.
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -1114,6 +1189,16 @@ must be added by hand; without it the op moves nothing and says so. Note that
 because omni-dev installs unsigned, the grant is invalidated by every upgrade and
 must be re-applied — see [Window repositioning](#window-repositioning-macos).
 
+The **`reload`** op (#1417) adds **no capability at all**, and needs no ADR. It rides
+the same `0600` socket, persists nothing (the directive is in-memory like `close`'s,
+so a daemon restart drops it), and touches neither git nor the OS — the daemon only
+sets a flag that the target window reads on its own next heartbeat and acts on
+itself. A socket *writer* can make the owning user's windows restart their extension
+hosts, which is annoying rather than dangerous: it is strictly weaker than the
+`close` capability that writer already has, it destroys nothing (VS Code's hot exit
+preserves dirty editors), and it already requires being that user. The op logs window
+keys and counts only — it never sees a path.
+
 ## Companion contract (for the extension and other clients)
 
 The service is reachable directly over the daemon's Unix control socket
@@ -1134,7 +1219,7 @@ Ops:
 | op                | payload                                        | success payload                            |
 |-------------------|------------------------------------------------|--------------------------------------------|
 | `register`        | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
-| `heartbeat`       | `{ key }`                                      | `{ known: <bool>, close?: true }`          |
+| `heartbeat`       | `{ key }`                                      | `{ known: <bool>, close?: true, reload?: true }` |
 | `unregister`      | `{ key }`                                      | `{ removed: <bool> }`                      |
 | `list`            | `null`                                         | `{ windows: [entry, …] }`                  |
 | `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
@@ -1142,6 +1227,7 @@ Ops:
 | `open`            | `{ path }`                                     | `{ ok: true }`                             |
 | `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
+| `reload`          | `{ target_keys[] }`                            | `{ requested, signalled, unknown[] }`      |
 | `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
 | `reposition`      | `{ reference_key, target_keys[], check? }`     | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
 | `reposition-undo` | `null`                                         | *(same shape, without `reference`)*        |
@@ -1156,7 +1242,7 @@ author`, forwarded from `gh pr list --json`) from a **shared, TTL-cached** resul
 `gh` per repo. The client answers a branch already carrying a `pr` badge straight
 from the snapshot without ever calling it.
 
-The first thirteen ops are strictly **request → one reply**. `subscribe` is the one
+Every op except `subscribe` is strictly **request → one reply**. `subscribe` is the one
 **streaming** op (see [Push subscription](#push-subscription)): the reply is a
 sequence of `{ ok: true, payload: { repos: …, show_closed } }` lines on the same
 connection — an initial snapshot, then a fresh one each time the view changes —
@@ -1212,12 +1298,38 @@ Where:
   or prune failure at WARN), plus an ERROR line if the safety check or the removal
   task itself fails (a non-git-worktree target, a panicked task). Only the worktree
   path and window keys are logged, never a secret.
-- `heartbeat` may carry an additive `close: true` when the daemon needs a specific
-  window to close itself (a cross-window `close`) — the only channel it has to a
-  window it can reply to but never call. It rides the reply exactly like the
-  `{ known:false } → re-register` precedent, is taken-and-cleared so it fires once,
-  and is omitted (older windows read only `known`) when no close is pending. The
-  companion runs `workbench.action.closeWindow` on seeing it.
+- `reload` — signals each listed window to reload itself (#1417), the batch form of
+  `Developer: Reload Window`. Addressed by **window key**, like `reposition` and
+  unlike `close`: a reload acts on a window, and one tree row is one window, whereas
+  a path can be open in several. There is no `requester_key` — a client that wants to
+  reload *itself* does so directly rather than waiting a heartbeat for its own
+  directive, so the daemon never needs to know who asked. The reply is
+  `{ requested, signalled, unknown[] }`, where `requested` counts **distinct** keys
+  (a repeated key asks for one reload, not two) and `unknown` names the keys with no
+  live window — a window that closed between the client listing its targets and the
+  op arriving. That is reported, never an error: the batch is a sweep. An empty
+  `target_keys` is a no-op success returning zeros.
+  Unlike `close`, the op **does not wait**: a reload has no completion the daemon can
+  observe, since the window re-registers under the same key. So the reply says what
+  was *signalled*, never what reloaded — and, because the directive rides the ~10s
+  heartbeat, a cross-window reload lands **up to ~10s later** and a batch will
+  visibly stagger. That latency is inherent to the companion contract (the daemon has
+  no push channel to a window outside the `subscribe` stream) and is the same one
+  `close` already accepts.
+  Each `reload` is auditable in `omni-dev daemon logs`: one INFO line with the
+  requested/signalled counts and any unknown keys. Only window keys are logged — this
+  op never sees a path.
+- `heartbeat` may carry the additive directives `close: true` and `reload: true` when
+  the daemon needs a specific window to act on itself (a cross-window `close` or
+  `reload`) — the only channel it has to a window it can reply to but never call.
+  They ride the reply exactly like the `{ known:false } → re-register` precedent, are
+  each taken-and-cleared so each fires once, and are omitted (older windows read only
+  `known`) when nothing is pending. The companion runs
+  `workbench.action.closeWindow` / `workbench.action.reloadWindow` on seeing them.
+  They are set and consumed **independently**, so both can ride one reply; the
+  companion checks `close` first, since closing subsumes reloading. A daemon restart
+  drops any pending directive — the registry is in-memory — after which the user
+  simply retries.
 - A `tree` `repo` is
   `{ main_repo, github?, root, worktrees: [worktree, …] }`, where `github` is
   `{ owner, name }` present only when `origin` (or the first `github.com` remote)
@@ -1344,7 +1456,7 @@ unregister) is unchanged from ADR-0040; the tree-view half opens one long-lived
 activate():    connect(socket) → {service:"worktrees", op:"register",
                                    payload:{key, folders, repo, title, pid}}
                connect(socket) → {service:"worktrees", op:"subscribe"}   // long-lived, reads pushed snapshots
-heartbeat:     every ~10s → {op:"heartbeat", key}     // close self if {close:true}; else re-register if {known:false}
+heartbeat:     every ~10s → {op:"heartbeat", key}     // close self if {close:true}; else reload self if {reload:true}; else re-register if {known:false}
 deactivate():  {op:"unregister", key}   + close the subscribe socket
 ```
 
