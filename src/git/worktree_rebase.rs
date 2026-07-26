@@ -148,8 +148,8 @@ pub struct WorktreeOutcome {
 
 /// The per-worktree classification and outcome.
 ///
-/// [`plan`](self::plan) only ever produces `WouldRebase` / `UpToDate` / `Skipped` /
-/// `FetchFailed`; [`execute`](self::execute) turns each `WouldRebase` into `Rebased`
+/// [`plan`] only ever produces `WouldRebase` / `UpToDate` / `Skipped` /
+/// `FetchFailed`; [`execute`] turns each `WouldRebase` into `Rebased`
 /// or `Conflict`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
