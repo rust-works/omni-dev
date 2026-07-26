@@ -629,7 +629,8 @@ export function partitionByWindow(nodes: WorktreeNode[]): {
 /**
  * Splits this window's **own** worktree out from the rest of a batch.
  *
- * Closing it runs `workbench.action.closeWindow`, which kills this extension host.
+ * Closing it runs `workbench.action.closeWindow` — and reloading it runs
+ * `workbench.action.reloadWindow` — either of which kills this extension host.
  * So it must not merely run *last* — it must run *alone*: anything still in flight
  * beside it dies with the host, unreported and possibly half-done. That is why the
  * callers need the two halves rather than one ordering — they run `others` to
@@ -646,4 +647,38 @@ export function partitionSelfLast(
     others: nodes.filter((node) => !isCurrentWindow(node.wt, windowKey)),
     self: nodes.filter((node) => isCurrentWindow(node.wt, windowKey)),
   };
+}
+
+/**
+ * Summarises a **Reload Window** batch for its notification (#1417).
+ *
+ * Pure and exported so the exact text a user sees is unit-testable — the
+ * comparable `reposition` summary lives in `extension.ts`, which imports
+ * `vscode` and so cannot be covered by `node --test`.
+ *
+ * Says "signalled", never "reloaded": cross-window reloads ride the ~10s
+ * heartbeat, so when this runs they have not happened yet and the daemon could
+ * not observe them if they had. `skipped` merges both reasons a target was left
+ * alone — selected with no window open, and a window that closed between the
+ * tree rendering and the op arriving — because to the user they are the same
+ * thing, and a partially-applied batch must never be silently narrowed.
+ */
+export function describeReload(counts: {
+  signalled: number;
+  skipped: number;
+  self: number;
+}): string {
+  const clauses: string[] = [];
+  if (counts.signalled > 0) {
+    const noun = counts.signalled === 1 ? "window" : "windows";
+    clauses.push(`signalled ${counts.signalled} ${noun} to reload`);
+  }
+  if (counts.self > 0) {
+    clauses.push("reloading this window");
+  }
+  if (clauses.length === 0) {
+    return "omni-dev: nothing to reload.";
+  }
+  const skipped = counts.skipped > 0 ? ` (${counts.skipped} skipped: no window open)` : "";
+  return `omni-dev: ${clauses.join("; ")}${skipped}.`;
 }

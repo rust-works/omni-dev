@@ -20,6 +20,8 @@ import {
   openEnvelope,
   openPrsEnvelope,
   registerEnvelope,
+  ReloadReply,
+  reloadEnvelope,
   RepositionReply,
   repositionEnvelope,
   repositionUndoEnvelope,
@@ -47,6 +49,7 @@ import {
   TreeGithubIdentity,
   TreeRepoPayload,
   WorktreeNode,
+  describeReload,
   isCurrentWindow,
   nodeDirectories,
   nodeId,
@@ -449,6 +452,13 @@ async function heartbeat(): Promise<void> {
     await vscode.commands.executeCommand("workbench.action.closeWindow");
     return;
   }
+  // A cross-window "Reload Window" (#1417) arrives on the same channel. Checked
+  // *after* `close`, so if both are somehow pending the close wins — closing
+  // subsumes reloading, and reloading first would only delay it a heartbeat.
+  if (reply.payload?.reload === true) {
+    await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    return;
+  }
   // The registry is in-memory, so a restarted daemon has forgotten this
   // window; `known: false` is our signal to re-register.
   if (reply.payload?.known === false) {
@@ -660,6 +670,10 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWindow",
       (node?: Node, selected?: Node[]) => void closeWindow(node, selected),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.reloadWindow",
+      (node?: Node, selected?: Node[]) => void reloadWindow(node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.copyDirectory",
@@ -1681,6 +1695,93 @@ async function showAccessibilityError(): Promise<void> {
   );
   if (choice === open) {
     await vscode.env.openExternal(vscode.Uri.parse(ACCESSIBILITY_SETTINGS_URL));
+  }
+}
+
+// --- Reload windows (#1417) --------------------------------------------------
+
+/**
+ * How long to wait for a `reload`. The op only marks a directive per target — no
+ * git, no OS calls, no waiting for the targets to act — so it needs nothing like
+ * {@link CLOSE_EXECUTE_TIMEOUT_MS}.
+ */
+const RELOAD_TIMEOUT_MS = 10_000;
+
+/**
+ * Reloads the VS Code window of every selected worktree (#1417) — the batch form
+ * of `Developer: Reload Window`, which otherwise has to be run by hand in each
+ * window in turn.
+ *
+ * Selected worktrees with **no open window** are skipped rather than refused:
+ * the selection is a sweep, so a row with nothing to reload is simply not a
+ * target. The count still reaches the summary, so a narrowed batch is never
+ * silently narrowed.
+ *
+ * Fires with no confirmation, following the `reposition` precedent rather than
+ * `close`'s two-phase confirm: a reload creates, modifies and destroys nothing,
+ * and VS Code's hot exit preserves dirty editors. There is correspondingly
+ * nothing to undo.
+ *
+ * Repo nodes are filtered out here rather than trusted to the menu: a `when`
+ * clause sees only the *clicked* row, so a mixed selection reaches this handler
+ * intact.
+ */
+async function reloadWindow(clicked?: Node, selected?: Node[]): Promise<void> {
+  const { open, closed } = partitionByWindow(
+    worktreeTargets(selectionTargets(clicked, selected)),
+  );
+  // This window must reload alone and last — doing so kills this extension host,
+  // taking any in-flight request and the summary notification with it.
+  const { others, self } = partitionSelfLast(open, windowKey);
+  const keys = others
+    .map((node) => node.wt.window_key)
+    .filter((key): key is string => !!key);
+
+  if (keys.length === 0 && self.length === 0) {
+    void vscode.window.showWarningMessage(
+      "omni-dev: nothing to reload — no selected worktree has a window open.",
+    );
+    return;
+  }
+
+  let signalled = 0;
+  let skipped = closed.length;
+  if (keys.length > 0) {
+    const reply = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title:
+          keys.length === 1
+            ? `Reloading “${worktreeLabel(others[0].wt)}”…`
+            : `Reloading ${keys.length} windows…`,
+      },
+      () => send(reloadEnvelope(keys), RELOAD_TIMEOUT_MS),
+    );
+    if (!reply) {
+      daemonDownError();
+      return;
+    }
+    if (!reply.ok) {
+      void vscode.window.showErrorMessage(
+        `omni-dev: could not reload windows — ${reply.error ?? "unknown error"}`,
+      );
+      return;
+    }
+    const payload = reply.payload as ReloadReply;
+    signalled = payload.signalled ?? 0;
+    // A key the daemon had no live window for is a row that went stale between
+    // render and send — the same "no window open" outcome from the user's side.
+    skipped += payload.unknown?.length ?? 0;
+  }
+
+  // Report *before* touching this window: reloading it kills the host, and the
+  // notification with it.
+  void vscode.window.showInformationMessage(
+    describeReload({ signalled, skipped, self: self.length }),
+  );
+
+  for (const _target of self) {
+    await vscode.commands.executeCommand("workbench.action.reloadWindow");
   }
 }
 
