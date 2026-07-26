@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
+use crate::daemon::service::{
+    DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus, ServiceStream,
+};
 use crate::daemon::services::worktrees::focus_window;
 use crate::sessions::{ObserveRequest, SessionEntry, SessionState, SessionsRegistry, WindowReport};
 
@@ -150,9 +152,24 @@ impl DaemonService for SessionsService {
                 let key = require_str(&payload, "key", "window-unregister")?;
                 Ok(json!({ "removed": self.registry.unregister_window(key) }))
             }
-            "list" => Ok(json!({ "sessions": self.registry.list() })),
+            "list" => Ok(sessions_payload(&self.registry)),
             other => bail!("unknown sessions op: {other}"),
         }
+    }
+
+    fn subscribe(&self, op: &str, _payload: &Value) -> Option<Box<dyn ServiceStream>> {
+        // The single streaming op: a live push of the same `sessions` snapshot
+        // `list` serves. Every other op falls through to the request→reply
+        // `handle`.
+        if op != "subscribe" {
+            return None;
+        }
+        Some(Box::new(SessionsStream {
+            registry: self.registry.clone(),
+            // Capture the change source *now* — before the server takes its
+            // initial snapshot — so a change racing that snapshot still wakes us.
+            changes: self.registry.subscribe_changes(),
+        }))
     }
 
     fn menu(&self) -> MenuSnapshot {
@@ -200,6 +217,48 @@ impl DaemonService for SessionsService {
             task.token.cancel();
             let _ = task.handle.await;
         }
+    }
+}
+
+/// The live session set as the wire payload — the single body both the one-shot
+/// `list` op and the `subscribe` stream serve, so a fetch and a push can never
+/// disagree.
+fn sessions_payload(registry: &SessionsRegistry) -> Value {
+    json!({ "sessions": registry.list() })
+}
+
+/// The live push stream behind the `subscribe` op (#1414).
+///
+/// Unlike the worktrees stream this needs no coalescing snapshot cache (#1303):
+/// `repo` is enriched at `observe` time, so [`SessionsRegistry::list`] is pure
+/// CPU under a lock with no disk I/O — cheap enough to run once per subscriber
+/// per wakeup, and cheap enough that [`snapshot`](ServiceStream::snapshot) needs
+/// no blocking thread.
+struct SessionsStream {
+    /// The registry each snapshot is read from.
+    registry: Arc<SessionsRegistry>,
+    /// Wakes on each consumer-visible change (a new or ended session, a state
+    /// transition, a window report that alters the source join). A burst
+    /// coalesces into one wakeup; the server's diff drops any snapshot that ends
+    /// up identical.
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+#[async_trait]
+impl ServiceStream for SessionsStream {
+    async fn changed(&mut self) {
+        // `watch::Receiver::changed` marks the newest version seen, so a burst of
+        // bumps collapses into a single wakeup. If every sender is gone (the
+        // registry — and thus the daemon — is tearing down) it returns `Err`;
+        // park instead of returning, so this arm can never spin the server's
+        // `select!` (the tick and shutdown arms still drive teardown).
+        if self.changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn snapshot(&self) -> Value {
+        sessions_payload(&self.registry)
     }
 }
 
@@ -667,5 +726,83 @@ mod tests {
         let status = svc.status().await;
         // Idle + ended both count toward the "idle" tally.
         assert!(status.summary.contains("2 idle"), "{}", status.summary);
+    }
+
+    // --- Push subscription (#1414) -----------------------------------------
+
+    #[tokio::test]
+    async fn subscribe_streams_only_for_the_subscribe_op() {
+        let svc = service();
+        // The one streaming op yields a stream; every other op declines, so the
+        // server dispatches them normally through `handle`.
+        assert!(svc.subscribe("subscribe", &Value::Null).is_some());
+        assert!(svc.subscribe("list", &Value::Null).is_none());
+        assert!(svc.subscribe("observe", &Value::Null).is_none());
+        assert!(svc.subscribe("window", &Value::Null).is_none());
+        assert!(svc.subscribe("bogus", &Value::Null).is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_snapshot_matches_the_list_op() {
+        let svc = service();
+        let stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // Empty registry: the push and the one-shot fetch agree.
+        assert_eq!(stream.snapshot().await, json!({ "sessions": [] }));
+
+        svc.handle(
+            "observe",
+            json!({ "session_id": "s1", "event": "pre_tool_use", "cwd": "/tmp/x" }),
+        )
+        .await
+        .unwrap();
+        // …and still agree byte-for-byte once there is state to serve, which is
+        // what lets the extension treat a pushed frame and a `list` reply the same.
+        let snap = stream.snapshot().await;
+        let listed = svc.handle("list", Value::Null).await.unwrap();
+        assert_eq!(snap, listed);
+        assert_eq!(snap["sessions"][0]["state"], json!("working"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_changed_wakes_on_a_visible_change() {
+        let svc = service();
+        let mut stream = svc
+            .subscribe("subscribe", &Value::Null)
+            .expect("subscribe stream");
+        // Idle: `changed()` must not resolve without a registry change.
+        tokio::select! {
+            () = stream.changed() => panic!("changed resolved with no registry change"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        // A new session bumps the change-notify → `changed()` resolves promptly.
+        svc.handle(
+            "observe",
+            json!({ "session_id": "s1", "event": "session_start" }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.changed())
+            .await
+            .expect("changed should resolve after a visible change");
+    }
+
+    #[tokio::test]
+    async fn changed_parks_when_every_sender_is_gone() {
+        // With the sender dropped, `watch::Receiver::changed` returns `Err`
+        // immediately and forever. `changed()` must park on that rather than
+        // return, or the arm would spin the server's `select!` for the rest of
+        // the connection's life.
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = SessionsStream {
+            registry: Arc::new(SessionsRegistry::new()),
+            changes: rx,
+        };
+        drop(tx);
+        tokio::select! {
+            () = stream.changed() => panic!("changed resolved after the sender was dropped"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
     }
 }
