@@ -342,11 +342,12 @@ impl CloseCommand {
 /// branch **exactly once per repository** (#1400).
 ///
 /// Unlike every other `worktrees` subcommand this runs **entirely locally** and
-/// never talks to the daemon: the fetch needs the user's `ssh-agent` /
-/// credential-helper environment, which the daemon — spawned by launchd/systemd
-/// with a minimal environment — does not have, so a daemon-side fetch could not
-/// authenticate to an SSH remote. The git work lives in
-/// [`crate::git::worktree_rebase`]; see ADR-0055 and ADR-0003.
+/// never talks to the daemon — **by choice, not by necessity** (ADR-0059). The
+/// daemon hosts the same engine behind its two-phase `rebase` op, which is what
+/// the tree view's "Rebase on main" drives; keeping this command local is what
+/// makes a batch rebase work with **no daemon running at all**, and keeps
+/// `--onto`/`--all` (CLI-only concerns) out of the wire protocol. The git work
+/// lives in [`crate::git::worktree_rebase`]; see ADR-0059, ADR-0055, ADR-0003.
 ///
 /// A rebase rewrites branch history, so it confirms by default (`--dry-run` to
 /// preview, `-y` to skip the prompt) in the spirit of ADR-0027.
@@ -371,6 +372,10 @@ pub struct RebaseCommand {
     /// Fetch and report what would be rebased, but rebase nothing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Leave a conflicting worktree mid-rebase to resolve in place, instead of
+    /// aborting it back to its previous state.
+    #[arg(long)]
+    pub keep_conflicts: bool,
     /// Skip the interactive confirmation before rebasing.
     #[arg(short = 'y', long)]
     pub yes: bool,
@@ -399,6 +404,11 @@ impl RebaseCommand {
             onto: self.onto.clone(),
             autostash: self.autostash,
             dry_run: self.dry_run,
+            keep_conflicts: self.keep_conflicts,
+            // Resolved by the engine. Unlike the daemon, the CLI runs in the
+            // user's shell with their own `PATH`, so the well-known-path probe is
+            // belt-and-braces here rather than load-bearing.
+            git_bin: None,
         };
 
         // Planning shells out to `git fetch` (once per repo) and walks the object
@@ -566,7 +576,20 @@ fn status_and_detail(result: &RebaseResult) -> (&'static str, String) {
         RebaseResult::WouldRebase { behind } => ("would-rebase", format!("{behind} behind")),
         RebaseResult::UpToDate => ("up-to-date", String::new()),
         RebaseResult::Skipped { reason } => ("skipped", skip_reason_text(*reason).to_string()),
-        RebaseResult::Conflict { detail } => ("conflict", brief(detail)),
+        // A left-in-place conflict is a *different instruction to the user* than an
+        // aborted one — the worktree is still mid-rebase and needs finishing — so
+        // the row says so instead of only quoting git's error.
+        RebaseResult::Conflict {
+            detail,
+            left_in_place: true,
+        } => (
+            "conflict",
+            format!(
+                "left in place; resolve then `git rebase --continue`: {}",
+                brief(detail)
+            ),
+        ),
+        RebaseResult::Conflict { detail, .. } => ("conflict", brief(detail)),
         RebaseResult::FetchFailed { detail } => ("fetch-failed", brief(detail)),
     }
 }
@@ -2889,6 +2912,7 @@ mod tests {
             onto: None,
             autostash: false,
             dry_run: false,
+            keep_conflicts: false,
             yes: false,
             output: TableOrJson::Table,
         }
@@ -2904,6 +2928,7 @@ mod tests {
             "origin/release",
             "--autostash",
             "--dry-run",
+            "--keep-conflicts",
             "-y",
             "-o",
             "json",
@@ -2914,7 +2939,7 @@ mod tests {
             vec![PathBuf::from("/wt/a"), PathBuf::from("/wt/b")]
         );
         assert_eq!(cmd.onto.as_deref(), Some("origin/release"));
-        assert!(cmd.autostash && cmd.dry_run && cmd.yes);
+        assert!(cmd.autostash && cmd.dry_run && cmd.keep_conflicts && cmd.yes);
         assert!(matches!(cmd.output, TableOrJson::Json));
     }
 
@@ -2922,6 +2947,9 @@ mod tests {
     fn rebase_defaults_are_conservative() {
         let cmd = RebaseCommand::try_parse_from(["rebase", "/wt/a"]).unwrap();
         assert!(!cmd.all && !cmd.autostash && !cmd.dry_run && !cmd.yes);
+        // Aborting a conflict stays the default: the opt-in is `--keep-conflicts`,
+        // so an unattended batch never leaves a worktree mid-rebase by surprise.
+        assert!(!cmd.keep_conflicts);
         assert_eq!(cmd.onto, None);
         assert!(matches!(cmd.output, TableOrJson::Table));
     }
@@ -3028,9 +3056,18 @@ mod tests {
         })
         .contains("main working tree"));
         assert!(row(RebaseResult::Conflict {
-            detail: "CONFLICT (content)".to_string()
+            detail: "CONFLICT (content)".to_string(),
+            left_in_place: false,
         })
         .contains("conflict"));
+        // A left-in-place conflict tells the user the worktree still needs
+        // finishing — a different instruction than an aborted one (#1415).
+        let kept = row(RebaseResult::Conflict {
+            detail: "CONFLICT (content)".to_string(),
+            left_in_place: true,
+        });
+        assert!(kept.contains("conflict"), "{kept}");
+        assert!(kept.contains("git rebase --continue"), "{kept}");
         assert!(row(RebaseResult::FetchFailed {
             detail: "host unreachable".to_string()
         })

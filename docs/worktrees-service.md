@@ -194,12 +194,13 @@ unregister, then prunes.
 `worktrees rebase` rebases worktrees onto the repository's **remote default
 branch**, fetching that branch **exactly once per repository** up front (#1400,
 [ADR-0055](adrs/adr-0055.md)). Unlike every other subcommand it runs **entirely
-locally and never contacts the daemon**: the fetch needs the user's `ssh-agent` /
-credential-helper environment, which the daemon (spawned by launchd/systemd with a
-minimal environment) does not have — so a daemon-side fetch could not authenticate
-to an SSH remote. Following [ADR-0003](adrs/adr-0003.md), the fetch and rebase shell
-out to the user's `git` (git2 only reads); the batch logic lives in
-`src/git/worktree_rebase.rs`.
+locally and never contacts the daemon** — since #1415 that is a *choice*, not a
+necessity: it means a batch rebase works with no daemon running at all, and it
+keeps `--all` and `--onto <ref>` out of the wire protocol. (The daemon hosts the
+same engine behind its `rebase` op, which is what the tree view drives; see
+[ADR-0059](adrs/adr-0059.md).) Following [ADR-0003](adrs/adr-0003.md), the fetch
+and rebase shell out to the user's `git` (git2 only reads); the batch logic lives
+in `src/git/worktree_rebase.rs`.
 
 ```bash
 # Preview: fetch once per repo, report what would be rebased, change nothing.
@@ -213,6 +214,10 @@ omni-dev worktrees rebase /path/to/wt-a /path/to/wt-b --onto origin/release
 
 # Stash uncommitted tracked changes around each rebase instead of skipping.
 omni-dev worktrees rebase --all --autostash
+
+# Leave a conflicting worktree mid-rebase to resolve in place, rather than
+# aborting it back to where it started.
+omni-dev worktrees rebase --all --keep-conflicts
 ```
 
 Selection is explicit: pass `<PATH>...` **or** `--all` (every linked worktree of the
@@ -221,17 +226,23 @@ current repo, never the main working tree, keyed on the structural `is_main` fac
 mass-rebase. Each worktree is reported as `rebased` / `up-to-date` /
 `skipped(<reason>)` / `conflict` / `fetch-failed` (`-o json` for the machine shape).
 A dirty worktree is skipped with a reason (unless `--autostash`); a detached HEAD or
-an in-progress rebase/merge is skipped; a rebase that hits conflicts is
+an in-progress rebase/merge is skipped; a rebase that hits conflicts is by default
 `git rebase --abort`-ed so the worktree is **left exactly as it was** and reported,
 and the batch continues for the rest. A rebase rewrites branch history, so the
 command confirms by default ([ADR-0027](adrs/adr-0027.md)); `--dry-run` still fetches
 (non-destructive) so the behind-count preview is accurate. This subcommand takes no
 `--socket` (it never opens the control socket).
 
-The tree view surfaces the same engine as **Rebase on main** (#1409) — see
-[Rebase onto main](#rebase-onto-main). It is the one tree-view action that spawns
-this CLI in a terminal rather than sending a socket op, for exactly the credential
-reason above.
+**`--keep-conflicts`** (#1415) flips the conflict handling: instead of aborting, the
+worktree is left **mid-rebase**, with its conflict markers on disk, to be resolved
+and finished with `git rebase --continue`. The batch continues either way. Aborting
+stays the default so an unattended run never leaves a worktree needing attention by
+surprise; the tree view's **Rebase on main** always opts in, since resolving in
+place is the point there.
+
+The tree view surfaces the same engine as **Rebase on main** — see
+[Rebase onto main](#rebase-onto-main). Since #1415 it drives the daemon's `rebase`
+op rather than spawning this CLI in a terminal.
 
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
@@ -354,6 +365,14 @@ Focusing is **best-effort**. The launcher is resolved in this order:
 3. bare `code` resolved via `PATH`.
 
 If none works, the failure is logged and the rest of the tray keeps working.
+
+The daemon resolves **`git`** the same way for the `rebase` op (#1415):
+`OMNI_DEV_GIT_BIN` → well-known absolute locations
+(`/opt/homebrew/bin/git`, `/usr/local/bin/git`,
+`/home/linuxbrew/.linuxbrew/bin/git`, `/usr/bin/git`) → bare `git`. Set the
+override if the daemon must use a specific `git` — macOS's minimal launchd `PATH`
+does contain `/usr/bin/git`, so the fallback works, but it may not be the same
+`git` your shell uses. `gh` has its own `OMNI_DEV_GH_BIN` on the same pattern.
 
 ## Tree view (companion UI)
 
@@ -669,52 +688,68 @@ the badge poll, and why it is the service's first op to mutate remote state.
 
 **Rebase on main** (the `4_git` context-menu group, on **linked** worktree rows
 only) rebases the selected worktrees' branches onto their repository's remote
-default branch, fetching each repository's ref **once** for the whole batch (#1409).
-It is the tree-view entry point to the [`worktrees rebase`](#cli) engine — the same
-`Selection::Paths` code path, the same per-worktree reporting.
+default branch, fetching each repository's ref **once** for the whole batch (#1409,
+reworked in #1415). It drives the daemon's two-phase **`rebase`** op, which runs
+the same engine as [`worktrees rebase`](#cli).
 
-**It is the one tree-view action that does not use the daemon.** Every other action
-sends a socket envelope; this one shells out to
-`omni-dev worktrees rebase <paths> -y` in a **new integrated terminal**. That is
-required, not stylistic: the fetch needs the user's `ssh-agent` /
-credential-helper environment, which the daemon does not have
-([ADR-0055](adrs/adr-0055.md), [ADR-0003](adrs/adr-0003.md), #903) — a `rebase`
-daemon op would reintroduce exactly the problem those ADRs avoid. Running in a
-terminal also makes the fetch, the result table, and any prompt visible and
-user-drivable, which is what a conflict-capable operation needs.
+**It is a socket client like every other action** ([ADR-0059](adrs/adr-0059.md)).
+#1409 shipped it as a shell-out to `omni-dev worktrees rebase` in an integrated
+terminal, on [ADR-0055](adrs/adr-0055.md)'s premise that the daemon lacked
+`SSH_AUTH_SOCK` and so could not authenticate a fetch. That premise was wrong —
+launchd exports `SSH_AUTH_SOCK` into the per-user session, so the daemon inherits
+the user's `ssh-agent`. What it lacked was a useful `PATH`, now closed by the same
+well-known-paths probe used for `code` and `gh` (override with `OMNI_DEV_GIT_BIN`).
 
-Consequences of that choice, all of which differ from the socket-backed actions:
+**Two phases, one confirm.**
 
-- The action needs the **`omni-dev` CLI** on the machine but **not** a running
-  daemon. The binary is resolved `OMNI_DEV_BIN` → well-known install paths
-  (`~/.cargo/bin` first, then Homebrew, `/usr/bin`, `~/.local/bin`) → bare
-  `omni-dev` on `PATH`, mirroring how the extension resolves `gh`
-  (`editors/vscode/src/omniDev.ts`). A GUI-launched editor with a minimal
-  environment still resolves it, and the terminal's shell loads the user's profile
-  besides.
-- The **terminal is the error surface**: a failed fetch, a conflict, or a
-  `command not found` from an unresolvable binary lands there rather than in a
-  notification. Nothing about the run is auditable in `omni-dev daemon logs` —
-  the daemon is not involved.
+1. **Check.** A progress notification while the daemon fetches each selected
+   repository's target ref once and classifies every worktree. Nothing is
+   rewritten. If nothing is pending, a warning toast says *why* — the skip reasons,
+   the up-to-date count, or the fetch error — rather than the action appearing to
+   do nothing.
+2. **Confirm.** A modal listing every branch about to be rewritten **with its real
+   behind-count**, plus the skipped ones with reasons. Shown even for a single row
+   ([ADR-0049](adrs/adr-0049.md) §1, as applied by
+   [Add to Merge Queue](#merge-queue)). The counts are the payoff of checking
+   first: #1409's modal deliberately showed none, because the only number it had
+   was the tree's `behind` — divergence from the branch's *upstream*, not from the
+   rebase target — which would have been quietly wrong.
+3. **Execute.** The daemon **re-plans from scratch** (a worktree that went dirty
+   between the phases is skipped, not rebased) and rebases each still-pending
+   worktree sequentially, then a summary toast reports the outcome.
+
+**Conflicts are left in place.** This surface always sends `keep_conflicts`, so a
+worktree that hits conflicts stays **mid-rebase** with its markers on disk instead
+of being `git rebase --abort`-ed. The batch continues with the rest; the summary
+toast is raised to a **warning** naming the worktrees to resolve; and the tree row
+keeps cueing it (below) until you finish with `git rebase --continue`.
+
+**Rebase state in the tree.** A row shows a spinning `$(sync~spin)` while the
+daemon is rebasing it, and a `$(warning)` with `rebase in progress` for as long as
+a rebase is left unfinished — the two coming from separate facts, so both a clean
+in-flight rebase (which never touches disk state) and a left-in-place conflict
+(which survives a daemon restart) are visible. While either is showing, the row's
+icon replaces its usual open-state glyph; the tooltip still names the open state.
+The cue is deliberately *not* a badge: a badge holds two characters, and the PR
+check verdict and Claude session cue already take one each.
+
+**The daemon is required.** With none running, the action reports it and points at
+`omni-dev daemon start` — or at running `omni-dev worktrees rebase <path>`
+yourself, which still works entirely locally. Every run is auditable in
+`omni-dev daemon logs` (`rebase check` / `rebase execute` lines carrying the
+requesting window, the counts, and how many worktrees were left mid-rebase).
 
 **Linked-only, and never silently widened.** The menu `when` clause is
 `viewItem =~ /worktree\..*linked/` (byte-for-byte **Close Worktree**'s gate), and
 the handler re-filters on the structural `is_main` fact, because a `when` clause is
 evaluated against the *clicked* row only and says nothing about the rest of a
 multi-selection. A main working tree carried in by a mixed selection is **named as
-skipped** in the confirmation, never quietly included — and the CLI refuses it on
-the same `is_main` guard regardless, so the UI gating is convenience, not the guard.
-
-**One confirm, always.** A rebase rewrites branch history and a batch is one gesture
-over N branches, so the modal is shown even for a single row, listing exactly which
-worktrees will be rewritten ([ADR-0049](adrs/adr-0049.md) §1's rule, as applied by
-[Add to Merge Queue](#merge-queue)). Confirming there is what lets the CLI run with
-`-y`. The list deliberately carries **no** behind-count: the tree's `behind` measures
-divergence from the branch's *upstream*, not from the rebase target, so showing it
-would be quietly wrong — the real counts arrive in the terminal seconds later.
+skipped** in the confirmation, never quietly included — and the daemon refuses it
+on the same `is_main` guard regardless, so the UI gating is convenience, not the
+guard.
 
 `--autostash` and `--onto <ref>` are **not** surfaced: a dirty worktree is reported
-as `skipped` in output the user is already reading, and a target other than the
+as skipped in the modal the user is already reading, and a target other than the
 remote default branch is a CLI concern (#1409).
 
 ### Window repositioning (macOS)
@@ -1156,16 +1191,31 @@ the `close` deletion, both same-user-bounded and guarded; see
 [ADR-0048](adrs/adr-0048.md) and [ADR-0049](adrs/adr-0049.md) for the full
 threat-model notes.
 
-The **`worktrees rebase`** command rewrites branch history and touches the network,
-but adds **no new socket capability**: it is a **pure CLI-side** operation that
-never opens the control socket ([ADR-0055](adrs/adr-0055.md)). It runs in the
-invoking user's own shell with their `git` credentials — deliberately *not* in the
-daemon, whose minimal launchd/systemd environment lacks `SSH_AUTH_SOCK` and could
-not authenticate an SSH fetch. It rewrites only branches the user names (or `--all`
-of their own repo's linked worktrees), refuses the main working tree on the same
-structural `is_main` guard as `close`, confirms by default, and aborts-and-restores
-rather than leaving a worktree dirty or half-rebased. No secret is read or
-persisted; the fetch relies entirely on the user's ambient `git` configuration.
+The **`rebase`** op **rewrites git history** from the daemon
+([ADR-0059](adrs/adr-0059.md)) — an escalation beyond `close`'s file deletion, and
+the second op after `merge-queue` to spend the user's ambient credentials. It is
+same-user-bounded for the same reason everything else here is (the `0600` socket
+already requires the owning local user, so no new principal gains anything), and
+guarded in the daemon rather than by the UI: it rewrites only branches the client
+names, refuses the main working tree on the same structural `is_main` guard as
+`close`, skips a dirty tree / detached HEAD / operation already in progress, and
+**re-validates all of it on execute** rather than trusting a phase-1 result the
+client sends back. Concurrent executes are serialized, since linked worktrees share
+one object database. No secret is read or persisted; the fetch relies entirely on
+the user's ambient `git` configuration, reached through `ssh-agent` exactly as the
+user's own shell would.
+
+One genuinely new residual: with `keep_conflicts` a worktree can be **left
+mid-rebase** by a socket request. That is the intent (#1415) rather than a lapse,
+and it is recoverable with ordinary git (`--continue` or `--abort`) — but it is a
+state a client can now leave behind, which is why it is cued durably in the tree,
+named in the summary toast, and counted in the `rebase execute` audit line.
+
+The **`worktrees rebase`** CLI command adds **no** socket capability: it never
+opens the control socket ([ADR-0055](adrs/adr-0055.md)), running the same engine
+in the invoking user's own shell with their `git` credentials. It applies the same
+guards, confirms by default, and (absent `--keep-conflicts`) aborts-and-restores
+rather than leaving a worktree dirty or half-rebased.
 
 The tree view's **Rebase on main** action (#1409) changes none of that: it spawns
 that same CLI in a VS Code integrated terminal — the user's own shell, their own
@@ -1235,6 +1285,7 @@ Ops:
 | `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
 | `reload`          | `{ target_keys[] }`                            | `{ requested, signalled, unknown[] }`      |
 | `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
+| `rebase`          | `{ paths[], check?, confirmed?, keep_conflicts?, autostash?, onto? }` | `{ fetches[], worktrees[] }` *(plan, or result)* |
 | `reposition`      | `{ reference_key, target_keys[], check? }`     | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
 | `reposition-undo` | `null`                                         | *(same shape, without `reference`)*        |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
@@ -1344,7 +1395,8 @@ Where:
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
-  `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr?, pr_none? }`. The
+  `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr?, pr_none?,
+  operation?, rebasing? }`. The
   main working tree
   comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
   `true` when a live window currently has that worktree open, and `window_key` (the
@@ -1376,6 +1428,17 @@ Where:
   branch included), mutually exclusive with `pr`. Both absent still means "not
   resolved" — before the first poll, after a failed one, or from a pre-#1370
   daemon — which is the only case a client's degraded `gh` fallback should cover.
+  `operation` and `rebasing` are the two halves of the **rebase cue** (#1415), both
+  skip-when-absent so a pre-#1415 client sees the identical bytes. `operation` is
+  the worktree's own in-progress git operation read off disk —
+  `rebase | rebase-interactive | merge | cherry-pick | revert | bisect |
+  apply-mailbox`, absent when clean — and is **durable**: a conflict the `rebase`
+  op left in place shows here across daemon restarts until it is resolved.
+  `rebasing` is a skip-when-false boolean meaning the daemon is rebasing that
+  worktree *right now*, from in-memory state. They are not redundant: a rebase that
+  applies cleanly never writes an on-disk state for `operation` to report, and a
+  conflicting one only writes it at the moment of collision. Treat an unrecognised
+  `operation` value as "some operation in progress" rather than ignoring it.
 - `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
   `{ paths: [<worktree path>, …] }`, it returns
   `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
@@ -1555,12 +1618,14 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   deferred.
 - The tree view is **view + focus only**, apart from two management actions: the
   destructive **close** ([ADR-0049](adrs/adr-0049.md)) and **Rebase on main**
-  ([Rebase onto main](#rebase-onto-main), #1409). The rest (add/prune) remain out of
-  scope for this iteration. Rebase is in the view but **not** in the daemon: the row
-  action spawns the [`worktrees rebase`](#cli) CLI in a terminal
-  ([ADR-0055](adrs/adr-0055.md)), so it inherits the user's fetch credentials. A
-  **tray** "rebase all" is still a follow-up for exactly that reason — the tray has
-  no terminal to spawn into and the daemon has no credentials to fetch with.
+  ([Rebase onto main](#rebase-onto-main), #1409/#1415). The rest (add/prune) remain
+  out of scope for this iteration. Since #1415 rebase *is* in the daemon
+  ([ADR-0059](adrs/adr-0059.md)), which unblocks a **tray** "rebase all" — no
+  longer barred by credentials, just unbuilt. Two more follow-ups it opens up:
+  **Abort Rebase / Continue Rebase** row actions, now that the tree can see a
+  left-in-place conflict, and **parallel** rebases (they still run one at a time,
+  within a batch and across concurrent requests, because linked worktrees share one
+  object database).
 - **PR badges are `gh`-based and GitHub-only (#1296):** the tree resolves open PRs
   via the GitHub CLI on repo-expand ([ADR-0050](adrs/adr-0050.md)). Other forges
   (GitLab/Bitbucket) and PR *creation/review/merge* are out of scope — the latter

@@ -4631,6 +4631,7 @@ Options:
       --onto <REF>       Rebase onto this ref instead of the remote default branch. A `<remote>/<branch>` value is still fetched once up front
       --autostash        Stash uncommitted changes around each rebase instead of skipping the worktree
       --dry-run          Fetch and report what would be rebased, but rebase nothing
+      --keep-conflicts   Leave a conflicting worktree mid-rebase to resolve in place, instead of aborting it back to its previous state
   -y, --yes              Skip the interactive confirmation before rebasing
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')

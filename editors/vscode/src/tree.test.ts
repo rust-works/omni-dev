@@ -31,6 +31,7 @@ import {
   worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
+  worktreeRebaseCue,
   worktreeLabel,
   worktreeNodes,
   worktreePrBadge,
@@ -158,6 +159,60 @@ test("worktreeDescription formats the sync counts, omitting absent sides", () =>
   // One-sided (defensive): only the present side is shown.
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, ahead: 4 }), "↑4");
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, behind: 5 }), "↓5");
+});
+
+test("worktreeRebaseCue prefers the in-flight spinner over the durable operation", () => {
+  const base: TreeWorktreePayload = { path: "/x", branch: "f", is_main: false, open: true };
+  // Nothing set — the overwhelmingly common case — renders no cue at all, so a
+  // pre-#1415 daemon's snapshot is byte-for-byte as before.
+  assert.equal(worktreeRebaseCue(base), undefined);
+  assert.equal(worktreeDescription(base), "");
+
+  // In flight wins: it is the more urgent fact, and `operation` may already be
+  // set from the very conflict the running rebase is about to report.
+  const busy = worktreeRebaseCue({ ...base, rebasing: true, operation: "rebase" });
+  assert.equal(busy?.iconId, "sync~spin");
+  assert.equal(busy?.text, "rebasing…");
+
+  // Left in place by the daemon: a warning the user has to act on.
+  const stuck = worktreeRebaseCue({ ...base, operation: "rebase" });
+  assert.equal(stuck?.iconId, "warning");
+  assert.equal(stuck?.text, "rebase in progress");
+  assert.match(stuck?.tooltip ?? "", /git rebase --continue/);
+
+  // An interactive rebase reads as a plain rebase; other operations keep their
+  // own name rather than being mislabelled.
+  assert.equal(
+    worktreeRebaseCue({ ...base, operation: "rebase-interactive" })?.text,
+    "rebase in progress",
+  );
+  assert.equal(worktreeRebaseCue({ ...base, operation: "merge" })?.text, "merge in progress");
+
+  // `--continue` is only suggested where it exists: `git bisect --continue` is
+  // not a command, and neither is whatever a future daemon might report.
+  assert.match(worktreeRebaseCue({ ...base, operation: "merge" })?.tooltip ?? "", /--continue/);
+  const bisect = worktreeRebaseCue({ ...base, operation: "bisect" });
+  assert.equal(bisect?.text, "bisect in progress");
+  assert.doesNotMatch(bisect?.tooltip ?? "", /--continue/);
+  assert.doesNotMatch(
+    worktreeRebaseCue({ ...base, operation: "something-new" })?.tooltip ?? "",
+    /--continue/,
+  );
+});
+
+test("worktreeDescription leads with the rebase cue, ahead of the sync counts", () => {
+  // While mid-rebase the sync counts are measured against a HEAD in flux, so the
+  // cue must not be buried behind them.
+  const wt: TreeWorktreePayload = {
+    path: "/x",
+    branch: "f",
+    is_main: false,
+    open: true,
+    ahead: 1,
+    behind: 2,
+    rebasing: true,
+  };
+  assert.equal(worktreeDescription(wt), "rebasing…  ↑1 ↓2");
 });
 
 test("withAheadBehind folds lazily-fetched counts in, and no-ops when absent", () => {
