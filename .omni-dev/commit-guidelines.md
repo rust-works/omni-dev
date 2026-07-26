@@ -54,16 +54,29 @@ Required. Must be one of:
 Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 
 - `atlassian` - Atlassian JIRA/Confluence integration and API client
+- `browser` - Browser bridge: drive authenticated requests through a browser tab
 - `ci` - CI/CD pipelines and GitHub Actions workflows
 - `claude` - Claude AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
+- `daemon` - Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray
 - `data` - Data structures and serialization
+- `datadog` - Datadog monitoring integration and REST API client
 - `docs` - Documentation and planning
 - `git` - Git operations and repository analysis
+- `mcp` - MCP server implementation and tool handlers
 - `release` - Release process, versioning, and publishing
+- `request-log` - Local append-only invocation + HTTP request log and its reader
 - `resources` - Embedded reference content registry shared by CLI and MCP
 - `scopes` - Commit scope definitions and configuration
+- `sessions` - Claude Code sessions tracker: cross-window live session state on the daemon
+- `snowflake` - Snowflake query service: authenticate-once SSO sessions on the daemon
+- `vscode` - VS Code companion extension for the worktrees service
+- `website` - Project promo site sources under website/
 - `workflows` - GitHub Actions workflow files
+
+In addition to the scopes above, this project is a Rust crate, so the
+ecosystem default scopes `cargo`, `core`, `lib` and `test` are also
+accepted.
 
 For multi-scope commits, the scopes are correct when each listed scope
 matches at least one modified file. Do not flag scopes as incorrect
