@@ -34,7 +34,14 @@ import {
   worktreeNodes,
   worktreeTooltip,
 } from "./tree";
-import { RowIcon, repoRowIcon, worktreeRowIcon } from "./icons";
+import {
+  RowColorMap,
+  RowIcon,
+  repoRowIcon,
+  rowColorTag,
+  sameRowColors,
+  worktreeRowIcon,
+} from "./icons";
 import { worktreeResourceUri } from "./decorations";
 
 /**
@@ -68,11 +75,11 @@ export const ITEM_CLICKED_COMMAND = "omniDevWorktrees.itemClicked";
 
 /**
  * Maps a pure {@link RowIcon} onto the editor's icon type — the whole of this file's
- * share of the row-icon logic.
+ * share of the row-icon logic (#1428).
  *
  * The one-argument form is used deliberately when there is no colour, rather than
  * passing an explicit `undefined`, so an uncoloured row constructs exactly the value it
- * did before this extraction.
+ * did before the colour tags existed.
  */
 function themeIcon(icon: RowIcon): vscode.ThemeIcon {
   return icon.colorId
@@ -99,6 +106,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * the item at render time.
    */
   private sessionTallies: SessionTallyMap = {};
+  /**
+   * Per-row icon colour tags (#1428), keyed by {@link nodeId} — the user's
+   * `omniDevWorktrees.rowColors` setting. Like the session tallies this is *pushed* in
+   * rather than pulled: it lives in VS Code settings, not in the daemon snapshot, so
+   * `extension.ts` reads it and forwards it on every configuration change.
+   */
+  private rowColors: RowColorMap = {};
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -139,6 +153,25 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   setShowPullRequests(showPr: boolean): void {
     this.showPr = showPr;
     this.emitter.fire(undefined);
+  }
+
+  /**
+   * Replaces the per-row icon colour tags (#1428), returning whether anything actually
+   * changed.
+   *
+   * Refreshing only on a real change matters more here than anywhere else: user-scope
+   * settings changes fire `onDidChangeConfiguration` in **every** open window, and a
+   * refresh re-runs {@link getChildren} and so the lazy ahead/behind and PR-badge
+   * fetches (see {@link setSessionTallies}). Without the guard, one colour edit would
+   * cost N windows × one `ahead-behind` op per expanded repo.
+   */
+  setRowColors(colors: RowColorMap): boolean {
+    if (sameRowColors(this.rowColors, colors)) {
+      return false;
+    }
+    this.rowColors = colors;
+    this.emitter.fire(undefined);
+    return true;
   }
 
   /**
@@ -224,7 +257,9 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
         vscode.TreeItemCollapsibleState.Expanded,
       );
       item.id = nodeId(node);
-      item.iconPath = themeIcon(repoRowIcon(node.repo, this.showPr));
+      item.iconPath = themeIcon(
+        repoRowIcon(node.repo, this.showPr, rowColorTag(this.rowColors, node)),
+      );
       // Encodes GitHub identity (gates "Open Pull Request…") and poll state (gates
       // "Enable/Disable PR Polling"); the plain `repo` value is unchanged for
       // non-GitHub repos.
@@ -258,9 +293,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     if (checks !== "none" || sessionDecoration(sessions)) {
       item.resourceUri = worktreeResourceUri(node.wt.path, checks, sessions);
     }
-    // The rebase cue and the three-way open badge — see `icons.ts` for the precedence
-    // between them.
-    item.iconPath = themeIcon(worktreeRowIcon(node.wt, this.windowKey));
+    // The rebase cue, the user's colour tag, and the three-way open badge — see
+    // `icons.ts` for the precedence between them.
+    item.iconPath = themeIcon(
+      worktreeRowIcon(node.wt, this.windowKey, rowColorTag(this.rowColors, node)),
+    );
     item.command = {
       command: ITEM_CLICKED_COMMAND,
       title: "Open Worktree",
