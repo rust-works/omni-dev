@@ -702,12 +702,14 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.addToMergeQueue",
       (node?: Node, selected?: Node[]) => void addToMergeQueue(node, selected),
     ),
-    // The one item command that never touches the daemon: it shells out to the
-    // `omni-dev` CLI in a terminal, because the rebase's fetch needs the user's
-    // git credentials (ADR-0055). See `rebaseCommand.ts`.
+    // A daemon op since #1415: the daemon inherits the user's `ssh-agent` from
+    // launchd, so it can fetch, and hosting the rebase there is what lets a
+    // conflict be left in place. `send`/`windowKey` are injected so the handler
+    // itself stays out of this file. See `rebaseCommand.ts` and ADR-0059.
     vscode.commands.registerCommand(
       "omniDevWorktrees.rebaseOnMain",
-      (node?: Node, selected?: Node[]) => void rebaseOnMain(node, selected),
+      (node?: Node, selected?: Node[]) =>
+        void rebaseOnMain({ send, windowKey }, node, selected),
     ),
     // Geometry work happens in the daemon, which is the only process that can do
     // it (#1407) — a VS Code extension has no API for its own window's bounds.

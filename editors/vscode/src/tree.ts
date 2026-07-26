@@ -93,6 +93,26 @@ export interface TreeWorktreePayload {
    * Renders nothing.
    */
   pr_none?: boolean;
+  /**
+   * The multi-step git operation this worktree is mid-way through, when any
+   * (#1415): `rebase`, `rebase-interactive`, `merge`, `cherry-pick`, `revert`,
+   * `bisect` or `apply-mailbox`. Absent for a clean worktree, and from a
+   * pre-#1415 daemon.
+   *
+   * The **durable** half of the rebase cue: read off disk into every snapshot, so
+   * a conflict the daemon's `rebase` op left in place keeps showing until it is
+   * resolved — across daemon restarts.
+   */
+  operation?: string;
+  /**
+   * Whether the daemon is rebasing this worktree **right now** (#1415) — the
+   * **transient** half of the cue.
+   *
+   * Not redundant with {@link TreeWorktreePayload.operation}: a rebase that
+   * applies cleanly never writes an on-disk state for `operation` to report, so
+   * without this a multi-second rebase would render as nothing happening.
+   */
+  rebasing?: boolean;
 }
 
 /**
@@ -337,17 +357,63 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
 }
 
 /**
- * The muted row description: the sync counts, the PR badge, and the Claude
- * session glyphs, each shown only when present, separated by a gap. A worktree
- * with none of them yields an empty description — byte-for-byte the pre-#1296
- * behavior.
+ * A worktree row's rebase cue (#1415): the codicon id for its row icon and the
+ * text fragment for its description, or `undefined` when there is nothing to say.
+ *
+ * Two orthogonal facts, in priority order:
+ *
+ *  - `rebasing` — the daemon is working on it *right now* → a spinner. Wins,
+ *    because "in flight" is the more urgent thing to know and the durable
+ *    `operation` may already be set from the conflict it is about to report.
+ *  - `operation` — the worktree is sitting mid-rebase (or mid-merge, mid-bisect…)
+ *    and needs the user → a warning triangle. For a rebase this is exactly the
+ *    left-in-place conflict the `rebase` op now leaves behind.
+ *
+ * Deliberately **not** the badge layer. A `FileDecoration.badge` holds only two
+ * characters, and both are already spoken for — the PR check verdict and the
+ * Claude session cue each get one (`decorations.ts`) — so a third would have to
+ * evict one of them. The row icon and description are unclaimed and carry more.
+ */
+export function worktreeRebaseCue(
+  wt: TreeWorktreePayload,
+): { iconId: string; text: string; tooltip: string } | undefined {
+  if (wt.rebasing === true) {
+    return { iconId: "sync~spin", text: "rebasing…", tooltip: "rebasing now" };
+  }
+  if (wt.operation === undefined) {
+    return undefined;
+  }
+  // An interactive rebase reads as a plain rebase; anything else keeps its own
+  // name, including a value this version does not know about.
+  const label = wt.operation.startsWith("rebase") ? "rebase" : wt.operation;
+  // Only suggest `--continue` for the operations that actually have one. `git
+  // bisect --continue` is not a command, and an unrecognised future operation
+  // may not have one either — so those just name the state.
+  const resumable = ["rebase", "merge", "cherry-pick", "revert"].includes(label);
+  const tooltip = resumable
+    ? `${label} in progress — resolve, then \`git ${label} --continue\``
+    : `${label} in progress`;
+  return { iconId: "warning", text: `${label} in progress`, tooltip };
+}
+
+/**
+ * The muted row description: the rebase cue, the sync counts, the PR badge, and
+ * the Claude session glyphs, each shown only when present, separated by a gap. A
+ * worktree with none of them yields an empty description — byte-for-byte the
+ * pre-#1296 behavior.
+ *
+ * The rebase cue leads: while a worktree is mid-rebase its sync counts are
+ * measured against a HEAD that is itself in flux, so they are the *least*
+ * trustworthy thing on the row and should not be read first.
  *
  * `sessions` is passed in already rendered (by `sessionCounts.ts`) rather than
  * derived here: session state rides its own daemon op, not the tree snapshot,
  * so it is side-data the provider folds in.
  */
 export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): string {
-  return [syncCounts(wt), worktreePrBadge(wt), sessions].filter(Boolean).join("  ");
+  return [worktreeRebaseCue(wt)?.text ?? "", syncCounts(wt), worktreePrBadge(wt), sessions]
+    .filter(Boolean)
+    .join("  ");
 }
 
 /**
@@ -489,6 +555,10 @@ export function worktreeTooltip(
       ? "● window open"
       : "no window open";
   const lines = [wt.path, `${kind} of ${repoLabel(repo)}`, branchLine];
+  const rebase = worktreeRebaseCue(wt);
+  if (rebase) {
+    lines.push(rebase.tooltip);
+  }
   const prLine = worktreePrTooltipLine(wt);
   if (prLine) {
     lines.push(prLine);
