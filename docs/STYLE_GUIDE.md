@@ -377,14 +377,21 @@ local overrides and the global fallback.
 The commit guidelines must themselves follow **Conventional Commits** and remain consistent
 with the scope definitions in `.omni-dev/scopes.yaml`:
 
-1. **Scope list** — the `## Scopes` section in `commit-guidelines.md` must list exactly the
-   scopes defined in `scopes.yaml`. When a scope is added, removed, or renamed in
-   `scopes.yaml`, update `commit-guidelines.md` to match.
+1. **Scope list** — the `` - `name` - description `` bullets in the `## Scopes` section of
+   `commit-guidelines.md` must match the scopes defined in `scopes.yaml` name-for-name and
+   description-for-description. When a scope is added, removed, or renamed in `scopes.yaml`,
+   update `commit-guidelines.md` to match. Prose in the same section is not part of the list
+   — the note recording the ecosystem default scopes that `merge_ecosystem_scopes` adds
+   (`cargo`, `core`, `lib`, `test` for a Rust project) belongs there, outside the bullets.
 2. **Examples** — every `<scope>` used in the `## Examples` section must be a scope that
    exists in `scopes.yaml`. Do not use scopes from other projects or hypothetical scopes.
 3. **Single source of truth** — `scopes.yaml` is the canonical definition. The scope list in
    `commit-guidelines.md` exists only so the AI prompt has inline context; it must never
    diverge from the YAML file.
+
+All three clauses are enforced by
+[`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs), so a
+divergence fails the build rather than silently degrading the prompt.
 
 ### Motivation
 
@@ -395,6 +402,11 @@ machine-readable guidelines.
 Both `commit-guidelines.md` and `scopes.yaml` are injected into the AI prompt for commit
 checking. If the two files list different scopes the AI receives contradictory instructions
 and may incorrectly flag valid scopes as invalid — or accept scopes that no longer exist.
+
+The list is hand-maintained, and before it was tested it had drifted by nine entries
+([#1421](https://github.com/rust-works/omni-dev/issues/1421)) without producing a visible
+failure: the judge happened to resolve the contradiction in favour of `scopes.yaml`. Relying
+on that is a coin flip, which is why the rule is now checked by a test.
 
 ---
 
