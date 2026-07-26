@@ -33,6 +33,7 @@ import {
   worktreeDescription,
   worktreeLabel,
   worktreeNodes,
+  worktreeRebaseCue,
   worktreeTooltip,
 } from "./tree";
 import { worktreeResourceUri } from "./decorations";
@@ -251,14 +252,23 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     if (checks !== "none" || sessionDecoration(sessions)) {
       item.resourceUri = worktreeResourceUri(node.wt.path, checks, sessions);
     }
+    // A rebase in flight (or a conflict left in place) takes the icon over (#1415):
+    // it is transient and actionable, where open-state is neither. The row does
+    // lose its open badge for the duration — an accepted trade, since the tooltip
+    // and `contextValue` still carry open state, and the alternative (the badge
+    // layer) has only two characters, both already claimed by the PR-check and
+    // Claude-session providers.
+    const rebase = worktreeRebaseCue(node.wt);
     // The open badge, three-way: a blue tick for the worktree open in *this*
     // window, a green dot for one open in another window, else the plain branch
     // glyph for a worktree with no live window.
-    item.iconPath = isCurrentWindow(node.wt, this.windowKey)
-      ? new vscode.ThemeIcon("check", new vscode.ThemeColor("charts.blue"))
-      : node.wt.open
-        ? new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"))
-        : new vscode.ThemeIcon("git-branch");
+    item.iconPath = rebase
+      ? new vscode.ThemeIcon(rebase.iconId, new vscode.ThemeColor("charts.yellow"))
+      : isCurrentWindow(node.wt, this.windowKey)
+        ? new vscode.ThemeIcon("check", new vscode.ThemeColor("charts.blue"))
+        : node.wt.open
+          ? new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"))
+          : new vscode.ThemeIcon("git-branch");
     item.command = {
       command: ITEM_CLICKED_COMMAND,
       title: "Open Worktree",

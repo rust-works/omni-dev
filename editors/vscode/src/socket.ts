@@ -283,6 +283,105 @@ export function mergeQueueEnvelope(paths: string[], requesterKey: string): Envel
 }
 
 /**
+ * The fields the extension sends on a `rebase` op — mirrors the daemon's
+ * `RebaseRequest` (`src/daemon/services/worktrees.rs`).
+ *
+ * Like `merge-queue` this is a **single batched** op over `paths`, not a
+ * client-side fan-out — which is exactly what buys the fetch-once-per-repository
+ * contract: the daemon can only group the selection by repository if it sees the
+ * whole selection at once.
+ */
+export interface RebasePayload {
+  paths: string[];
+  requester_key: string;
+  check?: boolean;
+  confirmed?: boolean;
+  keep_conflicts?: boolean;
+}
+
+/**
+ * One repository's one-shot fetch in a `rebase` reply (mirrors `FetchOutcome` in
+ * Rust). One entry per repository is the visible proof of fetch-once-per-repo.
+ */
+export interface RebaseFetch {
+  repo_root: string;
+  onto: string;
+  fetched: boolean;
+  ok: boolean;
+  detail?: string;
+}
+
+/**
+ * One worktree's outcome in a `rebase` reply (mirrors `WorktreeOutcome` +
+ * the flattened `RebaseResult` in Rust).
+ *
+ * `status` is the kebab-case discriminant: `would-rebase` / `up-to-date` /
+ * `skipped` in phase 1, and `rebased` / `conflict` / `skipped` / `fetch-failed`
+ * in phase 2. The other fields ride along per variant — `behind` on a
+ * rebase-shaped one, `reason` on a skip, `detail` on a failure.
+ */
+export interface RebaseOutcome {
+  path: string;
+  branch?: string;
+  onto: string;
+  status: string;
+  /** Commits behind the rebase target (on `would-rebase` / `rebased`). */
+  behind?: number;
+  /** Why a worktree was skipped, e.g. `dirty`, `main-working-tree`. */
+  reason?: string;
+  /** The git error, on `conflict` / `fetch-failed`. */
+  detail?: string;
+  /**
+   * Set when a conflicting worktree was **left mid-rebase** to resolve in place
+   * rather than aborted (#1415). Absent means aborted — including from a
+   * pre-#1415 daemon, which only ever aborted.
+   */
+  left_in_place?: boolean;
+}
+
+/** A `rebase` reply. Both phases share one shape; only the statuses differ. */
+export interface RebaseReply {
+  fetches?: RebaseFetch[];
+  worktrees?: RebaseOutcome[];
+}
+
+/**
+ * Builds a `rebase` **phase-1** envelope (`check:true`): the daemon fetches each
+ * repository's target ref once and classifies every selected worktree, rebasing
+ * nothing. That classification is the "is this worth doing?" gate *and* the
+ * source of the real behind-counts the confirmation modal shows.
+ */
+export function rebaseCheckEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "rebase",
+    payload: { paths, requester_key: requesterKey, check: true },
+  };
+}
+
+/**
+ * Builds a `rebase` **phase-2** execute envelope (`confirmed:true`): the daemon
+ * re-plans from scratch and rebases each still-pending worktree. One envelope for
+ * the whole selection — a batch confirms once (ADR-0049 §1).
+ *
+ * `keep_conflicts` is always set from this surface: a conflicted worktree is left
+ * mid-rebase so it can be resolved in place, which is the whole point of #1415.
+ * The tree row then cues it until it is finished.
+ */
+export function rebaseEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "rebase",
+    payload: {
+      paths,
+      requester_key: requesterKey,
+      confirmed: true,
+      keep_conflicts: true,
+    },
+  };
+}
+
+/**
  * The fields the extension sends on a `reposition` op — mirrors the daemon's
  * `RepositionRequest` (`src/daemon/services/worktrees.rs`).
  *
