@@ -109,8 +109,14 @@ impl SessionState {
     /// machine, kept in one testable place:
     ///
     /// - `SessionStart` → [`Starting`](Self::Starting)
-    /// - `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `TranscriptGrew` →
+    /// - `UserPromptSubmit` / `PreToolUse` / `PostToolUse` →
     ///   [`Working`](Self::Working)
+    /// - `TranscriptGrew` → [`Working`](Self::Working), **except** while
+    ///   [`WaitingForInput`](Self::WaitingForInput) /
+    ///   [`WaitingForPermission`](Self::WaitingForPermission) /
+    ///   [`Ended`](Self::Ended), which it leaves **unchanged** — growth is
+    ///   expected in those states without the session doing anything, so it is
+    ///   not evidence the turn resumed (#1418)
     /// - `Stop` → [`Idle`](Self::Idle)
     /// - `Notification(PermissionPrompt)` →
     ///   [`WaitingForPermission`](Self::WaitingForPermission)
@@ -129,8 +135,29 @@ impl SessionState {
             SessionEvent::SessionStart => Self::Starting,
             SessionEvent::UserPromptSubmit
             | SessionEvent::PreToolUse
-            | SessionEvent::PostToolUse
-            | SessionEvent::TranscriptGrew => Self::Working,
+            | SessionEvent::PostToolUse => Self::Working,
+            // Growth is only evidence the transcript file got bigger. From most
+            // states that does imply a turn is running, but in two it does not,
+            // and reading it as `working` would overwrite a state a hook
+            // reported directly:
+            //
+            // - `waiting_for_*` — Claude flushes the assistant `tool_use` line
+            //   *before* the prompt it is asking about can be answered, so the
+            //   watcher's next scan would downgrade the wait and the row would
+            //   go quiet exactly when it should be shouting (#1418);
+            // - `ended` — a session's last lines land around `SessionEnd`, so a
+            //   scan inside the ended-linger window would revive the entry and
+            //   hold a phantom `working` row for the whole session TTL.
+            //
+            // That is ADR-0052's reliable-over-inferred ordering, and the rule
+            // `stream.rs`'s `state` already applies to a permission prompt. Both
+            // states are released by any later hook, which is inference-free.
+            SessionEvent::TranscriptGrew => match current {
+                Some(held @ (Self::WaitingForInput | Self::WaitingForPermission | Self::Ended)) => {
+                    held
+                }
+                _ => Self::Working,
+            },
             SessionEvent::Stop => Self::Idle,
             // An authoritative state from a stream-json observer wins outright,
             // ignoring the inferred `current` — it read the exact state from the
@@ -834,6 +861,34 @@ mod tests {
             ),
             SessionState::Idle
         );
+        // Growth is expected while a session waits on the user (the transcript
+        // grows before the prompt is answered) and around `SessionEnd` (the
+        // final lines land as it exits), so in neither case is it evidence the
+        // turn is running: the directly reported state stands (#1418).
+        for held in [
+            SessionState::WaitingForInput,
+            SessionState::WaitingForPermission,
+            SessionState::Ended,
+        ] {
+            assert_eq!(
+                SessionState::for_event(&TranscriptGrew, Some(held)),
+                held,
+                "growth must not overwrite {held:?}"
+            );
+        }
+        // From every other state growth still means working, as does growth on
+        // a session whose state is not yet known (covered by the table above).
+        for other in [
+            SessionState::Working,
+            SessionState::Idle,
+            SessionState::Starting,
+        ] {
+            assert_eq!(
+                SessionState::for_event(&TranscriptGrew, Some(other)),
+                SessionState::Working,
+                "growth from {other:?}"
+            );
+        }
     }
 
     #[test]
@@ -1289,6 +1344,71 @@ mod tests {
         assert!(
             rx.has_changed().unwrap(),
             "a newly-filled `cwd` should bump"
+        );
+    }
+
+    #[test]
+    fn transcript_growth_does_not_clobber_a_waiting_session() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::Notification(NotificationKind::PermissionPrompt),
+            Some("/tmp/a"),
+        ));
+        // Subscribe *after* the insert so its bump is already seen. Never marked
+        // seen below, so the closing assert catches the release's bump only if
+        // the growth in between really did stay quiet.
+        let rx = reg.subscribe_changes();
+
+        // The watcher sees the assistant `tool_use` line Claude flushed before
+        // the prompt could be answered. The wait came from a direct
+        // `Notification`, so it must survive (#1418).
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::TranscriptGrew,
+            Some("/tmp/a"),
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "state did not change, so nothing a consumer renders did either (#1414)"
+        );
+
+        // Answering the prompt still releases the wait — on the next hook, which
+        // for an approved tool is the `PostToolUse` that fires when it finishes.
+        reg.observe(observe_request("s1", SessionEvent::PostToolUse, None));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+        assert!(
+            rx.has_changed().unwrap(),
+            "the release is a real transition"
+        );
+    }
+
+    #[test]
+    fn transcript_growth_does_not_revive_an_ended_session() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::PreToolUse,
+            Some("/tmp/a"),
+        ));
+        assert!(reg.end("s1", Some("clear")));
+        // Subscribed after the end so its bump is already seen (see above).
+        let rx = reg.subscribe_changes();
+
+        // The watcher's next scan sees the lines Claude flushed as it exited.
+        // `SessionEnd` reported the end directly, so the entry must stay `ended`
+        // and reap on the short ended TTL rather than being revived as a
+        // `working` phantom that outlives the session by the whole TTL (#1418).
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::TranscriptGrew,
+            Some("/tmp/a"),
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::Ended);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "state did not change, so nothing a consumer renders did either (#1414)"
         );
     }
 
