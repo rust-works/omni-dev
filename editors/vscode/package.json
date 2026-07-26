@@ -82,6 +82,16 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.setRowColor",
+        "title": "Set Colour…",
+        "category": "omni-dev"
+      },
+      {
+        "command": "omniDevWorktrees.clearAllRowColors",
+        "title": "Clear All Row Colours",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.openPullRequest",
         "title": "Open Pull Request…",
         "category": "omni-dev",
@@ -174,6 +184,10 @@
         },
         {
           "command": "omniDevWorktrees.copyDirectory",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.setRowColor",
           "when": "false"
         },
         {
@@ -299,6 +313,11 @@
           "command": "omniDevWorktrees.closeWorktree",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
           "group": "9_close@2"
+        },
+        {
+          "command": "omniDevWorktrees.setRowColor",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
+          "group": "6_appearance@1"
         }
       ],
       "editor/title": [
