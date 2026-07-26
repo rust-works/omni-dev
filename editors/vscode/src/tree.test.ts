@@ -10,6 +10,7 @@ import {
   TreeWorktreePayload,
   WorktreeNode,
   checkStateDecoration,
+  describeReload,
   isCurrentWindow,
   needsPrFallback,
   nodeDirectories,
@@ -654,4 +655,57 @@ test("partitionSelfLast puts a batch without this window's worktree entirely in 
 test("partitionSelfLast handles a batch of only this window's worktree, and an empty one", () => {
   assert.deepEqual(partitionSelfLast([SELF_MAIN], "w1"), { others: [], self: [SELF_MAIN] });
   assert.deepEqual(partitionSelfLast([], "w1"), { others: [], self: [] });
+});
+
+// --- describeReload (#1417) --------------------------------------------------
+
+test("describeReload reports cross-window targets as signalled, never reloaded", () => {
+  // "signalled" is the only honest word: the directive rides the ~10s heartbeat,
+  // so nothing has reloaded yet and the daemon could not observe it if it had.
+  assert.equal(
+    describeReload({ signalled: 2, skipped: 0, self: 0 }),
+    "omni-dev: signalled 2 windows to reload.",
+  );
+  assert.equal(
+    describeReload({ signalled: 1, skipped: 0, self: 0 }),
+    "omni-dev: signalled 1 window to reload.",
+  );
+});
+
+test("describeReload surfaces the skipped count so a narrowed batch is never silent", () => {
+  assert.equal(
+    describeReload({ signalled: 2, skipped: 1, self: 0 }),
+    "omni-dev: signalled 2 windows to reload (1 skipped: no window open).",
+  );
+  // A skip must survive even when nothing else was signalled — this is the
+  // "selected only closed worktrees plus this one" case.
+  assert.equal(
+    describeReload({ signalled: 0, skipped: 3, self: 1 }),
+    "omni-dev: reloading this window (3 skipped: no window open).",
+  );
+});
+
+test("describeReload distinguishes this window from the rest of the batch", () => {
+  // This window reloads immediately and locally; the others are only signalled.
+  assert.equal(
+    describeReload({ signalled: 0, skipped: 0, self: 1 }),
+    "omni-dev: reloading this window.",
+  );
+  assert.equal(
+    describeReload({ signalled: 2, skipped: 0, self: 1 }),
+    "omni-dev: signalled 2 windows to reload; reloading this window.",
+  );
+});
+
+test("describeReload degrades to a nothing-to-do line when there were no targets", () => {
+  // The command warns before it gets here, but the formatter stays total rather
+  // than emitting a stray "omni-dev: ." if it is ever called with an empty batch.
+  assert.equal(
+    describeReload({ signalled: 0, skipped: 0, self: 0 }),
+    "omni-dev: nothing to reload.",
+  );
+  assert.equal(
+    describeReload({ signalled: 0, skipped: 2, self: 0 }),
+    "omni-dev: nothing to reload.",
+  );
 });

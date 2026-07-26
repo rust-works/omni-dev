@@ -124,6 +124,18 @@ pub struct WorktreesRegistry {
     /// aborts and the user retries — an accepted failure mode). Behind its own
     /// `Mutex`, taken independently of the window map's, so neither nests.
     close_pending: Mutex<HashSet<String>>,
+    /// Window keys with a pending "reload yourself" directive, set by the
+    /// `reload` op (#1417). The second directive of the
+    /// [`close_pending`](Self::close_pending) shape, and for the same reason: a
+    /// window can only be reached on the `heartbeat` it initiates, so a
+    /// cross-window reload rides that reply and is taken-and-cleared to fire
+    /// exactly once. Unlike a close, nothing waits for it — a reload has no
+    /// completion the daemon can observe (the window re-registers under the same
+    /// key), so the op reports what it *signalled*, never what reloaded.
+    /// In-memory only: a daemon restart drops any pending directive, and the
+    /// user simply reloads again. Behind its **own** `Mutex`, taken
+    /// independently of the window map's and of `close_pending`'s, so none nest.
+    reload_pending: Mutex<HashSet<String>>,
     /// The daemon-backed **show/hide-closed** toggle (#1301): whether the
     /// companion's tree view shows worktrees with no open window. A single
     /// cross-window value carried in every `tree`/`subscribe` snapshot so all
@@ -176,6 +188,7 @@ impl WorktreesRegistry {
             ttl: DEFAULT_TTL,
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
+            reload_pending: Mutex::new(HashSet::new()),
             show_closed: AtomicBool::new(true),
             polling_enabled: Mutex::new(HashMap::new()),
             poll_ttl: DEFAULT_POLL_LEASE,
@@ -308,10 +321,12 @@ impl WorktreesRegistry {
             let reaped = reap(&mut windows, self.ttl, now);
             (removed, reaped)
         };
-        // The window is gone; any close directive for it is fulfilled or moot.
+        // The window is gone; any directive for it is fulfilled or moot.
         // (Keys are per-`activate()` UUIDs, never reused, so a stale directive
         // would only ever leak a little memory — but clearing keeps it tidy.)
+        // Both takes are outside the map's critical section, so no lock nests.
         self.take_close_pending(key);
+        self.take_reload_pending(key);
         if removed || reaped > 0 {
             self.bump();
         }
@@ -333,6 +348,27 @@ impl WorktreesRegistry {
     /// close is pending.
     pub fn take_close_pending(&self, key: &str) -> bool {
         self.close_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key)
+    }
+
+    /// Records a pending "reload yourself" directive for `key`, to be surfaced
+    /// on that window's next `heartbeat` (#1417). Set by the `reload` op for
+    /// every target window, which — unlike a close — includes no waiting: the
+    /// caller learns only that the directive was marked. Idempotent; infallible.
+    pub fn mark_reload_pending(&self, key: &str) {
+        self.reload_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_string());
+    }
+
+    /// Takes (returns and clears) `key`'s pending reload directive. Called on
+    /// each `heartbeat` so the directive fires exactly once; a `false` means no
+    /// reload is pending.
+    pub fn take_reload_pending(&self, key: &str) -> bool {
+        self.reload_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)
@@ -953,6 +989,59 @@ mod tests {
         // Unregistering the window drops any pending directive with it.
         assert!(reg.unregister("w1"));
         assert!(!reg.take_close_pending("w1"));
+    }
+
+    // --- Reload-pending directive (#1417) ----------------------------------
+
+    #[test]
+    fn reload_pending_is_taken_once_then_cleared() {
+        let reg = WorktreesRegistry::new();
+        // No directive by default.
+        assert!(!reg.take_reload_pending("w1"));
+        // Marked → the first take observes it, the next does not (fires once).
+        reg.mark_reload_pending("w1");
+        assert!(reg.take_reload_pending("w1"));
+        assert!(!reg.take_reload_pending("w1"));
+    }
+
+    #[test]
+    fn unregister_clears_a_pending_reload_directive() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.mark_reload_pending("w1");
+        // Unregistering the window drops any pending directive with it.
+        assert!(reg.unregister("w1"));
+        assert!(!reg.take_reload_pending("w1"));
+    }
+
+    #[test]
+    fn close_and_reload_directives_are_independent() {
+        let reg = WorktreesRegistry::new();
+        // Separate sets: marking one must not set or consume the other, so the
+        // heartbeat can surface both fields and the companion pick a winner.
+        reg.mark_reload_pending("w1");
+        assert!(!reg.take_close_pending("w1"));
+        reg.mark_close_pending("w1");
+        assert!(reg.take_close_pending("w1"));
+        assert!(reg.take_reload_pending("w1"));
+        // Each key is tracked on its own.
+        reg.mark_reload_pending("w1");
+        assert!(!reg.take_reload_pending("w2"));
+        assert!(reg.take_reload_pending("w1"));
+    }
+
+    #[test]
+    fn marking_a_reload_does_not_bump() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        let rx = reg.subscribe_changes();
+        // A directive is not consumer-visible state — it never reaches a tree
+        // snapshot — so marking one must not push a redundant frame to every
+        // subscriber. Same rule as the close directive.
+        reg.mark_reload_pending("w1");
+        assert!(!rx.has_changed().unwrap(), "marking a reload must not bump");
+        assert!(reg.take_reload_pending("w1"));
+        assert!(!rx.has_changed().unwrap(), "taking a reload must not bump");
     }
 
     // --- Show/hide-closed toggle (#1301) -----------------------------------
