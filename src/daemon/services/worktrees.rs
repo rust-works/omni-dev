@@ -8023,23 +8023,34 @@ mod tests {
         let (fake, _shim, counter) = counting_fake_gh(bin_dir.path(), "{}");
         let svc = WorktreesService::new();
         svc.registry.set_polling("rust-works", "omni-dev", true);
-        // `base` far larger than the test, so only the grew-trigger — released
-        // by the deadline — can fetch.
-        svc.start_pr_poller_with(Duration::from_secs(30), Duration::from_millis(50), fake);
+        // `base` far past the timeout below, so only the grew-trigger — released by
+        // the deadline — can fetch; a base the drip could outlive would let the
+        // periodic cadence satisfy the assertion on a very slow run (#1426).
+        svc.start_pr_poller_with(Duration::from_secs(300), Duration::from_millis(50), fake);
         let register = json!({ "key": "w", "folders": [dir.path()], "repo": "omni-dev" });
         svc.handle("register", register.clone()).await.unwrap();
-        // Re-register (an upsert, but still a bump) every 25ms — inside the
-        // 50ms debounce — for well past the 200ms deadline. A deadline-free
-        // loop would still be settling when the drip ends.
-        for _ in 0..24 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            svc.handle("register", register.clone()).await.unwrap();
-        }
-        let spawned_mid_drip = gh_spawn_count(&counter);
+        // Re-register (an upsert, but still a bump) every 25ms — inside the 50ms
+        // debounce — until the deadline-forced fetch actually lands. The observation
+        // point is the condition itself, never a clock: sampling the counter at a
+        // fixed instant would additionally assert that a `fork` + `exec` + `/bin/sh`
+        // startup + file append all beat that instant, which is what made this flaky
+        // under full-suite load (#1426). Under load the drip just runs longer. Every
+        // iteration bumps, so the fetch is still observed *while bumps are arriving*
+        // — a deadline-free settle loop never fetches here at all, and the timeout
+        // *is* the assertion.
+        let forced_mid_drip = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                svc.handle("register", register.clone()).await.unwrap();
+                if gh_spawn_count(&counter) >= 1 {
+                    return;
+                }
+            }
+        })
+        .await;
         svc.shutdown().await;
-        assert!(
-            spawned_mid_drip >= 1,
-            "the deadline must force a fetch while the drip is still running (#1389, fix 2)"
+        forced_mid_drip.expect(
+            "the deadline must force a fetch while the drip is still running (#1389, fix 2)",
         );
     }
 
