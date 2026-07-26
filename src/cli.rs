@@ -607,6 +607,48 @@ mod tests {
         assert!(cli.repo.is_none());
     }
 
+    /// Generalises the #1420 audit: no subcommand anywhere in the tree may
+    /// define an arg whose id collides with a root `global = true` arg. The
+    /// failure mode is silent at parse time and only surfaces as a downcast
+    /// panic when the global is read, so it is worth pinning structurally.
+    ///
+    /// Walks the **un-built** `Command`: `Command::build` propagates the globals
+    /// into every subcommand, which would make the check vacuously pass.
+    #[test]
+    fn no_subcommand_arg_shadows_a_global_arg_id() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+
+        fn walk(cmd: &clap::Command, globals: &HashSet<String>, path: &str) {
+            for sub in cmd.get_subcommands() {
+                let sub_path = format!("{path} {}", sub.get_name());
+                for arg in sub.get_arguments() {
+                    let id = arg.get_id().as_str();
+                    assert!(
+                        !globals.contains(id),
+                        "`{sub_path}` defines an arg with id `{id}`, which is a \
+                         global arg id — clap propagates globals by id, so this \
+                         shadows the global and panics when it is read (#1420). \
+                         Rename the subcommand-local field.",
+                    );
+                }
+                walk(sub, globals, &sub_path);
+            }
+        }
+
+        let cmd = Cli::command();
+        let globals: HashSet<String> = cmd
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().as_str().to_string())
+            .collect();
+        assert!(
+            !globals.is_empty(),
+            "expected the root command to declare global args"
+        );
+        walk(&cmd, &globals, "omni-dev");
+    }
+
     // ── propagate_global_flags() tests ──
     //
     // These tests mutate process-global env vars, so they serialise on
