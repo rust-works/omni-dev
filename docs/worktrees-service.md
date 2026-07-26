@@ -399,7 +399,9 @@ file decoration, not description text), which also tints that row's branch label
   **open badge** icon (#1274): a **blue tick** on the worktree open in *this*
   window, a **green dot** on one open in *another* window, and the plain branch
   glyph on a worktree with no live window. The current-window distinction comes
-  from matching a worktree's `window_key` against this window's own key. The
+  from matching a worktree's `window_key` against this window's own key. Any of the
+  three glyphs can be recoloured per row — see [Row colours](#row-colours) — which
+  changes the colour only, never which glyph is shown. The
   `↑ahead ↓behind` counts are **not** in the streamed snapshot — the extension
   fetches them **lazily when a repo is expanded** via the `ahead-behind` op (#1306),
   so only the worktrees you actually look at pay the divergence walk.
@@ -461,6 +463,59 @@ file decoration, not description text), which also tints that row's branch label
 
 The tree view runs **alongside** the reporter lifecycle (register/heartbeat/
 unregister): every window is both a reporter and, if it has the view open, a reader.
+
+### Row colours
+
+Any repository or worktree row can be tagged with an icon colour (#1428), so a tree
+spanning many repositories can be read at a glance — and so a user whose theme renders
+`charts.green` illegibly can pick something else. **Set Colour…** on the row's context
+menu opens a colour picker; it acts on the whole [multi-selection](#tree-view-companion-ui)
+and repo rows are as taggable as worktree rows. Its **Default (theme colour)** entry
+clears the selected rows, and **omni-dev: Clear All Row Colours** in the command palette
+clears every row at once.
+
+- **A colour attaches to a row, not to a state or a glyph.** A tagged row keeps its
+  colour whichever icon it is currently rendering — `check`, `circle-filled`, or
+  `git-branch` — and the glyph itself is never changed, so the open-state distinction is
+  not traded away. Colouring by *state* was rejected deliberately: in a tree where nearly
+  every row sits in "open in another window", a per-state colour repaints almost
+  everything identically and differentiates nothing. It would also be unstable — for the
+  ~10s after a daemon restart, before every window has re-registered, every row
+  transiently reports closed.
+- **Precedence**, first match wins: the [mid-rebase cue](#rebase-onto-main) (yellow,
+  transient and actionable) → the row's tag → the row's default state colour. So a tag
+  overrides the current-window blue tick and the PR-poll green, but a worktree left
+  mid-rebase still shows yellow until it is resolved. An untagged row renders exactly as
+  it did before the feature existed.
+- **Badges are untouched.** The PR-check and Claude-session badges keep their own
+  severity-ranked colour, so a tagged row's icon and badge can differ in colour — correct,
+  since they report different things.
+- **Stored in VS Code user settings**, as `omniDevWorktrees.rowColors`, and never sent
+  over the socket — this is client-side presentation the snapshot has no reason to carry.
+  Unlike the show/hide-closed toggle (#1301) and the per-repo poll flag (#1376), it
+  therefore needs no daemon state: user-scope settings changes fire
+  `workspace.onDidChangeConfiguration` in **every** open window, which gives the
+  cross-window live sync those two needed the daemon for. Consequences: tags survive a
+  daemon restart, a window reload and a reboot; they are hand-editable; and they ride
+  Settings Sync. The setting is `"scope": "application"`, so it cannot be overridden per
+  workspace — the tree spans every repo across every window, so a workspace-scoped map
+  would apply only where that folder happened to be open.
+- **Keys are `nodeId`**: `repo:<repo root>` for a repository row, `wt:<worktree path>`
+  for a worktree row. The discrimination matters — a main worktree's path *is* its
+  repo's root, so those two rows share a directory and a path-keyed map could not tell
+  them apart. It follows that colouring a repository row does not colour its main
+  worktree row; they are tagged separately.
+- **Values are workbench colour ids**, not hex: `vscode.ThemeIcon` accepts only a
+  `ThemeColor`. The vocabulary is the `charts.*` family, the `terminal.ansi*` and
+  `terminal.ansiBright*` families, and `descriptionForeground`, validated by a
+  JSON-schema `enum`. An empty string or an unrecognised id leaves the row its default
+  colour rather than rendering it invisible.
+- **Stale keys are never collected automatically.** Deleting a worktree leaves its entry
+  behind, and recreating one at the same path inherits the old colour. Pruning against
+  the live tree would be wrong — a row is legitimately absent whenever the daemon is
+  down, its repo is open in no window, or the setting has synced to a machine with a
+  different layout — so cleanup is the explicit **Clear All Row Colours** command, or a
+  hand-edit.
 
 ### Pull requests
 
