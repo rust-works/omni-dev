@@ -2739,6 +2739,24 @@ mod tests {
         .unwrap();
         server.await.unwrap();
 
+        // Reload: an empty path list resolves nothing, so `list` is the only
+        // request before the op.
+        let (_d, sock, server) = fake_daemon_seq(vec![
+            json!({ "ok": true, "payload": { "windows": [] } }),
+            json!({ "ok": true, "payload": { "requested": 0, "signalled": 0, "unknown": [] } }),
+        ]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Reload(ReloadCommand {
+                paths: Vec::new(),
+                output: TableOrJson::Table,
+                socket: Some(sock),
+            }),
+        }
+        .execute(None)
+        .await
+        .unwrap();
+        server.await.unwrap();
+
         // Register.
         let (_d, sock, server) =
             fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
@@ -3785,6 +3803,123 @@ mod tests {
             reference: None,
             dry_run: false,
             undo: true,
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an `ok:false` reply must not be reported as success");
+        assert!(err.to_string().contains("unknown worktrees op"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    /// Two open worktrees plus the canned `list` reply that resolves both, so a
+    /// reload test only has to supply the op's own reply.
+    fn reload_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Value) {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let list = json!({ "ok": true, "payload": { "windows": [
+            { "key": "key-a", "folders": [std::fs::canonicalize(&a).unwrap().to_string_lossy()] },
+            { "key": "key-b", "folders": [std::fs::canonicalize(&b).unwrap().to_string_lossy()] },
+        ] } });
+        (dir, a, b, list)
+    }
+
+    #[tokio::test]
+    async fn reload_resolves_paths_to_window_keys_before_sending_the_op() {
+        let (_dir, a, b, list) = reload_fixture();
+        // Two requests: the `list` that maps paths to windows, then the op itself.
+        // `fake_daemon_seq` (not `_replies`) so the sent payloads can be asserted.
+        let (_sock_dir, sock, server) = fake_daemon_seq(vec![
+            list,
+            json!({ "ok": true, "payload": {
+                "requested": 2, "signalled": 2, "unknown": [],
+            } }),
+        ]);
+
+        ReloadCommand {
+            paths: vec![a, b],
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        // The op addresses *windows*: the daemon must receive the resolved keys,
+        // never the paths the user typed.
+        let requests = server.await.unwrap();
+        assert_eq!(requests[1]["op"], "reload");
+        assert_eq!(
+            requests[1]["payload"]["target_keys"],
+            json!(["key-a", "key-b"])
+        );
+        assert!(
+            requests[1]["payload"].get("requester_key").is_none(),
+            "a CLI process is not a window, so it must not claim to be one"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_json_output_passes_the_reply_through_verbatim() {
+        let (_dir, a, _b, list) = reload_fixture();
+        let (_sock_dir, sock, server) = fake_daemon_replies(vec![
+            list,
+            json!({ "ok": true, "payload": {
+                "requested": 1, "signalled": 0, "unknown": ["key-a"],
+            } }),
+        ]);
+        // The `-o json` arm is the machine-readable surface, so it must not go
+        // through the human renderer.
+        ReloadCommand {
+            paths: vec![a],
+            output: TableOrJson::Json,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_fails_before_the_op_when_a_target_has_no_window() {
+        let (_dir, a, b, _list) = reload_fixture();
+        // Only `a` is open, so `b` cannot be resolved and the `reload` op is never
+        // sent — which is why one canned reply suffices. Unlike the tree view's
+        // silent skip, the CLI named this target explicitly, so it is an error.
+        let (_sock_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "windows": [
+                { "key": "key-a", "folders": [std::fs::canonicalize(&a).unwrap().to_string_lossy()] },
+            ] },
+        }));
+        let err = ReloadCommand {
+            paths: vec![a, b],
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an unopened target must abort the command");
+        assert!(err.to_string().contains("can be reloaded"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_surfaces_a_daemon_error() {
+        let (_dir, a, _b, list) = reload_fixture();
+        let (_sock_dir, sock, server) = fake_daemon_replies(vec![
+            list,
+            json!({ "ok": false, "error": "unknown worktrees op: reload" }),
+        ]);
+        // An older daemon that predates #1417 rejects the op; that must surface
+        // rather than read as a successful no-op.
+        let err = ReloadCommand {
+            paths: vec![a],
             output: TableOrJson::Table,
             socket: Some(sock),
         }
