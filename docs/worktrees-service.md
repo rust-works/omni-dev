@@ -312,10 +312,16 @@ can drive the registry's full lifecycle without VS Code (#1361). Each takes a
 caller-supplied window `--key`:
 
 ```bash
-omni-dev worktrees register --key <KEY> --folder /abs/path [--repo R] [--title T] [--pid N]
+omni-dev worktrees register --key <KEY> --folder /abs/path [--repo-name R] [--title T] [--pid N]
 omni-dev worktrees heartbeat --key <KEY>    # prints `known` and any pending `close`/`reload`
 omni-dev worktrees unregister --key <KEY>   # prints whether an entry was removed
 ```
+
+The repository is `--repo-name`, **not** `--repo`: the latter is the global
+`-C/--repo` path flag, and because clap propagates a global arg by its *id*, a
+subcommand-local `repo` displaced it and made every `register` invocation that
+used it panic (#1420). It is a wire-shape no-op — the op's payload key is still
+`repo`.
 
 Every command accepts `--socket` to target a non-default control socket. The
 underlying ops are documented in the [companion contract](#companion-contract-for-the-extension-and-other-clients).

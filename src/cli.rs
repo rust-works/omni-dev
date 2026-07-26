@@ -552,6 +552,103 @@ mod tests {
         assert!(err.to_string().contains("invalid"));
     }
 
+    // ── global arg-id collision tests (#1420) ──
+
+    /// A `global = true` arg is propagated by clap **arg id**, and the derive's
+    /// id defaults to the field name — so a subcommand-local field named `repo`
+    /// displaced the global `-C/--repo` under `worktrees register` and its
+    /// `String` was copied back up into the root matches, panicking `Cli`'s
+    /// `PathBuf` read. Renaming the local field to `repo_name` (`--repo-name`)
+    /// separates the ids; both spellings must now parse side by side.
+    #[cfg(unix)]
+    #[test]
+    fn worktrees_register_repo_name_coexists_with_global_repo() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "-C",
+            "/tmp/somerepo",
+            "worktrees",
+            "register",
+            "--key",
+            "k1",
+            "--repo-name",
+            "myrepo",
+            "--folder",
+            "/tmp",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.repo.as_deref(),
+            Some(std::path::Path::new("/tmp/somerepo"))
+        );
+        let Commands::Worktrees(worktrees::WorktreesCommand {
+            command: worktrees::WorktreesSubcommands::Register(register),
+        }) = cli.command
+        else {
+            panic!("expected a `worktrees register` invocation");
+        };
+        assert_eq!(register.key, "k1");
+        assert_eq!(register.repo_name.as_deref(), Some("myrepo"));
+
+        // The issue's exact repro, which panicked outright: the local flag with
+        // no global alongside it leaves the global unset rather than shadowed.
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "worktrees",
+            "register",
+            "--key",
+            "k1",
+            "--repo-name",
+            "myrepo",
+            "--folder",
+            "/tmp",
+        ])
+        .unwrap();
+        assert!(cli.repo.is_none());
+    }
+
+    /// Generalises the #1420 audit: no subcommand anywhere in the tree may
+    /// define an arg whose id collides with a root `global = true` arg. The
+    /// failure mode is silent at parse time and only surfaces as a downcast
+    /// panic when the global is read, so it is worth pinning structurally.
+    ///
+    /// Walks the **un-built** `Command`: `Command::build` propagates the globals
+    /// into every subcommand, which would make the check vacuously pass.
+    #[test]
+    fn no_subcommand_arg_shadows_a_global_arg_id() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+
+        fn walk(cmd: &clap::Command, globals: &HashSet<String>, path: &str) {
+            for sub in cmd.get_subcommands() {
+                let sub_path = format!("{path} {}", sub.get_name());
+                for arg in sub.get_arguments() {
+                    let id = arg.get_id().as_str();
+                    assert!(
+                        !globals.contains(id),
+                        "`{sub_path}` defines an arg with id `{id}`, which is a \
+                         global arg id — clap propagates globals by id, so this \
+                         shadows the global and panics when it is read (#1420). \
+                         Rename the subcommand-local field.",
+                    );
+                }
+                walk(sub, globals, &sub_path);
+            }
+        }
+
+        let cmd = Cli::command();
+        let globals: HashSet<String> = cmd
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().as_str().to_string())
+            .collect();
+        assert!(
+            !globals.is_empty(),
+            "expected the root command to declare global args"
+        );
+        walk(&cmd, &globals, "omni-dev");
+    }
+
     // ── propagate_global_flags() tests ──
     //
     // These tests mutate process-global env vars, so they serialise on
