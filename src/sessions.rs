@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 pub mod stream;
 pub mod watcher;
@@ -346,6 +347,20 @@ pub struct SessionsRegistry {
     ended_ttl: Duration,
     /// How long a window-embedding report survives without a refresh.
     window_ttl: Duration,
+    /// A monotonically-bumped version counter, incremented whenever the state a
+    /// subscriber renders changes. A push-subscription consumer holds a
+    /// [`watch::Receiver`] from [`subscribe_changes`](Self::subscribe_changes)
+    /// and wakes on each bump to re-snapshot (#1414) — the
+    /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry) arrangement,
+    /// one service over. The counter's *value* is immaterial — only that it
+    /// changed — so a burst coalesces into one wake and the server diffs the
+    /// resulting snapshot to suppress duplicate frames.
+    ///
+    /// `watch` needs no runtime and never blocks, so it fits this engine's
+    /// no-async-setup posture; every [`bump`](Self::bump) happens *after* the map
+    /// guard is dropped, so the `std::Mutex`-never-across-`.await` rule is intact
+    /// (and the watch's own internal lock is never nested under a map lock).
+    changes: watch::Sender<u64>,
 }
 
 impl SessionsRegistry {
@@ -358,7 +373,38 @@ impl SessionsRegistry {
             session_ttl: DEFAULT_SESSION_TTL,
             ended_ttl: ENDED_SESSION_TTL,
             window_ttl: DEFAULT_WINDOW_TTL,
+            changes: watch::channel(0).0,
         }
+    }
+
+    /// A change-notification receiver for the push subscription: it observes a
+    /// new value each time the rendered session state changes (see
+    /// [`bump`](Self::bump)). Created with the current version already marked
+    /// seen, so the first [`watch::Receiver::changed`] resolves on the *next*
+    /// change — the subscriber sends its own initial snapshot up front and then
+    /// waits for deltas (#1414).
+    #[must_use]
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Signals subscribers that the rendered state changed. Non-blocking and
+    /// runtime-free; called only *after* a map guard is released so the locks
+    /// never nest. A send never fails here (the sender is owned by the registry,
+    /// which outlives every receiver, and `send_modify` bumps even with no
+    /// receivers).
+    ///
+    /// Callers bump **only on a change a consumer renders** — a new or dropped
+    /// session, a [`SessionState`] transition, a best-effort field taking a new
+    /// value, or a window report that alters the [`Source`] join. Deliberately
+    /// *narrower* than "the serialized payload differs": [`SessionEntry`] carries
+    /// `last_seen` and `last_event`, which churn on every hook event, so bumping
+    /// on those would push a fresh snapshot to every window on every `PreToolUse`
+    /// with the server's snapshot diff unable to suppress any of it. Their deltas
+    /// ride the server's periodic re-sample instead — the same latency the poll
+    /// this replaced already had, for fields nothing renders.
+    pub(crate) fn bump(&self) {
+        self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Locks the sessions map, recovering from a poisoned mutex (a panic in a
@@ -380,38 +426,57 @@ impl SessionsRegistry {
     /// Best-effort fields (`cwd`/`transcript_path`/`repo`/`model`) *fill in* on
     /// an existing entry and never overwrite known data with `None`, so a later
     /// hook enriches a watcher-discovered session without a race losing data.
+    ///
+    /// [`bump`](Self::bump)s only when the sighting changed something a consumer
+    /// renders — a brand-new session, a [`SessionState`] transition, a
+    /// best-effort field taking a new value, or a reap that dropped a sibling.
+    /// A repeat sighting that merely refreshes liveness does not, since hooks
+    /// fire on every tool call (the `heartbeat` precedent in
+    /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry)).
     pub fn observe(&self, req: ObserveRequest) {
         let now = Utc::now();
-        let mut sessions = self.lock_sessions();
-        reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
-        if let Some(entry) = sessions.get_mut(&req.session_id) {
-            entry.state = SessionState::for_event(&req.event, Some(entry.state));
-            entry.last_event = req.event;
-            entry.last_seen = now;
-            fill(&mut entry.cwd, req.cwd);
-            fill(&mut entry.transcript_path, req.transcript_path);
-            fill(&mut entry.repo, req.repo);
-            fill(&mut entry.model, req.model);
-        } else {
-            if sessions.len() >= MAX_SESSIONS {
-                evict_oldest_session(&mut sessions);
-            }
-            let state = SessionState::for_event(&req.event, None);
-            sessions.insert(
-                req.session_id.clone(),
-                SessionEntry {
-                    session_id: req.session_id,
-                    cwd: req.cwd,
-                    transcript_path: req.transcript_path,
-                    repo: req.repo,
-                    model: req.model,
-                    state,
-                    source: Source::Terminal,
-                    last_event: req.event,
-                    started_at: now,
-                    last_seen: now,
-                },
-            );
+        let changed = {
+            let mut sessions = self.lock_sessions();
+            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let mutated = if let Some(entry) = sessions.get_mut(&req.session_id) {
+                let next = SessionState::for_event(&req.event, Some(entry.state));
+                let state_changed = next != entry.state;
+                entry.state = next;
+                entry.last_event = req.event;
+                entry.last_seen = now;
+                // Bound to locals rather than folded into the `||` below: every
+                // field must be filled, and short-circuiting would skip the rest.
+                let filled_cwd = fill(&mut entry.cwd, req.cwd);
+                let filled_transcript = fill(&mut entry.transcript_path, req.transcript_path);
+                let filled_repo = fill(&mut entry.repo, req.repo);
+                let filled_model = fill(&mut entry.model, req.model);
+                state_changed || filled_cwd || filled_transcript || filled_repo || filled_model
+            } else {
+                if sessions.len() >= MAX_SESSIONS {
+                    evict_oldest_session(&mut sessions);
+                }
+                let state = SessionState::for_event(&req.event, None);
+                sessions.insert(
+                    req.session_id.clone(),
+                    SessionEntry {
+                        session_id: req.session_id,
+                        cwd: req.cwd,
+                        transcript_path: req.transcript_path,
+                        repo: req.repo,
+                        model: req.model,
+                        state,
+                        source: Source::Terminal,
+                        last_event: req.event,
+                        started_at: now,
+                        last_seen: now,
+                    },
+                );
+                true
+            };
+            mutated || reaped > 0
+        };
+        if changed {
+            self.bump();
         }
     }
 
@@ -421,42 +486,75 @@ impl SessionsRegistry {
     /// duplicate/late `SessionEnd`).
     pub fn end(&self, session_id: &str, _reason: Option<&str>) -> bool {
         let now = Utc::now();
-        let mut sessions = self.lock_sessions();
-        reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
-        match sessions.get_mut(session_id) {
-            Some(entry) => {
-                entry.state = SessionState::Ended;
-                entry.last_event = SessionEvent::Stop;
-                entry.last_seen = now;
-                true
-            }
-            None => false,
+        let (known, reaped) = {
+            let mut sessions = self.lock_sessions();
+            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let known = match sessions.get_mut(session_id) {
+                Some(entry) => {
+                    entry.state = SessionState::Ended;
+                    entry.last_event = SessionEvent::Stop;
+                    entry.last_seen = now;
+                    true
+                }
+                None => false,
+            };
+            (known, reaped)
+        };
+        // A known session flipped to `ended`; an unknown one changed nothing, so
+        // only this call's inline reap could have.
+        if known || reaped > 0 {
+            self.bump();
         }
+        known
     }
 
     /// Records (upserts) a companion window-embedding report and refreshes its
     /// liveness. Reaps stale windows first, then caps like [`observe`](Self::observe).
+    ///
+    /// [`bump`](Self::bump)s only when the report changes the [`Source`] join a
+    /// consumer renders — a new window, different `folders`, or an embedding that
+    /// appeared or vanished — never on the unchanged ~10 s refresh every open
+    /// window sends, which would otherwise put a permanent push floor under the
+    /// daemon proportional to the window count.
     pub fn report_window(&self, report: WindowReport) {
         let now = Utc::now();
-        let mut windows = self.lock_windows();
-        reap_windows(&mut windows, self.window_ttl, now);
-        if !windows.contains_key(&report.key) && windows.len() >= MAX_WINDOWS {
-            evict_oldest_window(&mut windows);
+        let changed = {
+            let mut windows = self.lock_windows();
+            let reaped = reap_windows(&mut windows, self.window_ttl, now);
+            let mutated = if let Some(previous) = windows.get(&report.key) {
+                previous.report.folders != report.folders
+                    || previous.report.has_embedding() != report.has_embedding()
+            } else {
+                if windows.len() >= MAX_WINDOWS {
+                    evict_oldest_window(&mut windows);
+                }
+                true
+            };
+            windows.insert(
+                report.key.clone(),
+                WindowEntry {
+                    report,
+                    last_seen: now,
+                },
+            );
+            mutated || reaped > 0
+        };
+        if changed {
+            self.bump();
         }
-        windows.insert(
-            report.key.clone(),
-            WindowEntry {
-                report,
-                last_seen: now,
-            },
-        );
     }
 
     /// Drops a companion window-embedding report (the window closed). Returns
     /// whether an entry was present.
     pub fn unregister_window(&self, key: &str) -> bool {
-        let mut windows = self.lock_windows();
-        windows.remove(key).is_some()
+        let removed = {
+            let mut windows = self.lock_windows();
+            windows.remove(key).is_some()
+        };
+        if removed {
+            self.bump();
+        }
+        removed
     }
 
     /// Reaps stale sessions and windows, then returns the live sessions with
@@ -467,6 +565,14 @@ impl SessionsRegistry {
     /// windows snapshot, then the join runs lock-free. Path matching is a pure
     /// prefix compare (no canonicalization / disk I/O), honouring the
     /// `Mutex`-never-across-`.await` and no-I/O-under-lock invariants.
+    ///
+    /// Deliberately does **not** [`bump`](Self::bump), even when its inline reap
+    /// drops an entry: this is the body of every subscription's `snapshot()`, so
+    /// bumping here would feed the stream loop back into itself. A read-path reap
+    /// reaches other subscribers on the server's next periodic re-sample, whose
+    /// diff sees the shrunken list — the [`WorktreesRegistry::list`] arrangement.
+    ///
+    /// [`WorktreesRegistry::list`]: crate::worktrees::WorktreesRegistry::list
     pub fn list(&self) -> Vec<SessionEntry> {
         let now = Utc::now();
         let mut sessions: Vec<SessionEntry> = {
@@ -523,9 +629,16 @@ impl Default for SessionsRegistry {
 
 /// Fills `slot` from `incoming` only when `incoming` carries a value, so a
 /// best-effort field never overwrites known data with `None` on a re-`observe`.
-fn fill<T>(slot: &mut Option<T>, incoming: Option<T>) {
-    if let Some(value) = incoming {
-        *slot = Some(value);
+/// Returns whether the stored value actually changed, which is what decides
+/// whether the sighting is worth a [`bump`](SessionsRegistry::bump) — a hook
+/// re-sending the same `cwd` it sent last time is not.
+fn fill<T: PartialEq>(slot: &mut Option<T>, incoming: Option<T>) -> bool {
+    match incoming {
+        Some(value) if slot.as_ref() != Some(&value) => {
+            *slot = Some(value);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1114,5 +1227,170 @@ mod tests {
         let mut empty: HashMap<String, WindowEntry> = HashMap::new();
         evict_oldest_window(&mut empty);
         assert!(empty.is_empty());
+    }
+
+    // --- Change-notify for the push subscription (#1414) --------------------
+
+    /// A window report with one folder, parameterized by whether it embeds Claude.
+    fn window_report(key: &str, folder: &str, embedded: bool) -> WindowReport {
+        WindowReport {
+            key: key.to_string(),
+            folders: vec![PathBuf::from(folder)],
+            tabs: usize::from(embedded),
+            terminals: 0,
+        }
+    }
+
+    #[test]
+    fn subscribe_changes_starts_seen_and_a_new_session_bumps() {
+        let reg = SessionsRegistry::new();
+        let mut rx = reg.subscribe_changes();
+        // A fresh receiver has the current version already marked seen.
+        assert!(!rx.has_changed().unwrap());
+        reg.observe(observe_request("s1", SessionEvent::SessionStart, None));
+        assert!(rx.has_changed().unwrap(), "a new session should bump");
+        // Marking it seen clears the pending change.
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn observe_bumps_on_a_state_transition_but_not_on_a_repeat_sighting() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::PreToolUse,
+            Some("/tmp/a"),
+        ));
+        // Subscribe *after* the insert so its bump is already seen.
+        let mut rx = reg.subscribe_changes();
+
+        // Same event, same cwd: liveness and `last_event`/`last_seen` move, but
+        // nothing a consumer renders does. Hooks fire on every tool call, so this
+        // is the hot path that must stay quiet.
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::PreToolUse,
+            Some("/tmp/a"),
+        ));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a repeat sighting with no visible change must not bump"
+        );
+
+        // `PreToolUse` → `Stop` flips working → idle, which the tree renders.
+        reg.observe(observe_request("s1", SessionEvent::Stop, None));
+        assert!(rx.has_changed().unwrap(), "a state transition should bump");
+        rx.borrow_and_update();
+
+        // A best-effort field taking a *new* value is visible too (the tally
+        // joins sessions to worktree rows by `cwd`).
+        reg.observe(observe_request("s1", SessionEvent::Stop, Some("/tmp/b")));
+        assert!(
+            rx.has_changed().unwrap(),
+            "a newly-filled `cwd` should bump"
+        );
+    }
+
+    #[test]
+    fn end_bumps_only_for_a_known_session() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
+        let mut rx = reg.subscribe_changes();
+
+        assert!(!reg.end("ghost", None), "an unknown session is a no-op");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "ending an unknown session must not bump"
+        );
+
+        assert!(reg.end("s1", None));
+        assert!(rx.has_changed().unwrap(), "a real end should bump");
+        rx.borrow_and_update();
+    }
+
+    #[test]
+    fn window_report_bumps_only_when_it_changes_the_source_join() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(window_report("w1", "/p", true));
+        let mut rx = reg.subscribe_changes();
+
+        // The unchanged ~10s refresh every open window sends: liveness only.
+        reg.report_window(window_report("w1", "/p", true));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged window refresh must not bump"
+        );
+
+        // The window's Claude tab closed → its sessions fall back to `terminal`.
+        reg.report_window(window_report("w1", "/p", false));
+        assert!(
+            rx.has_changed().unwrap(),
+            "an embedding that vanished should bump"
+        );
+        rx.borrow_and_update();
+
+        // Different folders → a different `cwd`-prefix join.
+        reg.report_window(window_report("w1", "/q", false));
+        assert!(rx.has_changed().unwrap(), "changed folders should bump");
+        rx.borrow_and_update();
+
+        // A brand-new window joins the registry.
+        reg.report_window(window_report("w2", "/r", true));
+        assert!(rx.has_changed().unwrap(), "a new window should bump");
+    }
+
+    #[test]
+    fn unregister_window_bumps_only_when_it_removes() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(window_report("w1", "/p", true));
+        let rx = reg.subscribe_changes();
+
+        assert!(!reg.unregister_window("ghost"));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a no-op unregister must not bump"
+        );
+
+        assert!(reg.unregister_window("w1"));
+        assert!(
+            rx.has_changed().unwrap(),
+            "a removing unregister should bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_bumps_coalesces_into_one_wakeup() {
+        let reg = SessionsRegistry::new();
+        let mut rx = reg.subscribe_changes();
+        // Three visible changes back to back, all before anyone awaits.
+        reg.observe(observe_request("s1", SessionEvent::SessionStart, None));
+        reg.observe(observe_request("s2", SessionEvent::SessionStart, None));
+        reg.observe(observe_request("s3", SessionEvent::SessionStart, None));
+        // `changed()` marks the newest version seen, so the burst is one wakeup…
+        rx.changed().await.unwrap();
+        // …and there is nothing left pending for a second one.
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a burst should collapse into a single wakeup"
+        );
+    }
+
+    #[test]
+    fn list_does_not_bump_even_when_it_reaps() {
+        // `list` is the body of every subscription's `snapshot()`, so a bump here
+        // would feed the stream loop back into itself. A read-path reap reaches
+        // other subscribers on the server's next periodic re-sample instead.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
+        // Age the entry past its TTL so the next `list` reaps it.
+        {
+            let mut sessions = reg.lock_sessions();
+            let entry = sessions.get_mut("s1").unwrap();
+            entry.last_seen = Utc::now() - chrono::Duration::seconds(600);
+        }
+        let rx = reg.subscribe_changes();
+        assert!(reg.list().is_empty(), "the stale session should be reaped");
+        assert!(!rx.has_changed().unwrap(), "`list` must never bump");
     }
 }
