@@ -552,6 +552,61 @@ mod tests {
         assert!(err.to_string().contains("invalid"));
     }
 
+    // ── global arg-id collision tests (#1420) ──
+
+    /// A `global = true` arg is propagated by clap **arg id**, and the derive's
+    /// id defaults to the field name — so a subcommand-local field named `repo`
+    /// displaced the global `-C/--repo` under `worktrees register` and its
+    /// `String` was copied back up into the root matches, panicking `Cli`'s
+    /// `PathBuf` read. Renaming the local field to `repo_name` (`--repo-name`)
+    /// separates the ids; both spellings must now parse side by side.
+    #[cfg(unix)]
+    #[test]
+    fn worktrees_register_repo_name_coexists_with_global_repo() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "-C",
+            "/tmp/somerepo",
+            "worktrees",
+            "register",
+            "--key",
+            "k1",
+            "--repo-name",
+            "myrepo",
+            "--folder",
+            "/tmp",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.repo.as_deref(),
+            Some(std::path::Path::new("/tmp/somerepo"))
+        );
+        let Commands::Worktrees(worktrees::WorktreesCommand {
+            command: worktrees::WorktreesSubcommands::Register(register),
+        }) = cli.command
+        else {
+            panic!("expected a `worktrees register` invocation");
+        };
+        assert_eq!(register.key, "k1");
+        assert_eq!(register.repo_name.as_deref(), Some("myrepo"));
+
+        // The issue's exact repro, which panicked outright: the local flag with
+        // no global alongside it leaves the global unset rather than shadowed.
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "worktrees",
+            "register",
+            "--key",
+            "k1",
+            "--repo-name",
+            "myrepo",
+            "--folder",
+            "/tmp",
+        ])
+        .unwrap();
+        assert!(cli.repo.is_none());
+    }
+
     // ── propagate_global_flags() tests ──
     //
     // These tests mutate process-global env vars, so they serialise on

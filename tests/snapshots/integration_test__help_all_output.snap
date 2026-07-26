@@ -4645,13 +4645,13 @@ Register a window's open worktree folders (companion feed op)
 Usage: register [OPTIONS] --key <KEY>
 
 Options:
-      --key <KEY>      Stable per-window identity (the companion generates a per-activate UUID)
-      --folder <PATH>  A workspace-folder path (repeatable)
-      --repo <REPO>    Repository root or name, when the window has one
-      --title <TITLE>  Window title, for display
-      --pid <PID>      Reporting process id
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-  -h, --help           Print help
+      --key <KEY>         Stable per-window identity (the companion generates a per-activate UUID)
+      --folder <PATH>     A workspace-folder path (repeatable)
+      --repo-name <REPO>  Repository root or name, when the window has one
+      --title <TITLE>     Window title, for display
+      --pid <PID>         Reporting process id
+      --socket <PATH>     Control-socket path. Defaults to the per-user runtime location
+  -h, --help              Print help
 
 
 ================================================================================

@@ -1056,8 +1056,14 @@ pub struct RegisterCommand {
     #[arg(long = "folder", value_name = "PATH")]
     pub folders: Vec<PathBuf>,
     /// Repository root or name, when the window has one.
+    // Named `repo_name`, not `repo`, and so spelled `--repo-name`: clap
+    // propagates a `global = true` arg by **arg id**, and the derive's id is the
+    // field name. A local `repo` id therefore displaced the global `-C/--repo`
+    // under this subcommand and its `String` was copied back into the root
+    // matches, panicking `Cli`'s `PathBuf` read (#1420). Renaming only the long
+    // spelling would not have been enough. The wire key stays `repo`.
     #[arg(long, value_name = "REPO")]
-    pub repo: Option<String>,
+    pub repo_name: Option<String>,
     /// Window title, for display.
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
@@ -1076,7 +1082,7 @@ impl RegisterCommand {
         let payload = json!({
             "key": self.key,
             "folders": self.folders,
-            "repo": self.repo,
+            "repo": self.repo_name,
             "title": self.title,
             "pid": self.pid,
         });
@@ -2254,13 +2260,22 @@ mod tests {
     #[test]
     fn register_collects_repeated_folders() {
         let cmd = RegisterCommand::try_parse_from([
-            "register", "--key", "w1", "--folder", "/a", "--folder", "/b", "--repo", "r", "--pid",
+            "register",
+            "--key",
+            "w1",
+            "--folder",
+            "/a",
+            "--folder",
+            "/b",
+            "--repo-name",
+            "r",
+            "--pid",
             "42",
         ])
         .unwrap();
         assert_eq!(cmd.key, "w1");
         assert_eq!(cmd.folders, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
-        assert_eq!(cmd.repo.as_deref(), Some("r"));
+        assert_eq!(cmd.repo_name.as_deref(), Some("r"));
         assert_eq!(cmd.pid, Some(42));
     }
 
@@ -2592,7 +2607,7 @@ mod tests {
         RegisterCommand {
             key: "w1".to_string(),
             folders: vec![PathBuf::from("/a")],
-            repo: Some("r".to_string()),
+            repo_name: Some("r".to_string()),
             title: None,
             pid: Some(7),
             socket: Some(sock),
@@ -2764,7 +2779,7 @@ mod tests {
             command: WorktreesSubcommands::Register(RegisterCommand {
                 key: "w1".to_string(),
                 folders: vec![],
-                repo: None,
+                repo_name: None,
                 title: None,
                 pid: None,
                 socket: Some(sock),
