@@ -17,6 +17,7 @@ import {
   heartbeatEnvelope,
   mergeQueueCheckEnvelope,
   mergeQueueEnvelope,
+  reloadEnvelope,
   repositionEnvelope,
   repositionUndoEnvelope,
   openEnvelope,
@@ -224,6 +225,22 @@ test("reposition-undo envelope is payload-free", () => {
     service: "worktrees",
     op: "reposition-undo",
   });
+});
+
+test("reload envelope carries window keys, not paths", () => {
+  // Keyed by window like `reposition`, not by path like `close`: a reload acts on
+  // a window, and one tree row is one window, whereas a path can be open in
+  // several.
+  assert.deepEqual(reloadEnvelope(["a", "b"]), {
+    service: "worktrees",
+    op: "reload",
+    payload: { target_keys: ["a", "b"] },
+  });
+  // No `requester_key`: a window reloads itself directly rather than waiting a
+  // heartbeat for its own directive, so the daemon never needs to know who asked.
+  assert.equal("requester_key" in (reloadEnvelope(["a"]).payload as object), false);
+  // An empty selection is still well-formed; the daemon reports zero signalled.
+  assert.deepEqual(reloadEnvelope([]).payload, { target_keys: [] });
 });
 
 test("merge-queue envelope builders match the two-phase batched wire contract", () => {

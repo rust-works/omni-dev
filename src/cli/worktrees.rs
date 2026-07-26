@@ -53,11 +53,13 @@ pub enum WorktreesSubcommands {
     MergeQueue(MergeQueueCommand),
     /// Move and resize worktrees' open windows to match a reference window.
     Reposition(RepositionCommand),
+    /// Signal worktrees' open windows to reload themselves.
+    Reload(ReloadCommand),
     /// Show or set whether closed worktrees are shown across all windows.
     ShowClosed(ShowClosedCommand),
     /// Register a window's open worktree folders (companion feed op).
     Register(RegisterCommand),
-    /// Refresh a window's liveness and read any pending close directive.
+    /// Refresh a window's liveness and read any pending close/reload directive.
     Heartbeat(HeartbeatCommand),
     /// Remove a window's registration (companion feed op).
     Unregister(UnregisterCommand),
@@ -79,6 +81,7 @@ impl WorktreesCommand {
             WorktreesSubcommands::Rebase(cmd) => cmd.execute(repo).await,
             WorktreesSubcommands::MergeQueue(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reposition(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Reload(cmd) => cmd.execute().await,
             WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
@@ -772,10 +775,10 @@ impl RepositionCommand {
         // addresses *windows*, since geometry belongs to the OS window rather than
         // to the worktree, and only the registry knows which window that is.
         let windows = call(&socket, "list", Value::Null).await?;
-        let reference_key = window_key_for(&windows, reference)?;
+        let reference_key = window_key_for(&windows, reference, "repositioned")?;
         let mut target_keys = Vec::with_capacity(self.paths.len());
         for path in &self.paths {
-            target_keys.push(window_key_for(&windows, path)?);
+            target_keys.push(window_key_for(&windows, path, "repositioned")?);
         }
 
         let reply = call(
@@ -801,6 +804,89 @@ fn print_reposition(output: TableOrJson, reply: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Signals worktrees' open VS Code windows to reload themselves (#1417).
+///
+/// The CLI counterpart of the tree view's "Reload Window" — the batch form of
+/// `Developer: Reload Window`, which otherwise has to be run by hand in each
+/// window in turn.
+///
+/// Addresses windows by key like `reposition`, so a `list` call up front maps
+/// each folder to the key of the window that has it open. Unlike the tree view,
+/// a worktree with **no** open window is an error rather than a silent skip:
+/// there the selection is a sweep, here the user named each target explicitly.
+///
+/// The daemon only marks a directive per target; each window acts on it on its
+/// next heartbeat, up to ~10s later. Nothing here waits for that, which is why
+/// the output says how many windows were *signalled*.
+#[derive(Parser)]
+pub struct ReloadCommand {
+    /// Worktree folders whose windows to reload. Each is canonicalized
+    /// client-side, as the daemon runs in a different cwd and matches by
+    /// canonical path.
+    #[arg(value_name = "PATH", required = true)]
+    pub paths: Vec<PathBuf>,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+    /// Control-socket path. Defaults to the per-user runtime location.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl ReloadCommand {
+    /// Executes the reload command.
+    pub async fn execute(self) -> Result<()> {
+        let socket = server::resolve_socket(self.socket)?;
+        let windows = call(&socket, "list", Value::Null).await?;
+        let mut target_keys = Vec::with_capacity(self.paths.len());
+        for path in &self.paths {
+            target_keys.push(window_key_for(&windows, path, "reloaded")?);
+        }
+
+        let reply = call(&socket, "reload", json!({ "target_keys": target_keys })).await?;
+        match self.output {
+            TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&reply)?),
+            TableOrJson::Table => println!("{}", render_reload(&reply)),
+        }
+        Ok(())
+    }
+}
+
+/// Renders a `reload` reply as a one-line human summary.
+///
+/// Says "Signalled", never "Reloaded": the directive rides each window's ~10s
+/// heartbeat, so when this prints nothing has reloaded yet — and the daemon
+/// could not observe it if it had, since the window re-registers under the same
+/// key. Any key the daemon had no live window for is named rather than dropped.
+fn render_reload(reply: &Value) -> String {
+    let requested = reply.get("requested").and_then(Value::as_u64).unwrap_or(0);
+    let signalled = reply.get("signalled").and_then(Value::as_u64).unwrap_or(0);
+    let unknown: Vec<String> = reply
+        .get("unknown")
+        .and_then(Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(Value::as_str)
+                .map(sanitize)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The noun agrees with `requested`, the number it sits next to: "1 of 3
+    // windows", not "1 of 3 window".
+    let noun = if requested == 1 { "window" } else { "windows" };
+    let mut out = format!("Signalled {signalled} of {requested} {noun} to reload.");
+    if !unknown.is_empty() {
+        // A window that closed between the `list` above and the op landing. Rare
+        // but real, and never worth swallowing.
+        out.push_str(&format!(
+            "\nNo longer open, so not signalled: {}",
+            unknown.join(", ")
+        ));
+    }
+    out
+}
+
 /// Finds the registry key of the window that has `path` open.
 ///
 /// Canonicalizes client-side and compares against each window's canonicalized
@@ -808,7 +894,10 @@ fn print_reposition(output: TableOrJson, reply: &Value) -> Result<()> {
 /// window is an error rather than a silent skip: the CLI names its targets one by
 /// one, so an unmatched one is a mistake worth reporting, unlike a multi-select in
 /// the tree view where a stale row is expected.
-fn window_key_for(windows: &Value, path: &Path) -> Result<String> {
+///
+/// `verb` is the past participle of the caller's action ("repositioned",
+/// "reloaded"), so the error names what the user was actually trying to do.
+fn window_key_for(windows: &Value, path: &Path, verb: &str) -> Result<String> {
     let wanted = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve worktree path: {}", path.display()))?;
     windows
@@ -831,7 +920,7 @@ fn window_key_for(windows: &Value, path: &Path) -> Result<String> {
         .map(ToString::to_string)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no VS Code window has {} open (only open windows can be repositioned)",
+                "no VS Code window has {} open (only open windows can be {verb})",
                 wanted.display()
             )
         })
@@ -1000,8 +1089,9 @@ impl RegisterCommand {
 /// Refreshes a window's liveness and reports the daemon's reply.
 ///
 /// A companion feed op made typed: the reply carries `known` (false asks the
-/// window to re-register after a daemon restart) and, when present, `close` (a
-/// cross-window close directive).
+/// window to re-register after a daemon restart) and, when present, the
+/// cross-window directives `close` and `reload`. Both are omitted from the reply
+/// when nothing is pending, and both read as `false` here when absent.
 #[derive(Parser)]
 pub struct HeartbeatCommand {
     /// The window key to heartbeat.
@@ -1018,10 +1108,16 @@ impl HeartbeatCommand {
         let socket = server::resolve_socket(self.socket)?;
         let reply = call(&socket, "heartbeat", json!({ "key": self.key })).await?;
         let known = reply.get("known").and_then(Value::as_bool).unwrap_or(false);
-        // `close` is omitted from the reply when false; treat absent as false.
+        // Both directives are omitted from the reply when false; treat absent as
+        // false, which is also what a pre-#1417 daemon's reply reads as.
         let close = reply.get("close").and_then(Value::as_bool).unwrap_or(false);
+        let reload = reply
+            .get("reload")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         println!("known: {known}");
         println!("close: {close}");
+        println!("reload: {reload}");
         Ok(())
     }
 }
@@ -2643,6 +2739,24 @@ mod tests {
         .unwrap();
         server.await.unwrap();
 
+        // Reload: an empty path list resolves nothing, so `list` is the only
+        // request before the op.
+        let (_d, sock, server) = fake_daemon_seq(vec![
+            json!({ "ok": true, "payload": { "windows": [] } }),
+            json!({ "ok": true, "payload": { "requested": 0, "signalled": 0, "unknown": [] } }),
+        ]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Reload(ReloadCommand {
+                paths: Vec::new(),
+                output: TableOrJson::Table,
+                socket: Some(sock),
+            }),
+        }
+        .execute(None)
+        .await
+        .unwrap();
+        server.await.unwrap();
+
         // Register.
         let (_d, sock, server) =
             fake_daemon_seq(vec![json!({ "ok": true, "payload": { "ok": true } })]);
@@ -3411,7 +3525,10 @@ mod tests {
                 { "key": "wanted", "folders": [canonical.to_string_lossy()] },
             ]
         });
-        assert_eq!(window_key_for(&windows, &wt).unwrap(), "wanted");
+        assert_eq!(
+            window_key_for(&windows, &wt, "repositioned").unwrap(),
+            "wanted"
+        );
     }
 
     #[test]
@@ -3420,14 +3537,69 @@ mod tests {
         // mistake worth reporting — unlike a tree multi-select, where a stale row
         // is expected and skipped.
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        let err = window_key_for(&json!({ "windows": [] }), dir.path())
+        let err = window_key_for(&json!({ "windows": [] }), dir.path(), "repositioned")
             .expect_err("an unopened worktree must not resolve");
         assert!(err.to_string().contains("no VS Code window has"), "{err:#}");
+        // The verb names the caller's action, so the same helper serves both
+        // commands without either one's error mentioning the other.
+        let err = window_key_for(&json!({ "windows": [] }), dir.path(), "reloaded")
+            .expect_err("an unopened worktree must not resolve");
+        assert!(err.to_string().contains("can be reloaded"), "{err:#}");
         // A path that does not exist at all fails earlier, on canonicalization.
         let missing = dir.path().join("gone");
-        let err = window_key_for(&json!({ "windows": [] }), &missing)
+        let err = window_key_for(&json!({ "windows": [] }), &missing, "repositioned")
             .expect_err("a nonexistent path must not resolve");
         assert!(err.to_string().contains("cannot resolve"), "{err:#}");
+    }
+
+    #[test]
+    fn reload_command_requires_at_least_one_path() {
+        // Unlike the tree view's sweep, the CLI names each target, so an empty
+        // invocation is a mistake rather than an empty batch.
+        assert!(ReloadCommand::try_parse_from(["reload"]).is_err());
+        let cmd = ReloadCommand::try_parse_from(["reload", "/wt/a", "/wt/b"]).unwrap();
+        assert_eq!(cmd.paths.len(), 2);
+        assert!(matches!(cmd.output, TableOrJson::Table));
+        assert!(cmd.socket.is_none());
+    }
+
+    #[test]
+    fn render_reload_reports_what_was_signalled_not_reloaded() {
+        // "Signalled" is the only honest word: the directive rides each window's
+        // ~10s heartbeat, so nothing has reloaded when this prints.
+        let out = render_reload(&json!({ "requested": 2, "signalled": 2, "unknown": [] }));
+        assert_eq!(out, "Signalled 2 of 2 windows to reload.");
+        assert!(!out.contains("Reloaded"), "{out}");
+        // Singular when exactly one window was signalled.
+        let one = render_reload(&json!({ "requested": 1, "signalled": 1, "unknown": [] }));
+        assert_eq!(one, "Signalled 1 of 1 window to reload.");
+    }
+
+    #[test]
+    fn render_reload_names_windows_that_had_already_closed() {
+        // A window that closed between the `list` and the op landing is named,
+        // never silently dropped from the count.
+        let out = render_reload(&json!({
+            "requested": 3,
+            "signalled": 1,
+            "unknown": ["w2", "w3"],
+        }));
+        assert!(
+            out.starts_with("Signalled 1 of 3 windows to reload."),
+            "{out}"
+        );
+        assert!(out.contains("No longer open"), "{out}");
+        assert!(out.contains("w2, w3"), "{out}");
+    }
+
+    #[test]
+    fn render_reload_tolerates_a_reply_missing_every_field() {
+        // Forward-compatible like the other renderers: a field the daemon did not
+        // send reads as zero rather than panicking.
+        assert_eq!(
+            render_reload(&json!({})),
+            "Signalled 0 of 0 windows to reload."
+        );
     }
 
     #[test]
@@ -3631,6 +3803,123 @@ mod tests {
             reference: None,
             dry_run: false,
             undo: true,
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an `ok:false` reply must not be reported as success");
+        assert!(err.to_string().contains("unknown worktrees op"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    /// Two open worktrees plus the canned `list` reply that resolves both, so a
+    /// reload test only has to supply the op's own reply.
+    fn reload_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Value) {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let list = json!({ "ok": true, "payload": { "windows": [
+            { "key": "key-a", "folders": [std::fs::canonicalize(&a).unwrap().to_string_lossy()] },
+            { "key": "key-b", "folders": [std::fs::canonicalize(&b).unwrap().to_string_lossy()] },
+        ] } });
+        (dir, a, b, list)
+    }
+
+    #[tokio::test]
+    async fn reload_resolves_paths_to_window_keys_before_sending_the_op() {
+        let (_dir, a, b, list) = reload_fixture();
+        // Two requests: the `list` that maps paths to windows, then the op itself.
+        // `fake_daemon_seq` (not `_replies`) so the sent payloads can be asserted.
+        let (_sock_dir, sock, server) = fake_daemon_seq(vec![
+            list,
+            json!({ "ok": true, "payload": {
+                "requested": 2, "signalled": 2, "unknown": [],
+            } }),
+        ]);
+
+        ReloadCommand {
+            paths: vec![a, b],
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        // The op addresses *windows*: the daemon must receive the resolved keys,
+        // never the paths the user typed.
+        let requests = server.await.unwrap();
+        assert_eq!(requests[1]["op"], "reload");
+        assert_eq!(
+            requests[1]["payload"]["target_keys"],
+            json!(["key-a", "key-b"])
+        );
+        assert!(
+            requests[1]["payload"].get("requester_key").is_none(),
+            "a CLI process is not a window, so it must not claim to be one"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_json_output_passes_the_reply_through_verbatim() {
+        let (_dir, a, _b, list) = reload_fixture();
+        let (_sock_dir, sock, server) = fake_daemon_replies(vec![
+            list,
+            json!({ "ok": true, "payload": {
+                "requested": 1, "signalled": 0, "unknown": ["key-a"],
+            } }),
+        ]);
+        // The `-o json` arm is the machine-readable surface, so it must not go
+        // through the human renderer.
+        ReloadCommand {
+            paths: vec![a],
+            output: TableOrJson::Json,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_fails_before_the_op_when_a_target_has_no_window() {
+        let (_dir, a, b, _list) = reload_fixture();
+        // Only `a` is open, so `b` cannot be resolved and the `reload` op is never
+        // sent — which is why one canned reply suffices. Unlike the tree view's
+        // silent skip, the CLI named this target explicitly, so it is an error.
+        let (_sock_dir, sock, server) = fake_daemon_reply(json!({
+            "ok": true,
+            "payload": { "windows": [
+                { "key": "key-a", "folders": [std::fs::canonicalize(&a).unwrap().to_string_lossy()] },
+            ] },
+        }));
+        let err = ReloadCommand {
+            paths: vec![a, b],
+            output: TableOrJson::Table,
+            socket: Some(sock),
+        }
+        .execute()
+        .await
+        .expect_err("an unopened target must abort the command");
+        assert!(err.to_string().contains("can be reloaded"), "{err:#}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_surfaces_a_daemon_error() {
+        let (_dir, a, _b, list) = reload_fixture();
+        let (_sock_dir, sock, server) = fake_daemon_replies(vec![
+            list,
+            json!({ "ok": false, "error": "unknown worktrees op: reload" }),
+        ]);
+        // An older daemon that predates #1417 rejects the op; that must surface
+        // rather than read as a successful no-op.
+        let err = ReloadCommand {
+            paths: vec![a],
             output: TableOrJson::Table,
             socket: Some(sock),
         }

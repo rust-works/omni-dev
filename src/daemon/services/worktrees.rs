@@ -1287,6 +1287,53 @@ impl WorktreesService {
         }
     }
 
+    /// Handles the `reload` op (#1417): signal each target window to reload
+    /// itself, returning `{ requested, signalled, unknown }`.
+    ///
+    /// Synchronous, and deliberately so — the whole op is a set insert per key.
+    /// It marks a directive on each *currently registered* target and returns;
+    /// the window acts on it on its next `heartbeat`, up to the ~10s cadence
+    /// later. Unlike [`close`](Self::close) it never waits, because a reload has
+    /// no completion the daemon can observe (the window re-registers under the
+    /// same key), which is why the reply says `signalled`, never `reloaded`.
+    ///
+    /// A key with no live window is reported in `unknown` rather than erroring:
+    /// the batch is a sweep, and a window closing between the client rendering
+    /// its list and sending the op is routine, not a failure. `list()` reaps
+    /// stale entries on read, so a window that died without unregistering is
+    /// correctly unknown here.
+    fn reload(&self, req: ReloadRequest) -> Value {
+        let live: HashSet<String> = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+
+        let mut seen = HashSet::new();
+        let mut signalled = 0usize;
+        let mut unknown = Vec::new();
+        for key in &req.target_keys {
+            // A client repeating a key asks for one reload, not two.
+            if !seen.insert(key.as_str()) {
+                continue;
+            }
+            if live.contains(key) {
+                self.registry.mark_reload_pending(key);
+                signalled += 1;
+            } else {
+                unknown.push(key.clone());
+            }
+        }
+
+        log_reload(seen.len(), signalled, &unknown);
+        json!({
+            "requested": seen.len(),
+            "signalled": signalled,
+            "unknown": unknown,
+        })
+    }
+
     /// Handles the `merge-queue` op (#1401): batch-enqueue the eligible worktrees'
     /// PRs into the GitHub merge queue. Two-phase, keyed off `confirmed`:
     ///
@@ -1515,6 +1562,15 @@ impl DaemonService for WorktreesService {
                 if self.registry.take_close_pending(key) {
                     reply["close"] = Value::Bool(true);
                 }
+                // A pending reload directive (#1417) rides the same reply, on
+                // the same terms. Deliberately an independent `if`, not an
+                // `else`: each field then means exactly "this directive was
+                // pending", and each is taken exactly once regardless of the
+                // other. The companion resolves a both-set collision by
+                // checking `close` first, since closing subsumes reloading.
+                if self.registry.take_reload_pending(key) {
+                    reply["reload"] = Value::Bool(true);
+                }
                 Ok(reply)
             }
             "unregister" => {
@@ -1623,6 +1679,18 @@ impl DaemonService for WorktreesService {
                 let req: CloseRequest =
                     serde_json::from_value(payload).context("invalid `close` payload")?;
                 self.close(req).await
+            }
+            "reload" => {
+                // Signal each target window to reload itself (#1417). Addressed
+                // by window key like `reposition`, not by path like `close`: a
+                // reload acts on a *window*, and one tree row is one window,
+                // whereas a path can be open in several. Nothing here is
+                // destructive and nothing waits — the directive is marked and
+                // the reply says only what was *signalled*. See
+                // docs/worktrees-service.md.
+                let req: ReloadRequest =
+                    serde_json::from_value(payload).context("invalid `reload` payload")?;
+                Ok(self.reload(req))
             }
             "merge-queue" => {
                 // Batch-enqueue eligible worktrees' PRs into the GitHub merge
@@ -3208,6 +3276,44 @@ fn outcome_kinds(report: &geometry::RepositionReport) -> String {
         .join(",")
 }
 
+// --- Reload op (#1417) -------------------------------------------------------
+
+/// The `reload` op payload: reload the listed windows.
+///
+/// Keyed by **window**, like [`RepositionRequest`] and unlike [`CloseRequest`] —
+/// a reload acts on a window, and one tree row is one window, whereas a path can
+/// be open in several. There is no `requester_key`: a client that wants to
+/// reload itself does so directly rather than waiting a heartbeat for its own
+/// directive, so the daemon never needs to know who asked.
+#[derive(Debug, Clone, Deserialize)]
+struct ReloadRequest {
+    /// Registry keys of the windows to signal. An empty list is a no-op, not an
+    /// error: the callers all filter their targets first, and reporting zeros is
+    /// more useful to a batch client than a failure.
+    #[serde(default)]
+    target_keys: Vec<String>,
+}
+
+/// Emits the audit line for a `reload` op. Sync, like the `close` loggers, so it
+/// is unit-testable off the runtime. Logs counts and the unknown keys only —
+/// never a path, which this op never sees.
+fn log_reload(requested: usize, signalled: usize, unknown: &[String]) {
+    // Formatted before the macro, not inside it: a `tracing` field expression is
+    // only evaluated when a subscriber is interested, so inlining this would
+    // leave it unexecuted (and unmeasurable) in any test that installs none.
+    let unknown = if unknown.is_empty() {
+        "-".to_string()
+    } else {
+        unknown.join(",")
+    };
+    tracing::info!(
+        requested,
+        signalled,
+        unknown = %unknown,
+        "worktrees reload: signalled windows"
+    );
+}
+
 // --- Close op (#1277) --------------------------------------------------------
 
 /// The `close` op payload: close a worktree's window and (for a linked worktree)
@@ -4386,6 +4492,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown, json!({ "known": false }));
+
+        // reload signals a live window and reports one it does not know.
+        let reloaded = svc
+            .handle("reload", json!({ "target_keys": ["w1", "nope"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded,
+            json!({ "requested": 2, "signalled": 1, "unknown": ["nope"] })
+        );
+        assert!(svc.registry.take_reload_pending("w1"));
 
         // unregister removes, then repeats as a no-op success.
         let gone = svc
@@ -10015,6 +10132,170 @@ mod tests {
                 .await
                 .unwrap(),
             json!({ "known": true })
+        );
+    }
+
+    // --- Reload op (#1417) -------------------------------------------------
+
+    #[tokio::test]
+    async fn heartbeat_op_surfaces_a_pending_reload_directive_once() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        // Nothing pending → `reload` is absent, so a companion that predates
+        // #1417 sees a byte-identical reply.
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+        // Marked → the next heartbeat carries `reload: true`, exactly once.
+        svc.registry.mark_reload_pending("w1");
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true, "reload": true })
+        );
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_op_carries_both_directives_when_both_are_pending() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        // Independent `if`s, not an `else`: both fields ride the same reply and
+        // both are consumed, so neither directive can be stranded by the other.
+        // The companion resolves the collision by checking `close` first.
+        svc.registry.mark_close_pending("w1");
+        svc.registry.mark_reload_pending("w1");
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true, "close": true, "reload": true })
+        );
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_op_signals_live_windows_and_reports_unknown_keys() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        svc.handle("register", register_payload("w2", Some("r"), "/tmp/b"))
+            .await
+            .unwrap();
+
+        // A key with no live window is reported, never an error: a window
+        // closing between the client listing and sending is routine.
+        let reply = svc
+            .handle("reload", json!({ "target_keys": ["w1", "w2", "ghost"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({ "requested": 3, "signalled": 2, "unknown": ["ghost"] })
+        );
+
+        // Both live targets now have a directive waiting; the unknown one does
+        // not (the daemon must not resurrect a key it never knew).
+        assert!(svc.registry.take_reload_pending("w1"));
+        assert!(svc.registry.take_reload_pending("w2"));
+        assert!(!svc.registry.take_reload_pending("ghost"));
+    }
+
+    #[tokio::test]
+    async fn reload_op_dedupes_repeated_keys_and_accepts_an_empty_batch() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+
+        // A client repeating a key asks for one reload, not two — `requested`
+        // counts distinct targets so the client's summary cannot overstate.
+        assert_eq!(
+            svc.handle("reload", json!({ "target_keys": ["w1", "w1"] }))
+                .await
+                .unwrap(),
+            json!({ "requested": 1, "signalled": 1, "unknown": [] })
+        );
+
+        // An empty batch is a no-op success, and a missing field is an empty
+        // batch — the callers filter their targets before sending.
+        assert_eq!(
+            svc.handle("reload", json!({ "target_keys": [] }))
+                .await
+                .unwrap(),
+            json!({ "requested": 0, "signalled": 0, "unknown": [] })
+        );
+        assert_eq!(
+            svc.handle("reload", json!({})).await.unwrap(),
+            json!({ "requested": 0, "signalled": 0, "unknown": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_op_directive_reaches_the_target_on_its_next_heartbeat() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        svc.handle("register", register_payload("w2", Some("r"), "/tmp/b"))
+            .await
+            .unwrap();
+
+        // The end-to-end contract: `reload` marks, the target's own heartbeat
+        // delivers. Unlike `close`, nothing waits — the op has already returned.
+        svc.handle("reload", json!({ "target_keys": ["w2"] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w2" }))
+                .await
+                .unwrap(),
+            json!({ "known": true, "reload": true })
+        );
+        // A window that was not a target is untouched.
+        assert_eq!(
+            svc.handle("heartbeat", json!({ "key": "w1" }))
+                .await
+                .unwrap(),
+            json!({ "known": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_op_treats_an_unregistered_window_as_unknown() {
+        let svc = WorktreesService::new();
+        svc.handle("register", register_payload("w1", Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        svc.handle("unregister", json!({ "key": "w1" }))
+            .await
+            .unwrap();
+        // `list()` reaps on read, so a window that has gone away cannot be
+        // signalled — it is reported instead.
+        assert_eq!(
+            svc.handle("reload", json!({ "target_keys": ["w1"] }))
+                .await
+                .unwrap(),
+            json!({ "requested": 1, "signalled": 0, "unknown": ["w1"] })
         );
     }
 

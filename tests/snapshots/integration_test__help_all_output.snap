@@ -4523,9 +4523,10 @@ Commands:
   rebase       Rebase worktrees onto the remote default branch, fetching it once per repo
   merge-queue  Enqueue eligible worktrees' PRs into the GitHub merge queue
   reposition   Move and resize worktrees' open windows to match a reference window
+  reload       Signal worktrees' open windows to reload themselves
   show-closed  Show or set whether closed worktrees are shown across all windows
   register     Register a window's open worktree folders (companion feed op)
-  heartbeat    Refresh a window's liveness and read any pending close directive
+  heartbeat    Refresh a window's liveness and read any pending close/reload directive
   unregister   Remove a window's registration (companion feed op)
   help         Print this message or the help of the given subcommand(s)
 
@@ -4570,9 +4571,9 @@ Options:
 
 ================================================================================
 
-omni-dev worktrees heartbeat - Refresh a window's liveness and read any pending close directive
+omni-dev worktrees heartbeat - Refresh a window's liveness and read any pending close/reload directive
 
-Refresh a window's liveness and read any pending close directive
+Refresh a window's liveness and read any pending close/reload directive
 
 Usage: heartbeat [OPTIONS] --key <KEY>
 
@@ -4651,6 +4652,23 @@ Options:
       --pid <PID>      Reporting process id
       --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev worktrees reload - Signal worktrees' open windows to reload themselves
+
+Signal worktrees' open windows to reload themselves
+
+Usage: reload [OPTIONS] <PATH>...
+
+Arguments:
+  <PATH>...  Worktree folders whose windows to reload. Each is canonicalized client-side, as the daemon runs in a different cwd and matches by canonical path
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

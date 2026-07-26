@@ -46,14 +46,18 @@ window or open a worktree's folder. Two title-bar actions:
   worktrees. The setting is stored per-machine (`globalState`), so it reads the
   same in every window and survives a reload.
 
-Right-click a leaf or repo for context-menu actions: **Open Worktree**, **Close
-Window**, **Close Worktree**, **Rebase on main**, and — for a `github.com` repo —
-**Open Pull Request…** and **Open Pull Request in Browser…**.
+Right-click a leaf or repo for context-menu actions: **Open Worktree**, **Reload
+Window**, **Close Window**, **Close Worktree**, **Rebase on main**, and — for a
+`github.com` repo — **Open Pull Request…** and **Open Pull Request in Browser…**.
 
-The three worktree verbs are deliberately separate, because closing a *window* and
-deleting a *worktree* are different things:
+The four worktree verbs are deliberately separate, because reloading a *window*,
+closing a *window*, and deleting a *worktree* are different things:
 
 - **Open Worktree** — opens (or focuses) a window for each selected worktree.
+- **Reload Window** — reloads the window each selected worktree is open in (the
+  batch form of `Developer: Reload Window`). Selected worktrees with no window are
+  skipped. Nothing is confirmed and nothing is lost — VS Code's hot exit preserves
+  dirty editors.
 - **Close Window** — closes the window each selected worktree is open in, and
   **deletes nothing**. Available for any worktree that has a window, linked or
   main.
@@ -75,6 +79,11 @@ once — the view lists every window's worktrees, so the useful verbs are plural
   listing exactly what will be deleted, then progress through the targets. A main
   working tree caught up in a **Close Worktree** selection is skipped and named,
   never deleted and never quietly downgraded to a window close.
+- **Reload Window** runs as one batch with no confirmation, and reports what it
+  did — including how many selections were skipped for having no window open.
+  Windows other than this one reload on their next heartbeat, so a batch lands
+  over the following ~10 seconds rather than all at once; this window reloads
+  last, since doing so ends the extension host.
 - **Move Claude Session Here** is hidden while more than one row is selected — its
   argument is a single *destination*, so it has no multi-target meaning.
 - Selecting rows never opens them: double-click still opens a worktree, and

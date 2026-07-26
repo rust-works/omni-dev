@@ -365,6 +365,45 @@ export function repositionUndoEnvelope(): Envelope {
 }
 
 /**
+ * The `reload` op payload (#1417) — mirrors `ReloadRequest` in
+ * `src/daemon/services/worktrees.rs`.
+ *
+ * Keyed by **window**, like {@link RepositionPayload} and unlike
+ * {@link ClosePayload}: a reload acts on a window, and one tree row is one
+ * window, whereas a path can be open in several. There is no `requester_key` —
+ * a window that wants to reload itself does so directly rather than waiting a
+ * heartbeat for its own directive, so the daemon never needs to know who asked.
+ */
+export interface ReloadPayload {
+  target_keys: string[];
+}
+
+/**
+ * A `reload` reply. `signalled` is deliberately not "reloaded": the daemon marks
+ * a directive that the target picks up on its next heartbeat, and a reload has
+ * no completion the daemon can observe. `unknown` lists the keys it had no live
+ * window for — a window that closed between this client listing its targets and
+ * sending the op, which is routine rather than an error.
+ */
+export interface ReloadReply {
+  requested?: number;
+  signalled?: number;
+  unknown?: string[];
+}
+
+/**
+ * Builds a `reload` envelope: signal each target window to reload itself.
+ *
+ * Not two-phase like `close` — a reload creates, modifies and destroys nothing
+ * (VS Code's hot exit preserves dirty editors), so it follows the `reposition`
+ * precedent of firing and reporting rather than confirming first.
+ */
+export function reloadEnvelope(targetKeys: string[]): Envelope {
+  const payload: ReloadPayload = { target_keys: targetKeys };
+  return { service: WORKTREES_SERVICE, op: "reload", payload };
+}
+
+/**
  * The fields a window reports on the sessions `window` op (mirrors `WindowReport`
  * in `src/sessions.rs`) — how many Claude editor tabs / integrated terminals this
  * window has, plus its folders, so the daemon can tag a session's source as VS
