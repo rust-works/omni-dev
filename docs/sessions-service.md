@@ -114,6 +114,7 @@ best-effort:
 |---|---|
 | `SessionStart` | `starting` |
 | `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / transcript grew | `working` |
+| transcript grew — while already `waiting_for_*` or `ended` | *unchanged* |
 | `Stop` | `idle` |
 | `Notification` — permission prompt | `waiting_for_permission` |
 | `Notification` — idle/input prompt | `waiting_for_input` |
@@ -125,6 +126,25 @@ best-effort:
 `working` vs `idle` is best-effort, with the transcript-growth backstop covering
 the ~5–15s "thinking window" between a prompt and the first tool call, where no
 hook fires.
+
+That difference sets the precedence, which is why growth is the one sighting with
+exceptions: an inference never overwrites a state a hook reported directly. Claude
+flushes the assistant `tool_use` line to the transcript **before** the prompt it is
+asking about can be answered, and a session's last lines land around `SessionEnd`,
+so in both cases growth is evidence the file grew, not that a turn is running.
+Reading it as `working` would turn a waiting row green for the whole wait — exactly
+when it should be shouting — and revive an exited session as a phantom `working` row
+for the rest of the session TTL.
+
+Neither state can strand, but the release has latency worth knowing: it is the
+**next hook**, and no hook fires at the moment you answer a permission prompt (the
+prompt comes after `PreToolUse`), so the next one is the `PostToolUse` that fires
+when the approved tool *finishes*. On a hooks-only install a row therefore stays
+amber for the duration of a long approved tool — a build, a test run — which is the
+deliberate trade: a stale "blocked on you" is a nag you can see, a stale "working"
+is the alert you never got. Feed 4 has no such gap, reporting `working` off the
+`control_response` the moment the prompt is answered. Failing both,
+`Stop` / `UserPromptSubmit` / `SessionEnd` or the TTL releases it.
 
 Feed 4 is the exception: it reads the state out of Claude's own stream rather
 than guessing from a lifecycle event, so it wins outright over anything inferred
