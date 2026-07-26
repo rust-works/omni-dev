@@ -3298,10 +3298,18 @@ struct ReloadRequest {
 /// is unit-testable off the runtime. Logs counts and the unknown keys only —
 /// never a path, which this op never sees.
 fn log_reload(requested: usize, signalled: usize, unknown: &[String]) {
+    // Formatted before the macro, not inside it: a `tracing` field expression is
+    // only evaluated when a subscriber is interested, so inlining this would
+    // leave it unexecuted (and unmeasurable) in any test that installs none.
+    let unknown = if unknown.is_empty() {
+        "-".to_string()
+    } else {
+        unknown.join(",")
+    };
     tracing::info!(
         requested,
         signalled,
-        unknown = %if unknown.is_empty() { "-".to_string() } else { unknown.join(",") },
+        unknown = %unknown,
         "worktrees reload: signalled windows"
     );
 }
