@@ -42,6 +42,8 @@ import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { rebaseOnMain } from "./rebaseCommand";
+import { RowColorMap } from "./icons";
+import { clearAllRowColors, setRowColor } from "./rowColorCommand";
 import {
   AheadBehindMap,
   Node,
@@ -179,6 +181,34 @@ function showPullRequests(): boolean {
 /** Whether to show each worktree's Claude session cue (#1406). */
 function showClaudeSessions(): boolean {
   return config().get<boolean>("showClaudeSessions") ?? true;
+}
+
+/**
+ * The per-row icon colour tags (#1428), keyed by `nodeId`.
+ *
+ * Read from the **user scope** specifically, not the merged `get()` view: the same value
+ * is written back on every edit, and writing the merged view would bake a default (or
+ * some future lower-scope value) into the user's `settings.json`. The setting is
+ * declared `"scope": "application"` so user scope is the only one it can occupy anyway
+ * — this keeps that true rather than assuming it. Content is validated per-lookup by
+ * `rowColorTag`, since a hand-edited settings file can hold anything.
+ */
+function rowColors(): RowColorMap {
+  return config().inspect<RowColorMap>("rowColors")?.globalValue ?? {};
+}
+
+/**
+ * Persists the row colour tags, or removes the key entirely when the map is empty so
+ * clearing the last colour does not leave `"omniDevWorktrees.rowColors": {}` behind.
+ *
+ * `Global` is mandatory, not merely preferred: an `application`-scoped setting rejects a
+ * workspace-target write. It is also the point — the tree spans every repo across every
+ * window, so a workspace-scoped map would apply only in whichever window happened to
+ * have that folder open.
+ */
+async function writeRowColors(colors: RowColorMap): Promise<void> {
+  const value = Object.keys(colors).length === 0 ? undefined : colors;
+  await config().update("rowColors", value, vscode.ConfigurationTarget.Global);
 }
 
 /**
@@ -543,6 +573,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // Seed the PR-master context key + icon-colour flag from the current setting
   // (#1376), so the per-repo toggle menu and green icons reflect it from frame one.
   applyShowPullRequests();
+  // Likewise the per-row colour tags (#1428), so tagged rows render tagged from the
+  // first frame rather than only after the setting is next edited.
+  applyRowColors();
   // Window repositioning is macOS-only for now (ADR-0058), so hide its menu item
   // elsewhere rather than offering an action that can only report "unsupported".
   void vscode.commands.executeCommand(
@@ -689,6 +722,19 @@ function setupTreeView(context: vscode.ExtensionContext): void {
         );
       },
     ),
+    // Row colour tags (#1428). `read`/`write` are injected so `ConfigurationTarget` and
+    // the settings key stay in this file and the command module stays a thin adapter.
+    // Nothing is applied here: the write echoes back through `onDidChangeConfiguration`,
+    // which is the single place the provider is updated, in this window and every other.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.setRowColor",
+      (node?: Node, selected?: Node[]) =>
+        void setRowColor({ read: rowColors, write: writeRowColors }, node, selected),
+    ),
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.clearAllRowColors",
+      () => void clearAllRowColors({ read: rowColors, write: writeRowColors }),
+    ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openPullRequest",
       (node?: Node, selected?: Node[]) => void openPullRequest(node, selected, repoOpenPrs),
@@ -760,6 +806,15 @@ function setupTreeView(context: vscode.ExtensionContext): void {
         applyShowPullRequests();
         void refreshTree();
       }
+      // The per-row colour tags (#1428). This arm is the *only* place they are applied
+      // — never optimistically at write time — because user-scope settings changes echo
+      // back to the writing window too, so applying in both places would refresh it
+      // twice. Deliberately no `refreshTree()`: a colour is client-side presentation and
+      // needs no daemon round-trip, and the provider's own no-op guard keeps an
+      // unrelated repaint from re-triggering the lazy ahead/behind and PR fetches.
+      if (e.affectsConfiguration(`${CONFIG_SECTION}.rowColors`)) {
+        applyRowColors();
+      }
       // Flipping the Claude cue on repopulates it now; flipping it off has to
       // clear what is already rendered, since the cue feed simply stops (#1406).
       if (e.affectsConfiguration(`${CONFIG_SECTION}.showClaudeSessions`)) {
@@ -817,6 +872,18 @@ function applyShowPullRequests(): void {
   const on = showPullRequests();
   void vscode.commands.executeCommand("setContext", SHOW_PR_KEY, on);
   provider?.setShowPullRequests(on);
+}
+
+/**
+ * Applies the per-row icon colour tags to this window's tree (#1428).
+ *
+ * Purely local: unlike the show/hide-closed toggle and the per-repo poll flag, the tags
+ * never reach the daemon. They still sync across windows, because user-scope settings
+ * changes fire `onDidChangeConfiguration` in every one of them — the cross-window event
+ * `context.globalState` lacks, which is what #1301 needed the daemon for.
+ */
+function applyRowColors(): void {
+  provider?.setRowColors(rowColors());
 }
 
 /**
