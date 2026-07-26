@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
+use crate::git::worktree_rebase::{self, Selection};
 use crate::github_rate_limit::{
     resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
 };
@@ -535,6 +536,18 @@ pub struct WorktreesService {
     /// **own** `std::Mutex`, taken independently of the registry's (neither nests)
     /// and never held across an `.await`.
     reposition_undo: Mutex<Vec<(String, geometry::Frame)>>,
+    /// Serializes the `rebase` op's phase-2 execute across concurrent requests
+    /// (#1415) — the [`prune_lock`](Self::prune_lock) precedent, one op over.
+    ///
+    /// Within a batch the engine already rebases sequentially, on purpose: linked
+    /// worktrees share one object database, and `git rebase` writes refs and
+    /// packs into it. Two *concurrent requests* would defeat that, so the lock
+    /// restores it globally. It also means a second click cannot start a rebase of
+    /// a worktree the first is still mid-way through — the `operation`-in-progress
+    /// classifier only sees state that is already on disk.
+    ///
+    /// A `tokio` mutex, since it is held across the `spawn_blocking` join.
+    rebase_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorktreesService {
@@ -561,6 +574,7 @@ impl WorktreesService {
             pr_warm_start: Mutex::new(None),
             open_pr_cache: Arc::new(OpenPrCache::new(open_pr_ttl())),
             reposition_undo: Mutex::new(Vec::new()),
+            rebase_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1398,6 +1412,97 @@ impl WorktreesService {
         .unwrap_or_else(|_| json!({})))
     }
 
+    /// Handles the `rebase` op (#1415): batch-rebase the selected worktrees onto
+    /// their repository's remote default branch, fetching it **once per
+    /// repository**. Two-phase, keyed off `confirmed`, exactly like `merge-queue`:
+    ///
+    /// - **Phase 1** (`check:true`, or any un-`confirmed` request) — run
+    ///   [`worktree_rebase::plan`], which fetches once per repo and classifies
+    ///   every selected worktree. This *is* the "only rebase if it makes sense
+    ///   from the current git state" gate: the classifier skips the main working
+    ///   tree, a detached HEAD, a dirty tree, an operation already in progress, a
+    ///   non-worktree path, an unresolvable onto ref, and anything already up to
+    ///   date. Side-effect-free apart from the fetch, which only advances a
+    ///   remote-tracking ref.
+    /// - **Phase 2** (`confirmed:true`) — **re-plan from scratch** (never trust a
+    ///   phase-1 result the client sent back, as `close` and `merge-queue` do),
+    ///   then execute. A worktree that went dirty between the phases is skipped
+    ///   rather than rebased.
+    ///
+    /// **Why the daemon may do this at all** (ADR-0059): ADR-0055 confined the
+    /// rebase to the CLI on the premise that the daemon could not authenticate a
+    /// fetch. It can — launchd exports `SSH_AUTH_SOCK` into the per-user session,
+    /// so the daemon inherits the user's `ssh-agent`. The real gap was the minimal
+    /// `PATH`, closed by [`crate::git::resolve_git_binary`].
+    ///
+    /// All git I/O runs on a blocking thread, never the async worker and never
+    /// under the registry lock.
+    async fn rebase(&self, req: RebaseRequest) -> Result<Value> {
+        // Resolved once here (the probe is process-stable), then handed to the
+        // seam below — the `merge_queue_with` "bin as a param" pattern, so a test
+        // drives both phases against a stub without touching the environment.
+        self.rebase_with(req, crate::git::resolve_git_binary())
+            .await
+    }
+
+    /// [`rebase`](Self::rebase) with an explicit `git` binary, so a test exercises
+    /// the plan and execute paths against a stub.
+    async fn rebase_with(&self, req: RebaseRequest, git_bin: PathBuf) -> Result<Value> {
+        if req.paths.is_empty() {
+            bail!("`rebase` requires at least one path");
+        }
+        // Report-only unless explicitly confirmed; an explicit `check` request
+        // always reports and never rebases.
+        let report_only = req.check || !req.confirmed;
+        let opts = req.options(git_bin);
+        let selection = Selection::Paths(req.paths.clone());
+
+        if report_only {
+            // Phase 1: fetch once per repo and classify, rebase nothing. No lock —
+            // it mutates no worktree, and a plan is allowed to race an execute.
+            let plan = plan_rebase(&selection, &opts).await?;
+            // Auditable in `omni-dev daemon logs` (ADR-0049 §6 precedent).
+            log_rebase_check(&req, &plan);
+            return Ok(rebase_reply(&plan.fetches, &plan.worktrees));
+        }
+
+        // Phase 2: re-plan and execute, serialized against other executes —
+        // linked worktrees share one object database (see `rebase_lock`).
+        //
+        // The lock is taken **before** the re-plan, not merely around the execute,
+        // and that ordering is load-bearing. A plan taken outside it can be
+        // invalidated by a concurrent execute before this one gets its turn — and
+        // acting on a stale plan is not benign: if the other run left a worktree
+        // mid-rebase, a stale `WouldRebase` here would run `git rebase` against a
+        // repository that is already mid-rebase and (without `keep_conflicts`)
+        // `--abort` it, destroying exactly the conflict resolution the other run
+        // was preserving. Planning under the lock means the classifier sees that
+        // worktree's real state and skips it as `operation-in-progress`.
+        let _guard = self.rebase_lock.lock().await;
+        let plan = plan_rebase(&selection, &opts).await?;
+        // The worktrees actually about to be rewritten, canonicalized here (disk
+        // I/O belongs in the adapter, not the registry) so they match the tree
+        // snapshot's own keys.
+        let pending: Vec<PathBuf> = plan
+            .worktrees
+            .iter()
+            .filter(|w| matches!(w.result, worktree_rebase::RebaseResult::WouldRebase { .. }))
+            .map(|w| canonical(&w.path))
+            .collect();
+        self.registry.mark_rebasing(&pending);
+        let fetches = plan.fetches.clone();
+        let exec_opts = opts.clone();
+        let outcomes =
+            tokio::task::spawn_blocking(move || worktree_rebase::execute(plan, &exec_opts)).await;
+        // Cleared on **every** exit, including a panicked task, so a failed rebase
+        // can never leave a permanent spinner on a tree row.
+        self.registry.clear_rebasing(&pending);
+        let outcomes = outcomes.map_err(|e| anyhow!("rebase task panicked: {e}"))?;
+
+        log_rebase_execute(&req, &outcomes);
+        Ok(rebase_reply(&fetches, &outcomes))
+    }
+
     /// Handles the `reposition` op (#1407): move and resize each target worktree's
     /// **already-open** VS Code window to match the invoking window's geometry.
     ///
@@ -1703,6 +1808,19 @@ impl DaemonService for WorktreesService {
                     serde_json::from_value(payload).context("invalid `merge-queue` payload")?;
                 self.merge_queue(req).await
             }
+            "rebase" => {
+                // Batch-rebase the selected worktrees onto their repo's remote
+                // default branch, fetching once per repo (#1415). Two-phase like
+                // `close`/`merge-queue` (side-effect-free plan → confirmed
+                // execute) and daemon-re-validated. The fetch authenticates
+                // through the user's own `ssh-agent`, which launchd exports into
+                // the daemon's environment — the premise ADR-0055 got wrong. All
+                // git work runs on a blocking thread. See ADR-0059, ADR-0055 and
+                // docs/worktrees-service.md.
+                let req: RebaseRequest =
+                    serde_json::from_value(payload).context("invalid `rebase` payload")?;
+                self.rebase(req).await
+            }
             "reposition" => {
                 // Move each target's already-open VS Code window onto the invoking
                 // window's geometry (#1407). The one op that reaches outside the
@@ -1881,6 +1999,23 @@ struct GitStatus {
     /// repository's main working tree. Omitted (false) for a normal checkout.
     #[serde(skip_serializing_if = "is_false")]
     is_worktree: bool,
+    /// The multi-step git operation the worktree is in the middle of (#1415):
+    /// `rebase`, `rebase-interactive`, `merge`, `cherry-pick`, `revert`, `bisect`
+    /// or `apply-mailbox`. `None` for a clean worktree (the overwhelming case), so
+    /// the field is omitted on the wire and an older client is byte-identical.
+    ///
+    /// This is the **durable** half of the tree's rebase cue: read fresh off disk
+    /// on every snapshot, it survives a daemon restart and keeps showing a
+    /// conflict the `rebase` op left in place until the user resolves it. The
+    /// transient half — "the daemon is rebasing this right now" — comes from the
+    /// registry's in-memory set instead (see [`TreeWorktree::rebasing`]).
+    ///
+    /// Cheap enough for the every-worktree-every-tick snapshot (#1306's bar):
+    /// `Repository::state()` stats a handful of paths under `.git`, which is
+    /// nothing beside the `Repository::discover` this function already does — and
+    /// unlike `graph_ahead_behind` it is neither a revwalk nor an object lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
 }
 
 /// `skip_serializing_if` predicate for a `bool` defaulting to `false`, so the
@@ -2219,9 +2354,13 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
     };
     // Repo identity applies even when HEAD is unborn or detached, so a worktree
     // still names its parent repo (and is flagged as a worktree) in those states.
+    // The in-progress operation is read here too, for the same reason: a worktree
+    // mid-rebase has a *detached* HEAD, so reading it any later would miss the one
+    // state the cue exists to show.
     let base = GitStatus {
         main_repo: main_repo_name(repo.commondir()),
         is_worktree: repo.is_worktree(),
+        operation: operation_slug(repo.state()),
         ..GitStatus::default()
     };
     let Ok(head) = repo.head() else {
@@ -2273,6 +2412,30 @@ fn git_status_impl(folder: &Path, with_ahead_behind: bool) -> GitStatus {
         behind,
         ..base
     }
+}
+
+/// The stable kebab-case slug for a repository's in-progress operation, or `None`
+/// when it is [`RepositoryState::Clean`] (#1415).
+///
+/// The three rebase flavours libgit2 distinguishes (`Rebase`, `RebaseInteractive`,
+/// `RebaseMerge`) all collapse to `rebase-interactive` or `rebase`, because the
+/// distinction is an implementation detail of how git is driving the rebase and
+/// says nothing a user acting on the row would do differently. The `*Sequence`
+/// variants likewise fold into their singular form. Everything a client does not
+/// recognise still renders as "some operation in progress", which is the useful
+/// floor.
+fn operation_slug(state: RepositoryState) -> Option<String> {
+    let slug = match state {
+        RepositoryState::Clean => return None,
+        RepositoryState::Merge => "merge",
+        RepositoryState::Revert | RepositoryState::RevertSequence => "revert",
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => "cherry-pick",
+        RepositoryState::Bisect => "bisect",
+        RepositoryState::Rebase | RepositoryState::RebaseMerge => "rebase",
+        RepositoryState::RebaseInteractive => "rebase-interactive",
+        RepositoryState::ApplyMailbox | RepositoryState::ApplyMailboxOrRebase => "apply-mailbox",
+    };
+    Some(slug.to_string())
 }
 
 /// The commit `branch`'s configured upstream ref points at, or `None` when it
@@ -2446,6 +2609,22 @@ struct TreeWorktree {
     /// daemon has already answered for.
     #[serde(skip_serializing_if = "is_false")]
     pr_none: bool,
+    /// The multi-step git operation this worktree is mid-way through, when any
+    /// (#1415) — see [`GitStatus::operation`]. The **durable** half of the rebase
+    /// cue: a conflict the `rebase` op left in place shows here until it is
+    /// resolved, across daemon restarts. Omitted for a clean worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
+    /// Whether the daemon is rebasing this worktree **right now** (#1415) — the
+    /// **transient** half of the cue, from the registry's in-memory set.
+    ///
+    /// Not redundant with `operation`: a rebase that applies cleanly never leaves
+    /// an on-disk state for `operation` to report, and even one that conflicts
+    /// only writes it at the moment of collision — so without this a multi-second
+    /// rebase would render as nothing happening at all. Omitted (false) for the
+    /// common case, keeping an older client byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    rebasing: bool,
 }
 
 /// One repository (with **all** its worktrees) in the `tree` payload. Repos are
@@ -2559,9 +2738,11 @@ fn worktree_entry(
     path: &Path,
     is_main: bool,
     open_index: &HashMap<PathBuf, String>,
+    rebasing: &HashSet<PathBuf>,
 ) -> TreeWorktree {
     let status = git_status_cheap(path);
-    let window_key = open_index.get(&canonical(path)).cloned();
+    let canonical = canonical(path);
+    let window_key = open_index.get(&canonical).cloned();
     TreeWorktree {
         path: path.display().to_string(),
         branch: status.branch,
@@ -2574,6 +2755,10 @@ fn worktree_entry(
         // identity — known one level up, in `repo_tree`.
         pr: None,
         pr_none: false,
+        operation: status.operation,
+        // Both halves of the rebase cue are joined on the *canonical* path: the
+        // registry set is canonicalized by the adapter when the op marks it.
+        rebasing: rebasing.contains(&canonical),
     }
 }
 
@@ -2647,7 +2832,11 @@ fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
 /// shared common dir's parent so the main working tree and every linked worktree
 /// are enumerated regardless of which one seeded the discovery. `None` for a
 /// bare or otherwise root-less repo (no working tree to show).
-fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> Option<TreeRepo> {
+fn repo_tree(
+    discovered: &Repository,
+    open_index: &HashMap<PathBuf, String>,
+    rebasing: &HashSet<PathBuf>,
+) -> Option<TreeRepo> {
     // The common dir (`…/<root>/.git`) is shared by the main checkout and all
     // linked worktrees; its parent is the main working tree.
     let commondir = canonical(discovered.commondir());
@@ -2655,7 +2844,7 @@ fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> 
     let main_repo = Repository::open(&main_root).ok()?;
 
     // Main working tree first.
-    let mut worktrees = vec![worktree_entry(&main_root, true, open_index)];
+    let mut worktrees = vec![worktree_entry(&main_root, true, open_index, rebasing)];
     // Then every linked worktree, sorted by path for deterministic output. The
     // `StringArray` of names is bound so `iter()` can borrow it (only
     // `&StringArray` is `IntoIterator`); a name that no longer resolves to a
@@ -2673,7 +2862,7 @@ fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> 
     worktrees.extend(
         linked
             .iter()
-            .map(|path| worktree_entry(path, false, open_index)),
+            .map(|path| worktree_entry(path, false, open_index, rebasing)),
     );
 
     Some(TreeRepo {
@@ -2692,7 +2881,11 @@ fn repo_tree(discovered: &Repository, open_index: &HashMap<PathBuf, String>) -> 
 /// repo's worktrees) via a `BTreeMap` for deterministic ordering; a folder that
 /// is not in a git repo is skipped. Pure blocking git I/O — call it via
 /// [`tree_repos`], never under the registry lock.
-fn build_tree(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<TreeRepo> {
+fn build_tree(
+    folders: Vec<PathBuf>,
+    windows: Vec<WindowEntry>,
+    rebasing: HashSet<PathBuf>,
+) -> Vec<TreeRepo> {
     let open_index = open_window_index(&windows);
     let mut repos: BTreeMap<PathBuf, TreeRepo> = BTreeMap::new();
     for folder in &folders {
@@ -2703,7 +2896,7 @@ fn build_tree(folders: Vec<PathBuf>, windows: Vec<WindowEntry>) -> Vec<TreeRepo>
         if repos.contains_key(&key) {
             continue;
         }
-        if let Some(tree) = repo_tree(&repo, &open_index) {
+        if let Some(tree) = repo_tree(&repo, &open_index, &rebasing) {
             repos.insert(key, tree);
         }
     }
@@ -2719,9 +2912,10 @@ async fn tree_repos(
     windows: Vec<WindowEntry>,
     pr_cache: Arc<PrStatusCache>,
     enabled_polling: HashSet<String>,
+    rebasing: HashSet<PathBuf>,
 ) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
-        let mut repos = build_tree(folders, windows);
+        let mut repos = build_tree(folders, windows, rebasing);
         // Stamp per-repo poll state first so `fold_pr_badges` can skip a
         // not-polled repo — a disabled repo carries neither the flag nor a badge.
         stamp_polling(&mut repos, &enabled_polling);
@@ -2944,8 +3138,11 @@ async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache
     let windows = registry.list();
     let show_closed = registry.show_closed();
     let enabled_polling = registry.enabled_polling_repos();
+    // The transient half of the rebase cue (#1415), read here with the other cheap
+    // registry locks so the git work below deals only in plain data.
+    let rebasing = registry.rebasing_paths();
     json!({
-        "repos": tree_repos(folders, windows, pr_cache, enabled_polling).await,
+        "repos": tree_repos(folders, windows, pr_cache, enabled_polling, rebasing).await,
         "show_closed": show_closed,
     })
 }
@@ -3526,6 +3723,138 @@ struct GitSafety {
     removable: bool,
     risks: Vec<Note>,
     info: Vec<Note>,
+}
+
+// --- Rebase op (#1415) -------------------------------------------------------
+
+/// The `rebase` op payload: batch-rebase worktrees onto their repository's remote
+/// default branch. Two-phase like [`MergeQueueRequest`], keyed off `confirmed`,
+/// and likewise a **single batched** op over `paths` — which is what buys the
+/// fetch-once-per-repository contract (ADR-0055 §2), since the engine can only
+/// group by repository if it sees the whole selection at once.
+#[derive(Debug, Clone, Deserialize)]
+struct RebaseRequest {
+    /// Absolute paths of the selected worktree folders.
+    paths: Vec<PathBuf>,
+    /// The requesting window's key — carried for the audit line, as `close` and
+    /// `merge-queue` carry theirs.
+    #[serde(default)]
+    requester_key: Option<String>,
+    /// Phase 1: plan and report only, never rebase.
+    #[serde(default)]
+    check: bool,
+    /// Phase 2: rebase the (re-validated) pending worktrees.
+    #[serde(default)]
+    confirmed: bool,
+    /// Leave a conflicting worktree mid-rebase instead of aborting it. The tree
+    /// view sends `true` — resolving a conflict in place is the point of #1415 —
+    /// but it stays a client choice, and defaults to the engine's conservative
+    /// abort so an older or scripted client gets the pre-#1415 behaviour.
+    #[serde(default)]
+    keep_conflicts: bool,
+    /// Stash uncommitted changes around each rebase rather than skipping a dirty
+    /// worktree. Not surfaced by the tree view; here so a socket client can ask.
+    #[serde(default)]
+    autostash: bool,
+    /// Rebase onto this ref instead of the remote default branch.
+    #[serde(default)]
+    onto: Option<String>,
+}
+
+impl RebaseRequest {
+    /// The engine options this request selects, with `git` already resolved.
+    fn options(&self, git_bin: PathBuf) -> worktree_rebase::RebaseOptions {
+        worktree_rebase::RebaseOptions {
+            onto: self.onto.clone(),
+            autostash: self.autostash,
+            // The daemon never uses the engine's own dry-run flag: phase 1 *is*
+            // the dry run, and it is `plan` (never `execute`) that runs for it.
+            dry_run: false,
+            keep_conflicts: self.keep_conflicts,
+            git_bin: Some(git_bin),
+        }
+    }
+}
+
+/// Runs [`worktree_rebase::plan`] on a blocking thread: it shells out to
+/// `git fetch` once per repository and walks each worktree's object database, so
+/// it must never run on an async worker.
+async fn plan_rebase(
+    selection: &Selection,
+    opts: &worktree_rebase::RebaseOptions,
+) -> Result<worktree_rebase::Plan> {
+    let selection = selection.clone();
+    let opts = opts.clone();
+    tokio::task::spawn_blocking(move || worktree_rebase::plan(&selection, &opts))
+        .await
+        .map_err(|e| anyhow!("rebase planning task panicked: {e}"))
+        .and_then(|inner| inner)
+}
+
+/// Builds a `rebase` reply. Both phases share one shape — the per-repo fetch
+/// outcomes and the per-worktree results — because phase 1's report and phase 2's
+/// result differ only in which [`RebaseResult`](worktree_rebase::RebaseResult)
+/// variants appear, and a client that can render one can render the other.
+fn rebase_reply(
+    fetches: &[worktree_rebase::FetchOutcome],
+    worktrees: &[worktree_rebase::WorktreeOutcome],
+) -> Value {
+    json!({ "fetches": fetches, "worktrees": worktrees })
+}
+
+/// Emits the phase-1 audit line for a `rebase` plan (ADR-0049 §6's precedent, as
+/// applied by [`log_merge_check`]): who asked, how many worktrees were named, and
+/// how many the classifier found actually pending.
+fn log_rebase_check(req: &RebaseRequest, plan: &worktree_rebase::Plan) {
+    let pending = plan
+        .worktrees
+        .iter()
+        .filter(|w| matches!(w.result, worktree_rebase::RebaseResult::WouldRebase { .. }))
+        .count();
+    let failed_fetches = plan.fetches.iter().filter(|f| !f.ok).count();
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        requested = req.paths.len(),
+        pending,
+        fetches = plan.fetches.len(),
+        failed_fetches,
+        "rebase check"
+    );
+}
+
+/// Emits the phase-2 audit line for a `rebase` execute: the history-rewriting
+/// outcome, counted by kind. A left-in-place conflict is counted separately from
+/// an aborted one — it is the case that leaves a worktree needing the user.
+fn log_rebase_execute(req: &RebaseRequest, outcomes: &[worktree_rebase::WorktreeOutcome]) {
+    use worktree_rebase::RebaseResult;
+    let mut rebased = 0;
+    let mut conflicts = 0;
+    let mut left_in_place = 0;
+    let mut skipped = 0;
+    for outcome in outcomes {
+        match &outcome.result {
+            RebaseResult::Rebased { .. } => rebased += 1,
+            RebaseResult::Conflict {
+                left_in_place: k, ..
+            } => {
+                conflicts += 1;
+                if *k {
+                    left_in_place += 1;
+                }
+            }
+            RebaseResult::Skipped { .. } | RebaseResult::FetchFailed { .. } => skipped += 1,
+            RebaseResult::UpToDate | RebaseResult::WouldRebase { .. } => {}
+        }
+    }
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        requested = req.paths.len(),
+        rebased,
+        conflicts,
+        left_in_place,
+        skipped,
+        "rebase execute"
+    );
 }
 
 // --- Merge-queue op (#1401) --------------------------------------------------
@@ -9244,6 +9573,363 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
         logs
+    }
+
+    // ── rebase op (#1415) ──────────────────────────────────────────────────
+
+    /// A `RebaseRequest` over `paths` with everything else defaulted.
+    fn rebase_req(paths: Vec<PathBuf>) -> RebaseRequest {
+        RebaseRequest {
+            paths,
+            requester_key: None,
+            check: false,
+            confirmed: false,
+            keep_conflicts: false,
+            autostash: false,
+            onto: None,
+        }
+    }
+
+    /// A repo whose `main` has advanced one commit past a linked `feature`
+    /// worktree, returning `(repo dir, worktree parent dir, worktree path)`.
+    ///
+    /// Deliberately **no remote**: the daemon tests drive the op with a *local*
+    /// `--onto` (`main`), which the engine resolves with no fetch at all. That
+    /// keeps them offline and fast — the fetch-once-per-repo path is the engine's
+    /// own concern and is covered in `worktree_rebase.rs`.
+    fn behind_worktree() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        let base = commit_file(&repo, "refs/heads/main", "f.txt", b"base\n", "base");
+        repo.set_head("refs/heads/main").unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree(&repo, base, &wt_path, "feature");
+        // `main` moves on; `feature` stays at `base`, so it is 1 behind.
+        commit_file(&repo, "refs/heads/main", "g.txt", b"ahead\n", "ahead");
+        (main_dir, wt_parent, wt_path)
+    }
+
+    #[tokio::test]
+    async fn rebase_with_refuses_an_empty_selection() {
+        // A bare `rebase` must be a usage error, never a silent mass-rebase.
+        let svc = WorktreesService::new();
+        let err = svc
+            .rebase_with(rebase_req(Vec::new()), PathBuf::from("git"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one path"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebase_with_phase_one_reports_without_rebasing() {
+        let (_main, _parent, wt) = behind_worktree();
+        let before = Repository::open(&wt).unwrap().head().unwrap().target();
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .rebase_with(
+                RebaseRequest {
+                    check: true,
+                    onto: Some("main".into()),
+                    ..rebase_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(worktrees.len(), 1, "{reply}");
+        assert_eq!(
+            worktrees[0].get("status").and_then(Value::as_str),
+            Some("would-rebase"),
+            "{reply}"
+        );
+        // A local onto ref means no fetch was attempted at all.
+        let fetches = reply.get("fetches").and_then(Value::as_array).unwrap();
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(
+            fetches[0].get("fetched").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            Repository::open(&wt).unwrap().head().unwrap().target(),
+            before,
+            "phase 1 must not move the branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_with_phase_two_rebases_and_clears_the_rebasing_mark() {
+        let (_main, _parent, wt) = behind_worktree();
+        let svc = WorktreesService::new();
+        let reply = svc
+            .rebase_with(
+                RebaseRequest {
+                    confirmed: true,
+                    onto: Some("main".into()),
+                    ..rebase_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            worktrees[0].get("status").and_then(Value::as_str),
+            Some("rebased"),
+            "{reply}"
+        );
+        // The transient cue is cleared on the way out, so no row keeps spinning.
+        assert!(
+            svc.registry.rebasing_paths().is_empty(),
+            "the rebasing mark must be cleared after the execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_with_phase_two_reclassifies_rather_than_trusting_the_client() {
+        // The re-validation that makes two-phase meaningful: a `confirmed` request
+        // still runs the classifier, so a worktree that is dirty *now* is skipped
+        // rather than rebased on the strength of an earlier phase-1 verdict.
+        let (_main, _parent, wt) = behind_worktree();
+        std::fs::write(wt.join("f.txt"), "local edit\n").unwrap();
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .rebase_with(
+                RebaseRequest {
+                    confirmed: true,
+                    onto: Some("main".into()),
+                    ..rebase_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            worktrees[0].get("status").and_then(Value::as_str),
+            Some("skipped"),
+            "{reply}"
+        );
+        assert_eq!(
+            worktrees[0].get("reason").and_then(Value::as_str),
+            Some("dirty"),
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_with_never_disturbs_a_worktree_already_mid_rebase() {
+        // The hazard the plan-under-the-lock ordering exists to prevent: if another
+        // run has left a worktree mid-rebase, this one must classify it as
+        // `operation-in-progress` and leave it alone — never run `git rebase`
+        // against it, which (without `keep_conflicts`) would `--abort` and destroy
+        // the conflict resolution in progress.
+        let (_main, _parent, wt) = behind_worktree();
+        // Fake a rebase in progress the way git does: the state directory's
+        // presence is what `Repository::state()` keys on.
+        std::fs::create_dir_all(wt.join(".git")).ok();
+        let git_dir = Repository::open(&wt).unwrap().path().to_path_buf();
+        std::fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+        std::fs::write(git_dir.join("rebase-merge").join("interactive"), "").unwrap();
+        assert_ne!(
+            Repository::open(&wt).unwrap().state(),
+            RepositoryState::Clean,
+            "precondition: the worktree looks mid-rebase to git2"
+        );
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .rebase_with(
+                RebaseRequest {
+                    confirmed: true,
+                    onto: Some("main".into()),
+                    ..rebase_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            worktrees[0].get("reason").and_then(Value::as_str),
+            Some("operation-in-progress"),
+            "{reply}"
+        );
+        // Still mid-rebase: nothing aborted it out from under whoever owns it.
+        assert_ne!(
+            Repository::open(&wt).unwrap().state(),
+            RepositoryState::Clean
+        );
+    }
+
+    #[test]
+    fn rebase_request_maps_onto_engine_options() {
+        let req = RebaseRequest {
+            keep_conflicts: true,
+            autostash: true,
+            onto: Some("origin/release".into()),
+            ..rebase_req(vec![PathBuf::from("/wt")])
+        };
+        let opts = req.options(PathBuf::from("/custom/git"));
+        assert!(opts.keep_conflicts && opts.autostash);
+        assert_eq!(opts.onto.as_deref(), Some("origin/release"));
+        assert_eq!(opts.git_bin, Some(PathBuf::from("/custom/git")));
+        // Phase 1 *is* the dry run (it calls `plan`, never `execute`), so the
+        // engine's own flag stays off — setting it would be a second, redundant
+        // gate that could silently no-op a confirmed execute.
+        assert!(!opts.dry_run);
+    }
+
+    #[test]
+    fn log_rebase_check_records_the_pending_count_under_an_info_subscriber() {
+        let req = RebaseRequest {
+            requester_key: Some("win-3".into()),
+            check: true,
+            ..rebase_req(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        };
+        let plan = worktree_rebase::Plan {
+            fetches: vec![worktree_rebase::FetchOutcome {
+                repo_root: PathBuf::from("/repo"),
+                onto: "origin/main".into(),
+                fetched: true,
+                ok: false,
+                detail: Some("host unreachable".into()),
+            }],
+            worktrees: vec![
+                worktree_rebase::WorktreeOutcome {
+                    path: PathBuf::from("/a"),
+                    branch: Some("a".into()),
+                    onto: "origin/main".into(),
+                    result: worktree_rebase::RebaseResult::WouldRebase { behind: 2 },
+                },
+                worktree_rebase::WorktreeOutcome {
+                    path: PathBuf::from("/b"),
+                    branch: Some("b".into()),
+                    onto: "origin/main".into(),
+                    result: worktree_rebase::RebaseResult::UpToDate,
+                },
+            ],
+        };
+        let logs = capture_info(|| log_rebase_check(&req, &plan));
+        assert!(logs.contains("rebase check"), "{logs}");
+        assert!(logs.contains("win-3"), "{logs}");
+        assert!(logs.contains("requested=2"), "{logs}");
+        assert!(logs.contains("pending=1"), "{logs}");
+        assert!(logs.contains("failed_fetches=1"), "{logs}");
+    }
+
+    #[test]
+    fn log_rebase_execute_counts_left_in_place_conflicts_separately() {
+        // A CLI-style requester (no window key) logs the dash fallback.
+        let req = rebase_req(vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        let outcome = |result| worktree_rebase::WorktreeOutcome {
+            path: PathBuf::from("/x"),
+            branch: Some("x".into()),
+            onto: "origin/main".into(),
+            result,
+        };
+        let outcomes = vec![
+            outcome(worktree_rebase::RebaseResult::Rebased { behind: 1 }),
+            outcome(worktree_rebase::RebaseResult::Conflict {
+                detail: "CONFLICT".into(),
+                left_in_place: true,
+            }),
+            outcome(worktree_rebase::RebaseResult::Skipped {
+                reason: worktree_rebase::SkipReason::Dirty,
+            }),
+        ];
+        let logs = capture_info(|| log_rebase_execute(&req, &outcomes));
+        assert!(logs.contains("rebase execute"), "{logs}");
+        assert!(logs.contains("rebased=1"), "{logs}");
+        assert!(logs.contains("conflicts=1"), "{logs}");
+        assert!(logs.contains("left_in_place=1"), "{logs}");
+        assert!(logs.contains("skipped=1"), "{logs}");
+        assert!(logs.contains(r#"requester="-""#), "{logs}");
+    }
+
+    #[test]
+    fn operation_slug_names_each_in_progress_state_and_none_when_clean() {
+        assert_eq!(operation_slug(RepositoryState::Clean), None);
+        assert_eq!(
+            operation_slug(RepositoryState::Rebase).as_deref(),
+            Some("rebase")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::RebaseMerge).as_deref(),
+            Some("rebase"),
+            "the merge-backend rebase is still just a rebase to the user"
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::RebaseInteractive).as_deref(),
+            Some("rebase-interactive")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::Merge).as_deref(),
+            Some("merge")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::CherryPickSequence).as_deref(),
+            Some("cherry-pick")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::RevertSequence).as_deref(),
+            Some("revert")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::Bisect).as_deref(),
+            Some("bisect")
+        );
+        assert_eq!(
+            operation_slug(RepositoryState::ApplyMailboxOrRebase).as_deref(),
+            Some("apply-mailbox")
+        );
+    }
+
+    #[test]
+    fn git_status_omits_operation_for_a_clean_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        assert_eq!(
+            git_status(dir.path()).operation,
+            None,
+            "a clean worktree carries no operation, so the field stays off the wire"
+        );
+    }
+
+    #[test]
+    fn worktree_entry_marks_a_path_the_registry_reports_as_rebasing() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(main_dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let path = canonical(main_dir.path());
+
+        let quiet = worktree_entry(&path, true, &HashMap::new(), &HashSet::new());
+        assert!(!quiet.rebasing);
+        // Byte-identical for a pre-#1415 client: neither new field is serialized.
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json.get("rebasing").is_none(), "{json}");
+        assert!(json.get("operation").is_none(), "{json}");
+
+        let busy = worktree_entry(
+            &path,
+            true,
+            &HashMap::new(),
+            &std::iter::once(path.clone()).collect(),
+        );
+        assert!(busy.rebasing, "the registry's transient mark rides through");
+        assert_eq!(
+            serde_json::to_value(&busy).unwrap()["rebasing"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
