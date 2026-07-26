@@ -399,6 +399,20 @@ export function sessionsListEnvelope(): Envelope {
 }
 
 /**
+ * Builds a sessions `subscribe` envelope — opens the push subscription (#1414).
+ * The daemon then streams the same `{ sessions: [...] }` body `list` serves,
+ * pushing a fresh frame on every real change, so every window's cues flip
+ * together instead of drifting up to a poll period apart. See
+ * `SessionsSubscription`.
+ *
+ * A daemon predating the op replies `{ ok: false }` and keeps the connection
+ * open, which is the caller's signal to fall back to polling `list`.
+ */
+export function sessionsSubscribeEnvelope(): Envelope {
+  return { service: SESSIONS_SERVICE, op: "subscribe" };
+}
+
+/**
  * Sends one request envelope to the daemon and resolves with its reply.
  *
  * Opens a fresh connection, writes one `\n`-terminated JSON line, reads one

@@ -1,32 +1,49 @@
-// The long-lived push-subscription client for the worktrees `tree` view.
+// The long-lived push-subscription clients for the daemon's streaming ops.
 //
 // Like `socket.ts` this module is `vscode`-free so it is unit-testable under
-// `node --test` against a plain `net` server. It opens ONE persistent connection
-// to the daemon control socket, sends a single `subscribe` line, and then only
-// reads: the daemon pushes an initial `tree` snapshot followed by a fresh one on
-// every real change (`src/daemon/server.rs` `run_stream`). Writing any further
-// line is treated by the daemon as a cancel, so this client never writes again —
-// it unsubscribes by closing the socket. A dropped/absent daemon triggers a
+// `node --test` against a plain `net` server. A subscription opens ONE persistent
+// connection to the daemon control socket, sends a single `subscribe` line, and
+// then only reads: the daemon pushes an initial snapshot followed by a fresh one
+// on every real change (`src/daemon/server.rs` `run_stream`). Writing any further
+// line is treated by the daemon as a cancel, so these clients never write again —
+// they unsubscribe by closing the socket. A dropped/absent daemon triggers a
 // silent exponential-backoff reconnect loop; nothing here ever throws at the
 // caller, matching the reporter's "daemon down is a no-op" contract.
+//
+// `DaemonSubscription` holds all of that machinery; `TreeSubscription` (worktrees
+// `tree`, #1267) and `SessionsSubscription` (sessions state, #1414) are thin
+// bindings of an envelope to a payload guard.
 
 import * as net from "net";
 
-import { Reply, checkSocketPathLen, subscribeEnvelope } from "./socket";
+import {
+  Envelope,
+  Reply,
+  checkSocketPathLen,
+  sessionsSubscribeEnvelope,
+  subscribeEnvelope,
+} from "./socket";
+import { SessionEntry } from "./sessionCounts";
 import { TreeSnapshot } from "./tree";
 
 /** Injectable collaborators + backoff tuning (defaults wire real timers). */
-export interface TreeSubscriptionOptions {
-  /**
-   * Called with every pushed snapshot: its `repos` and the daemon-backed
-   * `show_closed` toggle (#1301), so the reader drives both the tree and the
-   * show/hide-closed filter from the same authoritative frame.
-   */
-  onSnapshot: (snapshot: TreeSnapshot) => void;
+export interface SubscriptionOptions<T> {
+  /** Called with every pushed snapshot that passes the subscription's guard. */
+  onSnapshot: (snapshot: T) => void;
   /** Called on connect↔disconnect transitions (drives the daemon-down hint). */
   onStatus?: (connected: boolean) => void;
   /** Called with a human-readable message on each recoverable drop. */
   onError?: (message: string) => void;
+  /**
+   * Called when the daemon *answers* but refuses the op — the version-skew
+   * signal. A daemon too old to stream this op replies `{ ok: false, error:
+   * "unknown <svc> op: subscribe" }` and then holds the connection open, so
+   * without this the client would wait forever on a stream that will never
+   * arrive. The subscription stops after firing it (no reconnect); the caller
+   * falls back to polling. Omit it to keep the original behaviour of ignoring
+   * every non-`ok` frame.
+   */
+  onUnsupported?: (message: string) => void;
   /** First reconnect delay; doubles each failure up to `maxBackoffMs`. */
   initialBackoffMs?: number;
   /** Reconnect backoff ceiling. */
@@ -38,18 +55,25 @@ export interface TreeSubscriptionOptions {
   random?: () => number;
 }
 
+/** Back-compat alias: `TreeSubscription`'s options before it was generalized. */
+export type TreeSubscriptionOptions = SubscriptionOptions<TreeSnapshot>;
+
 const DEFAULT_INITIAL_BACKOFF_MS = 500;
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
 /**
- * A resilient subscription to the daemon's worktrees `tree` stream. Construct
- * it, then call {@link start}; call {@link close} to tear it down (idempotent,
- * safe to hand to `context.subscriptions`).
+ * A resilient subscription to one of the daemon's push streams. Construct it,
+ * then call {@link start}; call {@link close} to tear it down (idempotent, safe
+ * to hand to `context.subscriptions`).
+ *
+ * Subclasses supply the request envelope and the guard that recognizes a
+ * well-formed snapshot for that stream.
  */
-export class TreeSubscription {
-  private readonly onSnapshot: (snapshot: TreeSnapshot) => void;
+export class DaemonSubscription<T> {
+  private readonly onSnapshot: (snapshot: T) => void;
   private readonly onStatus?: (connected: boolean) => void;
   private readonly onError?: (message: string) => void;
+  private readonly onUnsupported?: (message: string) => void;
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly setTimeoutFn: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -65,11 +89,14 @@ export class TreeSubscription {
 
   constructor(
     private readonly socketPath: string,
-    options: TreeSubscriptionOptions,
+    private readonly envelope: Envelope,
+    private readonly isSnapshot: (payload: Record<string, unknown>) => boolean,
+    options: SubscriptionOptions<T>,
   ) {
     this.onSnapshot = options.onSnapshot;
     this.onStatus = options.onStatus;
     this.onError = options.onError;
+    this.onUnsupported = options.onUnsupported;
     this.initialBackoffMs = options.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.setTimeoutFn = options.setTimeoutFn ?? ((cb, ms) => setTimeout(cb, ms));
@@ -89,6 +116,10 @@ export class TreeSubscription {
       this.onError?.(err instanceof Error ? err.message : String(err));
       return;
     }
+    // Re-`start()`ing a subscription that fell back (or was closed) revives it,
+    // so a caller can retry after a daemon restart without rebuilding it.
+    this.closed = false;
+    this.backoff = this.initialBackoffMs;
     this.connect();
   }
 
@@ -131,7 +162,7 @@ export class TreeSubscription {
     conn.on("connect", () => {
       // The one and only write: request the stream. Any further write would be
       // read by the daemon as a cancel.
-      conn.write(JSON.stringify(subscribeEnvelope()) + "\n");
+      conn.write(JSON.stringify(this.envelope) + "\n");
     });
     conn.on("data", (chunk: Buffer) => this.onData(chunk));
     conn.on("error", (err: Error) => drop(err.message));
@@ -160,9 +191,18 @@ export class TreeSubscription {
       this.onError?.(`malformed snapshot: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    // Ignore anything that is not a well-formed `tree` snapshot (e.g. an error
-    // reply); a fresh snapshot is the only frame the stream should carry.
-    if (reply.ok && reply.payload && Array.isArray(reply.payload.repos)) {
+    // An explicit error reply means the daemon is up but will not serve this op
+    // — almost always a daemon too old to know it. Hand that to the caller so it
+    // can degrade, and stop: reconnecting would only re-earn the same refusal.
+    if (!reply.ok && this.onUnsupported) {
+      const message = reply.error ?? "daemon refused the subscription";
+      this.close();
+      this.onUnsupported(message);
+      return;
+    }
+    // Ignore anything that is not a well-formed snapshot for this stream; a
+    // fresh snapshot is the only frame the stream should carry.
+    if (reply.ok && reply.payload && this.isSnapshot(reply.payload)) {
       // Any successful snapshot proves the daemon is up: reset backoff and, on
       // the first one, announce the connection.
       this.backoff = this.initialBackoffMs;
@@ -170,7 +210,7 @@ export class TreeSubscription {
         this.connected = true;
         this.onStatus?.(true);
       }
-      this.onSnapshot(reply.payload as TreeSnapshot);
+      this.onSnapshot(reply.payload as T);
     }
   }
 
@@ -197,5 +237,41 @@ export class TreeSubscription {
       this.connect();
     }, delay);
     this.backoff = Math.min(this.backoff * 2, this.maxBackoffMs);
+  }
+}
+
+/**
+ * A subscription to the worktrees `tree` stream (#1267): the repo/worktree rows
+ * plus the daemon-backed `show_closed` toggle (#1301), so the reader drives both
+ * the tree and the show/hide-closed filter from the same authoritative frame.
+ */
+export class TreeSubscription extends DaemonSubscription<TreeSnapshot> {
+  constructor(socketPath: string, options: SubscriptionOptions<TreeSnapshot>) {
+    super(socketPath, subscribeEnvelope(), (payload) => Array.isArray(payload.repos), options);
+  }
+}
+
+/** One pushed frame of the sessions stream — the same body the `list` op serves. */
+export interface SessionsSnapshot {
+  /** Every Claude session the daemon currently tracks. */
+  sessions: SessionEntry[];
+}
+
+/**
+ * A subscription to the sessions stream (#1414): the live set of Claude sessions,
+ * pushed on every state change so every window's cues flip together instead of
+ * drifting up to a poll period apart.
+ *
+ * Pass `onUnsupported` — a daemon predating the op answers but refuses it, and
+ * the caller must fall back to polling `list`.
+ */
+export class SessionsSubscription extends DaemonSubscription<SessionsSnapshot> {
+  constructor(socketPath: string, options: SubscriptionOptions<SessionsSnapshot>) {
+    super(
+      socketPath,
+      sessionsSubscribeEnvelope(),
+      (payload) => Array.isArray(payload.sessions),
+      options,
+    );
   }
 }
