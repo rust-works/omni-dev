@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-27
+
 ### Added
 - **Copy PR URL** ([#1430](https://github.com/rust-works/omni-dev/issues/1430)): a new context-menu action in the **Worktrees** view copies the selected rows' pull request links to the clipboard, next to **Copy Directory**. It is the missing half of a common move — gather the PR links for the batch of worktrees you are looking at and paste them into a Claude prompt, a stand-up note, a `gh` one-liner or a review checklist — where the only route before was opening each PR and copying from the address bar, which defeats the point of a multi-select tree. Select any number of rows and act once.
   - **It writes one line per selected row, not one per pull request found.** A row with an open PR contributes its URL; a row with none contributes a `#`-commented placeholder naming it (`# No PR for issue-1428 in /Users/me/wrk/work-trees/omni-dev/issue-1428`). That is the point of the feature as much as the URLs are: a block that silently dropped the PR-less rows would leave you unable to tell which of the six worktrees you selected are unrepresented. The `#` is deliberate too — the block stays paste-safe into a shell, a YAML/TOML scratch file or a markdown list without a placeholder being mistaken for a link. The placeholder names the worktree's **absolute path**, matching **Copy Directory**, because the block is meant to be pasted somewhere with no tree beside it.
