@@ -26,6 +26,7 @@ import {
   sessionWindowEnvelope,
   sessionWindowUnregisterEnvelope,
   sessionsListEnvelope,
+  sessionsSubscribeEnvelope,
   subscribeEnvelope,
   treeEnvelope,
   unregisterEnvelope,
@@ -165,6 +166,8 @@ test("sessions window envelope builders route to the sessions service", () => {
   });
   // The read side (#1406): no payload at all.
   assert.deepEqual(sessionsListEnvelope(), { service: "sessions", op: "list" });
+  // The push replacing that poll (#1414) — same service, same body, streamed.
+  assert.deepEqual(sessionsSubscribeEnvelope(), { service: "sessions", op: "subscribe" });
 });
 
 test("close envelope builders match the two-phase worktrees wire contract", () => {

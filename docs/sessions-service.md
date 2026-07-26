@@ -52,6 +52,7 @@ extension.
 
               daemon ──► `omni-dev sessions list` / tray submenu
                      ──► the companion's Worktrees tree cues
+                          (pushed live over `subscribe`)
 ```
 
 The **engine** ([`src/sessions.rs`](../src/sessions.rs), `SessionsRegistry`) is
@@ -60,6 +61,32 @@ the **adapter** ([`src/daemon/services/sessions.rs`](../src/daemon/services/sess
 routes ops, enriches `repo` from `cwd` with `git2`, renders the tray/status, and
 owns the transcript-watcher task — the same engine/adapter split as the worktrees
 service.
+
+### Change-notify and the push stream
+
+State reaches every open window over the **`subscribe`** op rather than a
+per-window poll (#1414), mirroring the worktrees stream ([ADR-0048](adrs/adr-0048.md)):
+the registry holds a `tokio::sync::watch` counter that a mutation bumps, and the
+server's `run_stream` loop re-snapshots on each bump (plus its own
+`OMNI_DEV_DAEMON_STREAM_TICK` re-sample, default 10 s) and pushes only a real
+delta. Without it two windows showing the same worktree row could disagree about
+its cue for a full poll period, with which one is stale set by whenever each
+window happened to activate.
+
+The stream needs **no coalescing snapshot cache** (the worktrees `TreeSnapshotCache`,
+#1303): `repo` is enriched at `observe` time, so `list` is pure formatting and
+`snapshot()` simply calls it — a one-shot `list` and a pushed frame are the same
+bytes, which is what lets a client treat them interchangeably.
+
+A registry mutation bumps **only when it changes something a consumer renders** —
+a session appearing or ending, a `SessionState` transition, a best-effort field
+taking a new value, or a window report that alters the `Source` join. It
+deliberately does *not* bump on the `last_seen`/`last_event` churn every hook
+event produces, nor on the unchanged ~10 s `window` refresh each open window
+sends; those would push a fresh snapshot to every window several times a second
+with the server's diff unable to suppress any of it. Their deltas ride the
+periodic re-sample instead. TTL-driven transitions (an idle session ageing out)
+fire no event at all and are likewise caught by that re-sample.
 
 ### Data model
 
@@ -256,7 +283,9 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
 **No new trust boundary** — the same posture as [ADR-0039](adrs/adr-0039.md) and
 [ADR-0040](adrs/adr-0040.md):
 
-- Ops ride the daemon's existing `0600` Unix socket in its `0700` directory.
+- Ops ride the daemon's existing `0600` Unix socket in its `0700` directory. The
+  `subscribe` stream (#1414) adds no capability: it is read-only and carries
+  exactly what `list` already serves, just pushed rather than polled.
 - **No secret is persisted** — the registry is in-memory only.
 - Residual exposure, stated plainly: anything that can read the socket can
   enumerate your open session **cwds/repos and coarse state**; anything that can
@@ -275,7 +304,7 @@ trust models.
 
 ## Companion contract (for the extension and other clients)
 
-The companion speaks three additional ops to the same socket the worktrees service
+The companion speaks four additional ops to the same socket the worktrees service
 uses (`DaemonEnvelope { service: "sessions", op, payload }`, newline-delimited
 JSON):
 
@@ -284,6 +313,21 @@ JSON):
 | `window` | `{ key, folders[], tabs, terminals }` | `{ ok: true }` | Report this window's Claude embedding counts + folders; refreshes the report's liveness (a 30s TTL, so ride it every ~10s). |
 | `window-unregister` | `{ key }` | `{ removed: bool }` | The window closed (fired on `deactivate()`). |
 | `list` | *(none)* | `{ sessions: [...] }` | The live set, for the Worktrees tree's per-worktree cues. Read-only; the companion tallies sessions onto rows by `cwd`. |
+| `subscribe` | *(none)* | `{ sessions: [...] }`, **repeatedly** | The same body as `list`, pushed on every real change (#1414). Read-only. |
+
+`subscribe` takes over the connection for its lifetime: the daemon sends an
+initial snapshot, then a fresh one on each change (and on its own periodic
+re-sample) until the client writes any further line — which is read as a cancel —
+or closes the socket. Prefer it over polling `list`: it is what keeps every open
+window's cues in step instead of up to a poll period apart.
+
+**Falling back.** The extension and daemon version independently, so handle a
+daemon that predates the op: it replies `{ ok: false, error: "unknown sessions op:
+subscribe" }` **and keeps the connection open**, so a client that only waits for
+frames waits forever. Treat any non-`ok` reply on a subscription as "this daemon
+cannot stream", stop reconnecting (a retry earns the same refusal), and poll
+`list` instead. The companion re-attempts the subscription when its worktrees
+stream reconnects, since a daemon upgrade lands as a restart.
 
 `key` is the **same per-window UUID** the companion already uses for the worktrees
 `register` op, so the two services agree on window identity. The companion reports
