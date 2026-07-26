@@ -82,6 +82,16 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.setRowColor",
+        "title": "Set Colour…",
+        "category": "omni-dev"
+      },
+      {
+        "command": "omniDevWorktrees.clearAllRowColors",
+        "title": "Clear All Row Colours",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.openPullRequest",
         "title": "Open Pull Request…",
         "category": "omni-dev",
@@ -174,6 +184,10 @@
         },
         {
           "command": "omniDevWorktrees.copyDirectory",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.setRowColor",
           "when": "false"
         },
         {
@@ -299,6 +313,11 @@
           "command": "omniDevWorktrees.closeWorktree",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
           "group": "9_close@2"
+        },
+        {
+          "command": "omniDevWorktrees.setRowColor",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
+          "group": "6_appearance@1"
         }
       ],
       "editor/title": [
@@ -331,6 +350,61 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show each worktree's running Claude Code sessions in the tree — glyph counts in the row (`!` waiting on you, `⚙` working, `◦` idle) plus a colored badge for the most urgent one. Tracked by the omni-dev daemon's sessions service; state is exact for Claude tabs launched through `omni-dev sessions install-wrapper`, and inferred from hooks otherwise. Disable to hide them."
+        },
+        "omniDevWorktrees.rowColors": {
+          "type": "object",
+          "scope": "application",
+          "default": {},
+          "markdownDescription": "Per-row icon colours for the **Worktrees** tree, so several repositories can be told apart at a glance. Set them from the **Set Colour…** context-menu action (which handles a multi-selection) rather than by hand; **omni-dev: Clear All Row Colours** removes the lot.\n\nEach key identifies one row — `repo:<repo root>` for a repository row, `wt:<worktree path>` for a worktree row. The two are distinct even when the paths match, since a repository's row and its main worktree's row share a directory. Each value is a workbench colour **id** (`vscode.ThemeIcon` accepts no hex values); an empty string or an unrecognised id leaves the row its default colour.\n\nA colour attaches to the row, not to its icon, so it survives the row changing state — but a worktree that is mid-rebase shows the yellow rebase cue instead until it is resolved. Keys are path-based and are never removed automatically, so deleting a worktree leaves its entry behind.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "",
+              "charts.red",
+              "charts.orange",
+              "charts.yellow",
+              "charts.green",
+              "charts.blue",
+              "charts.purple",
+              "charts.foreground",
+              "terminal.ansiRed",
+              "terminal.ansiYellow",
+              "terminal.ansiGreen",
+              "terminal.ansiCyan",
+              "terminal.ansiBlue",
+              "terminal.ansiMagenta",
+              "terminal.ansiBrightRed",
+              "terminal.ansiBrightYellow",
+              "terminal.ansiBrightGreen",
+              "terminal.ansiBrightCyan",
+              "terminal.ansiBrightBlue",
+              "terminal.ansiBrightMagenta",
+              "descriptionForeground"
+            ],
+            "enumDescriptions": [
+              "No override — the row keeps its default colour.",
+              "Red",
+              "Orange",
+              "Yellow",
+              "Green",
+              "Blue",
+              "Purple",
+              "Foreground",
+              "Terminal red",
+              "Terminal yellow",
+              "Terminal green",
+              "Terminal cyan",
+              "Terminal blue",
+              "Terminal magenta",
+              "Terminal bright red",
+              "Terminal bright yellow",
+              "Terminal bright green",
+              "Terminal bright cyan",
+              "Terminal bright blue",
+              "Terminal bright magenta",
+              "Muted grey"
+            ]
+          }
         },
         "omniDevWorktrees.claudeCommand": {
           "type": "string",
