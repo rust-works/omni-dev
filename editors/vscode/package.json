@@ -72,6 +72,11 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.reloadWindow",
+        "title": "Reload Window",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.copyDirectory",
         "title": "Copy Directory",
         "category": "omni-dev"
@@ -161,6 +166,10 @@
         },
         {
           "command": "omniDevWorktrees.closeWindow",
+          "when": "false"
+        },
+        {
+          "command": "omniDevWorktrees.reloadWindow",
           "when": "false"
         },
         {
@@ -275,6 +284,11 @@
           "command": "omniDevWorktrees.repositionWindowsToMatch",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.open\\./ && omniDevWorktrees.canReposition",
           "group": "4_layout@1"
+        },
+        {
+          "command": "omniDevWorktrees.reloadWindow",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\.(current|open)\\./",
+          "group": "5_window@1"
         },
         {
           "command": "omniDevWorktrees.closeWindow",
