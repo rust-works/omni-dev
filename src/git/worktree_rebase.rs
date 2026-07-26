@@ -17,9 +17,17 @@
 //! the user's `git`: libgit2's vendored build here has no reliable SSH transport
 //! (issue #903) and the shell inherits the user's `ssh-agent` / `~/.ssh/config` /
 //! credential-helper configuration for free, and `git rebase` brings full conflict
-//! handling, hooks, and `--autostash`. This engine is therefore **CLI-side only** —
-//! it never runs in the daemon, whose minimal launchd/systemd environment lacks the
-//! user's credential context.
+//! handling, hooks, and `--autostash`.
+//!
+//! **Where it runs (ADR-0059, superseding ADR-0055 in part).** This engine is host
+//! agnostic: it drives both the local CLI (`omni-dev worktrees rebase`) and the
+//! daemon's two-phase `rebase` op. ADR-0055 originally confined it to the CLI on
+//! the premise that the daemon's minimal environment lacked `SSH_AUTH_SOCK` and so
+//! could not authenticate a fetch. That premise was wrong — launchd exports
+//! `SSH_AUTH_SOCK` into the per-user session, so a LaunchAgent inherits the user's
+//! `ssh-agent`. What the daemon genuinely lacks is a useful `PATH`, which is why
+//! the `git` binary is resolved through
+//! [`crate::git::resolve_git_binary`] rather than by name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +38,7 @@ use git2::{Oid, Repository, RepositoryState, StatusOptions};
 use serde::Serialize;
 
 use crate::git::remote::RemoteInfo;
+use crate::git::resolve_git_binary;
 
 /// Which worktrees a batch rebase should target.
 #[derive(Debug, Clone)]
@@ -58,6 +67,31 @@ pub struct RebaseOptions {
     pub autostash: bool,
     /// Fetch and classify, but perform no rebase.
     pub dry_run: bool,
+    /// Leave a conflicting worktree **mid-rebase** instead of `git rebase
+    /// --abort`-ing it (#1415).
+    ///
+    /// The default (abort) keeps the worktree exactly as it was, which is the
+    /// right conservative choice for a batch the user is watching scroll past. But
+    /// it also throws away every conflict already resolved by `git rerere` and
+    /// every hunk git applied cleanly before the collision — work the user then has
+    /// to reproduce by hand. With this set, the worktree stays in its conflicted
+    /// state so the conflict can be resolved in place and finished with
+    /// `git rebase --continue`, and the batch moves on to the next worktree
+    /// regardless.
+    pub keep_conflicts: bool,
+    /// The `git` executable to shell out to. `None` resolves it via
+    /// [`resolve_git_binary`], which is what a caller with a minimal `PATH` (the
+    /// daemon) needs; the field exists so a caller can resolve **once** and reuse,
+    /// and so a test can point the engine at a stub.
+    pub git_bin: Option<PathBuf>,
+}
+
+impl RebaseOptions {
+    /// The `git` executable these options select, resolving the default lazily.
+    /// Called once per [`plan`] / [`execute`] rather than per subprocess.
+    fn git_bin(&self) -> PathBuf {
+        self.git_bin.clone().unwrap_or_else(resolve_git_binary)
+    }
 }
 
 /// The result of planning and (optionally) executing a batch rebase.
@@ -137,10 +171,18 @@ pub enum RebaseResult {
         /// Why it was skipped.
         reason: SkipReason,
     },
-    /// The rebase hit conflicts; it was aborted and the worktree left untouched.
+    /// The rebase hit conflicts. By default it was aborted and the worktree left
+    /// untouched; with [`RebaseOptions::keep_conflicts`] the worktree is instead
+    /// left mid-rebase, which `left_in_place` records.
     Conflict {
         /// The `git rebase` error output (trimmed).
         detail: String,
+        /// Whether the worktree was **left mid-rebase** for the user to resolve
+        /// (`true`) rather than aborted back to its previous state (`false`).
+        /// Omitted on the wire when false, so a pre-#1415 client sees the exact
+        /// bytes it saw before.
+        #[serde(skip_serializing_if = "is_false")]
+        left_in_place: bool,
     },
     /// The repository's one-shot fetch failed, so no worktree of it was attempted.
     FetchFailed {
@@ -180,6 +222,9 @@ pub enum SkipReason {
 /// is measured — and would be rebased — against.
 pub fn plan(selection: &Selection, opts: &RebaseOptions) -> Result<Plan> {
     let paths = resolve_selection(selection)?;
+    // Resolved once for the whole plan, not per subprocess: the probe stats the
+    // candidate paths, and the answer is process-stable.
+    let git = opts.git_bin();
 
     // Phase A — inspect each path with git2 (no network): structural facts + HEAD.
     let inspected: Vec<Inspected> = paths.iter().map(|p| Inspected::read(p)).collect();
@@ -188,7 +233,7 @@ pub fn plan(selection: &Selection, opts: &RebaseOptions) -> Result<Plan> {
     let onto_by_repo = resolve_onto_by_repo(&inspected, opts.onto.as_deref());
 
     // Phase C — fetch once per repository (the fetch-once-per-repo invariant).
-    let (fetches, fetch_ok) = fetch_all(&onto_by_repo);
+    let (fetches, fetch_ok) = fetch_all(&git, &onto_by_repo);
 
     // Phase D — classify each worktree against the now-fresh refs.
     let worktrees = inspected
@@ -203,17 +248,22 @@ pub fn plan(selection: &Selection, opts: &RebaseOptions) -> Result<Plan> {
 ///
 /// The rest pass through unchanged. Rebases run sequentially (deterministic output;
 /// no contention on the shared object database). A conflicting rebase is aborted so
-/// the worktree is left exactly as it was.
+/// the worktree is left exactly as it was — unless
+/// [`RebaseOptions::keep_conflicts`] is set, in which case it is left mid-rebase.
+/// Either way the batch continues with the remaining worktrees.
 #[must_use]
 pub fn execute(plan: Plan, opts: &RebaseOptions) -> Vec<WorktreeOutcome> {
+    let git = opts.git_bin();
     plan.worktrees
         .into_iter()
         .map(|mut outcome| {
             if let RebaseResult::WouldRebase { behind } = outcome.result {
-                outcome.result = match rebase_worktree(&outcome.path, &outcome.onto, opts.autostash)
-                {
+                outcome.result = match rebase_worktree(&git, &outcome.path, &outcome.onto, opts) {
                     Ok(()) => RebaseResult::Rebased { behind },
-                    Err(detail) => RebaseResult::Conflict { detail },
+                    Err(detail) => RebaseResult::Conflict {
+                        detail,
+                        left_in_place: opts.keep_conflicts,
+                    },
                 };
             }
             outcome
@@ -510,6 +560,7 @@ fn onto_from_override(repo: &Repository, reference: &str) -> OntoSpec {
 /// `root -> ok` map the classifier consults. A repo with a local onto ref records a
 /// `fetched: false, ok: true` entry.
 fn fetch_all(
+    git: &Path,
     onto_by_repo: &BTreeMap<PathBuf, OntoSpec>,
 ) -> (Vec<FetchOutcome>, BTreeMap<PathBuf, bool>) {
     let mut fetches = Vec::new();
@@ -517,7 +568,7 @@ fn fetch_all(
     for (root, spec) in onto_by_repo {
         let outcome = match &spec.fetch {
             Some((remote, branch)) => {
-                let result = fetch_once(root, remote, branch);
+                let result = fetch_once(git, root, remote, branch);
                 let ok = result.is_ok();
                 FetchOutcome {
                     repo_root: root.clone(),
@@ -543,8 +594,8 @@ fn fetch_all(
 
 /// Runs `git fetch <remote> <branch>` once in `repo_root`. The shared object
 /// database means this single fetch updates the tracking ref every worktree sees.
-fn fetch_once(repo_root: &Path, remote: &str, branch: &str) -> Result<()> {
-    let output = run_git_in(repo_root, &["fetch", remote, branch])?;
+fn fetch_once(git: &Path, repo_root: &Path, remote: &str, branch: &str) -> Result<()> {
+    let output = run_git_in(git, repo_root, &["fetch", remote, branch])?;
     if output.status.success() {
         return Ok(());
     }
@@ -556,19 +607,31 @@ fn fetch_once(repo_root: &Path, remote: &str, branch: &str) -> Result<()> {
 
 // ── rebase (shell-out, per worktree) ─────────────────────────────────────────
 
-/// Rebases the branch checked out in `path` onto `onto`. On failure (a conflict, or
-/// anything else) the rebase is aborted so the worktree is left exactly as it was,
-/// and the trimmed error is returned. With `autostash`, `git rebase --abort` also
-/// restores the stashed changes.
-fn rebase_worktree(path: &Path, onto: &str, autostash: bool) -> std::result::Result<(), String> {
-    let args = rebase_args(onto, autostash);
+/// Rebases the branch checked out in `path` onto `onto`, returning the trimmed
+/// error on failure (a conflict, or anything else).
+///
+/// By default the rebase is aborted on failure so the worktree is left exactly as
+/// it was; with `autostash`, `git rebase --abort` also restores the stashed
+/// changes. With [`RebaseOptions::keep_conflicts`] the abort is **skipped** and the
+/// worktree stays mid-rebase for in-place resolution — including any autostash
+/// entry, which git re-applies when the rebase eventually concludes (via
+/// `--continue` or a later `--abort`), exactly as for a hand-run rebase.
+fn rebase_worktree(
+    git: &Path,
+    path: &Path,
+    onto: &str,
+    opts: &RebaseOptions,
+) -> std::result::Result<(), String> {
+    let args = rebase_args(onto, opts.autostash);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    match run_git_in(path, &argv) {
+    match run_git_in(git, path, &argv) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => {
             let detail = trimmed_stderr(&output);
-            // Best-effort abort; harmlessly errors if no rebase is in progress.
-            let _ = run_git_in(path, &["rebase", "--abort"]);
+            if !opts.keep_conflicts {
+                // Best-effort abort; harmlessly errors if no rebase is in progress.
+                let _ = run_git_in(git, path, &["rebase", "--abort"]);
+            }
             Err(detail)
         }
         Err(err) => Err(err.to_string()),
@@ -596,14 +659,27 @@ fn rebase_args(onto: &str, autostash: bool) -> Vec<String> {
 /// user's `git` — rather than libgit2's network transport — is deliberate: it works
 /// across SSH/HTTPS and honours the user's authentication configuration (ADR-0003,
 /// issue #903).
-fn run_git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let mut cmd = Command::new("git");
+///
+/// That environment snapshot is also what makes the daemon host viable: under
+/// launchd the daemon's own environment carries the per-user `SSH_AUTH_SOCK`, so
+/// the child inherits the user's `ssh-agent` unchanged (ADR-0059). `git` itself is
+/// passed in resolved, because that environment's `PATH` is minimal.
+fn run_git_in(git: &Path, dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = Command::new(git);
     cmd.env_clear();
     cmd.envs(std::env::vars_os());
     cmd.current_dir(dir)
         .args(args)
         .output()
-        .with_context(|| format!("failed to execute git in {}", dir.display()))
+        .with_context(|| format!("failed to execute {} in {}", git.display(), dir.display()))
+}
+
+/// `skip_serializing_if` predicate for a `bool` defaulting to `false`, so the field
+/// is dropped on the wire unless set — the protocol's forward-compatibility
+/// convention (the twin of the daemon service's helper of the same name).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The trimmed stderr of a git subprocess (falling back to stdout when stderr is
@@ -878,13 +954,128 @@ mod tests {
         ));
         let outcomes = execute(plan, &RebaseOptions::default());
         assert!(
-            matches!(outcomes[0].result, RebaseResult::Conflict { .. }),
+            matches!(
+                outcomes[0].result,
+                RebaseResult::Conflict {
+                    left_in_place: false,
+                    ..
+                }
+            ),
             "a conflicting rebase is reported, not silently half-applied"
         );
         // Aborted: HEAD unchanged and no rebase left in progress.
         assert_eq!(head_oid(&wt), head_before);
         let repo = Repository::open(&wt).unwrap();
         assert_eq!(repo.state(), RepositoryState::Clean);
+    }
+
+    #[test]
+    fn keep_conflicts_leaves_the_worktree_mid_rebase() {
+        // The inverse of the test above (#1415): the conflicted worktree must be
+        // left in its conflicted state so the user can resolve it in place, rather
+        // than aborted back to where it started.
+        let _guard = serial();
+        let scenario = Scenario::new();
+        let wt = scenario.add_worktree("feature");
+        scenario.commit_in_worktree(&wt, "file.txt", "feature side\n", "feature edit");
+        scenario.advance_origin_main("main side\n");
+
+        let opts = RebaseOptions {
+            keep_conflicts: true,
+            ..RebaseOptions::default()
+        };
+        let plan = plan(&Selection::Paths(vec![wt.clone()]), &opts).unwrap();
+        let outcomes = execute(plan, &opts);
+        assert!(
+            matches!(
+                outcomes[0].result,
+                RebaseResult::Conflict {
+                    left_in_place: true,
+                    ..
+                }
+            ),
+            "the outcome records that the worktree was left mid-rebase"
+        );
+        // The load-bearing assertion: a rebase really is still in progress, which
+        // is what makes `git rebase --continue` (and the tree's cue) meaningful.
+        let repo = Repository::open(&wt).unwrap();
+        assert_ne!(
+            repo.state(),
+            RepositoryState::Clean,
+            "the worktree must still be mid-rebase, not aborted back to clean"
+        );
+        // And the conflict markers are on disk for the user to resolve.
+        let conflicted = std::fs::read_to_string(wt.join("file.txt")).unwrap();
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "expected conflict markers, got: {conflicted}"
+        );
+    }
+
+    #[test]
+    fn a_kept_conflict_does_not_stop_the_rest_of_the_batch() {
+        // A conflicting worktree left in place must not sink its siblings: the
+        // batch continues, and the next worktree still rebases.
+        let _guard = serial();
+        let scenario = Scenario::new();
+        let clashing = scenario.add_worktree("clashing");
+        let clean = scenario.add_worktree("clean");
+        scenario.commit_in_worktree(&clashing, "file.txt", "feature side\n", "feature edit");
+        scenario.advance_origin_main("main side\n");
+
+        let opts = RebaseOptions {
+            keep_conflicts: true,
+            ..RebaseOptions::default()
+        };
+        let plan = plan(&Selection::Paths(vec![clashing, clean.clone()]), &opts).unwrap();
+        let outcomes = execute(plan, &opts);
+        assert!(matches!(
+            outcomes[0].result,
+            RebaseResult::Conflict {
+                left_in_place: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcomes[1].result,
+            RebaseResult::Rebased { behind: 1 },
+            "the second worktree rebases despite the first being left conflicted"
+        );
+        assert!(head_contains(&clean, &scenario.origin_main_oid()));
+    }
+
+    #[test]
+    fn left_in_place_is_omitted_from_json_when_false() {
+        // Forward-compatibility: an aborted conflict must serialize byte-identically
+        // to the pre-#1415 shape, so an older client is unaffected.
+        let aborted = serde_json::to_value(RebaseResult::Conflict {
+            detail: "boom".to_string(),
+            left_in_place: false,
+        })
+        .unwrap();
+        assert_eq!(aborted["status"], "conflict");
+        assert!(aborted.get("left_in_place").is_none());
+
+        let kept = serde_json::to_value(RebaseResult::Conflict {
+            detail: "boom".to_string(),
+            left_in_place: true,
+        })
+        .unwrap();
+        assert_eq!(kept["left_in_place"], true);
+    }
+
+    #[test]
+    fn git_bin_defaults_to_the_resolver_and_honours_an_override() {
+        assert_eq!(
+            RebaseOptions::default().git_bin(),
+            crate::git::resolve_git_binary(),
+            "an unset git_bin falls back to the shared resolver"
+        );
+        let opts = RebaseOptions {
+            git_bin: Some(PathBuf::from("/custom/git")),
+            ..RebaseOptions::default()
+        };
+        assert_eq!(opts.git_bin(), PathBuf::from("/custom/git"));
     }
 
     #[test]
@@ -1119,7 +1310,7 @@ mod tests {
                 fetch: None,
             },
         );
-        let (fetches, ok) = fetch_all(&map);
+        let (fetches, ok) = fetch_all(Path::new("git"), &map);
         assert_eq!(fetches.len(), 1);
         assert!(!fetches[0].fetched && fetches[0].ok);
         assert_eq!(ok.get(Path::new("/repo")), Some(&true));
@@ -1131,7 +1322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         config_identity(&repo);
-        let err = fetch_once(dir.path(), "origin", "main")
+        let err = fetch_once(&resolve_git_binary(), dir.path(), "origin", "main")
             .unwrap_err()
             .to_string();
         assert!(err.contains("git fetch"), "got: {err}");
@@ -1264,7 +1455,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let output = run_git_in(dir, args).unwrap();
+        let output = run_git_in(&resolve_git_binary(), dir, args).unwrap();
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
