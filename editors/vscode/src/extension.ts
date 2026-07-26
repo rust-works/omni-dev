@@ -59,7 +59,7 @@ import {
   worktreeLabel,
   worktreeTargets,
 } from "./tree";
-import { TreeSubscription } from "./subscription";
+import { SessionsSubscription, TreeSubscription } from "./subscription";
 import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvider";
 import { WorktreeDecorationProvider } from "./decorations";
 
@@ -135,10 +135,24 @@ function refreshDecorations(): void {
 /** The last worktree click, for the manual double-click timer in `onItemClicked`. */
 let lastClick: { id: string; at: number } | undefined;
 /**
- * The worktree paths from the latest snapshot, so the Claude session poll (#1406)
+ * The worktree paths from the latest snapshot, so the Claude session cues (#1406)
  * can attribute sessions to rows without re-reading the tree.
  */
 let worktreePaths: string[] = [];
+/**
+ * The most recent set of live Claude sessions, from whichever feed supplied it.
+ * Kept so a *tree* change can re-attribute the sessions it already has to the new
+ * row set without another round-trip (#1414).
+ */
+let lastSessions: SessionEntry[] = [];
+/**
+ * Whether the daemon is pushing session state to this window (#1414). While true
+ * the ~10s `list` poll stays off; a daemon too old to stream the op flips it back
+ * to `false` and the poll resumes.
+ */
+let sessionPushActive = false;
+/** The live sessions subscription, so a daemon restart can revive it. */
+let sessionSubscription: SessionsSubscription | undefined;
 
 function config(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -218,14 +232,39 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
 }
 
 /**
- * Polls the daemon for every live Claude session, tallies them onto the current
- * worktree rows, and pushes the result into the tree (#1406).
+ * Attributes {@link lastSessions} to the current worktree rows and pushes the
+ * result into the tree (#1406). The single choke point both the push (#1414) and
+ * the poll fall through to, and the one to call when only the *rows* changed.
  *
- * Cheap and best-effort: one socket round-trip whose failure leaves the tree
- * exactly as it was, skipped entirely when the view is hidden or the cue is
- * switched off, and a complete no-op when nothing changed — the provider's
- * refresh re-runs the lazy ahead/behind and PR fetches, so it must only fire on
- * a real change.
+ * A complete no-op when nothing changed — `setSessionTallies` compares first,
+ * and the provider's refresh re-runs the lazy ahead/behind and PR fetches, so it
+ * must only fire on a real change.
+ */
+function retallySessions(): void {
+  if (!provider || !showClaudeSessions()) {
+    return;
+  }
+  if (provider.setSessionTallies(tallyByWorktree(lastSessions, worktreePaths))) {
+    refreshDecorations();
+  }
+}
+
+/**
+ * Records a fresh set of live sessions — from the push or the poll — and repaints.
+ */
+function applySessionSnapshot(sessions: SessionEntry[]): void {
+  lastSessions = sessions;
+  retallySessions();
+}
+
+/**
+ * Polls the daemon for every live Claude session (#1406).
+ *
+ * Since #1414 this is the **fallback** path only: it runs while
+ * {@link sessionPushActive} is false, i.e. against a daemon too old to stream the
+ * sessions `subscribe` op. Cheap and best-effort — one socket round-trip whose
+ * failure leaves the tree exactly as it was, skipped when the view is hidden (the
+ * reveal handler catches it up) or the cue is switched off.
  */
 async function refreshSessionCues(): Promise<void> {
   if (!provider || !showClaudeSessions() || treeView?.visible === false) {
@@ -236,8 +275,15 @@ async function refreshSessionCues(): Promise<void> {
   if (!Array.isArray(sessions)) {
     return;
   }
-  if (provider.setSessionTallies(tallyByWorktree(sessions, worktreePaths))) {
-    refreshDecorations();
+  applySessionSnapshot(sessions);
+}
+
+/** Refreshes the session cues from whichever feed is currently live. */
+function syncSessionCues(): void {
+  if (sessionPushActive) {
+    retallySessions();
+  } else {
+    void refreshSessionCues();
   }
 }
 
@@ -423,9 +469,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   heartbeatTimer = setInterval(() => {
     void heartbeat();
     void reportSessionWindow();
-    // The same tick refreshes the Claude session cues (#1406) — session state
-    // rides its own op, not the tree snapshot, so it needs its own poll.
-    void refreshSessionCues();
+    // Session state rides its own op, not the tree snapshot. The daemon pushes it
+    // (#1414), so this poll is the fallback for a daemon too old to stream it —
+    // and the reason two windows could disagree about a row's cue for up to a
+    // full tick, since each window's phase is set by whenever it activated.
+    if (!sessionPushActive) {
+      void refreshSessionCues();
+    }
   }, heartbeatMs());
   context.subscriptions.push({
     dispose: () => {
@@ -537,18 +587,61 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       // check colour (state-keyed URIs already re-decorate; this covers the rest).
       refreshDecorations();
       // The row set just changed, so re-attribute the live sessions to it (#1406).
-      void refreshSessionCues();
+      // Under the push (#1414) that is a pure re-tally — the sessions themselves
+      // did not change, so there is nothing to re-fetch.
+      syncSessionCues();
     },
     onStatus: (connected) => {
       // A drop re-shows the hint; a (re)connect's message is set by the snapshot.
       if (!connected) {
         view.message = DAEMON_DOWN_MESSAGE;
+        return;
+      }
+      // The daemon is back. An upgrade lands as a restart, so a sessions
+      // subscription that fell back against the *old* daemon gets one more
+      // chance here rather than waiting for a window reload (#1414).
+      if (!sessionPushActive) {
+        sessionSubscription?.start();
       }
     },
     onError: (message) => output?.appendLine(`subscription: ${message}`),
   });
   sub.start();
   context.subscriptions.push({ dispose: () => sub.close() });
+
+  // The parallel push of Claude session state (#1414). Worktree rows and session
+  // cues are independent streams, so they get one connection each; this one
+  // degrades on its own to the ~10s `list` poll without touching the tree.
+  const sessions = new SessionsSubscription(socketPath(), {
+    onSnapshot: (snapshot) => {
+      sessionPushActive = true;
+      applySessionSnapshot(snapshot.sessions);
+    },
+    onUnsupported: (message) => {
+      // The daemon answered but will not stream: too old to know the op. Resume
+      // polling and say so once, rather than silently showing stale cues.
+      sessionPushActive = false;
+      output?.appendLine(`sessions subscription unavailable, falling back to polling: ${message}`);
+      void refreshSessionCues();
+    },
+    onStatus: (connected) => {
+      // A dropped stream leaves the last tally rendered; the poll covers the gap
+      // until the subscription's own backoff reconnects.
+      if (!connected) {
+        sessionPushActive = false;
+      }
+    },
+    onError: (message) => output?.appendLine(`sessions subscription: ${message}`),
+  });
+  sessionSubscription = sessions;
+  sessions.start();
+  context.subscriptions.push({
+    dispose: () => {
+      sessions.close();
+      sessionSubscription = undefined;
+      sessionPushActive = false;
+    },
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand("omniDevWorktrees.refresh", () => void refreshTree()),
@@ -652,19 +745,20 @@ function setupTreeView(context: vscode.ExtensionContext): void {
         void refreshTree();
       }
       // Flipping the Claude cue on repopulates it now; flipping it off has to
-      // clear what is already rendered, since the poll simply stops (#1406).
+      // clear what is already rendered, since the cue feed simply stops (#1406).
       if (e.affectsConfiguration(`${CONFIG_SECTION}.showClaudeSessions`)) {
         if (showClaudeSessions()) {
-          void refreshSessionCues();
+          syncSessionCues();
         } else {
           clearSessionCues();
         }
       }
     }),
-    // A hidden tree is not polled, so catch it up the moment it is revealed.
+    // A hidden tree is not *polled*, so catch it up the moment it is revealed.
+    // Under the push (#1414) the tally is already current and this is a no-op.
     view.onDidChangeVisibility((e) => {
       if (e.visible) {
-        void refreshSessionCues();
+        syncSessionCues();
       }
     }),
   );
@@ -1605,7 +1699,7 @@ async function refreshTree(): Promise<void> {
     applyShowClosed(reply.payload.show_closed);
     // Re-evaluate the PR-check colours for the freshly-fetched rows (#1324).
     refreshDecorations();
-    void refreshSessionCues();
+    syncSessionCues();
     if (treeView) {
       treeView.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
     }
