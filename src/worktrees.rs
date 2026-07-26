@@ -136,6 +136,29 @@ pub struct WorktreesRegistry {
     /// user simply reloads again. Behind its **own** `Mutex`, taken
     /// independently of the window map's and of `close_pending`'s, so none nest.
     reload_pending: Mutex<HashSet<String>>,
+    /// Worktree paths the daemon is **currently rebasing** (#1415) — the
+    /// transient half of the tree view's rebase cue.
+    ///
+    /// Two orthogonal facts drive that cue and neither substitutes for the other.
+    /// The *durable* one is the worktree's own `repo.state()`, read fresh off disk
+    /// into each snapshot: it survives a daemon restart and keeps showing a
+    /// left-in-place conflict until the user resolves it. This is the *transient*
+    /// one: a rebase that is running right now has not yet written a
+    /// `.git/rebase-merge` state the snapshot can see for most of its life, and a
+    /// clean rebase never leaves one at all — so without this a multi-second
+    /// rebase would render as nothing happening.
+    ///
+    /// Unlike the two directives above this is **consumer-visible state**, not a
+    /// message to one window: it rides the `tree` snapshot, so marking and
+    /// clearing it bumps the change-notify (a directive never does).
+    ///
+    /// Keyed by **canonicalized worktree path**, not window key: a rebase targets
+    /// worktrees, and a worktree need not have a window open on it. Behind its own
+    /// `Mutex`, taken independently of the window map's, `close_pending`'s and
+    /// `reload_pending`'s, so none of the four ever nest. In-memory only — a
+    /// daemon restart clears it, which is correct: nothing is rebasing any more,
+    /// and the durable `operation` field still shows any conflict left behind.
+    rebasing: Mutex<HashSet<PathBuf>>,
     /// The daemon-backed **show/hide-closed** toggle (#1301): whether the
     /// companion's tree view shows worktrees with no open window. A single
     /// cross-window value carried in every `tree`/`subscribe` snapshot so all
@@ -189,6 +212,7 @@ impl WorktreesRegistry {
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
             reload_pending: Mutex::new(HashSet::new()),
+            rebasing: Mutex::new(HashSet::new()),
             show_closed: AtomicBool::new(true),
             polling_enabled: Mutex::new(HashMap::new()),
             poll_ttl: DEFAULT_POLL_LEASE,
@@ -372,6 +396,64 @@ impl WorktreesRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)
+    }
+
+    /// Marks `paths` as being rebased right now (#1415), returning whether the
+    /// set actually changed.
+    ///
+    /// A real change [`bump`](Self::bump)s the change-notify so every subscribed
+    /// window re-pushes a snapshot carrying the spinner — the same cross-window
+    /// sync `set_show_closed` / `set_polling` rely on. Bumping **only** on a real
+    /// change is load-bearing rather than an optimization: an unconditional bump
+    /// defeats the server's snapshot diff and re-pushes to every window on every
+    /// tick.
+    ///
+    /// Callers pass **already-canonicalized** paths, so these match the tree
+    /// snapshot's own keys. Canonicalizing is disk I/O, which belongs in the
+    /// adapter (where `canonical()` lives), not in this engine — the same split
+    /// that keeps the git enrichment out of here.
+    pub fn mark_rebasing(&self, paths: &[PathBuf]) -> bool {
+        self.mutate_rebasing(paths, true)
+    }
+
+    /// Clears the rebasing mark on `paths`, returning whether the set changed.
+    /// Called on **every** exit from a phase-2 execute, so a panicking or failing
+    /// rebase can never leave a permanent spinner on a row.
+    pub fn clear_rebasing(&self, paths: &[PathBuf]) -> bool {
+        self.mutate_rebasing(paths, false)
+    }
+
+    /// The shared body of [`mark_rebasing`](Self::mark_rebasing) /
+    /// [`clear_rebasing`](Self::clear_rebasing): mutate under the set's own lock,
+    /// drop the guard, then bump if anything moved (never bump while holding a
+    /// lock, per the engine's `std::Mutex`-never-across-`.await` discipline).
+    fn mutate_rebasing(&self, paths: &[PathBuf], insert: bool) -> bool {
+        let changed = {
+            let mut set = self.rebasing.lock().unwrap_or_else(PoisonError::into_inner);
+            paths.iter().fold(false, |changed, path| {
+                let moved = if insert {
+                    set.insert(path.clone())
+                } else {
+                    set.remove(path)
+                };
+                changed || moved
+            })
+        };
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// The worktree paths currently being rebased, canonicalized. Read into each
+    /// `tree`/`subscribe` snapshot; cheap (a set clone of at most a batch's worth
+    /// of paths) and never held across an `.await`.
+    #[must_use]
+    pub fn rebasing_paths(&self) -> HashSet<PathBuf> {
+        self.rebasing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The current show/hide-closed toggle: whether the tree view shows
@@ -1042,6 +1124,56 @@ mod tests {
         assert!(!rx.has_changed().unwrap(), "marking a reload must not bump");
         assert!(reg.take_reload_pending("w1"));
         assert!(!rx.has_changed().unwrap(), "taking a reload must not bump");
+    }
+
+    // --- Rebasing set (#1415) ----------------------------------------------
+
+    #[test]
+    fn rebasing_marks_and_clears_the_named_paths() {
+        let reg = WorktreesRegistry::new();
+        let a = PathBuf::from("/tmp/a");
+        let b = PathBuf::from("/tmp/b");
+        assert!(
+            reg.rebasing_paths().is_empty(),
+            "nothing rebases by default"
+        );
+
+        assert!(reg.mark_rebasing(&[a.clone(), b.clone()]));
+        assert_eq!(reg.rebasing_paths(), [a.clone(), b.clone()].into());
+
+        // Clearing one leaves the other — a batch reports per worktree.
+        assert!(reg.clear_rebasing(std::slice::from_ref(&a)));
+        assert_eq!(reg.rebasing_paths(), [b.clone()].into());
+        assert!(reg.clear_rebasing(&[b]));
+        assert!(reg.rebasing_paths().is_empty());
+    }
+
+    #[test]
+    fn rebasing_bumps_only_on_a_real_change() {
+        // Load-bearing: an unconditional bump would defeat the server's snapshot
+        // diff and re-push a `tree` frame to every window on every tick.
+        let reg = WorktreesRegistry::new();
+        let path = PathBuf::from("/tmp/a");
+
+        let mut rx = reg.subscribe_changes();
+        assert!(reg.mark_rebasing(std::slice::from_ref(&path)));
+        assert!(rx.has_changed().unwrap(), "the first mark bumps");
+        let _ = rx.borrow_and_update();
+
+        assert!(
+            !reg.mark_rebasing(std::slice::from_ref(&path)),
+            "re-marking an already-rebasing path is not a change"
+        );
+        assert!(!rx.has_changed().unwrap(), "a no-op mark must not bump");
+
+        assert!(
+            !reg.clear_rebasing(&[PathBuf::from("/tmp/never-marked")]),
+            "clearing an unmarked path is not a change"
+        );
+        assert!(!rx.has_changed().unwrap(), "a no-op clear must not bump");
+
+        assert!(reg.clear_rebasing(&[path]));
+        assert!(rx.has_changed().unwrap(), "a real clear bumps");
     }
 
     // --- Show/hide-closed toggle (#1301) -----------------------------------
