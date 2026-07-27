@@ -540,6 +540,28 @@ offers to install it or copy the PR URL. **"Open Pull Request in Browser…"** i
 explicit way to ask for a browser instead — it opens the PR's `github.com` page in
 the OS default browser and needs no extension.
 
+A third action **copies** rather than opens. **"Copy PR URL"** (#1430) puts the
+selection's PR links on the clipboard as **one line per selected row**, in selection
+order: the PR's URL when the row has one, and a `#`-commented placeholder naming the
+row when it does not (`# No PR for <branch> in <absolute path>`, or
+`# No open PRs for <owner>/<name>` for a repo row). The placeholders are the
+feature as much as the URLs are — a block that silently dropped the PR-less rows
+could no longer tell you which of the selected worktrees are unrepresented — and the
+`#` keeps the block paste-safe into a shell, a YAML/TOML scratch file or a markdown
+list. Three rules follow from being per-**row** rather than per-PR:
+
+- A lookup that **failed** gets its own comment (`# PR lookup failed for …`) rather
+  than an emptiness placeholder, so a transient `gh`/daemon failure can never be
+  read as a settled negative. The rest of the batch still copies.
+- URLs **de-duplicate across the whole block** (a repo row plus one of its own
+  worktree rows lists that PR once) while placeholders never do — they name
+  different worktrees. A row whose URLs were all already emitted therefore
+  contributes nothing rather than a placeholder.
+- It is gated like **"Copy Directory"** (`viewItem =~ /^(repo|worktree)/`), *not*
+  like the two Open actions (`/github/`): a row with no GitHub identity, and a
+  detached worktree, both have a truthful answer here, and the `/github/` gate would
+  hide the command exactly where the placeholder earns its keep.
+
 Discovery is **daemon-served** (#1389, fix 7): a worktree already resolved
 daemon-side opens straight from the snapshot badge (**zero `gh`**), and a repo-wide
 lookup goes through the daemon's shared, TTL-cached [`open-prs`](#companion-contract-for-the-extension-and-other-clients)
