@@ -123,18 +123,32 @@ export function repoRowIcon(repo: TreeRepoPayload, showPr: boolean, tag?: string
 }
 
 /**
- * A worktree row's icon, in precedence order.
+ * A worktree row's icon: a **glyph rule** and a **colour rule**, decided separately
+ * (#1433). One rule deciding both is what used to cost the current-window row its tick
+ * for the whole of a rebase.
  *
- * 1. **The rebase cue** (#1415). A rebase in flight — or a conflict left in place —
- *    takes the icon over entirely, colour included: it is transient and actionable,
- *    where both open-state and a user's tag are neither. The row does lose its open
- *    badge for the duration, an accepted trade, since the tooltip and `contextValue`
- *    still carry open state and the badge layer's two characters are already claimed by
- *    the PR-check and Claude-session providers.
+ * **Glyph**, first match wins:
+ *
+ * 1. **The current window** — a tick, whatever else the row is doing. This is the only
+ *    place "you are here" is said at all: the badge layer's two characters are already
+ *    claimed by the PR-check and Claude-session providers, and a mid-rebase row is
+ *    precisely the row you most need to find, since `--keep-conflicts` leaves a
+ *    conflicting worktree in place for as long as the conflict takes to resolve (#1415).
+ * 2. **The rebase cue** (#1415) — a spinner while the daemon is rebasing, a warning
+ *    triangle for an operation left unfinished. On *other* rows the glyph is the only
+ *    place a row's rebase state shows, and there is no "you are here" to preserve.
+ * 3. **The open badge** — a dot for a worktree open in another window, else the plain
+ *    branch glyph for one with no live window.
+ *
+ * **Colour**, first match wins:
+ *
+ * 1. **The rebase cue** — yellow: transient and actionable, where neither open state nor
+ *    a user's tag is either. A current-window row mid-rebase therefore renders a *yellow
+ *    tick*: identity from the glyph, rebase state from the colour, with the row
+ *    description and tooltip carrying the detail as they already do.
  * 2. **The row's tag**, when the user has set one.
- * 3. **The open badge**, three-way: a blue tick for the worktree open in *this* window,
- *    a green dot for one open in another window, else the plain branch glyph for a
- *    worktree with no live window.
+ * 3. **The row's state** — green for an open worktree, this window's or another's (both
+ *    mean the same thing, and the glyph already says which), else the theme default.
  *
  * Note that a tag replaces the colour but never the glyph, so tagging a row does not
  * cost you the open-state distinction.
@@ -145,16 +159,14 @@ export function worktreeRowIcon(
   tag?: string,
 ): RowIcon {
   const rebase = worktreeRebaseCue(wt);
-  if (rebase) {
-    return { iconId: rebase.iconId, colorId: "charts.yellow" };
-  }
+  const colorId = rebase ? "charts.yellow" : (tag ?? (wt.open ? "charts.green" : undefined));
   if (isCurrentWindow(wt, windowKey)) {
-    return { iconId: "check", colorId: tag ?? "charts.blue" };
+    return { iconId: "check", colorId };
   }
-  if (wt.open) {
-    return { iconId: "circle-filled", colorId: tag ?? "charts.green" };
+  if (rebase) {
+    return { iconId: rebase.iconId, colorId };
   }
-  return { iconId: "git-branch", colorId: tag };
+  return { iconId: wt.open ? "circle-filled" : "git-branch", colorId };
 }
 
 /**
