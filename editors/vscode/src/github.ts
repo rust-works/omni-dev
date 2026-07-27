@@ -89,8 +89,14 @@ export function scopeLabel(scope: PrScope): string {
   return scope.kind === "worktree" && scope.branch ? `${repo}@${scope.branch}` : repo;
 }
 
-/** A scope's identity, for deduping a selection down to the distinct `gh` calls. */
-function scopeKey(scope: PrScope): string {
+/**
+ * A scope's identity, for deduping a selection down to the distinct `gh` calls.
+ *
+ * Exported because discovery is per **scope** while "Copy PR URL" reports per
+ * **row** (#1430): the handler fans out over the distinct scopes as usual, then
+ * joins each outcome back onto the rows that produced it, keyed by this.
+ */
+export function prScopeKey(scope: PrScope): string {
   return `${scope.kind}:${repoSlug(scope.repo)}:${scope.kind === "worktree" ? (scope.branch ?? "") : ""}`;
 }
 
@@ -113,7 +119,7 @@ export function prScopesForNodes(nodes: Node[]): PrScope[] {
     if (!scope) {
       continue;
     }
-    const key = scopeKey(scope);
+    const key = prScopeKey(scope);
     if (seen.has(key)) {
       continue;
     }

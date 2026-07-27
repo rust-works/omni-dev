@@ -1,15 +1,19 @@
-// The `vscode`-facing "Open Pull Request…" commands. They are thin adapters: the
+// The `vscode`-facing pull-request commands. They are thin adapters: the
 // node→scope mapping, discovery, `gh` arg building, parsing, URI building,
 // quick-pick formatting, and both dedupes all live in the `vscode`-free,
-// unit-tested `github.ts`; this file only wires those onto the editor — a progress
-// notification, the empty/single/multi-select branches, and the open step.
+// unit-tested `github.ts`; the clipboard block's line rules live in the equally
+// pure `prClipboard.ts`. This file only wires those onto the editor — a progress
+// notification, the empty/single/multi-select branches, and the open/copy step.
 //
-// Both commands share one selection pipeline (`selectPullRequests`) and differ
-// only in what they hand `openExternal`: the in-editor one opens each PR as a tab
-// through the GitHub Pull Requests extension's URI handler, the browser one opens
-// the PR's `github.com` page in the OS default browser.
+// The two "Open Pull Request…" commands share one selection pipeline
+// (`selectPullRequests`) and differ only in what they hand `openExternal`: the
+// in-editor one opens each PR as a tab through the GitHub Pull Requests
+// extension's URI handler, the browser one opens the PR's `github.com` page in
+// the OS default browser. "Copy PR URL" (#1430) shares only the *discovery* half
+// of that pipeline, because it reports per selected **row** rather than per
+// discovered PR — see `copyPullRequestUrls`.
 //
-// Both are `view/item/context` commands on a multi-select view (#1357), so VS Code
+// All are `view/item/context` commands on a multi-select view (#1357), so VS Code
 // invokes them as `(clicked, selected[])` and they fan out over the whole
 // selection — see `selectionTargets` for why the two arguments are resolved rather
 // than concatenated.
@@ -25,9 +29,17 @@ import {
   prOverviewUri,
   prQuickPickDescription,
   prQuickPickLabel,
+  prScopeKey,
   prScopesForNodes,
   scopeLabel,
 } from "./github";
+import {
+  PrLookup,
+  prClipboardLines,
+  prClipboardText,
+  prCopySummary,
+  prUrlsText,
+} from "./prClipboard";
 import { Node, selectionTargets } from "./tree";
 
 /** The extension that renders a GitHub PR as a tab; without it the URI no-ops. */
@@ -93,6 +105,65 @@ export async function openPullRequestInBrowser(
 }
 
 /**
+ * Copies the selection's pull request URLs to the clipboard, **one line per
+ * selected row** (#1430): the PR's URL when the row has one, a `#`-commented
+ * placeholder naming the row when it does not.
+ *
+ * That per-row mapping is the whole point, and the one way this differs
+ * structurally from {@link selectPullRequests}: discovery is per *scope* — two
+ * worktrees on one branch are still one `gh` call — so the outcomes are joined
+ * back onto the rows by {@link prScopeKey} before the lines are built. A
+ * selection whose rows all resolve from the daemon's snapshot costs no
+ * subprocess and no network at all.
+ *
+ * Unlike the open commands this never bails: a scope that fails contributes its
+ * own distinct comment (so a transient failure can never be pasted as a settled
+ * "no PR") and the rest of the batch still copies. There is no blast-radius
+ * confirm either — a clipboard write is not destructive, and the count the user
+ * gets is exactly the selection they made.
+ */
+export async function copyPullRequestUrls(
+  clicked: Node | undefined,
+  selection: Node[] | undefined,
+  fetchRepoPrs: RepoPrFetcher,
+): Promise<void> {
+  const targets = selectionTargets(clicked, selection);
+  if (targets.length === 0) {
+    return;
+  }
+
+  // A selection of rows with no GitHub identity has nothing to discover, but it
+  // still has placeholders to copy — so an empty scope list is not an early exit.
+  const scopes = prScopesForNodes(targets);
+  const found = scopes.length > 0 ? await discoverScopes(scopes, fetchRepoPrs) : [];
+
+  const byScope = new Map<string, PrLookup>();
+  const failures: PrScope[] = [];
+  scopes.forEach((scope, i) => {
+    const result = found[i];
+    if (result.status === "fulfilled") {
+      byScope.set(prScopeKey(scope), { status: "ok", prs: result.value });
+      return;
+    }
+    byScope.set(prScopeKey(scope), { status: "failed" });
+    failures.push(scope);
+  });
+
+  const lines = prClipboardLines(targets, byScope);
+  if (lines.length === 0) {
+    return;
+  }
+  await vscode.env.clipboard.writeText(prClipboardText(lines));
+
+  if (failures.length > 0) {
+    void vscode.window.showWarningMessage(
+      `omni-dev: could not find pull requests for ${failures.map(scopeLabel).join(", ")}.`,
+    );
+  }
+  vscode.window.setStatusBarMessage(prCopySummary(lines), 3000);
+}
+
+/**
  * The pull request(s) to open for a selection, or `undefined` when there is
  * nothing to open. Nodes with no GitHub identity are dropped (the menu is gated so
  * it can only ever fire on a `github` item, but a *mixed* selection can hold
@@ -115,13 +186,7 @@ async function selectPullRequests(
     return undefined;
   }
 
-  const found = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: discoveryTitle(scopes),
-    },
-    () => Promise.allSettled(scopes.map((scope) => discoverPullRequests(scope, fetchRepoPrs))),
-  );
+  const found = await discoverScopes(scopes, fetchRepoPrs);
 
   // A failing `gh` takes down only its own scope: report the failures once and
   // open what did resolve. Only a total failure is fatal — which for a single
@@ -160,6 +225,25 @@ async function selectPullRequests(
     return picked && picked.length > 0 ? picked : undefined;
   }
   return (await confirmBulkOpen(prs)) ? prs : undefined;
+}
+
+/**
+ * Discovers every distinct scope in parallel under one progress notification,
+ * settling rather than racing so one failing scope cannot cancel the others.
+ * Shared by the open commands and by "Copy PR URL", which differ only in what
+ * they make of the failures.
+ */
+function discoverScopes(
+  scopes: PrScope[],
+  fetchRepoPrs: RepoPrFetcher,
+): Thenable<PromiseSettledResult<PullRequest[]>[]> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: discoveryTitle(scopes),
+    },
+    () => Promise.allSettled(scopes.map((scope) => discoverPullRequests(scope, fetchRepoPrs))),
+  );
 }
 
 /** The progress title: the one scope's label, or how many selections are searching. */
@@ -230,7 +314,10 @@ async function warnMissingPrExtension(prs: PullRequest[]): Promise<void> {
       PR_EXTENSION_ID,
     );
   } else if (choice === "Copy PR URL") {
-    await vscode.env.clipboard.writeText(prs.map((pr) => pr.url).join("\n"));
+    // Joined through the shared helper (#1430) so the clipboard block's shape has
+    // one definition. No placeholders here: these PRs are already resolved, so the
+    // rows that contributed nothing are long gone.
+    await vscode.env.clipboard.writeText(prUrlsText(prs));
     void vscode.window.showInformationMessage(
       prs.length === 1
         ? "PR URL copied to the clipboard."
