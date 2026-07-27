@@ -318,7 +318,9 @@ export function repoContextValue(repo: TreeRepoPayload): string {
 /**
  * Whether this worktree is the one open in **the current** VS Code window — the
  * leaf whose registry `window_key` matches this window's own `windowKey`. Used to
- * mark it distinctly (a blue tick) from worktrees open in *other* windows. Stays
+ * mark it distinctly (a tick, where another window's is a dot) from worktrees open
+ * in *other* windows — a distinction the glyph carries alone, since #1433 gave both
+ * states the same colour. Stays
  * `vscode`-free so it is unit-testable. An absent `windowKey` (or a worktree with
  * no live window) never matches.
  */

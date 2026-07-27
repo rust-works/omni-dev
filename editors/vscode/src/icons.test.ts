@@ -42,7 +42,7 @@ const SELF_WT: TreeWorktreePayload = { ...CLOSED_WT, open: true, window_key: "w1
 const REPO_NODE: Node = { kind: "repo", repo: GITHUB_REPO };
 const WT_NODE: Node = { kind: "worktree", repo: GITHUB_REPO, wt: CLOSED_WT };
 
-// --- Untagged rows reproduce today's appearance exactly (#1428 acceptance) ---
+// --- Untagged rows carry the plain state appearance (#1428 acceptance, #1433 palette) ---
 
 test("an untagged repo row renders exactly as it does today", () => {
   // GitHub origin, polling on and the master switch on: green.
@@ -60,8 +60,10 @@ test("an untagged repo row renders exactly as it does today", () => {
   assert.deepEqual(repoRowIcon(PLAIN_REPO, true), { iconId: "repo", colorId: undefined });
 });
 
-test("an untagged worktree row renders exactly as it does today", () => {
-  assert.deepEqual(worktreeRowIcon(SELF_WT, "w1"), { iconId: "check", colorId: "charts.blue" });
+test("an untagged worktree row renders one glyph per open state", () => {
+  // Green, not the pre-#1433 blue: the tick and the dot both mean "open", and the glyph
+  // already says which window, so the colour has no second distinction left to draw.
+  assert.deepEqual(worktreeRowIcon(SELF_WT, "w1"), { iconId: "check", colorId: "charts.green" });
   assert.deepEqual(worktreeRowIcon(OPEN_WT, "w1"), {
     iconId: "circle-filled",
     colorId: "charts.green",
@@ -107,7 +109,7 @@ test("a tag applies to both repo glyphs, overriding the PR-poll green", () => {
   });
 });
 
-// --- The rebase cue outranks a tag (#1415) ---
+// --- The rebase cue outranks a tag (#1415), but never the current-window tick (#1433) ---
 
 test("the mid-rebase cue overrides a tag, glyph and colour", () => {
   const rebasing = { ...OPEN_WT, rebasing: true };
@@ -115,12 +117,33 @@ test("the mid-rebase cue overrides a tag, glyph and colour", () => {
     iconId: "sync~spin",
     colorId: "charts.yellow",
   });
-  // The durable half — a conflict left in place — outranks a tag just the same, and on
-  // the current-window row too.
-  const conflicted = { ...SELF_WT, operation: "rebase-merge" };
+  // The durable half — a conflict left in place — outranks a tag just the same.
+  const conflicted = { ...OPEN_WT, operation: "rebase-merge" };
   assert.deepEqual(worktreeRowIcon(conflicted, "w1", "charts.purple"), {
     iconId: "warning",
     colorId: "charts.yellow",
+  });
+});
+
+test("the current window keeps its tick mid-rebase, and takes the cue's colour", () => {
+  // A yellow tick: identity from the glyph, rebase state from the colour. The durable
+  // half matters most — `--keep-conflicts` leaves this row mid-rebase for as long as the
+  // conflict takes to resolve, which is exactly when you need to find your own window.
+  const conflicted = { ...SELF_WT, operation: "rebase-merge" };
+  assert.deepEqual(worktreeRowIcon(conflicted, "w1"), {
+    iconId: "check",
+    colorId: "charts.yellow",
+  });
+  // Same for a rebase in flight, and the cue still outranks a tag on the colour.
+  const rebasing = { ...SELF_WT, rebasing: true };
+  assert.deepEqual(worktreeRowIcon(rebasing, "w1", "charts.purple"), {
+    iconId: "check",
+    colorId: "charts.yellow",
+  });
+  // Without a rebase the tag wins, as it does on every other glyph.
+  assert.deepEqual(worktreeRowIcon(SELF_WT, "w1", "charts.purple"), {
+    iconId: "check",
+    colorId: "charts.purple",
   });
 });
 
