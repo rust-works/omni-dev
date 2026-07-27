@@ -75,6 +75,9 @@ once — the view lists every window's worktrees, so the useful verbs are plural
   row's PR. A repo node and one of its own worktrees both selected will not open
   the same PR twice. Above five PRs it asks first, since a repo node contributes
   *every* open PR of its repository — a count you did not pick.
+- **Copy PR URL** copies one line per selected row — the PR's URL, or a
+  `#`-commented placeholder naming a row that has none — so the block accounts
+  for the whole selection rather than quietly shrinking to whatever had a PR.
 - **Close Worktree** / **Close Window** run as one batch: a single confirmation
   listing exactly what will be deleted, then progress through the targets. A main
   working tree caught up in a **Close Worktree** selection is skipped and named,
@@ -108,6 +111,37 @@ if that extension is not installed, a single warning offers **Install** or **Cop
 PR URL** — it never silently falls back to a browser. **Open Pull Request in
 Browser…** is the explicit way to ask for one: it opens the PR's `github.com` page
 with your OS default browser and needs no extension at all.
+
+### Copy PR URL
+
+Right-click any repository or worktree rows and choose **Copy PR URL** to put their
+pull request links on the clipboard, ready to paste into a prompt, a stand-up note,
+a `gh` one-liner or a review checklist. It writes **one line per selected row**, in
+selection order:
+
+```
+https://github.com/rust-works/omni-dev/pull/1417
+# No PR for issue-1428-configurable-row-icon-colour in /Users/me/wrk/work-trees/omni-dev/issue-1428
+https://github.com/rust-works/omni-dev/pull/1415
+```
+
+The placeholders are the point as much as the links are: a list that silently
+dropped the PR-less rows would leave you unable to tell which of the six worktrees
+you selected are unrepresented. They are commented with `#` so the block stays
+paste-safe into a shell, a YAML/TOML scratch file or a markdown list.
+
+- A **repository** row contributes every open PR it has, one line each, and says
+  `# No open PRs for <owner>/<name>` when it has none.
+- A row with **no `github.com` origin**, or a **detached** worktree, is a
+  placeholder rather than an error — so the command is offered on every row, not
+  only GitHub ones.
+- A lookup that **fails** says so distinctly (`# PR lookup failed for …`), never as
+  a settled "no PR", and the rest of the batch still copies.
+- URLs **de-duplicate** across the whole block, so selecting a repository together
+  with one of its own worktrees lists that PR once; placeholders never
+  de-duplicate, because they name different worktrees.
+- For a repository with **PR polling** enabled the whole thing is answered from the
+  daemon's snapshot — no `gh`, no network.
 
 ### Rebase on main
 
@@ -154,12 +188,13 @@ socket involved — so it works even when the omni-dev daemon is not running.
 - **macOS or Linux only** — like the daemon, the companion is Unix-only; on
   Windows there is no daemon socket to talk to (tracked in
   [#1363](https://github.com/rust-works/omni-dev/issues/1363)).
-- For the **Open Pull Request…** actions only: the [`gh`
-  CLI](https://cli.github.com/) installed and authenticated (`gh auth login`) —
-  both actions discover PRs with it. `gh` is found on your `PATH` or in the usual
-  install locations (Homebrew, `~/.local/bin`, …); if a GUI-launched editor
-  inherits a minimal `PATH` and can't find it, set `OMNI_DEV_GH_BIN` to its full
-  path.
+- For the pull-request actions only (**Open Pull Request…**, **Open Pull Request in
+  Browser…**, **Copy PR URL**): the [`gh` CLI](https://cli.github.com/) installed
+  and authenticated (`gh auth login`) — they all discover PRs with it, except where
+  the daemon's PR polling has already resolved the answer. `gh` is found on your
+  `PATH` or in the usual install locations (Homebrew, `~/.local/bin`, …); if a
+  GUI-launched editor inherits a minimal `PATH` and can't find it, set
+  `OMNI_DEV_GH_BIN` to its full path.
 - For **Open Pull Request…** additionally: the [**GitHub Pull
   Requests**](https://marketplace.visualstudio.com/items?itemName=GitHub.vscode-pull-request-github)
   extension (`GitHub.vscode-pull-request-github`) to render the PR in a tab.
