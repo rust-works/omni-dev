@@ -132,9 +132,10 @@ export function repoRowIcon(repo: TreeRepoPayload, showPr: boolean, tag?: string
  *    still carry open state and the badge layer's two characters are already claimed by
  *    the PR-check and Claude-session providers.
  * 2. **The row's tag**, when the user has set one.
- * 3. **The open badge**, three-way: a blue tick for the worktree open in *this* window,
- *    a green dot for one open in another window, else the plain branch glyph for a
- *    worktree with no live window.
+ * 3. **The open badge**, three-way: a tick for the worktree open in *this* window, a dot
+ *    for one open in another window, else the plain branch glyph for a worktree with no
+ *    live window. The two open states share one colour (#1433) — they mean the same
+ *    thing, and which window it is is what the glyph is for.
  *
  * Note that a tag replaces the colour but never the glyph, so tagging a row does not
  * cost you the open-state distinction.
@@ -149,7 +150,7 @@ export function worktreeRowIcon(
     return { iconId: rebase.iconId, colorId: "charts.yellow" };
   }
   if (isCurrentWindow(wt, windowKey)) {
-    return { iconId: "check", colorId: tag ?? "charts.blue" };
+    return { iconId: "check", colorId: tag ?? "charts.green" };
   }
   if (wt.open) {
     return { iconId: "circle-filled", colorId: tag ?? "charts.green" };

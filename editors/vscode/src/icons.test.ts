@@ -42,7 +42,7 @@ const SELF_WT: TreeWorktreePayload = { ...CLOSED_WT, open: true, window_key: "w1
 const REPO_NODE: Node = { kind: "repo", repo: GITHUB_REPO };
 const WT_NODE: Node = { kind: "worktree", repo: GITHUB_REPO, wt: CLOSED_WT };
 
-// --- Untagged rows reproduce today's appearance exactly (#1428 acceptance) ---
+// --- Untagged rows carry the plain state appearance (#1428 acceptance, #1433 palette) ---
 
 test("an untagged repo row renders exactly as it does today", () => {
   // GitHub origin, polling on and the master switch on: green.
@@ -60,8 +60,10 @@ test("an untagged repo row renders exactly as it does today", () => {
   assert.deepEqual(repoRowIcon(PLAIN_REPO, true), { iconId: "repo", colorId: undefined });
 });
 
-test("an untagged worktree row renders exactly as it does today", () => {
-  assert.deepEqual(worktreeRowIcon(SELF_WT, "w1"), { iconId: "check", colorId: "charts.blue" });
+test("an untagged worktree row renders one glyph per open state", () => {
+  // Green, not the pre-#1433 blue: the tick and the dot both mean "open", and the glyph
+  // already says which window, so the colour has no second distinction left to draw.
+  assert.deepEqual(worktreeRowIcon(SELF_WT, "w1"), { iconId: "check", colorId: "charts.green" });
   assert.deepEqual(worktreeRowIcon(OPEN_WT, "w1"), {
     iconId: "circle-filled",
     colorId: "charts.green",
