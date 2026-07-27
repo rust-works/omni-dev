@@ -277,6 +277,19 @@ export function repoLabel(repo: TreeRepoPayload): string {
 }
 
 /**
+ * A worktree's branch as shown to the user: its branch, or `(detached)` for a
+ * detached/unborn `HEAD`. Shared by the hover tooltip and the "Copy PR URL"
+ * placeholder (#1430) so the two can never drift apart.
+ *
+ * Not to be confused with {@link worktreeLabel}, which names the *row* and so
+ * falls back to the folder basename: both callers here already show the path, to
+ * which a basename adds nothing while `(detached)` says why there is no branch.
+ */
+export function worktreeBranchLabel(wt: TreeWorktreePayload): string {
+  return wt.branch ?? "(detached)";
+}
+
+/**
  * Whether the daemon is polling this repo's PR badges (#1376) — the flag the
  * provider colours the repo icon green on. Strictly `=== true` so an absent flag
  * (the default-off case, or a pre-#1376 daemon) reads as not-polled.
@@ -546,7 +559,7 @@ export function worktreeTooltip(
   sessionsLine?: string,
 ): string {
   const kind = wt.is_main ? "main working tree" : "linked worktree";
-  const branch = wt.branch ?? "(detached)";
+  const branch = worktreeBranchLabel(wt);
   const sync = syncCounts(wt);
   const branchLine = sync ? `${branch}  ${sync}` : branch;
   const openLine = isCurrentWindow(wt, windowKey)
