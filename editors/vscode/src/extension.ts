@@ -38,7 +38,7 @@ import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
 import { SessionEntry, tallyByWorktree } from "./sessionCounts";
-import { openPullRequest, openPullRequestInBrowser } from "./prCommands";
+import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { rebaseOnMain } from "./rebaseCommand";
@@ -743,6 +743,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.openPullRequestInBrowser",
       (node?: Node, selected?: Node[]) =>
         void openPullRequestInBrowser(node, selected, repoOpenPrs),
+    ),
+    // Gated like `copyDirectory`, not like the two open commands (#1430): a row
+    // with no GitHub identity has a truthful answer here — the placeholder — and
+    // a `/github/` gate would hide the command exactly where it earns its keep.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.copyPullRequestUrl",
+      (node?: Node, selected?: Node[]) => void copyPullRequestUrls(node, selected, repoOpenPrs),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.addToMergeQueue",
