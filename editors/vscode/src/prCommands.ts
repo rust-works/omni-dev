@@ -28,6 +28,7 @@ import {
   prScopesForNodes,
   scopeLabel,
 } from "./github";
+import { prUrlsText } from "./prClipboard";
 import { Node, selectionTargets } from "./tree";
 
 /** The extension that renders a GitHub PR as a tab; without it the URI no-ops. */
@@ -230,7 +231,10 @@ async function warnMissingPrExtension(prs: PullRequest[]): Promise<void> {
       PR_EXTENSION_ID,
     );
   } else if (choice === "Copy PR URL") {
-    await vscode.env.clipboard.writeText(prs.map((pr) => pr.url).join("\n"));
+    // Joined through the shared helper (#1430) so the clipboard block's shape has
+    // one definition. No placeholders here: these PRs are already resolved, so the
+    // rows that contributed nothing are long gone.
+    await vscode.env.clipboard.writeText(prUrlsText(prs));
     void vscode.window.showInformationMessage(
       prs.length === 1
         ? "PR URL copied to the clipboard."
