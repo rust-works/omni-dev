@@ -396,10 +396,13 @@ file decoration, not description text), which also tints that row's branch label
   `owner/repo`; a non-GitHub repo is still listed by its main-repo name.
 - **Children: worktrees.** Every worktree of that repo (main + linked), labelled
   by its branch with `↑ahead ↓behind` as the row description, and a three-way
-  **open badge** icon (#1274): a **blue tick** on the worktree open in *this*
+  **open badge** icon (#1274): a **green tick** on the worktree open in *this*
   window, a **green dot** on one open in *another* window, and the plain branch
   glyph on a worktree with no live window. The current-window distinction comes
-  from matching a worktree's `window_key` against this window's own key. Any of the
+  from matching a worktree's `window_key` against this window's own key, and is
+  carried by the glyph alone (#1433) — the tick and the dot share one colour
+  because they report the same thing. The tick also wins its glyph outright, so a
+  worktree left mid-rebase still shows you which row is yours. Any of the
   three glyphs can be recoloured per row — see [Row colours](#row-colours) — which
   changes the colour only, never which glyph is shown. The
   `↑ahead ↓behind` counts are **not** in the streamed snapshot — the extension
@@ -484,9 +487,12 @@ clears every row at once.
   transiently reports closed.
 - **Precedence**, first match wins: the [mid-rebase cue](#rebase-onto-main) (yellow,
   transient and actionable) → the row's tag → the row's default state colour. So a tag
-  overrides the current-window blue tick and the PR-poll green, but a worktree left
-  mid-rebase still shows yellow until it is resolved. An untagged row renders exactly as
-  it did before the feature existed.
+  overrides the open-state green and the PR-poll green, but a worktree left mid-rebase
+  still shows yellow until it is resolved. An untagged row renders exactly as it did
+  before the feature existed.
+- **Colour decides only the colour** (#1433). The glyph is chosen by its own rule, in
+  which the current window's tick outranks even the rebase cue, so a current-window row
+  mid-rebase is a *yellow tick*: identity from the glyph, rebase state from the colour.
 - **Badges are untouched.** The PR-check and Claude-session badges keep their own
   severity-ranked colour, so a tagged row's icon and badge can differ in colour — correct,
   since they report different things.
@@ -806,9 +812,15 @@ daemon is rebasing it, and a `$(warning)` with `rebase in progress` for as long 
 a rebase is left unfinished — the two coming from separate facts, so both a clean
 in-flight rebase (which never touches disk state) and a left-in-place conflict
 (which survives a daemon restart) are visible. While either is showing, the row's
-icon replaces its usual open-state glyph; the tooltip still names the open state.
-The cue is deliberately *not* a badge: a badge holds two characters, and the PR
-check verdict and Claude session cue already take one each.
+icon turns **yellow** and — on every row but one — replaces its usual open-state
+glyph; the tooltip still names the open state. The exception is the worktree open
+in *this* window (#1433), which keeps its tick and takes only the colour, so a
+**yellow tick** marks the row you are standing in while it is mid-rebase. That
+matters most for the durable half: `--keep-conflicts` leaves this very row
+unfinished for as long as the conflict takes to resolve, and its rebase state is
+also the one you can see first-hand in VS Code's own SCM view. The cue is
+deliberately *not* a badge: a badge holds two characters, and the PR check verdict
+and Claude session cue already take one each.
 
 **The daemon is required.** With none running, the action reports it and points at
 `omni-dev daemon start` — or at running `omni-dev worktrees rebase <path>`
