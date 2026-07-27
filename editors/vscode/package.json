@@ -82,6 +82,11 @@
         "category": "omni-dev"
       },
       {
+        "command": "omniDevWorktrees.copyPullRequestUrl",
+        "title": "Copy PR URL",
+        "category": "omni-dev"
+      },
+      {
         "command": "omniDevWorktrees.setRowColor",
         "title": "Set Colour…",
         "category": "omni-dev"
@@ -187,6 +192,10 @@
           "when": "false"
         },
         {
+          "command": "omniDevWorktrees.copyPullRequestUrl",
+          "when": "false"
+        },
+        {
           "command": "omniDevWorktrees.setRowColor",
           "when": "false"
         },
@@ -288,6 +297,11 @@
           "command": "omniDevWorktrees.copyDirectory",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
           "group": "3_copy@1"
+        },
+        {
+          "command": "omniDevWorktrees.copyPullRequestUrl",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
+          "group": "3_copy@2"
         },
         {
           "command": "omniDevWorktrees.rebaseOnMain",
