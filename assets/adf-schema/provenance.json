@@ -1,8 +1,8 @@
 {
   "npm_package": "@atlaskit/adf-schema",
-  "version": "56.1.13",
-  "tarball_url": "https://registry.npmjs.org/@atlaskit/adf-schema/-/adf-schema-56.1.13.tgz",
-  "tarball_sha256": "6d199ff2b5f18833a29209f310576d0d3189cbd5cb87b1a8678d18aea5172878",
+  "version": "56.1.18",
+  "tarball_url": "https://registry.npmjs.org/@atlaskit/adf-schema/-/adf-schema-56.1.18.tgz",
+  "tarball_sha256": "402cc55a1b402d060ae257073715c8620744d948897625a29a9d726a4fde646a",
   "source_path_in_tarball": "package/dist/json-schema/v1/full.json",
   "full_json_sha256": "75f080928a970250eb8289e9cae5374e3c2a6c0ac3ca22478acaa9d3f39484a3"
 }
