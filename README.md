@@ -1,5 +1,7 @@
 # omni-dev
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Frust-works%2Fomni-dev.svg)](https://mcptoplist.com/server/glama%2Frust-works%2Fomni-dev)
+
 [![Crates.io](https://img.shields.io/crates/v/omni-dev.svg)](https://crates.io/crates/omni-dev)
 [![Documentation](https://docs.rs/omni-dev/badge.svg)](https://docs.rs/omni-dev)
 [![Build Status](https://github.com/rust-works/omni-dev/workflows/CI/badge.svg)](https://github.com/rust-works/omni-dev/actions)
