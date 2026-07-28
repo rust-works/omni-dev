@@ -7,7 +7,6 @@ import { test } from "node:test";
 import {
   confirmDetail,
   confirmTitle,
-  describeMainSkips,
   failedFetches,
   nothingToRebaseMessage,
   outcomeLabel,
@@ -70,13 +69,15 @@ test("outcomeLabel prefers the branch and falls back to the folder basename", ()
 
 test("skipReasonText spells out each slug and passes an unknown one through", () => {
   assert.equal(skipReasonText("dirty"), "uncommitted changes");
-  assert.equal(skipReasonText("main-working-tree"), "a main working tree");
   assert.equal(skipReasonText("operation-in-progress"), "a rebase or merge already in progress");
   assert.equal(skipReasonText("detached-head"), "detached HEAD");
   assert.equal(skipReasonText("not-a-worktree"), "not a git worktree");
   assert.equal(skipReasonText("no-onto-ref"), "no resolvable target branch");
   // A slug from a newer daemon still renders as itself rather than vanishing.
   assert.equal(skipReasonText("something-new"), "something-new");
+  // "main-working-tree" (#1438, ADR-0060): the daemon no longer sends it, but an
+  // old, not-yet-restarted one might — falls through here rather than vanishing.
+  assert.equal(skipReasonText("main-working-tree"), "main-working-tree");
   assert.equal(skipReasonText(undefined), "skipped");
 });
 
@@ -191,18 +192,4 @@ test("summarize escalates a failed fetch to an error", () => {
 
 test("summarize says so when nothing happened", () => {
   assert.deepEqual(summarize({}), { severity: "info", message: "nothing was rebased" });
-});
-
-test("describeMainSkips names one main tree and counts several", () => {
-  assert.equal(
-    describeMainSkips([{ path: "/w/repo", branch: "main", is_main: true, open: true }]),
-    "main is a main working tree",
-  );
-  assert.equal(
-    describeMainSkips([
-      { path: "/w/a", branch: "main", is_main: true, open: true },
-      { path: "/w/b", branch: "main", is_main: true, open: true },
-    ]),
-    "2 main working trees",
-  );
 });

@@ -4624,10 +4624,10 @@ Rebase worktrees onto the remote default branch, fetching it once per repo
 Usage: rebase [OPTIONS] [PATH]...
 
 Arguments:
-  [PATH]...  Worktree folders to rebase. Omit these and pass `--all` to rebase every linked worktree of the current repository
+  [PATH]...  Worktree folders to rebase. Omit these and pass `--all` to rebase every worktree of the current repository, including its main working tree
 
 Options:
-      --all              Rebase every linked worktree of the current repository (never the main working tree)
+      --all              Rebase every worktree of the current repository, including its main working tree
       --onto <REF>       Rebase onto this ref instead of the remote default branch. A `<remote>/<branch>` value is still fetched once up front
       --autostash        Stash uncommitted changes around each rebase instead of skipping the worktree
       --dry-run          Fetch and report what would be rebased, but rebase nothing

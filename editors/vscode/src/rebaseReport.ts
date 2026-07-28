@@ -8,7 +8,6 @@
 // in `rebaseCommand.ts` and does nothing but call into here.
 
 import { RebaseOutcome, RebaseReply } from "./socket";
-import { TreeWorktreePayload } from "./tree";
 
 /** The statuses phase 1 assigns to a worktree it *would* rebase. */
 const PENDING = "would-rebase";
@@ -60,8 +59,6 @@ export function outcomeLabel(outcome: RebaseOutcome): string {
 /** The human phrase for a skip reason slug, falling back to the slug itself. */
 export function skipReasonText(reason: string | undefined): string {
   switch (reason) {
-    case "main-working-tree":
-      return "a main working tree";
     case "detached-head":
       return "detached HEAD";
     case "dirty":
@@ -186,12 +183,4 @@ export function summarize(reply: RebaseReply): RebaseSummary {
   const severity: RebaseSummary["severity"] =
     failedFetch.length > 0 ? "error" : conflicted.length > 0 ? "warning" : "info";
   return { severity, message: parts.join("; ") };
-}
-
-/** Names the main working tree(s) a selection carried in, which are never rebased. */
-export function describeMainSkips(main: TreeWorktreePayload[]): string {
-  if (main.length === 1) {
-    return `${main[0].branch ?? main[0].path} is a main working tree`;
-  }
-  return `${main.length} main working trees`;
 }
