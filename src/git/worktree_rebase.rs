@@ -44,13 +44,15 @@ use crate::git::resolve_git_binary;
 #[derive(Debug, Clone)]
 pub enum Selection {
     /// Rebase exactly these worktree folders (each resolved to the worktree that
-    /// contains it). A path that is the main working tree, is detached, is dirty,
-    /// or is not a git worktree is reported and skipped, never rebased.
+    /// contains it). A path that is detached, is dirty, or is not a git worktree is
+    /// reported and skipped, never rebased. The main working tree is a valid target
+    /// like any other (ADR-0060).
     Paths(Vec<PathBuf>),
-    /// Rebase every **linked** worktree of the repository that contains `base`
-    /// (the process working directory). The main working tree is never included.
+    /// Rebase every worktree of the repository that contains `base` (the process
+    /// working directory) — the main working tree included, alongside every linked
+    /// one (ADR-0060).
     All {
-        /// The directory whose repository's linked worktrees are the target set.
+        /// The directory whose repository's worktrees are the target set.
         base: PathBuf,
     },
 }
@@ -195,9 +197,6 @@ pub enum RebaseResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipReason {
-    /// The main working tree — rebasing it is never the intent (structural
-    /// `is_main`, not a branch-name heuristic).
-    MainWorkingTree,
     /// A detached or unborn HEAD — there is no branch to rebase.
     DetachedHead,
     /// Uncommitted changes to tracked files (pass `--autostash` to rebase anyway).
@@ -277,15 +276,15 @@ pub fn execute(plan: Plan, opts: &RebaseOptions) -> Vec<WorktreeOutcome> {
 fn resolve_selection(selection: &Selection) -> Result<Vec<PathBuf>> {
     match selection {
         Selection::Paths(paths) => Ok(paths.clone()),
-        Selection::All { base } => linked_worktree_paths(base),
+        Selection::All { base } => all_worktree_paths(base),
     }
 }
 
-/// Every **linked** worktree path of the repository containing `base` (never the
-/// main working tree). Mirrors the daemon service's repo enumeration: discover the
-/// repo, resolve its shared common dir's parent as the main root, then list the
-/// worktrees registered on the main repository.
-fn linked_worktree_paths(base: &Path) -> Result<Vec<PathBuf>> {
+/// Every worktree path of the repository containing `base` — the main working tree
+/// plus every linked one (ADR-0060). Mirrors the daemon service's repo enumeration:
+/// discover the repo, resolve its shared common dir's parent as the main root, then
+/// list the worktrees registered on the main repository.
+fn all_worktree_paths(base: &Path) -> Result<Vec<PathBuf>> {
     let repo = Repository::discover(base)
         .with_context(|| format!("not inside a git repository: {}", base.display()))?;
     let root = main_root(&repo);
@@ -294,7 +293,7 @@ fn linked_worktree_paths(base: &Path) -> Result<Vec<PathBuf>> {
     let names = main_repo
         .worktrees()
         .context("cannot enumerate worktrees")?;
-    let mut paths = Vec::new();
+    let mut paths = vec![root];
     // `iter()` yields `Result<Option<&str>, _>`: the first `flatten` drops per-name
     // errors, the second drops non-UTF-8 names (same idiom as the daemon service).
     for name in names.iter().flatten().flatten() {
@@ -318,13 +317,14 @@ enum Inspected {
     },
 }
 
-/// The structural facts read from one worktree, independent of any fetch.
+/// The structural facts read from one worktree, independent of any fetch. Whether
+/// this is the main working tree is deliberately not among them (ADR-0060) — the
+/// rebase engine no longer distinguishes it from a linked worktree.
 struct Inspection {
     path: PathBuf,
     repo_root: PathBuf,
     branch: Option<String>,
     head_oid: Option<Oid>,
-    is_main: bool,
     state_clean: bool,
     dirty: bool,
 }
@@ -338,7 +338,6 @@ impl Inspected {
         let Ok(repo) = Repository::discover(&canon) else {
             return Self::Unresolvable { path: canon };
         };
-        let is_main = !repo.is_worktree();
         let repo_root = main_root(&repo);
         let (branch, head_oid) = head_branch(&repo);
         let state_clean = repo.state() == RepositoryState::Clean;
@@ -348,7 +347,6 @@ impl Inspected {
             repo_root,
             branch,
             head_oid,
-            is_main,
             state_clean,
             dirty,
         })
@@ -389,9 +387,8 @@ impl Inspected {
         };
 
         // Structural skips (independent of the fetch), safe-before-destructive order.
-        if i.is_main {
-            return skip(SkipReason::MainWorkingTree);
-        }
+        // The main working tree is not exempted here (ADR-0060) — it is classified
+        // exactly like any other worktree.
         let (Some(head), Some(_)) = (i.head_oid, i.branch.as_ref()) else {
             return skip(SkipReason::DetachedHead);
         };
@@ -780,8 +777,8 @@ mod tests {
 
     #[test]
     fn one_repo_with_many_worktrees_fetches_exactly_once() {
-        // Three linked worktrees sharing one repository must yield a single fetch
-        // entry — the whole point of #1400.
+        // The main tree plus three linked worktrees sharing one repository must
+        // yield a single fetch entry — the whole point of #1400.
         let _guard = serial();
         let scenario = Scenario::new();
         scenario.add_worktree("feature-a");
@@ -790,7 +787,7 @@ mod tests {
 
         let plan = plan(
             &Selection::All {
-                base: scenario.local,
+                base: scenario.local.clone(),
             },
             &RebaseOptions::default(),
         )
@@ -801,8 +798,25 @@ mod tests {
             1,
             "fetch must run once per repo, not per worktree"
         );
-        assert_eq!(plan.worktrees.len(), 3);
+        assert_eq!(
+            plan.worktrees.len(),
+            4,
+            "--all now includes the main working tree alongside its three linked \
+             worktrees (#1438)"
+        );
+        let main_canon = std::fs::canonicalize(&scenario.local).unwrap();
+        assert!(plan.worktrees.iter().any(|w| w.path == main_canon));
         assert!(plan.fetches[0].ok);
+    }
+
+    #[test]
+    fn all_worktree_paths_includes_the_main_working_tree() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.add_worktree("feature-a");
+        let paths = all_worktree_paths(&scenario.local).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&std::fs::canonicalize(&scenario.local).unwrap()));
     }
 
     #[test]
@@ -811,13 +825,14 @@ mod tests {
         let scenario = Scenario::new();
         scenario.add_worktree("feature-a");
         scenario.add_worktree("feature-b");
-        let paths = linked_worktree_paths(&scenario.local).unwrap();
+        let paths = all_worktree_paths(&scenario.local).unwrap();
         let inspected: Vec<Inspected> = paths.iter().map(|p| Inspected::read(p)).collect();
         let map = resolve_onto_by_repo(&inspected, None);
         assert_eq!(
             map.len(),
             1,
-            "two worktrees of one repo resolve to one onto entry"
+            "the main tree and two linked worktrees of one repo resolve to one onto \
+             entry"
         );
     }
 
@@ -901,20 +916,26 @@ mod tests {
     }
 
     #[test]
-    fn main_working_tree_is_skipped() {
+    fn main_working_tree_is_rebased_like_any_worktree() {
         let _guard = serial();
         let scenario = Scenario::new();
+        // Advance origin/main by one commit, so the main tree is behind on fetch.
+        scenario.advance_origin_main("second\n");
+
         let plan = plan(
-            &Selection::Paths(vec![scenario.local]),
+            &Selection::Paths(vec![scenario.local.clone()]),
             &RebaseOptions::default(),
         )
         .unwrap();
         assert_eq!(
             plan.worktrees[0].result,
-            RebaseResult::Skipped {
-                reason: SkipReason::MainWorkingTree
-            }
+            RebaseResult::WouldRebase { behind: 1 },
+            "the main working tree is a valid rebase target like any other (#1438)"
         );
+
+        let outcomes = execute(plan, &RebaseOptions::default());
+        assert_eq!(outcomes[0].result, RebaseResult::Rebased { behind: 1 });
+        assert!(head_contains(&scenario.local, &scenario.origin_main_oid()));
     }
 
     #[test]
@@ -1129,7 +1150,6 @@ mod tests {
     fn inspected(
         branch: Option<&str>,
         head: Option<Oid>,
-        is_main: bool,
         state_clean: bool,
         dirty: bool,
     ) -> Inspected {
@@ -1138,7 +1158,6 @@ mod tests {
             repo_root: PathBuf::from("/repo"),
             branch: branch.map(str::to_string),
             head_oid: head,
-            is_main,
             state_clean,
             dirty,
         })
@@ -1171,24 +1190,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_skips_the_main_working_tree() {
-        let out = classify_reason(
-            &inspected(Some("main"), Some(Oid::ZERO_SHA1), true, true, false),
-            &onto_map(),
-            false,
-        );
-        assert_eq!(
-            out,
-            RebaseResult::Skipped {
-                reason: SkipReason::MainWorkingTree
-            }
-        );
-    }
-
-    #[test]
     fn classify_skips_a_detached_head() {
         let out = classify_reason(
-            &inspected(None, Some(Oid::ZERO_SHA1), false, true, false),
+            &inspected(None, Some(Oid::ZERO_SHA1), true, false),
             &onto_map(),
             false,
         );
@@ -1203,7 +1207,7 @@ mod tests {
     #[test]
     fn classify_skips_an_in_progress_operation() {
         let out = classify_reason(
-            &inspected(Some("f"), Some(Oid::ZERO_SHA1), false, false, false),
+            &inspected(Some("f"), Some(Oid::ZERO_SHA1), false, false),
             &onto_map(),
             false,
         );
@@ -1217,7 +1221,7 @@ mod tests {
 
     #[test]
     fn classify_skips_dirty_only_without_autostash() {
-        let dirty = inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, true);
+        let dirty = inspected(Some("f"), Some(Oid::ZERO_SHA1), true, true);
         assert_eq!(
             classify_reason(&dirty, &onto_map(), false),
             RebaseResult::Skipped {
@@ -1237,7 +1241,7 @@ mod tests {
     #[test]
     fn classify_reports_no_onto_ref_when_the_repo_is_unresolved() {
         let out = classify_reason(
-            &inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, false),
+            &inspected(Some("f"), Some(Oid::ZERO_SHA1), true, false),
             &BTreeMap::new(),
             false,
         );
@@ -1251,7 +1255,7 @@ mod tests {
 
     #[test]
     fn classify_reports_fetch_failed_when_the_repos_fetch_failed() {
-        let out = inspected(Some("f"), Some(Oid::ZERO_SHA1), false, true, false)
+        let out = inspected(Some("f"), Some(Oid::ZERO_SHA1), true, false)
             .classify(&onto_map(), &ok_map(false), false)
             .result;
         assert!(matches!(out, RebaseResult::FetchFailed { .. }));

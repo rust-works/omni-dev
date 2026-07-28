@@ -145,25 +145,29 @@ paste-safe into a shell, a YAML/TOML scratch file or a markdown list.
 
 ### Rebase on main
 
-Right-click one or more **linked** worktrees and choose **Rebase on main** to rebase
-their branches onto the repository's **remote default branch**. Select as many as you
-like, across as many repositories as you like: each repository's default branch is
-**fetched once** for the whole batch, so keeping a fan-out of feature branches
-current is one gesture instead of one `cd` and one `git pull --rebase` each.
+Right-click one or more worktrees — the repository's **main working tree**
+included — and choose **Rebase on main** to rebase their branches onto the
+repository's **remote default branch**. Select as many as you like, across as
+many repositories as you like: each repository's default branch is **fetched
+once** for the whole batch, so keeping a fan-out of feature branches, and your
+own main checkout, current is one gesture instead of one `cd` and one
+`git pull --rebase` each.
 
-- It **always confirms first**, listing exactly which branches would be rewritten —
-  a rebase rewrites history.
-- A repository's **main working tree is never a target**: the action is not offered
-  on one, and one caught up in a multi-selection is skipped and named.
+- It **always confirms first**, listing exactly which branches would be
+  rewritten, each with its real behind-count measured against the freshly
+  fetched target — a rebase rewrites history.
 - Worktrees with uncommitted changes, a detached `HEAD`, or a rebase already in
-  progress are **reported and skipped**, not touched. A rebase that hits conflicts
-  is aborted, leaving that worktree exactly as it was; the rest of the batch
-  continues.
-- It runs in a **new terminal, in your own shell** — so you watch the fetch and the
-  per-worktree result table live, and can answer anything that prompts. That is also
-  why it needs no daemon but does need the `omni-dev` CLI (see
-  [Requirements](#requirements)): the fetch uses *your* SSH agent and credential
-  helper, which a daemon started by launchd/systemd does not have.
+  progress are **reported and skipped**, not touched.
+- A rebase that hits **conflicts is left mid-rebase** rather than rolled back,
+  so you can resolve it in place and finish with `git rebase --continue`; the
+  row keeps cueing it until you do, even across a restart. The rest of the
+  batch continues either way.
+- It runs through the **omni-dev daemon**, so the result comes back as a
+  structured per-worktree summary rather than a terminal you have to watch.
+  Requires `omni-dev daemon start` (see [Requirements](#requirements)); with no
+  daemon running it says so and points at `omni-dev worktrees rebase <path>`,
+  which does the whole job locally using your own shell's SSH agent and
+  credential helper.
 
 ## Open Claude Code
 

@@ -26,21 +26,13 @@ import * as vscode from "vscode";
 import {
   confirmDetail,
   confirmTitle,
-  describeMainSkips,
   nothingToRebaseMessage,
   pendingOutcomes,
   skippedOutcomes,
   summarize,
 } from "./rebaseReport";
 import { Envelope, RebaseReply, Reply, rebaseCheckEnvelope, rebaseEnvelope } from "./socket";
-import {
-  Node,
-  WorktreeNode,
-  partitionByRole,
-  selectionTargets,
-  worktreeLabel,
-  worktreeTargets,
-} from "./tree";
+import { Node, selectionTargets, worktreeLabel, worktreeTargets } from "./tree";
 
 /**
  * Generous timeout for the phase-2 execute: the daemon re-plans (which re-fetches
@@ -65,44 +57,35 @@ export interface RebaseDeps {
 }
 
 /**
- * The **Rebase on main** command: rebases every selected **linked** worktree onto
- * its repository's remote default branch, in a single `rebase` op so the daemon
- * fetches once per repository however many worktrees of it were selected.
+ * The **Rebase on main** command: rebases every selected worktree onto its
+ * repository's remote default branch, in a single `rebase` op so the daemon
+ * fetches once per repository however many worktrees were selected. The main
+ * working tree is a valid target like any other (#1438, ADR-0060): it is sent to
+ * the daemon and classified there — up-to-date, would-rebase, dirty, etc. — same
+ * as a linked worktree, with no client-side pre-filter dropping it from the batch.
  *
  * Two-phase like "Add to Merge Queue": phase 1 fetches and classifies (side-effect
  * free apart from advancing a remote-tracking ref), the modal confirms against
  * *that* result, and phase 2 re-plans from scratch before rewriting anything.
- *
- * Main working trees are filtered out here rather than trusted to the menu: a `when`
- * clause sees only the *clicked* row, so a mixed multi-selection reaches this handler
- * intact. They are **named** as skipped rather than silently dropped, the way
- * `closeWorktree` names them — quietly narrowing what the user asked for is worse
- * than telling them. (The daemon refuses them too, on the same structural `is_main`
- * guard, so this is convenience rather than the guard.)
  */
 export async function rebaseOnMain(
   deps: RebaseDeps,
   clicked?: Node,
   selected?: Node[],
 ): Promise<void> {
-  const { linked, main } = partitionByRole(worktreeTargets(selectionTargets(clicked, selected)));
-  if (linked.length === 0) {
-    if (main.length > 0) {
-      void vscode.window.showWarningMessage(
-        `omni-dev: nothing to rebase — ${describeMainSkips(main.map((t) => t.wt))}.`,
-      );
-    }
+  const targets = worktreeTargets(selectionTargets(clicked, selected));
+  if (targets.length === 0) {
     return;
   }
-  const paths = linked.map((t) => t.wt.path);
+  const paths = targets.map((t) => t.wt.path);
 
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title:
-        linked.length === 1
-          ? `Checking “${worktreeLabel(linked[0].wt)}”…`
-          : `Checking ${linked.length} worktrees…`,
+        targets.length === 1
+          ? `Checking “${worktreeLabel(targets[0].wt)}”…`
+          : `Checking ${targets.length} worktrees…`,
     },
     async (progress) => {
       // Phase 1: fetch once per repo and classify. One op for the whole batch —
@@ -125,11 +108,11 @@ export async function rebaseOnMain(
       const pending = pendingOutcomes(report);
       if (pending.length === 0) {
         void vscode.window.showWarningMessage(
-          `omni-dev: nothing to rebase — ${nothingToRebaseMessage(report, linked.length)}.`,
+          `omni-dev: nothing to rebase — ${nothingToRebaseMessage(report, targets.length)}.`,
         );
         return;
       }
-      if (!(await confirmRebase(pending, skippedOutcomes(report), linked.length, main))) {
+      if (!(await confirmRebase(pending, skippedOutcomes(report), targets.length))) {
         return;
       }
 
@@ -169,13 +152,8 @@ async function confirmRebase(
   pending: ReturnType<typeof pendingOutcomes>,
   skipped: ReturnType<typeof skippedOutcomes>,
   total: number,
-  main: WorktreeNode[],
 ): Promise<boolean> {
-  // A main working tree carried in by a mixed selection never reached the daemon,
-  // so it is named here rather than in the daemon's own skip list.
-  const mainNote =
-    main.length > 0 ? [`Skipped: ${describeMainSkips(main.map((t) => t.wt))}`, ""] : [];
-  const detail = [...mainNote, confirmDetail(pending, skipped)].join("\n");
+  const detail = confirmDetail(pending, skipped);
   const choice = await vscode.window.showWarningMessage(
     confirmTitle(pending, total),
     { modal: true, detail },

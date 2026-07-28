@@ -206,7 +206,8 @@ in `src/git/worktree_rebase.rs`.
 # Preview: fetch once per repo, report what would be rebased, change nothing.
 omni-dev worktrees rebase --all --dry-run
 
-# Rebase every linked worktree of the current repo (interactive y/N unless --yes).
+# Rebase every worktree of the current repo, main included (interactive y/N
+# unless --yes).
 omni-dev worktrees rebase --all
 
 # Rebase specific worktrees onto an explicit ref (still fetched once up front).
@@ -220,10 +221,9 @@ omni-dev worktrees rebase --all --autostash
 omni-dev worktrees rebase --all --keep-conflicts
 ```
 
-Selection is explicit: pass `<PATH>...` **or** `--all` (every linked worktree of the
-current repo, never the main working tree, keyed on the structural `is_main` fact as
-`close` is). A bare invocation with neither is a usage error, not a silent
-mass-rebase. Each worktree is reported as `rebased` / `up-to-date` /
+Selection is explicit: pass `<PATH>...` **or** `--all` (every worktree of the
+current repo, main working tree included since [ADR-0060](adrs/adr-0060.md)). A
+bare invocation with neither is a usage error, not a silent mass-rebase. Each worktree is reported as `rebased` / `up-to-date` /
 `skipped(<reason>)` / `conflict` / `fetch-failed` (`-o json` for the machine shape).
 A dirty worktree is skipped with a reason (unless `--autostash`); a detached HEAD or
 an in-progress rebase/merge is skipped; a rebase that hits conflicts is by default
@@ -769,11 +769,11 @@ the badge poll, and why it is the service's first op to mutate remote state.
 
 ### Rebase onto main
 
-**Rebase on main** (the `4_git` context-menu group, on **linked** worktree rows
-only) rebases the selected worktrees' branches onto their repository's remote
-default branch, fetching each repository's ref **once** for the whole batch (#1409,
-reworked in #1415). It drives the daemon's two-phase **`rebase`** op, which runs
-the same engine as [`worktrees rebase`](#cli).
+**Rebase on main** (the `4_git` context-menu group, on every worktree row) rebases
+the selected worktrees' branches onto their repository's remote default branch,
+fetching each repository's ref **once** for the whole batch (#1409, reworked in
+#1415). It drives the daemon's two-phase **`rebase`** op, which runs the same
+engine as [`worktrees rebase`](#cli).
 
 **It is a socket client like every other action** ([ADR-0059](adrs/adr-0059.md)).
 #1409 shipped it as a shell-out to `omni-dev worktrees rebase` in an integrated
@@ -828,14 +828,11 @@ yourself, which still works entirely locally. Every run is auditable in
 `omni-dev daemon logs` (`rebase check` / `rebase execute` lines carrying the
 requesting window, the counts, and how many worktrees were left mid-rebase).
 
-**Linked-only, and never silently widened.** The menu `when` clause is
-`viewItem =~ /worktree\..*linked/` (byte-for-byte **Close Worktree**'s gate), and
-the handler re-filters on the structural `is_main` fact, because a `when` clause is
-evaluated against the *clicked* row only and says nothing about the rest of a
-multi-selection. A main working tree carried in by a mixed selection is **named as
-skipped** in the confirmation, never quietly included — and the daemon refuses it
-on the same `is_main` guard regardless, so the UI gating is convenience, not the
-guard.
+**Every worktree row, main included** ([ADR-0060](adrs/adr-0060.md)). The menu
+`when` clause is the same unconditional `viewItem =~ /worktree/` gate **Open
+Worktree** uses — no role restriction. A selected main working tree is sent to
+the daemon like any other target and classified there (up-to-date, would-rebase,
+dirty, etc.); there is no client-side pre-filter dropping it from the batch.
 
 `--autostash` and `--onto <ref>` are **not** surfaced: a dirty worktree is reported
 as skipped in the modal the user is already reading, and a target other than the
@@ -1286,10 +1283,10 @@ the second op after `merge-queue` to spend the user's ambient credentials. It is
 same-user-bounded for the same reason everything else here is (the `0600` socket
 already requires the owning local user, so no new principal gains anything), and
 guarded in the daemon rather than by the UI: it rewrites only branches the client
-names, refuses the main working tree on the same structural `is_main` guard as
-`close`, skips a dirty tree / detached HEAD / operation already in progress, and
-**re-validates all of it on execute** rather than trusting a phase-1 result the
-client sends back. Concurrent executes are serialized, since linked worktrees share
+names — the main working tree included, since [ADR-0060](adrs/adr-0060.md); that
+guard is `close`'s alone now, unrelated to rebase — skips a dirty tree / detached
+HEAD / operation already in progress, and **re-validates all of it on execute**
+rather than trusting a phase-1 result the client sends back. Concurrent executes are serialized, since linked worktrees share
 one object database. No secret is read or persisted; the fetch relies entirely on
 the user's ambient `git` configuration, reached through `ssh-agent` exactly as the
 user's own shell would.
