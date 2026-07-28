@@ -83,3 +83,4 @@ by Michael Nygard.
 | [ADR-0057](adr-0057.md)  | ✅ Accepted                              | 2026-07-25 | Authoritative Claude Session State via a Stream-Tee Process Wrapper                         |
 | [ADR-0058](adr-0058.md)  | ✅ Accepted                              | 2026-07-25 | Repositioning VS Code Windows from the Daemon via the macOS Accessibility API               |
 | [ADR-0059](adr-0059.md)  | ✅ Accepted                              | 2026-07-26 | Daemon-Hosted Worktree Rebase, Conflicts Left In Place                                      |
+| [ADR-0060](adr-0060.md)  | ✅ Accepted                              | 2026-07-28 | The Main Working Tree Is a Valid Batch-Rebase Target                                        |
