@@ -1419,11 +1419,11 @@ impl WorktreesService {
     /// - **Phase 1** (`check:true`, or any un-`confirmed` request) — run
     ///   [`worktree_rebase::plan`], which fetches once per repo and classifies
     ///   every selected worktree. This *is* the "only rebase if it makes sense
-    ///   from the current git state" gate: the classifier skips the main working
-    ///   tree, a detached HEAD, a dirty tree, an operation already in progress, a
-    ///   non-worktree path, an unresolvable onto ref, and anything already up to
-    ///   date. Side-effect-free apart from the fetch, which only advances a
-    ///   remote-tracking ref.
+    ///   from the current git state" gate: the classifier skips a detached HEAD, a
+    ///   dirty tree, an operation already in progress, a non-worktree path, an
+    ///   unresolvable onto ref, and anything already up to date — the main working
+    ///   tree is a valid target like any other (ADR-0060). Side-effect-free apart
+    ///   from the fetch, which only advances a remote-tracking ref.
     /// - **Phase 2** (`confirmed:true`) — **re-plan from scratch** (never trust a
     ///   phase-1 result the client sent back, as `close` and `merge-queue` do),
     ///   then execute. A worktree that went dirty between the phases is skipped
