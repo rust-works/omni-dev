@@ -260,9 +260,12 @@ test("worktreeContextValue encodes open state and structural role under a shared
   assert.equal(worktreeContextValue(linkedHere, "w1"), "worktree.current.linked");
   assert.equal(worktreeContextValue(linkedElsewhere, "w1"), "worktree.open.linked");
 
-  // A closed main tree matches neither close menu (nothing to close or delete).
+  // A closed main tree matches neither close menu (nothing to close or delete),
+  // but — unlike the close menus — "Rebase on main" is not role-gated (#1438,
+  // ADR-0060), so a closed main tree still matches its bare `/worktree/` gate.
   const closedMain = { path: "/repo", is_main: true, open: false };
   assert.equal(worktreeContextValue(closedMain), "worktree.main");
+  assert.match(worktreeContextValue(closedMain), /worktree/);
 });
 
 test("worktreeContextValue appends `.github` only when the parent repo is on GitHub", () => {
@@ -291,6 +294,11 @@ test("worktreeContextValue appends `.github` only when the parent repo is on Git
   // …and both GitHub variants match the new Open-PR menu's `/github/` gate.
   assert.match(worktreeContextValue(REPOS[0].worktrees[0], "w1", true), /github/);
   assert.match(worktreeContextValue(REPOS[0].worktrees[1], "w1", true), /github/);
+  // "Rebase on main" gates on bare `/worktree/` (#1438, ADR-0060): every variant
+  // matches, main working tree included — unlike the close menus it is not
+  // role-gated.
+  assert.match(worktreeContextValue(REPOS[0].worktrees[0], "w1", true), /worktree/);
+  assert.match(worktreeContextValue(closedMain, undefined, true), /worktree/);
 });
 
 // --- PR badge (#1296) --------------------------------------------------------

@@ -305,7 +305,7 @@
         },
         {
           "command": "omniDevWorktrees.rebaseOnMain",
-          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree\\..*linked/",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
           "group": "4_git@1"
         },
         {
