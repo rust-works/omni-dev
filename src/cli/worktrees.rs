@@ -354,11 +354,11 @@ impl CloseCommand {
 #[derive(Parser)]
 pub struct RebaseCommand {
     /// Worktree folders to rebase. Omit these and pass `--all` to rebase every
-    /// linked worktree of the current repository.
+    /// worktree of the current repository, including its main working tree.
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
-    /// Rebase every linked worktree of the current repository (never the main
-    /// working tree).
+    /// Rebase every worktree of the current repository, including its main
+    /// working tree.
     #[arg(long)]
     pub all: bool,
     /// Rebase onto this ref instead of the remote default branch. A
@@ -467,7 +467,7 @@ impl RebaseCommand {
         if self.paths.is_empty() {
             bail!(
                 "specify one or more <PATH> arguments, or --all to rebase \
-                 every linked worktree of this repository"
+                 every worktree of this repository"
             );
         }
         let paths = self
@@ -597,7 +597,6 @@ fn status_and_detail(result: &RebaseResult) -> (&'static str, String) {
 /// The human explanation for why a worktree was skipped.
 fn skip_reason_text(reason: SkipReason) -> &'static str {
     match reason {
-        SkipReason::MainWorkingTree => "main working tree",
         SkipReason::DetachedHead => "detached HEAD",
         SkipReason::Dirty => "uncommitted changes; pass --autostash",
         SkipReason::OperationInProgress => "a rebase/merge is already in progress",
@@ -3051,10 +3050,6 @@ mod tests {
             reason: SkipReason::Dirty
         })
         .contains("--autostash"));
-        assert!(row(RebaseResult::Skipped {
-            reason: SkipReason::MainWorkingTree
-        })
-        .contains("main working tree"));
         assert!(row(RebaseResult::Conflict {
             detail: "CONFLICT (content)".to_string(),
             left_in_place: false,
