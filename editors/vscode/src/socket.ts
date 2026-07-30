@@ -382,6 +382,95 @@ export function rebaseEnvelope(paths: string[], requesterKey: string): Envelope 
 }
 
 /**
+ * The fields the extension sends on a `push` op — mirrors the daemon's
+ * `PushRequest` (`src/daemon/services/worktrees.rs`).
+ *
+ * A single batched op over `paths`, like `rebase` and `merge-queue`, so the reply
+ * is one per-worktree summary rather than N independent results.
+ *
+ * There is deliberately **no** force field: the daemon always pushes with
+ * `--force-with-lease --force-if-includes` where a force is needed and never
+ * without, so there is nothing for a client to opt into or out of (ADR-0061 §2).
+ */
+export interface PushPayload {
+  paths: string[];
+  requester_key: string;
+  check?: boolean;
+  confirmed?: boolean;
+}
+
+/**
+ * One worktree's outcome in a `push` reply (mirrors `WorktreeOutcome` + the
+ * flattened `PushResult` in Rust).
+ *
+ * `status` is the kebab-case discriminant: `up-to-date` / `would-fast-forward` /
+ * `would-force` / `would-create` / `skipped` in phase 1, and `pushed` / `created` /
+ * `rejected` / `skipped` in phase 2. The other fields ride along per variant.
+ */
+export interface PushOutcome {
+  path: string;
+  branch?: string;
+  /** The remote published to, or empty when none could be resolved. */
+  remote: string;
+  /** The branch name on the remote — usually, but not always, `branch`. */
+  remote_branch: string;
+  status: string;
+  /** Commits ahead of upstream (on `would-fast-forward` / `would-force`). */
+  ahead?: number;
+  /** Commits behind upstream (on `would-force`). */
+  behind?: number;
+  /** Whether a completed push needed the lease (on `pushed`). */
+  forced?: boolean;
+  /** Why a worktree was skipped, e.g. `default-branch-force-push`. */
+  reason?: string;
+  /** The refusal reason or git error (on `rejected`). */
+  detail?: string;
+  /**
+   * Set when a rejection was the **lease** — the remote moved since the tip this
+   * worktree last saw. The signal that the fix is `git fetch` plus a rebase,
+   * never a harder push. Absent means an ordinary rejection.
+   */
+  stale?: boolean;
+}
+
+/**
+ * A `push` reply. Both phases share one shape; only the statuses differ.
+ *
+ * Note the absence of a `fetches` array, unlike {@link RebaseReply}: planning a
+ * push contacts no remote, so there is nothing per-repository to report.
+ */
+export interface PushReply {
+  worktrees?: PushOutcome[];
+}
+
+/**
+ * Builds a `push` **phase-1** envelope (`check:true`): the daemon classifies every
+ * selected worktree against its upstream and pushes nothing. That classification
+ * is the "is this worth doing?" gate *and* what lets the confirmation modal show
+ * force and fast-forward as visibly different acts.
+ */
+export function pushCheckEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "push",
+    payload: { paths, requester_key: requesterKey, check: true },
+  };
+}
+
+/**
+ * Builds a `push` **phase-2** execute envelope (`confirmed:true`): the daemon
+ * re-plans from scratch and publishes each still-pending worktree. One envelope
+ * for the whole selection — a batch confirms once (ADR-0049 §1).
+ */
+export function pushEnvelope(paths: string[], requesterKey: string): Envelope {
+  return {
+    service: WORKTREES_SERVICE,
+    op: "push",
+    payload: { paths, requester_key: requesterKey, confirmed: true },
+  };
+}
+
+/**
  * The fields the extension sends on a `reposition` op — mirrors the daemon's
  * `RepositionRequest` (`src/daemon/services/worktrees.rs`).
  *
