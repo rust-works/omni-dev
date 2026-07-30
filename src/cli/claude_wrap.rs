@@ -31,8 +31,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use crate::claude::model_config::get_model_registry;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::DaemonEnvelope;
 use crate::daemon::server;
@@ -69,6 +70,19 @@ const PUMP_BUF_BYTES: usize = 64 * 1024;
 /// Exit status used when the child is killed by a signal, mirroring the shell's
 /// `128 + signo` convention.
 const SIGNAL_EXIT_BASE: i32 = 128;
+
+/// Longest we will hold bytes back while looking for the parameter or
+/// terminator of a candidate OSC `0`/`2` title sequence, across any number of
+/// `read()` calls. Bounds memory and is the fail-open backstop for the title
+/// rewrite: a malformed or pathologically split sequence is flushed
+/// unchanged, rather than held back indefinitely, once this is exceeded.
+const MAX_OSC_SEQUENCE_BYTES: usize = 8 * 1024;
+
+/// Environment variable that, set to a truthy value, disables the OSC
+/// title rewrite entirely: Claude's own title sequence is then forwarded
+/// unchanged, exactly as it was before issue #1445. An escape hatch for the
+/// rare terminal/font where the rewritten title misrenders.
+const NO_TITLE_REWRITE_ENV: &str = "OMNI_DEV_CLAUDE_WRAP_NO_TITLE_REWRITE";
 
 /// Runs a command transparently, reporting the Claude session state it streams.
 #[derive(Parser)]
@@ -184,16 +198,27 @@ where
     let child_pid = child.id();
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
-    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL));
+    let (title_tx, title_rx) = watch::channel::<Option<String>>(None);
+    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL, title_tx));
     let signals = tokio::spawn(forward_signals(child_pid));
 
+    // The title rewrite only ever applies to the FromClaude direction — it
+    // rewrites what Claude asserts about itself, never what we send it.
+    let from_child_title_rx = title_rewrite_enabled().then_some(title_rx);
     let from_child = tokio::spawn(pump(
         child_stdout,
         output,
         Direction::FromClaude,
         tee.clone(),
+        from_child_title_rx,
     ));
-    let to_child = tokio::spawn(pump(input, child_stdin, Direction::ToClaude, tee.clone()));
+    let to_child = tokio::spawn(pump(
+        input,
+        child_stdin,
+        Direction::ToClaude,
+        tee.clone(),
+        None,
+    ));
     drop(tee);
 
     // Draining the child's stdout to EOF *before* reaping is what makes the
@@ -222,25 +247,45 @@ where
 /// even attempted, and the tee is a non-blocking [`try_send`] whose failure is
 /// ignored. No I/O here can be delayed by the observer or the daemon.
 ///
+/// `title_rx` is the one deliberate, narrow exception to "never depends on
+/// the observer" (see the [`TitleRewriter`] doc comment and the ADR-0057
+/// amendment for #1445): when present, each chunk is passed through
+/// [`TitleRewriter`] before being written, which does a single non-blocking
+/// [`watch::Receiver::borrow`] of a value the observer publishes — never an
+/// `.await` on the observer or the daemon. `None` (always the `ToClaude`
+/// direction, and `FromClaude` too when the rewrite is disabled) skips the
+/// rewrite entirely and writes the chunk verbatim, exactly as before #1445.
+///
 /// [`try_send`]: tokio::sync::mpsc::Sender::try_send
 async fn pump<R, W>(
     mut reader: R,
     mut writer: W,
     direction: Direction,
     tee: mpsc::Sender<(Direction, String)>,
+    title_rx: Option<watch::Receiver<Option<String>>>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0u8; PUMP_BUF_BYTES];
     let mut line = Vec::new();
+    let mut rewriter = TitleRewriter::default();
     loop {
         let read = match reader.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
         let chunk = &buffer[..read];
-        if writer.write_all(chunk).await.is_err() || writer.flush().await.is_err() {
+        let write_result = match &title_rx {
+            Some(rx) => {
+                let prefix = rx.borrow().clone();
+                writer
+                    .write_all(&rewriter.rewrite(chunk, prefix.as_deref()))
+                    .await
+            }
+            None => writer.write_all(chunk).await,
+        };
+        if write_result.is_err() || writer.flush().await.is_err() {
             break;
         }
         tee_chunk(chunk, direction, &tee, &mut line);
@@ -248,6 +293,190 @@ async fn pump<R, W>(
     // Closing the write end propagates EOF (this is how the child learns its
     // input has ended); a failure here means the peer is already gone.
     let _ = writer.shutdown().await;
+}
+
+/// Rewrites Claude's own OSC `0`/`2` terminal-title sequence in flight,
+/// prepending a colour-glyph + model-family prefix, while leaving every other
+/// byte untouched (issue #1445).
+///
+/// **Fail-open by construction**, matching every other guarantee this module
+/// makes: a candidate sequence is forwarded byte-for-byte unchanged, exactly
+/// as received, whenever it
+/// - is not an OSC `0` or `2` sequence (any other OSC code, or a bare `ESC`
+///   not followed by `]`),
+/// - is not terminated with `BEL` or the two-byte `ESC \` (ST) form,
+/// - carries a title that is not valid UTF-8,
+/// - exceeds [`MAX_OSC_SEQUENCE_BYTES`] before terminating, or
+/// - arrives while no model is known yet (`prefix` is `None`).
+///
+/// State (`pending`/`title`/`code`/`phase`) persists across calls so a
+/// sequence split unfavourably across a `read()` buffer boundary is still
+/// recognized and rewritten correctly.
+#[derive(Debug, Default)]
+struct TitleRewriter {
+    /// Every raw byte seen since leaving [`Phase::Idle`] — the exact bytes
+    /// flushed verbatim whenever a candidate sequence does not end up being
+    /// rewritten.
+    pending: Vec<u8>,
+    /// The title text accumulated once past `ESC ] <code> ;`, excluding the
+    /// terminator.
+    title: Vec<u8>,
+    /// The OSC parameter byte (`b'0'` or `b'2'`), once known.
+    code: u8,
+    phase: Phase,
+}
+
+/// `TitleRewriter`'s position within (or outside of) a candidate OSC title
+/// sequence.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Not inside any candidate escape sequence; bytes pass straight through.
+    #[default]
+    Idle,
+    /// Saw `ESC`; deciding whether `]` follows.
+    Esc,
+    /// Saw `ESC ]`; deciding whether a `0`/`2` title code follows.
+    Open,
+    /// Saw `ESC ] <code>`; deciding whether `;` follows.
+    Code,
+    /// Accumulating title text after `ESC ] <code> ;`, until `BEL` or ST.
+    Title,
+    /// Saw `ESC` while accumulating title text; deciding whether `\` (the
+    /// second byte of the ST terminator) follows.
+    TitleEsc,
+}
+
+const ESC: u8 = 0x1B;
+const BEL: u8 = 0x07;
+
+impl TitleRewriter {
+    /// Passes `chunk` through the rewriter, returning the bytes that should
+    /// actually be written downstream. `prefix` is the current
+    /// `"{glyph} {label} · "` string to prepend to a rewritten title, or
+    /// `None` while no model is known yet.
+    fn rewrite(&mut self, chunk: &[u8], prefix: Option<&str>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(chunk.len());
+        for &byte in chunk {
+            match self.phase {
+                Phase::Idle => {
+                    if byte == ESC {
+                        self.pending.push(byte);
+                        self.phase = Phase::Esc;
+                    } else {
+                        out.push(byte);
+                    }
+                }
+                Phase::Esc => {
+                    self.pending.push(byte);
+                    if byte == b']' {
+                        self.phase = Phase::Open;
+                    } else {
+                        self.flush_pending(&mut out);
+                    }
+                }
+                Phase::Open => {
+                    self.pending.push(byte);
+                    if byte == b'0' || byte == b'2' {
+                        self.code = byte;
+                        self.phase = Phase::Code;
+                    } else {
+                        self.flush_pending(&mut out);
+                    }
+                }
+                Phase::Code => {
+                    self.pending.push(byte);
+                    if byte == b';' {
+                        self.phase = Phase::Title;
+                    } else {
+                        self.flush_pending(&mut out);
+                    }
+                }
+                Phase::Title => {
+                    self.pending.push(byte);
+                    if byte == BEL {
+                        self.finish(&mut out, prefix, &[BEL]);
+                    } else if byte == ESC {
+                        self.phase = Phase::TitleEsc;
+                    } else {
+                        self.title.push(byte);
+                    }
+                }
+                Phase::TitleEsc => {
+                    self.pending.push(byte);
+                    if byte == b'\\' {
+                        self.finish(&mut out, prefix, &[ESC, b'\\']);
+                    } else {
+                        // Not a valid ST terminator: the whole candidate is
+                        // malformed, so flush verbatim rather than guess.
+                        self.flush_pending(&mut out);
+                    }
+                }
+            }
+            if self.pending.len() > MAX_OSC_SEQUENCE_BYTES {
+                self.flush_pending(&mut out);
+            }
+        }
+        out
+    }
+
+    /// A completed sequence: rewrites it when `prefix` and a valid UTF-8
+    /// title are both available, otherwise flushes the original bytes
+    /// unchanged.
+    fn finish(&mut self, out: &mut Vec<u8>, prefix: Option<&str>, terminator: &[u8]) {
+        let rewritten = prefix.zip(std::str::from_utf8(&self.title).ok());
+        match rewritten {
+            Some((prefix, title)) => {
+                out.push(ESC);
+                out.push(b']');
+                out.push(self.code);
+                out.push(b';');
+                out.extend_from_slice(prefix.as_bytes());
+                out.extend_from_slice(title.as_bytes());
+                out.extend_from_slice(terminator);
+            }
+            None => out.extend_from_slice(&self.pending),
+        }
+        self.reset();
+    }
+
+    /// Flushes everything buffered so far, unchanged, and returns to `Idle`.
+    fn flush_pending(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pending);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.title.clear();
+        self.code = 0;
+        self.phase = Phase::Idle;
+    }
+}
+
+/// Whether the OSC title rewrite is enabled — the default, unless
+/// [`NO_TITLE_REWRITE_ENV`] is set to a truthy value.
+fn title_rewrite_enabled() -> bool {
+    !std::env::var(NO_TITLE_REWRITE_ENV).is_ok_and(|v| flag_is_truthy(&v))
+}
+
+/// Whether a `NO_TITLE_REWRITE_ENV`-style flag value should be read as "on".
+/// Split out from [`title_rewrite_enabled`] so the parsing itself is testable
+/// without mutating process-wide environment state.
+fn flag_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Builds the `"{glyph} {label} · "` prefix to prepend to Claude's own OSC
+/// title text for `model_id`, classified via the shared [`ModelRegistry`]
+/// (issue #1445).
+///
+/// [`ModelRegistry`]: crate::claude::model_config::ModelRegistry
+fn title_prefix_for_model(model_id: &str) -> String {
+    let family = get_model_registry().get_model_family(model_id);
+    format!("{} {} · ", family.glyph(), family.label())
 }
 
 /// Reassembles newline-delimited lines out of a forwarded chunk and offers each
@@ -282,11 +511,13 @@ async fn observe(
     mut lines: mpsc::Receiver<(Direction, String)>,
     socket: Option<PathBuf>,
     every: Duration,
+    title_tx: watch::Sender<Option<String>>,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
         return;
     };
     let mut tracker = StreamTracker::new();
+    let mut last_model: Option<String> = None;
     let mut keepalive = tokio::time::interval(every);
     // The first tick of a tokio interval completes immediately; consume it so
     // the keep-alive does not fire before anything has been observed.
@@ -300,6 +531,15 @@ async fn observe(
             },
             _ = keepalive.tick() => tracker.keepalive(),
         };
+        // Publish the classified title prefix whenever the model changes —
+        // independent of `observed`, since a mid-session model switch does
+        // not necessarily move `SessionState` (issue #1445). The pump's
+        // `watch::Receiver::borrow` on the other end never blocks on this.
+        if tracker.model() != last_model.as_deref() {
+            last_model = tracker.model().map(str::to_string);
+            let prefix = last_model.as_deref().map(title_prefix_for_model);
+            let _ = title_tx.send(prefix);
+        }
         if let Some(request) = observed {
             if let Ok(payload) = serde_json::to_value(request) {
                 report(&socket, "observe", payload).await;
@@ -601,7 +841,13 @@ mod tests {
         // must keep being reported, or the registry ages it out at 5 minutes.
         let (_dir, socket, seen) = fake_daemon();
         let (tee, lines) = mpsc::channel(4);
-        let observer = tokio::spawn(observe(lines, Some(socket), Duration::from_millis(20)));
+        let (title_tx, _title_rx) = watch::channel(None);
+        let observer = tokio::spawn(observe(
+            lines,
+            Some(socket),
+            Duration::from_millis(20),
+            title_tx,
+        ));
         tee.send((
             Direction::FromClaude,
             r#"{"type":"system","subtype":"init","session_id":"ka-1"}"#.to_string(),
@@ -656,6 +902,7 @@ mod tests {
             Closed,
             Direction::FromClaude,
             tee,
+            None,
         )
         .await;
         assert!(lines.try_recv().is_err());
@@ -669,4 +916,128 @@ mod tests {
         // Two of the three were dropped; nothing blocked, nothing panicked.
         assert_eq!(tee.capacity(), 0);
     }
+
+    const PREFIX: &str = "🟡 Opus · ";
+
+    #[test]
+    fn bel_terminated_title_is_rewritten_with_the_model_prefix() {
+        let mut rewriter = TitleRewriter::default();
+        let out = rewriter.rewrite(b"\x1b]0;2.1.132\x07", Some(PREFIX));
+        assert_eq!(out, b"\x1b]0;\xf0\x9f\x9f\xa1 Opus \xc2\xb7 2.1.132\x07");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]0;🟡 Opus · 2.1.132\x07"
+        );
+    }
+
+    #[test]
+    fn st_terminated_title_is_rewritten_with_the_model_prefix() {
+        let mut rewriter = TitleRewriter::default();
+        let out = rewriter.rewrite(b"\x1b]2;2.1.132\x1b\\", Some(PREFIX));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]2;🟡 Opus · 2.1.132\x1b\\"
+        );
+    }
+
+    #[test]
+    fn no_model_known_yet_leaves_the_title_unchanged() {
+        let mut rewriter = TitleRewriter::default();
+        let chunk = b"\x1b]0;2.1.132\x07";
+        let out = rewriter.rewrite(chunk, None);
+        assert_eq!(out, chunk);
+    }
+
+    #[test]
+    fn a_non_osc_chunk_is_untouched() {
+        let mut rewriter = TitleRewriter::default();
+        let chunk = b"just some ordinary assistant output, no escapes here\n";
+        let out = rewriter.rewrite(chunk, Some(PREFIX));
+        assert_eq!(out, chunk);
+    }
+
+    #[test]
+    fn a_sequence_split_across_two_reads_is_still_rewritten() {
+        let mut rewriter = TitleRewriter::default();
+        let mut out = rewriter.rewrite(b"before \x1b]0;2.1", Some(PREFIX));
+        out.extend(rewriter.rewrite(b".132\x07 after", Some(PREFIX)));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "before \x1b]0;🟡 Opus · 2.1.132\x07 after"
+        );
+    }
+
+    #[test]
+    fn an_osc_code_other_than_0_or_2_is_left_untouched() {
+        // OSC 8 (hyperlink) must never be mistaken for a title sequence.
+        let mut rewriter = TitleRewriter::default();
+        let chunk = b"\x1b]8;;https://example.invalid\x07link text\x1b]8;;\x07";
+        let out = rewriter.rewrite(chunk, Some(PREFIX));
+        assert_eq!(out, chunk);
+    }
+
+    #[test]
+    fn an_overlong_sequence_without_a_terminator_is_flushed_unchanged() {
+        let mut rewriter = TitleRewriter::default();
+        let mut chunk = b"\x1b]0;".to_vec();
+        chunk.extend(std::iter::repeat_n(b'x', MAX_OSC_SEQUENCE_BYTES + 16));
+        let out = rewriter.rewrite(&chunk, Some(PREFIX));
+        assert_eq!(out, chunk);
+    }
+
+    #[test]
+    fn a_malformed_st_terminator_is_flushed_unchanged() {
+        // ESC not immediately followed by `\` is not a valid ST: the whole
+        // candidate must be forwarded verbatim rather than guessed at.
+        let mut rewriter = TitleRewriter::default();
+        let chunk = b"\x1b]0;oops\x1bnope";
+        let out = rewriter.rewrite(chunk, Some(PREFIX));
+        assert_eq!(out, chunk);
+    }
+
+    #[test]
+    fn flag_is_truthy_recognises_on_and_off_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(flag_is_truthy(value), "{value:?} should be truthy");
+        }
+        for value in ["0", "false", "no", "off", ""] {
+            assert!(!flag_is_truthy(value), "{value:?} should not be truthy");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_rewrites_claudes_title_end_to_end() {
+        let (_dir, socket, _seen) = fake_daemon();
+        // The `sleep` gives the observer task time to process the init line
+        // and publish the classified model over the watch channel before the
+        // pump reads the title bytes — the same real-world ordering Claude
+        // gets for free from the work it does between announcing itself and
+        // first asserting its title, but which a synthetic script has to be
+        // explicit about to avoid an inherent, and otherwise harmless, race
+        // (a title asserted before the model is known is simply forwarded
+        // unrewritten, and corrected on the very next reassertion).
+        let script = concat!(
+            r#"printf '{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-4-8"}\n';"#,
+            r#"sleep 0.05;"#,
+            r#"printf '\033]0;2.1.132\007';"#,
+            r#"printf 'plain text after the title\n'"#,
+        );
+        let (_code, forwarded) = wrap_script(script, Some(socket)).await;
+        // Everything outside the OSC span survives byte-for-byte, and the
+        // title itself now carries the classified model prefix.
+        assert!(
+            forwarded.contains("\x1b]0;🟡 Opus · 2.1.132\x07"),
+            "unexpected forwarded bytes: {forwarded:?}"
+        );
+        assert!(forwarded.ends_with("plain text after the title\n"));
+    }
+
+    // Note: there is deliberately no end-to-end test that sets
+    // `NO_TITLE_REWRITE_ENV` and drives `wrap_script` — mutating that real
+    // variable would race any other test in this module concurrently
+    // spawning `wrap_io` (which reads it too), exactly the hazard
+    // `request_log.rs`'s env-var tests avoid by mutating a private test-only
+    // name instead. `flag_is_truthy_recognises_on_and_off_values` above
+    // covers the parsing directly; the one-line `.then_some(title_rx)` wiring
+    // in `wrap_io` needs no separate test.
 }
