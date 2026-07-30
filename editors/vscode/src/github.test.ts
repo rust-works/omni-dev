@@ -18,6 +18,8 @@ import {
   prScopeForNode,
   prScopesForNodes,
   pullRequestFromBadge,
+  repoWebUrl,
+  repoWebUrlsForNodes,
   scopeLabel,
 } from "./github";
 import { Node, PrBadge, TreeGithubIdentity, TreeRepoPayload } from "./tree";
@@ -349,4 +351,48 @@ test("scopeLabel names a repo scope and a branch scope", () => {
   );
   // A detached worktree has no branch to qualify the repo with.
   assert.equal(scopeLabel({ kind: "worktree", repo: REPO }), "rust-works/omni-dev");
+});
+
+// --- "Open GitHub Repository" (#1442) ----------------------------------------
+
+/** A second GitHub repo, so ordering across repos is observable. */
+const OTHER_REPO: TreeRepoPayload = {
+  main_repo: "succinctly",
+  github: { owner: "newhoggy", name: "succinctly" },
+  root: "/home/me/succinctly",
+  worktrees: [{ path: "/home/me/succinctly", branch: "main", is_main: true, open: true }],
+};
+
+test("repoWebUrl is the repository's own github.com page", () => {
+  assert.equal(repoWebUrl(REPO), "https://github.com/rust-works/omni-dev");
+  assert.equal(repoWebUrl({ owner: "o", name: "r" }), "https://github.com/o/r");
+});
+
+test("repoWebUrlsForNodes collapses a repo node and its own worktree nodes", () => {
+  assert.deepEqual(
+    repoWebUrlsForNodes([repoNode(SCOPE_REPO), wtNode(SCOPE_REPO, 1), wtNode(SCOPE_REPO, 3)]),
+    ["https://github.com/rust-works/omni-dev"],
+  );
+});
+
+test("repoWebUrlsForNodes collapses two worktree nodes of one repo", () => {
+  // No repo row in the selection at all: both rows resolve to the parent's page.
+  assert.deepEqual(repoWebUrlsForNodes([wtNode(SCOPE_REPO, 1), wtNode(SCOPE_REPO, 2)]), [
+    "https://github.com/rust-works/omni-dev",
+  ]);
+});
+
+test("repoWebUrlsForNodes drops nodes with no GitHub identity", () => {
+  assert.deepEqual(repoWebUrlsForNodes([repoNode(NO_GITHUB_REPO), wtNode(NO_GITHUB_REPO, 0)]), []);
+  assert.deepEqual(repoWebUrlsForNodes([wtNode(NO_GITHUB_REPO, 0), repoNode(SCOPE_REPO)]), [
+    "https://github.com/rust-works/omni-dev",
+  ]);
+  assert.deepEqual(repoWebUrlsForNodes([]), []);
+});
+
+test("repoWebUrlsForNodes preserves selection order across repos", () => {
+  assert.deepEqual(
+    repoWebUrlsForNodes([wtNode(OTHER_REPO, 0), repoNode(SCOPE_REPO), repoNode(OTHER_REPO)]),
+    ["https://github.com/newhoggy/succinctly", "https://github.com/rust-works/omni-dev"],
+  );
 });
