@@ -985,6 +985,8 @@ mod tests {
         assert!(hook_op(r#"{"hook_event_name":"Stop"}"#).is_none());
         // Blank session_id → no op.
         assert!(hook_op(r#"{"session_id":"  ","hook_event_name":"Stop"}"#).is_none());
+        // A session_id present but no hook_event_name at all → no op.
+        assert!(hook_op(r#"{"session_id":"s1"}"#).is_none());
         // Unknown event → no op.
         assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"PreCompact"}"#).is_none());
         // Garbage that still parses as an (empty) payload → no op.
@@ -1445,6 +1447,17 @@ mod tests {
         // Unmappable input returns before any socket work.
         cmd.report("not json").await;
         cmd.report(r#"{"hook_event_name":"Stop"}"#).await; // no session_id → no op
+    }
+
+    #[tokio::test]
+    async fn hook_report_reaches_a_live_daemon() {
+        // The happy path: a real listener answers `ok: true`, so `report()`
+        // completes the full socket round trip rather than failing early.
+        let (_dir, sock, server) = fake_daemon(json!({ "ok": true, "payload": {} }));
+        let cmd = HookCommand { socket: Some(sock) };
+        cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#)
+            .await;
+        server.await.unwrap();
     }
 
     /// Spawns a minimal fake daemon on a short-path Unix socket that answers one
