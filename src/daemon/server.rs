@@ -972,4 +972,91 @@ mod tests {
         .expect("run_stream should return promptly when the initial send fails");
         assert_eq!(reason, StreamEndReason::SendFailed);
     }
+
+    /// Unlike the initial-send test above, this exercises the loop's *own*
+    /// `SendFailed` break (the resample path): the client is only closed
+    /// after `run_stream` has already committed to resampling, so there is no
+    /// race against the hangup-detection branch on the same `select!`.
+    #[tokio::test]
+    async fn run_stream_ends_when_a_later_send_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        /// Like [`FakeStream`], but its *second* `snapshot()` call signals
+        /// `entered` and then parks on `proceed` — giving the test a
+        /// checkpoint strictly after `changed()` has won the `select!` (so
+        /// `framed.next()` cannot also be observed ready this iteration) and
+        /// strictly before the resulting write is attempted.
+        struct GatedFakeStream {
+            rx: watch::Receiver<u64>,
+            snap: Arc<StdMutex<serde_json::Value>>,
+            calls: AtomicUsize,
+            entered: Arc<Notify>,
+            proceed: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ServiceStream for GatedFakeStream {
+            async fn changed(&mut self) {
+                if self.rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            async fn snapshot(&self) -> serde_json::Value {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.entered.notify_one();
+                    self.proceed.notified().await;
+                }
+                self.snap.lock().unwrap().clone()
+            }
+        }
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = watch::channel(0u64);
+        let snap = Arc::new(StdMutex::new(json!({ "n": 0 })));
+        let entered = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let fake = GatedFakeStream {
+            rx,
+            snap: snap.clone(),
+            calls: AtomicUsize::new(0),
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+        };
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+            run_stream(
+                &mut framed,
+                Box::new(fake),
+                &server_shutdown,
+                "test-service",
+                "subscribe",
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let _initial = read_reply(&mut reader).await;
+
+        // Wake the loop into a resample. `GatedFakeStream::snapshot` signals
+        // `entered` and then parks, so nothing past this point has touched
+        // `framed.next()` yet — the client is still fully connected.
+        *snap.lock().unwrap() = json!({ "n": 1 });
+        tx.send(1).unwrap();
+        entered.notified().await;
+
+        // Only now close the client. The loop already committed to this
+        // resample, so the next thing it does is attempt (and fail) the send.
+        drop(reader);
+        proceed.notify_one();
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("run_stream should end after a later send fails")
+            .unwrap();
+        assert_eq!(reason, StreamEndReason::SendFailed);
+    }
 }
