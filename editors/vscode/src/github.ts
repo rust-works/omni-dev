@@ -1,5 +1,6 @@
 // Pull-request discovery, formatting, and URI building for the "Open Pull
-// Request…" action on the Worktrees view.
+// Request…" action on the Worktrees view — plus the repository's own
+// `github.com` page, for "Open GitHub Repository" (#1442).
 //
 // Like `tree.ts`/`socket.ts`, this module is deliberately free of any `vscode`
 // import so it stays pure and unit-testable under `node --test`. The real `gh`
@@ -283,6 +284,50 @@ export function prQuickPickDescription(pr: PullRequest): string {
 export function prOverviewUri(scheme: string, prWebUrl: string): string {
   const query = new URLSearchParams({ uri: prWebUrl }).toString();
   return `${scheme}://github.vscode-pull-request-github/open-pull-request-webview?${query}`;
+}
+
+/**
+ * The repository's own `github.com` page — `https://github.com/<owner>/<name>`
+ * (#1442).
+ *
+ * The cheapest URL in this module: a pure function of the identity the daemon
+ * already puts in every snapshot, so unlike every other GitHub action it costs no
+ * `gh`, no network and no daemon op.
+ */
+export function repoWebUrl(repo: TreeGithubIdentity): string {
+  return `https://github.com/${repoSlug(repo)}`;
+}
+
+/**
+ * The distinct repository pages for a selection of nodes, in selection order
+ * (#1442).
+ *
+ * A **worktree** node resolves to its parent repository's page — the same page,
+ * which is exactly why the result dedupes: a repo row selected alongside its own
+ * worktrees, or two worktrees of one repo, is one page, not three (the
+ * {@link dedupePullRequests} precedent). Nodes with no GitHub identity are
+ * dropped, like {@link prScopesForNodes}.
+ *
+ * Worktree nodes are accepted even though the menu is gated to repo rows: VS Code
+ * evaluates a `when` clause against the **clicked** item only, so it says nothing
+ * about the rest of a multi-selection — every handler filters to what it
+ * understands rather than trusting the gate (see `worktreeTargets`).
+ */
+export function repoWebUrlsForNodes(nodes: Node[]): string[] {
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const node of nodes) {
+    if (!node.repo.github) {
+      continue;
+    }
+    const url = repoWebUrl(node.repo.github);
+    if (seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
 }
 
 /**
