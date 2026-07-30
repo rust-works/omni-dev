@@ -168,6 +168,17 @@ impl StreamTracker {
         self.session_id.as_deref()
     }
 
+    /// The most recently reported model id, once a line has carried one.
+    ///
+    /// Unlike [`Self::session_id`], this can change over a session's
+    /// lifetime (see [`Self::absorb_identity`]) — callers that need to react
+    /// to a model change compare successive reads rather than treating a
+    /// first sighting as final.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// Feeds one stdio line and returns a sighting when the effective state
     /// changed as a result.
     ///
@@ -627,6 +638,32 @@ mod tests {
         // …and a real id later still lands.
         tracker.observe_line(Direction::FromClaude, INIT);
         assert_eq!(tracker.session_id(), Some("sess-1"));
+    }
+
+    #[test]
+    fn a_later_model_change_updates_the_tracked_model() {
+        let mut tracker = tracker_after_init();
+        assert_eq!(tracker.model(), Some("claude-opus-5"));
+        // A `/model` switch mid-session carries a second `system`/`init`
+        // line with a different model; unlike `session_id`/`cwd` this must
+        // not stay latched to the first value seen.
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-sonnet-5","tools":["Read"]}"#,
+        );
+        assert_eq!(tracker.model(), Some("claude-sonnet-5"));
+        // session_id and cwd are unaffected by the same line.
+        assert_eq!(tracker.session_id(), Some("sess-1"));
+    }
+
+    #[test]
+    fn a_blank_model_is_not_taken_as_a_change() {
+        let mut tracker = tracker_after_init();
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"assistant","session_id":"sess-1","model":"   "}"#,
+        );
+        assert_eq!(tracker.model(), Some("claude-opus-5"));
     }
 
     #[test]
