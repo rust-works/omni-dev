@@ -39,6 +39,7 @@ import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
 import { SessionEntry, tallyByWorktree } from "./sessionCounts";
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
+import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { rebaseOnMain } from "./rebaseCommand";
@@ -695,6 +696,12 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.openWorktree",
       (node?: Node, selected?: Node[]) => void openWorktrees(node, selected),
+    ),
+    // Its `0_open` neighbour (#1442), and the one GitHub action that needs
+    // nothing but the snapshot: no `gh`, no network, no daemon op.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.openGithubRepository",
+      (node?: Node, selected?: Node[]) => void openGithubRepository(node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWorktree",
