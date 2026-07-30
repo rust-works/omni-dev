@@ -3140,7 +3140,7 @@ mod tests {
         // prompt must return before `worktree_rebase::execute` is ever reached.
         // Shares the engine tests' git-load lock so the whole suite's concurrent
         // `git` spawns never starve the daemon's timing-sensitive poller tests.
-        let _guard = worktree_rebase::test_serial_lock();
+        let _guard = crate::git::worktree_batch::test_serial_lock();
         let Some(scenario) = BehindScenario::build() else {
             return; // git unavailable — the engine tests cover the git behaviour.
         };
@@ -3169,7 +3169,7 @@ mod tests {
     async fn rebase_confirmed_rebases_the_behind_worktree() {
         // The accepted branch: confirming drives plan → execute → report, and the
         // behind worktree fast-forwards onto the freshly fetched origin/main.
-        let _guard = worktree_rebase::test_serial_lock();
+        let _guard = crate::git::worktree_batch::test_serial_lock();
         let Some(scenario) = BehindScenario::build() else {
             return; // git unavailable — the engine tests cover the git behaviour.
         };
