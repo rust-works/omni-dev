@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use clap::{CommandFactory, Parser};
 use omni_dev::request_log::{self, InvocationOutcome, RequestLogContext, Source};
+use omni_dev::utils::env::{EnvSource, SystemEnv};
+use omni_dev::utils::settings::Settings;
 use omni_dev::Cli;
 
 fn main() {
@@ -16,8 +18,12 @@ fn main() {
 
     // The long-lived `daemon run` defaults to `info` so its lifecycle events reach
     // the log sink; short-lived CLI invocations stay at `warn`. `RUST_LOG` still
-    // overrides either. See #1316.
-    init_tracing(daemon_run);
+    // overrides either, and `daemon.log_level` in settings.json sits between the
+    // two (issue #1447) — the only way to raise a launchd/systemd-spawned
+    // daemon's level, since neither passes RUST_LOG through to its environment.
+    // See #1316.
+    let daemon_log_level = Settings::load_daemon().log_level;
+    init_tracing(daemon_run, daemon_log_level.as_deref());
 
     let cli = Cli::parse();
 
@@ -120,16 +126,38 @@ fn default_filter(daemon_run: bool) -> &'static str {
     }
 }
 
+/// Resolves the tracing filter directive, honouring the precedence `RUST_LOG`
+/// (process env) > `settings.daemon.log_level` > [`default_filter`] (issue
+/// #1447).
+///
+/// Pure over an injected [`EnvSource`] so the precedence is unit-testable
+/// without mutating the process environment — mirrors
+/// `crate::mcp::runtime::resolve_log_directive`. Empty values at either layer
+/// are ignored so a blank `RUST_LOG` or `log_level` does not mask the next
+/// tier.
+fn resolve_log_directive(
+    env: &impl EnvSource,
+    daemon_run: bool,
+    daemon_log_level: Option<&str>,
+) -> String {
+    env.var("RUST_LOG")
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            daemon_log_level
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| default_filter(daemon_run).to_string())
+}
+
 /// Initializes the tracing subscriber (stderr, `RUST_LOG`-driven), keeping
-/// daemon/debug logs off stdout. The default level when `RUST_LOG` is unset is
-/// [`default_filter`]; `RUST_LOG` still overrides it.
-fn init_tracing(daemon_run: bool) {
+/// daemon/debug logs off stdout. The filter directive is resolved via
+/// [`resolve_log_directive`].
+fn init_tracing(daemon_run: bool, daemon_log_level: Option<&str>) {
+    let directive = resolve_log_directive(&SystemEnv, daemon_run, daemon_log_level);
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(daemon_run))),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(directive))
         .init();
 }
 
@@ -148,9 +176,34 @@ fn die(e: &anyhow::Error) -> ! {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A pure in-memory [`EnvSource`] for this binary crate's tests. `main.rs`
+    /// is a separate crate from `omni_dev`'s lib, so it cannot reach the
+    /// lib's private, `#[cfg(test)]`-only `test_support::env::MapEnv` — this
+    /// is that same fake, redefined locally.
+    #[derive(Default)]
+    struct MapEnv(HashMap<String, String>);
+
+    impl MapEnv {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with(mut self, key: &str, value: &str) -> Self {
+            self.0.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl EnvSource for MapEnv {
+        fn var(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
     }
 
     #[test]
@@ -175,5 +228,33 @@ mod tests {
     fn default_filter_is_info_only_for_daemon_run() {
         assert_eq!(default_filter(true), "info");
         assert_eq!(default_filter(false), "warn");
+    }
+
+    #[test]
+    fn resolve_log_directive_rust_log_wins_over_setting() {
+        let env = MapEnv::new().with("RUST_LOG", "trace");
+        assert_eq!(resolve_log_directive(&env, true, Some("info")), "trace");
+    }
+
+    #[test]
+    fn resolve_log_directive_setting_used_when_rust_log_unset() {
+        let env = MapEnv::new();
+        assert_eq!(resolve_log_directive(&env, false, Some("debug")), "debug");
+    }
+
+    #[test]
+    fn resolve_log_directive_falls_back_to_default_filter_per_daemon_run() {
+        let env = MapEnv::new();
+        assert_eq!(resolve_log_directive(&env, true, None), "info");
+        assert_eq!(resolve_log_directive(&env, false, None), "warn");
+    }
+
+    #[test]
+    fn resolve_log_directive_ignores_empty_values() {
+        // A blank RUST_LOG falls through to the setting; a blank setting
+        // falls through to the daemon_run-conditioned default.
+        let env = MapEnv::new().with("RUST_LOG", "");
+        assert_eq!(resolve_log_directive(&env, false, Some("trace")), "trace");
+        assert_eq!(resolve_log_directive(&env, true, Some("")), "info");
     }
 }
