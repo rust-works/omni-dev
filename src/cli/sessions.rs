@@ -204,6 +204,7 @@ impl HookCommand {
     pub async fn execute(self) -> Result<()> {
         let mut input = String::new();
         if std::io::stdin().read_to_string(&mut input).is_err() {
+            tracing::debug!("sessions hook: failed to read stdin; ignoring");
             return Ok(());
         }
         self.report(&input).await;
@@ -214,18 +215,24 @@ impl HookCommand {
     /// out so tests can exercise the send path against a fake socket.
     async fn report(&self, input: &str) {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
+            tracing::debug!("sessions hook: unparseable hook JSON; ignoring");
             return;
         };
         let Some((op, payload)) = hook.to_op() else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
+            tracing::debug!("sessions hook: failed to resolve the daemon socket; ignoring");
             return;
         };
         // Bounded, and every failure ignored: the daemon may be down, and that
         // must be a silent no-op.
         let env = DaemonEnvelope::service(SERVICE, op, payload);
-        let _ = tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await;
+        match tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!(op, error = %e, "sessions hook: daemon request failed"),
+            Err(_) => tracing::debug!(op, "sessions hook: timed out reporting to the daemon"),
+        }
     }
 }
 
@@ -255,8 +262,17 @@ impl HookPayload {
     /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
     /// it carries no `session_id` or names an event the tracker ignores.
     fn to_op(&self) -> Option<(&'static str, Value)> {
-        let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
-        let event_name = self.hook_event_name.as_deref()?;
+        let Some(session_id) = self.session_id.clone().filter(|s| !s.trim().is_empty()) else {
+            tracing::debug!("sessions hook: missing or blank session_id; ignoring");
+            return None;
+        };
+        let Some(event_name) = self.hook_event_name.as_deref() else {
+            tracing::debug!(
+                session_id,
+                "sessions hook: missing hook_event_name; ignoring"
+            );
+            return None;
+        };
         if event_name == "SessionEnd" {
             let mut payload = json!({ "session_id": session_id });
             if let Some(reason) = &self.message {
@@ -264,7 +280,14 @@ impl HookPayload {
             }
             return Some(("end", payload));
         }
-        let event = session_event_for(event_name, self.message.as_deref())?;
+        let Some(event) = session_event_for(event_name, self.message.as_deref()) else {
+            tracing::debug!(
+                session_id,
+                event_name,
+                "sessions hook: unrecognized hook event; ignoring"
+            );
+            return None;
+        };
         let request = ObserveRequest {
             session_id,
             cwd: self.cwd.clone(),
@@ -309,6 +332,16 @@ fn classify_notification(message: Option<&str>) -> NotificationKind {
     {
         NotificationKind::IdlePrompt
     } else {
+        // The interesting diagnostic case (#1447): a wording change in Claude
+        // Code's own notification banner would silently defeat this
+        // substring match, so log the (short, non-conversation) banner text
+        // that fell through — truncated defensively in case a future banner
+        // is unexpectedly long.
+        let truncated: String = message.chars().take(200).collect();
+        tracing::debug!(
+            message = truncated,
+            "sessions hook: unclassified notification message"
+        );
         NotificationKind::Other
     }
 }
