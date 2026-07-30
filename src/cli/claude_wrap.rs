@@ -256,13 +256,24 @@ where
 /// direction, and `FromClaude` too when the rewrite is disabled) skips the
 /// rewrite entirely and writes the chunk verbatim, exactly as before #1445.
 ///
+/// A second, independent branch races [`watch::Receiver::changed`] against
+/// the read: real Claude asserts its title once at startup, not on a timer,
+/// so waiting only on chunks read *from Claude* would very often lose the
+/// race against the observer classifying the model — with nothing left to
+/// reassert and catch it later. When the model becomes known (or changes),
+/// this branch calls [`TitleRewriter::resync`] to correct the cached title
+/// immediately, with no new bytes from Claude required. It is still
+/// non-blocking on the observer in the sense that matters: a value already
+/// sitting in the channel is read instantly, and if the observer never
+/// updates it, this branch simply never fires — it cannot hang the pump.
+///
 /// [`try_send`]: tokio::sync::mpsc::Sender::try_send
 async fn pump<R, W>(
     mut reader: R,
     mut writer: W,
     direction: Direction,
     tee: mpsc::Sender<(Direction, String)>,
-    title_rx: Option<watch::Receiver<Option<String>>>,
+    mut title_rx: Option<watch::Receiver<Option<String>>>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -271,24 +282,54 @@ async fn pump<R, W>(
     let mut line = Vec::new();
     let mut rewriter = TitleRewriter::default();
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let chunk = &buffer[..read];
-        let write_result = match &title_rx {
-            Some(rx) => {
-                let prefix = rx.borrow().clone();
-                writer
-                    .write_all(&rewriter.rewrite(chunk, prefix.as_deref()))
-                    .await
+        let title_changed = async {
+            match title_rx.as_mut() {
+                Some(rx) => rx.changed().await,
+                // No receiver (ToClaude, or the rewrite is disabled): never
+                // resolves, so `select!` only ever waits on the read.
+                None => std::future::pending().await,
             }
-            None => writer.write_all(chunk).await,
         };
-        if write_result.is_err() || writer.flush().await.is_err() {
-            break;
+        tokio::select! {
+            read_result = reader.read(&mut buffer) => {
+                let read = match read_result {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let chunk = &buffer[..read];
+                let write_result = match &title_rx {
+                    Some(rx) => {
+                        let prefix = rx.borrow().clone();
+                        writer
+                            .write_all(&rewriter.rewrite(chunk, prefix.as_deref()))
+                            .await
+                    }
+                    None => writer.write_all(chunk).await,
+                };
+                if write_result.is_err() || writer.flush().await.is_err() {
+                    break;
+                }
+                tee_chunk(chunk, direction, &tee, &mut line);
+            }
+            changed = title_changed => {
+                match changed {
+                    Ok(()) => {
+                        let Some(rx) = &title_rx else { continue };
+                        let prefix = rx.borrow().clone();
+                        let Some(bytes) = rewriter.resync(prefix.as_deref()) else { continue };
+                        if writer.write_all(&bytes).await.is_err()
+                            || writer.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // The observer's sender was dropped; stop selecting on
+                    // this branch rather than spinning on a channel that
+                    // will report closed forever.
+                    Err(_) => title_rx = None,
+                }
+            }
         }
-        tee_chunk(chunk, direction, &tee, &mut line);
     }
     // Closing the write end propagates EOF (this is how the child learns its
     // input has ended); a failure here means the peer is already gone.
@@ -312,6 +353,18 @@ async fn pump<R, W>(
 /// State (`pending`/`title`/`code`/`phase`) persists across calls so a
 /// sequence split unfavourably across a `read()` buffer boundary is still
 /// recognized and rewritten correctly.
+///
+/// Real Claude Code asserts its title **once**, as part of its terminal-mode
+/// setup at startup, not on a timer — measured empirically, not the
+/// "continuously re-asserted" behavior issue #1445 assumed. Left as
+/// rewrite-on-assert alone, that one assertion almost always races ahead of
+/// the model becoming known (the observer needs to receive, tee, and parse
+/// the `system`/`init` line first), and since there is no later reassertion
+/// to catch, the title is never corrected for the rest of the session. Every
+/// completed sequence is therefore also cached — regardless of whether it
+/// was rewritten or forwarded unchanged — so [`Self::resync`] can re-emit a
+/// corrected title the moment the model becomes known (or changes again),
+/// without waiting for Claude to assert anything else.
 #[derive(Debug, Default)]
 struct TitleRewriter {
     /// Every raw byte seen since leaving [`Phase::Idle`] — the exact bytes
@@ -324,6 +377,12 @@ struct TitleRewriter {
     /// The OSC parameter byte (`b'0'` or `b'2'`), once known.
     code: u8,
     phase: Phase,
+    /// The most recently completed sequence's parameter byte, title text,
+    /// and terminator — cached regardless of whether it was rewritten, so
+    /// [`Self::resync`] can reformat it under a new prefix.
+    last_code: Option<u8>,
+    last_title: Option<Vec<u8>>,
+    last_terminator: Option<Vec<u8>>,
 }
 
 /// `TitleRewriter`'s position within (or outside of) a candidate OSC title
@@ -421,7 +480,7 @@ impl TitleRewriter {
 
     /// A completed sequence: rewrites it when `prefix` and a valid UTF-8
     /// title are both available, otherwise flushes the original bytes
-    /// unchanged.
+    /// unchanged. Cached either way, for [`Self::resync`].
     fn finish(&mut self, out: &mut Vec<u8>, prefix: Option<&str>, terminator: &[u8]) {
         let rewritten = prefix.zip(std::str::from_utf8(&self.title).ok());
         match rewritten {
@@ -436,7 +495,29 @@ impl TitleRewriter {
             }
             None => out.extend_from_slice(&self.pending),
         }
+        self.last_code = Some(self.code);
+        self.last_title = Some(self.title.clone());
+        self.last_terminator = Some(terminator.to_vec());
         self.reset();
+    }
+
+    /// Re-emits the most recently completed title sequence under a new
+    /// `prefix`, so a title Claude already asserted — before any model was
+    /// known, or under a now-stale one — is corrected without waiting for
+    /// Claude to reassert it on its own (which, empirically, it may never
+    /// do again for the rest of the session). Returns `None` when nothing
+    /// has completed yet, `prefix` is still unavailable, or the cached title
+    /// is not valid UTF-8.
+    fn resync(&self, prefix: Option<&str>) -> Option<Vec<u8>> {
+        let prefix = prefix?;
+        let code = self.last_code?;
+        let title = std::str::from_utf8(self.last_title.as_ref()?).ok()?;
+        let terminator = self.last_terminator.as_ref()?;
+        let mut out = vec![ESC, b']', code, b';'];
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(title.as_bytes());
+        out.extend_from_slice(terminator);
+        Some(out)
     }
 
     /// Flushes everything buffered so far, unchanged, and returns to `Idle`.
@@ -908,6 +989,41 @@ mod tests {
         assert!(lines.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn pump_resyncs_the_title_from_the_watch_channel_alone_with_no_further_reads() {
+        // Isolates pump()'s select! loop from the rest of the observe()
+        // pipeline: drives the watch channel directly, with a reader that
+        // never offers a second chunk, to prove the resync path does not
+        // depend on Claude sending anything else.
+        let (tee, _lines) = mpsc::channel(4);
+        let (title_tx, title_rx) = watch::channel(None);
+        let sink = Sink::default();
+        let (mut writer_end, reader_end) = tokio::io::duplex(1024);
+        writer_end.write_all(b"\x1b]0;2.1.132\x07").await.unwrap();
+
+        let pump_task = tokio::spawn(pump(
+            reader_end,
+            sink.clone(),
+            Direction::FromClaude,
+            tee,
+            Some(title_rx),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(sink.contents(), "\x1b]0;2.1.132\x07");
+
+        title_tx.send(Some(PREFIX.to_string())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            sink.contents().contains("\x1b]0;🟡 Opus · 2.1.132\x07"),
+            "expected a resynced title, got: {:?}",
+            sink.contents()
+        );
+
+        drop(writer_end);
+        let _ = pump_task.await;
+    }
+
     #[test]
     fn a_full_tee_drops_lines_rather_than_blocking() {
         let (tee, _lines) = mpsc::channel(1);
@@ -996,6 +1112,46 @@ mod tests {
     }
 
     #[test]
+    fn resync_returns_none_before_anything_has_completed() {
+        let rewriter = TitleRewriter::default();
+        assert_eq!(rewriter.resync(Some(PREFIX)), None);
+    }
+
+    #[test]
+    fn resync_returns_none_without_a_prefix() {
+        let mut rewriter = TitleRewriter::default();
+        rewriter.rewrite(b"\x1b]0;2.1.132\x07", None);
+        assert_eq!(rewriter.resync(None), None);
+    }
+
+    #[test]
+    fn resync_reformats_a_title_that_was_forwarded_before_the_model_was_known() {
+        // The exact real-world case this exists for: Claude's one-and-only
+        // title assertion raced ahead of the model becoming known, so it
+        // went out unrewritten — resync must still be able to correct it
+        // later, from the cache, with no further help from Claude.
+        let mut rewriter = TitleRewriter::default();
+        let forwarded = rewriter.rewrite(b"\x1b]0;2.1.132\x07", None);
+        assert_eq!(forwarded, b"\x1b]0;2.1.132\x07");
+        let corrected = rewriter.resync(Some(PREFIX)).unwrap();
+        assert_eq!(
+            String::from_utf8(corrected).unwrap(),
+            "\x1b]0;🟡 Opus · 2.1.132\x07"
+        );
+    }
+
+    #[test]
+    fn resync_reformats_under_a_changed_prefix_on_a_mid_session_model_switch() {
+        let mut rewriter = TitleRewriter::default();
+        rewriter.rewrite(b"\x1b]0;2.1.132\x07", Some(PREFIX));
+        let resynced = rewriter.resync(Some("🟢 Sonnet · ")).unwrap();
+        assert_eq!(
+            String::from_utf8(resynced).unwrap(),
+            "\x1b]0;🟢 Sonnet · 2.1.132\x07"
+        );
+    }
+
+    #[test]
     fn flag_is_truthy_recognises_on_and_off_values() {
         for value in ["1", "true", "TRUE", "yes", "on", " on "] {
             assert!(flag_is_truthy(value), "{value:?} should be truthy");
@@ -1008,27 +1164,38 @@ mod tests {
     #[tokio::test]
     async fn the_wrapper_rewrites_claudes_title_end_to_end() {
         let (_dir, socket, _seen) = fake_daemon();
-        // The `sleep` gives the observer task time to process the init line
-        // and publish the classified model over the watch channel before the
-        // pump reads the title bytes — the same real-world ordering Claude
-        // gets for free from the work it does between announcing itself and
-        // first asserting its title, but which a synthetic script has to be
-        // explicit about to avoid an inherent, and otherwise harmless, race
-        // (a title asserted before the model is known is simply forwarded
-        // unrewritten, and corrected on the very next reassertion).
+        // Models the real race, not the happy path: real Claude asserts its
+        // title once, at startup, *before* the model can possibly be known
+        // (the observer has not even received the init line yet) — and,
+        // empirically, does not reassert it later in the session. So the
+        // very first assertion here is forwarded unrewritten (correct,
+        // fail-open behavior), and the `sleep` that follows leaves the child
+        // otherwise idle long enough for the async observer pipeline to
+        // classify the model and for the pump's watch-driven resync to
+        // correct the title on its own, with no further help from Claude.
         let script = concat!(
-            r#"printf '{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-4-8"}\n';"#,
-            r#"sleep 0.05;"#,
             r#"printf '\033]0;2.1.132\007';"#,
+            r#"printf '{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-4-8"}\n';"#,
+            r#"sleep 0.2;"#,
             r#"printf 'plain text after the title\n'"#,
         );
         let (_code, forwarded) = wrap_script(script, Some(socket)).await;
-        // Everything outside the OSC span survives byte-for-byte, and the
-        // title itself now carries the classified model prefix.
+        // The original, un-decorated assertion still reaches stdout exactly
+        // as Claude sent it — fail-open means "forward unchanged", not "hold
+        // back and hope".
+        assert!(
+            forwarded.contains("\x1b]0;2.1.132\x07"),
+            "the original title should still have been forwarded verbatim: {forwarded:?}"
+        );
+        // And it is followed, with no further title assertion from Claude,
+        // by a corrected one carrying the classified model prefix.
         assert!(
             forwarded.contains("\x1b]0;🟡 Opus · 2.1.132\x07"),
-            "unexpected forwarded bytes: {forwarded:?}"
+            "the title should have been corrected once the model became known: {forwarded:?}"
         );
+        let uncorrected_at = forwarded.find("\x1b]0;2.1.132\x07").unwrap();
+        let corrected_at = forwarded.find("\x1b]0;🟡 Opus · 2.1.132\x07").unwrap();
+        assert!(uncorrected_at < corrected_at);
         assert!(forwarded.ends_with("plain text after the title\n"));
     }
 
