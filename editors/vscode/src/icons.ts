@@ -21,7 +21,7 @@ import {
   isCurrentWindow,
   nodeId,
   repoPollingEnabled,
-  worktreeRebaseCue,
+  worktreeGitCue,
 } from "./tree";
 
 /**
@@ -134,17 +134,17 @@ export function repoRowIcon(repo: TreeRepoPayload, showPr: boolean, tag?: string
  *    claimed by the PR-check and Claude-session providers, and a mid-rebase row is
  *    precisely the row you most need to find, since `--keep-conflicts` leaves a
  *    conflicting worktree in place for as long as the conflict takes to resolve (#1415).
- * 2. **The rebase cue** (#1415) — a spinner while the daemon is rebasing, a warning
- *    triangle for an operation left unfinished. On *other* rows the glyph is the only
- *    place a row's rebase state shows, and there is no "you are here" to preserve.
+ * 2. **The git-operation cue** (#1415, #1443) — a spinner while the daemon is rebasing
+ *    or pushing, a warning triangle for an operation left unfinished. On *other* rows the
+ *    glyph is the only place that state shows, and there is no "you are here" to preserve.
  * 3. **The open badge** — a dot for a worktree open in another window, else the plain
  *    branch glyph for one with no live window.
  *
  * **Colour**, first match wins:
  *
- * 1. **The rebase cue** — yellow: transient and actionable, where neither open state nor
- *    a user's tag is either. A current-window row mid-rebase therefore renders a *yellow
- *    tick*: identity from the glyph, rebase state from the colour, with the row
+ * 1. **The git-operation cue** — yellow: transient and actionable, where neither open
+ *    state nor a user's tag is either. A current-window row mid-rebase therefore renders a
+ *    *yellow tick*: identity from the glyph, operation state from the colour, with the row
  *    description and tooltip carrying the detail as they already do.
  * 2. **The row's tag**, when the user has set one.
  * 3. **The row's state** — green for an open worktree, this window's or another's (both
@@ -158,13 +158,13 @@ export function worktreeRowIcon(
   windowKey?: string,
   tag?: string,
 ): RowIcon {
-  const rebase = worktreeRebaseCue(wt);
-  const colorId = rebase ? "charts.yellow" : (tag ?? (wt.open ? "charts.green" : undefined));
+  const cue = worktreeGitCue(wt);
+  const colorId = cue ? "charts.yellow" : (tag ?? (wt.open ? "charts.green" : undefined));
   if (isCurrentWindow(wt, windowKey)) {
     return { iconId: "check", colorId };
   }
-  if (rebase) {
-    return { iconId: rebase.iconId, colorId };
+  if (cue) {
+    return { iconId: cue.iconId, colorId };
   }
   return { iconId: wt.open ? "circle-filled" : "git-branch", colorId };
 }

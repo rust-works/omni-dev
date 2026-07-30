@@ -42,6 +42,7 @@ import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
+import { pushForceWithLease } from "./pushCommand";
 import { rebaseOnMain } from "./rebaseCommand";
 import { RowColorMap } from "./icons";
 import { clearAllRowColors, setRowColor } from "./rowColorCommand";
@@ -770,6 +771,16 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       "omniDevWorktrees.rebaseOnMain",
       (node?: Node, selected?: Node[]) =>
         void rebaseOnMain({ send, windowKey }, node, selected),
+    ),
+    // The other half of the rebase workflow (#1443): a rebase diverges every
+    // already-published branch it touches, and this is what publishes them again.
+    // Offered on repo rows as well as worktree rows, so the handler expands a
+    // selected repo to its worktrees rather than dropping it. See `pushCommand.ts`
+    // and ADR-0061.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.pushForceWithLease",
+      (node?: Node, selected?: Node[]) =>
+        void pushForceWithLease({ send, windowKey }, node, selected),
     ),
     // Geometry work happens in the daemon, which is the only process that can do
     // it (#1407) — a VS Code extension has no API for its own window's bounds.

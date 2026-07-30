@@ -113,6 +113,16 @@ export interface TreeWorktreePayload {
    * without this a multi-second rebase would render as nothing happening.
    */
   rebasing?: boolean;
+  /**
+   * Whether the daemon is pushing this worktree **right now** (#1443) — the
+   * {@link TreeWorktreePayload.rebasing} twin.
+   *
+   * Unlike a rebase this cue has no durable counterpart: a push writes no on-disk
+   * state, so there is no `operation` equivalent and this flag is the whole of it.
+   * A *completed* push shows instead as {@link TreeWorktreePayload.upstream_sha}
+   * moving. Absent from a pre-#1443 daemon.
+   */
+  pushing?: boolean;
 }
 
 /**
@@ -372,26 +382,38 @@ export function worktreePrBadge(wt: TreeWorktreePayload): string {
 }
 
 /**
- * A worktree row's rebase cue (#1415): the codicon id for its row icon and the
- * text fragment for its description, or `undefined` when there is nothing to say.
+ * A worktree row's git-operation cue (#1415, extended for pushes in #1443): the
+ * codicon id for its row icon and the text fragment for its description, or
+ * `undefined` when there is nothing to say.
  *
- * Two orthogonal facts, in priority order:
+ * Three orthogonal facts, in priority order:
  *
- *  - `rebasing` — the daemon is working on it *right now* → a spinner. Wins,
- *    because "in flight" is the more urgent thing to know and the durable
- *    `operation` may already be set from the conflict it is about to report.
+ *  - `pushing` — the daemon is publishing it *right now* → a spinner. First
+ *    because it is both in flight and the shortest-lived: a push is seconds, and
+ *    it is the one cue with no durable trace to fall back on if it is missed.
+ *  - `rebasing` — the daemon is rewriting it *right now* → a spinner. Beats
+ *    `operation`, because "in flight" is the more urgent thing to know and the
+ *    durable `operation` may already be set from the conflict it is about to
+ *    report.
  *  - `operation` — the worktree is sitting mid-rebase (or mid-merge, mid-bisect…)
  *    and needs the user → a warning triangle. For a rebase this is exactly the
  *    left-in-place conflict the `rebase` op now leaves behind.
+ *
+ * The two in-flight facts cannot both be true of one row in practice — the daemon
+ * serializes each op and neither marks a worktree the other holds — but the order
+ * is fixed rather than left to chance so the rendering is deterministic.
  *
  * Deliberately **not** the badge layer. A `FileDecoration.badge` holds only two
  * characters, and both are already spoken for — the PR check verdict and the
  * Claude session cue each get one (`decorations.ts`) — so a third would have to
  * evict one of them. The row icon and description are unclaimed and carry more.
  */
-export function worktreeRebaseCue(
+export function worktreeGitCue(
   wt: TreeWorktreePayload,
 ): { iconId: string; text: string; tooltip: string } | undefined {
+  if (wt.pushing === true) {
+    return { iconId: "sync~spin", text: "pushing…", tooltip: "pushing now" };
+  }
   if (wt.rebasing === true) {
     return { iconId: "sync~spin", text: "rebasing…", tooltip: "rebasing now" };
   }
@@ -412,13 +434,14 @@ export function worktreeRebaseCue(
 }
 
 /**
- * The muted row description: the rebase cue, the sync counts, the PR badge, and
- * the Claude session glyphs, each shown only when present, separated by a gap. A
- * worktree with none of them yields an empty description — byte-for-byte the
+ * The muted row description: the git-operation cue, the sync counts, the PR badge,
+ * and the Claude session glyphs, each shown only when present, separated by a gap.
+ * A worktree with none of them yields an empty description — byte-for-byte the
  * pre-#1296 behavior.
  *
- * The rebase cue leads: while a worktree is mid-rebase its sync counts are
- * measured against a HEAD that is itself in flux, so they are the *least*
+ * The cue leads: while a worktree is mid-rebase its sync counts are measured
+ * against a HEAD that is itself in flux, and while it is mid-push they are
+ * measured against an upstream that is about to move — so they are the *least*
  * trustworthy thing on the row and should not be read first.
  *
  * `sessions` is passed in already rendered (by `sessionCounts.ts`) rather than
@@ -426,7 +449,7 @@ export function worktreeRebaseCue(
  * so it is side-data the provider folds in.
  */
 export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): string {
-  return [worktreeRebaseCue(wt)?.text ?? "", syncCounts(wt), worktreePrBadge(wt), sessions]
+  return [worktreeGitCue(wt)?.text ?? "", syncCounts(wt), worktreePrBadge(wt), sessions]
     .filter(Boolean)
     .join("  ");
 }
@@ -570,9 +593,9 @@ export function worktreeTooltip(
       ? "● window open"
       : "no window open";
   const lines = [wt.path, `${kind} of ${repoLabel(repo)}`, branchLine];
-  const rebase = worktreeRebaseCue(wt);
-  if (rebase) {
-    lines.push(rebase.tooltip);
+  const cue = worktreeGitCue(wt);
+  if (cue) {
+    lines.push(cue.tooltip);
   }
   const prLine = worktreePrTooltipLine(wt);
   if (prLine) {
@@ -666,6 +689,41 @@ export function selectionTargets(clicked?: Node, selected?: Node[]): Node[] {
  */
 export function worktreeTargets(nodes: Node[]): WorktreeNode[] {
   return nodes.filter((node): node is WorktreeNode => node.kind === "worktree");
+}
+
+/**
+ * The worktree nodes a selection *means*, expanding any repo row into all of its
+ * worktrees (#1443).
+ *
+ * {@link worktreeTargets} drops a repo row on the floor, which is right for an
+ * action whose menu is worktree-only but wrong for one offered on repo rows too —
+ * there, a selected repo means "every worktree of it". No new daemon op is needed:
+ * a repo node already carries its full `worktrees` array on the snapshot, so the
+ * expansion is a local read.
+ *
+ * Order is selection order, with a repo's worktrees inserted where the repo was,
+ * in the daemon's own (main-first) order. Dedupe is by **worktree path**, not
+ * {@link nodeId}: selecting a repo *and* one of its worktrees must yield that
+ * worktree once, and the first occurrence wins so an explicitly-selected row keeps
+ * its position.
+ */
+export function expandToWorktrees(nodes: Node[]): WorktreeNode[] {
+  const seen = new Set<string>();
+  const out: WorktreeNode[] = [];
+  for (const node of nodes) {
+    const worktrees: WorktreeNode[] =
+      node.kind === "repo"
+        ? node.repo.worktrees.map((wt) => ({ kind: "worktree", repo: node.repo, wt }))
+        : [node];
+    for (const target of worktrees) {
+      if (seen.has(target.wt.path)) {
+        continue;
+      }
+      seen.add(target.wt.path);
+      out.push(target);
+    }
+  }
+  return out;
 }
 
 /**
