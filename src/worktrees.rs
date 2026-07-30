@@ -159,6 +159,16 @@ pub struct WorktreesRegistry {
     /// daemon restart clears it, which is correct: nothing is rebasing any more,
     /// and the durable `operation` field still shows any conflict left behind.
     rebasing: Mutex<HashSet<PathBuf>>,
+    /// Worktree paths the daemon is **currently pushing** (#1443) — the twin of
+    /// [`rebasing`](Self::rebasing), with the same keying, locking and
+    /// bump-only-on-a-real-change contract.
+    ///
+    /// Unlike a rebase this cue has **no durable half**: a push writes no on-disk
+    /// state for a later snapshot to rediscover, so there is no `operation`
+    /// equivalent and this set is the whole of it. What makes a *completed* push
+    /// visible instead is `upstream_sha` moving on the snapshot — which is exactly
+    /// why that field is carried (#1344).
+    pushing: Mutex<HashSet<PathBuf>>,
     /// The daemon-backed **show/hide-closed** toggle (#1301): whether the
     /// companion's tree view shows worktrees with no open window. A single
     /// cross-window value carried in every `tree`/`subscribe` snapshot so all
@@ -213,6 +223,7 @@ impl WorktreesRegistry {
             close_pending: Mutex::new(HashSet::new()),
             reload_pending: Mutex::new(HashSet::new()),
             rebasing: Mutex::new(HashSet::new()),
+            pushing: Mutex::new(HashSet::new()),
             show_closed: AtomicBool::new(true),
             polling_enabled: Mutex::new(HashMap::new()),
             poll_ttl: DEFAULT_POLL_LEASE,
@@ -413,23 +424,46 @@ impl WorktreesRegistry {
     /// adapter (where `canonical()` lives), not in this engine — the same split
     /// that keeps the git enrichment out of here.
     pub fn mark_rebasing(&self, paths: &[PathBuf]) -> bool {
-        self.mutate_rebasing(paths, true)
+        self.mutate_in_flight(&self.rebasing, paths, true)
     }
 
     /// Clears the rebasing mark on `paths`, returning whether the set changed.
     /// Called on **every** exit from a phase-2 execute, so a panicking or failing
     /// rebase can never leave a permanent spinner on a row.
     pub fn clear_rebasing(&self, paths: &[PathBuf]) -> bool {
-        self.mutate_rebasing(paths, false)
+        self.mutate_in_flight(&self.rebasing, paths, false)
     }
 
-    /// The shared body of [`mark_rebasing`](Self::mark_rebasing) /
-    /// [`clear_rebasing`](Self::clear_rebasing): mutate under the set's own lock,
-    /// drop the guard, then bump if anything moved (never bump while holding a
-    /// lock, per the engine's `std::Mutex`-never-across-`.await` discipline).
-    fn mutate_rebasing(&self, paths: &[PathBuf], insert: bool) -> bool {
+    /// Marks `paths` as being pushed right now (#1443), returning whether the set
+    /// actually changed. The [`mark_rebasing`](Self::mark_rebasing) twin, with the
+    /// same canonicalized-paths-in and bump-only-on-a-real-change contract.
+    pub fn mark_pushing(&self, paths: &[PathBuf]) -> bool {
+        self.mutate_in_flight(&self.pushing, paths, true)
+    }
+
+    /// Clears the pushing mark on `paths`, returning whether the set changed.
+    /// Called on **every** exit from a phase-2 execute — and it is the *only* thing
+    /// that clears this cue, since a push leaves no on-disk state a later snapshot
+    /// could correct a stale mark from.
+    pub fn clear_pushing(&self, paths: &[PathBuf]) -> bool {
+        self.mutate_in_flight(&self.pushing, paths, false)
+    }
+
+    /// The shared body of the in-flight-set mutators: mutate under that set's own
+    /// lock, drop the guard, then bump if anything moved (never bump while holding
+    /// a lock, per the engine's `std::Mutex`-never-across-`.await` discipline).
+    ///
+    /// Bumping **only** on a real change is load-bearing rather than an
+    /// optimization: an unconditional bump defeats the server's snapshot diff and
+    /// re-pushes to every window on every tick.
+    fn mutate_in_flight(
+        &self,
+        set: &Mutex<HashSet<PathBuf>>,
+        paths: &[PathBuf],
+        insert: bool,
+    ) -> bool {
         let changed = {
-            let mut set = self.rebasing.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut set = set.lock().unwrap_or_else(PoisonError::into_inner);
             paths.iter().fold(false, |changed, path| {
                 let moved = if insert {
                     set.insert(path.clone())
@@ -450,10 +484,19 @@ impl WorktreesRegistry {
     /// of paths) and never held across an `.await`.
     #[must_use]
     pub fn rebasing_paths(&self) -> HashSet<PathBuf> {
-        self.rebasing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        Self::snapshot_paths(&self.rebasing)
+    }
+
+    /// The worktree paths currently being pushed, canonicalized (#1443). The
+    /// [`rebasing_paths`](Self::rebasing_paths) twin, read into the same snapshot.
+    #[must_use]
+    pub fn pushing_paths(&self) -> HashSet<PathBuf> {
+        Self::snapshot_paths(&self.pushing)
+    }
+
+    /// A clone of one in-flight set, for folding into a tree snapshot.
+    fn snapshot_paths(set: &Mutex<HashSet<PathBuf>>) -> HashSet<PathBuf> {
+        set.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The current show/hide-closed toggle: whether the tree view shows
@@ -1174,6 +1217,67 @@ mod tests {
 
         assert!(reg.clear_rebasing(&[path]));
         assert!(rx.has_changed().unwrap(), "a real clear bumps");
+    }
+
+    // --- Pushing set (#1443) -----------------------------------------------
+
+    #[test]
+    fn pushing_marks_and_clears_the_named_paths() {
+        let reg = WorktreesRegistry::new();
+        let a = PathBuf::from("/tmp/a");
+        let b = PathBuf::from("/tmp/b");
+        assert!(reg.pushing_paths().is_empty(), "nothing pushes by default");
+
+        assert!(reg.mark_pushing(&[a.clone(), b.clone()]));
+        assert_eq!(reg.pushing_paths(), [a.clone(), b.clone()].into());
+
+        assert!(reg.clear_pushing(std::slice::from_ref(&a)));
+        assert_eq!(reg.pushing_paths(), [b.clone()].into());
+        assert!(reg.clear_pushing(&[b]));
+        assert!(reg.pushing_paths().is_empty());
+    }
+
+    #[test]
+    fn pushing_bumps_only_on_a_real_change() {
+        let reg = WorktreesRegistry::new();
+        let path = PathBuf::from("/tmp/a");
+
+        let mut rx = reg.subscribe_changes();
+        assert!(reg.mark_pushing(std::slice::from_ref(&path)));
+        assert!(rx.has_changed().unwrap(), "the first mark bumps");
+        let _ = rx.borrow_and_update();
+
+        assert!(
+            !reg.mark_pushing(std::slice::from_ref(&path)),
+            "re-marking an already-pushing path is not a change"
+        );
+        assert!(!rx.has_changed().unwrap(), "a no-op mark must not bump");
+
+        assert!(reg.clear_pushing(&[path]));
+        assert!(rx.has_changed().unwrap(), "a real clear bumps");
+    }
+
+    #[test]
+    fn pushing_and_rebasing_are_independent_sets() {
+        // The two cues are orthogonal — the same worktree can be marked by one op
+        // without the other's cue appearing, and clearing one must not clear the
+        // other.
+        let reg = WorktreesRegistry::new();
+        let path = PathBuf::from("/tmp/a");
+
+        assert!(reg.mark_rebasing(std::slice::from_ref(&path)));
+        assert!(
+            reg.pushing_paths().is_empty(),
+            "a rebase mark must not show as a push"
+        );
+
+        assert!(reg.mark_pushing(std::slice::from_ref(&path)));
+        assert!(reg.clear_rebasing(std::slice::from_ref(&path)));
+        assert_eq!(
+            reg.pushing_paths(),
+            [path].into(),
+            "clearing the rebase mark must leave the push mark alone"
+        );
     }
 
     // --- Show/hide-closed toggle (#1301) -----------------------------------
