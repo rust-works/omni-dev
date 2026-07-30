@@ -189,7 +189,18 @@ impl StreamTracker {
         if line.is_empty() {
             return None;
         }
-        let parsed: StreamLine = serde_json::from_str(line).ok()?;
+        // The tee's newline-based framing (`tee_chunk`, claude_wrap.rs) does
+        // not know about terminal control sequences: Claude's raw
+        // terminal-init bytes (title-set, mouse tracking, alt-screen — none
+        // of them newline-terminated on their own) can land in the same
+        // read() as the following stream-json line and get accumulated onto
+        // its front before the first `\n` is seen, corrupting what would
+        // otherwise be a valid line — most consequentially the first
+        // `system`/`init` line, which is what carries `model`. Every real
+        // line here is a JSON object, so skipping to the first `{` recovers
+        // it without needing to understand escape-sequence structure at all.
+        let json = line.find('{').map_or(line, |start| &line[start..]);
+        let parsed: StreamLine = serde_json::from_str(json).ok()?;
         self.absorb_identity(direction, &parsed);
         self.apply(direction, &parsed);
         self.emit_if_changed()
@@ -714,6 +725,21 @@ mod tests {
             assert!(tracker.observe_line(Direction::FromClaude, line).is_none());
         }
         assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_json_line_preceded_by_raw_terminal_control_bytes_still_parses() {
+        // Reproduces the real-world corruption: Claude's raw terminal-init
+        // bytes (title-set, mouse tracking, …) land in the same tee'd "line"
+        // as the following system/init line when both arrive in one read(),
+        // with no newline of their own to separate them.
+        let corrupted = "\u{1b}]0;2.1.132\u{7}{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"cwd\":\"/w\",\"model\":\"claude-opus-5\"}";
+        let mut tracker = StreamTracker::new();
+        let request = tracker
+            .observe_line(Direction::FromClaude, corrupted)
+            .expect("the JSON object should still be recovered");
+        assert_eq!(request.session_id, "s-1");
+        assert_eq!(request.model.as_deref(), Some("claude-opus-5"));
     }
 
     #[test]
