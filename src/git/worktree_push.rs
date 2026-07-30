@@ -775,6 +775,30 @@ mod tests {
                 Some("non-fast-forward".to_string())
             )
         );
+        assert_eq!(
+            split_reason("weird)"),
+            ("weird)".to_string(), None),
+            "a trailing `)` with no opening `(` is part of the summary, not a reason"
+        );
+    }
+
+    #[test]
+    fn a_multi_character_first_field_is_not_a_status_line() {
+        // The flag field is exactly one character. Anything wider is some other
+        // tab-separated output, and mis-reading it as a status would invent an
+        // outcome — so it is dropped rather than guessed at.
+        assert!(parse_porcelain("To\tgit@host:o/r.git\tsomething").is_empty());
+        assert!(parse_porcelain("\trefs/heads/a:refs/heads/a\tsummary").is_empty());
+    }
+
+    #[test]
+    fn an_unknown_status_flag_yields_no_result() {
+        // `-` is a deletion, which this engine never asks for. An unrecognised flag
+        // must not be mapped onto a success or a failure — the caller keeps looking
+        // and ultimately falls back to the exit status.
+        let parsed = parse_porcelain("-\t:refs/heads/a\t[deleted]");
+        assert_eq!(parsed.len(), 1, "the line still parses structurally");
+        assert_eq!(result_of(parsed[0].clone()), None);
     }
 
     // ── classification (git2 reads, real repos) ───────────────────────────
@@ -839,6 +863,33 @@ mod tests {
             ),
             "a rewritten tip diverges and needs the lease"
         );
+    }
+
+    #[test]
+    fn a_dangling_upstream_ref_is_not_guessed_at_as_a_force() {
+        // The remote-tracking ref resolves, but the commit it names is absent from
+        // the object database (a truncated fetch, a pruned pack). Divergence is then
+        // unknowable — and the safe reading of "unknowable" is *nothing to publish*,
+        // never a force, which would overwrite the remote on the strength of a
+        // comparison that failed.
+        let _guard = serial();
+        let scenario = Scenario::new();
+        let wt = scenario.add_worktree("feature-a");
+        scenario.publish(&wt, "feature-a");
+        scenario.commit_in(&wt, "file.txt", "local\n", "local work");
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::WouldFastForward { ahead: 1 },
+            "precondition: an intact upstream classifies normally"
+        );
+
+        // Point the tracking ref at a well-formed oid no object exists for. Written
+        // directly rather than via `git update-ref`, which validates the target.
+        let tracking = scenario.local.join(".git/refs/remotes/origin/feature-a");
+        std::fs::create_dir_all(tracking.parent().unwrap()).unwrap();
+        std::fs::write(&tracking, "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+
+        assert_eq!(classify(&wt).result, PushResult::UpToDate);
     }
 
     #[test]
@@ -1055,6 +1106,185 @@ mod tests {
             classify(&local).result,
             PushResult::Skipped {
                 reason: SkipReason::NoRemote
+            },
+        );
+    }
+
+    #[test]
+    fn a_sole_non_origin_remote_is_the_fallback_destination() {
+        // With no `origin` but exactly one remote, the destination is unambiguous
+        // and an unpublished branch should publish there rather than be skipped.
+        let _guard = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("solo");
+        std::fs::create_dir_all(&local).unwrap();
+        git_at(&local, &["init", "-b", "main"]);
+        config_repo(&local, "Test", "test@example.com");
+        std::fs::write(local.join("file.txt"), "x\n").unwrap();
+        git_at(&local, &["add", "file.txt"]);
+        git_at(&local, &["commit", "-m", "first"]);
+        git_at(&local, &["remote", "add", "upstream", "/nonexistent.git"]);
+
+        let outcome = classify(&local);
+        assert_eq!(outcome.result, PushResult::WouldCreate);
+        assert_eq!(outcome.remote, "upstream");
+    }
+
+    #[test]
+    fn several_remotes_without_origin_are_too_ambiguous_to_guess() {
+        let _guard = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("solo");
+        std::fs::create_dir_all(&local).unwrap();
+        git_at(&local, &["init", "-b", "main"]);
+        config_repo(&local, "Test", "test@example.com");
+        std::fs::write(local.join("file.txt"), "x\n").unwrap();
+        git_at(&local, &["add", "file.txt"]);
+        git_at(&local, &["commit", "-m", "first"]);
+        git_at(&local, &["remote", "add", "upstream", "/a.git"]);
+        git_at(&local, &["remote", "add", "fork", "/b.git"]);
+
+        assert_eq!(
+            classify(&local).result,
+            PushResult::Skipped {
+                reason: SkipReason::NoRemote
+            },
+            "publishing to an arbitrary one of several remotes would be a guess",
+        );
+    }
+
+    // ── the git-subprocess seam (stubbed `git`) ───────────────────────────
+
+    /// A `WorktreeOutcome` pointing at `path`, pre-classified as `result`, for
+    /// driving [`execute`] against a stubbed `git`.
+    fn outcome_at(path: &Path, result: PushResult) -> WorktreeOutcome {
+        WorktreeOutcome {
+            path: path.to_path_buf(),
+            branch: Some("feat".to_string()),
+            remote: "origin".to_string(),
+            remote_branch: "feat".to_string(),
+            result,
+        }
+    }
+
+    /// Runs [`execute`] over one pre-classified outcome against a `git` stub whose
+    /// body is `script`, and returns the resulting [`PushResult`].
+    ///
+    /// This is what [`PushOptions::git_bin`] exists for: the paths below are `git`
+    /// behaving in ways a real remote cannot be made to reproduce on demand.
+    fn execute_against_stub(script: &str, result: PushResult) -> PushResult {
+        use crate::test_support::shim::{retry_on_etxtbsy, shim_lock, write_exec_script};
+        let _guard = shim_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("git-stub");
+        write_exec_script(&stub, script);
+
+        let opts = PushOptions {
+            git_bin: Some(stub),
+        };
+        let plan = Plan {
+            worktrees: vec![outcome_at(dir.path(), result)],
+        };
+        // The shim is executed here, so absorb the write-then-exec `ETXTBSY` race.
+        retry_on_etxtbsy(|| {
+            let outcomes = execute(plan.clone(), &opts);
+            let result = outcomes.into_iter().next().unwrap().result;
+            match &result {
+                PushResult::Rejected { detail, .. } if detail.contains("Text file busy") => {
+                    Err(anyhow::anyhow!(std::io::Error::from_raw_os_error(26)))
+                }
+                _ => Ok(result),
+            }
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_git_that_cannot_be_spawned_is_reported_not_panicked() {
+        // The engine must degrade to a per-worktree `Rejected` rather than taking
+        // the whole batch down — one unusable path never fails the rest.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = PushOptions {
+            git_bin: Some(dir.path().join("no-such-git")),
+        };
+        let plan = Plan {
+            worktrees: vec![outcome_at(dir.path(), PushResult::WouldCreate)],
+        };
+
+        let outcomes = execute(plan, &opts);
+        assert!(
+            matches!(
+                &outcomes[0].result,
+                PushResult::Rejected { stale: false, detail } if detail.contains("failed to execute")
+            ),
+            "unexpected outcome: {:?}",
+            outcomes[0].result,
+        );
+    }
+
+    #[test]
+    fn a_silent_successful_git_is_trusted_by_its_exit_status() {
+        // `--porcelain` always emits a status line, so this is the "git exited 0
+        // without saying anything" path. Each push flavour must still report the
+        // outcome it asked for rather than collapsing to one.
+        let cases = [
+            (PushResult::WouldCreate, PushResult::Created),
+            (
+                PushResult::WouldForce {
+                    ahead: 1,
+                    behind: 1,
+                },
+                PushResult::Pushed { forced: true },
+            ),
+            (
+                PushResult::WouldFastForward { ahead: 1 },
+                PushResult::Pushed { forced: false },
+            ),
+        ];
+        for (planned, expected) in cases {
+            assert_eq!(
+                execute_against_stub("#!/bin/sh\nexit 0\n", planned.clone()),
+                expected,
+                "for a planned {planned:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_silent_failing_git_is_reported_with_its_stderr() {
+        let result = execute_against_stub(
+            "#!/bin/sh\necho 'fatal: could not read from remote' >&2\nexit 128\n",
+            PushResult::WouldFastForward { ahead: 1 },
+        );
+        assert_eq!(
+            result,
+            PushResult::Rejected {
+                detail: "fatal: could not read from remote".to_string(),
+                stale: false,
+            },
+        );
+    }
+
+    #[test]
+    fn a_porcelain_status_line_wins_over_the_exit_status() {
+        // git exits non-zero on a rejection but still reports *why* on stdout; the
+        // parsed reason is what the user needs, not the bare exit code.
+        let result = execute_against_stub(
+            "#!/bin/sh\n\
+             echo 'To /origin.git'\n\
+             printf '!\\trefs/heads/feat:refs/heads/feat\\t[rejected] (stale info)\\n'\n\
+             echo 'Done'\n\
+             exit 1\n",
+            PushResult::WouldForce {
+                ahead: 1,
+                behind: 1,
+            },
+        );
+        assert_eq!(
+            result,
+            PushResult::Rejected {
+                detail: "stale info".to_string(),
+                stale: true,
             },
         );
     }
