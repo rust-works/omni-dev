@@ -568,6 +568,24 @@ list. Three rules follow from being per-**row** rather than per-PR:
   detached worktree, both have a truthful answer here, and the `/github/` gate would
   hide the command exactly where the placeholder earns its keep.
 
+A fourth action opens the **repository** rather than a pull request. **"Open GitHub
+Repository"** (#1442) opens `https://github.com/<owner>/<name>` in the OS default
+browser, built straight from the `github` identity the `tree` payload already
+carries. It is the one GitHub action in the view that costs **no `gh`, no network
+and no daemon op at all** — the URL is a pure function of the snapshot — so it needs
+no progress notification, no confirmation, and no particular daemon version. Two
+details distinguish it from the PR actions:
+
+- It is gated on **repo rows only** (`viewItem =~ /^repo\.github/` — the
+  `repoContextValue` prefix), not the Open actions' `/github/` or Copy PR URL's
+  `^(repo|worktree)`: a worktree's repository page is its parent's, so offering it on
+  both doubles a menu entry for no new information. It sits in the `0_open` group
+  beside "Open Worktree", not in `1_pr` — it is an *open* action, not a PR one.
+- A multi-selection still **de-duplicates** by URL, and a worktree row caught up in
+  one resolves to its parent repository. VS Code evaluates a `when` clause against
+  the **clicked** row only, so the handler filters the selection itself rather than
+  trusting the gate — the same reason every other action here does.
+
 Discovery is **daemon-served** (#1389, fix 7): a worktree already resolved
 daemon-side opens straight from the snapshot badge (**zero `gh`**), and a repo-wide
 lookup goes through the daemon's shared, TTL-cached [`open-prs`](#companion-contract-for-the-extension-and-other-clients)
