@@ -42,7 +42,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
-use crate::git::worktree_rebase::{self, Selection};
+use crate::git::worktree_batch::Selection;
+use crate::git::worktree_push;
+use crate::git::worktree_rebase;
 use crate::github_rate_limit::{
     resolve_rate_limit_with, RateLimitCache, RateLimitResource, RateLimitSnapshot,
 };
@@ -548,6 +550,23 @@ pub struct WorktreesService {
     ///
     /// A `tokio` mutex, since it is held across the `spawn_blocking` join.
     rebase_lock: tokio::sync::Mutex<()>,
+    /// Serializes the `push` op's phase-2 execute across concurrent requests
+    /// (#1443) — the [`rebase_lock`](Self::rebase_lock) twin.
+    ///
+    /// A successful push writes `refs/remotes/<remote>/<branch>` into the object
+    /// database and ref store that every linked worktree of the repository shares,
+    /// so concurrent batches would race on it. Taking the lock **before** the
+    /// re-plan (not merely around the execute) is what keeps the classification the
+    /// engine acts on from being invalidated by another batch's push mid-flight —
+    /// which for a lease is not benign: a plan taken outside the lock could still
+    /// say `would-force` against a tracking ref the other run has since advanced.
+    ///
+    /// Deliberately **separate** from `rebase_lock` rather than shared: a rebase and
+    /// a push touch different refs (`refs/heads/*` vs `refs/remotes/*`) and there is
+    /// no reason a push should wait behind an unrelated repository's rebase.
+    ///
+    /// A `tokio` mutex, since it is held across the `spawn_blocking` join.
+    push_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorktreesService {
@@ -575,6 +594,7 @@ impl WorktreesService {
             open_pr_cache: Arc::new(OpenPrCache::new(open_pr_ttl())),
             reposition_undo: Mutex::new(Vec::new()),
             rebase_lock: tokio::sync::Mutex::new(()),
+            push_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1503,6 +1523,93 @@ impl WorktreesService {
         Ok(rebase_reply(&fetches, &outcomes))
     }
 
+    /// Handles the `push` op (#1443): publish the selected worktrees' branches to
+    /// their upstreams, force-pushing **with a lease** where a rebase rewrote
+    /// history. The complement of [`rebase`](Self::rebase), and two-phase in
+    /// exactly the same way:
+    ///
+    /// - **Phase 1** (`check:true`, or any un-`confirmed` request) — run
+    ///   [`worktree_push::plan`], which classifies every selected worktree against
+    ///   its upstream. This *is* the "does this make sense?" gate: it skips a
+    ///   detached HEAD (which also covers a worktree mid-rebase), a non-worktree
+    ///   path, a branch with nowhere to publish, and a force-push of the
+    ///   repository's remote default branch — while a dirty tree is deliberately
+    ///   **not** a skip, since a push publishes commits rather than the working
+    ///   tree. Unlike `rebase`'s phase 1 this is not merely side-effect-*light*: it
+    ///   contacts no remote at all (ADR-0061).
+    /// - **Phase 2** (`confirmed:true`) — **re-plan from scratch**, then execute. A
+    ///   phase-1 result the client sends back is never trusted, as `close`,
+    ///   `merge-queue` and `rebase` all re-validate. A branch that moved between
+    ///   the phases is re-classified, not pushed on stale information.
+    ///
+    /// **Why the daemon may do this at all** (ADR-0061): this is the first op to
+    /// write to a remote using the user's ambient *git* credentials — `merge-queue`
+    /// mutates the remote through `gh` (ADR-0056) and `rebase` only fetches
+    /// (ADR-0059). It stays same-user-bounded behind the `0600` socket, publishes
+    /// only branches the client names, and can never overwrite work it has not
+    /// seen, because the lease is enforced by `git` itself.
+    ///
+    /// All git I/O runs on a blocking thread, never the async worker and never
+    /// under the registry lock.
+    async fn push(&self, req: PushRequest) -> Result<Value> {
+        // Resolved once here (the probe is process-stable), then handed to the
+        // seam below — the `rebase_with` "bin as a param" pattern.
+        self.push_with(req, crate::git::resolve_git_binary()).await
+    }
+
+    /// [`push`](Self::push) with an explicit `git` binary, so a test exercises the
+    /// plan and execute paths against a stub.
+    async fn push_with(&self, req: PushRequest, git_bin: PathBuf) -> Result<Value> {
+        if req.paths.is_empty() {
+            bail!("`push` requires at least one path");
+        }
+        // Report-only unless explicitly confirmed; an explicit `check` request
+        // always reports and never pushes.
+        let report_only = req.check || !req.confirmed;
+        let selection = Selection::Paths(req.paths.clone());
+
+        if report_only {
+            // Phase 1: classify only. No lock and no network — planning reads the
+            // local remote-tracking refs, which is exactly what the lease is
+            // checked against.
+            let plan = plan_push(&selection).await?;
+            // Auditable in `omni-dev daemon logs` (ADR-0049 §6 precedent).
+            log_push_check(&req, &plan);
+            return Ok(push_reply(&plan.worktrees));
+        }
+
+        // Phase 2: re-plan and execute, serialized against other executes — a push
+        // writes into the ref store linked worktrees share (see `push_lock`). The
+        // lock is taken **before** the re-plan for the same reason `rebase` takes
+        // its own that way: a plan plus a lease are only meaningful together, and a
+        // plan taken outside the lock can be invalidated before its turn comes.
+        let _guard = self.push_lock.lock().await;
+        let plan = plan_push(&selection).await?;
+        // The worktrees actually about to be published, canonicalized here (disk
+        // I/O belongs in the adapter, not the registry) so they match the tree
+        // snapshot's own keys.
+        let pending: Vec<PathBuf> = plan
+            .worktrees
+            .iter()
+            .filter(|w| w.result.is_pending())
+            .map(|w| canonical(&w.path))
+            .collect();
+        self.registry.mark_pushing(&pending);
+        let opts = worktree_push::PushOptions {
+            git_bin: Some(git_bin),
+        };
+        let outcomes =
+            tokio::task::spawn_blocking(move || worktree_push::execute(plan, &opts)).await;
+        // Cleared on **every** exit, including a panicked task. A push writes no
+        // on-disk state, so this set is the *whole* cue — a mark left behind would
+        // be a permanent spinner nothing else could correct.
+        self.registry.clear_pushing(&pending);
+        let outcomes = outcomes.map_err(|e| anyhow!("push task panicked: {e}"))?;
+
+        log_push_execute(&req, &outcomes);
+        Ok(push_reply(&outcomes))
+    }
+
     /// Handles the `reposition` op (#1407): move and resize each target worktree's
     /// **already-open** VS Code window to match the invoking window's geometry.
     ///
@@ -1820,6 +1927,20 @@ impl DaemonService for WorktreesService {
                 let req: RebaseRequest =
                     serde_json::from_value(payload).context("invalid `rebase` payload")?;
                 self.rebase(req).await
+            }
+            "push" => {
+                // Publish the selected worktrees' branches to their upstreams,
+                // force-pushing **with a lease** where a rebase rewrote history
+                // (#1443). Two-phase like `rebase` (side-effect-free plan →
+                // confirmed execute) and daemon-re-validated, but its plan phase
+                // contacts no remote at all. The push authenticates through the
+                // user's own ambient git credentials — the first op to *write* to
+                // a remote that way. There is no force escape hatch and no remote
+                // override: a refused lease is the feature working. See ADR-0061
+                // and docs/worktrees-service.md.
+                let req: PushRequest =
+                    serde_json::from_value(payload).context("invalid `push` payload")?;
+                self.push(req).await
             }
             "reposition" => {
                 // Move each target's already-open VS Code window onto the invoking
@@ -2625,6 +2746,43 @@ struct TreeWorktree {
     /// common case, keeping an older client byte-identical.
     #[serde(skip_serializing_if = "is_false")]
     rebasing: bool,
+    /// Whether the daemon is pushing this worktree **right now** (#1443) — the
+    /// `rebasing` twin, from the registry's other in-flight set.
+    ///
+    /// Unlike a rebase this cue has **no durable half**: a push writes no on-disk
+    /// state, so there is nothing for a later snapshot to rediscover and this flag
+    /// is the whole of it. A *completed* push instead shows up as `upstream_sha`
+    /// moving, which is why that field rides the snapshot (#1344). Omitted (false)
+    /// for the common case, keeping an older client byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    pushing: bool,
+}
+
+/// The registry's two transient in-flight sets, read together into one tree
+/// snapshot (#1443).
+///
+/// Grouped rather than threaded as two parameters through
+/// [`worktree_entry`]/[`repo_tree`]/[`build_tree`]/[`tree_repos`]: they are always
+/// read at the same moment, from the same registry, for the same snapshot, and a
+/// third would otherwise mean a fifth positional `HashSet` at every level.
+#[derive(Debug, Clone, Default)]
+struct InFlight {
+    /// Worktree paths the `rebase` op is executing on (#1415).
+    rebasing: HashSet<PathBuf>,
+    /// Worktree paths the `push` op is executing on (#1443).
+    pushing: HashSet<PathBuf>,
+}
+
+impl InFlight {
+    /// Reads both sets off the registry. Two short lock acquisitions, neither held
+    /// across an `.await`; the pair need not be atomic, since each cue is
+    /// independently true or false of a given row.
+    fn read(registry: &WorktreesRegistry) -> Self {
+        Self {
+            rebasing: registry.rebasing_paths(),
+            pushing: registry.pushing_paths(),
+        }
+    }
 }
 
 /// One repository (with **all** its worktrees) in the `tree` payload. Repos are
@@ -2738,7 +2896,7 @@ fn worktree_entry(
     path: &Path,
     is_main: bool,
     open_index: &HashMap<PathBuf, String>,
-    rebasing: &HashSet<PathBuf>,
+    in_flight: &InFlight,
 ) -> TreeWorktree {
     let status = git_status_cheap(path);
     let canonical = canonical(path);
@@ -2756,9 +2914,10 @@ fn worktree_entry(
         pr: None,
         pr_none: false,
         operation: status.operation,
-        // Both halves of the rebase cue are joined on the *canonical* path: the
-        // registry set is canonicalized by the adapter when the op marks it.
-        rebasing: rebasing.contains(&canonical),
+        // Every in-flight cue is joined on the *canonical* path: the registry sets
+        // are canonicalized by the adapter when an op marks them.
+        rebasing: in_flight.rebasing.contains(&canonical),
+        pushing: in_flight.pushing.contains(&canonical),
     }
 }
 
@@ -2835,7 +2994,7 @@ fn fold_pr_badges(repos: &mut [TreeRepo], pr_cache: &PrStatusCache) {
 fn repo_tree(
     discovered: &Repository,
     open_index: &HashMap<PathBuf, String>,
-    rebasing: &HashSet<PathBuf>,
+    in_flight: &InFlight,
 ) -> Option<TreeRepo> {
     // The common dir (`…/<root>/.git`) is shared by the main checkout and all
     // linked worktrees; its parent is the main working tree.
@@ -2844,7 +3003,7 @@ fn repo_tree(
     let main_repo = Repository::open(&main_root).ok()?;
 
     // Main working tree first.
-    let mut worktrees = vec![worktree_entry(&main_root, true, open_index, rebasing)];
+    let mut worktrees = vec![worktree_entry(&main_root, true, open_index, in_flight)];
     // Then every linked worktree, sorted by path for deterministic output. The
     // `StringArray` of names is bound so `iter()` can borrow it (only
     // `&StringArray` is `IntoIterator`); a name that no longer resolves to a
@@ -2862,7 +3021,7 @@ fn repo_tree(
     worktrees.extend(
         linked
             .iter()
-            .map(|path| worktree_entry(path, false, open_index, rebasing)),
+            .map(|path| worktree_entry(path, false, open_index, in_flight)),
     );
 
     Some(TreeRepo {
@@ -2884,7 +3043,7 @@ fn repo_tree(
 fn build_tree(
     folders: Vec<PathBuf>,
     windows: Vec<WindowEntry>,
-    rebasing: HashSet<PathBuf>,
+    in_flight: InFlight,
 ) -> Vec<TreeRepo> {
     let open_index = open_window_index(&windows);
     let mut repos: BTreeMap<PathBuf, TreeRepo> = BTreeMap::new();
@@ -2896,7 +3055,7 @@ fn build_tree(
         if repos.contains_key(&key) {
             continue;
         }
-        if let Some(tree) = repo_tree(&repo, &open_index, &rebasing) {
+        if let Some(tree) = repo_tree(&repo, &open_index, &in_flight) {
             repos.insert(key, tree);
         }
     }
@@ -2912,10 +3071,10 @@ async fn tree_repos(
     windows: Vec<WindowEntry>,
     pr_cache: Arc<PrStatusCache>,
     enabled_polling: HashSet<String>,
-    rebasing: HashSet<PathBuf>,
+    in_flight: InFlight,
 ) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
-        let mut repos = build_tree(folders, windows, rebasing);
+        let mut repos = build_tree(folders, windows, in_flight);
         // Stamp per-repo poll state first so `fold_pr_badges` can skip a
         // not-polled repo — a disabled repo carries neither the flag nor a badge.
         stamp_polling(&mut repos, &enabled_polling);
@@ -3138,11 +3297,11 @@ async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache
     let windows = registry.list();
     let show_closed = registry.show_closed();
     let enabled_polling = registry.enabled_polling_repos();
-    // The transient half of the rebase cue (#1415), read here with the other cheap
-    // registry locks so the git work below deals only in plain data.
-    let rebasing = registry.rebasing_paths();
+    // The transient rebase (#1415) and push (#1443) cues, read here with the other
+    // cheap registry locks so the git work below deals only in plain data.
+    let in_flight = InFlight::read(registry);
     json!({
-        "repos": tree_repos(folders, windows, pr_cache, enabled_polling, rebasing).await,
+        "repos": tree_repos(folders, windows, pr_cache, enabled_polling, in_flight).await,
         "show_closed": show_closed,
     })
 }
@@ -3854,6 +4013,130 @@ fn log_rebase_execute(req: &RebaseRequest, outcomes: &[worktree_rebase::Worktree
         left_in_place,
         skipped,
         "rebase execute"
+    );
+}
+
+// --- Push op (#1443) ---------------------------------------------------------
+
+/// The `push` op payload: publish worktrees' branches to their upstreams,
+/// force-pushing with a lease where history was rewritten. Two-phase like
+/// [`RebaseRequest`], keyed off `confirmed`, and likewise a **single batched** op
+/// over `paths` so the reply is one per-worktree summary rather than N independent
+/// results.
+///
+/// Deliberately has **no** force knob. There is no field a client can set to escape
+/// the lease, and none to reach a remote other than the branch's own upstream —
+/// both by design (ADR-0061 §2).
+#[derive(Debug, Clone, Deserialize)]
+struct PushRequest {
+    /// Absolute paths of the selected worktree folders.
+    paths: Vec<PathBuf>,
+    /// The requesting window's key — carried for the audit line, as `close`,
+    /// `merge-queue` and `rebase` carry theirs.
+    #[serde(default)]
+    requester_key: Option<String>,
+    /// Phase 1: classify and report only, never push.
+    #[serde(default)]
+    check: bool,
+    /// Phase 2: publish the (re-validated) pending worktrees.
+    #[serde(default)]
+    confirmed: bool,
+}
+
+/// Runs [`worktree_push::plan`] on a blocking thread: it walks each worktree's
+/// object database, so it must never run on an async worker. Unlike
+/// [`plan_rebase`] it needs no `git` binary — planning a push contacts no remote.
+async fn plan_push(selection: &Selection) -> Result<worktree_push::Plan> {
+    let selection = selection.clone();
+    tokio::task::spawn_blocking(move || worktree_push::plan(&selection))
+        .await
+        .map_err(|e| anyhow!("push planning task panicked: {e}"))
+        .and_then(|inner| inner)
+}
+
+/// Builds a `push` reply. Both phases share one shape — the per-worktree results —
+/// because phase 1's report and phase 2's result differ only in which
+/// [`PushResult`](worktree_push::PushResult) variants appear, and a client that can
+/// render one can render the other.
+///
+/// There is no `fetches` field (the one shape difference from `rebase`): a push
+/// plan contacts no remote, so there is nothing per-repository to report.
+fn push_reply(worktrees: &[worktree_push::WorktreeOutcome]) -> Value {
+    json!({ "worktrees": worktrees })
+}
+
+/// Emits the phase-1 audit line for a `push` plan: who asked, how many worktrees
+/// were named, how many are pending, and — separately — how many would need the
+/// lease, since that is the interesting half.
+fn log_push_check(req: &PushRequest, plan: &worktree_push::Plan) {
+    use worktree_push::PushResult;
+    let pending = plan
+        .worktrees
+        .iter()
+        .filter(|w| w.result.is_pending())
+        .count();
+    let forced = plan
+        .worktrees
+        .iter()
+        .filter(|w| matches!(w.result, PushResult::WouldForce { .. }))
+        .count();
+    let skipped = plan
+        .worktrees
+        .iter()
+        .filter(|w| matches!(w.result, PushResult::Skipped { .. }))
+        .count();
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        requested = req.paths.len(),
+        pending,
+        forced,
+        skipped,
+        "push check"
+    );
+}
+
+/// Emits the phase-2 audit line for a `push` execute. `forced` and `stale_rejected`
+/// are broken out deliberately: the first is the count of histories this daemon
+/// published a rewrite of, and the second the count of times the lease stopped it
+/// from overwriting work it had not seen.
+fn log_push_execute(req: &PushRequest, outcomes: &[worktree_push::WorktreeOutcome]) {
+    use worktree_push::PushResult;
+    let mut pushed = 0;
+    let mut forced = 0;
+    let mut created = 0;
+    let mut rejected = 0;
+    let mut stale_rejected = 0;
+    for outcome in outcomes {
+        match &outcome.result {
+            PushResult::Pushed { forced: f } => {
+                pushed += 1;
+                if *f {
+                    forced += 1;
+                }
+            }
+            PushResult::Created => created += 1,
+            PushResult::Rejected { stale, .. } => {
+                rejected += 1;
+                if *stale {
+                    stale_rejected += 1;
+                }
+            }
+            PushResult::UpToDate
+            | PushResult::WouldFastForward { .. }
+            | PushResult::WouldForce { .. }
+            | PushResult::WouldCreate
+            | PushResult::Skipped { .. } => {}
+        }
+    }
+    tracing::info!(
+        requester = req.requester_key.as_deref().unwrap_or("-"),
+        requested = req.paths.len(),
+        pushed,
+        forced,
+        created,
+        rejected,
+        stale_rejected,
+        "push execute"
     );
 }
 
@@ -9866,6 +10149,346 @@ mod tests {
         assert!(logs.contains(r#"requester="-""#), "{logs}");
     }
 
+    // --- Push op (#1443) ---------------------------------------------------
+
+    /// A `PushRequest` with every field defaulted, for terse test construction.
+    fn push_req(paths: Vec<PathBuf>) -> PushRequest {
+        PushRequest {
+            paths,
+            requester_key: None,
+            check: false,
+            confirmed: false,
+        }
+    }
+
+    /// A bare `origin`, a local clone of `main`, and a linked `feature` worktree
+    /// whose branch is published and then **rewritten** — i.e. exactly what a
+    /// rebase leaves behind, the state `push` exists for.
+    ///
+    /// Shells out to `git` (so the push has a real remote to talk to) under the
+    /// shared serialization guard the other git-heavy tests use.
+    fn rewritten_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        // Held for the fixture only — that dozen-subprocess burst is what the lock
+        // exists to cap — and released on return, before any `.await` in the test.
+        let _guard = crate::git::worktree_batch::test_serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin.git");
+        let local = root.path().join("local");
+        let wt = root.path().join("feature-wt");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::git::worktree_batch::run_git_in(
+                &crate::git::resolve_git_binary(),
+                dir,
+                args,
+            )
+            .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&local, &["init", "-b", "main"]);
+        git(&local, &["config", "user.name", "Test"]);
+        git(&local, &["config", "user.email", "test@example.com"]);
+        git(&local, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(local.join("f.txt"), "base\n").unwrap();
+        git(&local, &["add", "f.txt"]);
+        git(&local, &["commit", "-m", "base"]);
+        git(
+            &local,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&local, &["push", "-u", "origin", "main"]);
+        git(
+            &local,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("g.txt"), "work\n").unwrap();
+        git(&wt, &["add", "g.txt"]);
+        git(&wt, &["commit", "-m", "work"]);
+        git(&wt, &["push", "-u", "origin", "feature"]);
+        // The rewrite: `feature` now diverges from `origin/feature`.
+        git(&wt, &["commit", "--amend", "-m", "rewritten"]);
+
+        (root, origin, std::fs::canonicalize(&wt).unwrap())
+    }
+
+    /// The tip of `refname` in the bare origin, when it exists.
+    fn origin_tip(origin: &Path, refname: &str) -> Option<git2::Oid> {
+        Repository::open_bare(origin)
+            .unwrap()
+            .refname_to_id(refname)
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn push_with_refuses_an_empty_selection() {
+        // A bare `push` must be a usage error, never a silent mass-push.
+        let svc = WorktreesService::new();
+        let err = svc
+            .push_with(push_req(Vec::new()), PathBuf::from("git"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one path"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn push_with_phase_one_reports_without_publishing() {
+        let (_root, origin, wt) = rewritten_worktree();
+        let before = origin_tip(&origin, "refs/heads/feature");
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .push_with(
+                PushRequest {
+                    check: true,
+                    ..push_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(worktrees.len(), 1, "{reply}");
+        assert_eq!(
+            worktrees[0].get("status").and_then(Value::as_str),
+            Some("would-force"),
+            "{reply}"
+        );
+        assert!(
+            reply.get("fetches").is_none(),
+            "a push plan contacts no remote, so it reports no fetches: {reply}"
+        );
+        assert_eq!(
+            origin_tip(&origin, "refs/heads/feature"),
+            before,
+            "phase 1 must publish nothing"
+        );
+        assert!(
+            svc.registry.pushing_paths().is_empty(),
+            "phase 1 must not mark a row as in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_with_phase_two_force_pushes_and_clears_the_pushing_mark() {
+        let (_root, origin, wt) = rewritten_worktree();
+        let rewritten = Repository::open(&wt).unwrap().head().unwrap().target();
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .push_with(
+                PushRequest {
+                    confirmed: true,
+                    ..push_req(vec![wt.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            worktrees[0].get("status").and_then(Value::as_str),
+            Some("pushed"),
+            "{reply}"
+        );
+        assert_eq!(
+            worktrees[0].get("forced").and_then(Value::as_bool),
+            Some(true),
+            "a rewritten branch is published under the lease: {reply}"
+        );
+        assert_eq!(
+            origin_tip(&origin, "refs/heads/feature"),
+            rewritten,
+            "the remote must carry the rewritten tip"
+        );
+        assert!(
+            svc.registry.pushing_paths().is_empty(),
+            "the pushing mark must be cleared after the execute — a push writes no \
+             on-disk state, so nothing else could ever correct a leftover"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_with_defaults_to_report_only_without_confirmation() {
+        // Neither `check` nor `confirmed`: the safe reading is "report", matching
+        // `rebase`. A client that forgets the flag must never publish.
+        let (_root, origin, wt) = rewritten_worktree();
+        let before = origin_tip(&origin, "refs/heads/feature");
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .push_with(push_req(vec![wt]), crate::git::resolve_git_binary())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reply.get("worktrees").and_then(Value::as_array).unwrap()[0]
+                .get("status")
+                .and_then(Value::as_str),
+            Some("would-force"),
+            "{reply}"
+        );
+        assert_eq!(origin_tip(&origin, "refs/heads/feature"), before);
+    }
+
+    #[tokio::test]
+    async fn push_with_refuses_to_force_the_remote_default_branch() {
+        // The gate that inverts ADR-0060, enforced in the daemon rather than only
+        // in the UI: a rewritten `main` is reported, never published.
+        let (root, origin, _wt) = rewritten_worktree();
+        let local = root.path().join("local");
+        let before = origin_tip(&origin, "refs/heads/main");
+        crate::git::worktree_batch::run_git_in(
+            &crate::git::resolve_git_binary(),
+            &local,
+            &["commit", "--amend", "-m", "rewritten main"],
+        )
+        .unwrap();
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .push_with(
+                PushRequest {
+                    confirmed: true,
+                    ..push_req(vec![local.clone()])
+                },
+                crate::git::resolve_git_binary(),
+            )
+            .await
+            .unwrap();
+
+        let worktrees = reply.get("worktrees").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            worktrees[0].get("reason").and_then(Value::as_str),
+            Some("default-branch-force-push"),
+            "{reply}"
+        );
+        assert_eq!(
+            origin_tip(&origin, "refs/heads/main"),
+            before,
+            "the default branch's published history must be untouched"
+        );
+    }
+
+    #[test]
+    fn log_push_check_separates_the_force_count_from_the_pending_count() {
+        let req = PushRequest {
+            requester_key: Some("win-7".into()),
+            check: true,
+            ..push_req(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        };
+        let outcome = |result| worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/x"),
+            branch: Some("x".into()),
+            remote: "origin".into(),
+            remote_branch: "x".into(),
+            result,
+        };
+        let plan = worktree_push::Plan {
+            worktrees: vec![
+                outcome(worktree_push::PushResult::WouldForce {
+                    ahead: 1,
+                    behind: 1,
+                }),
+                outcome(worktree_push::PushResult::WouldFastForward { ahead: 2 }),
+                outcome(worktree_push::PushResult::Skipped {
+                    reason: worktree_push::SkipReason::DefaultBranchForcePush,
+                }),
+            ],
+        };
+        let logs = capture_info(|| log_push_check(&req, &plan));
+        assert!(logs.contains("push check"), "{logs}");
+        assert!(logs.contains("pending=2"), "{logs}");
+        assert!(logs.contains("forced=1"), "{logs}");
+        assert!(logs.contains("skipped=1"), "{logs}");
+        assert!(logs.contains(r#"requester="win-7""#), "{logs}");
+    }
+
+    #[test]
+    fn log_push_execute_counts_lease_refusals_separately() {
+        let req = push_req(vec![PathBuf::from("/a")]);
+        let outcome = |result| worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/x"),
+            branch: Some("x".into()),
+            remote: "origin".into(),
+            remote_branch: "x".into(),
+            result,
+        };
+        let outcomes = vec![
+            outcome(worktree_push::PushResult::Pushed { forced: true }),
+            outcome(worktree_push::PushResult::Pushed { forced: false }),
+            outcome(worktree_push::PushResult::Created),
+            outcome(worktree_push::PushResult::Rejected {
+                detail: "stale info".into(),
+                stale: true,
+            }),
+            outcome(worktree_push::PushResult::Rejected {
+                detail: "pre-receive hook declined".into(),
+                stale: false,
+            }),
+        ];
+        let logs = capture_info(|| log_push_execute(&req, &outcomes));
+        assert!(logs.contains("push execute"), "{logs}");
+        assert!(logs.contains("pushed=2"), "{logs}");
+        assert!(logs.contains("forced=1"), "{logs}");
+        assert!(logs.contains("created=1"), "{logs}");
+        assert!(logs.contains("rejected=2"), "{logs}");
+        assert!(
+            logs.contains("stale_rejected=1"),
+            "a lease refusal is the interesting half of a rejection: {logs}"
+        );
+    }
+
+    #[test]
+    fn worktree_entry_marks_a_path_the_registry_reports_as_pushing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = canonical(dir.path());
+
+        let quiet = worktree_entry(&path, true, &HashMap::new(), &InFlight::default());
+        assert!(!quiet.pushing);
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            json.get("pushing").is_none(),
+            "an idle row stays byte-identical for an older client: {json}"
+        );
+
+        let busy = worktree_entry(
+            &path,
+            true,
+            &HashMap::new(),
+            &InFlight {
+                pushing: [path.clone()].into(),
+                rebasing: HashSet::new(),
+            },
+        );
+        assert!(busy.pushing, "the registry's transient mark rides through");
+        assert!(
+            !busy.rebasing,
+            "the two cues are independent — a push must not read as a rebase"
+        );
+        assert_eq!(
+            serde_json::to_value(&busy).unwrap()["pushing"],
+            serde_json::json!(true)
+        );
+    }
+
     #[test]
     fn operation_slug_names_each_in_progress_state_and_none_when_clean() {
         assert_eq!(operation_slug(RepositoryState::Clean), None);
@@ -9923,7 +10546,7 @@ mod tests {
         repo.set_head("refs/heads/main").unwrap();
         let path = canonical(main_dir.path());
 
-        let quiet = worktree_entry(&path, true, &HashMap::new(), &HashSet::new());
+        let quiet = worktree_entry(&path, true, &HashMap::new(), &InFlight::default());
         assert!(!quiet.rebasing);
         // Byte-identical for a pre-#1415 client: neither new field is serialized.
         let json = serde_json::to_value(&quiet).unwrap();
@@ -9934,7 +10557,10 @@ mod tests {
             &path,
             true,
             &HashMap::new(),
-            &std::iter::once(path.clone()).collect(),
+            &InFlight {
+                rebasing: std::iter::once(path.clone()).collect(),
+                pushing: HashSet::new(),
+            },
         );
         assert!(busy.rebasing, "the registry's transient mark rides through");
         assert_eq!(
