@@ -37,7 +37,7 @@ import {
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
-import { SessionEntry, tallyByWorktree } from "./sessionCounts";
+import { countUnmatchedSessions, SessionEntry, tallyByWorktree } from "./sessionCounts";
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
@@ -152,6 +152,12 @@ let worktreePaths: string[] = [];
  */
 let lastSessions: SessionEntry[] = [];
 /**
+ * The unmatched-session count last logged by {@link retallySessions} (#1447),
+ * so a log line fires only on a transition — never per tick — even though
+ * `retallySessions` itself runs on every push/poll.
+ */
+let lastUnmatchedSessionCount = 0;
+/**
  * Whether the daemon is pushing session state to this window (#1414). While true
  * the ~10s `list` poll stays off; a daemon too old to stream the op flips it back
  * to `false` and the poll resumes.
@@ -241,10 +247,25 @@ function registerPayload(): RegisterPayload {
  * silent no-op, never a user-facing error. Returns the reply, or `undefined`
  * when the daemon was unreachable. `timeoutMs` overrides the default for a
  * long-running op (the `close` execute waits on windows closing).
+ *
+ * `logRejection` (#1447, default off) additionally logs an `{ok:false}` reply
+ * to the output channel — opt-in per call site, since several existing
+ * callers (`heartbeat`, `fetchAheadBehind`, `daemonRepoPrs`,
+ * `refreshSessionCues`) already treat a rejected reply as an expected
+ * "older daemon, degrade gracefully" signal that fires every poll cycle;
+ * logging those unconditionally would just relocate the noise problem.
  */
-async function send(envelope: Envelope, timeoutMs?: number): Promise<Reply | undefined> {
+async function send(
+  envelope: Envelope,
+  timeoutMs?: number,
+  logRejection?: boolean,
+): Promise<Reply | undefined> {
   try {
-    return await sendEnvelope(socketPath(), envelope, timeoutMs);
+    const reply = await sendEnvelope(socketPath(), envelope, timeoutMs);
+    if (logRejection && reply && !reply.ok) {
+      output?.appendLine(`${envelope.op} rejected: ${reply.error ?? "unknown error"}`);
+    }
+    return reply;
   } catch (err) {
     output?.appendLine(
       `${envelope.op} skipped: ${err instanceof Error ? err.message : String(err)}`,
@@ -277,6 +298,17 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
 function retallySessions(): void {
   if (!provider || !showClaudeSessions()) {
     return;
+  }
+  // Logged only on a transition (#1447), not per call — this runs on every
+  // push/poll, and most sessions legitimately have no matching worktree open.
+  const unmatched = countUnmatchedSessions(lastSessions, worktreePaths);
+  if (unmatched !== lastUnmatchedSessionCount) {
+    output?.appendLine(
+      unmatched > 0
+        ? `${unmatched} session(s) have a cwd outside every known worktree`
+        : "no more unmatched sessions",
+    );
+    lastUnmatchedSessionCount = unmatched;
   }
   if (provider.setSessionTallies(tallyByWorktree(lastSessions, worktreePaths))) {
     refreshDecorations();
@@ -463,12 +495,15 @@ function claudeEmbeddings(): { tabs: number; terminals: number } {
  * Reports this window's Claude embeddings to the daemon's sessions service so it
  * can tag a session's source as VS Code (by joining a session `cwd` against this
  * window's folders). Refreshes the report's liveness on the same cadence as the
- * worktrees heartbeat; a missing daemon is a silent no-op like everything else.
+ * worktrees heartbeat. A missing/unreachable daemon stays a silent no-op; a
+ * *rejected* report is logged (#1447) — the daemon is up but declined it — since
+ * it permanently misattributes every session in this window as `Terminal`,
+ * unlike the other transport-only failures `send` already covers.
  */
 async function reportSessionWindow(): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const { tabs, terminals } = claudeEmbeddings();
-  await send(sessionWindowEnvelope({ key: windowKey, folders, tabs, terminals }));
+  await send(sessionWindowEnvelope({ key: windowKey, folders, tabs, terminals }), undefined, true);
 }
 
 async function heartbeat(): Promise<void> {

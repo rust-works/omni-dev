@@ -149,6 +149,29 @@ export function sessionTotal(tally: SessionTally): number {
 }
 
 /**
+ * Counts live (non-`ended`) sessions whose `cwd` matches no known worktree
+ * path — the population {@link tallyByWorktree} silently drops as "outside
+ * every worktree" (#1447). Kept separate from that function's return so its
+ * contract stays exactly `SessionTallyMap`; a caller that wants this count for
+ * diagnostics runs it as its own pass.
+ */
+export function countUnmatchedSessions(
+  sessions: readonly SessionEntry[],
+  paths: readonly string[],
+): number {
+  let count = 0;
+  for (const session of sessions) {
+    if (session.state === "ended" || !session.cwd) {
+      continue;
+    }
+    if (containingPath(session.cwd, paths) === undefined) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
  * The muted row segment, e.g. `!1 ⚙2` — one glyph-and-count per non-empty
  * bucket, most urgent first. Empty for a worktree with no sessions, so it drops
  * out of the row description entirely.
