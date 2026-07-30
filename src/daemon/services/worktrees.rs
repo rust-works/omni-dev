@@ -10326,6 +10326,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_resolves_the_git_binary_for_itself() {
+        // The public entry point, which `push_with` exists to let the other tests
+        // bypass. Safe to call for real: a `check` never reaches a subprocess at
+        // all, because planning a push contacts no remote.
+        let (_root, origin, wt) = rewritten_worktree();
+        let before = origin_tip(&origin, "refs/heads/feature");
+
+        let svc = WorktreesService::new();
+        let reply = svc
+            .push(PushRequest {
+                check: true,
+                ..push_req(vec![wt])
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reply.get("worktrees").and_then(Value::as_array).unwrap()[0]
+                .get("status")
+                .and_then(Value::as_str),
+            Some("would-force"),
+            "{reply}"
+        );
+        assert_eq!(origin_tip(&origin, "refs/heads/feature"), before);
+    }
+
+    #[tokio::test]
     async fn push_with_defaults_to_report_only_without_confirmation() {
         // Neither `check` nor `confirmed`: the safe reading is "report", matching
         // `rebase`. A client that forgets the flag must never publish.

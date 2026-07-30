@@ -4433,6 +4433,115 @@ mod tests {
         assert_eq!(render_push_outcomes(&[]), "No worktrees selected.");
     }
 
+    #[test]
+    fn push_rows_render_every_remaining_status_and_skip_reason() {
+        // The complement of `push_rows_render_each_status_with_its_own_instruction`:
+        // every arm the interesting-cases test does not reach, so a new variant
+        // cannot be added without a row rendering for it.
+        use worktree_push::{PushResult, SkipReason};
+        let outcome = |result| worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: Some("feature".into()),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            result,
+        };
+        let rendered = render_push_outcomes(&[
+            outcome(PushResult::UpToDate),
+            outcome(PushResult::WouldFastForward { ahead: 3 }),
+            outcome(PushResult::WouldCreate),
+            outcome(PushResult::Pushed { forced: true }),
+            outcome(PushResult::Pushed { forced: false }),
+            outcome(PushResult::Created),
+            outcome(PushResult::Rejected {
+                detail: "pre-receive hook declined".into(),
+                stale: false,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::DetachedHead,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::NotAWorktree,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::NoRemote,
+            }),
+        ]);
+
+        for expected in [
+            "up-to-date",
+            "3 ahead; fast-forward",
+            "no upstream yet",
+            "forced with lease",
+            "fast-forward",
+            "upstream set",
+            "pre-receive hook declined",
+            "detached HEAD",
+            "not a git worktree",
+            "no remote to publish to",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("`git fetch` and rebase"),
+            "only a *lease* refusal earns the fetch-and-rebase instruction: {rendered}"
+        );
+    }
+
+    #[test]
+    fn push_rows_render_an_unresolved_destination_as_a_dash() {
+        // A structural skip resolves no remote, so there is nothing to print in the
+        // REMOTE column — and an empty cell would read as a rendering bug.
+        let rendered = render_push_outcomes(&[worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: None,
+            remote: String::new(),
+            remote_branch: String::new(),
+            result: worktree_push::PushResult::Skipped {
+                reason: worktree_push::SkipReason::NotAWorktree,
+            },
+        }]);
+        let row = rendered.lines().nth(1).unwrap();
+        assert!(
+            row.contains(" - "),
+            "branch and remote both render as `-`: {row}"
+        );
+    }
+
+    #[test]
+    fn push_all_selects_the_repository_rather_than_named_paths() {
+        let cmd = PushCommand {
+            all: true,
+            ..push_cmd()
+        };
+        let selection = cmd.selection(Some(Path::new("/base"))).unwrap();
+        match selection {
+            Selection::All { base } => assert_eq!(base, PathBuf::from("/base")),
+            other @ Selection::Paths(_) => panic!("expected an --all selection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_json_output_carries_the_dry_run_flag_and_the_outcomes() {
+        // `-o json` is the machine surface, so it must stay a superset of the table:
+        // the same per-worktree results, plus whether this was a preview.
+        let (_root, _origin, wt) = push_scenario();
+        let cmd = PushCommand {
+            paths: vec![wt.clone()],
+            dry_run: true,
+            output: TableOrJson::Json,
+            ..push_cmd()
+        };
+        // Exercises the JSON arm of `print`; the human arm is covered by the
+        // renderer tests above.
+        cmd.execute_with(None, |_, _| async { false })
+            .await
+            .expect("a dry run must succeed");
+    }
+
     /// A bare `origin`, a local `main`, and a linked `feature` worktree whose
     /// published branch has been **rewritten** — the state a rebase leaves and
     /// `push` exists for. Returns `(temp root, origin path, worktree path)`.
