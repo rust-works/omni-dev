@@ -263,7 +263,9 @@ forwarding never waits on the parser or the daemon, over-long or unparseable lin
 are simply not parsed, and a missing daemon is a silent no-op. The worst case is
 losing state visibility, never Claude failing to launch. It **never logs or
 persists conversation content** — only the state, `session_id`, `cwd` and model
-leave the process.
+leave the process. An opt-in `OMNI_DEV_CLAUDE_WRAP_LOG` diagnostic sink can
+additionally write that same metadata to a local file — see
+[Troubleshooting](#troubleshooting).
 
 It also re-reports the current state every 30s, so a wrapped session idle at the
 prompt does **not** age out on the 5-minute TTL the way a hook-fed one does.
@@ -315,9 +317,11 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   fire-and-forget socket POST.
 - The stream wrapper is **opt-in** too, and is the one component that *sees* your
   conversation as it streams. It extracts only the state, `session_id`, `cwd` and
-  model, and logs and persists nothing — a design constraint, not a convention
-  ([ADR-0057](adrs/adr-0057.md)). The only thing it writes is the same
-  fire-and-forget socket POST.
+  model, and logs and persists nothing of the conversation itself — a design
+  constraint, not a convention ([ADR-0057](adrs/adr-0057.md)). The only network
+  I/O it does is the same fire-and-forget socket POST; the opt-in
+  `OMNI_DEV_CLAUDE_WRAP_LOG` sink (unset by default) writes that same
+  state/identity metadata to a local file when a user explicitly asks for it.
 
 This does not touch the browser-bridge ([ADR-0036](adrs/adr-0036.md)) or Snowflake
 trust models.
@@ -369,6 +373,87 @@ where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
 "agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`, or
 `{ "stream_state": "<state>" }` — the authoritative Feed 4 form, applied verbatim
 rather than inferred.
+
+## Troubleshooting
+
+Instrumentation added in #1447 to make a suspected broadcast bug (stale/wrong/
+missing session cues in a VS Code window) evidence-based instead of something
+that has to be re-derived by reading code.
+
+### Raising the daemon's log level
+
+The daemon defaults to `info`; short-lived CLI invocations (including
+`omni-dev sessions hook`, which Claude Code spawns directly on every hook
+event) default to `warn`. `RUST_LOG` always wins when set. Otherwise, set a
+persistent default in `~/.omni-dev/settings.json` — mirrors the MCP server's
+`mcp.log_level` ([docs/mcp.md](mcp.md#configuration-settingsjson)):
+
+```json
+{
+  "daemon": {
+    "log_level": "debug"
+  }
+}
+```
+
+This is the only way to raise a **launchd/systemd-spawned** daemon's level:
+neither's generated plist/unit passes `RUST_LOG` through to the daemon's
+environment, but `settings.json` is read from disk regardless of how the
+process was started. A new `log_level` needs a daemon restart (`omni-dev
+daemon restart`) — the subscriber is installed once at startup. Module-scoped
+directives work too, e.g. `"omni_dev::sessions=debug"`.
+
+### Reading the new log lines, hop by hop
+
+- **Broadcast** ([`src/daemon/server.rs`](../src/daemon/server.rs)) —
+  `debug`-level subscription lifecycle: each `subscribe`'s service+op on
+  start, and *why* it ended (an explicit cancel line, the client hanging up,
+  or a decode error — no longer collapsed into one silent cause); `trace`-level
+  per-wakeup outcome (pushed a changed snapshot vs. suppressed an identical
+  one); `warn` on a service's op returning an error and on a reply write
+  failure. Start here for "a window isn't seeing updates" — it tells you
+  whether a frame was even attempted and why a subscription ended.
+- **Registry** ([`src/sessions.rs`](../src/sessions.rs)) — one `debug` line per
+  `observe`/`end`/`report_window`/`unregister_window` call: session or window
+  key, the incoming event, the state transition (or "unchanged"), and whether
+  it triggered a push; a `debug` line when a session's `cwd` matches no
+  reporting window (the "why did this show as Terminal" question — this is
+  where a symlink or `/tmp` vs `/private/tmp` mismatch would surface); `debug`
+  on every TTL reap and cache-eviction, with the count and (for eviction) the
+  evicted key. This is the ground truth for "did the registry see the event
+  and did it decide to push."
+- **The four feeds** — Feed 1's hook sink
+  ([`src/cli/sessions.rs`](../src/cli/sessions.rs)) logs which gate a silent
+  early exit hit, and the raw (truncated) notification text when
+  `classify_notification` falls through to `Other`, so a Claude Code wording
+  change is visible instead of "waiting never shows up." Feed 2's transcript
+  watcher ([`src/sessions/watcher.rs`](../src/sessions/watcher.rs)) logs a
+  per-scan summary (files scanned, sightings produced) and `warn`s if a scan's
+  state is lost to a panicked blocking task. Feed 4's tracker
+  ([`src/sessions/stream.rs`](../src/sessions/stream.rs)) counts rather than
+  logs per-line — an unparseable-line count and an uncorrelated-`can_use_tool`
+  count — since it runs on every stream-json line; the wrapper is what
+  surfaces those counts (below).
+- **Extension output channel** (View → Output → "omni-dev") now also logs a
+  rejected (not just unreachable) daemon reply for a window's session report,
+  a dropped subscription frame that didn't match the expected shape, and a
+  count-based summary when live sessions have a `cwd` outside every known
+  worktree. Check this first for "the tree looks wrong in just this window."
+
+### The wrapper's opt-in diagnostic log
+
+`omni-dev claude-wrap` (Feed 4) never logs or persists conversation content by
+default (see [ADR-0057](adrs/adr-0057.md)). Set `OMNI_DEV_CLAUDE_WRAP_LOG` to a
+file path to opt into a diagnostic sink for one session:
+
+```bash
+OMNI_DEV_CLAUDE_WRAP_LOG=/tmp/claude-wrap.log claude …
+```
+
+It records only: process start/exit, `session_id`/`cwd`/`model` once learned,
+reported state transitions, tee-channel drop counts, and daemon-report
+failures/timeouts — **never** message or tool-call content. Leave it unset (the
+default) and the sink costs nothing: no file, no allocation, no syscall.
 
 ## Scope and follow-ups
 

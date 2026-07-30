@@ -93,6 +93,11 @@ The block is loaded once at process start for `log_level`, and per call for
 effect without restarting the server, but a new `log_level` needs a restart
 (the tracing subscriber is installed once).
 
+> See also `daemon.log_level`, the equivalent setting for the long-lived
+> `omni-dev daemon` process — an independent setting for an independent
+> process, documented in
+> [sessions-service.md's Troubleshooting section](sessions-service.md#troubleshooting).
+
 Because the file can carry credentials in its `env` map, place it inside a
 `0700` `~/.omni-dev/` (the `auth login` flows already harden it to `0600`).
 
