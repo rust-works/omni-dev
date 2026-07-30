@@ -110,6 +110,58 @@ pub struct BetaHeader {
     pub input_context: Option<usize>,
 }
 
+/// The four current Claude model families.
+///
+/// Classified from an API identifier or a [`ModelSpec`]'s human-readable
+/// name — distinct from [`ModelSpec::tier`], which groups by
+/// performance/capability rather than the model's name.
+///
+/// Used to render a colour-coded glyph identifying which model a session is
+/// running (`omni-dev claude-wrap`'s terminal-title rewrite, issue #1445): a
+/// terminal tab title is plain text with no ANSI/theme-colour channel, so a
+/// coloured circle emoji stands in for real colour. See
+/// [`ModelRegistry::get_model_family`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// The Fable family (e.g. `claude-fable-5`).
+    Fable,
+    /// The Opus family (e.g. `claude-opus-4-8`).
+    Opus,
+    /// The Sonnet family (e.g. `claude-sonnet-5`).
+    Sonnet,
+    /// The Haiku family (e.g. `claude-haiku-4-5`).
+    Haiku,
+    /// A known-but-unclassified, or entirely unrecognized, model id.
+    Unknown,
+}
+
+impl ModelFamily {
+    /// The colour-circle emoji standing in for this family, since a
+    /// terminal tab title is plain text with no colour channel.
+    #[must_use]
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Fable => "🟠",
+            Self::Opus => "🟡",
+            Self::Sonnet => "🟢",
+            Self::Haiku => "🔵",
+            Self::Unknown => "⚪",
+        }
+    }
+
+    /// Short human-readable label for this family.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fable => "Fable",
+            Self::Opus => "Opus",
+            Self::Sonnet => "Sonnet",
+            Self::Haiku => "Haiku",
+            Self::Unknown => "Claude",
+        }
+    }
+}
+
 /// Specification for a single model: its identity, limits, tier, and any
 /// beta-header unlocks.
 ///
@@ -691,6 +743,36 @@ impl ModelRegistry {
             return spec.input_context;
         }
         self.get_input_context(api_identifier)
+    }
+
+    /// Classifies a raw model identifier into its [`ModelFamily`].
+    ///
+    /// Resolves through [`Self::get_model_spec`] first, so Bedrock/region-
+    /// prefixed and versioned identifiers normalize the same way every other
+    /// lookup on this registry does; the family word (Fable/Opus/Sonnet/
+    /// Haiku) is then matched, case-insensitively, against the resolved
+    /// spec's human-readable [`ModelSpec::model`] name. A registry miss
+    /// falls back to matching directly against the raw identifier, so a
+    /// brand-new model not yet in the catalog still classifies correctly as
+    /// long as its id contains the family word. No match on either ⇒
+    /// [`ModelFamily::Unknown`].
+    #[must_use]
+    pub fn get_model_family(&self, api_identifier: &str) -> ModelFamily {
+        let haystack = self
+            .get_model_spec(api_identifier)
+            .map_or(api_identifier, |spec| spec.model.as_str())
+            .to_ascii_lowercase();
+        if haystack.contains("fable") {
+            ModelFamily::Fable
+        } else if haystack.contains("opus") {
+            ModelFamily::Opus
+        } else if haystack.contains("sonnet") {
+            ModelFamily::Sonnet
+        } else if haystack.contains("haiku") {
+            ModelFamily::Haiku
+        } else {
+            ModelFamily::Unknown
+        }
     }
 }
 
@@ -1970,5 +2052,72 @@ providers:
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
         assert_eq!(resolved.as_deref(), Some(Path::new("/some/path")));
+    }
+
+    #[test]
+    fn model_family_classifies_registered_claude_identifiers() {
+        let registry = embedded_only();
+        assert_eq!(
+            registry.get_model_family("claude-fable-5"),
+            ModelFamily::Fable
+        );
+        assert_eq!(
+            registry.get_model_family("claude-opus-4-8"),
+            ModelFamily::Opus
+        );
+        assert_eq!(
+            registry.get_model_family("claude-sonnet-5"),
+            ModelFamily::Sonnet
+        );
+        assert_eq!(
+            registry.get_model_family("claude-haiku-4-5-20251001"),
+            ModelFamily::Haiku
+        );
+    }
+
+    #[test]
+    fn model_family_normalizes_bedrock_identifiers() {
+        let registry = embedded_only();
+        assert_eq!(
+            registry.get_model_family("us.anthropic.claude-3-7-sonnet-20250219-v1:0"),
+            ModelFamily::Sonnet
+        );
+    }
+
+    #[test]
+    fn model_family_falls_back_to_the_raw_identifier_when_unregistered() {
+        let registry = embedded_only();
+        // "claude-opus-5" is not yet in the embedded catalog, but its id
+        // still names its family — the registry-miss fallback must catch it
+        // rather than reporting Unknown.
+        assert!(registry.get_model_spec("claude-opus-5").is_none());
+        assert_eq!(
+            registry.get_model_family("claude-opus-5"),
+            ModelFamily::Opus
+        );
+    }
+
+    #[test]
+    fn model_family_is_unknown_for_unrecognized_identifiers() {
+        let registry = embedded_only();
+        assert_eq!(registry.get_model_family("gpt-5.2"), ModelFamily::Unknown);
+        assert_eq!(
+            registry.get_model_family("some-future-model"),
+            ModelFamily::Unknown
+        );
+    }
+
+    #[test]
+    fn model_family_glyph_and_label_cover_every_variant() {
+        assert_eq!(ModelFamily::Fable.glyph(), "🟠");
+        assert_eq!(ModelFamily::Opus.glyph(), "🟡");
+        assert_eq!(ModelFamily::Sonnet.glyph(), "🟢");
+        assert_eq!(ModelFamily::Haiku.glyph(), "🔵");
+        assert_eq!(ModelFamily::Unknown.glyph(), "⚪");
+        assert_eq!(ModelFamily::Fable.label(), "Fable");
+        assert_eq!(ModelFamily::Opus.label(), "Opus");
+        assert_eq!(ModelFamily::Sonnet.label(), "Sonnet");
+        assert_eq!(ModelFamily::Haiku.label(), "Haiku");
+        assert_eq!(ModelFamily::Unknown.label(), "Claude");
     }
 }
