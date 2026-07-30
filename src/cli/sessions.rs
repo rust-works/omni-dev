@@ -1449,6 +1449,53 @@ mod tests {
         cmd.report(r#"{"hook_event_name":"Stop"}"#).await; // no session_id → no op
     }
 
+    /// A daemon stand-in that accepts a connection, captures the request, but
+    /// never replies — so `report`'s own timeout, not a connection error
+    /// (already covered by `hook_report_is_silent_when_the_daemon_is_down`),
+    /// is what has to end the call.
+    fn fake_daemon_that_never_replies() -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::sync::oneshot::Receiver<Value>,
+    ) {
+        use futures::StreamExt;
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let req = framed.next().await.unwrap().unwrap();
+            let _ = tx.send(serde_json::from_str::<Value>(&req).unwrap());
+            // Never reply: hold the connection open so the client's own
+            // timeout, not a connection error, is what ends the request.
+            std::future::pending::<()>().await;
+        });
+        (dir, sock, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_report_times_out_against_a_wedged_daemon() {
+        // Paused time lets the runtime fast-forward straight to `report`'s own
+        // 2-second timeout instead of the test actually waiting on it.
+        let (_dir, sock, received) = fake_daemon_that_never_replies();
+        let cmd = HookCommand { socket: Some(sock) };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#),
+        )
+        .await
+        .expect("report should time out rather than hang forever");
+
+        // The daemon did receive the request — this really is a wedged
+        // daemon, not a connection failure.
+        assert_eq!(received.await.unwrap()["op"], "observe");
+    }
+
     #[tokio::test]
     async fn hook_report_reaches_a_live_daemon() {
         // The happy path: a real listener answers `ok: true`, so `report()`

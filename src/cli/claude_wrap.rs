@@ -557,6 +557,53 @@ mod tests {
         (dir, socket, seen)
     }
 
+    /// A daemon stand-in that accepts a connection but never replies, holding
+    /// it open for the test's duration — so a request against it can only end
+    /// via `report`'s own timeout, not a connection error (already covered by
+    /// `a_missing_daemon_never_affects_the_child`).
+    fn fake_daemon_that_never_replies() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            // Never read from `held`: its sole purpose is to keep each
+            // accepted connection's fd alive instead of dropping it, so the
+            // client hangs until its own timeout fires.
+            #[allow(clippy::collection_is_never_read)]
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                held.push(stream);
+            }
+        });
+        (dir, socket)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_daemon_times_out_rather_than_hanging() {
+        // Paused time lets the runtime fast-forward straight to `report`'s own
+        // 2-second timeout instead of the test actually waiting on it.
+        let (_dir, socket) = fake_daemon_that_never_replies();
+        let log_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let log_path = log_dir.path().join("wrap.log");
+        let log = WrapLogSink::open(Some(&log_path));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            report(&socket, "observe", json!({}), &log),
+        )
+        .await
+        .expect("report should time out rather than hang forever");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("report op=observe timed out"),
+            "expected a timeout log line, got: {contents}"
+        );
+    }
+
     #[test]
     fn trailing_args_are_captured_verbatim_after_a_separator() {
         let cmd = parse(&["--", "node", "cli.js", "--output-format", "stream-json"]);
