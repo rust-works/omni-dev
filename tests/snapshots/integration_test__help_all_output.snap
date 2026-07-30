@@ -4521,6 +4521,7 @@ Commands:
   focus        Focus (raise) the VS Code window for a worktree folder
   close        Close a worktree's window and, for a linked worktree, delete it
   rebase       Rebase worktrees onto the remote default branch, fetching it once per repo
+  push         Publish worktrees' branches, force-pushing with a lease where needed
   merge-queue  Enqueue eligible worktrees' PRs into the GitHub merge queue
   reposition   Move and resize worktrees' open windows to match a reference window
   reload       Signal worktrees' open windows to reload themselves
@@ -4613,6 +4614,25 @@ Options:
   -y, --yes            Skip the interactive confirmation before enqueuing
       --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev worktrees push - Publish worktrees' branches, force-pushing with a lease where needed
+
+Publish worktrees' branches, force-pushing with a lease where needed
+
+Usage: push [OPTIONS] [PATH]...
+
+Arguments:
+  [PATH]...  Worktree folders to publish. Omit these and pass `--all` to publish every worktree of the current repository, including its main working tree
+
+Options:
+      --all              Publish every worktree of the current repository, including its main working tree
+      --dry-run          Report what would be published, but push nothing
+  -y, --yes              Skip the interactive confirmation before pushing
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
