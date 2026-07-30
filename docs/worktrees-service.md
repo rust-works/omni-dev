@@ -244,6 +244,60 @@ The tree view surfaces the same engine as **Rebase on main** — see
 [Rebase onto main](#rebase-onto-main). Since #1415 it drives the daemon's `rebase`
 op rather than spawning this CLI in a terminal.
 
+`worktrees push` publishes worktrees' branches to their upstreams, force-pushing
+**with a lease** where a rebase rewrote history (#1443,
+[ADR-0061](adrs/adr-0061.md)) — the other half of the rebase workflow above. Like
+`rebase` it runs **entirely locally and never contacts the daemon**, by choice: a
+batch push works with no daemon running, and `--all` stays out of the wire
+protocol. (The daemon hosts the same engine behind its `push` op, which is what
+the tree view drives.) The batch logic lives in `src/git/worktree_push.rs`.
+
+```bash
+# Preview: classify every worktree, publish nothing. Contacts no remote at all.
+omni-dev worktrees push --all --dry-run
+
+# Publish every worktree of the current repo (interactive y/N unless --yes).
+omni-dev worktrees push --all
+
+# Publish specific worktrees.
+omni-dev worktrees push /path/to/wt-a /path/to/wt-b
+```
+
+Selection is explicit: pass `<PATH>...` **or** `--all`. A bare invocation with
+neither is a usage error, not a silent mass-push. Each worktree is reported as
+`up-to-date` / `would-push` / `would-force` / `would-create` / `pushed` /
+`created` / `rejected` / `skipped(<reason>)` (`-o json` for the machine shape). A
+**dirty worktree is not skipped** — a push publishes commits, not the working
+tree — while a detached HEAD (which includes one sitting mid-rebase), a
+non-worktree path, and a branch with no remote to publish to are. A push publishes
+history to everyone, so the command confirms by default
+([ADR-0027](adrs/adr-0027.md)); the prompt names how many of the batch are force
+pushes separately from the total. This subcommand takes no `--socket` (it never
+opens the control socket).
+
+**The lease, and why it is two flags.** Every non-fast-forward goes out as
+`git push --force-with-lease --force-if-includes`. A bare `--force-with-lease`
+leases against your *local* remote-tracking ref, so any background fetch that
+refreshes it silently renews the lease — and VS Code's built-in Git extension does
+exactly that if `git.autofetch` is on. `--force-if-includes` closes that hole by
+additionally checking the remote tip was integrated locally, and per `git-push(1)`
+it is **not** implied: it must be passed explicitly, and it is a no-op unless
+`--force-with-lease` is given valueless (which is why this command never passes
+the `=<refname>:<expect>` form). There is **no `--force`**: `omni-dev worktrees
+push --force` is a parse error. When the lease refuses, the row says so and names
+`git fetch` plus a rebase as the fix — the tool offers no way to push harder.
+
+**The remote default branch is never force-pushed**, whichever worktree has it
+checked out ([ADR-0061](adrs/adr-0061.md) §4). This deliberately inverts
+[ADR-0060](adrs/adr-0060.md), which made the main working tree a valid *rebase*
+target: a rebase rewrites only local history and is `git reflog`-recoverable, but
+a force-push publishes that rewrite to everyone. The gate is on the **branch name**
+rather than `is_main`, so a linked worktree with `main` checked out is refused too
+— and a *fast-forward* onto the default branch stays allowed, being an ordinary
+push. A branch with no upstream is published with `--set-upstream` rather than
+refused. Pushing to a remote other than the branch's own upstream is not
+supported.
+
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
 It takes **any number** of paths, since the daemon evaluates and enqueues the whole
@@ -856,6 +910,72 @@ dirty, etc.); there is no client-side pre-filter dropping it from the batch.
 as skipped in the modal the user is already reading, and a target other than the
 remote default branch is a CLI concern (#1409).
 
+### Push (force-with-lease)
+
+**Push (force-with-lease)** (the `4_git` context-menu group, beside **Rebase on
+main**) publishes the selected branches to their upstreams, force-pushing with a
+lease where a rebase rewrote history (#1443,
+[ADR-0061](adrs/adr-0061.md)). It drives the daemon's two-phase **`push`** op,
+which runs the same engine as [`worktrees push`](#cli).
+
+This is the action that completes the batch-rebase workflow. Before it, the view
+could rewrite N branches with one gesture and then displayed the divergence it had
+just created with no way to resolve it — you opened a terminal in each worktree
+and force-pushed by hand.
+
+**Offered on repo rows too**, unlike every other batch git action. A selected repo
+means *every worktree of it*, expanded client-side from the snapshot the repo node
+already carries (no extra round-trip) and deduplicated against any worktree rows
+you selected alongside it. The `when` clause is therefore
+`viewItem =~ /^(repo|worktree)/`.
+
+**Two phases, one confirm.**
+
+1. **Check.** A progress notification while the daemon classifies every selected
+   worktree against its upstream. Nothing is published, and — unlike the rebase
+   check — **no remote is contacted at all**: the comparison is against your local
+   `refs/remotes/<remote>/<branch>`, which is exactly what the lease is checked
+   against, so the plan you confirm and the lease git enforces agree by
+   construction. If nothing is pending, a warning toast says *why*.
+2. **Confirm.** A modal listing every branch about to be published, **force
+   pushes first and labelled `FORCE`** with their ahead/behind counts, then the
+   fast-forwards, then the skipped ones with reasons. Shown even for a single row
+   ([ADR-0049](adrs/adr-0049.md) §1). The button reads **Force Push** whenever the
+   batch contains one, so a rewrite is never confirmed by a button that says
+   merely "Push".
+3. **Execute.** The daemon **re-plans from scratch** (a branch that moved between
+   the phases is re-classified, not pushed on stale information) and publishes
+   each still-pending worktree sequentially, then a summary toast reports the
+   outcome.
+
+**The lease is not negotiable.** Every force goes out as `--force-with-lease
+--force-if-includes` — see [the CLI section](#cli) for why both flags are needed —
+and there is no `--force` anywhere: not a flag, not a modal escape hatch, not a
+field a socket client could set. A refused lease is the feature working: the toast
+is raised to an **error**, names the branches, and tells you to run `git fetch`,
+rebase, and push again.
+
+**The remote default branch is never force-pushed**, whichever worktree has it
+checked out. The refusal lives in the daemon's engine, not in the menu gating, so
+it holds however the op is reached; a fast-forward onto the default branch is an
+ordinary push and stays allowed.
+
+**Push state in the tree.** A row shows a spinning `$(sync~spin)` with `pushing…`
+while the daemon is publishing it, and its icon turns yellow, exactly as for a
+rebase. There is deliberately **no durable counterpart**: a push writes no on-disk
+state a later snapshot could rediscover, so this cue is the whole of it — and a
+*completed* push instead shows up as the row's `↑ahead` count clearing on the next
+frame, since the push moves `upstream_sha` and that is what makes the frame a
+delta (#1344). Like the rebase cue it is deliberately *not* a badge: a badge holds
+two characters, and the PR check verdict and Claude session cue already take one
+each.
+
+**The daemon is required.** With none running, the action reports it and points at
+`omni-dev daemon start` — or at running `omni-dev worktrees push <path>` yourself,
+which still works entirely locally. Every run is auditable in `omni-dev daemon
+logs` (`push check` / `push execute` lines carrying the requesting window, the
+counts, how many needed the lease, and how many the lease refused).
+
 ### Window repositioning (macOS)
 
 **Reposition Windows to Match** (the `4_layout` context-menu group) moves and
@@ -1315,6 +1435,35 @@ and it is recoverable with ordinary git (`--continue` or `--abort`) — but it i
 state a client can now leave behind, which is why it is cued durably in the tree,
 named in the summary toast, and counted in the `rebase execute` audit line.
 
+The **`push`** op is the first to **write to a remote with the user's ambient git
+credentials** ([ADR-0061](adrs/adr-0061.md)) — `merge-queue` mutates the remote
+through `gh` and its own token, and `rebase` only fetches — so it is the largest
+escalation in this threat model to date: a socket writer can publish rewritten
+history that other people then have to recover from. It is same-user-bounded like
+everything else here, publishes only branches the client names, and re-validates
+on execute.
+
+The mitigation that actually carries the weight is **not ours**. Every
+non-fast-forward goes out as `--force-with-lease --force-if-includes`, and the
+lease is enforced by `git` against the remote's real tip: the daemon therefore
+**cannot** overwrite a commit it has not seen, however wrong the request is. There
+is no `--force` anywhere in the surface — no engine option, no CLI flag, no modal
+escape hatch, and **no field in the wire payload** for a socket client to set — so
+this is a property of the op rather than of the UI in front of it. A refused lease
+is reported (distinctly from every other rejection, naming `git fetch` as the fix)
+and counted in the `push execute` audit line as `stale_rejected`.
+
+Two further guards live in the daemon's engine rather than the menu, so they hold
+however the op is reached: the **remote default branch is never force-pushed**,
+whichever worktree has it checked out — the gate is the branch name, not `is_main`
+(this deliberately inverts [ADR-0060](adrs/adr-0060.md), which applies to rebase's
+*local* rewrite and not to publishing one) — and a branch publishes only to its own
+upstream's remote, never one the client picks. No secret is read or persisted; the
+push relies entirely on the user's ambient `git` configuration, reached through
+`ssh-agent`/credential helpers exactly as the user's own shell would. Nothing
+durable is left behind: the transient `pushing` mark is in-memory and cleared on
+every exit path, including a panicked task.
+
 The **`worktrees rebase`** CLI command adds **no** socket capability: it never
 opens the control socket ([ADR-0055](adrs/adr-0055.md)), running the same engine
 in the invoking user's own shell with their `git` credentials. It applies the same
@@ -1390,6 +1539,7 @@ Ops:
 | `reload`          | `{ target_keys[] }`                            | `{ requested, signalled, unknown[] }`      |
 | `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
 | `rebase`          | `{ paths[], check?, confirmed?, keep_conflicts?, autostash?, onto? }` | `{ fetches[], worktrees[] }` *(plan, or result)* |
+| `push`            | `{ paths[], check?, confirmed?, requester_key? }` | `{ worktrees[] }` *(plan, or result)*      |
 | `reposition`      | `{ reference_key, target_keys[], check? }`     | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
 | `reposition-undo` | `null`                                         | *(same shape, without `reference`)*        |
 | `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
@@ -1500,7 +1650,7 @@ Where:
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
 - A `tree` `worktree` is
   `{ path, branch?, head_sha?, upstream_sha?, is_main, open, window_key?, pr?, pr_none?,
-  operation?, rebasing? }`. The
+  operation?, rebasing?, pushing? }`. The
   main working tree
   comes first (`is_main: true`), then linked worktrees sorted by path. `open` is
   `true` when a live window currently has that worktree open, and `window_key` (the
@@ -1543,6 +1693,12 @@ Where:
   applies cleanly never writes an on-disk state for `operation` to report, and a
   conflicting one only writes it at the moment of collision. Treat an unrecognised
   `operation` value as "some operation in progress" rather than ignoring it.
+  `pushing` is the `rebasing` twin for the **`push` op** (#1443), likewise
+  skip-when-false and absent from a pre-#1443 daemon. It has **no durable
+  counterpart**: a push writes no on-disk state, so unlike a rebase there is
+  nothing for `operation` to report and this flag is the whole cue. A *completed*
+  push is instead observable as `upstream_sha` moving, which is exactly why that
+  field rides the snapshot.
 - `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
   `{ paths: [<worktree path>, …] }`, it returns
   `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
@@ -1720,10 +1876,11 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   for on-disk changes, so a branch move is reflected within the tick rather than
   instantly. A polling fallback and a filesystem watcher were both considered and
   deferred.
-- The tree view is **view + focus only**, apart from two management actions: the
-  destructive **close** ([ADR-0049](adrs/adr-0049.md)) and **Rebase on main**
-  ([Rebase onto main](#rebase-onto-main), #1409/#1415). The rest (add/prune) remain
-  out of scope for this iteration. Since #1415 rebase *is* in the daemon
+- The tree view is **view + focus only**, apart from three management actions: the
+  destructive **close** ([ADR-0049](adrs/adr-0049.md)), **Rebase on main**
+  ([Rebase onto main](#rebase-onto-main), #1409/#1415), and
+  **Push (force-with-lease)** ([Push](#push-force-with-lease), #1443). The rest
+  (add/prune) remain out of scope for this iteration. Since #1415 rebase *is* in the daemon
   ([ADR-0059](adrs/adr-0059.md)), which unblocks a **tray** "rebase all" — no
   longer barred by credentials, just unbuilt. Two more follow-ups it opens up:
   **Abort Rebase / Continue Rebase** row actions, now that the tree can see a
