@@ -48,7 +48,8 @@ window or open a worktree's folder. Two title-bar actions:
 
 Right-click a leaf or repo for context-menu actions: **Open Worktree**, **Reload
 Window**, **Close Window**, **Close Worktree**, **Rebase on main**, and — for a
-`github.com` repo — **Open Pull Request…** and **Open Pull Request in Browser…**.
+`github.com` repo — **Open GitHub Repository**, **Open Pull Request…** and **Open
+Pull Request in Browser…**.
 
 The four worktree verbs are deliberately separate, because reloading a *window*,
 closing a *window*, and deleting a *worktree* are different things:
@@ -71,6 +72,10 @@ Ctrl/cmd+click or shift+click to select several rows, then act on all of them at
 once — the view lists every window's worktrees, so the useful verbs are plural
 ("open the PRs for these three branches", "close these five stale worktrees").
 
+- **Open GitHub Repository** opens each selected row's repository page once. A
+  worktree row counts as its parent repository, so a repo row selected with its
+  own worktrees still opens one page. It never asks first — one page per selected
+  row is a count you did pick.
 - **Open Pull Request…** / **Open Pull Request in Browser…** open every selected
   row's PR. A repo node and one of its own worktrees both selected will not open
   the same PR twice. Above five PRs it asks first, since a repo node contributes
@@ -91,6 +96,22 @@ once — the view lists every window's worktrees, so the useful verbs are plural
   argument is a single *destination*, so it has no multi-target meaning.
 - Selecting rows never opens them: double-click still opens a worktree, and
   ctrl/shift+click only changes the selection.
+
+### Open GitHub Repository
+
+Right-click a **repository** row with a `github.com` origin and choose **Open
+GitHub Repository** to open `https://github.com/<owner>/<name>` in your default
+browser — the Issues tab, Actions, Settings, the code browser, the `README`. Every
+other GitHub action in the view is pull-request shaped, so reaching the repository
+itself otherwise meant leaving the view and typing the URL, or going via a PR's
+breadcrumb.
+
+It is the one GitHub action that needs **nothing**: the URL is built from the
+identity the daemon already put in the tree, so there is no `gh`, no network and no
+daemon round-trip — and correspondingly no progress notification and no
+confirmation. The action is offered on repository rows only, since a worktree's
+repository page is its parent's and a second menu entry would add no information.
+Repositories with no `github.com` origin do not show it at all.
 
 ### Open Pull Request…
 
