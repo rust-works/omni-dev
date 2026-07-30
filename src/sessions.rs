@@ -466,6 +466,7 @@ impl SessionsRegistry {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
             let mutated = if let Some(entry) = sessions.get_mut(&req.session_id) {
+                let old_state = entry.state;
                 let next = SessionState::for_event(&req.event, Some(entry.state));
                 let state_changed = next != entry.state;
                 entry.state = next;
@@ -477,12 +478,32 @@ impl SessionsRegistry {
                 let filled_transcript = fill(&mut entry.transcript_path, req.transcript_path);
                 let filled_repo = fill(&mut entry.repo, req.repo);
                 let filled_model = fill(&mut entry.model, req.model);
-                state_changed || filled_cwd || filled_transcript || filled_repo || filled_model
+                let mutated =
+                    state_changed || filled_cwd || filled_transcript || filled_repo || filled_model;
+                tracing::debug!(
+                    session_id = %entry.session_id,
+                    event = ?req.event,
+                    old_state = ?old_state,
+                    new_state = ?entry.state,
+                    filled_cwd,
+                    filled_transcript,
+                    filled_repo,
+                    filled_model,
+                    mutated,
+                    "session sighting observed"
+                );
+                mutated
             } else {
                 if sessions.len() >= MAX_SESSIONS {
                     evict_oldest_session(&mut sessions);
                 }
                 let state = SessionState::for_event(&req.event, None);
+                tracing::debug!(
+                    session_id = %req.session_id,
+                    event = ?req.event,
+                    new_state = ?state,
+                    "new session observed"
+                );
                 sessions.insert(
                     req.session_id.clone(),
                     SessionEntry {
@@ -527,9 +548,11 @@ impl SessionsRegistry {
             };
             (known, reaped)
         };
+        let bump = known || reaped > 0;
+        tracing::debug!(session_id, known, reaped, bump, "session end observed");
         // A known session flipped to `ended`; an unknown one changed nothing, so
         // only this call's inline reap could have.
-        if known || reaped > 0 {
+        if bump {
             self.bump();
         }
         known
@@ -557,6 +580,15 @@ impl SessionsRegistry {
                 }
                 true
             };
+            let mutated = mutated || reaped > 0;
+            tracing::debug!(
+                key = %report.key,
+                folders = report.folders.len(),
+                tabs = report.tabs,
+                terminals = report.terminals,
+                mutated,
+                "window report observed"
+            );
             windows.insert(
                 report.key.clone(),
                 WindowEntry {
@@ -564,7 +596,7 @@ impl SessionsRegistry {
                     last_seen: now,
                 },
             );
-            mutated || reaped > 0
+            mutated
         };
         if changed {
             self.bump();
@@ -578,6 +610,7 @@ impl SessionsRegistry {
             let mut windows = self.lock_windows();
             windows.remove(key).is_some()
         };
+        tracing::debug!(key, removed, "window unregister observed");
         if removed {
             self.bump();
         }
@@ -683,11 +716,21 @@ fn resolve_source(cwd: Option<&Path>, windows: &[WindowReport]) -> Source {
         .iter()
         .filter(|w| w.folders.iter().any(|f| cwd.starts_with(f)))
         .min_by(|a, b| a.key.cmp(&b.key));
-    match matched {
-        Some(window) => Source::VsCode {
+    if let Some(window) = matched {
+        Source::VsCode {
             window_key: window.key.clone(),
-        },
-        None => Source::Terminal,
+        }
+    } else {
+        // The interesting diagnostic case (#1447): a session with a real
+        // `cwd` that still didn't join any window — e.g. a symlink or
+        // `/tmp` vs `/private/tmp` mismatch between the session's `cwd` and
+        // every reported window folder.
+        tracing::debug!(
+            cwd = %cwd.display(),
+            window_count = windows.len(),
+            "no window folder matched session cwd; tagging Terminal"
+        );
+        Source::Terminal
     }
 }
 
@@ -712,7 +755,11 @@ fn reap_sessions(
         };
         (now - e.last_seen).num_seconds() <= max_age
     });
-    before - sessions.len()
+    let reaped = before - sessions.len();
+    if reaped > 0 {
+        tracing::debug!(reaped, "reaped stale sessions");
+    }
+    reaped
 }
 
 /// Removes window-embedding reports last refreshed longer than `ttl` ago.
@@ -724,7 +771,11 @@ fn reap_windows(
     let max_age = ttl.as_secs() as i64;
     let before = windows.len();
     windows.retain(|_, e| (now - e.last_seen).num_seconds() <= max_age);
-    before - windows.len()
+    let reaped = before - windows.len();
+    if reaped > 0 {
+        tracing::debug!(reaped, "reaped stale windows");
+    }
+    reaped
 }
 
 /// Removes the session with the oldest `last_seen` (ties broken by lowest
@@ -740,6 +791,11 @@ fn evict_oldest_session(sessions: &mut HashMap<String, SessionEntry>) {
         })
         .map(|e| e.session_id.clone());
     if let Some(key) = oldest {
+        tracing::debug!(
+            session_id = %key,
+            capacity = MAX_SESSIONS,
+            "evicting oldest session"
+        );
         sessions.remove(&key);
     }
 }
@@ -752,6 +808,7 @@ fn evict_oldest_window(windows: &mut HashMap<String, WindowEntry>) {
         .min_by(|a, b| a.1.last_seen.cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
         .map(|(k, _)| k.clone());
     if let Some(key) = oldest {
+        tracing::debug!(key = %key, capacity = MAX_WINDOWS, "evicting oldest window");
         windows.remove(&key);
     }
 }
