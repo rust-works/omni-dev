@@ -37,7 +37,7 @@ import {
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
-import { SessionEntry, tallyByWorktree } from "./sessionCounts";
+import { SessionEntry, tallyByWorktree, tallyModelsByWorktree } from "./sessionCounts";
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
@@ -271,7 +271,7 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
  * result into the tree (#1406). The single choke point both the push (#1414) and
  * the poll fall through to, and the one to call when only the *rows* changed.
  *
- * A complete no-op when nothing changed — `setSessionTallies` compares first,
+ * A complete no-op when nothing changed — `setSessionState` compares first,
  * and the provider's refresh re-runs the lazy ahead/behind and PR fetches, so it
  * must only fire on a real change.
  */
@@ -279,7 +279,9 @@ function retallySessions(): void {
   if (!provider || !showClaudeSessions()) {
     return;
   }
-  if (provider.setSessionTallies(tallyByWorktree(lastSessions, worktreePaths))) {
+  const tallies = tallyByWorktree(lastSessions, worktreePaths);
+  const models = tallyModelsByWorktree(lastSessions, worktreePaths);
+  if (provider.setSessionState(tallies, models)) {
     refreshDecorations();
   }
 }
@@ -324,7 +326,7 @@ function syncSessionCues(): void {
 
 /** Clears every session cue, e.g. when the setting is switched off. */
 function clearSessionCues(): void {
-  if (provider?.setSessionTallies({})) {
+  if (provider?.setSessionState({}, {})) {
     refreshDecorations();
   }
 }

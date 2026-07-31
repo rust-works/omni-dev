@@ -6,11 +6,15 @@
 import * as vscode from "vscode";
 
 import {
+  ModelFamilyMap,
   SessionTallyMap,
+  formatModelMarker,
+  sameModelFamilies,
   sameTallies,
   sessionDecoration,
   sessionGlyphs,
   sessionTooltipLine,
+  unionModelFamilies,
 } from "./sessionCounts";
 import {
   AheadBehindMap,
@@ -21,6 +25,7 @@ import {
   needsPrFallback,
   nodeId,
   repoContextValue,
+  repoDescription,
   repoLabel,
   repoPollingEnabled,
   reposToNodes,
@@ -107,6 +112,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    */
   private sessionTallies: SessionTallyMap = {};
   /**
+   * Per-worktree Claude model-family sets (#1448), keyed like
+   * {@link sessionTallies} and pushed in the same way, on the same cadence.
+   */
+  private modelFamilies: ModelFamilyMap = {};
+  /**
    * Per-row icon colour tags (#1428), keyed by {@link nodeId} — the user's
    * `omniDevWorktrees.rowColors` setting. Like the session tallies this is *pushed* in
    * rather than pulled: it lives in VS Code settings, not in the daemon snapshot, so
@@ -162,7 +172,7 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * Refreshing only on a real change matters more here than anywhere else: user-scope
    * settings changes fire `onDidChangeConfiguration` in **every** open window, and a
    * refresh re-runs {@link getChildren} and so the lazy ahead/behind and PR-badge
-   * fetches (see {@link setSessionTallies}). Without the guard, one colour edit would
+   * fetches (see {@link setSessionState}). Without the guard, one colour edit would
    * cost N windows × one `ahead-behind` op per expanded repo.
    */
   setRowColors(colors: RowColorMap): boolean {
@@ -175,8 +185,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
   }
 
   /**
-   * Replaces the per-worktree Claude session tallies (#1406), returning whether
-   * anything actually changed.
+   * Replaces the per-worktree Claude session tallies (#1406) and their
+   * model-family sets (#1448) together, returning whether anything actually
+   * changed. Combined into one setter so the two never cause a double fire in
+   * the same tick — a session's bucket and its newly-learned model commonly
+   * change together, and an independent pair of setters would each re-fire
+   * `onDidChangeTreeData` for that one poll.
    *
    * Refreshing only on a real change is load-bearing, not an optimization:
    * firing `onDidChangeTreeData` re-runs {@link getChildren}, which re-triggers
@@ -184,11 +198,14 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * be a complete no-op, or a ~10s cue poll would turn those into a poll of
    * their own.
    */
-  setSessionTallies(tallies: SessionTallyMap): boolean {
-    if (sameTallies(this.sessionTallies, tallies)) {
+  setSessionState(tallies: SessionTallyMap, models: ModelFamilyMap): boolean {
+    const changed =
+      !sameTallies(this.sessionTallies, tallies) || !sameModelFamilies(this.modelFamilies, models);
+    if (!changed) {
       return false;
     }
     this.sessionTallies = tallies;
+    this.modelFamilies = models;
     this.emitter.fire(undefined);
     return true;
   }
@@ -265,6 +282,19 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       // non-GitHub repos.
       item.contextValue = repoContextValue(node.repo);
       item.tooltip = node.repo.root;
+      // The rolled-up Claude model-family marker (#1448): the union of every
+      // child worktree's families. Omitted entirely when the repo runs no
+      // sessions, matching the worktree row's own all-or-nothing description.
+      const marker = formatModelMarker(
+        unionModelFamilies(
+          node.repo.worktrees.map((wt) => wt.path),
+          this.modelFamilies,
+        ),
+      );
+      const repoDesc = repoDescription(marker);
+      if (repoDesc) {
+        item.description = repoDesc;
+      }
       return item;
     }
 
@@ -274,7 +304,13 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     );
     const sessions = this.sessionTallies[node.wt.path];
     item.id = nodeId(node);
-    item.description = worktreeDescription(node.wt, sessionGlyphs(sessions));
+    const sessionsSegment = [
+      sessionGlyphs(sessions),
+      formatModelMarker(this.modelFamilies[node.wt.path]),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    item.description = worktreeDescription(node.wt, sessionsSegment);
     item.tooltip = worktreeTooltip(
       node.wt,
       node.repo,
