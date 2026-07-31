@@ -19,10 +19,15 @@ fn main() {
     // The long-lived `daemon run` defaults to `info` so its lifecycle events reach
     // the log sink; short-lived CLI invocations stay at `warn`. `RUST_LOG` still
     // overrides either, and `daemon.log_level` in settings.json sits between the
-    // two (issue #1447) — the only way to raise a launchd/systemd-spawned
-    // daemon's level, since neither passes RUST_LOG through to its environment.
-    // See #1316.
-    let daemon_log_level = Settings::load_daemon().log_level;
+    // two for `daemon run` specifically (issue #1447) — the only way to raise a
+    // launchd/systemd-spawned daemon's level, since neither passes RUST_LOG
+    // through to its environment. Scoped to `daemon_run` so every other
+    // invocation (notably the latency-sensitive `sessions hook` sink) neither
+    // pays for the settings-file read nor inherits a level meant for the
+    // daemon. See #1316.
+    let daemon_log_level = daemon_run
+        .then(|| Settings::load_daemon().log_level)
+        .flatten();
     init_tracing(daemon_run, daemon_log_level.as_deref());
 
     let cli = Cli::parse();
@@ -130,6 +135,12 @@ fn default_filter(daemon_run: bool) -> &'static str {
 /// (process env) > `settings.daemon.log_level` > [`default_filter`] (issue
 /// #1447).
 ///
+/// `daemon_log_level` is consulted only when `daemon_run` is true —
+/// `daemon.log_level` is a `daemon run`-scoped setting, so a non-daemon
+/// invocation must resolve as though it were unset even if the caller passes
+/// one in (defense in depth; the one production call site in `main` already
+/// only loads it for `daemon_run`).
+///
 /// Pure over an injected [`EnvSource`] so the precedence is unit-testable
 /// without mutating the process environment — mirrors
 /// `crate::mcp::runtime::resolve_log_directive`. Empty values at either layer
@@ -143,7 +154,9 @@ fn resolve_log_directive(
     env.var("RUST_LOG")
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            daemon_log_level
+            daemon_run
+                .then_some(daemon_log_level)
+                .flatten()
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
@@ -237,9 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_log_directive_setting_used_when_rust_log_unset() {
+    fn resolve_log_directive_setting_used_when_rust_log_unset_and_daemon_run() {
         let env = MapEnv::new();
-        assert_eq!(resolve_log_directive(&env, false, Some("debug")), "debug");
+        assert_eq!(resolve_log_directive(&env, true, Some("debug")), "debug");
+    }
+
+    #[test]
+    fn resolve_log_directive_setting_ignored_when_not_daemon_run() {
+        // `daemon.log_level` is scoped to `daemon run` — a non-daemon
+        // invocation (e.g. `sessions hook`) must not inherit it even when
+        // RUST_LOG is unset, or setting it to debug the daemon would also
+        // spam every other command's stderr (issue #1447 follow-up).
+        let env = MapEnv::new();
+        assert_eq!(resolve_log_directive(&env, false, Some("debug")), "warn");
     }
 
     #[test]
@@ -251,10 +274,10 @@ mod tests {
 
     #[test]
     fn resolve_log_directive_ignores_empty_values() {
-        // A blank RUST_LOG falls through to the setting; a blank setting
-        // falls through to the daemon_run-conditioned default.
+        // A blank RUST_LOG falls through to the setting (when daemon_run); a
+        // blank setting falls through to the daemon_run-conditioned default.
         let env = MapEnv::new().with("RUST_LOG", "");
-        assert_eq!(resolve_log_directive(&env, false, Some("trace")), "trace");
+        assert_eq!(resolve_log_directive(&env, true, Some("trace")), "trace");
         assert_eq!(resolve_log_directive(&env, true, Some("")), "info");
     }
 }

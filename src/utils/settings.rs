@@ -143,10 +143,12 @@ pub struct McpSettings {
 /// raise its log level persistently without an env var.
 #[derive(Debug, Default, Deserialize)]
 pub struct DaemonSettings {
-    /// Default tracing directive for `daemon run` (e.g. `"info"`,
-    /// `"omni_dev::sessions=debug"`). `RUST_LOG` overrides this when set; the
-    /// built-in fallback is `"info"` for `daemon run`, `"warn"` for every
-    /// other invocation.
+    /// Default tracing directive for `daemon run` only (e.g. `"info"`,
+    /// `"omni_dev::sessions=debug"`) — every other invocation ignores this
+    /// field entirely, so setting it to debug the daemon does not also raise
+    /// the verbosity of `sessions hook` or any other short-lived command.
+    /// `RUST_LOG` overrides this when set; the built-in fallback is `"info"`
+    /// for `daemon run`, `"warn"` for every other invocation.
     #[serde(default)]
     pub log_level: Option<String>,
 }

@@ -403,6 +403,11 @@ process was started. A new `log_level` needs a daemon restart (`omni-dev
 daemon restart`) — the subscriber is installed once at startup. Module-scoped
 directives work too, e.g. `"omni_dev::sessions=debug"`.
 
+`daemon.log_level` affects **only** `daemon run` — every other command,
+including `sessions hook`, ignores it and stays at its own `RUST_LOG`/`warn`
+resolution, so turning up the daemon's verbosity never spams a short-lived
+invocation's stderr.
+
 ### Reading the new log lines, hop by hop
 
 - **Broadcast** ([`src/daemon/server.rs`](../src/daemon/server.rs)) —
