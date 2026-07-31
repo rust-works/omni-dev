@@ -80,27 +80,27 @@ test("tallyByWorktree attributes a session sitting exactly at the worktree root"
   assert.deepEqual(tallies["/w/repo/"], { working: 1, waiting: 0, idle: 0 });
 });
 
-test("sessionGlyphs renders non-empty buckets, most urgent first", () => {
-  assert.equal(sessionGlyphs({ working: 2, waiting: 1, idle: 3 }), "!1 ⚙2 ◦3");
+test("sessionGlyphs renders non-empty buckets, most in need of attention first", () => {
+  assert.equal(sessionGlyphs({ working: 2, waiting: 1, idle: 3 }), "!1 ◦3 ⚙2");
   assert.equal(sessionGlyphs({ working: 1, waiting: 0, idle: 0 }), "⚙1");
   // Nothing to say → empty, so it drops out of the row description entirely.
   assert.equal(sessionGlyphs({ working: 0, waiting: 0, idle: 0 }), "");
   assert.equal(sessionGlyphs(undefined), "");
 });
 
-test("sessionDecoration ranks waiting over working over idle", () => {
+test("sessionDecoration ranks waiting over idle over working", () => {
   assert.deepEqual(sessionDecoration({ working: 3, waiting: 1, idle: 2 }), {
     badge: "!1",
     colorId: "charts.yellow",
-    tooltip: "Claude: 1 waiting on you, 3 working, 2 idle",
+    tooltip: "Claude: 1 waiting on you, 2 idle, 3 working",
   });
-  assert.equal(sessionDecoration({ working: 3, waiting: 0, idle: 2 })?.badge, "⚙3");
-  assert.equal(sessionDecoration({ working: 3, waiting: 0, idle: 2 })?.colorId, "charts.green");
-  assert.equal(sessionDecoration({ working: 0, waiting: 0, idle: 2 })?.badge, "◦2");
+  assert.equal(sessionDecoration({ working: 3, waiting: 0, idle: 2 })?.badge, "◦2");
   assert.equal(
-    sessionDecoration({ working: 0, waiting: 0, idle: 2 })?.colorId,
+    sessionDecoration({ working: 3, waiting: 0, idle: 2 })?.colorId,
     "descriptionForeground",
   );
+  assert.equal(sessionDecoration({ working: 3, waiting: 0, idle: 0 })?.badge, "⚙3");
+  assert.equal(sessionDecoration({ working: 3, waiting: 0, idle: 0 })?.colorId, "charts.green");
   assert.equal(sessionDecoration({ working: 0, waiting: 0, idle: 0 }), undefined);
   assert.equal(sessionDecoration(undefined), undefined);
 });
