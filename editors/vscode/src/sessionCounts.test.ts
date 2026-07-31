@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   SessionEntry,
   SessionTally,
+  countUnmatchedSessions,
   decodeSessionTally,
   encodeSessionTally,
   sameTallies,
@@ -121,6 +122,22 @@ test("decodeSessionTally rejects anything it did not write", () => {
   for (const bad of [null, undefined, "", "1-2", "1-2-3-4", "a-b-c", "1--1-2", "1.5-0-0"]) {
     assert.equal(decodeSessionTally(bad), undefined, `expected ${String(bad)} to be rejected`);
   }
+});
+
+test("countUnmatchedSessions counts a real cwd outside every worktree, not a cwd not yet known", () => {
+  const sessions = [
+    session("/w/repo", "ended"), // a tombstone, not unattributed — excluded
+    session(undefined, "working"), // no cwd learned yet — a transient state, not counted
+    session("/elsewhere", "working"), // a real cwd outside every worktree — counted
+    session("/w/repo", "idle"), // attributed fine — not counted
+  ];
+  assert.equal(countUnmatchedSessions(sessions, PATHS), 1);
+  assert.deepEqual(tallyByWorktree(sessions, PATHS), { "/w/repo": { working: 0, waiting: 0, idle: 1 } });
+});
+
+test("countUnmatchedSessions is zero when every live session matches a worktree", () => {
+  assert.equal(countUnmatchedSessions([session("/w/repo", "working")], PATHS), 0);
+  assert.equal(countUnmatchedSessions([], PATHS), 0);
 });
 
 test("sameTallies compares maps by value so an unchanged poll is a no-op", () => {

@@ -116,13 +116,23 @@ fn is_recent(modified: SystemTime, now: SystemTime) -> bool {
 /// first scan of a long-lived `~/.claude/projects` does not announce every
 /// historical session. Pure and side-effect-free apart from `state`, so it is
 /// unit-tested against a temp directory.
-fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
+///
+/// Returns the sightings alongside how many `.jsonl` files were examined (a
+/// per-scan summary for [`spawn`]'s log line) — every file that passed the
+/// extension check, whether ultimately discovered/grown/unchanged/old.
+fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> (Vec<Sighting>, usize) {
     let mut sightings = Vec::new();
+    let mut scanned = 0usize;
     let Ok(project_dirs) = std::fs::read_dir(root) else {
-        return sightings;
+        tracing::debug!(root = %root.display(), "sessions watcher: projects root unreadable");
+        return (sightings, scanned);
     };
     for project in project_dirs.flatten() {
         let Ok(files) = std::fs::read_dir(project.path()) else {
+            tracing::debug!(
+                dir = %project.path().display(),
+                "sessions watcher: project dir unreadable"
+            );
             continue;
         };
         for file in files.flatten() {
@@ -130,15 +140,18 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            scanned += 1;
             let Some(session_id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
             else {
+                tracing::debug!(path = %path.display(), "sessions watcher: empty transcript stem");
                 continue;
             };
             let Ok(meta) = file.metadata() else {
+                tracing::debug!(path = %path.display(), "sessions watcher: metadata unreadable");
                 continue;
             };
             let size = meta.len();
@@ -161,7 +174,7 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
             });
         }
     }
-    sightings
+    (sightings, scanned)
 }
 
 /// Spawns the watcher loop, returning its [`JoinHandle`].
@@ -185,13 +198,24 @@ pub fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -> JoinH
             // thread; the state map moves in and back out so it persists across
             // scans without a lock.
             let mut owned_state = std::mem::take(&mut state);
-            let (returned_state, sightings) = tokio::task::spawn_blocking(move || {
-                let sightings = scan(&scan_root, &mut owned_state, SystemTime::now());
-                (owned_state, sightings)
+            let (returned_state, sightings, scanned) = tokio::task::spawn_blocking(move || {
+                let (sightings, scanned) = scan(&scan_root, &mut owned_state, SystemTime::now());
+                (owned_state, sightings, scanned)
             })
             .await
-            .unwrap_or_else(|_| (ScanState::new(), Vec::new()));
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "sessions watcher: scan task panicked; state reset for this cycle"
+                );
+                (ScanState::new(), Vec::new(), 0)
+            });
             state = returned_state;
+            tracing::debug!(
+                scanned,
+                sightings = sightings.len(),
+                "sessions watcher: scan complete"
+            );
             for sighting in sightings {
                 registry.observe(sighting.into_observe());
             }
@@ -229,17 +253,18 @@ mod tests {
 
         let mut state = ScanState::new();
         // First scan: the recent file is discovered.
-        let first = scan(root, &mut state, now);
+        let (first, scanned) = scan(root, &mut state, now);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].session_id, "sess-1");
         assert_eq!(first[0].event, SessionEvent::TranscriptDiscovered);
+        assert_eq!(scanned, 1, "one .jsonl file was examined");
 
         // A second scan with no change surfaces nothing.
-        assert!(scan(root, &mut state, now).is_empty());
+        assert!(scan(root, &mut state, now).0.is_empty());
 
         // Growth is detected.
         write_transcript(root, "-home-me-proj", "sess-1", b"line one\nline two\n");
-        let grew = scan(root, &mut state, now);
+        let (grew, _) = scan(root, &mut state, now);
         assert_eq!(grew.len(), 1);
         assert_eq!(grew[0].event, SessionEvent::TranscriptGrew);
     }
@@ -255,7 +280,7 @@ mod tests {
         std::fs::write(root.join("proj").join(".jsonl"), b"z").unwrap();
 
         let mut state = ScanState::new();
-        let sightings = scan(root, &mut state, now);
+        let (sightings, _) = scan(root, &mut state, now);
         let ids: Vec<&str> = sightings.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec!["notes"]);
     }
@@ -270,13 +295,13 @@ mod tests {
 
         let mut state = ScanState::new();
         // Not surfaced (the file looks old relative to the far-future "now")...
-        assert!(scan(root, &mut state, future).is_empty());
+        assert!(scan(root, &mut state, future).0.is_empty());
         // ...but its size was recorded, so a later real growth is caught.
         assert_eq!(state.get(&path).copied(), Some(4));
         // The resume rewrites the file, giving it a fresh (real) mtime, so a scan
         // at real time surfaces the growth even though the file predated the daemon.
         std::fs::write(&path, b"old\nresumed\n").unwrap();
-        let grew = scan(root, &mut state, SystemTime::now());
+        let (grew, _) = scan(root, &mut state, SystemTime::now());
         assert_eq!(grew.len(), 1);
         assert_eq!(grew[0].event, SessionEvent::TranscriptGrew);
     }
@@ -284,12 +309,13 @@ mod tests {
     #[test]
     fn scan_of_missing_root_is_empty() {
         let mut state = ScanState::new();
-        let sightings = scan(
+        let (sightings, scanned) = scan(
             Path::new("/no/such/dir/omni-dev-test"),
             &mut state,
             SystemTime::now(),
         );
         assert!(sightings.is_empty());
+        assert_eq!(scanned, 0);
     }
 
     #[test]
@@ -353,7 +379,7 @@ mod tests {
         write_transcript(root, "proj", "sess-1", b"line\n");
 
         let mut state = ScanState::new();
-        let sightings = scan(root, &mut state, SystemTime::now());
+        let (sightings, _) = scan(root, &mut state, SystemTime::now());
         let ids: Vec<&str> = sightings.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, vec!["sess-1"], "the loose file must not surface");
     }

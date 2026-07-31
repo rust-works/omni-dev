@@ -204,6 +204,7 @@ impl HookCommand {
     pub async fn execute(self) -> Result<()> {
         let mut input = String::new();
         if std::io::stdin().read_to_string(&mut input).is_err() {
+            tracing::debug!("sessions hook: failed to read stdin; ignoring");
             return Ok(());
         }
         self.report(&input).await;
@@ -214,18 +215,24 @@ impl HookCommand {
     /// out so tests can exercise the send path against a fake socket.
     async fn report(&self, input: &str) {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
+            tracing::debug!("sessions hook: unparseable hook JSON; ignoring");
             return;
         };
         let Some((op, payload)) = hook.to_op() else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
+            tracing::debug!("sessions hook: failed to resolve the daemon socket; ignoring");
             return;
         };
         // Bounded, and every failure ignored: the daemon may be down, and that
         // must be a silent no-op.
         let env = DaemonEnvelope::service(SERVICE, op, payload);
-        let _ = tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await;
+        match tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!(op, error = %e, "sessions hook: daemon request failed"),
+            Err(_) => tracing::debug!(op, "sessions hook: timed out reporting to the daemon"),
+        }
     }
 }
 
@@ -255,8 +262,17 @@ impl HookPayload {
     /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
     /// it carries no `session_id` or names an event the tracker ignores.
     fn to_op(&self) -> Option<(&'static str, Value)> {
-        let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
-        let event_name = self.hook_event_name.as_deref()?;
+        let Some(session_id) = self.session_id.clone().filter(|s| !s.trim().is_empty()) else {
+            tracing::debug!("sessions hook: missing or blank session_id; ignoring");
+            return None;
+        };
+        let Some(event_name) = self.hook_event_name.as_deref() else {
+            tracing::debug!(
+                session_id,
+                "sessions hook: missing hook_event_name; ignoring"
+            );
+            return None;
+        };
         if event_name == "SessionEnd" {
             let mut payload = json!({ "session_id": session_id });
             if let Some(reason) = &self.message {
@@ -264,7 +280,14 @@ impl HookPayload {
             }
             return Some(("end", payload));
         }
-        let event = session_event_for(event_name, self.message.as_deref())?;
+        let Some(event) = session_event_for(event_name, self.message.as_deref()) else {
+            tracing::debug!(
+                session_id,
+                event_name,
+                "sessions hook: unrecognized hook event; ignoring"
+            );
+            return None;
+        };
         let request = ObserveRequest {
             session_id,
             cwd: self.cwd.clone(),
@@ -309,6 +332,16 @@ fn classify_notification(message: Option<&str>) -> NotificationKind {
     {
         NotificationKind::IdlePrompt
     } else {
+        // The interesting diagnostic case (#1447): a wording change in Claude
+        // Code's own notification banner would silently defeat this
+        // substring match, so log the (short, non-conversation) banner text
+        // that fell through — truncated defensively in case a future banner
+        // is unexpectedly long.
+        let truncated: String = message.chars().take(200).collect();
+        tracing::debug!(
+            message = truncated,
+            "sessions hook: unclassified notification message"
+        );
         NotificationKind::Other
     }
 }
@@ -952,6 +985,8 @@ mod tests {
         assert!(hook_op(r#"{"hook_event_name":"Stop"}"#).is_none());
         // Blank session_id → no op.
         assert!(hook_op(r#"{"session_id":"  ","hook_event_name":"Stop"}"#).is_none());
+        // A session_id present but no hook_event_name at all → no op.
+        assert!(hook_op(r#"{"session_id":"s1"}"#).is_none());
         // Unknown event → no op.
         assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"PreCompact"}"#).is_none());
         // Garbage that still parses as an (empty) payload → no op.
@@ -1412,6 +1447,64 @@ mod tests {
         // Unmappable input returns before any socket work.
         cmd.report("not json").await;
         cmd.report(r#"{"hook_event_name":"Stop"}"#).await; // no session_id → no op
+    }
+
+    /// A daemon stand-in that accepts a connection, captures the request, but
+    /// never replies — so `report`'s own timeout, not a connection error
+    /// (already covered by `hook_report_is_silent_when_the_daemon_is_down`),
+    /// is what has to end the call.
+    fn fake_daemon_that_never_replies() -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::sync::oneshot::Receiver<Value>,
+    ) {
+        use futures::StreamExt;
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let req = framed.next().await.unwrap().unwrap();
+            let _ = tx.send(serde_json::from_str::<Value>(&req).unwrap());
+            // Never reply: hold the connection open so the client's own
+            // timeout, not a connection error, is what ends the request.
+            std::future::pending::<()>().await;
+        });
+        (dir, sock, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_report_times_out_against_a_wedged_daemon() {
+        // Paused time lets the runtime fast-forward straight to `report`'s own
+        // 2-second timeout instead of the test actually waiting on it.
+        let (_dir, sock, received) = fake_daemon_that_never_replies();
+        let cmd = HookCommand { socket: Some(sock) };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#),
+        )
+        .await
+        .expect("report should time out rather than hang forever");
+
+        // The daemon did receive the request — this really is a wedged
+        // daemon, not a connection failure.
+        assert_eq!(received.await.unwrap()["op"], "observe");
+    }
+
+    #[tokio::test]
+    async fn hook_report_reaches_a_live_daemon() {
+        // The happy path: a real listener answers `ok: true`, so `report()`
+        // completes the full socket round trip rather than failing early.
+        let (_dir, sock, server) = fake_daemon(json!({ "ok": true, "payload": {} }));
+        let cmd = HookCommand { socket: Some(sock) };
+        cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#)
+            .await;
+        server.await.unwrap();
     }
 
     /// Spawns a minimal fake daemon on a short-path Unix socket that answers one

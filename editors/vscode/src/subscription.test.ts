@@ -184,6 +184,37 @@ test("subscribe: a too-long socket path fails permanently without throwing", (t:
   assert.match(errors[0], /104-byte limit/);
 });
 
+test("subscribe: an ok:true frame with the wrong shape is dropped and reported, not fatal", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  const srv = trackingServer((conn) => {
+    conn.on("data", () => {
+      // First frame: `ok: true` but `repos` is not an array — fails `isSnapshot`.
+      conn.write(JSON.stringify({ ok: true, payload: { repos: "not-an-array" } }) + "\n");
+      // Second frame: well-formed, so the stream must still deliver it.
+      conn.write(snapshotLine([{ main_repo: "a", root: "/a", worktrees: [] }]));
+    });
+  });
+  await srv.listen(socketPath);
+
+  const received: TreeSnapshot[] = [];
+  const errors: string[] = [];
+  const sub = new TreeSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+    onError: (m) => errors.push(m),
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => received.length >= 1);
+
+  assert.equal(errors.length, 1, "the malformed frame should be reported exactly once");
+  assert.match(errors[0], /dropped worktrees subscribe frame/);
+  assert.equal(received[0].repos[0].main_repo, "a");
+});
+
 // --- The sessions stream (#1414) ---------------------------------------------
 
 /** One pushed `sessions` snapshot line, matching the daemon's `DaemonReply::ok`. */
@@ -328,5 +359,35 @@ test("sessions subscribe: without onUnsupported an error reply is ignored, as be
 
   // The stream survives the error frame and keeps delivering — the pre-#1414
   // behaviour `TreeSubscription` still relies on.
+  assert.equal(received[0].sessions[0].session_id, "s1");
+});
+
+test("sessions subscribe: an ok:true frame with no payload is dropped and reported", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  const srv = trackingServer((conn) => {
+    conn.on("data", () => {
+      // `ok: true` with no `payload` at all — also fails `isSnapshot`.
+      conn.write(JSON.stringify({ ok: true }) + "\n");
+      conn.write(sessionsLine([{ session_id: "s1", state: "idle" }]));
+    });
+  });
+  await srv.listen(socketPath);
+
+  const received: SessionsSnapshot[] = [];
+  const errors: string[] = [];
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+    onError: (m) => errors.push(m),
+  });
+  t.after(() => {
+    sub.close();
+    srv.close();
+  });
+
+  sub.start();
+  await waitFor(() => received.length >= 1);
+
+  assert.equal(errors.length, 1, "the malformed frame should be reported exactly once");
+  assert.match(errors[0], /dropped sessions subscribe frame/);
   assert.equal(received[0].sessions[0].session_id, "s1");
 });

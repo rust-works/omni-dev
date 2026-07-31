@@ -130,6 +130,29 @@ pub struct McpSettings {
     pub max_response_bytes: Option<usize>,
 }
 
+/// The `daemon` section of `settings.json` — defaults for `omni-dev daemon
+/// run` (issue #1447).
+///
+/// Every field is optional; an unset field falls back to the built-in
+/// default, so an absent `daemon` block preserves the daemon's behaviour
+/// byte-for-byte. See [`Settings::load_daemon`] for the loader and
+/// `src/main.rs`'s `init_tracing` for the wiring. Mirrors [`McpSettings`]: a
+/// launchd/systemd-spawned daemon can't inherit `RUST_LOG` from the
+/// environment (no `EnvironmentVariables`/`Environment=` key in the
+/// generated plist/unit), so a settings-file default is the only way to
+/// raise its log level persistently without an env var.
+#[derive(Debug, Default, Deserialize)]
+pub struct DaemonSettings {
+    /// Default tracing directive for `daemon run` only (e.g. `"info"`,
+    /// `"omni_dev::sessions=debug"`) — every other invocation ignores this
+    /// field entirely, so setting it to debug the daemon does not also raise
+    /// the verbosity of `sessions hook` or any other short-lived command.
+    /// `RUST_LOG` overrides this when set; the built-in fallback is `"info"`
+    /// for `daemon run`, `"warn"` for every other invocation.
+    #[serde(default)]
+    pub log_level: Option<String>,
+}
+
 /// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
@@ -147,6 +170,11 @@ pub struct Settings {
     /// [`McpSettings::default`].
     #[serde(default)]
     pub mcp: McpSettings,
+
+    /// Daemon defaults (issue #1447); an absent block yields
+    /// [`DaemonSettings::default`].
+    #[serde(default)]
+    pub daemon: DaemonSettings,
 }
 
 /// Returns the active profile name from `raw` (the process environment), or
@@ -221,6 +249,14 @@ impl Settings {
     /// graceful `unwrap_or_default` of [`SettingsEnv::load`].
     pub fn load_mcp() -> McpSettings {
         Self::load().map(|s| s.mcp).unwrap_or_default()
+    }
+
+    /// Loads just the [`daemon`](DaemonSettings) section, falling back to its
+    /// defaults when the settings file is absent or unreadable — so `daemon
+    /// run` always boots even with a malformed `settings.json` (issue
+    /// #1447). Mirrors [`Settings::load_mcp`].
+    pub fn load_daemon() -> DaemonSettings {
+        Self::load().map(|s| s.daemon).unwrap_or_default()
     }
 
     /// Loads settings from a specific path.
@@ -903,6 +939,21 @@ mod tests {
         assert_eq!(settings.mcp.log_level.as_deref(), Some("debug"));
         assert!(settings.mcp.default_model.is_none());
         assert!(settings.mcp.max_response_bytes.is_none());
+    }
+
+    #[test]
+    fn settings_parse_daemon_section_from_json() {
+        let settings: Settings =
+            serde_json::from_str(r#"{ "daemon": { "log_level": "debug" } }"#).unwrap();
+        assert_eq!(settings.daemon.log_level.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn settings_without_daemon_key_defaults_to_none() {
+        // An absent `daemon` block must leave `log_level` unset so callers
+        // fall back to the built-in default (issue #1447).
+        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
+        assert!(settings.daemon.log_level.is_none());
     }
 
     // ── free get_env_var seam (pure: injected raw env + lazy settings loader) ──

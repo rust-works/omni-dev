@@ -200,8 +200,7 @@ export class DaemonSubscription<T> {
       this.onUnsupported(message);
       return;
     }
-    // Ignore anything that is not a well-formed snapshot for this stream; a
-    // fresh snapshot is the only frame the stream should carry.
+    // A fresh snapshot is the only frame the stream should carry.
     if (reply.ok && reply.payload && this.isSnapshot(reply.payload)) {
       // Any successful snapshot proves the daemon is up: reset backoff and, on
       // the first one, announce the connection.
@@ -211,6 +210,18 @@ export class DaemonSubscription<T> {
         this.onStatus?.(true);
       }
       this.onSnapshot(reply.payload as T);
+      return;
+    }
+    // `ok: true` but the payload is missing or does not match this stream's
+    // expected shape — previously dropped with no signal at all (#1447), so
+    // the subscription looked "connected" while silently rendering nothing.
+    // Not fatal to the connection (the next frame may be fine), which is
+    // exactly what `onError` already means elsewhere in this class.
+    if (reply.ok) {
+      this.onError?.(
+        `dropped ${this.envelope.service} ${this.envelope.op} frame: payload missing or ` +
+          "did not match the expected snapshot shape",
+      );
     }
   }
 

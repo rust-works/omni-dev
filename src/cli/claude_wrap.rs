@@ -17,14 +17,20 @@
 //! full, and every reporting error is swallowed exactly as the `sessions hook`
 //! sink swallows its own.
 //!
-//! Nothing is logged or persisted. The observer reads only the state, the
-//! `session_id`, the `cwd` and the model out of the stream, and reports them to
-//! the daemon's existing `0600` Unix socket.
+//! Nothing about the conversation is logged or persisted: the observer reads
+//! only the state, the `session_id`, the `cwd` and the model out of the
+//! stream, and reports them to the daemon's existing `0600` Unix socket. An
+//! opt-in, env-gated diagnostic file sink ([`WRAP_LOG_ENV`]) can additionally
+//! record that same state/identity metadata locally — never message or
+//! tool-call content — for troubleshooting (#1447); it is unset (silent) by
+//! default. See ADR-0057's amendment note.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,6 +43,7 @@ use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::DaemonEnvelope;
 use crate::daemon::server;
 use crate::sessions::stream::{Direction, StreamTracker};
+use crate::sessions::SessionEvent;
 
 /// The `sessions` service routing key on the daemon control socket.
 const SERVICE: &str = "sessions";
@@ -69,6 +76,51 @@ const PUMP_BUF_BYTES: usize = 64 * 1024;
 /// Exit status used when the child is killed by a signal, mirroring the shell's
 /// `128 + signo` convention.
 const SIGNAL_EXIT_BASE: i32 = 128;
+
+/// Env var gating the wrapper's opt-in diagnostic file sink (#1447). Unset
+/// (the default) makes every [`WrapLogSink::log`] call a single branch — no
+/// allocation, no syscall — preserving the wrapper's zero-overhead-by-default,
+/// fail-open posture. When set to a path, the sink records only process
+/// start/exit, identity (`session_id`/`cwd`/`model`) once learned, reported
+/// state transitions, tee-channel drop counts, and daemon-report outcomes —
+/// never message or tool-call content.
+const WRAP_LOG_ENV: &str = "OMNI_DEV_CLAUDE_WRAP_LOG";
+
+/// The wrapper's opt-in diagnostic file sink.
+///
+/// A plain local file, not a second `tracing` layer: layering the global
+/// subscriber per-subcommand would mean restructuring `main.rs`'s one-shot
+/// `tracing_subscriber::fmt().init()` into a reloadable `Registry`, just to
+/// serve one subcommand's diagnostics.
+struct WrapLogSink(Option<std::sync::Mutex<std::fs::File>>);
+
+impl WrapLogSink {
+    /// Opens the sink against an explicit path, or constructs a no-op sink when
+    /// `path` is `None` or unopenable. Pure over the argument (rather than
+    /// reading [`WRAP_LOG_ENV`] itself) so it is testable without mutating the
+    /// process environment; the one production call site resolves the env var.
+    fn open(path: Option<&Path>) -> Self {
+        let file = path.and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+        Self(file.map(std::sync::Mutex::new))
+    }
+
+    /// Appends one timestamped line, or does nothing when the sink is unset.
+    fn log(&self, line: &str) {
+        let Some(file) = &self.0 else {
+            return;
+        };
+        let Ok(mut file) = file.lock() else {
+            return;
+        };
+        let _ = writeln!(file, "{} {line}", chrono::Utc::now().to_rfc3339());
+    }
+}
 
 /// Runs a command transparently, reporting the Claude session state it streams.
 #[derive(Parser)]
@@ -160,6 +212,11 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let log = Arc::new(WrapLogSink::open(
+        std::env::var_os(WRAP_LOG_ENV).map(PathBuf::from).as_deref(),
+    ));
+    log.log(&format!("start: wrapping {program}"));
+
     // stderr is inherited and env is left untouched, so the child sees exactly
     // the environment it would have without the wrapper. The child is
     // deliberately *not* put in its own process group (unlike the managed
@@ -184,16 +241,24 @@ where
     let child_pid = child.id();
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
-    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL));
+    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL, log.clone()));
     let signals = tokio::spawn(forward_signals(child_pid));
 
+    let dropped = Arc::new(AtomicU64::new(0));
     let from_child = tokio::spawn(pump(
         child_stdout,
         output,
         Direction::FromClaude,
         tee.clone(),
+        dropped.clone(),
     ));
-    let to_child = tokio::spawn(pump(input, child_stdin, Direction::ToClaude, tee.clone()));
+    let to_child = tokio::spawn(pump(
+        input,
+        child_stdin,
+        Direction::ToClaude,
+        tee.clone(),
+        dropped.clone(),
+    ));
     drop(tee);
 
     // Draining the child's stdout to EOF *before* reaping is what makes the
@@ -207,12 +272,19 @@ where
     let _ = to_child.await;
     signals.abort();
 
+    let dropped = dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        log.log(&format!("tee: dropped {dropped} line(s) (channel full)"));
+    }
+
     let status = child
         .wait()
         .await
         .context("failed to wait for the wrapped process")?;
     let _ = observer.await;
-    Ok(exit_code(status))
+    let code = exit_code(status);
+    log.log(&format!("exit: code={code}"));
+    Ok(code)
 }
 
 /// Copies `reader` to `writer` byte-for-byte, teeing complete lines to the
@@ -228,6 +300,7 @@ async fn pump<R, W>(
     mut writer: W,
     direction: Direction,
     tee: mpsc::Sender<(Direction, String)>,
+    dropped: Arc<AtomicU64>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -243,7 +316,7 @@ async fn pump<R, W>(
         if writer.write_all(chunk).await.is_err() || writer.flush().await.is_err() {
             break;
         }
-        tee_chunk(chunk, direction, &tee, &mut line);
+        tee_chunk(chunk, direction, &tee, &mut line, &dropped);
     }
     // Closing the write end propagates EOF (this is how the child learns its
     // input has ended); a failure here means the peer is already gone.
@@ -252,18 +325,23 @@ async fn pump<R, W>(
 
 /// Reassembles newline-delimited lines out of a forwarded chunk and offers each
 /// to the observer, dropping any that is over-long, not UTF-8, or arrives while
-/// the channel is full.
+/// the channel is full. `dropped` counts only the last case (a full or
+/// disconnected channel) — the over-long/non-UTF-8 drops are a distinct,
+/// already-expected class of loss, not tracked as diagnostic signal.
 fn tee_chunk(
     chunk: &[u8],
     direction: Direction,
     tee: &mpsc::Sender<(Direction, String)>,
     line: &mut Vec<u8>,
+    dropped: &AtomicU64,
 ) {
     for &byte in chunk {
         if byte == b'\n' {
             if line.len() < MAX_LINE_BYTES {
                 if let Ok(text) = std::str::from_utf8(line) {
-                    let _ = tee.try_send((direction, text.to_string()));
+                    if tee.try_send((direction, text.to_string())).is_err() {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             line.clear();
@@ -282,6 +360,7 @@ async fn observe(
     mut lines: mpsc::Receiver<(Direction, String)>,
     socket: Option<PathBuf>,
     every: Duration,
+    log: Arc<WrapLogSink>,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
         return;
@@ -291,6 +370,7 @@ async fn observe(
     // The first tick of a tokio interval completes immediately; consume it so
     // the keep-alive does not fire before anything has been observed.
     keepalive.tick().await;
+    let mut identity_logged = false;
 
     loop {
         let observed = tokio::select! {
@@ -301,22 +381,42 @@ async fn observe(
             _ = keepalive.tick() => tracker.keepalive(),
         };
         if let Some(request) = observed {
-            if let Ok(payload) = serde_json::to_value(request) {
-                report(&socket, "observe", payload).await;
+            if !identity_logged {
+                identity_logged = true;
+                log.log(&format!(
+                    "identity: session_id={} cwd={} model={}",
+                    request.session_id,
+                    request
+                        .cwd
+                        .as_deref()
+                        .map_or_else(|| "-".to_string(), |p| p.display().to_string()),
+                    request.model.as_deref().unwrap_or("-"),
+                ));
+            }
+            if let SessionEvent::StreamState(state) = request.event {
+                log.log(&format!("state: {state:?}"));
+            }
+            if let Ok(payload) = serde_json::to_value(&request) {
+                report(&socket, "observe", payload, &log).await;
             }
         }
     }
 
     if let Some(session_id) = tracker.session_id() {
-        report(&socket, "end", json!({ "session_id": session_id })).await;
+        report(&socket, "end", json!({ "session_id": session_id }), &log).await;
     }
 }
 
 /// Sends one bounded, fire-and-forget op to the daemon's `sessions` service,
-/// swallowing every failure — a missing or wedged daemon must be a silent no-op.
-async fn report(socket: &Path, op: &str, payload: Value) {
+/// swallowing every failure — a missing or wedged daemon must be a silent
+/// no-op. `log`s only the failure/timeout case, never a success.
+async fn report(socket: &Path, op: &str, payload: Value, log: &WrapLogSink) {
     let envelope = DaemonEnvelope::service(SERVICE, op, payload);
-    let _ = tokio::time::timeout(REPORT_TIMEOUT, DaemonClient::new(socket).request(envelope)).await;
+    match tokio::time::timeout(REPORT_TIMEOUT, DaemonClient::new(socket).request(envelope)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => log.log(&format!("report op={op} failed: {e}")),
+        Err(_) => log.log(&format!("report op={op} timed out")),
+    }
 }
 
 /// Relays `SIGINT`/`SIGTERM` to the child, so a caller that signals the wrapper
@@ -457,6 +557,53 @@ mod tests {
         (dir, socket, seen)
     }
 
+    /// A daemon stand-in that accepts a connection but never replies, holding
+    /// it open for the test's duration — so a request against it can only end
+    /// via `report`'s own timeout, not a connection error (already covered by
+    /// `a_missing_daemon_never_affects_the_child`).
+    fn fake_daemon_that_never_replies() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            // Never read from `held`: its sole purpose is to keep each
+            // accepted connection's fd alive instead of dropping it, so the
+            // client hangs until its own timeout fires.
+            #[allow(clippy::collection_is_never_read)]
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                held.push(stream);
+            }
+        });
+        (dir, socket)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_daemon_times_out_rather_than_hanging() {
+        // Paused time lets the runtime fast-forward straight to `report`'s own
+        // 2-second timeout instead of the test actually waiting on it.
+        let (_dir, socket) = fake_daemon_that_never_replies();
+        let log_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let log_path = log_dir.path().join("wrap.log");
+        let log = WrapLogSink::open(Some(&log_path));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            report(&socket, "observe", json!({}), &log),
+        )
+        .await
+        .expect("report should time out rather than hang forever");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("report op=observe timed out"),
+            "expected a timeout log line, got: {contents}"
+        );
+    }
+
     #[test]
     fn trailing_args_are_captured_verbatim_after_a_separator() {
         let cmd = parse(&["--", "node", "cli.js", "--output-format", "stream-json"]);
@@ -583,16 +730,19 @@ mod tests {
     fn over_long_and_non_utf8_lines_are_dropped_but_still_forwarded() {
         let (tee, mut lines) = mpsc::channel(4);
         let mut buffer = Vec::new();
+        let dropped = AtomicU64::new(0);
         let mut chunk = vec![b'x'; MAX_LINE_BYTES + 1];
         chunk.push(b'\n');
         chunk.extend_from_slice(&[0xff, 0xfe, b'\n']);
         chunk.extend_from_slice(b"{\"type\":\"result\"}\n");
-        tee_chunk(&chunk, Direction::FromClaude, &tee, &mut buffer);
+        tee_chunk(&chunk, Direction::FromClaude, &tee, &mut buffer, &dropped);
         // Only the last (short, valid UTF-8) line is offered to the observer.
         let (direction, text) = lines.try_recv().unwrap();
         assert_eq!(direction, Direction::FromClaude);
         assert_eq!(text, r#"{"type":"result"}"#);
         assert!(lines.try_recv().is_err());
+        // Neither drop was a full-channel drop, so the counter stays at 0.
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -601,7 +751,8 @@ mod tests {
         // must keep being reported, or the registry ages it out at 5 minutes.
         let (_dir, socket, seen) = fake_daemon();
         let (tee, lines) = mpsc::channel(4);
-        let observer = tokio::spawn(observe(lines, Some(socket), Duration::from_millis(20)));
+        let log = Arc::new(WrapLogSink::open(None));
+        let observer = tokio::spawn(observe(lines, Some(socket), Duration::from_millis(20), log));
         tee.send((
             Direction::FromClaude,
             r#"{"type":"system","subtype":"init","session_id":"ka-1"}"#.to_string(),
@@ -656,6 +807,7 @@ mod tests {
             Closed,
             Direction::FromClaude,
             tee,
+            Arc::new(AtomicU64::new(0)),
         )
         .await;
         assert!(lines.try_recv().is_err());
@@ -665,8 +817,54 @@ mod tests {
     fn a_full_tee_drops_lines_rather_than_blocking() {
         let (tee, _lines) = mpsc::channel(1);
         let mut buffer = Vec::new();
-        tee_chunk(b"a\nb\nc\n", Direction::ToClaude, &tee, &mut buffer);
+        let dropped = AtomicU64::new(0);
+        tee_chunk(
+            b"a\nb\nc\n",
+            Direction::ToClaude,
+            &tee,
+            &mut buffer,
+            &dropped,
+        );
         // Two of the three were dropped; nothing blocked, nothing panicked.
         assert_eq!(tee.capacity(), 0);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            2,
+            "tee_chunk_counts_drops_when_channel_full"
+        );
+    }
+
+    #[test]
+    fn wrap_log_sink_is_a_no_op_when_unset() {
+        let sink = WrapLogSink::open(None);
+        // Must not panic, and (since there is no file) nothing to read back.
+        sink.log("this must go nowhere");
+        assert!(sink.0.is_none());
+    }
+
+    #[test]
+    fn wrap_log_sink_writes_when_env_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrap.log");
+        let sink = WrapLogSink::open(Some(&path));
+        sink.log("identity: session_id=s-1 cwd=/w model=claude-opus-5");
+        sink.log("state: Working");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("identity: session_id=s-1 cwd=/w model=claude-opus-5"));
+        assert!(lines[1].ends_with("state: Working"));
+        // Never conversation content — only the metadata lines this test wrote.
+        assert!(!contents.contains("message"));
+    }
+
+    #[test]
+    fn wrap_log_sink_tolerates_an_unopenable_path() {
+        // A directory that does not exist and cannot be created-into: `open`
+        // degrades to a no-op sink rather than panicking or erroring the wrapper.
+        let sink = WrapLogSink::open(Some(Path::new("/no/such/dir/omni-dev-test/wrap.log")));
+        sink.log("must not panic");
+        assert!(sink.0.is_none());
     }
 }

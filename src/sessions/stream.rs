@@ -114,6 +114,15 @@ pub struct StreamTracker {
     pending: HashSet<String>,
     /// The state most recently returned to the caller, for change detection.
     reported: Option<SessionState>,
+    /// How many stdio lines failed to parse as [`StreamLine`] JSON (#1447).
+    /// Counted rather than logged per-line, since this runs on every line;
+    /// the wrapper polls it periodically alongside its keepalive.
+    parse_failures: u64,
+    /// How many `can_use_tool` control requests carried no correlation id
+    /// (#1447) — the "drift backstop engaged silently" case: a shape this
+    /// tracker no longer recognizes would otherwise wedge `open_permission`
+    /// with no visible signal.
+    uncorrelated_control_lines: u64,
 }
 
 impl StreamTracker {
@@ -131,6 +140,8 @@ impl StreamTracker {
             base: SessionState::Idle,
             pending: HashSet::new(),
             reported: None,
+            parse_failures: 0,
+            uncorrelated_control_lines: 0,
         }
     }
 
@@ -138,6 +149,19 @@ impl StreamTracker {
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// How many stdio lines this tracker has failed to parse as JSON.
+    #[must_use]
+    pub fn parse_failure_count(&self) -> u64 {
+        self.parse_failures
+    }
+
+    /// How many `can_use_tool` control requests this tracker has seen with no
+    /// usable correlation id.
+    #[must_use]
+    pub fn uncorrelated_control_count(&self) -> u64 {
+        self.uncorrelated_control_lines
     }
 
     /// Feeds one stdio line and returns a sighting when the effective state
@@ -150,7 +174,10 @@ impl StreamTracker {
         if line.is_empty() {
             return None;
         }
-        let parsed: StreamLine = serde_json::from_str(line).ok()?;
+        let Ok(parsed) = serde_json::from_str::<StreamLine>(line) else {
+            self.parse_failures += 1;
+            return None;
+        };
         self.absorb_identity(&parsed);
         self.apply(direction, &parsed);
         self.emit_if_changed()
@@ -223,6 +250,10 @@ impl StreamTracker {
             return;
         }
         let Some(id) = correlation_id(parsed, body) else {
+            // Not counted at the (routine) "not a can_use_tool control"
+            // return above — only here, where a request this tracker *does*
+            // recognize as a permission prompt still couldn't be correlated.
+            self.uncorrelated_control_lines += 1;
             return;
         };
         if self.pending.len() < MAX_PENDING_PERMISSIONS {
@@ -517,6 +548,42 @@ mod tests {
             assert!(tracker.observe_line(Direction::FromClaude, line).is_none());
         }
         assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+    }
+
+    #[test]
+    fn observe_line_counts_unparseable_lines() {
+        let mut tracker = tracker_after_init();
+        assert_eq!(tracker.parse_failure_count(), 0);
+        tracker.observe_line(Direction::FromClaude, "not json at all");
+        tracker.observe_line(Direction::FromClaude, "{");
+        assert_eq!(tracker.parse_failure_count(), 2);
+        // A well-formed-but-unrecognized line is not a parse failure.
+        tracker.observe_line(Direction::FromClaude, r#"{"type":"nonsense"}"#);
+        assert_eq!(tracker.parse_failure_count(), 2);
+    }
+
+    #[test]
+    fn open_permission_counts_uncorrelated_can_use_tool_requests() {
+        let mut tracker = tracker_after_init();
+        assert_eq!(tracker.uncorrelated_control_count(), 0);
+        // A can_use_tool request with no correlation id anywhere: counted.
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"control_request","request":{"subtype":"can_use_tool"}}"#,
+        );
+        assert_eq!(tracker.uncorrelated_control_count(), 1);
+        // A can_use_tool request that *does* carry a request_id: not counted.
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool"}}"#,
+        );
+        assert_eq!(tracker.uncorrelated_control_count(), 1);
+        // A non-can_use_tool control (the routine case) is not counted either.
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"control_request","request":{"subtype":"initialize"}}"#,
+        );
+        assert_eq!(tracker.uncorrelated_control_count(), 1);
     }
 
     #[test]
