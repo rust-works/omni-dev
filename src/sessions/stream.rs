@@ -105,7 +105,11 @@ pub struct StreamTracker {
     session_id: Option<String>,
     /// The session's working directory, learned from `system`/`init`.
     cwd: Option<PathBuf>,
-    /// The model id, learned from `system`/`init`.
+    /// The model currently in use, from the most recent `system`/`init` line.
+    /// Unlike `session_id`/`cwd`, this is **not** fill-once: Claude Code
+    /// re-emits `system`/`init` — model included — at the start of every turn
+    /// (not just session start), specifically so a client can pick up a
+    /// mid-session `/model` switch (#1448 follow-up).
     model: Option<String>,
     /// The state implied by the most recent content message, before the
     /// permission overlay is applied.
@@ -167,8 +171,10 @@ impl StreamTracker {
         self.request(self.state())
     }
 
-    /// Records the identity fields carried on a line, never overwriting a value
-    /// already learned with a later absent one.
+    /// Records the identity fields carried on a line: `session_id`/`cwd` are
+    /// fill-once (never overwriting a value already learned with a later
+    /// absent one), but `model` always takes the latest non-empty value seen —
+    /// see the field doc on [`Self::model`] for why.
     fn absorb_identity(&mut self, parsed: &StreamLine) {
         if self.session_id.is_none() {
             if let Some(id) = parsed.session_id.as_deref() {
@@ -180,8 +186,10 @@ impl StreamTracker {
         if self.cwd.is_none() {
             self.cwd.clone_from(&parsed.cwd);
         }
-        if self.model.is_none() {
-            self.model.clone_from(&parsed.model);
+        if let Some(model) = parsed.model.as_deref() {
+            if !model.trim().is_empty() {
+                self.model = Some(model.to_string());
+            }
         }
     }
 
@@ -368,6 +376,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_of(&idle), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_model_switch_is_picked_up_on_the_next_turns_init() {
+        // Claude Code re-announces itself via `system`/`init` at the start of
+        // *every* turn, not just session start — specifically so a mid-session
+        // `/model` switch is observable. The tracker must not lock the model in
+        // after the first sighting (#1448 follow-up).
+        let mut tracker = tracker_after_init(); // model = claude-opus-5
+        let working = tracker
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"user","session_id":"sess-1"}"#,
+            )
+            .unwrap();
+        assert_eq!(working.model.as_deref(), Some("claude-opus-5"));
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"result","subtype":"success"}"#,
+        );
+
+        // The next turn's init announces the switched model. The init line
+        // itself reports nothing (already idle)...
+        let switched_init = r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-sonnet-5","tools":["Read"]}"#;
+        assert!(tracker
+            .observe_line(Direction::FromClaude, switched_init)
+            .is_none());
+        // ...but the model it carried rides the next state-changing line.
+        let working_again = tracker
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"user","session_id":"sess-1"}"#,
+            )
+            .unwrap();
+        assert_eq!(working_again.model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]
