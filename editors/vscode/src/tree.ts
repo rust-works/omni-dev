@@ -455,6 +455,18 @@ export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): str
 }
 
 /**
+ * A repo row's muted description (#1448): the Claude model-family marker,
+ * passed in already rendered — mirrors {@link worktreeDescription}. Repo rows
+ * have no rebase cue, sync counts, or PR badge of their own (those are
+ * per-worktree), so the marker is the whole of it today; kept as its own
+ * function, rather than inlined at the call site, so a future repo-level
+ * segment does not require rewriting `treeDataProvider.ts`.
+ */
+export function repoDescription(models = ""): string {
+  return models;
+}
+
+/**
  * A worktree row's colored PR-check badge (#1324): the glyph, its theme color id,
  * and a hover tooltip. The `vscode`-facing `FileDecorationProvider`
  * (`decorations.ts`) maps these fields onto a `vscode.FileDecoration`, so

@@ -19,6 +19,7 @@ import {
   partitionByWindow,
   partitionSelfLast,
   repoContextValue,
+  repoDescription,
   repoLabel,
   repoPollingEnabled,
   rowColorId,
@@ -446,6 +447,12 @@ test("worktreeDescription appends the Claude session glyphs last (#1406)", () =>
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }, "!1"), "!1");
   // No sessions → byte-for-byte the pre-#1406 description.
   assert.equal(worktreeDescription(wt, ""), worktreeDescription(wt));
+});
+
+test("repoDescription renders the model marker, or nothing (#1448)", () => {
+  assert.equal(repoDescription("[hs]"), "[hs]");
+  assert.equal(repoDescription(""), "");
+  assert.equal(repoDescription(), "");
 });
 
 test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
