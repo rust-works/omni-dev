@@ -457,10 +457,15 @@ fn push_worktree(git: &Path, outcome: &WorktreeOutcome, kind: PushKind) -> PushR
     let output = match run_git_in(git, &outcome.path, &argv) {
         Ok(output) => output,
         Err(err) => {
+            // `{err:#}` chains the anyhow context onto the underlying io::Error's
+            // message (e.g. "Text file busy") — plain `{err}` prints only the
+            // outer "failed to execute ... in ..." context and silently drops the
+            // reason, which is also what the spawn-retry's ETXTBSY sniff below
+            // depends on.
             return PushResult::Rejected {
-                detail: err.to_string(),
+                detail: format!("{err:#}"),
                 stale: false,
-            }
+            };
         }
     };
 
