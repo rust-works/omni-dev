@@ -31,10 +31,11 @@ import {
   worktreeCheckDecoration,
   worktreeContextValue,
   worktreeDescription,
-  worktreeRebaseCue,
+  worktreeGitCue,
   worktreeLabel,
   worktreeNodes,
   worktreePrBadge,
+  expandToWorktrees,
   worktreeTargets,
   worktreeTooltip,
 } from "./tree";
@@ -161,21 +162,21 @@ test("worktreeDescription formats the sync counts, omitting absent sides", () =>
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false, behind: 5 }), "↓5");
 });
 
-test("worktreeRebaseCue prefers the in-flight spinner over the durable operation", () => {
+test("worktreeGitCue prefers the in-flight spinner over the durable operation", () => {
   const base: TreeWorktreePayload = { path: "/x", branch: "f", is_main: false, open: true };
   // Nothing set — the overwhelmingly common case — renders no cue at all, so a
   // pre-#1415 daemon's snapshot is byte-for-byte as before.
-  assert.equal(worktreeRebaseCue(base), undefined);
+  assert.equal(worktreeGitCue(base), undefined);
   assert.equal(worktreeDescription(base), "");
 
   // In flight wins: it is the more urgent fact, and `operation` may already be
   // set from the very conflict the running rebase is about to report.
-  const busy = worktreeRebaseCue({ ...base, rebasing: true, operation: "rebase" });
+  const busy = worktreeGitCue({ ...base, rebasing: true, operation: "rebase" });
   assert.equal(busy?.iconId, "sync~spin");
   assert.equal(busy?.text, "rebasing…");
 
   // Left in place by the daemon: a warning the user has to act on.
-  const stuck = worktreeRebaseCue({ ...base, operation: "rebase" });
+  const stuck = worktreeGitCue({ ...base, operation: "rebase" });
   assert.equal(stuck?.iconId, "warning");
   assert.equal(stuck?.text, "rebase in progress");
   assert.match(stuck?.tooltip ?? "", /git rebase --continue/);
@@ -183,21 +184,46 @@ test("worktreeRebaseCue prefers the in-flight spinner over the durable operation
   // An interactive rebase reads as a plain rebase; other operations keep their
   // own name rather than being mislabelled.
   assert.equal(
-    worktreeRebaseCue({ ...base, operation: "rebase-interactive" })?.text,
+    worktreeGitCue({ ...base, operation: "rebase-interactive" })?.text,
     "rebase in progress",
   );
-  assert.equal(worktreeRebaseCue({ ...base, operation: "merge" })?.text, "merge in progress");
+  assert.equal(worktreeGitCue({ ...base, operation: "merge" })?.text, "merge in progress");
 
   // `--continue` is only suggested where it exists: `git bisect --continue` is
   // not a command, and neither is whatever a future daemon might report.
-  assert.match(worktreeRebaseCue({ ...base, operation: "merge" })?.tooltip ?? "", /--continue/);
-  const bisect = worktreeRebaseCue({ ...base, operation: "bisect" });
+  assert.match(worktreeGitCue({ ...base, operation: "merge" })?.tooltip ?? "", /--continue/);
+  const bisect = worktreeGitCue({ ...base, operation: "bisect" });
   assert.equal(bisect?.text, "bisect in progress");
   assert.doesNotMatch(bisect?.tooltip ?? "", /--continue/);
   assert.doesNotMatch(
-    worktreeRebaseCue({ ...base, operation: "something-new" })?.tooltip ?? "",
+    worktreeGitCue({ ...base, operation: "something-new" })?.tooltip ?? "",
     /--continue/,
   );
+});
+
+test("worktreeGitCue shows a push in flight, ahead of every other fact", () => {
+  const base: TreeWorktreePayload = { path: "/x", branch: "f", is_main: false, open: true };
+  const pushing = worktreeGitCue({ ...base, pushing: true });
+  assert.equal(pushing?.iconId, "sync~spin");
+  assert.equal(pushing?.text, "pushing…");
+  assert.equal(pushing?.tooltip, "pushing now");
+  assert.equal(
+    worktreeDescription({ ...base, pushing: true, ahead: 2 }),
+    "pushing…  ↑2",
+    "the cue leads: the counts are about to move",
+  );
+
+  // A push has no durable counterpart, so an idle row with a left-in-place rebase
+  // still reports the rebase rather than being masked.
+  assert.equal(worktreeGitCue({ ...base, pushing: false, operation: "rebase" })?.text,
+    "rebase in progress");
+
+  // Fixed priority, so the rendering is deterministic even though the daemon
+  // never marks a worktree as both.
+  assert.equal(worktreeGitCue({ ...base, pushing: true, rebasing: true })?.text, "pushing…");
+
+  // Absent from a pre-#1443 daemon: byte-for-byte the previous rendering.
+  assert.equal(worktreeGitCue(base), undefined);
 });
 
 test("worktreeDescription leads with the rebase cue, ahead of the sync counts", () => {
@@ -654,6 +680,37 @@ test("worktreeTargets drops repo nodes a mixed selection carries in", () => {
     CLOSED_LINKED,
   ]);
   assert.deepEqual(worktreeTargets([REPO_NODE]), []);
+});
+
+test("expandToWorktrees turns a selected repo row into all of its worktrees", () => {
+  // The difference from `worktreeTargets`, which drops a repo row entirely: an
+  // action offered on repo rows means "every worktree of it".
+  assert.deepEqual(
+    expandToWorktrees([REPO_NODE]).map((n) => n.wt.path),
+    SELECTION_REPO.worktrees.map((w) => w.path),
+  );
+});
+
+test("expandToWorktrees dedupes an expanded repo against explicitly selected rows", () => {
+  // Selecting a repo *and* one of its worktrees must yield that worktree once, and
+  // the explicitly-selected row keeps its position (first occurrence wins).
+  const paths = expandToWorktrees([OTHER_LINKED, REPO_NODE]).map((n) => n.wt.path);
+  assert.equal(paths[0], OTHER_LINKED.wt.path, "the explicit row keeps its place");
+  assert.equal(
+    new Set(paths).size,
+    paths.length,
+    `a worktree must not appear twice: ${paths.join(", ")}`,
+  );
+  assert.deepEqual(
+    [...paths].sort(),
+    SELECTION_REPO.worktrees.map((w) => w.path).sort(),
+    "every worktree is still covered exactly once",
+  );
+});
+
+test("expandToWorktrees leaves a worktree-only selection in its original order", () => {
+  assert.deepEqual(expandToWorktrees([CLOSED_LINKED, SELF_MAIN]), [CLOSED_LINKED, SELF_MAIN]);
+  assert.deepEqual(expandToWorktrees([]), []);
 });
 
 test("nodeDirectories maps a repo node to its root and a worktree node to its path", () => {

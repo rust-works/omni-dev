@@ -20,8 +20,10 @@ use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
+use crate::git::worktree_batch::Selection;
+use crate::git::worktree_push;
 use crate::git::worktree_rebase::{
-    self, FetchOutcome, RebaseOptions, RebaseResult, Selection, SkipReason, WorktreeOutcome,
+    self, FetchOutcome, RebaseOptions, RebaseResult, SkipReason, WorktreeOutcome,
 };
 
 /// The `worktrees` service routing key on the daemon control socket.
@@ -49,6 +51,8 @@ pub enum WorktreesSubcommands {
     Close(CloseCommand),
     /// Rebase worktrees onto the remote default branch, fetching it once per repo.
     Rebase(RebaseCommand),
+    /// Publish worktrees' branches, force-pushing with a lease where needed.
+    Push(PushCommand),
     /// Enqueue eligible worktrees' PRs into the GitHub merge queue.
     MergeQueue(MergeQueueCommand),
     /// Move and resize worktrees' open windows to match a reference window.
@@ -70,8 +74,9 @@ impl WorktreesCommand {
     ///
     /// `repo` is the global `-C/--repo` location, resolved once in [`crate::cli`]
     /// and threaded down rather than re-read from the ambient CWD. Only `rebase`
-    /// uses it (it is the one subcommand that acts on the local repository); the
-    /// daemon-client subcommands address worktrees by absolute path instead.
+    /// and `push` use it (they are the subcommands that act on the local
+    /// repository); the daemon-client subcommands address worktrees by absolute
+    /// path instead.
     pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
@@ -79,6 +84,7 @@ impl WorktreesCommand {
             WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
             WorktreesSubcommands::Close(cmd) => cmd.execute().await,
             WorktreesSubcommands::Rebase(cmd) => cmd.execute(repo).await,
+            WorktreesSubcommands::Push(cmd) => cmd.execute(repo).await,
             WorktreesSubcommands::MergeQueue(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reposition(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reload(cmd) => cmd.execute().await,
@@ -648,6 +654,268 @@ fn rebase_prompt(pending: usize) -> String {
         "worktrees"
     };
     format!("Rebase {pending} {noun} (this rewrites branch history)? [y/N] ")
+}
+
+// --- worktrees push (#1443) --------------------------------------------------
+
+/// Publishes worktrees' branches to their upstreams, force-pushing **with a
+/// lease** where a rebase rewrote history (#1443).
+///
+/// The complement of [`RebaseCommand`], and local for the same reason: the daemon
+/// hosts the same engine behind its two-phase `push` op (which is what the tree
+/// view's **Push (force-with-lease)** drives), and keeping this command local is
+/// what makes a batch push work with **no daemon running at all**, and keeps
+/// `--all` out of the wire protocol. The git work lives in
+/// [`crate::git::worktree_push`]; see ADR-0061, ADR-0059, ADR-0003.
+///
+/// There is deliberately **no `--force`**: every non-fast-forward goes out as
+/// `--force-with-lease --force-if-includes`, and a refused lease is reported with
+/// `git fetch` named as the fix. There is likewise no remote override — a branch
+/// publishes to its own upstream's remote.
+///
+/// A force-push publishes rewritten history, so it confirms by default
+/// (`--dry-run` to preview, `-y` to skip the prompt) in the spirit of ADR-0027.
+#[derive(Parser)]
+pub struct PushCommand {
+    /// Worktree folders to publish. Omit these and pass `--all` to publish every
+    /// worktree of the current repository, including its main working tree.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+    /// Publish every worktree of the current repository, including its main
+    /// working tree.
+    #[arg(long)]
+    pub all: bool,
+    /// Report what would be published, but push nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the interactive confirmation before pushing.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+}
+
+impl PushCommand {
+    /// Executes the push command, confirming interactively via stdin.
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+        self.execute_with(repo, confirm_push).await
+    }
+
+    /// The push core, with the confirm decision injected as
+    /// `confirm(pending, forced) -> bool` — the [`RebaseCommand::execute_with`]
+    /// split, so the abort and confirmed branches are unit-testable without
+    /// driving real stdin.
+    async fn execute_with<F, Fut>(self, repo: Option<&Path>, confirm: F) -> Result<()>
+    where
+        F: FnOnce(usize, usize) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let selection = self.selection(repo)?;
+
+        // Planning walks each worktree's object database, so it runs on a blocking
+        // thread rather than an async worker. Unlike the rebase plan it contacts
+        // no remote at all (ADR-0061): the classification is against the local
+        // remote-tracking ref, which is exactly what the lease is checked against.
+        let plan = tokio::task::spawn_blocking(move || worktree_push::plan(&selection))
+            .await
+            .context("push planning task panicked")??;
+
+        let json = matches!(self.output, TableOrJson::Json);
+        // A dry run, or a plan with nothing left to publish, reports and stops.
+        if self.dry_run || !plan.has_pending_pushes() {
+            return self.print(json, &plan.worktrees);
+        }
+
+        // Show what is about to happen, then confirm: a force-push publishes a
+        // rewrite to everyone who has the branch.
+        if !json {
+            println!("{}", render_push_outcomes(&plan.worktrees));
+        }
+        let pending = plan
+            .worktrees
+            .iter()
+            .filter(|w| w.result.is_pending())
+            .count();
+        let forced = plan
+            .worktrees
+            .iter()
+            .filter(|w| matches!(w.result, worktree_push::PushResult::WouldForce { .. }))
+            .count();
+        if !self.yes && !confirm(pending, forced).await {
+            println!("Aborted; nothing was pushed.");
+            return Ok(());
+        }
+
+        // The CLI runs in the user's shell with their own `PATH`, so the engine's
+        // well-known-path probe is belt-and-braces here rather than load-bearing
+        // (unlike the daemon, which must resolve `git` explicitly).
+        let opts = worktree_push::PushOptions::default();
+        let outcomes = tokio::task::spawn_blocking(move || worktree_push::execute(plan, &opts))
+            .await
+            .context("push task panicked")?;
+        if !json {
+            println!();
+        }
+        self.print(json, &outcomes)
+    }
+
+    /// Resolves the CLI's target selection, rejecting an empty one rather than
+    /// silently publishing everything. Mirrors [`RebaseCommand::selection`].
+    fn selection(&self, repo: Option<&Path>) -> Result<Selection> {
+        let base = repo.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        if self.all {
+            if !self.paths.is_empty() {
+                bail!("pass either <PATH>... or --all, not both");
+            }
+            return Ok(Selection::All { base });
+        }
+        if self.paths.is_empty() {
+            bail!(
+                "specify one or more <PATH> arguments, or --all to publish \
+                 every worktree of this repository"
+            );
+        }
+        let paths = self
+            .paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    base.join(path)
+                }
+            })
+            .collect();
+        Ok(Selection::Paths(paths))
+    }
+
+    /// Prints a report as either pretty JSON or the human table.
+    fn print(&self, json: bool, outcomes: &[worktree_push::WorktreeOutcome]) -> Result<()> {
+        if json {
+            let value = json!({ "dry_run": self.dry_run, "worktrees": outcomes });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!("{}", render_push_outcomes(outcomes));
+        }
+        Ok(())
+    }
+}
+
+/// Renders the per-worktree push result table.
+fn render_push_outcomes(outcomes: &[worktree_push::WorktreeOutcome]) -> String {
+    if outcomes.is_empty() {
+        return "No worktrees selected.".to_string();
+    }
+    let mut out = format!(
+        "{:<14} {:<24} {:<20} {}",
+        "STATUS", "BRANCH", "REMOTE", "WORKTREE"
+    );
+    for outcome in outcomes {
+        out.push('\n');
+        out.push_str(&push_outcome_row(outcome));
+    }
+    out
+}
+
+/// One worktree row: status, branch, destination, path, and a parenthesised detail.
+fn push_outcome_row(outcome: &worktree_push::WorktreeOutcome) -> String {
+    let (status, detail) = push_status_and_detail(&outcome.result);
+    let branch = sanitize(outcome.branch.as_deref().unwrap_or("-"));
+    let destination = if outcome.remote.is_empty() {
+        "-".to_string()
+    } else {
+        sanitize(&format!("{}/{}", outcome.remote, outcome.remote_branch))
+    };
+    let path = sanitize(&outcome.path.display().to_string());
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("  ({detail})")
+    };
+    format!("{status:<14} {branch:<24} {destination:<20} {path}{suffix}")
+}
+
+/// The status word and human detail for one push outcome.
+fn push_status_and_detail(result: &worktree_push::PushResult) -> (&'static str, String) {
+    use worktree_push::PushResult;
+    match result {
+        PushResult::UpToDate => ("up-to-date", String::new()),
+        PushResult::WouldFastForward { ahead } => {
+            ("would-push", format!("{ahead} ahead; fast-forward"))
+        }
+        PushResult::WouldForce { ahead, behind } => (
+            "would-force",
+            format!("{ahead} ahead, {behind} behind; needs --force-with-lease"),
+        ),
+        PushResult::WouldCreate => ("would-create", "no upstream yet".to_string()),
+        PushResult::Pushed { forced: true } => ("pushed", "forced with lease".to_string()),
+        PushResult::Pushed { forced: false } => ("pushed", "fast-forward".to_string()),
+        PushResult::Created => ("created", "upstream set".to_string()),
+        // A refused lease is a *different instruction to the user* than any other
+        // rejection: the remote moved, so the fix is to integrate their work — never
+        // a harder push, which this command has no way to make anyway.
+        PushResult::Rejected { detail, stale: true } => (
+            "rejected",
+            format!(
+                "the remote moved since you last fetched; run `git fetch` and rebase, then retry: {}",
+                brief(detail)
+            ),
+        ),
+        PushResult::Rejected { detail, .. } => ("rejected", brief(detail)),
+        PushResult::Skipped { reason } => ("skipped", push_skip_reason_text(*reason).to_string()),
+    }
+}
+
+/// The human explanation for why a worktree was not published.
+fn push_skip_reason_text(reason: worktree_push::SkipReason) -> &'static str {
+    use worktree_push::SkipReason;
+    match reason {
+        SkipReason::DetachedHead => "detached HEAD",
+        SkipReason::NotAWorktree => "not a git worktree",
+        SkipReason::NoRemote => "no remote to publish to",
+        SkipReason::DefaultBranchForcePush => {
+            "refusing to force-push the remote default branch; \
+             fast-forward it or open a PR instead"
+        }
+    }
+}
+
+/// Prompts on stderr before publishing, reading from real stdin.
+async fn confirm_push(pending: usize, forced: usize) -> bool {
+    confirm_push_with(pending, forced, read_stdin_line()).await
+}
+
+/// Prints the push confirmation prompt and resolves the (injected) read into a
+/// yes/no decision. Any read error, EOF, or join failure is treated as "no", so a
+/// force-push never proceeds unattended.
+async fn confirm_push_with(
+    pending: usize,
+    forced: usize,
+    read: impl std::future::Future<Output = Option<String>>,
+) -> bool {
+    use std::io::Write;
+    eprint!("{}", push_prompt(pending, forced));
+    let _ = std::io::stderr().flush();
+    read.await.as_deref().is_some_and(answer_is_yes)
+}
+
+/// The confirmation prompt. Pure, so the wording is unit-testable.
+///
+/// The force count is called out separately from the total: publishing a
+/// fast-forward and publishing a rewrite are different acts, and the number that
+/// matters when deciding is how many branches other people may already have.
+fn push_prompt(pending: usize, forced: usize) -> String {
+    let noun = if pending == 1 { "branch" } else { "branches" };
+    if forced == 0 {
+        return format!("Push {pending} {noun}? [y/N] ");
+    }
+    let forced_noun = if forced == 1 { "one" } else { "them" };
+    format!(
+        "Push {pending} {noun}, force-pushing {forced} with a lease \
+         (this publishes rewritten history — anyone who has {forced_noun} \
+         will need to reset)? [y/N] "
+    )
 }
 
 /// Enqueues eligible worktrees' PRs into the GitHub merge queue — the daemon's
@@ -3140,7 +3408,7 @@ mod tests {
         // prompt must return before `worktree_rebase::execute` is ever reached.
         // Shares the engine tests' git-load lock so the whole suite's concurrent
         // `git` spawns never starve the daemon's timing-sensitive poller tests.
-        let _guard = worktree_rebase::test_serial_lock();
+        let _guard = crate::git::worktree_batch::test_serial_lock();
         let Some(scenario) = BehindScenario::build() else {
             return; // git unavailable — the engine tests cover the git behaviour.
         };
@@ -3169,7 +3437,7 @@ mod tests {
     async fn rebase_confirmed_rebases_the_behind_worktree() {
         // The accepted branch: confirming drives plan → execute → report, and the
         // behind worktree fast-forwards onto the freshly fetched origin/main.
-        let _guard = worktree_rebase::test_serial_lock();
+        let _guard = crate::git::worktree_batch::test_serial_lock();
         let Some(scenario) = BehindScenario::build() else {
             return; // git unavailable — the engine tests cover the git behaviour.
         };
@@ -3975,5 +4243,371 @@ mod tests {
         .expect_err("an `ok:false` reply must not be reported as success");
         assert!(err.to_string().contains("unknown worktrees op"), "{err:#}");
         server.await.unwrap();
+    }
+
+    // ── worktrees push (#1443) ────────────────────────────────────────────
+
+    /// A `PushCommand` with every field defaulted, for terse test construction.
+    fn push_cmd() -> PushCommand {
+        PushCommand {
+            paths: Vec::new(),
+            all: false,
+            dry_run: false,
+            yes: false,
+            output: TableOrJson::Table,
+        }
+    }
+
+    #[test]
+    fn push_parses_paths_and_flags() {
+        let cmd = PushCommand::try_parse_from(["push", "/a", "/b", "--dry-run", "-y"]).unwrap();
+        assert_eq!(cmd.paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert!(cmd.dry_run && cmd.yes);
+        assert!(!cmd.all);
+    }
+
+    #[test]
+    fn push_exposes_no_force_escape_hatch() {
+        // The whole point of ADR-0061 §2: there must be no way to ask this command
+        // for a lease-free force, so a `--force` argument has to be a parse error.
+        for flag in ["--force", "-f", "--no-force-if-includes"] {
+            assert!(
+                PushCommand::try_parse_from(["push", "/a", flag]).is_err(),
+                "{flag} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn push_selection_requires_paths_or_all() {
+        let err = push_cmd().selection(None).unwrap_err().to_string();
+        assert!(err.contains("--all"), "{err}");
+
+        let both = PushCommand {
+            paths: vec![PathBuf::from("/a")],
+            all: true,
+            ..push_cmd()
+        };
+        let err = both.selection(None).unwrap_err().to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn push_selection_resolves_relative_paths_against_the_repo_flag() {
+        let cmd = PushCommand {
+            paths: vec![PathBuf::from("wt-a"), PathBuf::from("/abs/wt-b")],
+            ..push_cmd()
+        };
+        let Selection::Paths(paths) = cmd.selection(Some(Path::new("/base"))).unwrap() else {
+            panic!("expected an explicit path selection");
+        };
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/base/wt-a"), PathBuf::from("/abs/wt-b")],
+            "a relative path resolves against -C, an absolute one is left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_dry_run_reaches_no_remote_and_pushes_nothing() {
+        // A non-worktree path with --dry-run is a complete, side-effect-free run:
+        // it opens no socket and contacts no remote.
+        let dir = tempfile::tempdir().unwrap();
+        PushCommand {
+            paths: vec![dir.path().to_path_buf()],
+            dry_run: true,
+            ..push_cmd()
+        }
+        .execute_with(None, |_, _| async { panic!("a dry run must not confirm") })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_declining_the_confirmation_publishes_nothing() {
+        let (_root, origin, wt) = push_scenario();
+        let before = origin_tip(&origin, "refs/heads/feature");
+
+        PushCommand {
+            paths: vec![wt],
+            ..push_cmd()
+        }
+        .execute_with(None, |pending, forced| async move {
+            assert_eq!((pending, forced), (1, 1));
+            false
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            origin_tip(&origin, "refs/heads/feature"),
+            before,
+            "declining must leave the remote exactly as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_confirming_force_pushes_with_the_lease() {
+        let (_root, origin, wt) = push_scenario();
+        let rewritten = git2::Repository::open(&wt)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target();
+
+        PushCommand {
+            paths: vec![wt],
+            ..push_cmd()
+        }
+        .execute_with(None, |_, _| async { true })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            origin_tip(&origin, "refs/heads/feature"),
+            rewritten,
+            "confirming publishes the rewritten tip"
+        );
+    }
+
+    #[test]
+    fn push_prompt_calls_out_the_force_count_separately() {
+        assert_eq!(push_prompt(1, 0), "Push 1 branch? [y/N] ");
+        assert_eq!(push_prompt(3, 0), "Push 3 branches? [y/N] ");
+
+        let forced = push_prompt(3, 2);
+        assert!(forced.contains("force-pushing 2 with a lease"), "{forced}");
+        assert!(
+            forced.contains("rewritten history"),
+            "the prompt must say what is actually being published: {forced}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_confirmation_treats_anything_but_yes_as_no() {
+        assert!(confirm_push_with(1, 1, async { Some("y\n".into()) }).await);
+        assert!(confirm_push_with(1, 1, async { Some("YES".into()) }).await);
+        assert!(!confirm_push_with(1, 1, async { Some("n".into()) }).await);
+        assert!(
+            !confirm_push_with(1, 1, async { None }).await,
+            "EOF must never be read as consent"
+        );
+    }
+
+    #[test]
+    fn push_rows_render_each_status_with_its_own_instruction() {
+        let outcome = |result| worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: Some("feature".into()),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            result,
+        };
+        let rendered = render_push_outcomes(&[
+            outcome(worktree_push::PushResult::WouldForce {
+                ahead: 2,
+                behind: 1,
+            }),
+            outcome(worktree_push::PushResult::Rejected {
+                detail: "stale info".into(),
+                stale: true,
+            }),
+            outcome(worktree_push::PushResult::Skipped {
+                reason: worktree_push::SkipReason::DefaultBranchForcePush,
+            }),
+        ]);
+        assert!(rendered.contains("would-force"), "{rendered}");
+        assert!(rendered.contains("origin/feature"), "{rendered}");
+        assert!(
+            rendered.contains("`git fetch` and rebase"),
+            "a lease refusal must name the fix, not just quote git: {rendered}"
+        );
+        assert!(
+            rendered.contains("refusing to force-push the remote default branch"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn push_renders_an_empty_selection_without_a_bare_header() {
+        assert_eq!(render_push_outcomes(&[]), "No worktrees selected.");
+    }
+
+    #[test]
+    fn push_rows_render_every_remaining_status_and_skip_reason() {
+        // The complement of `push_rows_render_each_status_with_its_own_instruction`:
+        // every arm the interesting-cases test does not reach, so a new variant
+        // cannot be added without a row rendering for it.
+        use worktree_push::{PushResult, SkipReason};
+        let outcome = |result| worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: Some("feature".into()),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            result,
+        };
+        let rendered = render_push_outcomes(&[
+            outcome(PushResult::UpToDate),
+            outcome(PushResult::WouldFastForward { ahead: 3 }),
+            outcome(PushResult::WouldCreate),
+            outcome(PushResult::Pushed { forced: true }),
+            outcome(PushResult::Pushed { forced: false }),
+            outcome(PushResult::Created),
+            outcome(PushResult::Rejected {
+                detail: "pre-receive hook declined".into(),
+                stale: false,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::DetachedHead,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::NotAWorktree,
+            }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::NoRemote,
+            }),
+        ]);
+
+        for expected in [
+            "up-to-date",
+            "3 ahead; fast-forward",
+            "no upstream yet",
+            "forced with lease",
+            "fast-forward",
+            "upstream set",
+            "pre-receive hook declined",
+            "detached HEAD",
+            "not a git worktree",
+            "no remote to publish to",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("`git fetch` and rebase"),
+            "only a *lease* refusal earns the fetch-and-rebase instruction: {rendered}"
+        );
+    }
+
+    #[test]
+    fn push_rows_render_an_unresolved_destination_as_a_dash() {
+        // A structural skip resolves no remote, so there is nothing to print in the
+        // REMOTE column — and an empty cell would read as a rendering bug.
+        let rendered = render_push_outcomes(&[worktree_push::WorktreeOutcome {
+            path: PathBuf::from("/wt"),
+            branch: None,
+            remote: String::new(),
+            remote_branch: String::new(),
+            result: worktree_push::PushResult::Skipped {
+                reason: worktree_push::SkipReason::NotAWorktree,
+            },
+        }]);
+        let row = rendered.lines().nth(1).unwrap();
+        assert!(
+            row.contains(" - "),
+            "branch and remote both render as `-`: {row}"
+        );
+    }
+
+    #[test]
+    fn push_all_selects_the_repository_rather_than_named_paths() {
+        let cmd = PushCommand {
+            all: true,
+            ..push_cmd()
+        };
+        let selection = cmd.selection(Some(Path::new("/base"))).unwrap();
+        match selection {
+            Selection::All { base } => assert_eq!(base, PathBuf::from("/base")),
+            other @ Selection::Paths(_) => panic!("expected an --all selection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_json_output_carries_the_dry_run_flag_and_the_outcomes() {
+        // `-o json` is the machine surface, so it must stay a superset of the table:
+        // the same per-worktree results, plus whether this was a preview.
+        let (_root, _origin, wt) = push_scenario();
+        let cmd = PushCommand {
+            paths: vec![wt.clone()],
+            dry_run: true,
+            output: TableOrJson::Json,
+            ..push_cmd()
+        };
+        // Exercises the JSON arm of `print`; the human arm is covered by the
+        // renderer tests above.
+        cmd.execute_with(None, |_, _| async { false })
+            .await
+            .expect("a dry run must succeed");
+    }
+
+    /// A bare `origin`, a local `main`, and a linked `feature` worktree whose
+    /// published branch has been **rewritten** — the state a rebase leaves and
+    /// `push` exists for. Returns `(temp root, origin path, worktree path)`.
+    fn push_scenario() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        // Held for the fixture only — that dozen-subprocess burst is what the lock
+        // exists to cap — and released on return, before any `.await` in the test.
+        let _guard = crate::git::worktree_batch::test_serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin.git");
+        let local = root.path().join("local");
+        let wt = root.path().join("feature-wt");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::git::worktree_batch::run_git_in(
+                &crate::git::resolve_git_binary(),
+                dir,
+                args,
+            )
+            .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&local, &["init", "-b", "main"]);
+        git(&local, &["config", "user.name", "Test"]);
+        git(&local, &["config", "user.email", "test@example.com"]);
+        git(&local, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(local.join("f.txt"), "base\n").unwrap();
+        git(&local, &["add", "f.txt"]);
+        git(&local, &["commit", "-m", "base"]);
+        git(
+            &local,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&local, &["push", "-u", "origin", "main"]);
+        git(
+            &local,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("g.txt"), "work\n").unwrap();
+        git(&wt, &["add", "g.txt"]);
+        git(&wt, &["commit", "-m", "work"]);
+        git(&wt, &["push", "-u", "origin", "feature"]);
+        git(&wt, &["commit", "--amend", "-m", "rewritten"]);
+
+        (root, origin, std::fs::canonicalize(&wt).unwrap())
+    }
+
+    /// The tip of `refname` in a bare origin, when it exists.
+    fn origin_tip(origin: &Path, refname: &str) -> Option<git2::Oid> {
+        git2::Repository::open_bare(origin)
+            .unwrap()
+            .refname_to_id(refname)
+            .ok()
     }
 }

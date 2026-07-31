@@ -127,6 +127,12 @@
         "icon": "$(git-branch)"
       },
       {
+        "command": "omniDevWorktrees.pushForceWithLease",
+        "title": "Push (force-with-lease)",
+        "category": "omni-dev",
+        "icon": "$(repo-push)"
+      },
+      {
         "command": "omniDevWorktrees.repositionWindowsToMatch",
         "title": "Reposition Windows to Match",
         "category": "omni-dev",
@@ -226,6 +232,10 @@
           "when": "false"
         },
         {
+          "command": "omniDevWorktrees.pushForceWithLease",
+          "when": "false"
+        },
+        {
           "command": "omniDevWorktrees.repositionWindowsToMatch",
           "when": "false"
         },
@@ -322,6 +332,11 @@
           "command": "omniDevWorktrees.rebaseOnMain",
           "when": "view == omniDevWorktrees.tree && viewItem =~ /worktree/",
           "group": "4_git@1"
+        },
+        {
+          "command": "omniDevWorktrees.pushForceWithLease",
+          "when": "view == omniDevWorktrees.tree && viewItem =~ /^(repo|worktree)/",
+          "group": "4_git@2"
         },
         {
           "command": "omniDevWorktrees.repositionWindowsToMatch",
