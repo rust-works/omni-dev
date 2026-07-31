@@ -379,13 +379,16 @@ enum StreamEndReason {
 /// `service`/`op` are for logging only (the caller already knows which
 /// subscription this is); the return value tells the caller why the stream
 /// ended.
-async fn run_stream(
-    framed: &mut Framed<UnixStream, LinesCodec>,
+async fn run_stream<T>(
+    framed: &mut Framed<T, LinesCodec>,
     mut stream: Box<dyn ServiceStream>,
     shutdown: &CancellationToken,
     service: &str,
     op: &str,
-) -> StreamEndReason {
+) -> StreamEndReason
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     tracing::debug!(service, op, "subscription started");
 
     // Initial snapshot up front. The stream's change source was captured when it
@@ -444,7 +447,10 @@ async fn run_stream(
 
 /// Encodes and writes one reply line. Returns `false` when the connection
 /// should be closed (encode failed, or the write failed).
-async fn send_reply(framed: &mut Framed<UnixStream, LinesCodec>, reply: DaemonReply) -> bool {
+async fn send_reply<T>(framed: &mut Framed<T, LinesCodec>, reply: DaemonReply) -> bool
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let encoded = match serde_json::to_string(&reply) {
         Ok(encoded) => encoded,
         Err(e) => {
@@ -977,6 +983,14 @@ mod tests {
     /// `SendFailed` break (the resample path): the client is only closed
     /// after `run_stream` has already committed to resampling, so there is no
     /// race against the hangup-detection branch on the same `select!`.
+    ///
+    /// Uses [`tokio::io::duplex`] rather than [`UnixStream::pair`]: closing a
+    /// real Unix socket doesn't guarantee the peer's *next* write fails — the
+    /// kernel can transiently accept one more write into its buffer before the
+    /// closed state propagates, which surfaces as a `DecodeError` on the
+    /// following read instead of the `SendFailed` this test wants (observed
+    /// as a CI flake under full-suite load). The in-memory duplex closes
+    /// deterministically in-process with no such race.
     #[tokio::test]
     async fn run_stream_ends_when_a_later_send_fails() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1011,7 +1025,7 @@ mod tests {
             }
         }
 
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = tokio::io::duplex(4096);
         let (tx, rx) = watch::channel(0u64);
         let snap = Arc::new(StdMutex::new(json!({ "n": 0 })));
         let entered = Arc::new(Notify::new());
