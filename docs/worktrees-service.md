@@ -508,6 +508,17 @@ file decoration, not description text), which also tints that row's branch label
   the remaining targets are silently skipped. Selection survives the
   live snapshot churn for free, since it is keyed by `TreeItem.id` — the stable
   repo-root/worktree-path identity — and not by node object identity.
+- **Claude model-family marker** (#1448): when the [sessions service](sessions-service.md)
+  attributes one or more Claude sessions to a worktree, its row description gets a
+  trailing `[hsof*]`-style marker — **h**aiku, **s**onnet, **o**pus, **f**able, `*`
+  for anything else — naming which model families are running there, in that fixed
+  order, with only the letters actually in use. A repository row shows the union of
+  its worktrees' markers, so `[so]` there means Sonnet is running in one worktree and
+  Opus in another, not necessarily both in the same one. Idle counts the same as
+  working — the marker's scope matches the session-state glyphs it sits beside — and
+  a row with no attributed session shows no marker at all. Purely a client-side
+  reclassification of the `model` id the daemon already sends on every session; no
+  wire change was needed.
 - **Four worktree verbs.** Window management and worktree deletion are separate
   actions (#1357): **Open Worktree** opens/focuses a window per selected worktree;
   **Close Window** closes the window of any selected worktree — main *or* linked —
