@@ -5,22 +5,32 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  Family,
   SessionEntry,
   SessionTally,
+  classifyModel,
   decodeSessionTally,
   encodeSessionTally,
+  formatModelMarker,
+  sameModelFamilies,
   sameTallies,
   sessionDecoration,
   sessionGlyphs,
   sessionTooltipLine,
   sessionTotal,
   tallyByWorktree,
+  tallyModelsByWorktree,
+  unionModelFamilies,
 } from "./sessionCounts";
 
 const PATHS = ["/w/repo", "/w/repo-two", "/w/repo/nested"];
 
-function session(cwd: string | undefined, state: SessionEntry["state"]): SessionEntry {
-  return { session_id: `s-${cwd ?? "none"}-${state}`, cwd, state };
+function session(
+  cwd: string | undefined,
+  state: SessionEntry["state"],
+  model?: string,
+): SessionEntry {
+  return { session_id: `s-${cwd ?? "none"}-${state}`, cwd, state, model };
 }
 
 test("tallyByWorktree buckets each state onto its worktree", () => {
@@ -130,4 +140,84 @@ test("sameTallies compares maps by value so an unchanged poll is a no-op", () =>
   assert.ok(!sameTallies(a, {}));
   assert.ok(!sameTallies(a, { "/w/other": { working: 1, waiting: 0, idle: 2 } }));
   assert.ok(sameTallies({}, {}));
+});
+
+test("classifyModel matches each family by case-insensitive substring (#1448)", () => {
+  assert.equal(classifyModel("claude-haiku-4-5-20251001"), "h");
+  assert.equal(classifyModel("claude-SONNET-4-6"), "s");
+  assert.equal(classifyModel("claude-opus-4-8"), "o");
+  assert.equal(classifyModel("claude-fable-5"), "f");
+});
+
+test("classifyModel survives a Bedrock/regional-prefixed id", () => {
+  assert.equal(classifyModel("us.anthropic.claude-3-7-sonnet-20250219-v1:0"), "s");
+});
+
+test("classifyModel falls back to * for an unrecognized or empty id", () => {
+  assert.equal(classifyModel("some-other-vendor-model"), "*");
+  assert.equal(classifyModel(""), "*");
+});
+
+test("tallyModelsByWorktree buckets each session's family onto its worktree", () => {
+  const families = tallyModelsByWorktree(
+    [
+      session("/w/repo", "working", "claude-sonnet-4-6"),
+      session("/w/repo", "idle", "claude-opus-4-8"), // idle still counts (#1448 scope)
+    ],
+    PATHS,
+  );
+  assert.deepEqual([...families["/w/repo"]].sort(), ["o", "s"]);
+});
+
+test("tallyModelsByWorktree yields no entry for a worktree with no sessions", () => {
+  assert.deepEqual(tallyModelsByWorktree([], PATHS), {});
+});
+
+test("tallyModelsByWorktree drops what tallyByWorktree also drops", () => {
+  const families = tallyModelsByWorktree(
+    [
+      session("/w/repo", "ended", "claude-opus-4-8"),
+      session(undefined, "working", "claude-opus-4-8"),
+      session("/elsewhere", "working", "claude-opus-4-8"),
+    ],
+    PATHS,
+  );
+  assert.deepEqual(families, {});
+});
+
+test("tallyModelsByWorktree classifies a session with no learned model as *", () => {
+  const families = tallyModelsByWorktree([session("/w/repo", "working")], PATHS);
+  assert.deepEqual([...families["/w/repo"]], ["*"]);
+});
+
+test("unionModelFamilies unions across every worktree of a repo", () => {
+  const families = {
+    "/w/repo": new Set<Family>(["s"]),
+    "/w/repo/nested": new Set<Family>(["o"]),
+  };
+  assert.deepEqual(
+    [...unionModelFamilies(["/w/repo", "/w/repo/nested"], families)].sort(),
+    ["o", "s"],
+  );
+});
+
+test("unionModelFamilies is empty for a repo with no sessions anywhere", () => {
+  assert.deepEqual(unionModelFamilies(["/w/repo", "/w/repo-two"], {}), new Set());
+});
+
+test("formatModelMarker renders in fixed h/s/o/f/* order regardless of insertion order", () => {
+  assert.equal(formatModelMarker(new Set<Family>(["o", "h"])), "[ho]");
+  assert.equal(formatModelMarker(new Set<Family>(["*", "f", "s"])), "[sf*]");
+});
+
+test("formatModelMarker is empty (not '[]') for an empty or absent set", () => {
+  assert.equal(formatModelMarker(new Set()), "");
+  assert.equal(formatModelMarker(undefined), "");
+});
+
+test("sameModelFamilies compares maps by value", () => {
+  const a = { "/w/repo": new Set<Family>(["s", "o"]) };
+  assert.ok(sameModelFamilies(a, { "/w/repo": new Set<Family>(["o", "s"]) }));
+  assert.ok(!sameModelFamilies(a, { "/w/repo": new Set<Family>(["s"]) }));
+  assert.ok(!sameModelFamilies(a, {}));
 });

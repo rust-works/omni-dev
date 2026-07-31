@@ -256,6 +256,17 @@ export function reposToNodes(repos: TreeRepoPayload[]): Node[] {
 }
 
 /**
+ * `repo`'s worktrees honoring the `showClosed` filter: every worktree when
+ * `true`, else only those with an open window (`open === true`). The single
+ * place that filter predicate lives — {@link worktreeNodes} and
+ * {@link visibleWorktreePaths} both build on it, so the two can never drift
+ * apart the way they once did (#1448).
+ */
+function visibleWorktrees(repo: TreeRepoPayload, showClosed: boolean): TreeWorktreePayload[] {
+  return showClosed ? repo.worktrees : repo.worktrees.filter((wt) => wt.open);
+}
+
+/**
  * The worktree child nodes of a repository, in the daemon's order (main first).
  *
  * When `showClosed` is false, worktrees with no open window (`open === false`)
@@ -265,8 +276,17 @@ export function reposToNodes(repos: TreeRepoPayload[]): Node[] {
  * (the current, unfiltered behavior).
  */
 export function worktreeNodes(repo: TreeRepoPayload, showClosed = true): Node[] {
-  const worktrees = showClosed ? repo.worktrees : repo.worktrees.filter((wt) => wt.open);
-  return worktrees.map((wt) => ({ kind: "worktree", repo, wt }));
+  return visibleWorktrees(repo, showClosed).map((wt) => ({ kind: "worktree", repo, wt }));
+}
+
+/**
+ * The paths of `repo`'s worktrees currently visible in the tree — the same
+ * `showClosed` filter {@link worktreeNodes} applies, for a caller that only
+ * needs the paths (the repo-row model-family marker rollup, #1448) rather
+ * than full nodes.
+ */
+export function visibleWorktreePaths(repo: TreeRepoPayload, showClosed: boolean): string[] {
+  return visibleWorktrees(repo, showClosed).map((wt) => wt.path);
 }
 
 /**
@@ -452,6 +472,18 @@ export function worktreeDescription(wt: TreeWorktreePayload, sessions = ""): str
   return [worktreeGitCue(wt)?.text ?? "", syncCounts(wt), worktreePrBadge(wt), sessions]
     .filter(Boolean)
     .join("  ");
+}
+
+/**
+ * A repo row's muted description (#1448): the Claude model-family marker,
+ * passed in already rendered — mirrors {@link worktreeDescription}. Repo rows
+ * have no rebase cue, sync counts, or PR badge of their own (those are
+ * per-worktree), so the marker is the whole of it today; kept as its own
+ * function, rather than inlined at the call site, so a future repo-level
+ * segment does not require rewriting `treeDataProvider.ts`.
+ */
+export function repoDescription(models = ""): string {
+  return models;
 }
 
 /**

@@ -19,12 +19,14 @@ import {
   partitionByWindow,
   partitionSelfLast,
   repoContextValue,
+  repoDescription,
   repoLabel,
   repoPollingEnabled,
   rowColorId,
   reposToNodes,
   selectionTargets,
   unbadgedBranches,
+  visibleWorktreePaths,
   withAheadBehind,
   withPr,
   withoutPrBadges,
@@ -114,6 +116,15 @@ test("worktreeNodes hides no-window worktrees when showClosed is false", () => {
   // derived from open windows); as a pure function it can return an empty list,
   // but the daemon's invariant means the filter never empties a real repo.
   assert.equal(worktreeNodes(REPOS[1], false).length, 0);
+});
+
+test("visibleWorktreePaths mirrors worktreeNodes' showClosed filter, as paths (#1448)", () => {
+  assert.deepEqual(visibleWorktreePaths(REPOS[0], true), [
+    "/home/me/omni-dev",
+    "/home/me/wt/issue-1300",
+  ]);
+  assert.deepEqual(visibleWorktreePaths(REPOS[0], false), ["/home/me/omni-dev"]);
+  assert.deepEqual(visibleWorktreePaths(REPOS[1], false), []);
 });
 
 test("repoPollingEnabled is true only for an explicit polling_enabled flag", () => {
@@ -446,6 +457,12 @@ test("worktreeDescription appends the Claude session glyphs last (#1406)", () =>
   assert.equal(worktreeDescription({ path: "/x", is_main: true, open: false }, "!1"), "!1");
   // No sessions → byte-for-byte the pre-#1406 description.
   assert.equal(worktreeDescription(wt, ""), worktreeDescription(wt));
+});
+
+test("repoDescription renders the model marker, or nothing (#1448)", () => {
+  assert.equal(repoDescription("[hs]"), "[hs]");
+  assert.equal(repoDescription(""), "");
+  assert.equal(repoDescription(), "");
 });
 
 test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
