@@ -15,6 +15,11 @@
 //! on the child's stdin as a `control_response`. Correlating the two by
 //! `request_id` is what makes `waiting_for_permission` exact rather than a guess,
 //! so [`StreamTracker::observe_line`] takes the [`Direction`] a line was seen in.
+//! A model switch is the same shape the other way around: `set_model` is a
+//! `control_request` the editor sends **to** the CLI at the exact moment the
+//! user switches models, well before the next turn's `system`/`init` line would
+//! otherwise announce it — reading it is what makes a mid-session `/model`
+//! switch instant rather than delayed until the next prompt (#1448 follow-up).
 //!
 //! Nothing here does I/O and nothing here retains conversation content: only the
 //! message `type`/`subtype`, the identity fields (`session_id`, `cwd`, `model`)
@@ -85,13 +90,19 @@ struct StreamLine {
 /// The shared shape of a `control_request` / `control_response` body.
 #[derive(Debug, Default, Deserialize)]
 struct ControlBody {
-    /// The control kind, e.g. `can_use_tool`, `initialize`, `hook_callback`.
+    /// The control kind, e.g. `can_use_tool`, `initialize`, `hook_callback`,
+    /// `set_model`.
     #[serde(default)]
     subtype: Option<String>,
     /// The correlation id, when carried inside the body rather than at the top
     /// level (a `control_response` echoes it here).
     #[serde(default)]
     request_id: Option<String>,
+    /// A `set_model` request's target model id. Absent when the editor asked
+    /// to reset to the account/session default — a value only the CLI itself
+    /// can resolve, so that case is left for the next `system`/`init` line.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// The authoritative session-state machine over one wrapped `claude` process.
@@ -105,19 +116,23 @@ pub struct StreamTracker {
     session_id: Option<String>,
     /// The session's working directory, learned from `system`/`init`.
     cwd: Option<PathBuf>,
-    /// The model currently in use, from the most recent `system`/`init` line.
-    /// Unlike `session_id`/`cwd`, this is **not** fill-once: Claude Code
-    /// re-emits `system`/`init` — model included — at the start of every turn
-    /// (not just session start), specifically so a client can pick up a
-    /// mid-session `/model` switch (#1448 follow-up).
+    /// The model currently in use: from the most recent `system`/`init` line,
+    /// or — sooner — a `set_model` `control_request` the editor sent. Unlike
+    /// `session_id`/`cwd`, this is **not** fill-once: Claude Code re-emits
+    /// `system`/`init` — model included — at the start of every turn (not just
+    /// session start), and a `set_model` request updates it immediately, at
+    /// the moment of the switch rather than the next turn (#1448 follow-up).
     model: Option<String>,
     /// The state implied by the most recent content message, before the
     /// permission overlay is applied.
     base: SessionState,
     /// The `request_id`s of permission prompts asked but not yet answered.
     pending: HashSet<String>,
-    /// The state most recently returned to the caller, for change detection.
-    reported: Option<SessionState>,
+    /// The (state, model) pair most recently returned to the caller, for
+    /// change detection. Both dimensions are tracked because they change
+    /// independently: an ordinary turn changes state without the model, while
+    /// a mid-turn `set_model` changes the model without the state.
+    reported: Option<(SessionState, Option<String>)>,
 }
 
 impl StreamTracker {
@@ -155,7 +170,7 @@ impl StreamTracker {
             return None;
         }
         let parsed: StreamLine = serde_json::from_str(line).ok()?;
-        self.absorb_identity(&parsed);
+        self.absorb_identity(direction, &parsed);
         self.apply(direction, &parsed);
         self.emit_if_changed()
     }
@@ -173,9 +188,10 @@ impl StreamTracker {
 
     /// Records the identity fields carried on a line: `session_id`/`cwd` are
     /// fill-once (never overwriting a value already learned with a later
-    /// absent one), but `model` always takes the latest non-empty value seen —
-    /// see the field doc on [`Self::model`] for why.
-    fn absorb_identity(&mut self, parsed: &StreamLine) {
+    /// absent one), but `model` always takes the latest non-empty value seen,
+    /// from either of two shapes — see the field doc on [`Self::model`] for
+    /// why.
+    fn absorb_identity(&mut self, direction: Direction, parsed: &StreamLine) {
         if self.session_id.is_none() {
             if let Some(id) = parsed.session_id.as_deref() {
                 if !id.trim().is_empty() {
@@ -186,9 +202,28 @@ impl StreamTracker {
         if self.cwd.is_none() {
             self.cwd.clone_from(&parsed.cwd);
         }
+        // The top-level `model`, carried on a `system`/`init` line.
         if let Some(model) = parsed.model.as_deref() {
             if !model.trim().is_empty() {
                 self.model = Some(model.to_string());
+            }
+        }
+        // A `set_model` control_request, which — unlike every other identity
+        // signal here — travels editor → CLI, so it is only ever trusted on
+        // that direction (the same rule `close_permission` applies to a
+        // permission answer). A `"default"` target cannot be resolved without
+        // the CLI's own account/session settings, so it is left alone rather
+        // than guessed; the next `system`/`init` line settles it instead.
+        if direction == Direction::ToClaude && parsed.kind.as_deref() == Some("control_request") {
+            if let Some(model) = parsed
+                .request
+                .as_ref()
+                .filter(|body| body.subtype.as_deref() == Some("set_model"))
+                .and_then(|body| body.model.as_deref())
+            {
+                if !model.trim().is_empty() && model != "default" {
+                    self.model = Some(model.to_string());
+                }
             }
         }
     }
@@ -257,15 +292,19 @@ impl StreamTracker {
         }
     }
 
-    /// Returns a sighting when the effective state differs from the last one
-    /// reported, and records it as reported.
+    /// Returns a sighting when the effective state or the model differs from
+    /// what was last reported, and records the new pair as reported. Emitting
+    /// on a model-only change (no state change) is what makes a `set_model`
+    /// control_request reach the daemon immediately rather than waiting for
+    /// the next state transition to carry it along.
     fn emit_if_changed(&mut self) -> Option<ObserveRequest> {
         let state = self.state();
-        if self.reported == Some(state) {
+        let signature = (state, self.model.clone());
+        if self.reported.as_ref() == Some(&signature) {
             return None;
         }
         let request = self.request(state)?;
-        self.reported = Some(state);
+        self.reported = Some(signature);
         Some(request)
     }
 
@@ -379,38 +418,72 @@ mod tests {
     }
 
     #[test]
-    fn a_model_switch_is_picked_up_on_the_next_turns_init() {
-        // Claude Code re-announces itself via `system`/`init` at the start of
-        // *every* turn, not just session start — specifically so a mid-session
-        // `/model` switch is observable. The tracker must not lock the model in
-        // after the first sighting (#1448 follow-up).
+    fn a_set_model_request_updates_and_reports_the_model_immediately() {
+        // `set_model` travels editor -> CLI at the exact moment the user
+        // switches models — no turn required to observe it (#1448 follow-up).
         let mut tracker = tracker_after_init(); // model = claude-opus-5
-        let working = tracker
+        let switched = tracker
             .observe_line(
-                Direction::FromClaude,
-                r#"{"type":"user","session_id":"sess-1"}"#,
+                Direction::ToClaude,
+                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"claude-sonnet-5"}}"#,
             )
             .unwrap();
-        assert_eq!(working.model.as_deref(), Some("claude-opus-5"));
-        tracker.observe_line(
-            Direction::FromClaude,
-            r#"{"type":"result","subtype":"success"}"#,
-        );
+        assert_eq!(switched.model.as_deref(), Some("claude-sonnet-5"));
+        // The state itself did not change — this session is still idle.
+        assert_eq!(state_of(&switched), SessionState::Idle);
+    }
 
-        // The next turn's init announces the switched model. The init line
-        // itself reports nothing (already idle)...
-        let switched_init = r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-sonnet-5","tools":["Read"]}"#;
+    #[test]
+    fn a_set_model_default_is_left_for_the_next_init_to_settle() {
+        // "default" cannot be resolved without the CLI's own settings, so it
+        // is not taken at face value...
+        let mut tracker = tracker_after_init(); // model = claude-opus-5
         assert!(tracker
-            .observe_line(Direction::FromClaude, switched_init)
+            .observe_line(
+                Direction::ToClaude,
+                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"default"}}"#,
+            )
             .is_none());
-        // ...but the model it carried rides the next state-changing line.
-        let working_again = tracker
+        // ...and the model is unchanged until the next turn's init resolves it.
+        let switched_init = r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-haiku-4-5","tools":["Read"]}"#;
+        let resolved = tracker
+            .observe_line(Direction::FromClaude, switched_init)
+            .unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn a_set_model_request_is_only_honored_from_the_editor() {
+        // The same line seen on the wrong direction (as if Claude itself sent
+        // it) is not trusted, mirroring the permission-response direction rule.
+        let mut tracker = tracker_after_init(); // model = claude-opus-5
+        assert!(tracker
             .observe_line(
                 Direction::FromClaude,
-                r#"{"type":"user","session_id":"sess-1"}"#,
+                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"claude-sonnet-5"}}"#,
             )
-            .unwrap();
-        assert_eq!(working_again.model.as_deref(), Some("claude-sonnet-5"));
+            .is_none());
+        assert_eq!(
+            tracker.keepalive().unwrap().model.as_deref(),
+            Some("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_later_init_confirming_the_already_set_model_does_not_re_emit() {
+        // Claude Code re-announces itself via `system`/`init` at the start of
+        // every turn, not just session start. Once `set_model` has already
+        // moved the tracker to the new model, that turn's init line — which
+        // confirms the same model — is a no-op rather than a redundant report.
+        let mut tracker = tracker_after_init(); // model = claude-opus-5
+        tracker.observe_line(
+            Direction::ToClaude,
+            r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"claude-sonnet-5"}}"#,
+        );
+        let confirming_init = r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-sonnet-5","tools":["Read"]}"#;
+        assert!(tracker
+            .observe_line(Direction::FromClaude, confirming_init)
+            .is_none());
     }
 
     #[test]
