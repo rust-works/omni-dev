@@ -283,11 +283,17 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       item.contextValue = repoContextValue(node.repo);
       item.tooltip = node.repo.root;
       // The rolled-up Claude model-family marker (#1448): the union of every
-      // child worktree's families. Omitted entirely when the repo runs no
-      // sessions, matching the worktree row's own all-or-nothing description.
+      // *visible* child worktree's families — mirrors the `showClosed` filter
+      // `getChildren` applies via `worktreeNodes`, so the marker never names a
+      // family attributable only to a worktree hidden by "hide closed
+      // worktrees". Omitted entirely when the repo runs no sessions, matching
+      // the worktree row's own all-or-nothing description.
+      const visibleWorktrees = this.showClosed
+        ? node.repo.worktrees
+        : node.repo.worktrees.filter((wt) => wt.open);
       const marker = formatModelMarker(
         unionModelFamilies(
-          node.repo.worktrees.map((wt) => wt.path),
+          visibleWorktrees.map((wt) => wt.path),
           this.modelFamilies,
         ),
       );
