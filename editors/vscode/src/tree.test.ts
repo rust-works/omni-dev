@@ -26,6 +26,7 @@ import {
   reposToNodes,
   selectionTargets,
   unbadgedBranches,
+  visibleWorktreePaths,
   withAheadBehind,
   withPr,
   withoutPrBadges,
@@ -115,6 +116,15 @@ test("worktreeNodes hides no-window worktrees when showClosed is false", () => {
   // derived from open windows); as a pure function it can return an empty list,
   // but the daemon's invariant means the filter never empties a real repo.
   assert.equal(worktreeNodes(REPOS[1], false).length, 0);
+});
+
+test("visibleWorktreePaths mirrors worktreeNodes' showClosed filter, as paths (#1448)", () => {
+  assert.deepEqual(visibleWorktreePaths(REPOS[0], true), [
+    "/home/me/omni-dev",
+    "/home/me/wt/issue-1300",
+  ]);
+  assert.deepEqual(visibleWorktreePaths(REPOS[0], false), ["/home/me/omni-dev"]);
+  assert.deepEqual(visibleWorktreePaths(REPOS[1], false), []);
 });
 
 test("repoPollingEnabled is true only for an explicit polling_enabled flag", () => {

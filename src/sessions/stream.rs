@@ -15,11 +15,16 @@
 //! on the child's stdin as a `control_response`. Correlating the two by
 //! `request_id` is what makes `waiting_for_permission` exact rather than a guess,
 //! so [`StreamTracker::observe_line`] takes the [`Direction`] a line was seen in.
-//! A model switch is the same shape the other way around: `set_model` is a
-//! `control_request` the editor sends **to** the CLI at the exact moment the
-//! user switches models, well before the next turn's `system`/`init` line would
-//! otherwise announce it — reading it is what makes a mid-session `/model`
-//! switch instant rather than delayed until the next prompt (#1448 follow-up).
+//! A model switch can be the same shape the other way around: `set_model` is a
+//! `control_request` an SDK-driven caller can send **to** the CLI, over a
+//! *live* process's stdin, to switch models without waiting for the next
+//! turn's `system`/`init` line (#1448 follow-up). In practice this rarely
+//! fires for the Claude VS Code extension itself: its in-chat `/model` command
+//! is a local UI action that never sends `set_model` at all (it mutates local
+//! state and persists to the user's settings file instead), and the extension
+//! respawns a fresh wrapped process per turn rather than keeping one alive —
+//! so for that caller, a switch is still only observed via the next turn's
+//! `system`/`init` line, same as every other identity field here.
 //!
 //! Nothing here does I/O and nothing here retains conversation content: only the
 //! message `type`/`subtype`, the identity fields (`session_id`, `cwd`, `model`)
@@ -98,9 +103,13 @@ struct ControlBody {
     /// level (a `control_response` echoes it here).
     #[serde(default)]
     request_id: Option<String>,
-    /// A `set_model` request's target model id. Absent when the editor asked
-    /// to reset to the account/session default — a value only the CLI itself
-    /// can resolve, so that case is left for the next `system`/`init` line.
+    /// A `set_model` request's target model id. Per Claude Code's own schema
+    /// this field is optional and simply **absent** when the editor asks to
+    /// reset to the account/session default (a value only the CLI itself can
+    /// resolve) — that case is left for the next `system`/`init` line to
+    /// settle. The literal string `"default"` is guarded against too, purely
+    /// defensively: nothing in the documented protocol sends it, but nothing
+    /// rules out a caller that does.
     #[serde(default)]
     model: Option<String>,
 }
@@ -211,9 +220,23 @@ impl StreamTracker {
         // A `set_model` control_request, which — unlike every other identity
         // signal here — travels editor → CLI, so it is only ever trusted on
         // that direction (the same rule `close_permission` applies to a
-        // permission answer). A `"default"` target cannot be resolved without
-        // the CLI's own account/session settings, so it is left alone rather
-        // than guessed; the next `system`/`init` line settles it instead.
+        // permission answer). An unresolved target — the field absent per the
+        // documented schema, or (defensively) the literal string "default" —
+        // cannot be resolved without the CLI's own account/session settings,
+        // so it is left alone rather than guessed; the next `system`/`init`
+        // line settles it instead.
+        //
+        // Note this path is only reachable while a wrapped process is alive:
+        // Claude Code's own in-chat `/model` command does not send this
+        // control_request at all (it mutates local state and persists to the
+        // user's settings file instead), and the VS Code extension respawns a
+        // fresh wrapped process per turn rather than keeping one alive across
+        // a whole conversation. So in practice, a model switch is still only
+        // observed at the start of the *next* turn's `system`/`init` line
+        // (handled above) — this block is a correctness improvement for
+        // whatever caller does send `set_model` to a live process (e.g. an
+        // external SDK-driven consumer), not a guaranteed instant path for
+        // this extension's own in-chat command.
         if direction == Direction::ToClaude && parsed.kind.as_deref() == Some("control_request") {
             if let Some(model) = parsed
                 .request
@@ -434,14 +457,16 @@ mod tests {
     }
 
     #[test]
-    fn a_set_model_default_is_left_for_the_next_init_to_settle() {
-        // "default" cannot be resolved without the CLI's own settings, so it
-        // is not taken at face value...
+    fn a_set_model_with_no_model_field_is_left_for_the_next_init_to_settle() {
+        // Per the documented schema, "reset to the account/session default" is
+        // signaled by omitting `model` entirely, not by a literal value — that
+        // cannot be resolved without the CLI's own settings, so it is not
+        // taken at face value...
         let mut tracker = tracker_after_init(); // model = claude-opus-5
         assert!(tracker
             .observe_line(
                 Direction::ToClaude,
-                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"default"}}"#,
+                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model"}}"#,
             )
             .is_none());
         // ...and the model is unchanged until the next turn's init resolves it.
@@ -450,6 +475,25 @@ mod tests {
             .observe_line(Direction::FromClaude, switched_init)
             .unwrap();
         assert_eq!(resolved.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn a_set_model_literal_default_string_is_also_left_unresolved() {
+        // Defensive only: nothing in the documented schema sends the literal
+        // string "default" (the field is simply omitted instead — see the
+        // previous test), but a hypothetical caller that did should not have
+        // that string taken as a real model id either.
+        let mut tracker = tracker_after_init(); // model = claude-opus-5
+        assert!(tracker
+            .observe_line(
+                Direction::ToClaude,
+                r#"{"type":"control_request","request_id":"c1","request":{"subtype":"set_model","model":"default"}}"#,
+            )
+            .is_none());
+        assert_eq!(
+            tracker.keepalive().unwrap().model.as_deref(),
+            Some("claude-opus-5")
+        );
     }
 
     #[test]
