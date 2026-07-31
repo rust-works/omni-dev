@@ -26,8 +26,8 @@ export type SessionState =
   | "ended";
 
 /**
- * One entry of the sessions service's `list` reply. Only the two fields the cue
- * needs are declared; the daemon sends more.
+ * One entry of the sessions service's `list` reply. Only the three fields the
+ * cues need are declared; the daemon sends more.
  */
 export interface SessionEntry {
   /** The Claude session id. */
@@ -36,6 +36,8 @@ export interface SessionEntry {
   cwd?: string;
   /** The session's live state. */
   state: SessionState;
+  /** The raw model id, when the daemon has learned one (#1448). */
+  model?: string;
 }
 
 /** How many sessions of each coarse kind a worktree is running. */
@@ -93,6 +95,41 @@ function bucketFor(state: SessionState): keyof SessionTally | undefined {
 }
 
 /**
+ * One letter of the `[hsof*]` model-family marker (#1448), in the fixed order
+ * the marker always renders them: h(aiku), s(onnet), o(pus), f(able), then
+ * *(anything else, including a model the daemon never learned).
+ */
+export type Family = "h" | "s" | "o" | "f" | "*";
+
+/** {@link Family} letters in the marker's fixed rendering order. */
+const FAMILY_ORDER: readonly Family[] = ["h", "s", "o", "f", "*"];
+
+/** Substring needles, checked in {@link FAMILY_ORDER} order. */
+const FAMILY_NEEDLES: readonly { family: Family; needle: string }[] = [
+  { family: "h", needle: "haiku" },
+  { family: "s", needle: "sonnet" },
+  { family: "o", needle: "opus" },
+  { family: "f", needle: "fable" },
+];
+
+/**
+ * Classifies a raw model id into its family letter: a case-insensitive
+ * substring match, so it survives a Bedrock/regional-prefixed id (e.g.
+ * `us.anthropic.claude-3-7-sonnet-...` still contains `sonnet`). An id
+ * matching no known family — including an empty string, i.e. a session whose
+ * model was never learned — classifies as `"*"`.
+ */
+export function classifyModel(model: string): Family {
+  const lower = model.toLowerCase();
+  for (const { family, needle } of FAMILY_NEEDLES) {
+    if (lower.includes(needle)) {
+      return family;
+    }
+  }
+  return "*";
+}
+
+/**
  * The longest of `paths` that contains `cwd`, or `undefined` when none does.
  *
  * Matching is on a path *boundary*, so `/w/foo` never claims a session running
@@ -143,6 +180,54 @@ export function tallyByWorktree(
   return tallies;
 }
 
+/** Per-worktree-path model-family sets, keyed like {@link SessionTallyMap}. */
+export type ModelFamilyMap = Record<string, Set<Family>>;
+
+/**
+ * Tallies which model families are in use per worktree (#1448). Uses the same
+ * inclusion rule as {@link tallyByWorktree} — any session with a live bucket
+ * (i.e. not `"ended"`) and an attributable `cwd`, idle included — so the two
+ * maps are always populated from the same session set. A worktree with no
+ * attributed sessions gets no entry, matching {@link tallyByWorktree}.
+ */
+export function tallyModelsByWorktree(
+  sessions: readonly SessionEntry[],
+  paths: readonly string[],
+): ModelFamilyMap {
+  const families: ModelFamilyMap = {};
+  for (const session of sessions) {
+    if (bucketFor(session.state) === undefined || !session.cwd) {
+      continue;
+    }
+    const worktree = containingPath(session.cwd, paths);
+    if (worktree === undefined) {
+      continue;
+    }
+    const set = families[worktree] ?? new Set<Family>();
+    set.add(classifyModel(session.model ?? ""));
+    families[worktree] = set;
+  }
+  return families;
+}
+
+/**
+ * The union of every worktree's family set among `paths` — a repo row's
+ * rollup (#1448): every worktree under that repo, unioned. Empty when none of
+ * `paths` has an entry in `families` (no session anywhere in the repo).
+ */
+export function unionModelFamilies(
+  paths: readonly string[],
+  families: ModelFamilyMap,
+): Set<Family> {
+  const union = new Set<Family>();
+  for (const path of paths) {
+    for (const family of families[path] ?? []) {
+      union.add(family);
+    }
+  }
+  return union;
+}
+
 /** How many sessions a tally counts in total. */
 export function sessionTotal(tally: SessionTally): number {
   return tally.working + tally.waiting + tally.idle;
@@ -160,6 +245,20 @@ export function sessionGlyphs(tally: SessionTally | undefined): string {
   return BY_URGENCY.filter((bucket) => tally[bucket] > 0)
     .map((bucket) => `${GLYPHS[bucket]}${tally[bucket]}`)
     .join(" ");
+}
+
+/**
+ * The `[hsof*]`-style model-family marker text (#1448): fixed letter order,
+ * only letters actually present, empty for an empty/absent set — not `"[]"` —
+ * so a worktree/repo with no sessions contributes nothing to the row
+ * description.
+ */
+export function formatModelMarker(families: ReadonlySet<Family> | undefined): string {
+  if (!families || families.size === 0) {
+    return "";
+  }
+  const letters = FAMILY_ORDER.filter((f) => families.has(f)).join("");
+  return `[${letters}]`;
 }
 
 /** The word for a bucket, used in the tooltip. */
@@ -273,5 +372,21 @@ export function sameTallies(left: SessionTallyMap, right: SessionTallyMap): bool
     return (
       b !== undefined && a.working === b.working && a.waiting === b.waiting && a.idle === b.idle
     );
+  });
+}
+
+/**
+ * Whether two model-family maps are equivalent, mirroring {@link sameTallies}
+ * so the tree provider can guard a no-op poll the same way for both.
+ */
+export function sameModelFamilies(left: ModelFamilyMap, right: ModelFamilyMap): boolean {
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) {
+    return false;
+  }
+  return keys.every((key) => {
+    const a = left[key];
+    const b = right[key];
+    return b !== undefined && a.size === b.size && [...a].every((f) => b.has(f));
   });
 }
