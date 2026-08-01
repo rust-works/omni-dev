@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 
+use crate::git::remote::RemoteInfo;
 use crate::git::worktree_batch::Selection;
 use crate::git::worktree_push;
 use crate::git::worktree_rebase;
@@ -2588,6 +2589,53 @@ fn folder_ahead_behind(folder: &Path) -> Option<(usize, usize)> {
     upstream_ahead_behind(&repo, &branch)
 }
 
+/// Commits `folder`'s checked-out branch is behind the repository's remote
+/// default branch (`origin/<main>`), computed on demand for the lazy
+/// `ahead-behind` op (#1457). Resolves the default branch the same
+/// **local-only, no-fetch** way `worktree_rebase::resolve_onto` resolves its
+/// `--onto` default — via [`RemoteInfo::detect_main_branch_local`] — but,
+/// unlike that resolver, never falls back to a hardcoded `"main"`: this is a
+/// passive signal, so an unresolvable default branch means silence (`None`)
+/// rather than a guess.
+///
+/// `None` when: `folder` is not a repo, HEAD is detached/unborn, no default
+/// branch is locally resolvable, or the branch's own upstream **is** already
+/// that default branch — in which case [`folder_ahead_behind`]'s `behind`
+/// already reports this exact divergence, so repeating it here would just
+/// duplicate the existing sync count.
+fn folder_main_behind(folder: &Path) -> Option<usize> {
+    let repo = Repository::discover(folder).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = git2::Branch::wrap(head);
+
+    let remote = "origin";
+    let default_branch = RemoteInfo::detect_main_branch_local(&repo, remote)?;
+    let onto_ref = format!("refs/remotes/{remote}/{default_branch}");
+
+    // Skip when the branch's own upstream already IS the resolved default
+    // branch (the common checked-out-main/master case) — compared by ref name
+    // so a fork's upstream on a *different* remote (e.g. `upstream/main`) is
+    // never mistaken for it.
+    if let Ok(upstream) = branch.upstream() {
+        if upstream.get().name() == Ok(onto_ref.as_str()) {
+            return None;
+        }
+    }
+
+    let head_oid = branch.get().target()?;
+    let onto_oid = repo
+        .revparse_single(&onto_ref)
+        .ok()?
+        .peel_to_commit()
+        .ok()?
+        .id();
+    let (_ahead, behind) = repo.graph_ahead_behind(head_oid, onto_oid).ok()?;
+    Some(behind)
+}
+
 /// The main repository's directory name from git's common dir. For the usual
 /// `<repo>/.git` layout — shared by a checkout and all its linked worktrees —
 /// that is the working-tree directory's name; for a bare repo (`<name>.git`) it
@@ -3090,11 +3138,31 @@ async fn tree_repos(
 
 // --- Lazy ahead/behind (#1306) -----------------------------------------------
 
+/// The wire shape of one worktree's lazily-fetched divergence: `ahead`/`behind`
+/// (from its own upstream, folded in together or not at all — they come from one
+/// `graph_ahead_behind` call) and `main_behind` (from the repo's remote default
+/// branch, #1457), each independently optional. `main_behind` can be present
+/// when `ahead`/`behind` are absent (no upstream at all) or absent when they are
+/// present (the branch's own upstream already *is* the default branch).
+#[derive(Serialize)]
+struct AheadBehindEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ahead: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_behind: Option<usize>,
+}
+
 /// Computes the ahead/behind divergence for a batch of worktree `paths` on demand,
 /// returning a JSON object keyed by the **requested** path string:
-/// `{ "<path>": { "ahead": n, "behind": m }, … }`. A path with no upstream (or that
-/// is not a repo / is detached) is **omitted** — the client renders it without a
-/// sync indicator, exactly as the tree does for an absent `ahead`/`behind`.
+/// `{ "<path>": { "ahead"?, "behind"?, "main_behind"? }, … }`. A row is **omitted**
+/// when neither the upstream divergence nor the main-branch divergence resolves
+/// (not a repo, detached/unborn HEAD) — the client renders it without a sync
+/// indicator, exactly as before #1457. A row can otherwise carry any subset of the
+/// three fields: `main_behind` alone (no upstream, but behind the default branch),
+/// `ahead`/`behind` alone (upstream *is* the default branch, so `main_behind` is
+/// skipped), or all three together.
 ///
 /// Backs the `ahead-behind` op, which exists precisely so the streamed `tree`
 /// snapshot can stay cheap: a client fetches divergence only for the worktrees it
@@ -3105,12 +3173,20 @@ async fn ahead_behind_results(paths: Vec<PathBuf>) -> Value {
     tokio::task::spawn_blocking(move || {
         let mut results = serde_json::Map::new();
         for path in paths {
-            if let Some((ahead, behind)) = folder_ahead_behind(&path) {
-                results.insert(
-                    path.display().to_string(),
-                    json!({ "ahead": ahead, "behind": behind }),
-                );
+            let (ahead, behind) =
+                folder_ahead_behind(&path).map_or((None, None), |(a, b)| (Some(a), Some(b)));
+            let main_behind = folder_main_behind(&path);
+            if ahead.is_none() && main_behind.is_none() {
+                continue;
             }
+            results.insert(
+                path.display().to_string(),
+                json!(AheadBehindEntry {
+                    ahead,
+                    behind,
+                    main_behind,
+                }),
+            );
         }
         Value::Object(results)
     })
@@ -6426,6 +6502,23 @@ mod tests {
         repo
     }
 
+    /// Builds a repo whose `main` has **no upstream configured** but is 1 commit
+    /// behind a resolvable `origin/main` — the "no own upstream, but behind the
+    /// default branch" case [`folder_main_behind`] exists for (#1457). No
+    /// `origin/HEAD` symref is set, so resolution goes through
+    /// [`RemoteInfo::detect_main_branch_local`]'s common-names fallback.
+    fn behind_main_no_upstream_repo(dir: &Path) -> Repository {
+        let repo = init_repo(dir);
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        let a_commit = repo.find_commit(a).unwrap();
+        let c = empty_commit(&repo, None, &[&a_commit], "C");
+        repo.reference("refs/remotes/origin/main", c, true, "origin main")
+            .unwrap();
+        drop(a_commit);
+        repo.set_head("refs/heads/main").unwrap();
+        repo
+    }
+
     #[test]
     fn git_status_reads_branch_and_ahead_behind() {
         let dir = tempfile::tempdir().unwrap();
@@ -6646,6 +6739,93 @@ mod tests {
         assert_eq!(folder_ahead_behind(plain.path()), None);
     }
 
+    // --- Lazy main-branch behind (#1457) ------------------------------------
+
+    #[test]
+    fn folder_main_behind_computes_divergence_and_degrades() {
+        // No own upstream, but a resolvable `origin/main` (via the common-names
+        // fallback — no `origin/HEAD` symref is set) that the branch is
+        // genuinely behind.
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = behind_main_no_upstream_repo(dir.path());
+        assert_eq!(folder_main_behind(dir.path()), Some(1));
+
+        // A detached HEAD and a plain (non-repo) directory → None.
+        let detached = tempfile::tempdir().unwrap();
+        let drepo = init_repo(detached.path());
+        let a = empty_commit(&drepo, Some("refs/heads/main"), &[], "A");
+        drepo.set_head_detached(a).unwrap();
+        assert_eq!(folder_main_behind(detached.path()), None);
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(folder_main_behind(plain.path()), None);
+    }
+
+    #[test]
+    fn folder_main_behind_skips_when_own_upstream_is_the_default_branch() {
+        // `diverging_repo` checks out `main` tracking `origin/main` itself — the
+        // common case — so even though it's genuinely 1 behind, `folder_main_behind`
+        // stays silent: `folder_ahead_behind`'s `behind` already reports this
+        // exact divergence.
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        assert_eq!(folder_main_behind(dir.path()), None);
+    }
+
+    #[test]
+    fn folder_main_behind_returns_none_without_a_resolvable_default_branch() {
+        // No `origin` remote-tracking refs at all (no symref, no common names).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        assert_eq!(folder_main_behind(dir.path()), None);
+    }
+
+    #[test]
+    fn folder_main_behind_and_folder_ahead_behind_report_independent_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let base = empty_commit(&repo, Some("refs/heads/main"), &[], "base");
+        let base_commit = repo.find_commit(base).unwrap();
+
+        // origin/main advances 3 commits past the shared base.
+        let m1 = empty_commit(&repo, None, &[&base_commit], "m1");
+        let m1_commit = repo.find_commit(m1).unwrap();
+        let m2 = empty_commit(&repo, None, &[&m1_commit], "m2");
+        let m2_commit = repo.find_commit(m2).unwrap();
+        let m3 = empty_commit(&repo, None, &[&m2_commit], "m3");
+        repo.reference("refs/remotes/origin/main", m3, true, "origin main")
+            .unwrap();
+
+        // `feature` branches off the shared base and diverges 1 ahead / 1
+        // behind its own upstream `origin/feature`.
+        let of = empty_commit(&repo, None, &[&base_commit], "origin-feature");
+        repo.reference("refs/remotes/origin/feature", of, true, "origin feature")
+            .unwrap();
+        empty_commit(
+            &repo,
+            Some("refs/heads/feature"),
+            &[&base_commit],
+            "local-feature",
+        );
+        drop(base_commit);
+        drop(m1_commit);
+        drop(m2_commit);
+
+        repo.set_head("refs/heads/feature").unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/x.git")
+            .unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.feature.remote", "origin").unwrap();
+        cfg.set_str("branch.feature.merge", "refs/heads/feature")
+            .unwrap();
+
+        assert_eq!(folder_ahead_behind(dir.path()), Some((1, 1)));
+        assert_eq!(folder_main_behind(dir.path()), Some(3));
+    }
+
     #[tokio::test]
     async fn ahead_behind_op_returns_divergence_keyed_by_path_and_omits_no_upstream() {
         let diverging = tempfile::tempdir().unwrap();
@@ -6667,15 +6847,87 @@ mod tests {
             .unwrap();
         let results = reply.get("results").unwrap();
         // The diverging worktree carries its counts, keyed by the requested path.
+        // `diverging_repo` checks out `main` tracking `origin/main` itself, so
+        // `main_behind` is skipped — `behind` already reports this divergence.
         let d = results.get(diverging_path.as_str()).unwrap();
         assert_eq!(d.get("ahead").and_then(Value::as_u64), Some(1));
         assert_eq!(d.get("behind").and_then(Value::as_u64), Some(1));
-        // The no-upstream worktree is omitted entirely, not reported as zero.
+        assert!(d.get("main_behind").is_none(), "{d:?}");
+        // The no-upstream worktree has no `origin` remote-tracking refs at all,
+        // so neither `ahead`/`behind` nor `main_behind` resolves — the row is
+        // omitted entirely, not reported as zero.
         assert!(results.get(no_up_path.as_str()).is_none(), "{results:?}");
 
         // A missing/empty `paths` list yields an empty results object, not an error.
         let empty = svc.handle("ahead-behind", json!({})).await.unwrap();
         assert_eq!(empty.get("results"), Some(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_op_includes_a_path_with_only_main_behind_and_no_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = behind_main_no_upstream_repo(dir.path());
+        let svc = WorktreesService::new();
+        let path = dir.path().display().to_string();
+        let reply = svc
+            .handle("ahead-behind", json!({ "paths": [&path] }))
+            .await
+            .unwrap();
+        let entry = reply.get("results").unwrap().get(path.as_str()).unwrap();
+        assert_eq!(entry.get("main_behind").and_then(Value::as_u64), Some(1));
+        // No own upstream at all → no `ahead`/`behind` keys, just `main_behind`.
+        assert!(entry.get("ahead").is_none(), "{entry:?}");
+        assert!(entry.get("behind").is_none(), "{entry:?}");
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_op_reports_main_behind_alongside_an_in_sync_own_upstream() {
+        // `release` stays perfectly in sync with its own upstream
+        // `origin/release`, while `origin/main` has independently advanced 2
+        // commits past their shared base — `main_behind` must still fold in
+        // even though `ahead`/`behind` are both zero.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let base = empty_commit(&repo, Some("refs/heads/main"), &[], "base");
+        let base_commit = repo.find_commit(base).unwrap();
+
+        let m1 = empty_commit(&repo, None, &[&base_commit], "m1");
+        let m1_commit = repo.find_commit(m1).unwrap();
+        let m2 = empty_commit(&repo, None, &[&m1_commit], "m2");
+        repo.reference("refs/remotes/origin/main", m2, true, "origin main")
+            .unwrap();
+
+        let r = empty_commit(
+            &repo,
+            Some("refs/heads/release"),
+            &[&base_commit],
+            "release",
+        );
+        repo.reference("refs/remotes/origin/release", r, true, "origin release")
+            .unwrap();
+        drop(base_commit);
+        drop(m1_commit);
+
+        repo.set_head("refs/heads/release").unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("remote.origin.url", "https://example.invalid/x.git")
+            .unwrap();
+        cfg.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            .unwrap();
+        cfg.set_str("branch.release.remote", "origin").unwrap();
+        cfg.set_str("branch.release.merge", "refs/heads/release")
+            .unwrap();
+
+        let svc = WorktreesService::new();
+        let path = dir.path().display().to_string();
+        let reply = svc
+            .handle("ahead-behind", json!({ "paths": [&path] }))
+            .await
+            .unwrap();
+        let entry = reply.get("results").unwrap().get(path.as_str()).unwrap();
+        assert_eq!(entry.get("ahead").and_then(Value::as_u64), Some(0));
+        assert_eq!(entry.get("behind").and_then(Value::as_u64), Some(0));
+        assert_eq!(entry.get("main_behind").and_then(Value::as_u64), Some(2));
     }
 
     #[tokio::test]
