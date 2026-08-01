@@ -1697,10 +1697,10 @@ fn worktree_paths(result: &Value) -> Vec<String> {
     paths
 }
 
-/// Folds `{ ahead, behind }` counts (keyed by worktree path) from an `ahead-behind`
-/// reply back into a `tree` reply's worktree objects. A worktree whose path is
-/// absent from `results` (no upstream) is left untouched. Pure, so the merge is
-/// unit-testable without a socket.
+/// Folds `{ ahead, behind, main_behind }` counts (keyed by worktree path) from an
+/// `ahead-behind` reply back into a `tree` reply's worktree objects. A worktree
+/// whose path is absent from `results` (neither resolves) is left untouched. Pure,
+/// so the merge is unit-testable without a socket.
 fn merge_ahead_behind(result: &mut Value, results: &serde_json::Map<String, Value>) {
     for repo in result
         .get_mut("repos")
@@ -1733,6 +1733,13 @@ fn merge_ahead_behind(result: &mut Value, results: &serde_json::Map<String, Valu
             {
                 obj.insert("ahead".to_string(), ahead);
                 obj.insert("behind".to_string(), behind);
+            }
+            // `main_behind` (#1457) folds in independently of `ahead`/`behind` —
+            // it comes from a wholly separate walk and can be present when they
+            // are absent (no upstream at all) or absent when they are present
+            // (the upstream-is-the-default-branch skip case).
+            if let Some(main_behind) = counts.get("main_behind").cloned() {
+                obj.insert("main_behind".to_string(), main_behind);
             }
         }
     }
@@ -1866,7 +1873,7 @@ fn worktree_row(worktree: &Value) -> String {
         ""
     };
     let path = sanitize(worktree.get("path").and_then(Value::as_str).unwrap_or(""));
-    format!("  {marker} {branch:<24} {sync:<9} {open:<5} {path}")
+    format!("  {marker} {branch:<24} {sync:<16} {open:<5} {path}")
 }
 
 /// The repo name to show for a window: the daemon-computed `main_repo` (which
@@ -1881,14 +1888,21 @@ fn repo_name(window: &Value) -> &str {
 }
 
 /// A compact `+ahead -behind` divergence indicator for a window, or `-` when
-/// the branch tracks no upstream (or there is no branch at all). The counts are
-/// daemon-computed integers, so no sanitizing is needed.
+/// the branch tracks no upstream (or there is no branch at all), with a trailing
+/// `main-N` fragment (#1457) when the `tree` reply carries `main_behind` — the
+/// `list` reply's eagerly-computed window objects never do (that path is out of
+/// scope for #1457), so this degrades to the pre-#1457 rendering there. The
+/// counts are daemon-computed integers, so no sanitizing is needed.
 fn sync_summary(window: &Value) -> String {
     let ahead = window.get("ahead").and_then(Value::as_u64);
     let behind = window.get("behind").and_then(Value::as_u64);
-    match (ahead, behind) {
+    let base = match (ahead, behind) {
         (Some(ahead), Some(behind)) => format!("+{ahead} -{behind}"),
         _ => "-".to_string(),
+    };
+    match window.get("main_behind").and_then(Value::as_u64) {
+        Some(main_behind) => format!("{base} main-{main_behind}"),
+        None => base,
     }
 }
 
@@ -2130,6 +2144,20 @@ mod tests {
     }
 
     #[test]
+    fn sync_summary_appends_main_behind_when_present() {
+        // `main_behind` (#1457) trails the existing summary, whether or not the
+        // branch has its own upstream.
+        assert_eq!(
+            sync_summary(&json!({ "ahead": 2, "behind": 1, "main_behind": 5 })),
+            "+2 -1 main-5"
+        );
+        assert_eq!(sync_summary(&json!({ "main_behind": 7 })), "- main-7");
+        // Absent `main_behind` (a pre-#1457 daemon, or the skip case) renders
+        // exactly as before.
+        assert_eq!(sync_summary(&json!({ "ahead": 2, "behind": 1 })), "+2 -1");
+    }
+
+    #[test]
     fn folder_summary_strips_control_bytes() {
         assert_eq!(
             folder_summary(&json!({ "folders": ["/a\x1b[2J/b"] })),
@@ -2198,6 +2226,40 @@ mod tests {
         assert!(b.get("ahead").is_none(), "{b:?}");
         assert!(b.get("behind").is_none(), "{b:?}");
         assert_eq!(sync_summary(b), "-");
+    }
+
+    #[test]
+    fn merge_ahead_behind_folds_main_behind_independently_of_ahead_behind() {
+        // `/a` carries all three fields; `/b` has no upstream at all, only
+        // `main_behind`; `/c` has `ahead`/`behind` but no `main_behind` (the
+        // branch's own upstream is the resolved default branch).
+        let mut result = json!({ "repos": [{ "worktrees": [
+            { "path": "/a", "branch": "feature" },
+            { "path": "/b", "branch": "no-upstream" },
+            { "path": "/c", "branch": "main" },
+        ]}]});
+        let results = json!({
+            "/a": { "ahead": 1, "behind": 1, "main_behind": 3 },
+            "/b": { "main_behind": 7 },
+            "/c": { "ahead": 1, "behind": 1 },
+        });
+        merge_ahead_behind(&mut result, results.as_object().unwrap());
+
+        let worktrees = result.pointer("/repos/0/worktrees").unwrap();
+        let a = &worktrees[0];
+        assert_eq!(a.get("ahead").and_then(Value::as_u64), Some(1));
+        assert_eq!(a.get("behind").and_then(Value::as_u64), Some(1));
+        assert_eq!(a.get("main_behind").and_then(Value::as_u64), Some(3));
+
+        let b = &worktrees[1];
+        assert!(b.get("ahead").is_none(), "{b:?}");
+        assert!(b.get("behind").is_none(), "{b:?}");
+        assert_eq!(b.get("main_behind").and_then(Value::as_u64), Some(7));
+
+        let c = &worktrees[2];
+        assert_eq!(c.get("ahead").and_then(Value::as_u64), Some(1));
+        assert_eq!(c.get("behind").and_then(Value::as_u64), Some(1));
+        assert!(c.get("main_behind").is_none(), "{c:?}");
     }
 
     #[test]
