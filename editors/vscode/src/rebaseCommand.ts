@@ -2,7 +2,7 @@
 // the selected worktree(s) onto their repository's remote default branch, fetching
 // it once per repo. A thin adapter — every string it shows comes from the pure,
 // unit-tested `rebaseReport.ts`, and this file only wires them onto the editor (the
-// selection filter, the confirmation, the progress notification, the toasts).
+// selection filter, the progress notification, the toasts).
 //
 // **It is a socket client like every other tree action.** #1409 shipped it as a
 // shell-out to `omni-dev worktrees rebase` in an integrated terminal, because
@@ -10,9 +10,11 @@
 // environment supposedly lacking `SSH_AUTH_SOCK`. That premise was wrong: launchd
 // exports `SSH_AUTH_SOCK` into the per-user session, so the daemon inherits the
 // user's `ssh-agent`. ADR-0059 moves the rebase into the daemon's two-phase
-// `rebase` op, which removes the terminal, gives the modal real behind-counts, and
-// — the actual motivation — lets a conflicted worktree be left mid-rebase instead
-// of thrown away by `git rebase --abort`.
+// `rebase` op, which removes the terminal and — the actual motivation — lets a
+// conflicted worktree be left mid-rebase instead of thrown away by
+// `git rebase --abort`. ADR-0062 later drops the confirmation modal ADR-0059
+// added: rebase is local and reflog-recoverable regardless of whether the user
+// confirms first, unlike `close`'s irreversible deletion.
 //
 // The daemon is therefore required, as it is for close / merge-queue / reposition.
 // `omni-dev worktrees rebase` keeps its own local engine for when there is none.
@@ -23,14 +25,7 @@
 
 import * as vscode from "vscode";
 
-import {
-  confirmDetail,
-  confirmTitle,
-  nothingToRebaseMessage,
-  pendingOutcomes,
-  skippedOutcomes,
-  summarize,
-} from "./rebaseReport";
+import { nothingToRebaseMessage, pendingOutcomes, summarize } from "./rebaseReport";
 import { Envelope, RebaseReply, Reply, rebaseCheckEnvelope, rebaseEnvelope } from "./socket";
 import { Node, selectionTargets, worktreeLabel, worktreeTargets } from "./tree";
 
@@ -64,9 +59,12 @@ export interface RebaseDeps {
  * the daemon and classified there — up-to-date, would-rebase, dirty, etc. — same
  * as a linked worktree, with no client-side pre-filter dropping it from the batch.
  *
- * Two-phase like "Add to Merge Queue": phase 1 fetches and classifies (side-effect
- * free apart from advancing a remote-tracking ref), the modal confirms against
- * *that* result, and phase 2 re-plans from scratch before rewriting anything.
+ * Two-phase like "Add to Merge Queue": phase 1 fetches and classifies
+ * (side-effect free apart from advancing a remote-tracking ref) and short-circuits
+ * on a daemon error or nothing-to-do, then phase 2 re-plans from scratch before
+ * rewriting anything — with no confirmation gate in between (ADR-0062): every
+ * outcome a rebase can produce is equally reflog-recoverable, so there is nothing
+ * for a modal to distinguish.
  */
 export async function rebaseOnMain(
   deps: RebaseDeps,
@@ -112,11 +110,8 @@ export async function rebaseOnMain(
         );
         return;
       }
-      if (!(await confirmRebase(pending, skippedOutcomes(report), targets.length))) {
-        return;
-      }
-
-      // Phase 2: execute. The daemon re-plans before rewriting anything.
+      // Phase 2: execute. No confirmation gate (ADR-0062) — the daemon re-plans
+      // before rewriting anything, and every outcome is reflog-recoverable.
       progress.report({ message: `Rebasing ${pending.length}…` });
       const exec = await deps.send(
         rebaseEnvelope(paths, deps.windowKey),
@@ -135,31 +130,6 @@ export async function rebaseOnMain(
       reportSummary(exec.payload as RebaseReply);
     },
   );
-}
-
-/**
- * The rebase confirmation. **Always** shown, even for a single row: a rebase
- * rewrites branch history, and a batch is one gesture over N branches — the modal is
- * the only place the user sees the full set (ADR-0049 §1's rule, as applied by
- * "Add to Merge Queue").
- *
- * Unlike #1409's version this lists each branch's **behind-count**, because phase 1
- * has just measured it against the freshly fetched rebase target. The old modal
- * omitted counts on purpose: the only number it had was the tree's `behind`, which
- * measures divergence from the branch's *upstream* and would have been wrong here.
- */
-async function confirmRebase(
-  pending: ReturnType<typeof pendingOutcomes>,
-  skipped: ReturnType<typeof skippedOutcomes>,
-  total: number,
-): Promise<boolean> {
-  const detail = confirmDetail(pending, skipped);
-  const choice = await vscode.window.showWarningMessage(
-    confirmTitle(pending, total),
-    { modal: true, detail },
-    "Rebase",
-  );
-  return choice === "Rebase";
 }
 
 /**
