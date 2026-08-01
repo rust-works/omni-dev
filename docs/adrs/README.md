@@ -86,3 +86,4 @@ by Michael Nygard.
 | [ADR-0060](adr-0060.md)  | ✅ Accepted                              | 2026-07-28 | The Main Working Tree Is a Valid Batch-Rebase Target                                        |
 | [ADR-0061](adr-0061.md)  | ✅ Accepted                              | 2026-07-30 | Daemon-Hosted Force-Push With a Lease                                                       |
 | [ADR-0062](adr-0062.md)  | ✅ Accepted                              | 2026-08-01 | Drop the VS Code Rebase Confirmation Modal                                                  |
+| [ADR-0063](adr-0063.md)  | 🟡 Proposed                              | 2026-08-01 | OAuth2 Authorization-Code + PKCE for Gmail, with Bring-Your-Own Google Cloud Project        |
