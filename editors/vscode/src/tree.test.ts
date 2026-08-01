@@ -269,6 +269,22 @@ test("withAheadBehind folds lazily-fetched counts in, and no-ops when absent", (
   assert.equal(worktreeDescription(withAheadBehind(base, { ahead: 4 })), "↑4");
 });
 
+test("withAheadBehind folds main_behind in independently of ahead/behind (#1457)", () => {
+  const base: TreeWorktreePayload = { path: "/x", branch: "feature", is_main: false, open: false };
+  // A one-sided `main_behind` (no own upstream at all) renders alone.
+  assert.equal(worktreeDescription(withAheadBehind(base, { main_behind: 3 })), "⇊3");
+  // Combined with ahead/behind, it trails them in order.
+  assert.equal(
+    worktreeDescription(withAheadBehind(base, { ahead: 1, behind: 2, main_behind: 4 })),
+    "↑1 ↓2 ⇊4",
+  );
+  // `main_behind` alone still counts as a resolvable entry — the guard must not
+  // short-circuit before checking it.
+  assert.notEqual(withAheadBehind(base, { main_behind: 1 }), base);
+  // All three absent still no-ops, same as the all-absent case above.
+  assert.equal(withAheadBehind(base, {}), base);
+});
+
 test("isCurrentWindow matches only the open worktree whose key is this window's", () => {
   // Open here: the open worktree's key equals this window's key.
   assert.equal(isCurrentWindow(REPOS[0].worktrees[0], "w1"), true);
@@ -487,6 +503,19 @@ test("worktreeTooltip adds a PR line only when a PR is resolved", () => {
 
   // No PR → no PR line at all.
   assert.doesNotMatch(worktreeTooltip(REPOS[0].worktrees[0], REPOS[0]), /PR #/);
+});
+
+test("worktreeTooltip adds a behind-main line only when main_behind is present (#1457)", () => {
+  const behind = worktreeTooltip({ ...REPOS[0].worktrees[0], main_behind: 3 }, REPOS[0]);
+  assert.match(behind, /3 commits behind origin\/main — right-click → Rebase on main/);
+
+  // Singular wording for exactly one commit.
+  const singular = worktreeTooltip({ ...REPOS[0].worktrees[0], main_behind: 1 }, REPOS[0]);
+  assert.match(singular, /1 commit behind origin\/main/);
+  assert.doesNotMatch(singular, /1 commits/);
+
+  // Absent `main_behind` → no such line at all.
+  assert.doesNotMatch(worktreeTooltip(REPOS[0].worktrees[0], REPOS[0]), /behind origin\/main/);
 });
 
 test("worktreeTooltip adds a Claude line only when sessions are running (#1406)", () => {
