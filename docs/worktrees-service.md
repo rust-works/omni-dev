@@ -150,7 +150,11 @@ the (cheap) `tree` payload — `worktrees tree` fetches it on demand via the
 `ahead-behind` op and folds it in (#1306), for both the table and `-o json`; so
 `-o json` is the `tree` payload described under
 [the contract](#companion-contract-for-the-extension-and-other-clients) with
-`ahead`/`behind` merged back onto each worktree.
+`ahead`/`behind` merged back onto each worktree. When the branch is genuinely
+behind the repository's remote default branch (#1457), the sync state gets a
+trailing `main-N` fragment — e.g. `+1 -3 main-12` — the CLI counterpart of the
+tree view's `⇊N` glyph, folded in from the same `ahead-behind` reply's
+`main_behind` field and independent of `+ahead -behind`.
 
 `worktrees focus` raises the VS Code window for a worktree folder from the CLI —
 the same capability as the tray's per-window focus action, now reachable on
@@ -461,7 +465,16 @@ file decoration, not description text), which also tints that row's branch label
   changes the colour only, never which glyph is shown. The
   `↑ahead ↓behind` counts are **not** in the streamed snapshot — the extension
   fetches them **lazily when a repo is expanded** via the `ahead-behind` op (#1306),
-  so only the worktrees you actually look at pay the divergence walk.
+  so only the worktrees you actually look at pay the divergence walk. A third,
+  independent glyph — `⇊N` — reports commits behind the repository's **remote
+  default branch** (typically `origin/main`), distinct from `↓`'s divergence
+  from the branch's *own* upstream (#1457): a feature branch can be fully in
+  sync with its own upstream while sitting well behind `origin/main`, and
+  `⇊N` is the only passive, at-rest signal of that. It rides the same
+  `ahead-behind` op (no extra round trip), computed with no `git fetch` — the
+  same staleness contract the `↑`/`↓` counts already have — and is omitted
+  when the branch's own upstream *is* already the resolved default branch (the
+  common checked-out-`main` case), since `↓` already reports that divergence.
 - **Double-click to focus/open.** Because the VS Code TreeView API has **no** native
   double-click event (a single click only selects), the companion implements it with
   a manual click-timer: a second click on the same worktree within ~400 ms sends the
@@ -871,6 +884,13 @@ version paused between the phases with a modal listing every branch about to be
 rewritten; #1458 removed it, since every outcome a rebase can produce — a clean
 fast-forward or one left mid-rebase with a conflict — is equally reflog-recoverable,
 so a gate had nothing left to distinguish.
+
+**Where the behind-count went.** #1409's since-removed modal deliberately showed no
+numbers, because the only one it had was the tree's `behind` — divergence from the
+branch's *upstream*, not from the rebase target — which would have been quietly
+wrong. #1457 closes that gap at rest, with no modal needed to show it: the tree
+row's `⇊N` glyph (see [Tree view](#tree-view-companion-ui)) passively surfaces the
+real rebase-target divergence, with no rebase — or even a fetch — required.
 
 1. **Check.** A progress notification while the daemon fetches each selected
    repository's target ref once and classifies every worktree. Nothing is
@@ -1327,6 +1347,17 @@ extension never runs git.
   once for the whole tree). The bounded, non-streamed surfaces — `list`/`status`
   (the primary folder of each open window) and the tray `menu` (open windows only)
   — still compute `ahead`/`behind` inline, since the walk cost there is negligible.
+- **`main_behind` rides the same lazy op (#1457).** `folder_main_behind`
+  resolves the repository's remote default branch the same **local-only,
+  no-fetch** way `worktrees rebase`'s `--onto` default does
+  (`RemoteInfo::detect_main_branch_local`), then reuses the same
+  `graph_ahead_behind` walk against `origin/<default>` instead of the branch's
+  own upstream. It folds into the `ahead-behind` op's per-path result as an
+  independently-optional third field, and is omitted whenever the branch's own
+  upstream *is* already that default branch (the common checked-out-`main`
+  case) — reporting it there too would just duplicate `behind`. Unlike
+  `ahead`/`behind`, it can be present for a branch with **no upstream at all**,
+  since that is exactly the case it exists to surface.
 - **`list` enriches the primary folder; `tree` enriches every worktree.** For a
   window entry (`list`/`status`), only the first workspace folder is enriched — it
   is the one the table shows and the "Focus" action opens. For the `tree` view the
@@ -1339,9 +1370,14 @@ extension never runs git.
   cannot supply (no `branch`, or `branch` with no `ahead`/`behind`). The
   `main_repo` name and `is_worktree` flag are resolved from the repository itself,
   so they are present even for an unborn or detached HEAD (only a non-repo folder
-  omits them). The `ahead-behind` op degrades the same way: a path with no upstream
-  is simply omitted from its `results`. A branch with no upstream likewise has no
-  `upstream_sha`, so it renders with no sync indicator at all. The enrichment never
+  omits them). The `ahead-behind` op degrades the same way, but since #1457 "no
+  upstream" no longer implies "omitted from `results`": a path is included
+  whenever *either* `ahead`/`behind` or `main_behind` resolves, so a branch with
+  no upstream at all but a resolvable, genuinely-behind default branch still gets
+  a row (`main_behind` alone). Only a path where **neither** resolves — not a
+  repo, or a detached/unborn HEAD — is omitted entirely. A branch with no
+  upstream likewise has no `upstream_sha`, so its own-upstream sync indicator
+  stays absent even though `main_behind` may still show. The enrichment never
   fails a `list`.
 - **The lazy counts still refresh themselves (#1344).** Fetching divergence on demand
   means it refreshes only when a client re-renders, and a client re-renders only on a
@@ -1404,7 +1440,9 @@ same owner from those open folders. `subscribe` streams exactly that same snapsh
 on a schedule; a subscriber learns nothing a repeated `tree` poll would not.
 `ahead-behind` only computes local commit-graph divergence for paths the caller
 supplies (in practice the same worktrees `tree` already returned), so it reveals
-nothing the owner could not read from those repos directly. The stream is bounded and self-limiting:
+nothing the owner could not read from those repos directly — `main_behind`
+(#1457) is the same local commit-graph walk against a different target ref and
+adds nothing new. The stream is bounded and self-limiting:
 it lives on one `0600` connection, coalesces bursts, diffs to suppress duplicate
 frames, and is torn down on client disconnect, an explicit cancel line, or daemon
 shutdown.
@@ -1535,26 +1573,26 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op                | payload                                        | success payload                            |
-|-------------------|------------------------------------------------|--------------------------------------------|
-| `register`        | `{ key, folders[], repo?, title?, pid? }`      | `{ ok: true }`                             |
-| `heartbeat`       | `{ key }`                                      | `{ known: <bool>, close?: true, reload?: true }` |
-| `unregister`      | `{ key }`                                      | `{ removed: <bool> }`                      |
-| `list`            | `null`                                         | `{ windows: [entry, …] }`                  |
-| `tree`            | `null`                                         | `{ repos: [repo, …], show_closed }`        |
-| `ahead-behind`    | `{ paths: [path, …] }`                         | `{ results: { "<path>": { ahead, behind } } }` |
-| `open`            | `{ path }`                                     | `{ ok: true }`                             |
-| `open-prs`        | `{ owner, name }`                              | `{ pull_requests: [pr, …] }`               |
-| `close`           | `{ path, remove, requester_key?, confirmed? }` | *(safety report, or `{ removed/closed }`)* |
-| `reload`          | `{ target_keys[] }`                            | `{ requested, signalled, unknown[] }`      |
-| `merge-queue`     | `{ paths[], check?, confirmed? }`              | *(eligibility report, or enqueue result)*  |
-| `rebase`          | `{ paths[], check?, confirmed?, keep_conflicts?, autostash?, onto? }` | `{ fetches[], worktrees[] }` *(plan, or result)* |
-| `push`            | `{ paths[], check?, confirmed?, requester_key? }` | `{ worktrees[] }` *(plan, or result)*      |
-| `reposition`      | `{ reference_key, target_keys[], check? }`     | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
-| `reposition-undo` | `null`                                         | *(same shape, without `reference`)*        |
-| `set-show-closed` | `{ show_closed }`                              | `{ ok: true }`                             |
-| `set-polling`     | `{ owner, name, enabled }`                     | `{ ok: true }`                             |
-| `subscribe`       | `null`                                         | *(stream — see below)*                     |
+| op                | payload                                                               | success payload                                                           |
+|-------------------|------------------------------------------------------------------------|----------------------------------------------------------------------------|
+| `register`        | `{ key, folders[], repo?, title?, pid? }`                             | `{ ok: true }`                                                            |
+| `heartbeat`       | `{ key }`                                                             | `{ known: <bool>, close?: true, reload?: true }`                          |
+| `unregister`      | `{ key }`                                                             | `{ removed: <bool> }`                                                     |
+| `list`            | `null`                                                                | `{ windows: [entry, …] }`                                                 |
+| `tree`            | `null`                                                                | `{ repos: [repo, …], show_closed }`                                       |
+| `ahead-behind`    | `{ paths: [path, …] }`                                                | `{ results: { "<path>": { ahead?, behind?, main_behind? } } }`            |
+| `open`            | `{ path }`                                                            | `{ ok: true }`                                                            |
+| `open-prs`        | `{ owner, name }`                                                     | `{ pull_requests: [pr, …] }`                                              |
+| `close`           | `{ path, remove, requester_key?, confirmed? }`                        | *(safety report, or `{ removed/closed }`)*                                |
+| `reload`          | `{ target_keys[] }`                                                   | `{ requested, signalled, unknown[] }`                                     |
+| `merge-queue`     | `{ paths[], check?, confirmed? }`                                     | *(eligibility report, or enqueue result)*                                 |
+| `rebase`          | `{ paths[], check?, confirmed?, keep_conflicts?, autostash?, onto? }` | `{ fetches[], worktrees[] }` *(plan, or result)*                          |
+| `push`            | `{ paths[], check?, confirmed?, requester_key? }`                     | `{ worktrees[] }` *(plan, or result)*                                     |
+| `reposition`      | `{ reference_key, target_keys[], check? }`                            | `{ trusted, reference?, blocked?, results[], moved, skipped, undoable? }` |
+| `reposition-undo` | `null`                                                                | *(same shape, without `reference`)*                                       |
+| `set-show-closed` | `{ show_closed }`                                                     | `{ ok: true }`                                                            |
+| `set-polling`     | `{ owner, name, enabled }`                                            | `{ ok: true }`                                                            |
+| `subscribe`       | `null`                                                                | *(stream — see below)*                                                    |
 
 `open-prs` (#1389, fix 7) serves "Open Pull Request…" from the daemon: it returns a
 repo's open PRs (`number, title, url, headRefName, baseRefName, isDraft, state,
@@ -1709,15 +1747,23 @@ Where:
   nothing for `operation` to report and this flag is the whole cue. A *completed*
   push is instead observable as `upstream_sha` moving, which is exactly why that
   field rides the snapshot.
-- `ahead-behind` (#1306) — the **lazy** per-worktree divergence op. Given
-  `{ paths: [<worktree path>, …] }`, it returns
-  `{ results: { "<path>": { ahead, behind } } }`, keyed by the requested path. A
-  path that is not a repo, is on a detached/unborn HEAD, or tracks no upstream is
-  **omitted** from `results` (the client renders it with no sync indicator). It
-  exists so the streamed `tree`/`subscribe` snapshot can stay cheap: a client
-  fetches divergence only for the worktrees it shows (the extension when a repo is
-  expanded; `worktrees tree` once for the whole tree), rather than the daemon
-  walking every worktree's commit graph on every tick.
+- `ahead-behind` (#1306, extended #1457) — the **lazy** per-worktree divergence
+  op. Given `{ paths: [<worktree path>, …] }`, it returns
+  `{ results: { "<path>": { ahead?, behind?, main_behind? } } }`, keyed by the
+  requested path. `ahead`/`behind` (a branch's divergence from its own upstream)
+  fold in together or not at all; `main_behind` (its divergence from the
+  repository's remote default branch, resolved the same local-only way
+  `worktrees rebase`'s `--onto` default is) is **independently optional** — it
+  can be present when `ahead`/`behind` are absent (no upstream at all, but
+  behind the default branch) or absent when they are present (the branch's own
+  upstream *is* already the default branch, so it would just duplicate
+  `behind`). A path is **omitted** from `results` entirely only when *neither*
+  side resolves (not a repo, or a detached/unborn HEAD) — the client renders it
+  with no sync indicator. It exists so the streamed `tree`/`subscribe` snapshot
+  can stay cheap: a client fetches divergence only for the worktrees it shows
+  (the extension when a repo is expanded; `worktrees tree` once for the whole
+  tree), rather than the daemon walking every worktree's commit graph on every
+  tick.
 - `subscribe` streams the `tree` payload live; see
   [Push subscription](#push-subscription) for the framing, coalescing, and
   teardown semantics.
@@ -1809,13 +1855,17 @@ Example exchange:
 → {"service":"worktrees","op":"tree"}
 ← {"ok":true,"payload":{"repos":[{"main_repo":"omni-dev","github":{"owner":"rust-works","name":"omni-dev"},"root":"/home/me/omni-dev","worktrees":[{"path":"/home/me/omni-dev","branch":"main","head_sha":"64ca4a88…","upstream_sha":"64ca4a88…","is_main":true,"open":true,"window_key":"3f1c…","pr_none":true},{"path":"/home/me/wt/issue-1300","branch":"issue-1300","head_sha":"9b2e77a1…","upstream_sha":"c05d1f3b…","is_main":false,"open":false,"pr":{"number":1300,"isDraft":false,"checks":"pending","url":"https://github.com/rust-works/omni-dev/pull/1300"}}]}],"show_closed":true}}
 → {"service":"worktrees","op":"ahead-behind","payload":{"paths":["/home/me/omni-dev","/home/me/wt/issue-1300"]}}
-← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3}}}}
+← {"ok":true,"payload":{"results":{"/home/me/omni-dev":{"ahead":2,"behind":0},"/home/me/wt/issue-1300":{"ahead":1,"behind":3,"main_behind":12}}}}
 ```
 
 The `tree` snapshot carries `branch` but not `ahead`/`behind` — those are the
 expensive part, fetched on demand via the `ahead-behind` op (#1306). The companion
 sends no `branch`/`ahead`/`behind` on `register`; the daemon derives `branch` (and,
-for `list`/`status`, `ahead`/`behind`) on read.
+for `list`/`status`, `ahead`/`behind`) on read. `issue-1300`'s own upstream
+(`origin/issue-1300`) is distinct from the repo's resolved default branch, so it
+also carries `main_behind` (#1457); `main`'s own upstream *is* `origin/main`
+itself, so its entry omits the field — `behind: 0` already reports that
+divergence.
 
 ### Push subscription
 
@@ -1903,3 +1953,10 @@ classic one-reply exchange. See [ADR-0048](adrs/adr-0048.md) for the design.
   defers to the GitHub Pull Requests extension. A daemon-side, cross-window PR
   cache was considered and rejected: it would put a GitHub token in the daemon,
   breaking its no-secret posture.
+- **`main_behind` is scoped to the lazy `ahead-behind` op (#1457):** both its
+  consumers — the tree view's `⇊N` glyph and `worktrees tree`'s `main-N` — get
+  it. Wiring it into `list`/`status`/the tray menu (which eagerly compute the
+  full `GitStatus` today) is a deliberate follow-up: the walk is cheap and
+  local, but those surfaces enrich only the primary folder of each *open*
+  window, and keeping this iteration scoped to the tree/`tree` kept it
+  reviewable.
