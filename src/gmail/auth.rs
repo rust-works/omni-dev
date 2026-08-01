@@ -729,7 +729,11 @@ pub(crate) async fn login_to(
     let (Some(code), Some(returned_state)) = (callback.code, callback.state) else {
         return Err(GmailError::MalformedCallback.into());
     };
-    if !crate::browser::auth::constant_time_eq(&returned_state, &pending.state) {
+    // Plain equality, not constant-time: `state` is a CSRF nonce carried in
+    // a browser-visible URL, not a secret — there's nothing for a timing
+    // side-channel to extract here (unlike `constant_time_eq`'s real use
+    // guarding a bridge auth token in `src/browser/auth.rs`).
+    if returned_state != pending.state {
         return Err(GmailError::StateMismatch.into());
     }
 

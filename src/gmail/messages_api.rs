@@ -9,6 +9,7 @@
 //! `src/datadog/monitors_api.rs` instead.
 
 use anyhow::Result;
+use futures::stream::StreamExt as _;
 use serde::Serialize;
 use url::Url;
 
@@ -201,29 +202,46 @@ impl<'a> MessagesApi<'a> {
     ///
     /// Gmail's list endpoint only returns `{id, threadId}` per hit — a
     /// `search`-shaped CLI/MCP surface needs more than bare ids to be
-    /// useful, so this costs one extra request per result (sequential, not
-    /// concurrent, to stay within Gmail's per-user quota without adding a
-    /// separate throttling layer — see the shared `retry_429`/403 gap noted
-    /// in issue #1465).
+    /// useful, so this costs one extra request per result. Gmail's quota is
+    /// **250 units/user/second** and `messages.get` costs **5 units**, so
+    /// this is a genuinely expensive operation — callers are expected to
+    /// treat it as opt-in (the CLI's `--enrich` flag) rather than a default,
+    /// and `concurrency` bounds the fan-out (modelled on
+    /// `src/cli/atlassian/confluence/download.rs`'s
+    /// `Semaphore::new(params.concurrency)` list-then-hydrate shape) so a
+    /// large `limit` can't burst past the quota in an uncontrolled way.
+    /// Order is preserved (`buffered`, not `buffer_unordered`) so results
+    /// match `search_all`'s ordering. A hydration failure on any one id
+    /// aborts the whole call with that error, once every already-in-flight
+    /// fetch in its concurrency batch completes — it is never silently
+    /// dropped from the results.
     pub async fn search_summaries(
         &self,
         query: Option<&str>,
         label_ids: &[&str],
         limit: usize,
+        concurrency: usize,
     ) -> Result<Vec<MessageSummary>> {
         let list = self.search_all(query, label_ids, limit).await?;
-        let mut summaries = Vec::with_capacity(list.messages.len());
-        for message_ref in &list.messages {
-            let message = self
-                .get(
-                    &message_ref.id,
-                    MessageFormat::Metadata,
-                    &["From", "Subject", "Date"],
-                )
-                .await?;
-            summaries.push(MessageSummary::from_message(&message));
-        }
-        Ok(summaries)
+        let concurrency = concurrency.max(1);
+        // Collect owned ids first: a closure borrowing `list.messages`
+        // directly ties its returned future to that borrow's lifetime,
+        // which `buffered` then can't unify into a `for<'a> FnMut(&'a _)`
+        // shape — this is what the `implementation of FnOnce is not
+        // general enough` error was pointing at.
+        let ids: Vec<String> = list.messages.into_iter().map(|m| m.id).collect();
+        futures::stream::iter(ids)
+            .map(|id| async move {
+                let message = self
+                    .get(&id, MessageFormat::Metadata, &["From", "Subject", "Date"])
+                    .await?;
+                Ok::<_, anyhow::Error>(MessageSummary::from_message(&message))
+            })
+            .buffered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Adds/removes labels on up to 1000 messages in one call.
@@ -797,7 +815,7 @@ mod tests {
             .await;
 
         let summaries = MessagesApi::new(&client)
-            .search_summaries(None, &[], 10)
+            .search_summaries(None, &[], 10, 4)
             .await
             .unwrap();
         assert_eq!(summaries.len(), 1);
@@ -806,6 +824,69 @@ mod tests {
         assert_eq!(summaries[0].from, "a@example.com");
         assert_eq!(summaries[0].subject, "Hello");
         assert_eq!(summaries[0].snippet, "Hi there");
+    }
+
+    #[tokio::test]
+    async fn search_summaries_preserves_original_order_under_concurrency() {
+        // `buffered` (not `buffer_unordered`) is load-bearing here: with
+        // concurrency > 1, an unordered combinator could return hydrated
+        // results in completion order rather than search order.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(page_body(&["m1", "m2", "m3"], None)),
+            )
+            .mount(&server)
+            .await;
+        for id in ["m1", "m2", "m3"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/gmail/v1/users/me/messages/{id}"
+                )))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id": id})),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let summaries = MessagesApi::new(&client)
+            .search_summaries(None, &[], 10, 4)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn search_summaries_clamps_zero_concurrency_to_one() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(page_body(&["m1"], None)),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        // concurrency = 0 must not panic or deadlock; it's clamped to 1.
+        let summaries = MessagesApi::new(&client)
+            .search_summaries(None, &[], 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
     }
 
     #[tokio::test]
@@ -826,7 +907,7 @@ mod tests {
             .await;
 
         let err = MessagesApi::new(&client)
-            .search_summaries(None, &[], 10)
+            .search_summaries(None, &[], 10, 4)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
