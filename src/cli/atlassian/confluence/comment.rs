@@ -14,9 +14,9 @@ use crate::atlassian::document::JfmDocument;
 use crate::atlassian::inline_comment::{
     audit_inline_comments, reanchor_inline_comment, CommentDrift, DriftStatus,
 };
-use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
+use crate::cli::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 
 /// Manages comments on a Confluence page.
 #[derive(Parser)]

@@ -47,6 +47,63 @@ impl MessageFormat {
     }
 }
 
+/// A search hit enriched with the headers a search-result table/list needs.
+///
+/// Not a Gmail wire type — `messages.list` only returns `{id, threadId}`;
+/// this is assembled client-side by [`MessagesApi::search_summaries`] from a
+/// follow-up `messages.get(format=metadata)` call per hit.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct MessageSummary {
+    /// Gmail message id.
+    pub id: String,
+    /// Id of the thread this message belongs to.
+    pub thread_id: String,
+    /// The `From` header, or empty if absent.
+    pub from: String,
+    /// The `Subject` header, or empty if absent.
+    pub subject: String,
+    /// The `Date` header, or empty if absent.
+    pub date: String,
+    /// A short, plain-text snippet of the message body.
+    pub snippet: String,
+}
+
+impl MessageSummary {
+    /// Builds a summary row from an already-fetched [`Message`] — the seam
+    /// `omni-dev gmail thread` reuses to render its per-message rows with
+    /// the same table renderer `search` uses, without a second API call.
+    #[must_use]
+    pub fn from_message(message: &Message) -> Self {
+        Self {
+            id: message.id.clone(),
+            thread_id: message.thread_id.clone().unwrap_or_default(),
+            from: header_value(message.payload.as_ref(), "From").unwrap_or_default(),
+            subject: header_value(message.payload.as_ref(), "Subject").unwrap_or_default(),
+            date: header_value(message.payload.as_ref(), "Date").unwrap_or_default(),
+            snippet: message.snippet.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// Looks up a header's value from a message's raw `payload.headers` array
+/// (`[{"name": "...", "value": "..."}]`), matching `name` case-insensitively
+/// — Gmail's `metadataHeaders` filter matches case-insensitively too.
+fn header_value(payload: Option<&serde_json::Value>, name: &str) -> Option<String> {
+    payload?
+        .get("headers")?
+        .as_array()?
+        .iter()
+        .find(|header| {
+            header
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .and_then(|header| header.get("value"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Messages API façade.
 #[derive(Debug)]
 pub struct MessagesApi<'a> {
@@ -137,6 +194,36 @@ impl<'a> MessagesApi<'a> {
         self.client
             .get_parsed(url.as_str(), "Failed to parse messages.get response")
             .await
+    }
+
+    /// Searches messages and enriches each hit with `From`/`Subject`/`Date`
+    /// via one `messages.get(format=metadata)` call per hit.
+    ///
+    /// Gmail's list endpoint only returns `{id, threadId}` per hit — a
+    /// `search`-shaped CLI/MCP surface needs more than bare ids to be
+    /// useful, so this costs one extra request per result (sequential, not
+    /// concurrent, to stay within Gmail's per-user quota without adding a
+    /// separate throttling layer — see the shared `retry_429`/403 gap noted
+    /// in issue #1465).
+    pub async fn search_summaries(
+        &self,
+        query: Option<&str>,
+        label_ids: &[&str],
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>> {
+        let list = self.search_all(query, label_ids, limit).await?;
+        let mut summaries = Vec::with_capacity(list.messages.len());
+        for message_ref in &list.messages {
+            let message = self
+                .get(
+                    &message_ref.id,
+                    MessageFormat::Metadata,
+                    &["From", "Subject", "Date"],
+                )
+                .await?;
+            summaries.push(MessageSummary::from_message(&message));
+        }
+        Ok(summaries)
     }
 
     /// Adds/removes labels on up to 1000 messages in one call.
@@ -654,6 +741,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(message.payload, Some(payload));
+    }
+
+    // ── search_summaries / header_value ─────────────────────────────
+
+    #[test]
+    fn header_value_matches_case_insensitively() {
+        let payload = serde_json::json!({
+            "headers": [{"name": "subject", "value": "Hello"}],
+        });
+        assert_eq!(
+            header_value(Some(&payload), "Subject").as_deref(),
+            Some("Hello")
+        );
+    }
+
+    #[test]
+    fn header_value_is_none_when_absent() {
+        let payload = serde_json::json!({"headers": []});
+        assert_eq!(header_value(Some(&payload), "From"), None);
+        assert_eq!(header_value(None, "From"), None);
+    }
+
+    #[tokio::test]
+    async fn search_summaries_enriches_each_hit_with_headers_and_snippet() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(page_body(&["m1"], None)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "metadata"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "thread-1",
+                    "snippet": "Hi there",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "a@example.com"},
+                            {"name": "Subject", "value": "Hello"},
+                            {"name": "Date", "value": "Mon, 1 Jan 2026 00:00:00 +0000"},
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let summaries = MessagesApi::new(&client)
+            .search_summaries(None, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "m1");
+        assert_eq!(summaries[0].thread_id, "thread-1");
+        assert_eq!(summaries[0].from, "a@example.com");
+        assert_eq!(summaries[0].subject, "Hello");
+        assert_eq!(summaries[0].snippet, "Hi there");
+    }
+
+    #[tokio::test]
+    async fn search_summaries_propagates_get_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(page_body(&["m1"], None)),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let err = MessagesApi::new(&client)
+            .search_summaries(None, &[], 10)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
     }
 
     // ── batch_modify ──────────────────────────────────────────────────

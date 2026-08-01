@@ -14,7 +14,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::format::{write_items_jsonl, write_scalar_jsonl, JsonlSerialize};
+use crate::cli::gmail::format::{write_items_jsonl, write_scalar_jsonl, JsonlSerialize};
 
 /// A bare `(id, threadId)` pair, as returned by `messages.list` without
 /// fetching each message's full content.

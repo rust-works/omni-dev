@@ -17,6 +17,7 @@ Commands:
   browser      Browser bridge: drive authenticated requests through a browser tab
   daemon       Daemon: host long-lived services (e.g. the browser bridge)
   datadog      Datadog: read-only API operations
+  gmail        Gmail: search, read, and label messages via OAuth2
   snowflake    Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
   worktrees    Worktrees: list the repos/worktrees open across all VS Code windows
   sessions     Sessions: track Claude Code sessions running across all terminals and windows
@@ -4095,6 +4096,195 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail - Gmail: search, read, and label messages via OAuth2
+
+Gmail: search, read, and label messages via OAuth2
+
+Usage: gmail <COMMAND>
+
+Commands:
+  auth    Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
+  search  Searches Gmail messages (mirrors the `gmail_search` MCP tool)
+  read    Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
+  thread  Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
+  label   Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail auth - Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
+
+Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
+
+Usage: auth <COMMAND>
+
+Commands:
+  login   Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only — login has no MCP equivalent
+  logout  Removes the stored Gmail refresh token from settings.json
+  status  Shows the current authentication status (mirrors the `gmail_auth_status` MCP tool)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail auth login - Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only — login has no MCP equivalent
+
+Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only — login has no MCP equivalent
+
+Usage: login [OPTIONS]
+
+Options:
+      --modify  Request the `gmail.modify` scope (needed for `label add`/`remove`) in addition to `gmail.readonly`. Without this flag, only read access is granted
+  -h, --help    Print help
+
+
+================================================================================
+
+omni-dev gmail auth logout - Removes the stored Gmail refresh token from settings.json
+
+Removes the stored Gmail refresh token from settings.json
+
+Usage: logout
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail auth status - Shows the current authentication status (mirrors the `gmail_auth_status` MCP tool)
+
+Shows the current authentication status (mirrors the `gmail_auth_status` MCP tool)
+
+Usage: status
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail label - Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+
+Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+
+Usage: label <COMMAND>
+
+Commands:
+  list    Lists Gmail labels (mirrors the `gmail_label_list` MCP tool)
+  add     Adds a label to one or more messages (`gmail.modify` scope required)
+  remove  Removes a label from one or more messages (`gmail.modify` scope required)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail label add - Adds a label to one or more messages (`gmail.modify` scope required)
+
+Adds a label to one or more messages (`gmail.modify` scope required)
+
+Usage: add --label <LABEL> <MESSAGE_IDS>...
+
+Arguments:
+  <MESSAGE_IDS>...  Gmail message ids to add the label to
+
+Options:
+      --label <LABEL>  Label id to add (see `gmail label list` for ids)
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev gmail label list - Lists Gmail labels (mirrors the `gmail_label_list` MCP tool)
+
+Lists Gmail labels (mirrors the `gmail_label_list` MCP tool)
+
+Usage: list [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail label remove - Removes a label from one or more messages (`gmail.modify` scope required)
+
+Removes a label from one or more messages (`gmail.modify` scope required)
+
+Usage: remove [OPTIONS] --label <LABEL> <MESSAGE_IDS>...
+
+Arguments:
+  <MESSAGE_IDS>...  Gmail message ids to remove the label from
+
+Options:
+      --label <LABEL>  Label id to remove (see `gmail label list` for ids)
+      --force          Skip the interactive confirmation prompt
+      --dry-run        Print what would be removed without calling the API
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev gmail read - Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
+
+Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
+
+Usage: read [OPTIONS] <MESSAGE_ID>
+
+Arguments:
+  <MESSAGE_ID>  Gmail message id
+
+Options:
+      --out-file <PATH>  Output file (writes to stdout if omitted)
+      --format <FORMAT>  How much of the message to fetch [default: full] [possible values: meta, full, raw]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail search - Searches Gmail messages (mirrors the `gmail_search` MCP tool)
+
+Searches Gmail messages (mirrors the `gmail_search` MCP tool)
+
+Usage: search [OPTIONS] --query <QUERY>
+
+Options:
+      --query <QUERY>    Gmail search query (same syntax as the Gmail search box, e.g. `label:finance after:2026/01/01`)
+      --limit <LIMIT>    Maximum results to return. `0` means "fetch every match" (capped, like Datadog's log/event search, at a hard ceiling to bound run time and quota) [default: 50]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail thread - Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
+
+Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
+
+Usage: thread [OPTIONS] <THREAD_ID>
+
+Arguments:
+  <THREAD_ID>  Gmail thread id
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
