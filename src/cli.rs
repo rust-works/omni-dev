@@ -9,6 +9,7 @@ pub mod browser;
 pub mod commands;
 pub mod completions;
 pub mod config;
+pub(crate) mod confirm;
 pub mod coverage;
 // The daemon and the Snowflake client (which talks to the daemon over its
 // Unix-domain control socket) are Unix-only; on Windows they run only under WSL2,
@@ -20,6 +21,7 @@ pub mod daemon;
 pub mod datadog;
 pub mod format;
 pub mod git;
+pub mod gmail;
 pub mod help;
 pub mod log;
 pub mod resources;
@@ -186,6 +188,8 @@ pub enum Commands {
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
+    /// Gmail: search, read, and label messages via OAuth2.
+    Gmail(gmail::GmailCommand),
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
     #[cfg(unix)]
     Snowflake(snowflake::SnowflakeCommand),
@@ -329,6 +333,7 @@ impl Cli {
             #[cfg(unix)]
             Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            Commands::Gmail(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
@@ -368,6 +373,20 @@ impl Cli {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // `execute()`'s command dispatch is otherwise only exercised by spawning
+    // the real binary in integration tests; this covers the `Gmail` arm
+    // in-process (deterministic, network-free: missing credentials fail
+    // fast before any Gmail API call).
+    #[tokio::test]
+    async fn execute_routes_gmail_subcommand() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cli = Cli::try_parse_from(["omni-dev", "gmail", "auth", "status"]).unwrap();
+        let err = cli.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
 
     #[test]
     fn parses_ai_backend_claude_cli() {
