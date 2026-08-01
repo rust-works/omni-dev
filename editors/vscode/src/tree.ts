@@ -69,6 +69,17 @@ export interface TreeWorktreePayload {
   ahead?: number;
   /** Commits behind upstream. Lazily fetched like {@link TreeWorktreePayload.ahead}. */
   behind?: number;
+  /**
+   * Commits behind the repository's remote default branch (typically
+   * `origin/main`) — distinct from {@link TreeWorktreePayload.behind}, which is
+   * divergence from the branch's *own* upstream (#1457). Lazily fetched via the
+   * `ahead-behind` op like `ahead`/`behind`, and folded in by
+   * {@link withAheadBehind}. Absent when unresolvable (detached/unborn HEAD, no
+   * locally-resolvable default branch) or when the branch's own upstream *is*
+   * already that default branch — reporting it there too would just duplicate
+   * `behind`.
+   */
+  main_behind?: number;
   /** Whether this is the repo's main working tree (vs a linked worktree). */
   is_main: boolean;
   /** Whether a live VS Code window currently has this worktree open. */
@@ -127,11 +138,16 @@ export interface TreeWorktreePayload {
 
 /**
  * Ahead/behind divergence of one worktree, as returned by the `ahead-behind` op
- * (#1306). Both counts are absent when the branch tracks no upstream.
+ * (#1306). `ahead`/`behind` are absent together when the branch tracks no
+ * upstream. `main_behind` (#1457) is independent of the other two: it can be
+ * present when they are absent (no upstream, but behind the remote default
+ * branch) or absent when they are present (the branch's own upstream *is*
+ * already the default branch).
  */
 export interface AheadBehind {
   ahead?: number;
   behind?: number;
+  main_behind?: number;
 }
 
 /** The `ahead-behind` op's `results`: divergence keyed by worktree path. */
@@ -139,18 +155,22 @@ export type AheadBehindMap = Record<string, AheadBehind>;
 
 /**
  * Folds a lazily-fetched {@link AheadBehind} into a worktree payload, returning a
- * new payload with the counts applied (#1306). An absent entry — no upstream, or
- * not yet fetched — leaves the worktree unchanged, so it renders with no sync
- * indicator, exactly as an eager snapshot did for a branch with no upstream.
+ * new payload with the counts applied (#1306, extended for `main_behind` in
+ * #1457). An absent entry — nothing resolved, or not yet fetched — leaves the
+ * worktree unchanged, so it renders with no sync indicator, exactly as an eager
+ * snapshot did for a branch with no upstream.
  */
 export function withAheadBehind(
   wt: TreeWorktreePayload,
   ab?: AheadBehind,
 ): TreeWorktreePayload {
-  if (ab === undefined || (ab.ahead === undefined && ab.behind === undefined)) {
+  if (
+    ab === undefined ||
+    (ab.ahead === undefined && ab.behind === undefined && ab.main_behind === undefined)
+  ) {
     return wt;
   }
-  return { ...wt, ahead: ab.ahead, behind: ab.behind };
+  return { ...wt, ahead: ab.ahead, behind: ab.behind, main_behind: ab.main_behind };
 }
 
 /**
@@ -367,9 +387,11 @@ export function worktreeLabel(wt: TreeWorktreePayload): string {
 }
 
 /**
- * The muted sync counts, e.g. `↑2 ↓0`. Each side is shown only when its count is
- * present (both are absent together when the branch has no upstream), so a
- * no-upstream worktree yields an empty string.
+ * The muted sync counts, e.g. `↑2 ↓0 ⇊5`. `↑`/`↓` are shown only when present
+ * (both absent together when the branch has no upstream). `⇊N` (#1457) is the
+ * independent divergence from the repository's remote default branch — distinct
+ * from the plain `↓`, which is divergence from the branch's own upstream — so a
+ * worktree with no upstream at all can still show `⇊N` alone.
  */
 function syncCounts(wt: TreeWorktreePayload): string {
   const parts: string[] = [];
@@ -378,6 +400,9 @@ function syncCounts(wt: TreeWorktreePayload): string {
   }
   if (wt.behind !== undefined) {
     parts.push(`↓${wt.behind}`);
+  }
+  if (wt.main_behind !== undefined) {
+    parts.push(`⇊${wt.main_behind}`);
   }
   return parts.join(" ");
 }
@@ -628,6 +653,13 @@ export function worktreeTooltip(
   const cue = worktreeGitCue(wt);
   if (cue) {
     lines.push(cue.tooltip);
+  }
+  if (wt.main_behind !== undefined) {
+    // `⇊N` is a project-specific concept (unlike near-universal `↑`/`↓`), and
+    // its next action isn't otherwise discoverable from the glyph alone — so,
+    // like `cue.tooltip` above, it earns its own explicit line (#1457).
+    const n = wt.main_behind;
+    lines.push(`${n} commit${n === 1 ? "" : "s"} behind origin/main — right-click → Rebase on main`);
   }
   const prLine = worktreePrTooltipLine(wt);
   if (prLine) {
