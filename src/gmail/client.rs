@@ -74,16 +74,11 @@ impl GmailClient {
     /// Takes `base_url` (rather than `&self`) so the free `build_*_url`
     /// functions in the API façade modules — and their unit tests, which
     /// pass literal base URLs — can call it without an instance.
-    // Not yet called: the API façades (messages/threads/labels/history)
-    // that use this land in a subsequent commit.
-    #[allow(dead_code)]
     pub(crate) fn api_url(base_url: &str, path: &str) -> Result<Url> {
         Url::parse(&format!("{base_url}{path}")).context("Invalid Gmail base URL")
     }
 
     /// Checks `response` for success and deserialises its JSON body into `T`.
-    // Not yet called: see `api_url` above.
-    #[allow(dead_code)]
     pub(crate) async fn parse_response<T: serde::de::DeserializeOwned>(
         &self,
         response: Response,
@@ -96,8 +91,6 @@ impl GmailClient {
     }
 
     /// Sends an authenticated GET and deserialises the JSON body into `T`.
-    // Not yet called: see `api_url` above.
-    #[allow(dead_code)]
     pub(crate) async fn get_parsed<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -232,6 +225,29 @@ fn extract_gmail_error_message(body: &str) -> Option<String> {
         || message.to_string(),
         |r| format!("{message} (reason: {r})"),
     ))
+}
+
+/// Test-only seam letting sibling API-façade test modules (which can't
+/// reach `GmailClient`'s private fields directly, unlike this module's own
+/// `tests` submodule) bootstrap a deterministic access token via wiremock.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::GmailClient;
+    use crate::gmail::auth::{GmailCredentials, GmailSession};
+
+    /// Replaces `client`'s session with one pointed at an explicit token
+    /// endpoint.
+    pub(crate) fn replace_session(
+        client: &mut GmailClient,
+        credentials: &GmailCredentials,
+        token_endpoint: &str,
+    ) {
+        client.session = GmailSession::new_with_token_endpoint(
+            client.client.clone(),
+            credentials,
+            token_endpoint,
+        );
+    }
 }
 
 #[cfg(test)]
