@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Rebase on main now offers, and rebases, the main working tree** ([#1438](https://github.com/rust-works/omni-dev/issues/1438)): the action previously only appeared on **linked** worktree rows, and a main tree caught up in a multi-selection was silently dropped and named as skipped in the confirmation. It is now offered on every worktree row — main included — and a selected main working tree is sent to the daemon and classified like any other target (up to date, would-rebase, dirty, etc.), rather than always being excluded. `--all` from the command line follows the same change: it now rebases every worktree of the repository, not just the linked ones.
 
+### Fixed
+- **Claude session cue now ranks idle above working**: a worktree's dominant session state — the one that wins the row's badge/colour and leads its description — previously ranked waiting on you > working > idle. An idle session (sitting at the prompt with nothing happening) actually needs your attention more than a working one (busy on a turn, nothing for you to do until it finishes), so the ranking is now waiting on you > idle > working. A worktree running both a working and an idle session now shows the muted idle badge instead of the green working one, and lists the idle count first in the description and tooltip.
+
 ## [0.8.0] - 2026-07-27
 
 ### Added
