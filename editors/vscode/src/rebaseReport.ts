@@ -1,11 +1,13 @@
 // The pure reporting model for the "Rebase on main" action (#1415): turning the
-// daemon's two-phase `rebase` reply into the strings the modal and the summary
-// toast show.
+// daemon's two-phase `rebase` reply into the strings the pre-flight toast and the
+// post-execute summary toast show. There is deliberately no confirmation-modal
+// text here (ADR-0062 removed it) — every outcome a rebase can produce is equally
+// reflog-recoverable, so there was nothing left for a modal to distinguish.
 //
 // Deliberately free of any `vscode` import, so it stays unit-testable under
 // `node --test` (the `sessionCounts.ts` / `claudeEmbeddings.ts` split). The
-// `vscode`-facing half — the modal, the progress notification, the toasts — lives
-// in `rebaseCommand.ts` and does nothing but call into here.
+// `vscode`-facing half — the progress notification, the toasts — lives in
+// `rebaseCommand.ts` and does nothing but call into here.
 
 import { RebaseOutcome, RebaseReply } from "./socket";
 
@@ -72,50 +74,6 @@ export function skipReasonText(reason: string | undefined): string {
     default:
       return reason ?? "skipped";
   }
-}
-
-/** One line describing why a worktree was not rebased. */
-function skipLine(outcome: RebaseOutcome): string {
-  const why =
-    outcome.status === "fetch-failed"
-      ? `the repository's fetch failed${outcome.detail ? ` (${outcome.detail})` : ""}`
-      : skipReasonText(outcome.reason);
-  return `• ${outcomeLabel(outcome)} — ${why}`;
-}
-
-/**
- * The confirmation modal's detail body: every branch about to be rewritten with
- * its **real** behind-count, then the skipped ones with reasons.
- *
- * The behind-counts are the payoff of checking before confirming. #1409's modal
- * deliberately showed none, because the only number it had was the tree's
- * `behind` — divergence from the branch's *upstream*, not from the rebase target,
- * which would have been quietly wrong. Phase 1 measures against the freshly
- * fetched target, so these are the true counts.
- */
-export function confirmDetail(pending: RebaseOutcome[], skipped: RebaseOutcome[]): string {
-  const lines = pending.map((p) => {
-    const behind = p.behind === undefined ? "" : ` (${p.behind} behind)`;
-    return `• ${outcomeLabel(p)}${behind}`;
-  });
-  if (skipped.length > 0) {
-    lines.push("", "Skipped:", ...skipped.map(skipLine));
-  }
-  lines.push(
-    "",
-    "This rewrites branch history. A worktree that hits conflicts is left " +
-      "mid-rebase so you can resolve it in place and run `git rebase --continue`.",
-  );
-  return lines.join("\n");
-}
-
-/** The modal's title line. */
-export function confirmTitle(pending: RebaseOutcome[], total: number): string {
-  if (pending.length === 1) {
-    return `Rebase “${outcomeLabel(pending[0])}” onto the remote default branch?`;
-  }
-  const of = pending.length === total ? "" : ` of ${total}`;
-  return `Rebase ${pending.length}${of} worktrees onto the remote default branch?`;
 }
 
 /**

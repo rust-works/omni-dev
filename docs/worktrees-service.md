@@ -866,23 +866,21 @@ launchd exports `SSH_AUTH_SOCK` into the per-user session, so the daemon inherit
 the user's `ssh-agent`. What it lacked was a useful `PATH`, now closed by the same
 well-known-paths probe used for `code` and `gh` (override with `OMNI_DEV_GIT_BIN`).
 
-**Two phases, one confirm.**
+**Two phases, no confirmation gate** ([ADR-0062](adrs/adr-0062.md)). An earlier
+version paused between the phases with a modal listing every branch about to be
+rewritten; #1458 removed it, since every outcome a rebase can produce — a clean
+fast-forward or one left mid-rebase with a conflict — is equally reflog-recoverable,
+so a gate had nothing left to distinguish.
 
 1. **Check.** A progress notification while the daemon fetches each selected
    repository's target ref once and classifies every worktree. Nothing is
    rewritten. If nothing is pending, a warning toast says *why* — the skip reasons,
    the up-to-date count, or the fetch error — rather than the action appearing to
    do nothing.
-2. **Confirm.** A modal listing every branch about to be rewritten **with its real
-   behind-count**, plus the skipped ones with reasons. Shown even for a single row
-   ([ADR-0049](adrs/adr-0049.md) §1, as applied by
-   [Add to Merge Queue](#merge-queue)). The counts are the payoff of checking
-   first: #1409's modal deliberately showed none, because the only number it had
-   was the tree's `behind` — divergence from the branch's *upstream*, not from the
-   rebase target — which would have been quietly wrong.
-3. **Execute.** The daemon **re-plans from scratch** (a worktree that went dirty
+2. **Execute.** The daemon **re-plans from scratch** (a worktree that went dirty
    between the phases is skipped, not rebased) and rebases each still-pending
-   worktree sequentially, then a summary toast reports the outcome.
+   worktree sequentially, then a summary toast reports the outcome, naming every
+   worktree left mid-rebase with a conflict.
 
 **Conflicts are left in place.** This surface always sends `keep_conflicts`, so a
 worktree that hits conflicts stays **mid-rebase** with its markers on disk instead
@@ -917,9 +915,10 @@ Worktree** uses — no role restriction. A selected main working tree is sent to
 the daemon like any other target and classified there (up-to-date, would-rebase,
 dirty, etc.); there is no client-side pre-filter dropping it from the batch.
 
-`--autostash` and `--onto <ref>` are **not** surfaced: a dirty worktree is reported
-as skipped in the modal the user is already reading, and a target other than the
-remote default branch is a CLI concern (#1409).
+`--autostash` and `--onto <ref>` are **not** surfaced: a dirty worktree is instead
+reported as a skip reason (step 1's toast, when it is the reason nothing in the
+batch was pending), and a target other than the remote default branch is a CLI
+concern (#1409).
 
 ### Push (force-with-lease)
 
