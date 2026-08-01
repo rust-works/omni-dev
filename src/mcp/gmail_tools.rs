@@ -48,6 +48,16 @@ pub struct GmailSearchParams {
     /// hard cap. Defaults to 50.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// When `true`, enrich each hit with From/Subject/Date/snippet via one
+    /// extra `messages.get` request per hit. Defaults to `false` (ids-only,
+    /// the quota-safe default — `messages.get` costs 5 units against
+    /// Gmail's 250 units/user/second budget).
+    #[serde(default)]
+    pub enrich: Option<bool>,
+    /// Bounds concurrent `messages.get` calls when `enrich` is true (has no
+    /// effect otherwise). Defaults to 4.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
 }
 
 /// Parameters for the `gmail_message_read` tool.
@@ -55,8 +65,9 @@ pub struct GmailSearchParams {
 pub struct GmailMessageReadParams {
     /// Gmail message id. Required.
     pub message_id: String,
-    /// `meta` (headers + snippet), `full` (default; parsed MIME
-    /// structure), or `raw` (base64url RFC 2822 source).
+    /// `minimal` (ids/labels only), `metadata` (headers + snippet), `full`
+    /// (default; parsed MIME structure), or `raw` (base64url RFC 2822
+    /// source). Matches Gmail's own wire values verbatim.
     #[serde(default)]
     pub format: Option<String>,
     /// When set, writes the rendered message to this path and returns a
@@ -109,11 +120,12 @@ impl OmniDevServer {
     /// Tool: search Gmail messages.
     #[tool(
         description = "Search Gmail messages with a Gmail query (same syntax as the Gmail \
-                       search box, e.g. `label:finance after:2026/01/01`). Each hit is enriched \
-                       with From/Subject/Date/snippet (one extra request per hit beyond the raw \
-                       list call). `limit` of 0 (or omitted) auto-paginates up to a hard cap \
-                       (10000); defaults to 50. Read-only. \
-                       Mirrors `omni-dev gmail search`. Output is YAML."
+                       search box, e.g. `label:finance after:2026/01/01`). Returns only \
+                       id/threadId per hit by default (ids-only, quota-safe). Set `enrich: true` \
+                       to add From/Subject/Date/snippet — this costs one extra `messages.get` \
+                       request per hit, bounded by `concurrency` (default 4). `limit` of 0 (or \
+                       omitted) auto-paginates up to a hard cap (10000); defaults to 50. \
+                       Read-only. Mirrors `omni-dev gmail search`. Output is YAML."
     )]
     pub async fn gmail_search(
         &self,
@@ -126,12 +138,13 @@ impl OmniDevServer {
 
     /// Tool: read a single Gmail message.
     #[tool(
-        description = "Read a single Gmail message by id. `format` is `meta` (headers + \
-                       snippet only), `full` (default; parsed MIME structure), or `raw` \
-                       (base64url-encoded RFC 2822 source). When `output_file` is set, writes \
-                       the rendered message to that path and returns a short YAML summary \
-                       instead of the inline body — use it for large messages or ones with \
-                       attachments that would exceed the response size limit. Read-only. \
+        description = "Read a single Gmail message by id. `format` is `minimal` (ids/labels \
+                       only), `metadata` (headers + snippet only), `full` (default; parsed MIME \
+                       structure), or `raw` (base64url-encoded RFC 2822 source) — Gmail's own \
+                       wire values verbatim. When `output_file` is set, writes the rendered \
+                       message to that path and returns a short YAML summary instead of the \
+                       inline body — use it for large messages or ones with attachments that \
+                       would exceed the response size limit. Read-only. \
                        Mirrors `omni-dev gmail read`. Output is YAML."
     )]
     pub async fn gmail_message_read(
@@ -206,10 +219,18 @@ fn run_auth_status() -> Result<String> {
 }
 
 async fn run_search(client: &GmailClient, params: &GmailSearchParams) -> Result<String> {
-    let summaries = MessagesApi::new(client)
-        .search_summaries(Some(&params.query), &[], params.limit.unwrap_or(0))
-        .await?;
-    yaml_result(&summaries)
+    let limit = params.limit.unwrap_or(0);
+    let api = MessagesApi::new(client);
+    if params.enrich.unwrap_or(false) {
+        let concurrency = params.concurrency.unwrap_or(4);
+        let summaries = api
+            .search_summaries(Some(&params.query), &[], limit, concurrency)
+            .await?;
+        yaml_result(&summaries)
+    } else {
+        let list = api.search_all(Some(&params.query), &[], limit).await?;
+        yaml_result(&list.messages)
+    }
 }
 
 async fn run_message_read(client: &GmailClient, params: &GmailMessageReadParams) -> Result<String> {
@@ -238,26 +259,28 @@ async fn run_label_list(client: &GmailClient) -> Result<String> {
 
 /// Parses an MCP-supplied message format string.
 ///
-/// Accepts the same names as the CLI `--format` arg (`meta`/`full`/`raw`);
-/// `None` defaults to `full`.
+/// Accepts the same names as the CLI `--detail` arg (`minimal`/`metadata`/
+/// `full`/`raw` — Gmail's own wire values verbatim); `None` defaults to
+/// `full`.
 fn parse_message_format(raw: Option<&str>) -> Result<MessageFormat> {
     match raw.map(str::to_ascii_lowercase).as_deref() {
         None | Some("full") => Ok(MessageFormat::Full),
-        Some("meta") => Ok(MessageFormat::Metadata),
+        Some("minimal") => Ok(MessageFormat::Minimal),
+        Some("metadata") => Ok(MessageFormat::Metadata),
         Some("raw") => Ok(MessageFormat::Raw),
-        Some(other) => {
-            anyhow::bail!("unknown format {other:?} (expected 'meta', 'full', or 'raw')")
-        }
+        Some(other) => anyhow::bail!(
+            "unknown format {other:?} (expected 'minimal', 'metadata', 'full', or 'raw')"
+        ),
     }
 }
 
 /// String label used in [`super::output_file::WriteFileSummary`].
 fn message_format_label(format: MessageFormat) -> &'static str {
     match format {
-        MessageFormat::Metadata => "meta",
+        MessageFormat::Minimal => "minimal",
+        MessageFormat::Metadata => "metadata",
         MessageFormat::Full => "full",
         MessageFormat::Raw => "raw",
-        MessageFormat::Minimal => "minimal",
     }
 }
 
@@ -329,7 +352,11 @@ mod tests {
     #[test]
     fn parse_message_format_accepts_known_strings() {
         assert!(matches!(
-            parse_message_format(Some("meta")).unwrap(),
+            parse_message_format(Some("minimal")).unwrap(),
+            MessageFormat::Minimal
+        ));
+        assert!(matches!(
+            parse_message_format(Some("metadata")).unwrap(),
             MessageFormat::Metadata
         ));
         assert!(matches!(
@@ -345,14 +372,14 @@ mod tests {
     #[test]
     fn parse_message_format_is_case_insensitive() {
         assert!(matches!(
-            parse_message_format(Some("META")).unwrap(),
+            parse_message_format(Some("METADATA")).unwrap(),
             MessageFormat::Metadata
         ));
     }
 
     #[test]
     fn parse_message_format_rejects_unknown_value() {
-        let err = parse_message_format(Some("minimal")).unwrap_err();
+        let err = parse_message_format(Some("meta")).unwrap_err();
         assert!(err.to_string().contains("format"));
     }
 
@@ -409,7 +436,39 @@ mod tests {
     // ── run_search ───────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn run_search_returns_yaml_array() {
+    async fn run_search_defaults_to_ids_only_and_makes_no_hydration_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": [{"id": "m1", "threadId": "t1"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No mock for GET .../messages/m1 — if `run_search` hydrated by
+        // default, wiremock would 404 and the call would fail.
+
+        let yaml = run_search(
+            &client,
+            &GmailSearchParams {
+                query: "label:finance".to_string(),
+                limit: Some(10),
+                enrich: None,
+                concurrency: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("id: m1"));
+        assert!(yaml.contains("threadId: t1"));
+    }
+
+    #[tokio::test]
+    async fn run_search_enrich_true_hydrates_each_hit() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -429,6 +488,7 @@ mod tests {
                     "snippet": "Hi there",
                 })),
             )
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -437,6 +497,8 @@ mod tests {
             &GmailSearchParams {
                 query: "label:finance".to_string(),
                 limit: Some(10),
+                enrich: Some(true),
+                concurrency: Some(2),
             },
         )
         .await
@@ -459,6 +521,8 @@ mod tests {
             &GmailSearchParams {
                 query: "*".to_string(),
                 limit: None,
+                enrich: None,
+                concurrency: None,
             },
         )
         .await
@@ -637,6 +701,8 @@ mod tests {
             .gmail_search(Parameters(GmailSearchParams {
                 query: "*".to_string(),
                 limit: None,
+                enrich: None,
+                concurrency: None,
             }))
             .await
             .unwrap_err();
