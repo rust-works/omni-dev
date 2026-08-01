@@ -227,6 +227,21 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 | `datadog_hosts_list` | List active hosts |
 | `datadog_downtime_list` | List downtimes; supports `active_only` |
 
+### Gmail (5 tools)
+
+Read access (search, messages, threads, labels) via OAuth2. Authentication
+uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
+`omni-dev gmail auth login`. See [Gmail Guide](gmail.md) and
+[ADR-0063](adrs/adr-0063.md).
+
+| Tool | Purpose |
+|------|---------|
+| `gmail_auth_status` | Credential-presence flags and granted scope only — never calls the Gmail API |
+| `gmail_search` | Search messages (Gmail query syntax); each hit enriched with From/Subject/Date/snippet |
+| `gmail_message_read` | Read a single message (`format`: `meta`/`full`/`raw`); `output_file` writes to disk |
+| `gmail_thread_read` | Read a full thread (every message); always truncation-guarded |
+| `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
+
 ### AI / Config (5 tools)
 
 | Tool | Purpose |
@@ -449,7 +464,7 @@ a value of `0` disables truncation entirely.
   assistant launched the server from inside the repo you expected.
 - **Tool not found:** confirm the binary was built with `--features mcp`.
   `omni-dev-mcp --help` should print without error if the build succeeded.
-- **Atlassian / Datadog tools return auth errors:** run the matching
+- **Atlassian / Datadog / Gmail tools return auth errors:** run the matching
   `*_auth_status` tool first to confirm credentials are visible to the
   process. Environment variables exported in your shell are not inherited
   unless the MCP client launched the server from that shell.
@@ -457,7 +472,9 @@ a value of `0` disables truncation entirely.
 ## See also
 
 - [ADR-0021](adrs/adr-0021.md) — MCP server via second binary
+- [ADR-0063](adrs/adr-0063.md) — Gmail OAuth2 authorization-code + PKCE design
 - [JIRA-Flavoured Markdown spec](specs/jfm.md) — also served as
   `omni-dev://specs/jfm`
 - [User Guide — Atlassian Integration](user-guide.md#atlassian---jira-and-confluence-integration)
 - [User Guide — Datadog Integration](user-guide.md#datadog-integration)
+- [User Guide — Gmail Integration](user-guide.md#gmail-integration)
