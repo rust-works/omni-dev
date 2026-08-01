@@ -12,10 +12,21 @@ use crate::gmail::messages_api::{MessageFormat, MessagesApi};
 use crate::gmail::types::Message;
 
 /// How much of the message to fetch.
+///
+/// Named `--detail`, not `--format`: ADR-0046 retired `--format` project-wide
+/// (every surviving `--format` in the codebase is a hidden deprecated alias
+/// for `-o/--output`), so a new *visible* `--format` would be the only one
+/// left and would collide in spirit with that migration — Gmail's `format`
+/// is a request-side projection, not an output format, which is a different
+/// axis from `-o` entirely (the same reasoning ADR-0046 applies to
+/// `--out-file`). Variant names match Gmail's own wire values verbatim
+/// (`minimal`/`metadata`/`full`/`raw`) rather than an invented shorthand.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-pub enum ReadFormat {
+pub enum ReadDetail {
+    /// Only `id`/`threadId`/`labelIds`/`sizeEstimate` — no headers or body.
+    Minimal,
     /// Headers and snippet only, no body.
-    Meta,
+    Metadata,
     /// The full parsed MIME structure. Default.
     #[default]
     Full,
@@ -23,10 +34,11 @@ pub enum ReadFormat {
     Raw,
 }
 
-impl ReadFormat {
+impl ReadDetail {
     fn as_message_format(self) -> MessageFormat {
         match self {
-            Self::Meta => MessageFormat::Metadata,
+            Self::Minimal => MessageFormat::Minimal,
+            Self::Metadata => MessageFormat::Metadata,
             Self::Full => MessageFormat::Full,
             Self::Raw => MessageFormat::Raw,
         }
@@ -46,8 +58,8 @@ pub struct ReadCommand {
     pub out_file: Option<String>,
 
     /// How much of the message to fetch.
-    #[arg(long, value_enum, default_value_t = ReadFormat::Full)]
-    pub format: ReadFormat,
+    #[arg(long, value_enum, default_value_t = ReadDetail::Full)]
+    pub detail: ReadDetail,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -61,7 +73,7 @@ impl ReadCommand {
         run_read(
             client,
             &self.message_id,
-            self.format,
+            self.detail,
             self.out_file.as_deref(),
             &self.output,
         )
@@ -76,12 +88,12 @@ impl ReadCommand {
 async fn run_read(
     client: &GmailClient,
     message_id: &str,
-    format: ReadFormat,
+    detail: ReadDetail,
     out_file: Option<&str>,
     output: &OutputFormat,
 ) -> Result<()> {
     let message = MessagesApi::new(client)
-        .get(message_id, format.as_message_format(), &[])
+        .get(message_id, detail.as_message_format(), &[])
         .await?;
 
     if let Some(path) = out_file {
@@ -176,17 +188,21 @@ mod tests {
     }
 
     #[test]
-    fn read_format_maps_to_message_format() {
+    fn read_detail_maps_to_message_format() {
         assert!(matches!(
-            ReadFormat::Meta.as_message_format(),
+            ReadDetail::Minimal.as_message_format(),
+            MessageFormat::Minimal
+        ));
+        assert!(matches!(
+            ReadDetail::Metadata.as_message_format(),
             MessageFormat::Metadata
         ));
         assert!(matches!(
-            ReadFormat::Full.as_message_format(),
+            ReadDetail::Full.as_message_format(),
             MessageFormat::Full
         ));
         assert!(matches!(
-            ReadFormat::Raw.as_message_format(),
+            ReadDetail::Raw.as_message_format(),
             MessageFormat::Raw
         ));
     }
@@ -272,7 +288,7 @@ mod tests {
         run_read(
             &client,
             "m1",
-            ReadFormat::Full,
+            ReadDetail::Full,
             Some(path.to_str().unwrap()),
             &OutputFormat::Table,
         )
@@ -295,7 +311,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "m1", ReadFormat::Full, None, &OutputFormat::Table)
+        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -312,7 +328,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "m1", ReadFormat::Full, None, &OutputFormat::Json)
+        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Json)
             .await
             .unwrap();
     }
@@ -327,14 +343,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "m1", ReadFormat::Full, None, &OutputFormat::Table)
+        let err = run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
     #[tokio::test]
-    async fn run_read_uses_metadata_format_for_meta() {
+    async fn run_read_uses_metadata_format_for_metadata_detail() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -347,9 +363,40 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "m1", ReadFormat::Meta, None, &OutputFormat::Table)
-            .await
-            .unwrap();
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Metadata,
+            None,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_uses_minimal_format_for_minimal_detail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "minimal"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Minimal,
+            None,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     // ── ReadCommand::execute glue ────────────────────────────────────
@@ -371,7 +418,7 @@ mod tests {
         let cmd = ReadCommand {
             message_id: "m42".to_string(),
             out_file: None,
-            format: ReadFormat::Full,
+            detail: ReadDetail::Full,
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
