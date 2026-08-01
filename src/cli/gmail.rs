@@ -99,6 +99,48 @@ mod tests {
         GmailClient::new("http://127.0.0.1:1", &dead_credentials()).unwrap()
     }
 
+    // ── GmailCommand::execute glue ──────────────────────────────────
+    //
+    // The success path (`helpers::create_client()` succeeding, then
+    // `data.dispatch(&client)` actually issuing a request) needs real
+    // credentials and would hit the real Gmail API host — there's no
+    // env-var override to redirect it at a mock server (see the
+    // `mcp::gmail_tools` module doc). These tests cover the
+    // credentials-missing error path, which is deterministic and
+    // network-free.
+
+    #[tokio::test]
+    async fn execute_routes_auth_subcommand_and_surfaces_missing_credentials() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            command: GmailSubcommands::Auth(auth::AuthCommand {
+                command: auth::AuthSubcommands::Status(auth::StatusCommand),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn execute_non_auth_subcommand_errors_when_credentials_missing() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            command: GmailSubcommands::Search(search::SearchCommand {
+                query: "label:finance".to_string(),
+                limit: 10,
+                enrich: false,
+                concurrency: 4,
+                output: OutputFormat::Table,
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
     #[test]
     fn gmail_subcommands_auth_variant() {
         let cmd = GmailCommand {
@@ -114,6 +156,8 @@ mod tests {
         let cmd = GmailSubcommands::Search(search::SearchCommand {
             query: "label:finance".to_string(),
             limit: 10,
+            enrich: false,
+            concurrency: 4,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
@@ -124,7 +168,7 @@ mod tests {
         let cmd = GmailSubcommands::Read(read::ReadCommand {
             message_id: "msg1".to_string(),
             out_file: None,
-            format: read::ReadFormat::Full,
+            detail: read::ReadDetail::Full,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
