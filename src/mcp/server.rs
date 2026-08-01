@@ -48,6 +48,7 @@ impl OmniDevServer {
             + Self::ai_tool_router()
             + Self::config_tool_router()
             + Self::datadog_tool_router()
+            + Self::gmail_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
             + Self::coverage_tool_router()
@@ -367,6 +368,20 @@ mod tests {
             "datadog_dashboard_list",
             "datadog_dashboard_get",
             "datadog_logs_search",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_all_gmail_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "gmail_auth_status",
+            "gmail_search",
+            "gmail_message_read",
+            "gmail_thread_read",
+            "gmail_label_list",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }
