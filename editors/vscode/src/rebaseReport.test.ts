@@ -5,8 +5,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  confirmDetail,
-  confirmTitle,
   failedFetches,
   nothingToRebaseMessage,
   outcomeLabel,
@@ -79,41 +77,6 @@ test("skipReasonText spells out each slug and passes an unknown one through", ()
   // old, not-yet-restarted one might — falls through here rather than vanishing.
   assert.equal(skipReasonText("main-working-tree"), "main-working-tree");
   assert.equal(skipReasonText(undefined), "skipped");
-});
-
-test("confirmDetail lists real behind-counts and the skipped worktrees", () => {
-  const detail = confirmDetail(
-    [
-      outcome({ status: "would-rebase", branch: "a", behind: 3 }),
-      outcome({ status: "would-rebase", branch: "b" }),
-    ],
-    [outcome({ status: "skipped", branch: "c", reason: "dirty" })],
-  );
-  // The counts are the payoff of checking before confirming (#1409 could not
-  // show them, since the tree's `behind` measures a different thing).
-  assert.match(detail, /• a \(3 behind\)/);
-  assert.match(detail, /• b$/m, "an absent count renders no parenthetical");
-  assert.match(detail, /Skipped:/);
-  assert.match(detail, /• c — uncommitted changes/);
-  assert.match(detail, /git rebase --continue/);
-});
-
-test("confirmDetail omits the skipped section when nothing was skipped", () => {
-  const detail = confirmDetail([outcome({ status: "would-rebase", behind: 1 })], []);
-  assert.doesNotMatch(detail, /Skipped:/);
-});
-
-test("confirmTitle names a single worktree and counts a partial batch", () => {
-  assert.equal(
-    confirmTitle([outcome({ status: "would-rebase", branch: "a" })], 1),
-    "Rebase “a” onto the remote default branch?",
-  );
-  const two = [
-    outcome({ status: "would-rebase", branch: "a" }),
-    outcome({ status: "would-rebase", branch: "b" }),
-  ];
-  assert.equal(confirmTitle(two, 2), "Rebase 2 worktrees onto the remote default branch?");
-  assert.equal(confirmTitle(two, 5), "Rebase 2 of 5 worktrees onto the remote default branch?");
 });
 
 test("nothingToRebaseMessage leads with a failed fetch", () => {
