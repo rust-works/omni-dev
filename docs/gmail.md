@@ -52,6 +52,7 @@ self-scoped read/label-modify request). See
 | `GMAIL_CLIENT_ID`       | OAuth2 client id from your own Google Cloud project (required). | _none_  |
 | `GMAIL_CLIENT_SECRET`   | OAuth2 client secret for the same client (required).            | _none_  |
 | `GMAIL_REFRESH_TOKEN`   | Written by `gmail auth login`; not meant to be hand-set.        | _none_  |
+| `GMAIL_SCOPE`           | Written by `gmail auth login`; records the granted scope (`gmail.readonly` or `gmail.modify`) so `auth status` can report it without a network call. | _none_ |
 
 `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET` must be set (in your shell profile,
 or in `~/.omni-dev/settings.json`'s `env` map) before running
@@ -118,41 +119,54 @@ leaf has a use for it.
 
 ```bash
 $ omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
+$ omni-dev gmail search --query 'label:finance' --limit 50 --enrich --concurrency 4
 ```
 
 `--query` uses [Gmail's own search syntax] (the same operators as the Gmail
 search box: `from:`, `label:`, `after:`, `has:attachment`, etc.) — omni-dev
 does not reinterpret it. `--limit 0` fetches every match up to a 10,000
-hard cap, auto-paginating underneath. Each hit is enriched with
-From/Subject/Date/snippet via one extra `messages.get` request per result
-(`messages.list` itself only returns bare ids).
+hard cap, auto-paginating underneath.
+
+By default `search` returns only `id`/`threadId` per hit — `messages.list`
+itself never returns more than that, and it's the quota-safe choice. Pass
+`--enrich` to add From/Subject/Date/snippet, at the cost of one extra
+`messages.get` request **per hit**. `--concurrency` (default 4) bounds how
+many of those hydration requests run at once; see
+[Rate limits and retry behaviour](#rate-limits-and-retry-behaviour) for the
+quota math before raising it or combining `--enrich` with a large `--limit`.
 
 [Gmail's own search syntax]: https://support.google.com/mail/answer/7190
 
 ### MCP equivalent(s)
 
-`gmail_search`.
+`gmail_search` — same ids-only default; pass `enrich: true` (and optionally
+`concurrency`) for the enriched rows.
 
 ## Messages
 
 ```bash
 $ omni-dev gmail read <message-id>
-$ omni-dev gmail read <message-id> --format meta
-$ omni-dev gmail read <message-id> --format raw --out-file message.eml
+$ omni-dev gmail read <message-id> --detail minimal
+$ omni-dev gmail read <message-id> --detail metadata
+$ omni-dev gmail read <message-id> --detail raw --out-file message.eml
 ```
 
-`--format` controls how much of the message is fetched: `meta` (headers +
-snippet only), `full` (default; parsed MIME structure), or `raw`
+`--detail` controls how much of the message is fetched — named `--detail`,
+not `--format`, since `-o/--output` already owns that word for this
+project's rendering axis (see [ADR-0046](adrs/adr-0046.md)); the values
+match Gmail's own wire values verbatim: `minimal` (only
+`id`/`threadId`/`labelIds`/`sizeEstimate` — no headers or body), `metadata`
+(headers + snippet only), `full` (default; parsed MIME structure), or `raw`
 (base64url-encoded RFC 2822 source — the cheapest way to get a
 byte-for-byte copy). `--out-file` writes a flat text rendering to disk
 instead of stdout.
 
 ### MCP equivalent(s)
 
-`gmail_message_read` — takes the same `format` values, plus `output_file`
-(writes to disk and returns a short YAML summary instead of the inline
-body — for large messages/attachments that would exceed the response size
-limit).
+`gmail_message_read` — takes the same `format` values (`minimal` /
+`metadata` / `full` / `raw`), plus `output_file` (writes to disk and
+returns a short YAML summary instead of the inline body — for large
+messages/attachments that would exceed the response size limit).
 
 ## Threads
 
@@ -194,8 +208,16 @@ is CLI-only.
 
 Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
 `messages.list` each cost 5 units, `messages.batchModify` costs 50 units
-for up to 1000 ids. `gmail search`'s enrichment step (one `messages.get`
-per hit) is usually the dominant per-call cost, not the initial list call.
+for up to 1000 ids. `gmail search`'s ids-only default costs a flat 5 units
+regardless of `--limit` (auto-pagination is still one `messages.list` call
+per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
+`--enrich --limit 50` can cost up to 255 units — nearly the entire
+per-second budget in one command — and `--limit 0 --enrich` against a large
+mailbox can cost tens of thousands of units, spread across as many seconds
+as `--concurrency` allows. `--concurrency` (default 4) bounds how many of
+those `messages.get` calls are in flight at once; it does not itself pace
+requests against the per-second budget, so a large `--limit --enrich`
+combination should be sized deliberately, not left at defaults.
 
 **Known gap:** Gmail signals quota exhaustion as **HTTP 403** with
 `reason: rateLimitExceeded` / `userRateLimitExceeded`, not HTTP 429.
