@@ -61,12 +61,10 @@ const GLYPHS: Record<keyof SessionTally, string> = {
 };
 
 /**
- * The order buckets are rendered and ranked in, most in need of attention
- * first: a session waiting on you outranks one sitting idle at the prompt,
- * which in turn outranks one still working — there is nothing to look at
- * until a working session finishes, so it is the least urgent of the three.
+ * The order buckets are rendered and ranked in, most urgent first: a worktree
+ * that is waiting on you should say so even while other sessions in it work.
  */
-const BY_URGENCY: (keyof SessionTally)[] = ["waiting", "idle", "working"];
+const BY_URGENCY: (keyof SessionTally)[] = ["waiting", "working", "idle"];
 
 /** An empty tally, the identity every accumulation starts from. */
 function emptyTally(): SessionTally {
@@ -236,9 +234,9 @@ export function sessionTotal(tally: SessionTally): number {
 }
 
 /**
- * The muted row segment, e.g. `!1 ◦2` — one glyph-and-count per non-empty
- * bucket, most in need of attention first. Empty for a worktree with no
- * sessions, so it drops out of the row description entirely.
+ * The muted row segment, e.g. `!1 ⚙2` — one glyph-and-count per non-empty
+ * bucket, most urgent first. Empty for a worktree with no sessions, so it drops
+ * out of the row description entirely.
  */
 export function sessionGlyphs(tally: SessionTally | undefined): string {
   if (tally === undefined) {
@@ -294,12 +292,10 @@ function badge(glyph: string, count: number): string {
  * The colored badge for a worktree row's sessions, or `undefined` when it runs
  * none.
  *
- * The dominant bucket wins by urgency — yellow `!` waiting outranks muted `◦`
- * idle outranks green `⚙` working, since a working session needs nothing from
- * you while it runs and an idle one is the one actually asking to be looked
- * at — so one glance says whether a worktree needs you. Mirrors
- * {@link CheckDecoration}'s contract, which the decoration provider consumes
- * uniformly.
+ * The dominant bucket wins by urgency — yellow `!` waiting outranks green `⚙`
+ * working outranks muted `◦` idle — so one glance says whether a worktree needs
+ * you. Mirrors {@link CheckDecoration}'s contract, which the decoration
+ * provider consumes uniformly.
  */
 export function sessionDecoration(tally: SessionTally | undefined): CheckDecoration | undefined {
   if (tally === undefined) {
@@ -312,19 +308,19 @@ export function sessionDecoration(tally: SessionTally | undefined): CheckDecorat
       tooltip: sessionTooltipLine(tally) ?? "",
     };
   }
+  if (tally.working > 0) {
+    return {
+      badge: badge(GLYPHS.working, tally.working),
+      colorId: "charts.green",
+      tooltip: sessionTooltipLine(tally) ?? "",
+    };
+  }
   if (tally.idle > 0) {
     return {
       badge: badge(GLYPHS.idle, tally.idle),
       // Not a `charts.*` colour: an idle session is deliberately muted, the same
       // grey the row description already uses.
       colorId: "descriptionForeground",
-      tooltip: sessionTooltipLine(tally) ?? "",
-    };
-  }
-  if (tally.working > 0) {
-    return {
-      badge: badge(GLYPHS.working, tally.working),
-      colorId: "charts.green",
       tooltip: sessionTooltipLine(tally) ?? "",
     };
   }
