@@ -242,82 +242,6 @@ pub struct LabelListResponse {
     pub labels: Vec<Label>,
 }
 
-/// A message added in a history record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HistoryMessageAdded {
-    /// The message that was added.
-    pub message: MessageRef,
-}
-
-/// A message deleted in a history record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HistoryMessageDeleted {
-    /// The message that was deleted.
-    pub message: MessageRef,
-}
-
-/// A label-change event in a history record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HistoryLabelChanged {
-    /// The message whose labels changed.
-    pub message: MessageRef,
-    /// The label ids that were added or removed.
-    #[serde(default, rename = "labelIds")]
-    pub label_ids: Vec<String>,
-}
-
-/// One entry in the mailbox's change history.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HistoryRecord {
-    /// This history record's id.
-    pub id: String,
-    /// Messages added since the previous record.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "messagesAdded"
-    )]
-    pub messages_added: Vec<HistoryMessageAdded>,
-    /// Messages deleted since the previous record.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "messagesDeleted"
-    )]
-    pub messages_deleted: Vec<HistoryMessageDeleted>,
-    /// Labels added to messages since the previous record.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "labelsAdded")]
-    pub labels_added: Vec<HistoryLabelChanged>,
-    /// Labels removed from messages since the previous record.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "labelsRemoved"
-    )]
-    pub labels_removed: Vec<HistoryLabelChanged>,
-}
-
-/// Response envelope for `GET /gmail/v1/users/{userId}/history`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HistoryListResponse {
-    /// History records since the requested `startHistoryId`.
-    #[serde(default)]
-    pub history: Vec<HistoryRecord>,
-    /// Cursor for the next page, when more results are available.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "nextPageToken"
-    )]
-    pub next_page_token: Option<String>,
-    /// The mailbox's current `historyId`. Present only on the *last*
-    /// page (when [`Self::next_page_token`] is absent). Not consumed by
-    /// anything in Phase 1 — Phase 2's incremental sync will use this as
-    /// its next watermark.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "historyId")]
-    pub history_id: Option<String>,
-}
-
 impl JsonlSerialize for Message {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_scalar_jsonl(self, out)
@@ -351,12 +275,6 @@ impl JsonlSerialize for Label {
 impl JsonlSerialize for LabelListResponse {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.labels.iter(), out)
-    }
-}
-
-impl JsonlSerialize for HistoryListResponse {
-    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
-        write_items_jsonl(self.history.iter(), out)
     }
 }
 
@@ -471,21 +389,6 @@ mod tests {
         let label: Label = serde_json::from_value(without_color).unwrap();
         assert!(label.color.is_none());
         assert!(label.is_system());
-    }
-
-    #[test]
-    fn history_record_deserializes_populated_fixture() {
-        let json = serde_json::json!({
-            "id": "12345",
-            "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
-            "labelsAdded": [{"message": {"id": "m2", "threadId": "t1"}, "labelIds": ["IMPORTANT"]}],
-            "labelsRemoved": [{"message": {"id": "m3", "threadId": "t1"}, "labelIds": ["UNREAD"]}],
-        });
-        let record: HistoryRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(record.messages_added.len(), 1);
-        assert_eq!(record.labels_added[0].label_ids, vec!["IMPORTANT"]);
-        assert_eq!(record.labels_removed[0].label_ids, vec!["UNREAD"]);
-        assert!(record.messages_deleted.is_empty());
     }
 
     #[test]
