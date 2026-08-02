@@ -1057,6 +1057,233 @@ mod tests {
         assert!(err.to_string().contains("PKCE"));
     }
 
+    // ── login_to (end-to-end: state mismatch / access_denied) ───────────
+    //
+    // These exercise `login_to` itself rather than its sub-components in
+    // isolation, so a regression in how it wires the loopback callback into
+    // the state-mismatch/access_denied branches would actually be caught.
+    // The callback port is picked by binding-then-dropping a std listener
+    // (a well-known "reserve a free port" trick) so the test's connector
+    // task can dial it directly — `login_to` binds the real listener before
+    // opening the browser, so the connector retries briefly to cover the
+    // small window before that bind completes.
+
+    async fn connect_and_send(port: u16, request_line: &[u8]) {
+        let mut stream = loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+            }
+        };
+        stream.write_all(request_line).await.unwrap();
+    }
+
+    fn reserve_free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn login_to_rejects_a_callback_with_mismatched_state() {
+        let port = reserve_free_port();
+        let browser = BrowserConfig {
+            launch: BrowserLaunch::Manual,
+            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            callback_port: port,
+        };
+        let connector = tokio::spawn(connect_and_send(
+            port,
+            b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
+        ));
+
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+
+        let err = login_to(
+            &settings_path,
+            None,
+            "client-id",
+            &Secret::new("client-secret"),
+            GmailScope::ReadOnly,
+            &browser,
+            "http://127.0.0.1:1/token", // never reached — state check fails first
+        )
+        .await
+        .unwrap_err();
+        connector.await.unwrap();
+
+        assert!(matches!(
+            err.downcast_ref::<GmailError>(),
+            Some(GmailError::StateMismatch)
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_to_surfaces_access_denied_from_the_callback() {
+        let port = reserve_free_port();
+        let browser = BrowserConfig {
+            launch: BrowserLaunch::Manual,
+            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            callback_port: port,
+        };
+        let connector = tokio::spawn(connect_and_send(
+            port,
+            b"GET /?error=access_denied&error_description=user+declined HTTP/1.1\r\n\r\n",
+        ));
+
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+
+        let err = login_to(
+            &settings_path,
+            None,
+            "client-id",
+            &Secret::new("client-secret"),
+            GmailScope::ReadOnly,
+            &browser,
+            "http://127.0.0.1:1/token", // never reached — denied before exchange
+        )
+        .await
+        .unwrap_err();
+        connector.await.unwrap();
+
+        match err.downcast_ref::<GmailError>() {
+            Some(GmailError::AuthorizationDenied(message)) => {
+                assert!(message.contains("access_denied"));
+                assert!(message.contains("user declined"));
+            }
+            other => panic!("expected AuthorizationDenied, got {other:?}"),
+        }
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_to_rejects_a_callback_missing_code_and_state() {
+        let port = reserve_free_port();
+        let browser = BrowserConfig {
+            launch: BrowserLaunch::Manual,
+            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            callback_port: port,
+        };
+        let connector = tokio::spawn(connect_and_send(port, b"GET /?foo=bar HTTP/1.1\r\n\r\n"));
+
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+
+        let err = login_to(
+            &settings_path,
+            None,
+            "client-id",
+            &Secret::new("client-secret"),
+            GmailScope::ReadOnly,
+            &browser,
+            "http://127.0.0.1:1/token", // never reached — malformed before exchange
+        )
+        .await
+        .unwrap_err();
+        connector.await.unwrap();
+
+        assert!(matches!(
+            err.downcast_ref::<GmailError>(),
+            Some(GmailError::MalformedCallback)
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_to_completes_full_success_flow_and_persists_credentials() {
+        // Captures the real authorization URL `login_to` generates (with its
+        // randomly-generated CSRF `state`) by pointing the browser launch at
+        // a shell command instead of an actual browser: `open_browser`
+        // substitutes `{url}` into the command's args and spawns it, so a
+        // tiny `/bin/sh` one-liner writes the URL to a file we can read back
+        // — letting this test drive the full success path (state echoed
+        // correctly, token exchange, credential persistence) without ever
+        // opening a real browser or needing to predict the CSRF nonce.
+        let port = reserve_free_port();
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let capture_path = temp_dir.path().join("captured-url.txt");
+
+        let browser = BrowserConfig {
+            launch: BrowserLaunch::Command(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf '%s' \"$0\" > '{}'", capture_path.display()),
+                "{url}".to_string(),
+            ]),
+            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            callback_port: port,
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-1",
+                    "refresh_token": "rt-1",
+                    "expires_in": 3600,
+                    "scope": SCOPE_READONLY,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let connector = tokio::spawn(async move {
+            let auth_url = loop {
+                if let Ok(contents) = std::fs::read_to_string(&capture_path) {
+                    if !contents.is_empty() {
+                        break contents;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            };
+            let parsed = Url::parse(&auth_url).unwrap();
+            let state = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.into_owned())
+                .expect("authorization URL must carry a state param");
+            connect_and_send(
+                port,
+                format!("GET /?code=auth-code&state={state} HTTP/1.1\r\n\r\n").as_bytes(),
+            )
+            .await;
+        });
+
+        let settings_path = temp_dir.path().join("settings.json");
+        let status = login_to(
+            &settings_path,
+            None,
+            "client-id",
+            &Secret::new("client-secret"),
+            GmailScope::ReadOnly,
+            &browser,
+            &format!("{}/token", server.uri()),
+        )
+        .await
+        .unwrap();
+        connector.await.unwrap();
+
+        assert!(status.has_client_id);
+        assert!(status.has_client_secret);
+        assert!(status.has_refresh_token);
+        assert_eq!(status.scope.as_deref(), Some(SCOPE_READONLY));
+
+        let saved = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(saved.contains("rt-1"));
+        assert!(saved.contains("client-id"));
+    }
+
     #[tokio::test]
     async fn refresh_access_token_posts_grant_type_refresh_token_and_parses_expires_in() {
         let server = wiremock::MockServer::start().await;
