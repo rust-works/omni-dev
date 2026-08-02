@@ -237,8 +237,8 @@ uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
 | Tool | Purpose |
 |------|---------|
 | `gmail_auth_status` | Credential-presence flags and granted scope only — never calls the Gmail API |
-| `gmail_search` | Search messages (Gmail query syntax); each hit enriched with From/Subject/Date/snippet |
-| `gmail_message_read` | Read a single message (`format`: `meta`/`full`/`raw`); `output_file` writes to disk |
+| `gmail_search` | Search messages (Gmail query syntax); ids-only by default, `enrich: true` adds From/Subject/Date/snippet |
+| `gmail_message_read` | Read a single message (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes to disk |
 | `gmail_thread_read` | Read a full thread (every message); always truncation-guarded |
 | `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
 
