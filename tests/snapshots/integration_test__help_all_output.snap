@@ -2931,10 +2931,28 @@ Usage: scopes <COMMAND>
 
 Commands:
   usage  Tallies declared commit scopes against `scopes.yaml`, reporting unknown, unused, and scope-less commits
+  lint   Validates scopes.yaml against the source tree: every `file_patterns` entry must match a tracked file, and every tracked file under `--root` must be matched by some scope
   help   Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev config scopes lint - Validates scopes.yaml against the source tree: every `file_patterns` entry must match a tracked file, and every tracked file under `--root` must be matched by some scope
+
+Validates scopes.yaml against the source tree: every `file_patterns` entry must match a tracked file, and every tracked file under `--root` must be matched by some scope
+
+Usage: lint [OPTIONS]
+
+Options:
+      --root <ROOT>                Root path(s) to check for scope coverage (repeatable) [default: src]
+      --no-project-only            Disables `--project-only` (on by default): folds in the ecosystem-detected default scopes (e.g. Rust's `lib` = `["src/lib.rs", "src/**"]`) before checking coverage. Without `--project-only`, a catch-all ecosystem scope can make the "every file is scoped" check vacuously true
+      --allow <ALLOW>              Additional glob(s) for paths that need no scope (repeatable). Unioned with any `allow:` list in scopes.yaml
+  -o, --output <OUTPUT>            Output format [default: text] [possible values: text, json, yaml]
+      --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================

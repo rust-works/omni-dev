@@ -312,6 +312,93 @@ fn binary_config_models_show_succeeds() {
     assert!(stdout.contains("claude"));
 }
 
+// NOTE: these two tests encode this repo's *current, still-broken* scopes
+// state (issue #1468: src/transcript/**, src/coverage/**, src/worktrees.rs
+// have no covering scope). Once #1468 lands, invert (don't delete) the first
+// test to assert a clean run.
+#[test]
+fn binary_config_scopes_lint_reports_known_gaps_today() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "config",
+            "scopes",
+            "lint",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit against today's scopes.yaml"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON report");
+    let unscoped = report["unscoped_files"]
+        .as_array()
+        .expect("unscoped_files array");
+    let paths: Vec<&str> = unscoped.iter().filter_map(|v| v.as_str()).collect();
+    assert!(paths.iter().any(|p| p.starts_with("src/transcript")));
+    assert!(paths.iter().any(|p| p.starts_with("src/coverage")));
+    assert!(paths.contains(&"src/worktrees.rs"));
+}
+
+#[test]
+fn binary_config_scopes_lint_project_only_matters() {
+    // The regression #1475 exists to prevent, demonstrated end-to-end: the
+    // ecosystem `lib` = `src/**` catch-all would make every currently
+    // unscoped src/ file (the gaps above) resolve to `lib` and vacuously
+    // pass — proving --project-only (the default) is what actually catches
+    // drift. Checked via the `unscoped_files` field specifically, not the
+    // overall exit code: this repo also has an unrelated, pre-existing dead
+    // pattern (scope "resources"' `src/resources/**`, since only
+    // `src/resources.rs` exists) that keeps the `--no-project-only` run
+    // non-zero regardless — fixing scopes.yaml drift is out of scope for
+    // #1475 (that's #1468's job), so the exit code alone can't isolate this.
+    let default_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "config",
+            "scopes",
+            "lint",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    let default_stdout = String::from_utf8_lossy(&default_run.stdout);
+    let default_report: serde_json::Value =
+        serde_json::from_str(&default_stdout).expect("valid JSON report");
+    assert!(!default_report["unscoped_files"]
+        .as_array()
+        .expect("unscoped_files array")
+        .is_empty());
+
+    let no_project_only_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "config",
+            "scopes",
+            "lint",
+            "--no-project-only",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    let no_project_only_stdout = String::from_utf8_lossy(&no_project_only_run.stdout);
+    let no_project_only_report: serde_json::Value =
+        serde_json::from_str(&no_project_only_stdout).expect("valid JSON report");
+    assert!(no_project_only_report["unscoped_files"]
+        .as_array()
+        .expect("unscoped_files array")
+        .is_empty());
+}
+
 #[test]
 fn binary_resources_show_jfm_succeeds() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
