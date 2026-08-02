@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Retired the AI-powered commit-check workflow in favour of the deterministic lint** ([#1472](https://github.com/rust-works/omni-dev/issues/1472)): across the last 40 runs, `.github/workflows/commit-check.yml` (`action-works/omni-dev-commit-check@v1` + `claude-haiku-4-5`) caught zero commit-message defects and produced one false positive — an Anthropic billing outage that blocked a PR without saying anything about its commits — while re-judging messages an AI had already written against the same guidelines it was checking them with. `.github/workflows/commit-lint.yml` replaces it with the same reusable action's `command: lint` mode (`action-works/omni-dev-commit-check@v1.4`), which runs the deterministic `omni-dev git commit message lint --strict` added in [#1474](https://github.com/rust-works/omni-dev/issues/1474): no API key, no model, no network call beyond fetching the `omni-dev` binary itself. The semantic guideline that "the message must accurately reflect the code change" cannot be checked without a model and is no longer enforced in CI; it is accepted as authoring-time-only until [#1471](https://github.com/rust-works/omni-dev/issues/1471) lands a `Stop` hook.
+- **Pinned the coverage-check action to `v1.1`** instead of the floating `v1` tag, so the reference stops moving silently whenever `v1` is later retargeted at a new minor release.
+
 ## [0.40.0] - 2026-08-02
 
 ### Added
