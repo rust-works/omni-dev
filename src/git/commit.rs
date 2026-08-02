@@ -1,27 +1,16 @@
 //! Git commit operations and analysis.
 
 use std::fs;
-use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use git2::{Commit, Repository};
 use globset::Glob;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::data::context::ScopeDefinition;
 use crate::git::diff_split::split_by_file;
-
-/// Matches conventional commit scope patterns including breaking-change syntax.
-///
-/// The `!` may appear either before the scope (the lenient `type!(scope):`
-/// form some earlier tooling produced) or, per the project's own documented
-/// convention, after it (`type(scope)!:`, e.g. `feat(cli)!: change format`)
-/// — see `.omni-dev/commit-guidelines.md`'s Breaking Changes section (#1473).
-#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
-static SCOPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z]+(?:!)?\(([^)]+)\)(?:!)?:").unwrap());
+use crate::git::lint;
 
 /// Commit information structure, generic over analysis type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,29 +723,28 @@ impl CommitInfoForAI {
     /// Runs deterministic pre-validation checks on the commit message.
     /// Passing checks are recorded in pre_validated_checks so the LLM
     /// can skip re-checking them. Failing checks are not recorded.
+    ///
+    /// Subject parsing and the scope predicates are shared with
+    /// [`crate::git::lint::lint_message`] via [`lint::parse_subject`] /
+    /// [`lint::scope_comma_format_ok`] / [`lint::scope_parts_all_valid`] —
+    /// one implementation, not a second one to drift (#1474).
     pub fn run_pre_validation_checks(&mut self, valid_scopes: &[ScopeDefinition]) {
-        if let Some(caps) = SCOPE_RE.captures(&self.base.original_message) {
-            let scope = caps.get(1).map(|m| m.as_str());
-            if let Some(scope) = scope {
-                if scope.contains(',') && !scope.contains(",  ") && !scope.contains(" ,") {
-                    self.pre_validated_checks.push(format!(
-                        "Scope format verified: multi-scope '{scope}' uses commas with at most one trailing space"
-                    ));
-                }
+        let first_line = self.base.original_message.lines().next().unwrap_or("");
+        let Some(scope) = lint::parse_subject(first_line).and_then(|p| p.scope) else {
+            return;
+        };
 
-                // Deterministic scope validity check
-                if !valid_scopes.is_empty() {
-                    let scope_parts: Vec<&str> = scope.split(',').map(str::trim).collect();
-                    let all_valid = scope_parts
-                        .iter()
-                        .all(|part| valid_scopes.iter().any(|s| s.name == *part));
-                    if all_valid {
-                        self.pre_validated_checks.push(format!(
-                            "Scope validity verified: '{scope}' is in the valid scopes list"
-                        ));
-                    }
-                }
-            }
+        if scope.contains(',') && lint::scope_comma_format_ok(scope) {
+            self.pre_validated_checks.push(format!(
+                "Scope format verified: multi-scope '{scope}' uses commas with at most one trailing space"
+            ));
+        }
+
+        // Deterministic scope validity check
+        if !valid_scopes.is_empty() && lint::scope_parts_all_valid(scope, valid_scopes) {
+            self.pre_validated_checks.push(format!(
+                "Scope validity verified: '{scope}' is in the valid scopes list"
+            ));
         }
     }
 }
@@ -814,11 +802,9 @@ pub fn refine_message_scope(
         .split_once('\n')
         .map_or((message, ""), |(f, r)| (f, r));
 
-    let Some(caps) = SCOPE_RE.captures(first_line) else {
+    let Some(existing_scope) = lint::parse_subject(first_line).and_then(|p| p.scope) else {
         return message.to_string();
     };
-
-    let existing_scope = caps.get(1).map_or("", |m| m.as_str());
 
     if existing_scope == resolved {
         return message.to_string();
@@ -938,9 +924,8 @@ pub fn tally_scope_usage(
     let mut scope_less_count = 0;
 
     for subject in subjects {
-        match SCOPE_RE.captures(subject) {
-            Some(caps) => {
-                let scope_text = caps.get(1).map_or("", |m| m.as_str());
+        match lint::parse_subject(subject).and_then(|p| p.scope) {
+            Some(scope_text) => {
                 for part in scope_text.split(',').map(str::trim) {
                     if !part.is_empty() {
                         *counts.entry(part).or_default() += 1;
@@ -1355,6 +1340,19 @@ mod tests {
     }
 
     #[test]
+    fn refine_message_scope_canonical_breaking_change_preserves_bang() {
+        // #1473: the documented `type(scope)!:` form (bang after the paren)
+        // used to never match at all, so refinement silently no-opped.
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let result = super::refine_message_scope("feat(ci)!: breaking change", files, &scope_defs);
+        assert_eq!(result, "feat(workflows)!: breaking change");
+    }
+
+    #[test]
     fn refine_message_scope_no_matching_scope_defs() {
         let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
         let files = &["README.md"];
@@ -1517,6 +1515,67 @@ mod tests {
         let mut info = make_commit_info_for_ai("feat: no scope here");
         info.run_pre_validation_checks(&scopes);
         assert!(info.pre_validated_checks.is_empty());
+    }
+
+    // #1473: canonical `type(scope)!:` breaking-change form used to record
+    // nothing at all (SCOPE_RE never matched it). These four cases pin the
+    // fix — the first was failing before it.
+
+    #[test]
+    fn pre_validation_canonical_breaking_change_single_scope() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(cli)!: change output format");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "canonical breaking-change form must record scope validity, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_canonical_breaking_change_multi_scope() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("claude", &["src/claude/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli,claude)!: add twiddle contextual options");
+        info.run_pre_validation_checks(&scopes);
+        assert!(info
+            .pre_validated_checks
+            .iter()
+            .any(|c| c.contains("Scope validity verified")));
+        assert!(info
+            .pre_validated_checks
+            .iter()
+            .any(|c| c.contains("multi-scope")));
+    }
+
+    #[test]
+    fn pre_validation_lenient_legacy_breaking_change_still_records() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat!(cli): add thing");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "lenient legacy form must still record scope validity, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_non_breaking_unchanged() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(cli): add command");
+        info.run_pre_validation_checks(&scopes);
+        assert!(info
+            .pre_validated_checks
+            .iter()
+            .any(|c| c.contains("Scope validity verified")));
     }
 
     // ── property tests ────────────────────────────────────────────
