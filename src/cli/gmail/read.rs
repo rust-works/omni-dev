@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 
 use crate::cli::gmail::format::{output_as, OutputFormat};
@@ -97,8 +98,13 @@ async fn run_read(
         .await?;
 
     if let Some(path) = out_file {
-        let rendered = render_plain_text(&message);
-        fs::write(path, &rendered).with_context(|| format!("Failed to write to {path}"))?;
+        if matches!(detail, ReadDetail::Raw) {
+            let bytes = decode_raw_message(&message)?;
+            fs::write(path, &bytes).with_context(|| format!("Failed to write to {path}"))?;
+        } else {
+            let rendered = render_plain_text(&message);
+            fs::write(path, &rendered).with_context(|| format!("Failed to write to {path}"))?;
+        }
         println!("Saved to: {path}");
         return Ok(());
     }
@@ -111,8 +117,28 @@ async fn run_read(
     render_read_table(&message, &mut handle)
 }
 
+/// Base64url-decodes [`Message::raw`] into the literal RFC 2822 bytes Gmail
+/// returned — a genuine byte-exact copy, not a preview, which is the whole
+/// reason to request `--detail raw` in the first place (the archive use
+/// case in #1467).
+///
+/// Gmail's own encoder omits padding, but this decodes leniently either way
+/// by stripping any trailing `=` before decoding unpadded.
+fn decode_raw_message(message: &Message) -> Result<Vec<u8>> {
+    let raw = message
+        .raw
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Gmail's response for `--detail raw` had no `raw` field"))?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim_end_matches('='))
+        .context("Failed to base64url-decode the raw RFC 2822 message")
+}
+
 /// Renders a message as a flat `key: value` header block followed by its
-/// snippet — an `.eml`-ish preview for `--out-file`, not a markdown dialect.
+/// snippet — an `.eml`-ish preview for `--out-file` on non-`raw` details,
+/// not a markdown dialect. `--detail raw` never reaches this: it writes the
+/// decoded bytes from [`decode_raw_message`] instead, since Gmail's `raw`
+/// field only comes back populated for that format.
 fn render_plain_text(message: &Message) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Id: {}", message.id));
@@ -125,9 +151,6 @@ fn render_plain_text(message: &Message) -> String {
     lines.push(String::new());
     if let Some(snippet) = &message.snippet {
         lines.push(snippet.clone());
-    }
-    if let Some(raw) = &message.raw {
-        lines.push(raw.clone());
     }
     lines.join("\n")
 }
@@ -223,15 +246,56 @@ mod tests {
         assert!(text.contains("Hi there"));
     }
 
+    // ── decode_raw_message ───────────────────────────────────────────
+
     #[test]
-    fn render_plain_text_includes_raw_source_when_present() {
+    fn decode_raw_message_decodes_unpadded_base64url() {
+        let source = "From: a@example.com\r\nSubject: Hi\r\n\r\nBody text.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
         let message = Message {
             id: "m1".to_string(),
-            raw: Some("raw-rfc2822-bytes".to_string()),
+            raw: Some(encoded),
             ..Default::default()
         };
-        let text = render_plain_text(&message);
-        assert!(text.contains("raw-rfc2822-bytes"));
+        let decoded = decode_raw_message(&message).unwrap();
+        assert_eq!(decoded, source.as_bytes());
+    }
+
+    #[test]
+    fn decode_raw_message_tolerates_padded_base64url() {
+        let source = "From: a@example.com\r\n\r\nBody.";
+        // `URL_SAFE` (padded) rather than `URL_SAFE_NO_PAD`: real-world
+        // encoders aren't guaranteed to omit padding, so decoding must not
+        // assume Gmail's own convention is the only valid input.
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(source);
+        let message = Message {
+            id: "m1".to_string(),
+            raw: Some(encoded),
+            ..Default::default()
+        };
+        let decoded = decode_raw_message(&message).unwrap();
+        assert_eq!(decoded, source.as_bytes());
+    }
+
+    #[test]
+    fn decode_raw_message_errors_when_raw_field_absent() {
+        let message = Message {
+            id: "m1".to_string(),
+            ..Default::default()
+        };
+        let err = decode_raw_message(&message).unwrap_err();
+        assert!(err.to_string().contains("no `raw` field"));
+    }
+
+    #[test]
+    fn decode_raw_message_errors_on_malformed_base64() {
+        let message = Message {
+            id: "m1".to_string(),
+            raw: Some("not valid base64url!!!".to_string()),
+            ..Default::default()
+        };
+        let err = decode_raw_message(&message).unwrap_err();
+        assert!(err.to_string().contains("base64url-decode"));
     }
 
     // ── render_read_table ────────────────────────────────────────────
@@ -297,6 +361,69 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("Hi there"));
+    }
+
+    #[tokio::test]
+    async fn run_read_detail_raw_out_file_writes_decoded_bytes_not_base64() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let source = "From: a@example.com\r\nSubject: Hi\r\n\r\nBody text.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "raw": encoded,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.eml");
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Raw,
+            Some(path.to_str().unwrap()),
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        // A genuine byte-exact copy: no Id:/Thread-Id:/Labels: preamble, no
+        // duplicated snippet, and definitely not still base64-encoded.
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, source.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn run_read_detail_raw_out_file_propagates_decode_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.eml");
+        let err = run_read(
+            &client,
+            "m1",
+            ReadDetail::Raw,
+            Some(path.to_str().unwrap()),
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no `raw` field"));
+        assert!(!path.exists());
     }
 
     #[tokio::test]
