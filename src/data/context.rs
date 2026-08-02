@@ -51,6 +51,61 @@ pub struct ScopeDefinition {
     pub file_patterns: Vec<String>,
 }
 
+/// The ten conventional-commit types accepted by default when no
+/// `.omni-dev/commit-rules.yaml` overrides them; mirrors the `## Types`
+/// table in `.omni-dev/commit-guidelines.md`.
+pub const DEFAULT_COMMIT_TYPES: &[&str] = &[
+    "feat", "fix", "docs", "refactor", "chore", "test", "ci", "build", "perf", "style",
+];
+
+/// Footer prefixes rejected by default (case-insensitive, `<prefix>:` match).
+pub const DEFAULT_FORBIDDEN_FOOTERS: &[&str] = &["Co-Authored-By"];
+
+/// Default subject-line length limit (characters) used when no
+/// `.omni-dev/commit-rules.yaml` overrides it.
+pub const DEFAULT_SUBJECT_MAX_LEN: usize = 80;
+
+/// Deterministic commit-message lint configuration.
+///
+/// Loaded from an optional `.omni-dev/commit-rules.yaml`. Every field falls
+/// back to its own default when the file is absent or a field is omitted
+/// (`#[serde(default)]` at the container level fills missing fields from
+/// [`Default::default`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommitRules {
+    /// Maximum subject-line length in characters. Commits over this are a
+    /// `Subject Line` error.
+    pub subject_max_len: usize,
+    /// Accepted conventional-commit types. An unrecognized type is a
+    /// `Types` error.
+    pub types: Vec<String>,
+    /// When `true`, a subject with no `(scope)` segment is a `Scopes`
+    /// error. Off by default — some historical/legitimate commits
+    /// legitimately omit a scope.
+    pub require_scope: bool,
+    /// Footer line prefixes that are not permitted (e.g. AI attribution
+    /// lines). A match is a `Body Guidelines` warning.
+    pub forbidden_footers: Vec<String>,
+}
+
+impl Default for CommitRules {
+    fn default() -> Self {
+        Self {
+            subject_max_len: DEFAULT_SUBJECT_MAX_LEN,
+            types: DEFAULT_COMMIT_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            require_scope: false,
+            forbidden_footers: DEFAULT_FORBIDDEN_FOOTERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Context for a specific feature or work area.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureContext {

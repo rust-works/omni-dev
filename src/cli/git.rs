@@ -5,6 +5,7 @@ mod check;
 mod create_pr;
 pub(crate) mod formatting;
 mod info;
+mod lint;
 mod staged;
 mod twiddle;
 mod view;
@@ -14,6 +15,7 @@ pub use amend::{run_amend, AmendCommand, AmendOutcome};
 pub use check::{run_check, CheckCommand, CheckOutcome};
 pub use create_pr::{run_create_pr, CreatePrCommand, CreatePrOutcome, PrContent};
 pub use info::{run_info, InfoCommand};
+pub use lint::{run_lint, LintCommand, LintInput, LintOutcome};
 pub use staged::{run_staged, StagedCommand, StagedOutcome};
 pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
@@ -107,6 +109,8 @@ pub enum MessageSubcommands {
     Twiddle(TwiddleCommand),
     /// Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool).
     Check(CheckCommand),
+    /// Deterministically lints commit messages against guidelines — no AI, no network (mirrors the `git_lint_commits` MCP tool).
+    Lint(LintCommand),
     /// Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool).
     Staged(StagedCommand),
 }
@@ -175,6 +179,7 @@ impl MessageCommand {
             MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(repo),
             MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute(repo).await,
             MessageSubcommands::Check(check_cmd) => check_cmd.execute(repo).await,
+            MessageSubcommands::Lint(lint_cmd) => lint_cmd.execute(repo).await,
             MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute(repo).await,
         }
     }
@@ -324,6 +329,21 @@ mod tests {
             "omni-dev", "git", "commit", "message", "check", "--strict", "--quiet", "--format",
             "json",
         ]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_lint_with_options() {
+        let cli = Cli::try_parse_from([
+            "omni-dev", "git", "commit", "message", "lint", "--strict", "--quiet", "--output",
+            "json",
+        ]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_lint_with_stdin() {
+        let cli = Cli::try_parse_from(["omni-dev", "git", "commit", "message", "lint", "--stdin"]);
         assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
     }
 

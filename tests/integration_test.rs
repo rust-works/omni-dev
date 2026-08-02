@@ -399,6 +399,47 @@ fn binary_config_scopes_lint_project_only_matters() {
         .is_empty());
 }
 
+/// `git commit message lint --stdin` reads the message from the process's
+/// real stdin — a code path `LintCommand::execute`'s own unit tests can't
+/// drive without hijacking `cargo test`'s stdin, so it's covered here via
+/// the spawned binary instead. The message has a valid-shaped subject but
+/// an unknown type, which the lint reports as an error; on a non-strict
+/// invocation an error alone drives `exit_code` to 1 and `execute()` calls
+/// `std::process::exit(1)`, so this also exercises that exit path (which
+/// would abort the whole test binary if triggered in-process).
+#[test]
+fn binary_lint_stdin_reads_message_and_exits_nonzero_on_error() {
+    use std::io::Write;
+
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .current_dir(temp_dir.path())
+        .args(["git", "commit", "message", "lint", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(b"feature(bogus): Bad Message.")
+        .expect("failed to write to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert_eq!(output.status.code(), Some(1), "expected exit code 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("feature(bogus): Bad Message."),
+        "expected the linted message in output, got: {stdout}"
+    );
+}
+
 #[test]
 fn binary_resources_show_jfm_succeeds() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
@@ -662,6 +703,56 @@ async fn cli_execute_dispatches_git_commit_message_view() {
         }),
     };
     let _ = cli.execute().await;
+}
+
+/// Exercises the `MessageSubcommands::Lint` dispatch arm (#1474) all the way
+/// through `Cli::execute`, not just `LintCommand::execute` directly (already
+/// covered at the unit level in `src/cli/git/lint.rs`). `repo: None` makes
+/// `LintCommand::execute` fall back to `std::env::current_dir()`, which is
+/// this crate's own root under `cargo test` — a valid git repository. The
+/// range is deliberately empty (`HEAD..HEAD`) so the report is always clean:
+/// a non-zero exit code would call `std::process::exit`, which would abort
+/// this entire test binary rather than just failing one test.
+#[tokio::test]
+async fn cli_execute_dispatches_git_commit_message_lint() {
+    use omni_dev::cli::git::{
+        CommitCommand, CommitSubcommands, GitCommand, GitSubcommands, LintCommand, MessageCommand,
+        MessageSubcommands,
+    };
+    use omni_dev::cli::{Cli, Commands};
+    use omni_dev::data::check::OutputFormat;
+
+    let cli = Cli {
+        ai_backend: None,
+        model: None,
+        beta_header: None,
+        claude_cli_allow_tools: false,
+        claude_cli_allow_mcp: false,
+        claude_cli_max_budget_usd: None,
+        models_yaml: None,
+        repo: None,
+        profile: None,
+        instance: None,
+        command: Commands::Git(GitCommand {
+            command: GitSubcommands::Commit(CommitCommand {
+                command: CommitSubcommands::Message(MessageCommand {
+                    command: MessageSubcommands::Lint(LintCommand {
+                        commit_range: Some("HEAD..HEAD".to_string()),
+                        context_dir: None,
+                        guidelines: None,
+                        output: OutputFormat::Text,
+                        strict: false,
+                        quiet: false,
+                        verbose: true,
+                        show_passing: false,
+                        stdin: false,
+                    }),
+                }),
+            }),
+        }),
+    };
+    let result = cli.execute().await;
+    assert!(result.is_ok(), "expected clean exit, got: {result:?}");
 }
 
 #[tokio::test]

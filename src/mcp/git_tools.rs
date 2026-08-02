@@ -71,6 +71,34 @@ pub struct GitCheckCommitsParams {
     pub model: Option<String>,
 }
 
+/// Parameters for the `git_lint_commits` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GitLintCommitsParams {
+    /// Commit range to lint (e.g., `HEAD~3..HEAD`, `abc123..def456`).
+    /// Defaults to commits ahead of the default base branch when omitted
+    /// (unlike `git_check_commits`, which requires `range`).
+    #[serde(default)]
+    pub range: Option<String>,
+    /// Lint this literal message directly instead of a commit range (the
+    /// `--stdin` equivalent) — no git repository is touched. Exactly one of
+    /// `range`/`message` should be set; `message` takes precedence if both are.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Optional explicit context directory (overrides the standard
+    /// `.omni-dev/` resolution chain for both `scopes.yaml` and
+    /// `commit-rules.yaml`).
+    #[serde(default)]
+    pub context_dir: Option<String>,
+    /// Path to the git repository. Defaults to the current working
+    /// directory. Ignored when `message` is set.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    /// When true, warnings are treated as non-zero exit conditions.
+    /// Defaults to `false` (only errors fail).
+    #[serde(default)]
+    pub strict: bool,
+}
+
 /// Parameters for the `git_twiddle_commits` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitTwiddleCommitsParams {
@@ -231,6 +259,46 @@ impl OmniDevServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             format_check_payload(&outcome),
+        )]))
+    }
+
+    /// Tool: deterministically validate commit messages against guidelines
+    /// — no AI, no network, no credentials needed.
+    #[tool(
+        description = "Deterministically validate commit messages against guidelines — no AI, \
+                       no network, no credentials required (unlike `git_check_commits`, which \
+                       calls an AI model). Checks: type/scope format, scope membership in \
+                       `scopes.yaml`, subject length, lowercase/no-trailing-period style, blank \
+                       line after the subject when a body is present, and forbidden footers. Does \
+                       NOT check type-matches-diff, scope-file-correspondence, or description \
+                       truthfulness — those need a model and stay in `git_check_commits`. Set \
+                       `message` to lint a single literal message directly (bypassing git \
+                       entirely), or `range` to lint every non-merge commit in a range (defaults \
+                       to commits ahead of the base branch). Mirrors \
+                       `omni-dev git commit message lint`. Returns a YAML payload with the full \
+                       CheckReport, a pass/fail summary, and the exit code the CLI would use \
+                       (honouring `strict`)."
+    )]
+    pub async fn git_lint_commits(
+        &self,
+        Parameters(params): Parameters<GitLintCommitsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let input = match params.message {
+            Some(message) => crate::cli::git::LintInput::Message(message),
+            None => crate::cli::git::LintInput::Range(params.range),
+        };
+
+        let outcome = crate::cli::git::run_lint(
+            input,
+            params.repo_path.as_deref().map(std::path::Path::new),
+            params.context_dir.as_deref().map(std::path::Path::new),
+            params.strict,
+        )
+        .await
+        .map_err(tool_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            format_lint_payload(&outcome),
         )]))
     }
 
@@ -411,6 +479,19 @@ fn format_check_payload(outcome: &crate::cli::git::CheckOutcome) -> String {
     )
 }
 
+/// Formats the payload returned by the `git_lint_commits` tool.
+fn format_lint_payload(outcome: &crate::cli::git::LintOutcome) -> String {
+    format!(
+        "# git_lint_commits outcome\nexit_code: {}\nstrict: {}\nhas_errors: {}\nhas_warnings: {}\ntotal_commits: {}\nreport: |\n{}",
+        outcome.exit_code,
+        outcome.strict,
+        outcome.has_errors,
+        outcome.has_warnings,
+        outcome.total_commits,
+        indent_for_yaml(&outcome.report_yaml),
+    )
+}
+
 /// Formats the payload returned by the `git_twiddle_commits` tool.
 fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bool) -> String {
     format!(
@@ -549,6 +630,40 @@ mod tests {
     }
 
     #[test]
+    fn format_lint_payload_includes_all_fields() {
+        let outcome = crate::cli::git::LintOutcome {
+            report_yaml: "commits:\n  - hash: abc\n".to_string(),
+            has_errors: true,
+            has_warnings: false,
+            total_commits: 3,
+            strict: true,
+            exit_code: 1,
+        };
+        let payload = format_lint_payload(&outcome);
+        assert!(payload.contains("exit_code: 1"));
+        assert!(payload.contains("strict: true"));
+        assert!(payload.contains("has_errors: true"));
+        assert!(payload.contains("has_warnings: false"));
+        assert!(payload.contains("total_commits: 3"));
+        assert!(payload.contains("  commits:"), "report should be indented");
+    }
+
+    #[test]
+    fn format_lint_payload_clean_outcome() {
+        let outcome = crate::cli::git::LintOutcome {
+            report_yaml: String::new(),
+            has_errors: false,
+            has_warnings: false,
+            total_commits: 0,
+            strict: false,
+            exit_code: 0,
+        };
+        let payload = format_lint_payload(&outcome);
+        assert!(payload.contains("exit_code: 0"));
+        assert!(payload.contains("strict: false"));
+    }
+
+    #[test]
     fn format_twiddle_payload_applied() {
         let outcome = TwiddleOutcome {
             amendments_yaml: "amendments:\n  - commit: abc\n".to_string(),
@@ -638,6 +753,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_lint_commits_handler_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitLintCommitsParams {
+            range: Some("HEAD".to_string()),
+            message: None,
+            context_dir: None,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+            strict: false,
+        };
+        let err = server
+            .git_lint_commits(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_lint_commits_handler_message_input_needs_no_repo() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitLintCommitsParams {
+            range: None,
+            message: Some("feature(bogus): Bad Message.".to_string()),
+            context_dir: None,
+            repo_path: None,
+            strict: false,
+        };
+        let result = server
+            .git_lint_commits(Parameters(params))
+            .await
+            .expect("linting a literal message needs no repository");
+        let text = result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .clone();
+        assert!(text.contains("exit_code: 1"));
+        assert!(text.contains("has_errors: true"));
     }
 
     #[tokio::test]

@@ -180,6 +180,7 @@ mod tests {
             "git_view_commits",
             "git_branch_info",
             "git_check_commits",
+            "git_lint_commits",
             "git_twiddle_commits",
             "git_create_pr",
         ] {
@@ -235,6 +236,7 @@ mod tests {
             "git_view_commits",
             "git_branch_info",
             "git_check_commits",
+            "git_lint_commits",
             "git_twiddle_commits",
             "git_create_pr",
             "confluence_children",

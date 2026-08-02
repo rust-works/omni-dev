@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub mod amendment;
 pub mod commit;
 pub mod diff_split;
+pub mod lint;
 pub mod main_branches;
 pub mod remote;
 pub mod repository;
@@ -18,6 +19,7 @@ pub use commit::{
     CommitInfoForAI, FileDiffRef,
 };
 pub use diff_split::{split_by_file, split_file_by_hunk, FileDiff, HunkDiff};
+pub use lint::{lint_message, parse_subject, passes as lint_passes, ParsedSubject};
 pub use main_branches::{branches_containing, detect_main_branch_tips, MainBranchTip};
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;
