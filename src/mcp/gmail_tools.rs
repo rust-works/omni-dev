@@ -201,7 +201,7 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let client = create_client().map_err(tool_error)?;
         let yaml = run_label_list(&client).await.map_err(tool_error)?;
-        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+        Ok(build_truncated_result(yaml))
     }
 }
 
