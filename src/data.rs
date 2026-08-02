@@ -7,11 +7,13 @@ use crate::git::{CommitInfo, CommitInfoForAI, RemoteInfo};
 pub mod amendments;
 pub mod check;
 pub mod context;
+pub mod scopes_lint;
 pub mod yaml;
 
 pub use amendments::*;
 pub use check::*;
 pub use context::*;
+pub use scopes_lint::*;
 pub use yaml::*;
 
 /// Root node of the YAML output produced by `view`, `info`, `check`, and the branch
