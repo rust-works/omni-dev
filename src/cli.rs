@@ -340,7 +340,7 @@ impl Cli {
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),
-            Commands::Config(config_cmd) => config_cmd.execute(),
+            Commands::Config(config_cmd) => config_cmd.execute(repo),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::Completions(completions_cmd) => completions_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),

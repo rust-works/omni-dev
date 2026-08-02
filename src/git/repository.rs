@@ -205,25 +205,7 @@ impl GitRepository {
                 .hide(start_commit.id())
                 .context("Failed to hide start commit")?;
 
-            for oid in walker {
-                let oid = oid.context("Failed to get commit OID from walker")?;
-                let commit = self
-                    .repo
-                    .find_commit(oid)
-                    .context("Failed to find commit")?;
-
-                // Skip merge commits
-                if commit.parent_count() > 1 {
-                    continue;
-                }
-
-                commits.push(CommitInfo::from_git_commit(
-                    &self.repo, &commit, &main_tips,
-                )?);
-            }
-
-            // Reverse to get chronological order (oldest first)
-            commits.reverse();
+            commits = self.collect_walk(walker, &main_tips, None)?;
         } else {
             // Single commit by hash or reference
             let obj = self
@@ -238,6 +220,57 @@ impl GitRepository {
             )?);
         }
 
+        Ok(commits)
+    }
+
+    /// Walks every commit reachable from `HEAD`, optionally capped to the
+    /// newest `max_count` non-merge commits.
+    ///
+    /// Unlike [`Self::get_commits_in_range`] (which needs an explicit range),
+    /// this is the whole-history default a reporting command like `config
+    /// scopes usage` wants when the caller gave no range at all.
+    pub fn get_commits_from_head(&self, max_count: Option<usize>) -> Result<Vec<CommitInfo>> {
+        let main_tips = crate::git::main_branches::detect_main_branch_tips(&self.repo)?;
+        let mut walker = self.repo.revwalk().context("Failed to create revwalk")?;
+        walker.push_head().context("Failed to push HEAD")?;
+        self.collect_walk(walker, &main_tips, max_count)
+    }
+
+    /// Drains a revwalk into commit info, skipping merges, honoring an
+    /// optional count cap (checked after each non-merge commit is collected,
+    /// so it always bounds the output length rather than raw traversal
+    /// steps), then reverses to chronological order (oldest first) — the
+    /// shared collection loop behind [`Self::get_commits_in_range`]'s range
+    /// branch and [`Self::get_commits_from_head`].
+    fn collect_walk(
+        &self,
+        walker: git2::Revwalk<'_>,
+        main_tips: &[crate::git::main_branches::MainBranchTip],
+        max_count: Option<usize>,
+    ) -> Result<Vec<CommitInfo>> {
+        let mut commits = Vec::new();
+
+        for oid in walker {
+            let oid = oid.context("Failed to get commit OID from walker")?;
+            let commit = self
+                .repo
+                .find_commit(oid)
+                .context("Failed to find commit")?;
+
+            // Skip merge commits
+            if commit.parent_count() > 1 {
+                continue;
+            }
+
+            commits.push(CommitInfo::from_git_commit(&self.repo, &commit, main_tips)?);
+
+            if max_count.is_some_and(|n| commits.len() >= n) {
+                break;
+            }
+        }
+
+        // Reverse to get chronological order (oldest first)
+        commits.reverse();
         Ok(commits)
     }
 }
@@ -728,6 +761,80 @@ mod tests {
         let commits = repo.get_commits_in_range("HEAD")?;
         assert_eq!(commits.len(), 1);
         assert!(commits[0].in_main_branches.is_empty());
+        Ok(())
+    }
+
+    // ── get_commits_from_head (#1476) ───────────────────────────────
+
+    /// Creates a linear chain of `n` commits (subjects "commit 0".."commit
+    /// n-1", oldest first) in a fresh temp repo.
+    #[allow(clippy::unwrap_used)]
+    fn repo_with_linear_commits(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path().to_path_buf();
+        for i in 0..n {
+            std::fs::write(p.join("f.txt"), format!("content {i}")).unwrap();
+            git_in(&p, &["add", "."]);
+            git_in(&p, &["commit", "-m", &format!("commit {i}")]);
+        }
+        (temp_dir, p)
+    }
+
+    #[test]
+    fn commits_from_head_no_cap_returns_all_in_chronological_order() -> Result<()> {
+        let (_tmp, p) = repo_with_linear_commits(3);
+        let repo = GitRepository::open_at(&p)?;
+        let commits = repo.get_commits_from_head(None)?;
+        let subjects: Vec<&str> = commits.iter().map(|c| c.original_message.trim()).collect();
+        assert_eq!(subjects, vec!["commit 0", "commit 1", "commit 2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn commits_from_head_max_count_caps_to_newest() -> Result<()> {
+        let (_tmp, p) = repo_with_linear_commits(5);
+        let repo = GitRepository::open_at(&p)?;
+        let commits = repo.get_commits_from_head(Some(2))?;
+        let subjects: Vec<&str> = commits.iter().map(|c| c.original_message.trim()).collect();
+        // The newest 2 commits, still returned oldest-first.
+        assert_eq!(subjects, vec!["commit 3", "commit 4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn commits_from_head_unborn_head_errors() -> Result<()> {
+        // A freshly `git init`ed repo with zero commits has an unborn HEAD,
+        // so `push_head()` errors — distinct from an empty *range* on an
+        // otherwise-populated repo (e.g. `HEAD..HEAD`), which the CLI layer
+        // handles as an empty report rather than a hard failure.
+        let temp_dir = init_tmp_repo();
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        let result = repo.get_commits_from_head(None);
+        assert!(result.is_err(), "unborn HEAD is expected to error");
+        Ok(())
+    }
+
+    #[test]
+    fn commits_from_head_skips_merge_commits() -> Result<()> {
+        let (_tmp, p) = repo_with_linear_commits(1);
+        git_in(&p, &["checkout", "-b", "feature"]);
+        std::fs::write(p.join("g.txt"), "feature")?;
+        git_in(&p, &["add", "."]);
+        git_in(&p, &["commit", "-m", "feature commit"]);
+        // Back to the branch `feature` was cut from, then merge it in with a
+        // real merge commit (--no-ff, so a fast-forward can't collapse it away).
+        git_in(&p, &["checkout", "-"]);
+        git_in(&p, &["merge", "--no-ff", "feature", "-m", "merge feature"]);
+
+        let repo = GitRepository::open_at(&p)?;
+        let commits = repo.get_commits_from_head(None)?;
+        let subjects: Vec<&str> = commits.iter().map(|c| c.original_message.trim()).collect();
+        assert!(
+            !subjects.contains(&"merge feature"),
+            "merge commit must be excluded, got: {subjects:?}"
+        );
+        assert!(subjects.contains(&"commit 0"));
+        assert!(subjects.contains(&"feature commit"));
         Ok(())
     }
 }
