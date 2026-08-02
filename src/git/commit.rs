@@ -885,6 +885,101 @@ fn count_specificity(pattern: &str) -> usize {
         .count()
 }
 
+/// One scope name with the number of commits that declared it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeCount {
+    /// The scope name, e.g. `cli`.
+    pub name: String,
+    /// Number of commits (within the analyzed subjects) that declared it.
+    pub count: usize,
+}
+
+/// Report produced by [`tally_scope_usage`]: how declared commit scopes
+/// compare against a project's scope taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeUsageReport {
+    /// Total commit subjects analyzed (including scope-less ones).
+    pub total_commits: usize,
+    /// Every declared scope with its count, descending by count then name.
+    pub declared: Vec<ScopeCount>,
+    /// The subset of `declared` not present in the known-scope set.
+    pub unknown: Vec<ScopeCount>,
+    /// Scopes present in `unused_candidates` that no subject declared.
+    pub unused: Vec<String>,
+    /// Commits whose subject carries no conventional-commit scope at all.
+    pub scope_less_count: usize,
+}
+
+/// Tallies declared conventional-commit scopes across `subjects` (each the
+/// commit's first message line) against a project's scope taxonomy.
+///
+/// Pure and git-free: `subjects` is already-extracted text, so this is safe
+/// to unit test with string literals. Multi-scope subjects like
+/// `feat(cli,claude): …` count once for each of `cli` and `claude`, matching
+/// [`CommitInfoForAI::run_pre_validation_checks`]'s own comma-splitting.
+///
+/// `known_scopes` decides `unknown` — normally `scopes.yaml` plus ecosystem
+/// defaults, or just `scopes.yaml` under `--project-only`. `unused_candidates`
+/// is always `scopes.yaml`'s own entries: ecosystem defaults are synthesized
+/// by omni-dev rather than written by the project, so they must never be
+/// reported as "defined but unused."
+pub fn tally_scope_usage(
+    subjects: &[&str],
+    known_scopes: &[ScopeDefinition],
+    unused_candidates: &[ScopeDefinition],
+) -> ScopeUsageReport {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut scope_less_count = 0;
+
+    for subject in subjects {
+        match SCOPE_RE.captures(subject) {
+            Some(caps) => {
+                let scope_text = caps.get(1).map_or("", |m| m.as_str());
+                for part in scope_text.split(',').map(str::trim) {
+                    if !part.is_empty() {
+                        *counts.entry(part).or_default() += 1;
+                    }
+                }
+            }
+            None => scope_less_count += 1,
+        }
+    }
+
+    let mut declared: Vec<ScopeCount> = counts
+        .iter()
+        .map(|(&name, &count)| ScopeCount {
+            name: name.to_string(),
+            count,
+        })
+        .collect();
+    declared.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    let known_names: std::collections::HashSet<&str> =
+        known_scopes.iter().map(|s| s.name.as_str()).collect();
+    let unknown: Vec<ScopeCount> = declared
+        .iter()
+        .filter(|sc| !known_names.contains(sc.name.as_str()))
+        .cloned()
+        .collect();
+
+    let mut unused: Vec<String> = unused_candidates
+        .iter()
+        .filter(|s| !counts.contains_key(s.name.as_str()))
+        .map(|s| s.name.clone())
+        .collect();
+    unused.sort();
+
+    ScopeUsageReport {
+        total_commits: subjects.len(),
+        declared,
+        unknown,
+        unused,
+        scope_less_count,
+    }
+}
+
 impl CommitAnalysisForAI {
     /// Converts from a basic `CommitAnalysis` by loading diff content from file.
     pub fn from_commit_analysis(analysis: CommitAnalysis) -> Result<Self> {
@@ -1959,5 +2054,102 @@ diff_file: "/tmp/test.diff"
         assert_eq!(changes.files_added, 1, "c.txt added");
         assert_eq!(changes.files_deleted, 1, "a.txt deleted");
         Ok(())
+    }
+
+    // ── tally_scope_usage (#1476) ────────────────────────────────────
+
+    #[test]
+    fn tally_multi_scope_counts_each_name_once() {
+        let subjects = ["feat(cli,claude): cross-cutting change"];
+        let report = super::tally_scope_usage(&subjects, &[], &[]);
+        let names: Vec<&str> = report.declared.iter().map(|sc| sc.name.as_str()).collect();
+        assert!(names.contains(&"cli"), "declared: {:?}", report.declared);
+        assert!(names.contains(&"claude"), "declared: {:?}", report.declared);
+        assert!(
+            !names.contains(&"cli,claude"),
+            "must not count the literal compound string, declared: {:?}",
+            report.declared
+        );
+        assert_eq!(
+            report
+                .declared
+                .iter()
+                .find(|sc| sc.name == "cli")
+                .map(|sc| sc.count),
+            Some(1)
+        );
+        assert_eq!(report.scope_less_count, 0);
+    }
+
+    #[test]
+    fn tally_scope_less_commit_not_a_named_bucket() {
+        let subjects = ["docs: update readme"];
+        let report = super::tally_scope_usage(&subjects, &[], &[]);
+        assert!(
+            report.declared.is_empty(),
+            "a scope-less subject must not create an empty-named declared entry: {:?}",
+            report.declared
+        );
+        assert_eq!(report.scope_less_count, 1);
+        assert_eq!(report.total_commits, 1);
+    }
+
+    #[test]
+    fn tally_breaking_change_counts_under_scope() {
+        // Pins #1473: the documented `type(scope)!:` form must count under
+        // its scope, not fall through to scope-less.
+        let subjects = ["feat(cli)!: change output format"];
+        let report = super::tally_scope_usage(&subjects, &[], &[]);
+        assert_eq!(report.scope_less_count, 0);
+        assert_eq!(
+            report
+                .declared
+                .iter()
+                .find(|sc| sc.name == "cli")
+                .map(|sc| sc.count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn tally_unknown_excludes_known_scopes() {
+        let subjects = ["feat(cli): add flag", "fix(lib): patch bug"];
+        let known = vec![make_scope_def("cli", &[])];
+        let report = super::tally_scope_usage(&subjects, &known, &[]);
+        let unknown_names: Vec<&str> = report.unknown.iter().map(|sc| sc.name.as_str()).collect();
+        assert_eq!(unknown_names, vec!["lib"]);
+    }
+
+    #[test]
+    fn tally_unused_lists_scope_never_declared() {
+        let subjects = ["feat(cli): add flag"];
+        let unused_candidates = vec![make_scope_def("cli", &[]), make_scope_def("workflows", &[])];
+        let report = super::tally_scope_usage(&subjects, &unused_candidates, &unused_candidates);
+        assert_eq!(report.unused, vec!["workflows".to_string()]);
+    }
+
+    #[test]
+    fn tally_empty_subjects_all_zero_report() {
+        let report = super::tally_scope_usage(&[], &[], &[]);
+        assert_eq!(report.total_commits, 0);
+        assert!(report.declared.is_empty());
+        assert!(report.unknown.is_empty());
+        assert!(report.unused.is_empty());
+        assert_eq!(report.scope_less_count, 0);
+    }
+
+    #[test]
+    fn tally_declared_sorted_desc_by_count_then_name() {
+        let subjects = [
+            "feat(cli): a",
+            "feat(git): b",
+            "feat(git): c",
+            "feat(data): d",
+            "feat(data): e",
+        ];
+        let report = super::tally_scope_usage(&subjects, &[], &[]);
+        let names: Vec<&str> = report.declared.iter().map(|sc| sc.name.as_str()).collect();
+        // "data" and "git" tie at count 2; "cli" trails at count 1.
+        assert_eq!(names, vec!["data", "git", "cli"]);
     }
 }
