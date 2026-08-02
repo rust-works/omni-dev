@@ -14,9 +14,14 @@ use crate::data::context::ScopeDefinition;
 use crate::git::diff_split::split_by_file;
 
 /// Matches conventional commit scope patterns including breaking-change syntax.
+///
+/// The `!` may appear either before the scope (the lenient `type!(scope):`
+/// form some earlier tooling produced) or, per the project's own documented
+/// convention, after it (`type(scope)!:`, e.g. `feat(cli)!: change format`)
+/// — see `.omni-dev/commit-guidelines.md`'s Breaking Changes section (#1473).
 #[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static SCOPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap());
+    LazyLock::new(|| Regex::new(r"^[a-z]+(?:!)?\(([^)]+)\)(?:!)?:").unwrap());
 
 /// Commit information structure, generic over analysis type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,7 +736,7 @@ impl CommitInfoForAI {
     /// can skip re-checking them. Failing checks are not recorded.
     pub fn run_pre_validation_checks(&mut self, valid_scopes: &[ScopeDefinition]) {
         if let Some(caps) = SCOPE_RE.captures(&self.base.original_message) {
-            let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+            let scope = caps.get(1).map(|m| m.as_str());
             if let Some(scope) = scope {
                 if scope.contains(',') && !scope.contains(",  ") && !scope.contains(" ,") {
                     self.pre_validated_checks.push(format!(
@@ -813,11 +818,7 @@ pub fn refine_message_scope(
         return message.to_string();
     };
 
-    // Determine which capture group matched (group 1 = breaking, group 2 = normal)
-    let existing_scope = caps
-        .get(1)
-        .or_else(|| caps.get(2))
-        .map_or("", |m| m.as_str());
+    let existing_scope = caps.get(1).map_or("", |m| m.as_str());
 
     if existing_scope == resolved {
         return message.to_string();
@@ -1240,6 +1241,20 @@ mod tests {
         assert_eq!(result, "feat!(workflows): breaking change");
     }
 
+    /// #1473: the documented breaking-change form puts `!` after the scope
+    /// (`type(scope)!:`), not before it — `.omni-dev/commit-guidelines.md`'s
+    /// own examples use this form exclusively.
+    #[test]
+    fn refine_message_scope_breaking_change_documented_form() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let result = super::refine_message_scope("feat(ci)!: breaking change", files, &scope_defs);
+        assert_eq!(result, "feat(workflows)!: breaking change");
+    }
+
     #[test]
     fn refine_message_scope_no_matching_scope_defs() {
         let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
@@ -1285,6 +1300,22 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("Scope validity verified")),
             "expected scope validity check, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    /// #1473: `run_pre_validation_checks` must recognize the documented
+    /// `type(scope)!:` breaking-change form, not just the bare `type(scope):`.
+    #[test]
+    fn pre_validation_breaking_change_documented_form() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(cli)!: change output format");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "expected scope validity check for breaking-change form, got: {:?}",
             info.pre_validated_checks
         );
     }
