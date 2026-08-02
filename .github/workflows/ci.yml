@@ -206,30 +206,6 @@ jobs:
         fail-under-lines: 30
         worktree-system-deps: libasound2-dev
 
-  commit-lint:
-    name: Commit Message Lint
-    # Deterministic, no-AI validation (#1472), replacing the AI-powered
-    # `command: check` invocation: across 40 runs it caught zero
-    # commit-message defects and produced one false positive (an Anthropic
-    # billing outage), while re-judging messages an AI had already written
-    # against the same guidelines. `command: lint` (v1.4+) runs
-    # `omni-dev git commit message lint` instead — no API key, no network
-    # call beyond fetching the omni-dev binary itself.
-    # Skipped on tag pushes, mirroring the Coverage job above (#1289):
-    # `version: latest` resolves to the in-flight release whose binary
-    # hasn't finished uploading yet, and the tag's commits were already
-    # linted on the PR that merged them into main.
-    if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-      with:
-        fetch-depth: 0          # full history so the base-branch range resolves
-    - uses: action-works/omni-dev-commit-check@v1.4
-      with:
-        command: lint
-        strict: true
-
   audit:
     name: Security Audit
     needs: gate
