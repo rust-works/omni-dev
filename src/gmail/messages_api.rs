@@ -26,6 +26,16 @@ pub const MAX_PAGE_LIMIT: usize = 500;
 /// [`MessagesApi::search_all`], even when the caller passes `limit = 0`.
 pub const HARD_CAP: usize = 10_000;
 
+/// Upper bound on [`MessagesApi::search_summaries`]'s `concurrency`
+/// parameter, regardless of what the caller (CLI `--concurrency` or the MCP
+/// `concurrency` param) requests.
+///
+/// Gmail's quota is 250 units/user/second and `messages.get` costs 5 units,
+/// so more than 50 requests in flight at once already assumes every one
+/// completes within a second — the flag exists to bound the fan-out against
+/// that quota, so it shouldn't itself accept a value that can blow past it.
+pub const MAX_CONCURRENCY: usize = 50;
+
 /// Default `limit` for a search when the caller doesn't specify one.
 ///
 /// Shared between the CLI (`gmail search`'s `--limit` default) and the MCP
@@ -234,7 +244,7 @@ impl<'a> MessagesApi<'a> {
         concurrency: usize,
     ) -> Result<Vec<MessageSummary>> {
         let list = self.search_all(query, label_ids, limit).await?;
-        let concurrency = concurrency.max(1);
+        let concurrency = effective_concurrency(concurrency);
         // Collect owned ids first: a closure borrowing `list.messages`
         // directly ties its returned future to that borrow's lifetime,
         // which `buffered` then can't unify into a `for<'a> FnMut(&'a _)`
@@ -370,6 +380,14 @@ fn effective_cap(limit: usize) -> usize {
     } else {
         limit.min(HARD_CAP)
     }
+}
+
+/// Clamps a requested hydration `concurrency` into `1..=MAX_CONCURRENCY`:
+/// `0` (which would otherwise stall the stream forever) is raised to `1`,
+/// and anything past [`MAX_CONCURRENCY`] is capped rather than allowed to
+/// burst past Gmail's per-second quota.
+fn effective_concurrency(concurrency: usize) -> usize {
+    concurrency.clamp(1, MAX_CONCURRENCY)
 }
 
 #[derive(Debug, Serialize)]
@@ -1094,5 +1112,25 @@ mod tests {
     #[test]
     fn effective_cap_passes_through_small_limits() {
         assert_eq!(effective_cap(42), 42);
+    }
+
+    // ── effective_concurrency ────────────────────────────────────────
+
+    #[test]
+    fn effective_concurrency_raises_zero_to_one() {
+        assert_eq!(effective_concurrency(0), 1);
+    }
+
+    #[test]
+    fn effective_concurrency_clamps_above_max_concurrency() {
+        assert_eq!(
+            effective_concurrency(MAX_CONCURRENCY + 1000),
+            MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn effective_concurrency_passes_through_small_values() {
+        assert_eq!(effective_concurrency(4), 4);
     }
 }

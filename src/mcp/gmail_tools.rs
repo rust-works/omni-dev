@@ -55,7 +55,9 @@ pub struct GmailSearchParams {
     #[serde(default)]
     pub enrich: Option<bool>,
     /// Bounds concurrent `messages.get` calls when `enrich` is true (has no
-    /// effect otherwise). Defaults to 4.
+    /// effect otherwise). Defaults to 4, clamped to 1-50 regardless of what
+    /// is requested — Gmail's quota is 250 units/user/second and
+    /// `messages.get` costs 5 units, so a higher value could burst past it.
     #[serde(default)]
     pub concurrency: Option<usize>,
 }
