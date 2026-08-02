@@ -142,6 +142,8 @@ impl StatusCommand {
 struct ProfileResponse {
     #[serde(rename = "emailAddress")]
     email_address: String,
+    #[serde(rename = "messagesTotal")]
+    messages_total: i64,
 }
 
 /// Calls `users.getProfile` and reports whether the stored refresh token is
@@ -163,6 +165,7 @@ async fn run_auth_status(client: &GmailClient, scope: GmailScope) -> Result<()> 
         .context("Failed to parse users.getProfile response")?;
 
     println!("Authenticated as: {}", profile.email_address);
+    println!("Messages in mailbox: {}", profile.messages_total);
     println!(
         "Granted scope: {}",
         if scope.allows_modify() {
