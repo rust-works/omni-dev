@@ -273,7 +273,14 @@ mod tests {
     /// Env-isolation lock for `ai_chat` handler tests — they mutate the
     /// provider env vars (USE_OLLAMA, OLLAMA_BASE_URL, …) so they need to
     /// serialise against each other and against `cli::ai::chat::tests`.
-    static AI_CHAT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] to
+    /// actually deliver that cross-module serialisation: an independent
+    /// `Mutex<()>` here provides no real exclusion against
+    /// `cli::ai::chat::tests`'s own separate lock, despite this comment's
+    /// stated intent (see issue #1465, where the same independent-mutex
+    /// pattern caused a real Gmail-vs-Datadog race).
+    static AI_CHAT_ENV_LOCK: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
     const AI_CHAT_KEYS: &[&str] = &[
         "USE_OPENAI",

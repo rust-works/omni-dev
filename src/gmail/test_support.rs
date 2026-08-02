@@ -11,7 +11,13 @@ use crate::gmail::auth::{GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOK
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the Gmail
 /// credential environment variables.
-static GMAIL_ENV_MUTEX: Mutex<()> = Mutex::new(());
+///
+/// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] so Gmail's
+/// `HOME` mutation also serialises against every other domain's (Atlassian,
+/// Datadog, …) — an independent `Mutex<()>` here provides no real exclusion
+/// against them, which is exactly the race that surfaced between Gmail and
+/// Datadog in issue #1465.
+static GMAIL_ENV_MUTEX: &Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
 /// RAII guard: snapshots `HOME` + every Gmail credential env var on
 /// construction and restores them on drop.

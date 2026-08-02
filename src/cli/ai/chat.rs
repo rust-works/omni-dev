@@ -152,7 +152,13 @@ mod tests {
 
     /// Env-isolation lock — tests in this module must serialise because they
     /// mutate `HOME` and every provider env var the preflight check reads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] so
+    /// this module's `HOME` mutation also serialises against
+    /// `mcp::ai_tools::tests` (which mutates the same env vars under its own
+    /// separate lock) and every other domain — see that static's doc
+    /// comment (issue #1465).
+    static ENV_LOCK: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
     const KEYS: &[&str] = &[
         "OMNI_DEV_AI_BACKEND",
