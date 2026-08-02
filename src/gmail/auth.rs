@@ -2,10 +2,10 @@
 //! storage, and in-memory access-token refresh.
 //!
 //! See [ADR-0063](../../../docs/adrs/adr-0063.md) for the design rationale.
-//! The loopback-listener + browser-launch shape follows
-//! [`crate::snowflake::client::auth`]'s external-browser SSO flow, extended
-//! with PKCE (RFC 7636), a `state` nonce, and an `error=` branch — none of
-//! which a static-token or SSO-only flow needs.
+//! The loopback-listener + browser-launch shape follows the Snowflake
+//! client's external-browser SSO flow (`crate::snowflake::client`'s private
+//! `auth` module), extended with PKCE (RFC 7636), a `state` nonce, and an
+//! `error=` branch — none of which a static-token or SSO-only flow needs.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -592,7 +592,7 @@ struct TokenState {
 ///
 /// Uses [`tokio::sync::Mutex`] (not `std::sync::Mutex`) held *across* the
 /// refresh network call — unlike
-/// [`SnowflakeSession::renew`](crate::snowflake::client::session::SnowflakeSession::renew),
+/// [`SnowflakeSession::renew`](crate::snowflake::client::SnowflakeSession::renew),
 /// which releases its lock before the network call and accepts concurrent
 /// refreshes racing each other. Gmail's design requires single-flight
 /// refresh (issue #1465's explicit "concurrent callers don't stampede"
