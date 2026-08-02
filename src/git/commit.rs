@@ -1353,6 +1353,20 @@ mod tests {
     }
 
     #[test]
+    fn refine_message_scope_preserves_breaking_marker() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let result = super::refine_message_scope("feat(ci)!: breaking change", files, &scope_defs);
+        assert_eq!(
+            result, "feat(workflows)!: breaking change",
+            "the documented `type(scope)!:` form must be refined with its `!` intact"
+        );
+    }
+
+    #[test]
     fn refine_message_scope_no_matching_scope_defs() {
         let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
         let files = &["README.md"];
@@ -1433,6 +1447,60 @@ mod tests {
             .pre_validated_checks
             .iter()
             .any(|c| c.contains("multi-scope")),);
+    }
+
+    #[test]
+    fn pre_validation_breaking_change_single_scope() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(cli)!: change output format");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "the documented `type(scope)!:` breaking-change form must be pre-validated \
+             like any other scoped subject, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_breaking_change_multi_scope() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("git", &["src/git/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli,git)!: cross-cutting breaking change");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "expected scope validity check, got: {:?}",
+            info.pre_validated_checks
+        );
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("multi-scope")),
+            "expected multi-scope format check, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_legacy_breaking_change_marker() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat!(cli): change output format");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "the undocumented `type!(scope):` form stays accepted as a lenient fallback, \
+             got: {:?}",
+            info.pre_validated_checks
+        );
     }
 
     #[test]

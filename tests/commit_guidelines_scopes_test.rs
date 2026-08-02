@@ -9,6 +9,14 @@
 //! judge two documents that contradict each other. That list had drifted by nine
 //! entries before anything caught it (#1421); these tests are what makes the rule
 //! self-enforcing rather than aspirational.
+//!
+//! The same file is also the source of truth for the commit *syntax* the code has to
+//! parse, so `example_subjects_are_parseable_by_parse_subject` closes the second half
+//! of that contract: every subject the guidelines demonstrate must be parseable by the
+//! parser every scope-aware code path runs on. The old `SCOPE_RE` had drifted the
+//! other way — matching a breaking-change form the guidelines never mention while
+//! failing on the one they mandate (#1473, fixed as part of #1474's `lint::parse_subject`
+//! unification).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,6 +26,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use omni_dev::data::context::ScopeDefinition;
+use omni_dev::git::parse_subject;
 
 /// Mirror of the private `ScopesConfig` in `src/claude/context/discovery.rs`.
 ///
@@ -147,6 +156,77 @@ fn example_scopes_are_defined_in_scopes_yaml() {
         "the `## Examples` section of .omni-dev/commit-guidelines.md uses scopes that \
          are not defined in .omni-dev/scopes.yaml (STYLE-0007):\n  {}",
         undefined.join("\n  ")
+    );
+}
+
+/// Returns the first line of each fenced code block in `body`.
+///
+/// Every example in `## Examples` is a fenced commit message, so its first line is
+/// the subject — precisely the input the subject parser has to handle.
+fn example_subjects(body: &str) -> Vec<&str> {
+    let mut subjects = Vec::new();
+    let mut in_block = false;
+    let mut expecting_subject = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_block = !in_block;
+            expecting_subject = in_block;
+        } else if expecting_subject {
+            subjects.push(line);
+            expecting_subject = false;
+        }
+    }
+    subjects
+}
+
+/// Every subject form the guidelines demonstrate must be parseable, with a scope, by
+/// the parser.
+///
+/// Closes the class rather than the instance: the old `SCOPE_RE` matched
+/// `type!(scope):` — a form the guidelines never mention — and failed on the
+/// `type(scope)!:` form they mandate, so the pre-validation checks and scope
+/// refinement silently no-opped on every breaking-change commit (#1473). This test
+/// fails the moment the guidelines teach a scoped subject the code cannot read.
+#[test]
+fn example_subjects_are_parseable_by_parse_subject() {
+    let guidelines = commit_guidelines();
+    let subjects = example_subjects(section(&guidelines, "Examples"));
+
+    assert!(
+        !subjects.is_empty(),
+        "no fenced examples found in `## Examples` — the block scraper is broken, \
+         which would let this test pass vacuously"
+    );
+    assert!(
+        subjects.iter().any(|subject| subject.contains(")!:")),
+        "no `type(scope)!:` breaking-change example found in `## Examples` — that form \
+         is the reason this test exists (#1473), so its absence must fail loudly"
+    );
+
+    let unparseable: Vec<&str> = subjects
+        .iter()
+        .copied()
+        .filter(|subject| parse_subject(subject).and_then(|p| p.scope).is_none())
+        .collect();
+
+    assert!(
+        unparseable.is_empty(),
+        "`omni_dev::git::parse_subject` cannot parse a scope out of these subjects \
+         demonstrated in the `## Examples` section of .omni-dev/commit-guidelines.md:\n  {}\n\n\
+         the guidelines are the source of truth — the parser must handle every scoped \
+         form they teach.",
+        unparseable.join("\n  ")
+    );
+}
+
+#[test]
+fn example_subjects_takes_the_first_line_of_each_fenced_block() {
+    let body = "\n### Simple\n```\nfix(git): a subject\n```\n\n\
+                ### With body\n```\nfeat(cli)!: another subject\n\n\
+                BREAKING CHANGE: not a subject\n```\n";
+    assert_eq!(
+        example_subjects(body),
+        vec!["fix(git): a subject", "feat(cli)!: another subject"]
     );
 }
 
