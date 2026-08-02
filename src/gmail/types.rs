@@ -14,7 +14,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::gmail::format::{write_items_jsonl, write_scalar_jsonl, JsonlSerialize};
+use crate::cli::gmail::format::{write_scalar_jsonl, JsonlSerialize};
 
 /// A bare `(id, threadId)` pair, as returned by `messages.list` without
 /// fetching each message's full content.
@@ -248,33 +248,15 @@ impl JsonlSerialize for Message {
     }
 }
 
-impl JsonlSerialize for MessageListResponse {
-    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
-        write_items_jsonl(self.messages.iter(), out)
-    }
-}
-
 impl JsonlSerialize for Thread {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_scalar_jsonl(self, out)
     }
 }
 
-impl JsonlSerialize for ThreadListResponse {
-    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
-        write_items_jsonl(self.threads.iter(), out)
-    }
-}
-
 impl JsonlSerialize for Label {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_scalar_jsonl(self, out)
-    }
-}
-
-impl JsonlSerialize for LabelListResponse {
-    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
-        write_items_jsonl(self.labels.iter(), out)
     }
 }
 
@@ -405,46 +387,30 @@ mod tests {
     }
 
     #[test]
-    fn message_list_response_write_jsonl_emits_one_line_per_message() {
-        let response = MessageListResponse {
-            messages: vec![
-                MessageRef {
-                    id: "m1".to_string(),
-                    thread_id: "t1".to_string(),
-                },
-                MessageRef {
-                    id: "m2".to_string(),
-                    thread_id: "t1".to_string(),
-                },
-            ],
+    fn thread_write_jsonl_emits_exactly_one_line() {
+        let thread = Thread {
+            id: "t1".to_string(),
             ..Default::default()
         };
         let mut buf = Vec::new();
-        response.write_jsonl(&mut buf).unwrap();
+        thread.write_jsonl(&mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        assert_eq!(text.lines().count(), 2);
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("t1"));
     }
 
     #[test]
-    fn label_list_response_write_jsonl_emits_one_line_per_label() {
-        let response = LabelListResponse {
-            labels: vec![
-                Label {
-                    id: "L1".to_string(),
-                    name: "One".to_string(),
-                    ..Default::default()
-                },
-                Label {
-                    id: "L2".to_string(),
-                    name: "Two".to_string(),
-                    ..Default::default()
-                },
-            ],
+    fn label_write_jsonl_emits_exactly_one_line() {
+        let label = Label {
+            id: "INBOX".to_string(),
+            name: "INBOX".to_string(),
+            ..Default::default()
         };
         let mut buf = Vec::new();
-        response.write_jsonl(&mut buf).unwrap();
+        label.write_jsonl(&mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        assert_eq!(text.lines().count(), 2);
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("INBOX"));
     }
 
     #[test]
