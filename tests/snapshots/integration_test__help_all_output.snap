@@ -3832,6 +3832,7 @@ Commands:
   amend    Amends commit messages based on a YAML configuration file
   twiddle  AI-powered commit message improvement using Claude (mirrors the `git_twiddle_commits` MCP tool)
   check    Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool)
+  lint     Deterministically lints commit messages against guidelines — no AI, no network (mirrors the `git_lint_commits` MCP tool)
   staged   Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
@@ -3878,6 +3879,29 @@ Options:
       --no-coherence               Disables the cross-commit coherence pass
       --no-suggestions             Skips generating corrected message suggestions
       --twiddle                    Offers to apply suggested messages when issues are found
+  -h, --help                       Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev git commit message lint - Deterministically lints commit messages against guidelines — no AI, no network (mirrors the `git_lint_commits` MCP tool)
+
+Deterministically lints commit messages against guidelines — no AI, no network (mirrors the `git_lint_commits` MCP tool)
+
+Usage: lint [OPTIONS] [COMMIT_RANGE]
+
+Arguments:
+  [COMMIT_RANGE]  Commit range to lint (e.g., HEAD~3..HEAD, abc123..def456). Defaults to commits ahead of the default base branch (origin/main, origin/master, main, or master)
+
+Options:
+      --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+      --guidelines <GUIDELINES>    Accepted for CLI parity with `check`; unused by `lint` (there is no AI prose guidelines file to load — deterministic rules come from `.omni-dev/commit-rules.yaml` and `.omni-dev/scopes.yaml` instead)
+  -o, --output <OUTPUT>            Output format [default: text] [possible values: text, json, yaml]
+      --strict                     Exits with error code if any issues found (including warnings)
+      --quiet                      Only shows errors/warnings, suppresses info-level output
+      --verbose                    Shows the resolved rules/scopes configuration sources
+      --show-passing               Includes passing commits in output (hidden by default)
+      --stdin                      Reads a single commit message from standard input instead of a commit range (for a `commit-msg` git hook call site)
   -h, --help                       Print help (see more with '--help')
 
 

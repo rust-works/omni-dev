@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use tracing::debug;
 
 use crate::data::context::{
-    Ecosystem, FeatureContext, ProjectContext, ProjectConventions, ScopeDefinition,
+    CommitRules, Ecosystem, FeatureContext, ProjectContext, ProjectConventions, ScopeDefinition,
     ScopeRequirements,
 };
 use crate::utils::env::{EnvSource, SystemEnv};
@@ -392,6 +392,36 @@ pub fn load_scopes_file_strict(context_dir: &Path) -> Result<ScopesFile> {
         .with_context(|| format!("Failed to read scopes file: {}", scopes_path.display()))?;
     serde_yaml::from_str(&raw)
         .with_context(|| format!("Failed to parse scopes file: {}", scopes_path.display()))
+}
+
+/// Loads deterministic commit-lint rules from an optional config file.
+///
+/// Resolves `.omni-dev/commit-rules.yaml` via the standard config priority
+/// (local → project → home). Returns [`CommitRules::default`] when the file
+/// is absent or malformed — never errors, mirroring [`load_project_scopes`].
+pub fn load_commit_rules(context_dir: &Path) -> CommitRules {
+    let rules_path = resolve_config_file(context_dir, "commit-rules.yaml");
+    if !rules_path.exists() {
+        return CommitRules::default();
+    }
+
+    let rules_yaml = match fs::read_to_string(&rules_path) {
+        Ok(content) => content,
+        Err(e) => {
+            let path = rules_path.display();
+            tracing::warn!("Cannot read commit rules file {path}: {e}");
+            return CommitRules::default();
+        }
+    };
+
+    match serde_yaml::from_str::<CommitRules>(&rules_yaml) {
+        Ok(rules) => rules,
+        Err(e) => {
+            let path = rules_path.display();
+            tracing::warn!("Ignoring malformed commit rules file {path}: {e}");
+            CommitRules::default()
+        }
+    }
 }
 
 /// Merges ecosystem-detected default scopes into the given scope list.
@@ -1215,6 +1245,81 @@ scopes:
         // caller-gated step via `merge_ecosystem_scopes`, never implicit.
         assert_eq!(file.scopes.len(), 1);
         assert_eq!(file.scopes[0].name, "custom");
+        Ok(())
+    }
+
+    // ── load_commit_rules ──────────────────────────────────────────────
+
+    #[test]
+    fn load_commit_rules_no_file_returns_default() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+
+        let rules = load_commit_rules(dir.path());
+        assert_eq!(
+            rules.subject_max_len,
+            CommitRules::default().subject_max_len
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_commit_rules_with_valid_yaml() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let rules_yaml = r#"
+subject_max_len: 50
+types:
+  - feat
+  - fix
+require_scope: true
+forbidden_footers:
+  - "Co-Authored-By"
+"#;
+        std::fs::write(dir.path().join("commit-rules.yaml"), rules_yaml)?;
+
+        let rules = load_commit_rules(dir.path());
+        assert_eq!(rules.subject_max_len, 50);
+        assert!(rules.require_scope);
+        assert_eq!(rules.types, vec!["feat".to_string(), "fix".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_commit_rules_with_malformed_yaml_falls_back_to_default() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        std::fs::write(dir.path().join("commit-rules.yaml"), "not: [valid: yaml")?;
+
+        let rules = load_commit_rules(dir.path());
+        assert_eq!(
+            rules.subject_max_len,
+            CommitRules::default().subject_max_len
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_commit_rules_unreadable_file_falls_back_to_default() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // A directory named `commit-rules.yaml` exists, so it passes the
+        // `.exists()` check but fails `fs::read_to_string` (not a regular file).
+        std::fs::create_dir_all(dir.path().join("commit-rules.yaml"))?;
+
+        let rules = load_commit_rules(dir.path());
+        assert_eq!(
+            rules.subject_max_len,
+            CommitRules::default().subject_max_len
+        );
         Ok(())
     }
 
