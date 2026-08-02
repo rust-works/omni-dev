@@ -79,3 +79,13 @@ scopes:
     description: "GitHub Actions workflow files"
     examples: ["workflows: add commit check on push", "workflows: fix release permissions"]
     file_patterns: [".github/workflows/**"]
+
+# Paths that legitimately belong to no scope, per the `lib` convention:
+# generic/shared utilities and top-level entry points that don't belong to
+# any single subsystem. Checked by `omni-dev config scopes lint` (#1475).
+allow:
+  - "src/utils/**"
+  - "src/lib.rs"
+  - "src/test_support.rs"
+  - "src/bin/**"
+  - "src/templates/**"

@@ -1,8 +1,6 @@
 //! Configuration-related CLI commands.
 
-mod scopes;
-
-pub use scopes::UsageCommand;
+pub mod scopes;
 
 use std::path::Path;
 
@@ -25,23 +23,7 @@ pub enum ConfigSubcommands {
     /// AI model configuration and information.
     Models(ModelsCommand),
     /// Scope-taxonomy operations (scopes.yaml).
-    Scopes(ScopesCommand),
-}
-
-/// Scopes operations.
-#[derive(Parser)]
-pub struct ScopesCommand {
-    /// Scopes subcommand to execute.
-    #[command(subcommand)]
-    pub command: ScopesSubcommands,
-}
-
-/// Scopes subcommands.
-#[derive(Subcommand)]
-pub enum ScopesSubcommands {
-    /// Tallies declared commit scopes against `scopes.yaml`, reporting
-    /// unknown, unused, and scope-less commits.
-    Usage(UsageCommand),
+    Scopes(scopes::ScopesCommand),
 }
 
 /// Models operations.
@@ -81,15 +63,6 @@ impl ConfigCommand {
         match self.command {
             ConfigSubcommands::Models(models_cmd) => models_cmd.execute(),
             ConfigSubcommands::Scopes(scopes_cmd) => scopes_cmd.execute(repo),
-        }
-    }
-}
-
-impl ScopesCommand {
-    /// Executes the scopes command.
-    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
-        match self.command {
-            ScopesSubcommands::Usage(usage_cmd) => usage_cmd.execute(repo),
         }
     }
 }
