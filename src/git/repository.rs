@@ -78,6 +78,22 @@ impl GitRepository {
         Ok(status.clean)
     }
 
+    /// Returns the repo-relative paths of every file tracked in the git
+    /// index (what `git ls-files` would print), sorted and deduplicated.
+    ///
+    /// Deduplication matters because an unresolved merge conflict produces
+    /// one index entry per stage for the same path.
+    pub fn tracked_files(&self) -> Result<Vec<String>> {
+        let index = self.repo.index().context("Failed to open git index")?;
+        let mut files: Vec<String> = index
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+            .collect();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     /// Returns the repository path.
     pub fn path(&self) -> &std::path::Path {
         self.repo.path()
@@ -835,6 +851,65 @@ mod tests {
         );
         assert!(subjects.contains(&"commit 0"));
         assert!(subjects.contains(&"feature commit"));
+        Ok(())
+    }
+
+    // ── tracked_files (issue #1475) ─────────────────────────────────
+
+    #[test]
+    fn tracked_files_includes_committed_and_staged() -> Result<()> {
+        let work = init_tmp_repo();
+        let p = work.path();
+        std::fs::write(p.join("a.txt"), "committed")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        std::fs::write(p.join("b.txt"), "staged only")?;
+        git_in(p, &["add", "b.txt"]);
+
+        let repo = GitRepository::open_at(p)?;
+        let files = repo.tracked_files()?;
+        assert!(files.contains(&"a.txt".to_string()));
+        assert!(files.contains(&"b.txt".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_files_excludes_untracked() -> Result<()> {
+        let work = init_tmp_repo();
+        let p = work.path();
+        std::fs::write(p.join("a.txt"), "committed")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        std::fs::write(p.join("untracked.txt"), "never added")?;
+
+        let repo = GitRepository::open_at(p)?;
+        let files = repo.tracked_files()?;
+        assert!(!files.contains(&"untracked.txt".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_files_sorted() -> Result<()> {
+        let work = init_tmp_repo();
+        let p = work.path();
+        std::fs::write(p.join("zeta.txt"), "z")?;
+        std::fs::write(p.join("alpha.txt"), "a")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+
+        let repo = GitRepository::open_at(p)?;
+        let files = repo.tracked_files()?;
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted);
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_files_empty_repo() -> Result<()> {
+        let temp_dir = init_tmp_repo();
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        assert!(repo.tracked_files()?.is_empty());
         Ok(())
     }
 }

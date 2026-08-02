@@ -838,7 +838,11 @@ pub fn refine_message_scope(
 ///
 /// Returns `Some(max_specificity)` if at least one file matches the scope
 /// (after applying negation patterns), or `None` if no file matches.
-fn scope_matches_files(files: &[&str], patterns: &[String]) -> Option<usize> {
+///
+/// `pub(crate)` so `config scopes lint` (issue #1475) can reuse it
+/// per-pattern to detect dead `file_patterns` entries, rather than
+/// reimplementing the same globset matching logic.
+pub(crate) fn scope_matches_files(files: &[&str], patterns: &[String]) -> Option<usize> {
     let mut positive = Vec::new();
     let mut negative = Vec::new();
     for pat in patterns {
