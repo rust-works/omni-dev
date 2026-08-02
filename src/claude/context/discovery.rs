@@ -356,11 +356,52 @@ pub fn load_project_scopes_only(context_dir: &Path) -> Vec<ScopeDefinition> {
     }
 }
 
+/// Strictly-parsed `scopes.yaml`, including the optional `allow:` key.
+///
+/// Distinct from the private [`ScopesConfig`] used by [`load_project_scopes`]
+/// in two ways: it's `pub` (crosses the crate boundary for
+/// `omni-dev config scopes lint`, issue #1475), and it carries `allow` — a
+/// list of glob patterns for paths that legitimately belong to no scope.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ScopesFile {
+    /// The scope definitions, exactly as written in `scopes.yaml`.
+    #[serde(default)]
+    pub scopes: Vec<ScopeDefinition>,
+    /// Glob patterns for paths that need no covering scope.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+/// Loads `scopes.yaml` strictly, for `omni-dev config scopes lint`.
+///
+/// Unlike [`load_project_scopes`], a read or parse failure is propagated as
+/// an `Err` instead of logged-and-swallowed: a malformed `scopes.yaml` must
+/// be a loud lint failure, not a silent "zero scopes" fallback that happens
+/// to (correctly, but for the wrong reason) report every file unscoped.
+///
+/// Returns `Ok(ScopesFile::default())` when no `scopes.yaml` exists at any
+/// resolution tier — an absent file is not an error, only a malformed one.
+/// Never merges ecosystem defaults; whether to do so is the caller's
+/// decision (see [`merge_ecosystem_scopes`]).
+pub fn load_scopes_file_strict(context_dir: &Path) -> Result<ScopesFile> {
+    let scopes_path = resolve_config_file(context_dir, "scopes.yaml");
+    if !scopes_path.exists() {
+        return Ok(ScopesFile::default());
+    }
+    let raw = fs::read_to_string(&scopes_path)
+        .with_context(|| format!("Failed to read scopes file: {}", scopes_path.display()))?;
+    serde_yaml::from_str(&raw)
+        .with_context(|| format!("Failed to parse scopes file: {}", scopes_path.display()))
+}
+
 /// Merges ecosystem-detected default scopes into the given scope list.
 ///
 /// Detects the project ecosystem from marker files (Cargo.toml, package.json, etc.)
 /// and adds default scopes for that ecosystem, skipping any that already exist by name.
-fn merge_ecosystem_scopes(scopes: &mut Vec<ScopeDefinition>, repo_path: &Path) {
+///
+/// `pub(crate)` so `omni-dev config scopes lint` (issue #1475) can call this
+/// as an explicit, caller-gated step when `--no-project-only` is passed.
+pub(crate) fn merge_ecosystem_scopes(scopes: &mut Vec<ScopeDefinition>, repo_path: &Path) {
     let ecosystem_scopes: Vec<(&str, &str, Vec<&str>)> = if repo_path.join("Cargo.toml").exists() {
         vec![
             (
@@ -1089,6 +1130,91 @@ scopes:
         let scopes = load_project_scopes_only(&config_dir);
         let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["custom"], "must not include ecosystem defaults");
+        Ok(())
+    }
+
+    // ── load_scopes_file_strict (issue #1475) ─────────────────────────
+
+    #[test]
+    fn load_scopes_file_strict_parses_scopes_and_allow() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let scopes_yaml = r#"
+scopes:
+  - name: custom
+    description: Custom scope
+    examples: []
+    file_patterns:
+      - "src/custom/**"
+allow:
+  - "src/lib.rs"
+  - "src/bin/**"
+"#;
+        std::fs::write(dir.path().join("scopes.yaml"), scopes_yaml)?;
+
+        let file = load_scopes_file_strict(dir.path())?;
+        assert_eq!(file.scopes.len(), 1);
+        assert_eq!(file.scopes[0].name, "custom");
+        assert_eq!(
+            file.allow,
+            vec!["src/lib.rs".to_string(), "src/bin/**".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_scopes_file_strict_missing_file_returns_default() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // No scopes.yaml under `dir`; `resolve_config_file`'s XDG/legacy-home
+        // fallback tiers may still find a real one on the machine running
+        // this test (same non-hermetic reality `load_project_scopes_no_file`
+        // above already tolerates) — this only proves absence at the
+        // project tier is not an error, not that the result is empty.
+        assert!(load_scopes_file_strict(dir.path()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn load_scopes_file_strict_malformed_yaml_errors() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // Unlike `load_project_scopes`, which swallows this into an empty
+        // Vec, the strict loader must surface it as a loud failure.
+        std::fs::write(dir.path().join("scopes.yaml"), "scopes: [not valid")?;
+        assert!(load_scopes_file_strict(dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn load_scopes_file_strict_never_merges_ecosystem_defaults() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+        let scopes_yaml = r#"
+scopes:
+  - name: custom
+    description: Custom scope
+    examples: []
+    file_patterns:
+      - "src/custom/**"
+"#;
+        std::fs::write(dir.path().join("scopes.yaml"), scopes_yaml)?;
+
+        let file = load_scopes_file_strict(dir.path())?;
+        // No ecosystem `cargo`/`lib`/... scopes leak in even though a
+        // Cargo.toml marker is present — merging is an explicit,
+        // caller-gated step via `merge_ecosystem_scopes`, never implicit.
+        assert_eq!(file.scopes.len(), 1);
+        assert_eq!(file.scopes[0].name, "custom");
         Ok(())
     }
 
