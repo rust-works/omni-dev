@@ -201,7 +201,7 @@ jobs:
     # worktree-system-deps installs the ALSA headers only on the merge-base
     # recompute path, for fork points that predate the cpal/voice removal
     # (#980); a no-op once the merge-base is itself cpal-free.
-    - uses: action-works/omni-dev-coverage-check@v1
+    - uses: action-works/omni-dev-coverage-check@v1.1
       with:
         fail-under-lines: 30
         worktree-system-deps: libasound2-dev
