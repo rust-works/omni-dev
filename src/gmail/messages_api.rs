@@ -26,6 +26,14 @@ pub const MAX_PAGE_LIMIT: usize = 500;
 /// [`MessagesApi::search_all`], even when the caller passes `limit = 0`.
 pub const HARD_CAP: usize = 10_000;
 
+/// Default `limit` for a search when the caller doesn't specify one.
+///
+/// Shared between the CLI (`gmail search`'s `--limit` default) and the MCP
+/// `gmail_search` tool (its `limit` param default when omitted), so an
+/// unset limit means the same "quota-safe 50" thing in both surfaces rather
+/// than silently falling back to `0` (fetch-to-[`HARD_CAP`]) in one of them.
+pub const DEFAULT_SEARCH_LIMIT: usize = 50;
+
 /// The `format` query parameter accepted by `messages.get`.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum MessageFormat {

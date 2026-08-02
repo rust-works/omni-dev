@@ -7,7 +7,7 @@ use clap::Parser;
 
 use crate::cli::gmail::format::{output_as, OutputFormat};
 use crate::gmail::client::GmailClient;
-use crate::gmail::messages_api::{MessageSummary, MessagesApi};
+use crate::gmail::messages_api::{MessageSummary, MessagesApi, DEFAULT_SEARCH_LIMIT};
 use crate::gmail::types::MessageRef;
 
 /// Maximum snippet length shown in the table view before truncation.
@@ -34,7 +34,7 @@ pub struct SearchCommand {
 
     /// Maximum results to return. `0` means "fetch every match" (capped, like
     /// Datadog's log/event search, at a hard ceiling to bound run time and quota).
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
     pub limit: usize,
 
     /// Enrich each hit with From/Subject/Date/snippet via one extra
