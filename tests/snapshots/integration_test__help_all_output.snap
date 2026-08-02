@@ -2885,6 +2885,7 @@ Usage: config <COMMAND>
 
 Commands:
   models  AI model configuration and information
+  scopes  Scope-taxonomy operations (scopes.yaml)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2918,6 +2919,41 @@ Usage: show [OPTIONS]
 Options:
       --embedded-only  Show only the embedded `models.yaml` verbatim, ignoring any user/project overrides
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev config scopes - Scope-taxonomy operations (scopes.yaml)
+
+Scope-taxonomy operations (scopes.yaml)
+
+Usage: scopes <COMMAND>
+
+Commands:
+  usage  Tallies declared commit scopes against `scopes.yaml`, reporting unknown, unused, and scope-less commits
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev config scopes usage - Tallies declared commit scopes against `scopes.yaml`, reporting unknown, unused, and scope-less commits
+
+Tallies declared commit scopes against `scopes.yaml`, reporting unknown, unused, and scope-less commits
+
+Usage: usage [OPTIONS] [COMMIT_RANGE]
+
+Arguments:
+  [COMMIT_RANGE]  Commit range to analyze (e.g., HEAD~300..HEAD, abc123..def456). Defaults to the entire history reachable from HEAD
+
+Options:
+  -n, --max-count <N>              Limits analysis to the newest N commits reachable from HEAD (ignored when COMMIT_RANGE is given). Useful for comparing the answer at different window sizes, e.g. `-n 150` vs `-n 400`
+      --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+      --project-only               Excludes ecosystem default scopes (cargo/core/lib/test, …) from the known set, so they are reported as unknown rather than accepted
+  -o, --output <OUTPUT>            Output format [default: text] [possible values: text, json, yaml]
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================

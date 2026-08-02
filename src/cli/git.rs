@@ -252,6 +252,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_config_scopes_usage() {
+        let cli = Cli::try_parse_from(["omni-dev", "config", "scopes", "usage"]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_config_scopes_usage_with_options() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "config",
+            "scopes",
+            "usage",
+            "-n",
+            "300",
+            "--project-only",
+            "-o",
+            "json",
+        ]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_rejects_config_scopes_usage_range_and_max_count_together() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "config",
+            "scopes",
+            "usage",
+            "HEAD~10..HEAD",
+            "-n",
+            "300",
+        ]);
+        assert!(
+            cli.is_err(),
+            "COMMIT_RANGE and -n/--max-count must be mutually exclusive"
+        );
+    }
+
+    #[test]
     fn cli_parses_help_all() {
         let cli = Cli::try_parse_from(["omni-dev", "help-all"]);
         assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
