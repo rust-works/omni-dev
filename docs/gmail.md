@@ -158,9 +158,12 @@ project's rendering axis (see [ADR-0046](adrs/adr-0046.md)); the values
 match Gmail's own wire values verbatim: `minimal` (only
 `id`/`threadId`/`labelIds`/`sizeEstimate` — no headers or body), `metadata`
 (headers + snippet only), `full` (default; parsed MIME structure), or `raw`
-(base64url-encoded RFC 2822 source — the cheapest way to get a
-byte-for-byte copy). `--out-file` writes a flat text rendering to disk
-instead of stdout.
+(the RFC 2822 source, base64url-encoded over the wire — the cheapest way to
+get a byte-for-byte copy). `--out-file` writes a flat text rendering to disk
+instead of stdout for `minimal`/`metadata`/`full`; for `raw` it decodes the
+base64url payload first and writes the literal RFC 2822 bytes, so
+`--detail raw --out-file message.eml` produces a genuine `.eml` rather than
+still-encoded text.
 
 ### MCP equivalent(s)
 
