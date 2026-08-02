@@ -37,6 +37,18 @@ pub const GMAIL_CLIENT_SECRET: &str = "GMAIL_CLIENT_SECRET";
 pub const GMAIL_REFRESH_TOKEN: &str = "GMAIL_REFRESH_TOKEN";
 /// Environment variable / settings key recording the scope granted at login.
 pub const GMAIL_SCOPE: &str = "GMAIL_SCOPE";
+/// Environment variable overriding the real Gmail API host.
+///
+/// Process-env only — never written to `settings.json` by `auth login`,
+/// unlike the four keys above (`crate::gmail::client::GmailClient`'s
+/// default base URL). Useful for:
+/// - Tests that point at a wiremock server (e.g. `http://127.0.0.1:PORT`).
+/// - Environments where outbound traffic must go through a forced proxy.
+///
+/// Mirrors `DATADOG_API_URL` (`crate::datadog::auth`); unlike Datadog, Gmail
+/// has no per-tenant site/region the override is *deriving from* — it's a
+/// flat replacement of the one real host, not a site substitution.
+pub const GMAIL_API_URL: &str = "GMAIL_API_URL";
 
 /// Google's OAuth2 authorization endpoint.
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";

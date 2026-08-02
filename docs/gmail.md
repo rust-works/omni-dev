@@ -53,6 +53,7 @@ self-scoped read/label-modify request). See
 | `GMAIL_CLIENT_SECRET`   | OAuth2 client secret for the same client (required).            | _none_  |
 | `GMAIL_REFRESH_TOKEN`   | Written by `gmail auth login`; not meant to be hand-set.        | _none_  |
 | `GMAIL_SCOPE`           | Written by `gmail auth login`; records the granted scope (`gmail.readonly` or `gmail.modify`) so `auth status` can report it without a network call. | _none_ |
+| `GMAIL_API_URL`         | Explicit API base URL; overrides the real `gmail.googleapis.com` host entirely. Use for a proxy or a forced egress gateway. | _unset_ |
 
 `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET` must be set (in your shell profile,
 or in `~/.omni-dev/settings.json`'s `env` map) before running

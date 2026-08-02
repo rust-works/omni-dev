@@ -14,6 +14,7 @@ use url::Url;
 use crate::gmail::auth::{GmailCredentials, GmailSession};
 use crate::gmail::error::GmailError;
 use crate::request_log;
+use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
 
 /// HTTP client for the Gmail v1 REST API.
@@ -36,8 +37,12 @@ impl std::fmt::Debug for GmailClient {
 
 impl GmailClient {
     /// The real Gmail API host. Unlike Datadog, there is no per-tenant
-    /// site/region override for Gmail — [`Self::new`]'s `base_url`
-    /// parameter exists purely as a test seam.
+    /// site/region this is *derived* from — [`Self::DEFAULT_BASE_URL`] is
+    /// the one real host, overridable wholesale via `GMAIL_API_URL`
+    /// (`crate::gmail::auth::GMAIL_API_URL`; see
+    /// [`Self::from_credentials_with`]) rather than site-substituted like
+    /// Datadog's `DATADOG_API_URL`. [`Self::new`]'s `base_url` parameter is
+    /// the lower-level seam both the override and tests go through.
     const DEFAULT_BASE_URL: &'static str = "https://gmail.googleapis.com";
 
     /// Builds a client against `base_url` with already-loaded credentials.
@@ -57,10 +62,31 @@ impl GmailClient {
         })
     }
 
-    /// Creates a client against the real Gmail API host from stored
-    /// credentials.
+    /// Creates a client from stored credentials against the real Gmail API
+    /// host.
+    ///
+    /// Respects `GMAIL_API_URL` as an optional override: when set (and
+    /// non-empty) in the process environment it replaces
+    /// [`Self::DEFAULT_BASE_URL`] wholesale. Added per PR #1466 review —
+    /// without it, exercising the CLI's output shapes required a real
+    /// Google Cloud project, and there was no way to route through a forced
+    /// egress proxy.
     pub fn from_credentials(credentials: &GmailCredentials) -> Result<Self> {
-        Self::new(Self::DEFAULT_BASE_URL, credentials)
+        Self::from_credentials_with(&SystemEnv, credentials)
+    }
+
+    /// [`from_credentials`](Self::from_credentials) over an injected
+    /// [`EnvSource`], so tests can exercise the `GMAIL_API_URL` override via
+    /// `MapEnv` without mutating the process environment.
+    pub(crate) fn from_credentials_with(
+        env: &impl EnvSource,
+        credentials: &GmailCredentials,
+    ) -> Result<Self> {
+        let base_url = env
+            .var(crate::gmail::auth::GMAIL_API_URL)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string());
+        Self::new(&base_url, credentials)
     }
 
     /// Returns the API base URL (without trailing slash).
@@ -281,7 +307,30 @@ mod tests {
 
     #[test]
     fn from_credentials_uses_gmail_api_host() {
-        let client = GmailClient::from_credentials(&test_credentials()).unwrap();
+        // Via a fresh MapEnv, not from_credentials()'s real SystemEnv — a
+        // stray GMAIL_API_URL in the actual process environment must not
+        // make this test flaky (mirrors the Datadog precedent,
+        // from_credentials_builds_base_url_from_site).
+        let env = crate::test_support::env::MapEnv::new();
+        let client = GmailClient::from_credentials_with(&env, &test_credentials()).unwrap();
+        assert_eq!(client.base_url(), "https://gmail.googleapis.com");
+    }
+
+    #[test]
+    fn from_credentials_honours_api_url_override() {
+        let env = crate::test_support::env::MapEnv::new().with(
+            crate::gmail::auth::GMAIL_API_URL,
+            "http://proxy.example:8080",
+        );
+        let client = GmailClient::from_credentials_with(&env, &test_credentials()).unwrap();
+        assert_eq!(client.base_url(), "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn from_credentials_ignores_empty_api_url_override() {
+        let env =
+            crate::test_support::env::MapEnv::new().with(crate::gmail::auth::GMAIL_API_URL, "");
+        let client = GmailClient::from_credentials_with(&env, &test_credentials()).unwrap();
         assert_eq!(client.base_url(), "https://gmail.googleapis.com");
     }
 
