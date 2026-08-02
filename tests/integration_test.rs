@@ -1749,3 +1749,287 @@ fn worktree_failures_still_record() -> Result<()> {
     assert!(rec["context"].get("repo").is_none(), "rec: {rec}");
     Ok(())
 }
+
+// ── config scopes usage (#1476) ─────────────────────────────────────────
+
+/// Writes `yaml` as `<repo_path>/.omni-dev/scopes.yaml`.
+fn write_scopes_yaml(repo_path: &std::path::Path, yaml: &str) {
+    let omni_dir = repo_path.join(".omni-dev");
+    fs::create_dir_all(&omni_dir).unwrap();
+    fs::write(omni_dir.join("scopes.yaml"), yaml).unwrap();
+}
+
+#[test]
+fn binary_config_scopes_usage_json_round_trip() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    write_scopes_yaml(
+        &repo.repo_path,
+        r#"
+scopes:
+  - name: cli
+    description: CLI
+    examples: []
+    file_patterns: ["src/cli/**"]
+  - name: unused-scope
+    description: Never used
+    examples: []
+    file_patterns: []
+"#,
+    );
+    repo.add_commit("feat(cli): add flag", "a")?;
+    repo.add_commit("fix(mystery): patch bug", "b")?;
+    repo.add_commit("docs: update readme", "c")?;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "--project-only",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(report["total_commits"], 3);
+    assert_eq!(report["scope_less_count"], 1);
+
+    let declared = report["declared"].as_array().unwrap();
+    let cli_count = declared
+        .iter()
+        .find(|sc| sc["name"] == "cli")
+        .and_then(|sc| sc["count"].as_u64());
+    assert_eq!(cli_count, Some(1));
+
+    let unknown = report["unknown"].as_array().unwrap();
+    assert!(
+        unknown.iter().any(|sc| sc["name"] == "mystery"),
+        "unknown: {unknown:?}"
+    );
+
+    let unused = report["unused"].as_array().unwrap();
+    assert!(
+        unused.iter().any(|u| u == "unused-scope"),
+        "unused: {unused:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn binary_config_scopes_usage_empty_range_exits_zero() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("feat(cli): add flag", "a")?;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "HEAD..HEAD",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(report["total_commits"], 0);
+    assert_eq!(report["declared"], serde_json::json!([]));
+    assert_eq!(report["scope_less_count"], 0);
+    Ok(())
+}
+
+#[test]
+fn binary_config_scopes_usage_reads_true_first_line_not_folded_paragraph() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    // No blank line before the second line — `git log --format=%s` folds this
+    // into one inflated "subject" (the historical bug behind commit
+    // 6413fd73); the raw first-line extraction used here must not.
+    repo.add_commit(
+        "feat(cli): add flag\nfeat(sneaky): this continuation line must never be tallied as its own scope",
+        "content",
+    )?;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(report["total_commits"], 1);
+    assert_eq!(report["scope_less_count"], 0);
+    let declared = report["declared"].as_array().unwrap();
+    assert_eq!(declared.len(), 1, "declared: {declared:?}");
+    assert_eq!(declared[0]["name"], "cli");
+    assert_eq!(declared[0]["count"], 1);
+    assert!(
+        !declared.iter().any(|sc| sc["name"] == "sneaky"),
+        "must not tally the continuation line's scope: {declared:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn binary_config_scopes_usage_excludes_merge_commits() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    let base = repo.add_commit("feat(cli): base commit", "a")?;
+    let base_commit = repo.repo.find_commit(base)?;
+    let sig = Signature::now("Test User", "test@example.com")?;
+
+    fs::write(repo.repo_path.join("feature.txt"), "feature")?;
+    let mut index = repo.repo.index()?;
+    index.add_path(std::path::Path::new("feature.txt"))?;
+    index.write()?;
+    let feature_tree = repo.repo.find_tree(index.write_tree()?)?;
+    let feature_commit_id = repo.repo.commit(
+        None,
+        &sig,
+        &sig,
+        "feat(feature): add feature file",
+        &feature_tree,
+        &[&base_commit],
+    )?;
+    let feature_commit = repo.repo.find_commit(feature_commit_id)?;
+
+    // A real two-parent merge commit — TestRepo::add_commit only builds a
+    // linear chain, so this is constructed directly. Its subject deliberately
+    // carries a scope that must never surface in the tally.
+    repo.repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "merge(bogus): merge feature into main",
+        &feature_tree,
+        &[&base_commit, &feature_commit],
+    )?;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(report["total_commits"], 2, "report: {report}");
+    let declared = report["declared"].as_array().unwrap();
+    assert!(
+        !declared.iter().any(|sc| sc["name"] == "bogus"),
+        "merge commit must be excluded: {declared:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn binary_config_scopes_usage_project_only_flag() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    fs::write(
+        repo.repo_path.join("Cargo.toml"),
+        "[package]\nname = \"x\"\n",
+    )?;
+    write_scopes_yaml(
+        &repo.repo_path,
+        r"
+scopes:
+  - name: custom
+    description: Custom
+    examples: []
+    file_patterns: []
+",
+    );
+    repo.add_commit("chore(lib): tweak internals", "a")?;
+
+    // Without --project-only, `lib` is an accepted ecosystem default.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    let unknown = report["unknown"].as_array().unwrap();
+    assert!(
+        !unknown.iter().any(|sc| sc["name"] == "lib"),
+        "lib should be accepted as an ecosystem default: {unknown:?}"
+    );
+
+    // With --project-only, `lib` is absent from scopes.yaml, so it's unknown.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args([
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
+            "config",
+            "scopes",
+            "usage",
+            "--project-only",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    let unknown = report["unknown"].as_array().unwrap();
+    assert!(
+        unknown.iter().any(|sc| sc["name"] == "lib"),
+        "--project-only must exclude ecosystem defaults: {unknown:?}"
+    );
+    Ok(())
+}

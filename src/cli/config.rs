@@ -1,5 +1,11 @@
 //! Configuration-related CLI commands.
 
+mod scopes;
+
+pub use scopes::UsageCommand;
+
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -18,6 +24,24 @@ pub struct ConfigCommand {
 pub enum ConfigSubcommands {
     /// AI model configuration and information.
     Models(ModelsCommand),
+    /// Scope-taxonomy operations (scopes.yaml).
+    Scopes(ScopesCommand),
+}
+
+/// Scopes operations.
+#[derive(Parser)]
+pub struct ScopesCommand {
+    /// Scopes subcommand to execute.
+    #[command(subcommand)]
+    pub command: ScopesSubcommands,
+}
+
+/// Scopes subcommands.
+#[derive(Subcommand)]
+pub enum ScopesSubcommands {
+    /// Tallies declared commit scopes against `scopes.yaml`, reporting
+    /// unknown, unused, and scope-less commits.
+    Usage(UsageCommand),
 }
 
 /// Models operations.
@@ -48,9 +72,24 @@ pub struct ShowCommand {
 
 impl ConfigCommand {
     /// Executes the config command.
-    pub fn execute(self) -> Result<()> {
+    ///
+    /// `repo` is the repository location resolved once at the CLI boundary
+    /// (`None` = current working directory); threaded explicitly into the
+    /// `Scopes` subtree, the first `config` leaf that reads git history.
+    /// `Models` ignores it — it never touches a repository.
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
             ConfigSubcommands::Models(models_cmd) => models_cmd.execute(),
+            ConfigSubcommands::Scopes(scopes_cmd) => scopes_cmd.execute(repo),
+        }
+    }
+}
+
+impl ScopesCommand {
+    /// Executes the scopes command.
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        match self.command {
+            ScopesSubcommands::Usage(usage_cmd) => usage_cmd.execute(repo),
         }
     }
 }

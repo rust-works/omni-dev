@@ -319,31 +319,41 @@ fn config_source_label_with(
 /// Resolves `scopes.yaml` via the standard config priority (local → project → home),
 /// then detects the project ecosystem and merges default scopes for that ecosystem.
 pub fn load_project_scopes(context_dir: &Path, repo_path: &Path) -> Vec<ScopeDefinition> {
-    let scopes_path = resolve_config_file(context_dir, "scopes.yaml");
-    let mut scopes = if scopes_path.exists() {
-        let scopes_yaml = match fs::read_to_string(&scopes_path) {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!("Cannot read scopes file {}: {e}", scopes_path.display());
-                return vec![];
-            }
-        };
-        match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
-            Ok(config) => config.scopes,
-            Err(e) => {
-                tracing::warn!(
-                    "Ignoring malformed scopes file {}: {e}",
-                    scopes_path.display()
-                );
-                vec![]
-            }
-        }
-    } else {
-        vec![]
-    };
-
+    let mut scopes = load_project_scopes_only(context_dir);
     merge_ecosystem_scopes(&mut scopes, repo_path);
     scopes
+}
+
+/// Loads only the scopes explicitly defined in `scopes.yaml`, without merging
+/// ecosystem defaults (`cargo`/`lib`/`core`/`test`, …) the way
+/// [`load_project_scopes`] does.
+///
+/// For callers that need to distinguish "a human wrote this in scopes.yaml"
+/// from "omni-dev synthesized this from the detected ecosystem" — e.g.
+/// reporting which project-defined scopes go unused, which must never flag
+/// an ecosystem default the project never asked for.
+pub fn load_project_scopes_only(context_dir: &Path) -> Vec<ScopeDefinition> {
+    let scopes_path = resolve_config_file(context_dir, "scopes.yaml");
+    if !scopes_path.exists() {
+        return vec![];
+    }
+    let scopes_yaml = match fs::read_to_string(&scopes_path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!("Cannot read scopes file {}: {e}", scopes_path.display());
+            return vec![];
+        }
+    };
+    match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
+        Ok(config) => config.scopes,
+        Err(e) => {
+            tracing::warn!(
+                "Ignoring malformed scopes file {}: {e}",
+                scopes_path.display()
+            );
+            vec![]
+        }
+    }
 }
 
 /// Merges ecosystem-detected default scopes into the given scope list.
@@ -1050,6 +1060,35 @@ scopes:
         let scopes = load_project_scopes(dir.path(), dir.path());
         // Should still get ecosystem defaults
         assert!(!scopes.is_empty());
+        Ok(())
+    }
+
+    // ── load_project_scopes_only ─────────────────────────────────────
+
+    #[test]
+    fn load_project_scopes_only_skips_ecosystem_merge() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir)?;
+
+        let scopes_yaml = r#"
+scopes:
+  - name: custom
+    description: Custom scope
+    examples: []
+    file_patterns:
+      - "src/custom/**"
+"#;
+        std::fs::write(config_dir.join("scopes.yaml"), scopes_yaml)?;
+        // Cargo.toml present, but load_project_scopes_only must not merge it in.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+
+        let scopes = load_project_scopes_only(&config_dir);
+        let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["custom"], "must not include ecosystem defaults");
         Ok(())
     }
 
