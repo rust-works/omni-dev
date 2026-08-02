@@ -88,6 +88,7 @@ $ omni-dev gmail auth login --modify
 $ omni-dev gmail auth status
 Checking Gmail authentication...
 Authenticated as: user@example.com
+Messages in mailbox: 5842
 Granted scope: gmail.readonly
 ```
 
