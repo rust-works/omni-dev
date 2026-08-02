@@ -24,7 +24,7 @@ use crate::cli::gmail::helpers::create_client;
 use crate::gmail::auth;
 use crate::gmail::client::GmailClient;
 use crate::gmail::labels_api::LabelsApi;
-use crate::gmail::messages_api::{MessageFormat, MessagesApi};
+use crate::gmail::messages_api::{MessageFormat, MessagesApi, DEFAULT_SEARCH_LIMIT};
 use crate::gmail::threads_api::{ThreadFormat, ThreadsApi};
 
 use super::error::tool_error;
@@ -44,8 +44,8 @@ pub struct GmailSearchParams {
     /// Gmail search query, same syntax as the Gmail search box (e.g.
     /// `label:finance after:2026/01/01`). Required.
     pub query: String,
-    /// Maximum results. `0` (or omitted) means fetch every match up to the
-    /// hard cap. Defaults to 50.
+    /// Maximum results. Defaults to 50 when omitted; `0` explicitly means
+    /// fetch every match up to the hard cap (10000).
     #[serde(default)]
     pub limit: Option<usize>,
     /// When `true`, enrich each hit with From/Subject/Date/snippet via one
@@ -123,8 +123,9 @@ impl OmniDevServer {
                        search box, e.g. `label:finance after:2026/01/01`). Returns only \
                        id/threadId per hit by default (ids-only, quota-safe). Set `enrich: true` \
                        to add From/Subject/Date/snippet — this costs one extra `messages.get` \
-                       request per hit, bounded by `concurrency` (default 4). `limit` of 0 (or \
-                       omitted) auto-paginates up to a hard cap (10000); defaults to 50. \
+                       request per hit, bounded by `concurrency` (default 4). `limit` defaults \
+                       to 50 when omitted; pass `0` explicitly to auto-paginate up to a hard cap \
+                       (10000) — expensive combined with `enrich: true`, use deliberately. \
                        Read-only. Mirrors `omni-dev gmail search`. Output is YAML."
     )]
     pub async fn gmail_search(
@@ -219,7 +220,7 @@ fn run_auth_status() -> Result<String> {
 }
 
 async fn run_search(client: &GmailClient, params: &GmailSearchParams) -> Result<String> {
-    let limit = params.limit.unwrap_or(0);
+    let limit = params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
     let api = MessagesApi::new(client);
     if params.enrich.unwrap_or(false) {
         let concurrency = params.concurrency.unwrap_or(4);
@@ -465,6 +466,39 @@ mod tests {
         .unwrap();
         assert!(yaml.contains("id: m1"));
         assert!(yaml.contains("threadId: t1"));
+    }
+
+    #[tokio::test]
+    async fn run_search_omitted_limit_defaults_to_50_not_hard_cap() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("maxResults", "50"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": [{"id": "m1", "threadId": "t1"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No mock matching any other `maxResults` value — if an omitted
+        // `limit` fell back to 0 (fetch-to-HARD_CAP) instead of the CLI's
+        // 50, the request above wouldn't match and wiremock would 404.
+
+        let yaml = run_search(
+            &client,
+            &GmailSearchParams {
+                query: "label:finance".to_string(),
+                limit: None,
+                enrich: None,
+                concurrency: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("id: m1"));
     }
 
     #[tokio::test]
