@@ -4268,7 +4268,7 @@ Options:
       --query <QUERY>              Gmail search query (same syntax as the Gmail search box, e.g. `label:finance after:2026/01/01`)
       --limit <LIMIT>              Maximum results to return. `0` means "fetch every match" (capped, like Datadog's log/event search, at a hard ceiling to bound run time and quota) [default: 50]
       --enrich                     Enrich each hit with From/Subject/Date/snippet via one extra `messages.get` request per hit. Without this flag, `search` returns only `id`/`threadId` — the cheap, quota-safe default. Combined with `--limit 0` this can issue thousands of requests; use deliberately
-      --concurrency <CONCURRENCY>  Bounds concurrent `messages.get` calls when `--enrich` is set (has no effect otherwise). Modelled on `confluence download`'s `--concurrency` [default: 4]
+      --concurrency <CONCURRENCY>  Bounds concurrent `messages.get` calls when `--enrich` is set (has no effect otherwise). Modelled on `confluence download`'s `--concurrency`. Clamped to 1..=50 — Gmail's quota is 250 units/user/second and `messages.get` costs 5 units, so a higher value could burst past it [default: 4]
   -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                       Print help (see more with '--help')
 
