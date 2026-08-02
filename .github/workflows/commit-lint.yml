@@ -1,0 +1,34 @@
+name: Commit Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-lint:
+    name: Commit Message Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Deterministic, no-AI validation (#1472), replacing the AI-powered
+      # `command: check` invocation this workflow used to run: across 40
+      # runs it caught zero commit-message defects and produced one false
+      # positive (an Anthropic billing outage), while re-judging messages an
+      # AI had already written against the same guidelines. `command: lint`
+      # (v1.4+) runs `omni-dev git commit message lint` instead — no API
+      # key, no network call beyond fetching the omni-dev binary itself.
+      - uses: action-works/omni-dev-commit-check@v1.4
+        with:
+          command: lint
+          strict: true
