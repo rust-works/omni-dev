@@ -255,7 +255,7 @@ The automated release pipeline requires these GitHub secrets:
 
 - `.github/workflows/ci.yml` - Quality checks
 - `.github/workflows/release.yml` - Release creation and publishing
-- `.github/workflows/commit-check.yml` - PR commit message validation
+- `.github/workflows/commit-lint.yml` - PR commit message validation
 
 ## Security Notes
 
