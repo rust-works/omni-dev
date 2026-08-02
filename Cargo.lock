@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "omni-dev"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "anyhow",
  "arboard",
