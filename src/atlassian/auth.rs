@@ -228,7 +228,13 @@ pub(crate) mod test_util {
     /// Mutex shared by every test that mutates `HOME`, `OMNI_DEV_PROFILE`, or
     /// the Atlassian credential env vars. Serialises those tests against each
     /// other so parallel execution doesn't race on process-wide env state.
-    pub(crate) static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] rather
+    /// than declaring its own `Mutex<()>`, so Atlassian's HOME mutation also
+    /// serialises against every other domain's (Datadog, Gmail, …) — see
+    /// that static's doc comment for why an independent mutex here provides
+    /// no real exclusion.
+    pub(crate) static AUTH_ENV_MUTEX: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
     /// RAII guard: snapshots `HOME`, `OMNI_DEV_PROFILE`, and every Atlassian
     /// credential env var on construction and restores them on drop.
