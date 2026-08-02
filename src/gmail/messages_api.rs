@@ -8,6 +8,9 @@
 //! so URL construction follows the free `build_*_url` pattern from
 //! `src/datadog/monitors_api.rs` instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures::stream::StreamExt as _;
 use serde::Serialize;
@@ -230,12 +233,33 @@ impl<'a> MessagesApi<'a> {
         // shape — this is what the `implementation of FnOnce is not
         // general enough` error was pointing at.
         let ids: Vec<String> = list.messages.into_iter().map(|m| m.id).collect();
+        // `buffered` refills its concurrency window from `ids` as each slot
+        // frees, regardless of whether the item that just freed it errored —
+        // left unchecked, one failed hydration wouldn't stop the remaining
+        // fetches from firing, defeating the point of bounding concurrency
+        // against Gmail's per-second quota. `failed` is checked once per
+        // item before its network call: only fetches not yet dispatched at
+        // the time of the first failure are skipped, so already in-flight
+        // ones (up to `concurrency` many) still run to completion.
+        let failed = Arc::new(AtomicBool::new(false));
         futures::stream::iter(ids)
-            .map(|id| async move {
-                let message = self
-                    .get(&id, MessageFormat::Metadata, &["From", "Subject", "Date"])
-                    .await?;
-                Ok::<_, anyhow::Error>(MessageSummary::from_message(&message))
+            .map(|id| {
+                let failed = Arc::clone(&failed);
+                async move {
+                    if failed.load(Ordering::Acquire) {
+                        return Err(anyhow::anyhow!(
+                            "skipped hydrating message {id}: an earlier hydration request failed"
+                        ));
+                    }
+                    let result = self
+                        .get(&id, MessageFormat::Metadata, &["From", "Subject", "Date"])
+                        .await
+                        .map(|message| MessageSummary::from_message(&message));
+                    if result.is_err() {
+                        failed.store(true, Ordering::Release);
+                    }
+                    result
+                }
             })
             .buffered(concurrency)
             .collect::<Vec<_>>()
@@ -911,6 +935,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn search_summaries_stops_dispatching_new_fetches_after_a_failure() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(page_body(&["m1", "m2", "m3", "m4", "m5"], None)),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m2"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        // m3/m4/m5 have no mounted mock. With concurrency = 1, `buffered`
+        // only creates the next fetch once the previous one completes, so
+        // m3 is only dispatched after m2's failure has set the flag — if
+        // the short-circuit regresses, m3 (and m4/m5) would hit the server
+        // with no matching mock and this MockServer would panic on drop.
+
+        let err = MessagesApi::new(&client)
+            .search_summaries(None, &[], 10, 1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500") || err.to_string().contains("boom"));
+
+        let requests = server.received_requests().await.unwrap();
+        let hydration_requests = requests
+            .iter()
+            .filter(|r| r.url.path().starts_with("/gmail/v1/users/me/messages/"))
+            .count();
+        assert_eq!(
+            hydration_requests, 2,
+            "only m1 and m2 should have been fetched before the failure stopped further dispatch"
+        );
     }
 
     // ── batch_modify ──────────────────────────────────────────────────
