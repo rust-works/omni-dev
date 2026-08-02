@@ -46,7 +46,9 @@ pub struct SearchCommand {
 
     /// Bounds concurrent `messages.get` calls when `--enrich` is set (has
     /// no effect otherwise). Modelled on `confluence download`'s
-    /// `--concurrency`.
+    /// `--concurrency`. Clamped to 1..=50 — Gmail's quota is 250
+    /// units/user/second and `messages.get` costs 5 units, so a higher
+    /// value could burst past it.
     #[arg(long, default_value_t = DEFAULT_ENRICH_CONCURRENCY)]
     pub concurrency: usize,
 
