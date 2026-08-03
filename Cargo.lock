@@ -2450,6 +2450,7 @@ dependencies = [
  "futures",
  "git2",
  "globset",
+ "http",
  "insta",
  "mime_guess",
  "nix",
