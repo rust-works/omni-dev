@@ -52,6 +52,10 @@ pub(crate) enum SyncAction {
     Deleted { id: String },
     /// A previously soft-deleted message reappeared in a listing.
     Undeleted { id: String },
+    /// `--dry-run` only: a message would have been soft-deleted.
+    WouldDelete { id: String },
+    /// `--dry-run` only: a message would have been undeleted.
+    WouldUndelete { id: String },
     /// An informational note about the run (e.g. why reconciliation ran).
     Note { message: String },
 }

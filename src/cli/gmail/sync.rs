@@ -141,6 +141,8 @@ fn render_report_text(report: &SyncReport, out: &mut dyn Write) -> Result<()> {
             }
             SyncAction::Deleted { id } => format!("Deleted {id}"),
             SyncAction::Undeleted { id } => format!("Undeleted {id}"),
+            SyncAction::WouldDelete { id } => format!("Would delete {id}"),
+            SyncAction::WouldUndelete { id } => format!("Would undelete {id}"),
             SyncAction::Note { message } => format!("Note: {message}"),
         };
         writeln!(out, "{line}").context("Failed to write sync report")?;
