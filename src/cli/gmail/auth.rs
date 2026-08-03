@@ -1,11 +1,11 @@
 //! CLI commands for Gmail credential management.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 
 use crate::gmail::auth::{self, BrowserConfig, GmailScope};
 use crate::gmail::client::GmailClient;
+use crate::gmail::profile_api::ProfileApi;
 use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
 
@@ -138,31 +138,12 @@ impl StatusCommand {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ProfileResponse {
-    #[serde(rename = "emailAddress")]
-    email_address: String,
-    #[serde(rename = "messagesTotal")]
-    messages_total: i64,
-}
-
 /// Calls `users.getProfile` and reports whether the stored refresh token is
 /// still accepted.
 async fn run_auth_status(client: &GmailClient, scope: GmailScope) -> Result<()> {
     println!("Checking Gmail authentication...");
 
-    let url = format!("{}/gmail/v1/users/me/profile", client.base_url());
-    let response = client.get_json(&url).await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(GmailClient::response_to_error(response).await.into());
-    }
-
-    let profile: ProfileResponse = response
-        .json()
-        .await
-        .context("Failed to parse users.getProfile response")?;
+    let profile = ProfileApi::new(client).get().await?;
 
     println!("Authenticated as: {}", profile.email_address);
     println!("Messages in mailbox: {}", profile.messages_total);
@@ -371,6 +352,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "emailAddress": "user@example.com",
                     "messagesTotal": 100,
+                    "threadsTotal": 50,
                     "historyId": "1000",
                 })),
             )
@@ -392,6 +374,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "emailAddress": "user@example.com",
                     "messagesTotal": 100,
+                    "threadsTotal": 50,
                     "historyId": "1000",
                 })),
             )

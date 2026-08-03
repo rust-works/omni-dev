@@ -4,12 +4,12 @@ use std::fs;
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 
 use crate::cli::gmail::format::{output_as, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi};
+use crate::gmail::raw_message::decode_raw_message;
 use crate::gmail::types::Message;
 
 /// How much of the message to fetch.
@@ -117,23 +117,6 @@ async fn run_read(
     render_read_table(&message, &mut handle)
 }
 
-/// Base64url-decodes [`Message::raw`] into the literal RFC 2822 bytes Gmail
-/// returned — a genuine byte-exact copy, not a preview, which is the whole
-/// reason to request `--detail raw` in the first place (the archive use
-/// case in #1467).
-///
-/// Gmail's own encoder omits padding, but this decodes leniently either way
-/// by stripping any trailing `=` before decoding unpadded.
-fn decode_raw_message(message: &Message) -> Result<Vec<u8>> {
-    let raw = message
-        .raw
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Gmail's response for `--detail raw` had no `raw` field"))?;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw.trim_end_matches('='))
-        .context("Failed to base64url-decode the raw RFC 2822 message")
-}
-
 /// Renders a message as a flat `key: value` header block followed by its
 /// snippet — an `.eml`-ish preview for `--out-file` on non-`raw` details,
 /// not a markdown dialect. `--detail raw` never reaches this: it writes the
@@ -179,6 +162,7 @@ mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
+    use base64::Engine as _;
 
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
@@ -244,58 +228,6 @@ mod tests {
         assert!(text.contains("Thread-Id: t1"));
         assert!(text.contains("Labels: INBOX, UNREAD"));
         assert!(text.contains("Hi there"));
-    }
-
-    // ── decode_raw_message ───────────────────────────────────────────
-
-    #[test]
-    fn decode_raw_message_decodes_unpadded_base64url() {
-        let source = "From: a@example.com\r\nSubject: Hi\r\n\r\nBody text.";
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
-        let message = Message {
-            id: "m1".to_string(),
-            raw: Some(encoded),
-            ..Default::default()
-        };
-        let decoded = decode_raw_message(&message).unwrap();
-        assert_eq!(decoded, source.as_bytes());
-    }
-
-    #[test]
-    fn decode_raw_message_tolerates_padded_base64url() {
-        let source = "From: a@example.com\r\n\r\nBody.";
-        // `URL_SAFE` (padded) rather than `URL_SAFE_NO_PAD`: real-world
-        // encoders aren't guaranteed to omit padding, so decoding must not
-        // assume Gmail's own convention is the only valid input.
-        let encoded = base64::engine::general_purpose::URL_SAFE.encode(source);
-        let message = Message {
-            id: "m1".to_string(),
-            raw: Some(encoded),
-            ..Default::default()
-        };
-        let decoded = decode_raw_message(&message).unwrap();
-        assert_eq!(decoded, source.as_bytes());
-    }
-
-    #[test]
-    fn decode_raw_message_errors_when_raw_field_absent() {
-        let message = Message {
-            id: "m1".to_string(),
-            ..Default::default()
-        };
-        let err = decode_raw_message(&message).unwrap_err();
-        assert!(err.to_string().contains("no `raw` field"));
-    }
-
-    #[test]
-    fn decode_raw_message_errors_on_malformed_base64() {
-        let message = Message {
-            id: "m1".to_string(),
-            raw: Some("not valid base64url!!!".to_string()),
-            ..Default::default()
-        };
-        let err = decode_raw_message(&message).unwrap_err();
-        assert!(err.to_string().contains("base64url-decode"));
     }
 
     // ── render_read_table ────────────────────────────────────────────
