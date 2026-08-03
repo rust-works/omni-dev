@@ -39,6 +39,10 @@ scopes:
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
     file_patterns: ["src/git/**"]
+  - name: "gmail"
+    description: "Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces"
+    examples: ["gmail: add OAuth2 PKCE login flow", "gmail: implement message search"]
+    file_patterns: ["src/gmail/**", "src/cli/gmail.rs", "src/cli/gmail/**"]
   - name: "mcp"
     description: "MCP server implementation and tool handlers"
     examples: ["mcp: add git_view_commits tool", "mcp: wire up stdio transport"]

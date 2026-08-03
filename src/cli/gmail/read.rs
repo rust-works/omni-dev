@@ -1,0 +1,553 @@
+//! CLI command for `omni-dev gmail read`.
+
+use std::fs;
+use std::io::Write;
+
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use clap::{Parser, ValueEnum};
+
+use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::gmail::client::GmailClient;
+use crate::gmail::messages_api::{MessageFormat, MessagesApi};
+use crate::gmail::types::Message;
+
+/// How much of the message to fetch.
+///
+/// Named `--detail`, not `--format`: ADR-0046 retired `--format` project-wide
+/// (every surviving `--format` in the codebase is a hidden deprecated alias
+/// for `-o/--output`), so a new *visible* `--format` would be the only one
+/// left and would collide in spirit with that migration — Gmail's `format`
+/// is a request-side projection, not an output format, which is a different
+/// axis from `-o` entirely (the same reasoning ADR-0046 applies to
+/// `--out-file`). Variant names match Gmail's own wire values verbatim
+/// (`minimal`/`metadata`/`full`/`raw`) rather than an invented shorthand.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum ReadDetail {
+    /// Only `id`/`threadId`/`labelIds`/`sizeEstimate` — no headers or body.
+    Minimal,
+    /// Headers and snippet only, no body.
+    Metadata,
+    /// The full parsed MIME structure. Default.
+    #[default]
+    Full,
+    /// The full RFC 2822 message, base64url-encoded.
+    Raw,
+}
+
+impl ReadDetail {
+    fn as_message_format(self) -> MessageFormat {
+        match self {
+            Self::Minimal => MessageFormat::Minimal,
+            Self::Metadata => MessageFormat::Metadata,
+            Self::Full => MessageFormat::Full,
+            Self::Raw => MessageFormat::Raw,
+        }
+    }
+}
+
+/// Reads a single Gmail message.
+///
+/// (mirrors the `gmail_message_read` MCP tool)
+#[derive(Parser)]
+pub struct ReadCommand {
+    /// Gmail message id.
+    pub message_id: String,
+
+    /// Output file (writes to stdout if omitted).
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<String>,
+
+    /// How much of the message to fetch.
+    #[arg(long, value_enum, default_value_t = ReadDetail::Full)]
+    pub detail: ReadDetail,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl ReadCommand {
+    /// Runs the command against the shared client resolved by the parent
+    /// `GmailCommand::execute`.
+    pub async fn execute(self, client: &GmailClient) -> Result<()> {
+        run_read(
+            client,
+            &self.message_id,
+            self.detail,
+            self.out_file.as_deref(),
+            &self.output,
+        )
+        .await
+    }
+}
+
+/// Fetches the message and emits it in the requested format.
+///
+/// Split from [`ReadCommand::execute`] so tests can inject a wiremock
+/// client without going through the credential-loading path.
+async fn run_read(
+    client: &GmailClient,
+    message_id: &str,
+    detail: ReadDetail,
+    out_file: Option<&str>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let message = MessagesApi::new(client)
+        .get(message_id, detail.as_message_format(), &[])
+        .await?;
+
+    if let Some(path) = out_file {
+        if matches!(detail, ReadDetail::Raw) {
+            let bytes = decode_raw_message(&message)?;
+            fs::write(path, &bytes).with_context(|| format!("Failed to write to {path}"))?;
+        } else {
+            let rendered = render_plain_text(&message);
+            fs::write(path, &rendered).with_context(|| format!("Failed to write to {path}"))?;
+        }
+        println!("Saved to: {path}");
+        return Ok(());
+    }
+
+    if output_as(&message, output)? {
+        return Ok(());
+    }
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    render_read_table(&message, &mut handle)
+}
+
+/// Base64url-decodes [`Message::raw`] into the literal RFC 2822 bytes Gmail
+/// returned — a genuine byte-exact copy, not a preview, which is the whole
+/// reason to request `--detail raw` in the first place (the archive use
+/// case in #1467).
+///
+/// Gmail's own encoder omits padding, but this decodes leniently either way
+/// by stripping any trailing `=` before decoding unpadded.
+fn decode_raw_message(message: &Message) -> Result<Vec<u8>> {
+    let raw = message
+        .raw
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Gmail's response for `--detail raw` had no `raw` field"))?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim_end_matches('='))
+        .context("Failed to base64url-decode the raw RFC 2822 message")
+}
+
+/// Renders a message as a flat `key: value` header block followed by its
+/// snippet — an `.eml`-ish preview for `--out-file` on non-`raw` details,
+/// not a markdown dialect. `--detail raw` never reaches this: it writes the
+/// decoded bytes from [`decode_raw_message`] instead, since Gmail's `raw`
+/// field only comes back populated for that format.
+fn render_plain_text(message: &Message) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Id: {}", message.id));
+    if let Some(thread_id) = &message.thread_id {
+        lines.push(format!("Thread-Id: {thread_id}"));
+    }
+    if !message.label_ids.is_empty() {
+        lines.push(format!("Labels: {}", message.label_ids.join(", ")));
+    }
+    lines.push(String::new());
+    if let Some(snippet) = &message.snippet {
+        lines.push(snippet.clone());
+    }
+    lines.join("\n")
+}
+
+/// Renders a single message as a bespoke header block — a "table" in the
+/// sense of "one command, one rendering," not a literal grid, matching the
+/// Datadog `monitor get` precedent for single-record views.
+fn render_read_table(message: &Message, out: &mut dyn Write) -> Result<()> {
+    writeln!(out, "Id: {}", message.id).context("Failed to write read row")?;
+    if let Some(thread_id) = &message.thread_id {
+        writeln!(out, "Thread-Id: {thread_id}").context("Failed to write read row")?;
+    }
+    if !message.label_ids.is_empty() {
+        writeln!(out, "Labels: {}", message.label_ids.join(", "))
+            .context("Failed to write read row")?;
+    }
+    if let Some(snippet) = &message.snippet {
+        writeln!(out, "Snippet: {snippet}").context("Failed to write read row")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::gmail::auth::{GmailCredentials, GmailScope};
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> GmailCredentials {
+        GmailCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: GmailScope::ReadOnly,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> GmailClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = GmailClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::gmail::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    #[test]
+    fn read_detail_maps_to_message_format() {
+        assert!(matches!(
+            ReadDetail::Minimal.as_message_format(),
+            MessageFormat::Minimal
+        ));
+        assert!(matches!(
+            ReadDetail::Metadata.as_message_format(),
+            MessageFormat::Metadata
+        ));
+        assert!(matches!(
+            ReadDetail::Full.as_message_format(),
+            MessageFormat::Full
+        ));
+        assert!(matches!(
+            ReadDetail::Raw.as_message_format(),
+            MessageFormat::Raw
+        ));
+    }
+
+    #[test]
+    fn render_plain_text_includes_id_labels_and_snippet() {
+        let message = Message {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string(), "UNREAD".to_string()],
+            snippet: Some("Hi there".to_string()),
+            ..Default::default()
+        };
+        let text = render_plain_text(&message);
+        assert!(text.contains("Id: m1"));
+        assert!(text.contains("Thread-Id: t1"));
+        assert!(text.contains("Labels: INBOX, UNREAD"));
+        assert!(text.contains("Hi there"));
+    }
+
+    // ── decode_raw_message ───────────────────────────────────────────
+
+    #[test]
+    fn decode_raw_message_decodes_unpadded_base64url() {
+        let source = "From: a@example.com\r\nSubject: Hi\r\n\r\nBody text.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        let message = Message {
+            id: "m1".to_string(),
+            raw: Some(encoded),
+            ..Default::default()
+        };
+        let decoded = decode_raw_message(&message).unwrap();
+        assert_eq!(decoded, source.as_bytes());
+    }
+
+    #[test]
+    fn decode_raw_message_tolerates_padded_base64url() {
+        let source = "From: a@example.com\r\n\r\nBody.";
+        // `URL_SAFE` (padded) rather than `URL_SAFE_NO_PAD`: real-world
+        // encoders aren't guaranteed to omit padding, so decoding must not
+        // assume Gmail's own convention is the only valid input.
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(source);
+        let message = Message {
+            id: "m1".to_string(),
+            raw: Some(encoded),
+            ..Default::default()
+        };
+        let decoded = decode_raw_message(&message).unwrap();
+        assert_eq!(decoded, source.as_bytes());
+    }
+
+    #[test]
+    fn decode_raw_message_errors_when_raw_field_absent() {
+        let message = Message {
+            id: "m1".to_string(),
+            ..Default::default()
+        };
+        let err = decode_raw_message(&message).unwrap_err();
+        assert!(err.to_string().contains("no `raw` field"));
+    }
+
+    #[test]
+    fn decode_raw_message_errors_on_malformed_base64() {
+        let message = Message {
+            id: "m1".to_string(),
+            raw: Some("not valid base64url!!!".to_string()),
+            ..Default::default()
+        };
+        let err = decode_raw_message(&message).unwrap_err();
+        assert!(err.to_string().contains("base64url-decode"));
+    }
+
+    // ── render_read_table ────────────────────────────────────────────
+
+    #[test]
+    fn render_read_table_writes_id_thread_labels_and_snippet() {
+        let message = Message {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string(), "UNREAD".to_string()],
+            snippet: Some("Hi there".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_read_table(&message, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Id: m1"));
+        assert!(text.contains("Thread-Id: t1"));
+        assert!(text.contains("Labels: INBOX, UNREAD"));
+        assert!(text.contains("Snippet: Hi there"));
+    }
+
+    #[test]
+    fn render_read_table_omits_absent_fields() {
+        let message = Message {
+            id: "m1".to_string(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_read_table(&message, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, "Id: m1\n");
+    }
+
+    // ── run_read ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_read_writes_to_out_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "snippet": "Hi there",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.txt");
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            Some(path.to_str().unwrap()),
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Hi there"));
+    }
+
+    #[tokio::test]
+    async fn run_read_detail_raw_out_file_writes_decoded_bytes_not_base64() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let source = "From: a@example.com\r\nSubject: Hi\r\n\r\nBody text.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "raw": encoded,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.eml");
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Raw,
+            Some(path.to_str().unwrap()),
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        // A genuine byte-exact copy: no Id:/Thread-Id:/Labels: preamble, no
+        // duplicated snippet, and definitely not still base64-encoded.
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, source.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn run_read_detail_raw_out_file_propagates_decode_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.eml");
+        let err = run_read(
+            &client,
+            "m1",
+            ReadDetail::Raw,
+            Some(path.to_str().unwrap()),
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no `raw` field"));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn run_read_table_path_writes_to_stdout() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_json_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Json)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_read_uses_metadata_format_for_metadata_detail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "metadata"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Metadata,
+            None,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_uses_minimal_format_for_minimal_detail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "minimal"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Minimal,
+            None,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    // ── ReadCommand::execute glue ────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_passes_message_id_through() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m42"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "m42"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cmd = ReadCommand {
+            message_id: "m42".to_string(),
+            out_file: None,
+            detail: ReadDetail::Full,
+            output: OutputFormat::Json,
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+}

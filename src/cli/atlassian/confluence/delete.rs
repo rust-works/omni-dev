@@ -7,8 +7,8 @@ use clap::Parser;
 
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::confluence_api::ConfluenceApi;
-use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
+use crate::cli::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 
 /// Deletes a Confluence page.
 #[derive(Parser)]

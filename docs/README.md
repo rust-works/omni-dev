@@ -25,6 +25,10 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 - **[Datadog Guide](datadog.md)** - Authentication, metrics, monitors, dashboards, logs, events, SLOs, downtimes, hosts; CLI and MCP forms
 
+### Gmail Integration
+
+- **[Gmail Guide](gmail.md)** - OAuth2 authentication, search, messages, threads, labels; CLI and MCP forms
+
 ### Browser Bridge
 
 - **[Browser Bridge Guide](browser-bridge.md)** - Drive authenticated HTTP requests through a browser tab (Grafana/Loki, internal dashboards); the two planes, the `request` thin client, and the security model
@@ -143,6 +147,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
+| **Gmail Integration** | [Gmail Guide](gmail.md) | [User Guide - Gmail](user-guide.md#gmail-integration) · [README - Gmail](../README.md#-gmail-integration) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 | **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 

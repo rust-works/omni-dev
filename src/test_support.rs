@@ -5,6 +5,22 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// Process-wide mutex serialising every test in the crate that mutates the
+/// global `HOME` environment variable, or any credential env var whose
+/// resolution depends on it (`dirs::home_dir()` /
+/// `Settings::get_settings_path()`).
+///
+/// Every HOME-mutating test-support module (Atlassian, Datadog, Gmail, the
+/// `ai_chat`/`cli::ai::chat` provider tests, …) aliases this **one** static
+/// rather than declaring its own `Mutex<()>`. Independent per-module mutexes
+/// provide no mutual exclusion against each other — each only serialises its
+/// own module's tests — while `HOME` itself is shared process-wide state, so
+/// two modules' tests can still interleave and race on it. That exact
+/// pattern caused the flaky race fixed for Atlassian in issue #950, and
+/// resurfaced as a Gmail-vs-Datadog race (both mutating `HOME` under their
+/// own independent mutex) in issue #1465.
+pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) mod failing_io {
     //! Writer fixture that always returns `ErrorKind::Other` from
     //! `write` and `flush`. Used to drive `?`-propagation Err branches
