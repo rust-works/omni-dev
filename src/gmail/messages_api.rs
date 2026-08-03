@@ -36,6 +36,17 @@ pub const HARD_CAP: usize = 10_000;
 /// that quota, so it shouldn't itself accept a value that can blow past it.
 pub const MAX_CONCURRENCY: usize = 50;
 
+/// Gmail's documented quota ceiling, in quota units per user per second.
+///
+/// The load-bearing constraint behind [`MAX_CONCURRENCY`] above and behind
+/// `gmail sync`'s proactive token-bucket limiter
+/// (`src/cli/gmail/sync/engine.rs`) — the single biggest determinant of
+/// whether a bulk sync is pleasant or infuriating (#1467).
+pub const GMAIL_QUOTA_UNITS_PER_SECOND: u32 = 250;
+
+/// Quota-unit cost of one `messages.get` call, regardless of `format`.
+pub const MESSAGES_GET_COST_UNITS: u32 = 5;
+
 /// Default `limit` for a search when the caller doesn't specify one.
 ///
 /// Shared between the CLI (`gmail search`'s `--limit` default) and the MCP
