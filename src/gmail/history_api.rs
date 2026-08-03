@@ -12,6 +12,7 @@ use url::Url;
 
 use crate::gmail::client::GmailClient;
 use crate::gmail::types::HistoryListResponse;
+use crate::utils::rate_limit::TokenBucket;
 
 /// Maximum page size accepted by `GET /gmail/v1/users/{userId}/history`.
 pub const MAX_PAGE_LIMIT: usize = 500;
@@ -19,6 +20,10 @@ pub const MAX_PAGE_LIMIT: usize = 500;
 /// Per-call upper bound on the number of history records returned by
 /// [`HistoryApi::list_all`], even when the caller passes `limit = 0`.
 pub const HARD_CAP: usize = 10_000;
+
+/// Quota-unit cost of one `history.list` page request, per Google's
+/// documented per-method quota cost table.
+pub const HISTORY_LIST_COST_UNITS: u32 = 2;
 
 /// History API façade.
 #[derive(Debug)]
@@ -65,20 +70,71 @@ impl<'a> HistoryApi<'a> {
     }
 
     /// Lists mailbox changes since `start_history_id`, auto-paginating via
-    /// cursor as needed. Same "cursor-only, never a short page" termination
-    /// rule as the other façades.
+    /// cursor as needed. `limit == 0` means "fetch every change up to
+    /// [`HARD_CAP`]" — a deliberate safety limit for this general-purpose
+    /// entry point. See [`Self::list_all_unbounded`] for the one caller that
+    /// must not have it.
     pub async fn list_all(
         &self,
         start_history_id: &str,
         history_types: &[&str],
         limit: usize,
     ) -> Result<HistoryListResponse> {
-        let cap = effective_cap(limit);
+        self.paginate(
+            start_history_id,
+            history_types,
+            Some(effective_cap(limit)),
+            None,
+        )
+        .await
+    }
+
+    /// Lists mailbox changes since `start_history_id`, auto-paginating with
+    /// **no cap** — every page is fetched until Gmail stops returning a
+    /// `nextPageToken`.
+    ///
+    /// `gmail sync`'s incremental path is the one caller for which a
+    /// truncated listing is a correctness bug: a history burst larger than
+    /// [`HARD_CAP`] (e.g. a large bulk label operation from another client)
+    /// would otherwise silently drop `messagesAdded`/`messagesDeleted`/
+    /// `labelsAdded`/`labelsRemoved` events past the cap (#1467), the same
+    /// class of bug [`crate::gmail::messages_api::MessagesApi::search_all_unbounded`]
+    /// fixes for the full-mailbox listing path.
+    ///
+    /// `limiter` paces each page request at [`HISTORY_LIST_COST_UNITS`]
+    /// against the caller's quota budget, proactively rather than relying on
+    /// reactive 429/403 retry.
+    pub(crate) async fn list_all_unbounded(
+        &self,
+        start_history_id: &str,
+        history_types: &[&str],
+        limiter: &TokenBucket,
+    ) -> Result<HistoryListResponse> {
+        self.paginate(start_history_id, history_types, None, Some(limiter))
+            .await
+    }
+
+    /// Shared pagination loop backing [`Self::list_all`] and
+    /// [`Self::list_all_unbounded`]. `cap: None` means no ceiling at all —
+    /// only an absent `nextPageToken` stops the loop.
+    async fn paginate(
+        &self,
+        start_history_id: &str,
+        history_types: &[&str],
+        cap: Option<usize>,
+        limiter: Option<&TokenBucket>,
+    ) -> Result<HistoryListResponse> {
         let mut acc: Option<HistoryListResponse> = None;
         let mut page_token: Option<String> = None;
         loop {
             let collected = acc.as_ref().map_or(0, |r| r.history.len());
-            let page_size = (cap - collected).min(MAX_PAGE_LIMIT);
+            let page_size = match cap {
+                Some(cap) => (cap - collected).min(MAX_PAGE_LIMIT),
+                None => MAX_PAGE_LIMIT,
+            };
+            if let Some(limiter) = limiter {
+                limiter.acquire(HISTORY_LIST_COST_UNITS).await;
+            }
             let page = self
                 .list(
                     start_history_id,
@@ -97,13 +153,16 @@ impl<'a> HistoryApi<'a> {
                 None => acc = Some(page),
             }
             let collected = acc.as_ref().map_or(0, |r| r.history.len());
-            if collected >= cap || next_token.is_none() {
+            let cap_reached = cap.is_some_and(|cap| collected >= cap);
+            if cap_reached || next_token.is_none() {
                 break;
             }
             page_token = next_token;
         }
         let mut result = acc.unwrap_or_default();
-        result.history.truncate(cap);
+        if let Some(cap) = cap {
+            result.history.truncate(cap);
+        }
         Ok(result)
     }
 }
@@ -148,6 +207,35 @@ mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `history.list` responder that serves `full_pages` full pages (each
+    /// with a fresh `nextPageToken`) followed by one terminating page with no
+    /// token — used to prove [`HistoryApi::list_all_unbounded`] keeps
+    /// paginating past whatever [`HARD_CAP`] would have stopped
+    /// [`HistoryApi::list_all`] at.
+    struct SequentialPages {
+        full_pages: usize,
+        calls: AtomicUsize,
+    }
+
+    impl wiremock::Respond for SequentialPages {
+        fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.full_pages {
+                let page: Vec<serde_json::Value> = (0..MAX_PAGE_LIMIT)
+                    .map(|i| history_record_json(&format!("p{call}-h{i}")))
+                    .collect();
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": page,
+                    "nextPageToken": format!("token-{}", call + 1),
+                }))
+            } else {
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"history": Vec::<serde_json::Value>::new()}))
+            }
+        }
+    }
 
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
@@ -496,6 +584,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── list_all_unbounded ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_all_unbounded_does_not_truncate_past_hard_cap() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // One more full page than `list_all` would allow before hitting
+        // `HARD_CAP` — a regression back to the capped pagination path would
+        // truncate this result to exactly `HARD_CAP`.
+        let full_pages = HARD_CAP / MAX_PAGE_LIMIT + 1;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(SequentialPages {
+                full_pages,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let result = HistoryApi::new(&client)
+            .list_all_unbounded("1000", &[], &limiter)
+            .await
+            .unwrap();
+
+        assert_eq!(result.history.len(), full_pages * MAX_PAGE_LIMIT);
+        assert!(result.history.len() > HARD_CAP);
+    }
+
+    #[tokio::test]
+    async fn list_all_unbounded_draws_the_limiter_once_per_page() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let full_pages = 4;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(SequentialPages {
+                full_pages,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        // Zero refill: capacity alone is large enough that `acquire` never
+        // actually waits, and with no refill between real HTTP round trips
+        // the token count accurately reflects cumulative debits — a nonzero
+        // refill rate this large would otherwise replenish the bucket back
+        // to full between each network round trip, masking how many times
+        // `acquire` was really called. This test only proves each of the 5
+        // page requests (4 full + 1 terminating) draws
+        // `HISTORY_LIST_COST_UNITS`; `TokenBucket` pacing itself is already
+        // covered by `rate_limit.rs`'s own tests.
+        let limiter = TokenBucket::new(1_000_000, 0);
+        HistoryApi::new(&client)
+            .list_all_unbounded("1000", &[], &limiter)
+            .await
+            .unwrap();
+
+        let page_requests = 5;
+        let expected_spent = f64::from(page_requests * HISTORY_LIST_COST_UNITS);
+        // Exact integer-valued floats (units are whole numbers well within
+        // f64's precision) — cast to compare, avoiding a lint against
+        // strict floating-point equality that doesn't apply here.
+        assert_eq!(
+            limiter.available().await as i64,
+            (1_000_000.0 - expected_spent) as i64
+        );
     }
 
     // ── History record shapes (added/deleted/label changes) ──────────

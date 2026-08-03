@@ -155,7 +155,7 @@ async fn run_full_sync(
     report: &mut SyncReport,
 ) -> Result<String> {
     let listed = MessagesApi::new(client)
-        .search_all(opts.query.as_deref(), &[], 0)
+        .search_all_unbounded(opts.query.as_deref(), &[], limiter)
         .await?;
     let listed_ids: HashSet<String> = listed.messages.iter().map(|m| m.id.clone()).collect();
 
@@ -208,7 +208,7 @@ async fn run_incremental(
     report: &mut SyncReport,
 ) -> Result<String> {
     let history = HistoryApi::new(client)
-        .list_all(start_history_id, &[], 0)
+        .list_all_unbounded(start_history_id, &[], limiter)
         .await?;
 
     let mut seen = HashSet::new();
@@ -458,6 +458,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use chrono::DateTime;
+    use std::sync::atomic::Ordering;
 
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
@@ -1110,5 +1111,107 @@ not-really-a-pdf\r\n\
 
         let err = run_sync(&client, &opts(output_dir)).await.unwrap_err();
         assert!(err.to_string().contains("Failed to parse manifest"));
+    }
+
+    // ── reconciliation must not truncate at HARD_CAP (#1467) ────────────
+
+    #[tokio::test]
+    async fn run_sync_full_reconciliation_does_not_mislabel_mail_past_hard_cap() {
+        use crate::gmail::messages_api::HARD_CAP;
+
+        /// Serves `ids` back across as many `messages.list` pages as it
+        /// takes, terminating only when exhausted — mirrors real Gmail
+        /// pagination rather than hand-mounting one `Mock` per page.
+        struct SequentialIdPages {
+            ids: Vec<String>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl wiremock::Respond for SequentialIdPages {
+            fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let page_size = 500usize;
+                let start = call * page_size;
+                let page: Vec<serde_json::Value> = self
+                    .ids
+                    .iter()
+                    .skip(start)
+                    .take(page_size)
+                    .map(|id| serde_json::json!({"id": id, "threadId": "t1"}))
+                    .collect();
+                let mut body = serde_json::json!({"messages": page});
+                if start + page_size < self.ids.len() {
+                    body["nextPageToken"] = serde_json::json!(format!("token-{}", call + 1));
+                }
+                wiremock::ResponseTemplate::new(200).set_body_json(body)
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        // One more id than `HARD_CAP`. Before the fix, `run_full_sync`'s
+        // listing truncated to `HARD_CAP`, so every id past that point
+        // would have been wrongly soft-deleted below, even though the
+        // listing (mocked here to return every one of them) says otherwise.
+        let ids: Vec<String> = (0..HARD_CAP + 10).map(|i| format!("m{i}")).collect();
+        let mut manifest = Manifest::default();
+        for id in &ids {
+            let path = shard_path(&output_dir, id, None);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"From: a@example.com\r\n\r\nbody").unwrap();
+            manifest.upsert(ManifestRecord {
+                id: id.clone(),
+                thread_id: Some("t1".to_string()),
+                label_ids: vec!["INBOX".to_string()],
+                internal_date: None,
+                subject: None,
+                from: None,
+                to: None,
+                rfc822_msgid: None,
+                in_reply_to: None,
+                references: None,
+                attachment_count: 0,
+                attachment_filenames: Vec::new(),
+                path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+                size: 4,
+                history_id: Some("1".to_string()),
+                deleted_at: None,
+            });
+        }
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(SequentialIdPages {
+                ids: ids.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+        // Deliberately no mock for any `messages/<id>?format=raw` fetch —
+        // every id is already archived on disk, so a re-fetch here would
+        // mean the presence-on-disk check regressed too.
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty(), "no id should need re-fetching");
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Deleted { .. })),
+            "no already-archived message should be marked deleted just because it fell \
+             outside a truncated listing"
+        );
+        let manifest_after = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert_eq!(
+            manifest_after.ids_not_deleted().count(),
+            ids.len(),
+            "every id should still be present and not soft-deleted"
+        );
     }
 }
