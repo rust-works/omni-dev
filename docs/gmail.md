@@ -234,9 +234,11 @@ already-synced mailbox with no new mail is fast — typically a single
 ```
 <output-dir>/
   state.json                  # watermark (historyId) + account identity
-  manifest.jsonl               # one record per message: id, threadId, labelIds,
-                                #   internalDate, subject, from, rfc822_msgid, path
-  messages/<aa>/<id>.eml        # sharded by the first 2 characters of the message id
+  manifest.jsonl               # one record per message: id, thread_id, label_ids,
+                                #   internal_date, subject, from, to, rfc822_msgid,
+                                #   in_reply_to, references, attachment_count,
+                                #   attachment_filenames, path
+  messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
 ```
 
 `.eml` files are **immutable** once written — Gmail labels aren't part of
@@ -267,11 +269,20 @@ would match your `--query` is only picked up by a later `--full` re-run. If
 you sync a query-scoped subset of your mailbox regularly, plan on an
 occasional `--full` pass.
 
-**Header fields:** `subject`/`from`/`rfc822_msgid` in the manifest are
-parsed directly from the already-fetched raw message bytes (no second
-network request), and are stored as their raw wire encoding — non-ASCII
-subjects encoded per RFC 2047 (`=?UTF-8?B?...?=`) are **not** decoded to
-human-readable text in this release.
+**Header fields:** `subject`/`from`/`to`/`rfc822_msgid`/`in_reply_to`/
+`references` in the manifest are parsed directly from the already-fetched
+raw message bytes (no second network request), and are stored as their raw
+wire encoding — non-ASCII subjects encoded per RFC 2047
+(`=?UTF-8?B?...?=`) are **not** decoded to human-readable text in this
+release. `in_reply_to`/`references` are what let a conversation be
+reconstructed from the manifest alone, without re-parsing every `.eml`.
+
+**Attachments:** `attachment_count` and `attachment_filenames` record how
+many MIME parts are marked `Content-Disposition: attachment` and whichever
+filenames could be parsed from them (including RFC 2231 percent-encoded
+filenames), scanned from the same already-decoded bytes — no second fetch.
+This is metadata only: attachments stay inline inside the `.eml` (lossless,
+since `format=raw` preserves them), not extracted to separate files.
 
 **`--dry-run`** reports every action sync would take without writing any
 file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
