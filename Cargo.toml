@@ -110,6 +110,10 @@ insta = { version = "1.47", features = ["filters"] }
 proptest = "1"
 wiremock = "0.6"
 rmcp = { version = "2.1", features = ["client", "server", "transport-io", "macros"] }
+# `test-util` (pause/advance the tokio clock) is not implied by `full` — used
+# by src/utils/rate_limit.rs's TokenBucket tests to drive its
+# tokio::time::Instant-based pacing deterministically instead of real sleeps.
+tokio = { version = "1.52", features = ["test-util"] }
 
 [lib]
 name = "omni_dev"
