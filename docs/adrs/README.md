@@ -87,3 +87,4 @@ by Michael Nygard.
 | [ADR-0061](adr-0061.md)  | ✅ Accepted                              | 2026-07-30 | Daemon-Hosted Force-Push With a Lease                                                       |
 | [ADR-0062](adr-0062.md)  | ✅ Accepted                              | 2026-08-01 | Drop the VS Code Rebase Confirmation Modal                                                  |
 | [ADR-0063](adr-0063.md)  | ✅ Accepted                              | 2026-08-01 | OAuth2 Authorization-Code + PKCE for Gmail, with Bring-Your-Own Google Cloud Project        |
+| [ADR-0064](adr-0064.md)  | ✅ Accepted                              | 2026-08-03 | Presence-on-Disk Idempotence and Immutable-`.eml`/Mutable-Manifest Split for `gmail sync`   |
