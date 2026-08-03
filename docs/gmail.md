@@ -16,9 +16,10 @@ CLI's `-o yaml` output. For the MCP-tool reference (parameters only), see
 5. [Messages](#messages)
 6. [Threads](#threads)
 7. [Labels](#labels)
-8. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-9. [Troubleshooting](#troubleshooting)
-10. [See also](#see-also)
+8. [Sync](#sync)
+9. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+10. [Troubleshooting](#troubleshooting)
+11. [See also](#see-also)
 
 ## Prerequisites
 
@@ -209,6 +210,76 @@ calling the API (`--dry-run` wins if both are set).
 tool (add/remove) is planned as a fast-follow — until then, label mutation
 is CLI-only.
 
+## Sync
+
+```bash
+$ omni-dev gmail sync --output-dir ~/mail-archive
+$ omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
+$ omni-dev gmail sync --output-dir ~/mail-archive --full
+$ omni-dev gmail sync --output-dir ~/mail-archive --dry-run
+```
+
+Maintains a durable, greppable local archive of a mailbox — full-fidelity
+`.eml` files plus a JSONL manifest — incrementally updated on each run.
+Unlike every other Gmail command, `sync` is a genuinely long-running bulk
+operation: **a first sync of a several-thousand-message mailbox takes
+minutes, not seconds**, and a 50k-message mailbox roughly 15-20 minutes,
+bounded by Gmail's per-second quota (see
+[Rate limits](#rate-limits-and-retry-behaviour) below). A re-run against an
+already-synced mailbox with no new mail is fast — typically a single
+`history.list` call.
+
+**Archive layout:**
+
+```
+<output-dir>/
+  state.json                  # watermark (historyId) + account identity
+  manifest.jsonl               # one record per message: id, threadId, labelIds,
+                                #   internalDate, subject, from, rfc822_msgid, path
+  messages/<aa>/<id>.eml        # sharded by the first 2 characters of the message id
+```
+
+`.eml` files are **immutable** once written — Gmail labels aren't part of
+the RFC 2822 body, so a label change updates only the manifest record, never
+the message file. The manifest is *not* a derived index that could be
+regenerated from the `.eml` files; it is the sole record of each message's
+Gmail-side metadata (labels, thread, watermark).
+
+**Backfill vs. incremental:** the first run (or `--full`) lists the whole
+mailbox and fetches whatever's missing on disk — presence-on-disk is the
+real idempotence mechanism, so an interrupted backfill simply picks up
+where it left off on the next run, no cursor required. Subsequent runs use
+`history.list` from the stored watermark, applying
+`messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved` events.
+Google does not guarantee history availability past roughly **one week**;
+a `startHistoryId` older than that gets a 404, which `sync` treats as a
+signal to fall back to the same full-listing pass as a backfill (not a
+silent gap, and not a blind re-download of everything) — the `historyId`
+watermark is purely an optimisation over that fallback, never a
+correctness requirement. A run that hits a per-item error never advances
+the watermark, so the next run safely re-examines the same range (already
+-archived messages are skipped for free).
+
+**`--query` and incremental sync (a known limitation):** `--query` scopes a
+backfill/`--full`/reconciliation pass, but `history.list` has no query
+filter, so an incremental run cannot re-apply it — newly-arrived mail that
+would match your `--query` is only picked up by a later `--full` re-run. If
+you sync a query-scoped subset of your mailbox regularly, plan on an
+occasional `--full` pass.
+
+**Header fields:** `subject`/`from`/`rfc822_msgid` in the manifest are
+parsed directly from the already-fetched raw message bytes (no second
+network request), and are stored as their raw wire encoding — non-ASCII
+subjects encoded per RFC 2047 (`=?UTF-8?B?...?=`) are **not** decoded to
+human-readable text in this release.
+
+**`--dry-run`** reports every action sync would take without writing any
+file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
+
+No MCP equivalent — a bulk, potentially long-running filesystem operation
+is a poor fit for a synchronous MCP tool call (the same reasoning that kept
+label mutation CLI-only above).
+
 ## Rate limits and retry behaviour
 
 Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
@@ -224,13 +295,17 @@ those `messages.get` calls are in flight at once; it does not itself pace
 requests against the per-second budget, so a large `--limit --enrich`
 combination should be sized deliberately, not left at defaults.
 
-**Known gap:** Gmail signals quota exhaustion as **HTTP 403** with
-`reason: rateLimitExceeded` / `userRateLimitExceeded`, not HTTP 429.
-omni-dev's shared retry driver (`retry_429`, used by every REST client in
-this project) only retries literal 429s, so a Gmail rate-limit error is
-**not** automatically retried in this release — it surfaces immediately
-with the `reason` included in the error message so it's at least
-actionable. Narrow your `--query`/`--limit` if you hit this.
+Gmail signals quota exhaustion as **HTTP 403** with `reason:
+rateLimitExceeded` / `userRateLimitExceeded`, not HTTP 429 — the Gmail
+client's requests retry both `429` and this specific 403 shape through the
+shared retry driver (`retry_if`/`retry_429`, `src/utils/http.rs`), with the
+same `Retry-After`-then-exponential-backoff schedule; any other 403 (e.g.
+`insufficientPermissions`) is never retried. `gmail sync` additionally
+paces its own `messages.get` requests against the 250-units/second budget
+with a proactive token-bucket limiter, rather than relying on this reactive
+retry — see [Sync](#sync) above. `search --enrich`/`thread` still rely on
+`--concurrency` alone (a concurrency bound, not a rate limiter) plus this
+retry driver as their only quota protection.
 
 The list endpoints (`search`, `thread`'s underlying calls) auto-paginate
 when `--limit 0` is passed, capped at **10,000 records** per invocation.
