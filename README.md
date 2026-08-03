@@ -279,6 +279,41 @@ All Datadog subcommands are also exposed as MCP tools (`datadog_*`) — see
 [docs/mcp.md](docs/mcp.md#datadog-14-tools). For the full guide covering
 every family with worked examples, see [docs/datadog.md](docs/datadog.md).
 
+### 📧 Gmail Integration
+
+Authenticate against your own Gmail account via OAuth2 (loopback
+authorization-code + PKCE) and search, read, and label messages and
+threads. See the [Gmail integration guide](docs/gmail.md) for
+prerequisites (you bring your own Google Cloud OAuth2 client — Gmail read
+scopes require Google's CASA security assessment to distribute otherwise),
+authentication setup, rate-limit behaviour, and troubleshooting.
+
+```bash
+# One-time: create your own Google Cloud OAuth2 client (see docs/gmail.md),
+# then authenticate (opens a browser)
+export GMAIL_CLIENT_ID=...
+export GMAIL_CLIENT_SECRET=...
+omni-dev gmail auth login
+
+# Verify the credentials by calling users.getProfile
+omni-dev gmail auth status
+
+# Search, read messages/threads, and manage labels
+omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
+omni-dev gmail read <message-id>
+omni-dev gmail thread <thread-id>
+omni-dev gmail label list
+```
+
+An OAuth2 client left in Google's "Testing" publishing status issues
+refresh tokens that expire after 7 days — see
+[docs/gmail.md](docs/gmail.md#prerequisites) for how to avoid re-running
+`auth login` weekly.
+
+Every read-only Gmail subcommand is also exposed as an MCP tool
+(`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-5-tools). For the full
+guide, see [docs/gmail.md](docs/gmail.md).
+
 ### 🎙️ Transcript Fetching
 
 Pull captions and transcripts from external media platforms. YouTube is the
@@ -565,7 +600,7 @@ omni-dev over stdio instead of shelling out to the CLI. The server is
 delivered as a second binary, `omni-dev-mcp`, gated behind the `mcp` Cargo
 feature (see [ADR-0021](docs/adrs/adr-0021.md)).
 
-Tools cover six domains:
+Tools cover seven domains:
 
 | Domain | Examples |
 |--------|----------|
@@ -574,6 +609,7 @@ Tools cover six domains:
 | **Confluence** (13) | read/write/search/create/delete/download/children, comments, labels, user search |
 | **Atlassian shared** (2) | `atlassian_auth_status`, `atlassian_convert` (offline JFM ↔ ADF) |
 | **Datadog** (14) | metrics, monitors, dashboards, logs, events, SLOs, hosts, downtimes, metrics catalog |
+| **Gmail** (5) | `gmail_auth_status`, `gmail_search`, `gmail_message_read`, `gmail_thread_read`, `gmail_label_list` |
 | **AI / Config** (5) | `ai_chat` (one-shot chat), `claude_skills_*` (sync / clean / status for `.claude/skills/` distribution), `config_models_show` |
 
 Resources exposed via URI templates:

@@ -14,7 +14,13 @@ use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY, DA
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the
 /// Datadog credential environment variables.
-static DATADOG_ENV_MUTEX: Mutex<()> = Mutex::new(());
+///
+/// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] so
+/// Datadog's `HOME` mutation also serialises against every other domain's
+/// (Atlassian, Gmail, …) — an independent `Mutex<()>` here provides no real
+/// exclusion against them, which is exactly the race that surfaced between
+/// Gmail and Datadog in issue #1465.
+static DATADOG_ENV_MUTEX: &Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
 /// RAII guard: snapshots `HOME` + every Datadog credential env var on
 /// construction and restores them on drop.

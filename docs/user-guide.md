@@ -12,10 +12,11 @@ intelligence.
 5. [Claude Code Integration](#claude-code-integration)
 6. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
 7. [Datadog Integration](#datadog-integration)
-8. [Contextual Intelligence](#contextual-intelligence)
-9. [Workflows](#workflows)
-10. [Advanced Usage](#advanced-usage)
-11. [Best Practices](#best-practices)
+8. [Gmail Integration](#gmail-integration)
+9. [Contextual Intelligence](#contextual-intelligence)
+10. [Workflows](#workflows)
+11. [Advanced Usage](#advanced-usage)
+12. [Best Practices](#best-practices)
 
 ## Your First Improvement
 
@@ -1663,6 +1664,39 @@ omni-dev datadog hosts list --filter env:prod
 
 Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
 [docs/mcp.md](mcp.md#datadog-14-tools).
+
+## Gmail Integration
+
+omni-dev exposes read access (and, opt-in, label mutation) to the Gmail v1
+API through the `omni-dev gmail` command tree. The full reference —
+prerequisites (bring-your-own Google Cloud OAuth2 client), authentication,
+every subcommand with worked examples, rate-limit behaviour, and
+troubleshooting — lives in **[docs/gmail.md](gmail.md)**.
+
+Quick orientation:
+
+```bash
+# One-time OAuth2 client setup (create your own Google Cloud project first —
+# see docs/gmail.md#prerequisites), then log in (opens a browser)
+export GMAIL_CLIENT_ID=...
+export GMAIL_CLIENT_SECRET=...
+omni-dev gmail auth login
+omni-dev gmail auth status
+
+# Search, read, and browse
+omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
+omni-dev gmail read <message-id>
+omni-dev gmail thread <thread-id>
+omni-dev gmail label list
+
+# Label mutation needs the gmail.modify scope (auth login --modify)
+omni-dev gmail label add <message-id> --label IMPORTANT
+omni-dev gmail label remove <message-id> --label UNREAD
+```
+
+Every read-only Gmail CLI subcommand has a matching `gmail_*` MCP tool — see
+[docs/mcp.md](mcp.md#gmail-5-tools). Label mutation is CLI-only in this
+release.
 
 ## Contextual Intelligence
 

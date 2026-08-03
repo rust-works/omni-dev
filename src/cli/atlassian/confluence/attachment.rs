@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
 
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::atlassian::confluence_types::{ConfluenceAttachment, ConfluenceAttachmentPage};
-use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
+use crate::cli::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::utils::path::attachment_filename;
 
 /// Manages attachments on Confluence pages.

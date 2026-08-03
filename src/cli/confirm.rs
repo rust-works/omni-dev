@@ -1,4 +1,8 @@
-//! Shared confirmation and dry-run helper for destructive Atlassian CLI commands.
+//! Shared confirmation and dry-run helper for destructive CLI commands.
+//!
+//! Originally Atlassian-only (`src/cli/atlassian/confirm.rs`); promoted here
+//! (issue #1465) once `gmail label remove` became a second, non-Atlassian
+//! consumer of the same ADR-0027 guard. No behavior change.
 
 use std::io::{BufRead, Write};
 

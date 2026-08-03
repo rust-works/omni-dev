@@ -50,6 +50,7 @@ pub mod datadog;
 pub mod git;
 pub mod github_metrics;
 pub mod github_rate_limit;
+pub mod gmail;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod pr_status;

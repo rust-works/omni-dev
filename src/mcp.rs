@@ -17,6 +17,7 @@ pub mod datadog_tools;
 pub mod dry_run;
 pub mod error;
 pub mod git_tools;
+pub mod gmail_tools;
 pub mod jira_core_tools;
 pub mod jira_tools;
 pub mod log_tools;

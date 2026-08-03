@@ -6,8 +6,8 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::client::AtlassianClient;
-use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
+use crate::cli::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 
 /// Deletes a JIRA issue.
 #[derive(Parser)]
