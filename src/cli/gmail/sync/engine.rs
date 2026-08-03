@@ -182,10 +182,16 @@ async fn run_full_sync(
 
     for id in &listed_ids {
         if manifest.get(id).is_some_and(|r| r.deleted_at.is_some()) {
-            manifest.undelete(id);
-            report
-                .actions
-                .push(SyncAction::Undeleted { id: id.clone() });
+            if opts.dry_run {
+                report
+                    .actions
+                    .push(SyncAction::WouldUndelete { id: id.clone() });
+            } else {
+                manifest.undelete(id);
+                report
+                    .actions
+                    .push(SyncAction::Undeleted { id: id.clone() });
+            }
         }
     }
 
@@ -197,8 +203,12 @@ async fn run_full_sync(
         .map(str::to_string)
         .collect();
     for id in stale {
-        manifest.mark_deleted(&id, Utc::now());
-        report.actions.push(SyncAction::Deleted { id });
+        if opts.dry_run {
+            report.actions.push(SyncAction::WouldDelete { id });
+        } else {
+            manifest.mark_deleted(&id, Utc::now());
+            report.actions.push(SyncAction::Deleted { id });
+        }
     }
 
     // Snapshotted *before* the listing began (by the caller, via `profile`)
@@ -1384,5 +1394,67 @@ not-really-a-pdf\r\n\
                 "checkpoint should have covered {id}"
             );
         }
+    }
+
+    // ── --dry-run reconciliation reports planned actions (#1467) ────────
+
+    #[tokio::test]
+    async fn run_sync_dry_run_reconciliation_reports_would_delete_without_mutating_manifest() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"From: a@example.com\r\n\r\nbody").unwrap();
+        let mut manifest = Manifest::default();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: 4,
+            history_id: Some("1".to_string()),
+            deleted_at: None,
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+        let manifest_bytes_before = std::fs::read(manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &[]).await; // m1 no longer appears server-side
+
+        let report = run_sync(
+            &client,
+            &SyncOptions {
+                output_dir: output_dir.clone(),
+                query: None,
+                full: false,
+                concurrency: 4,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            report.actions.as_slice(),
+            [SyncAction::WouldDelete { id }] if id == "m1"
+        ));
+        assert_eq!(
+            std::fs::read(manifest_path(&output_dir)).unwrap(),
+            manifest_bytes_before,
+            "dry-run must not mutate the manifest, in memory or on disk"
+        );
     }
 }
