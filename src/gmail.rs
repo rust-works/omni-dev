@@ -5,14 +5,17 @@
 //! [ADR-0063](../../docs/adrs/adr-0063.md)). Phase 1 covers the client,
 //! authentication, and the message/thread/label API façades, plus the CLI
 //! and MCP surfaces built on them. `history_api.rs` (the `historyId`
-//! watermark used for incremental sync) has no Phase 1 consumer and is
-//! deferred to the Phase 2 sync follow-up rather than built ahead of need.
+//! watermark) and `profile_api.rs` (`users.getProfile`) back Phase 2's
+//! `gmail sync` (see [ADR-0064](../../docs/adrs/adr-0064.md)).
 
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod history_api;
 pub mod labels_api;
 pub mod messages_api;
+pub mod profile_api;
+pub mod raw_message;
 pub mod threads_api;
 pub mod types;
 
