@@ -250,7 +250,10 @@ Gmail-side metadata (labels, thread, watermark).
 **Backfill vs. incremental:** the first run (or `--full`) lists the whole
 mailbox and fetches whatever's missing on disk — presence-on-disk is the
 real idempotence mechanism, so an interrupted backfill simply picks up
-where it left off on the next run, no cursor required. Subsequent runs use
+where it left off on the next run, no cursor required. The manifest itself
+is checkpointed to disk every 200 fetched messages during a large backfill
+(not only once at the end), so a crash loses at most that many messages'
+worth of already-completed work, not the whole run. Subsequent runs use
 `history.list` from the stored watermark, applying
 `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved` events.
 Google does not guarantee history availability past roughly **one week**;

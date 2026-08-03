@@ -11,7 +11,10 @@
 //! backfill needs no cursor to resume correctly): backfill, `--full`, and
 //! 404-triggered reconciliation are therefore all the *same* code path,
 //! [`run_full_sync`], which lists the whole mailbox and fetches only what's
-//! missing on disk.
+//! missing on disk. For that to actually hold across a real interruption
+//! (not just a clean run), the manifest itself must reach disk periodically
+//! during the fetch fan-out, not only once at the very end — see
+//! [`fetch_and_archive_messages`]'s [`MANIFEST_CHECKPOINT_INTERVAL`] (#1467).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -54,6 +57,15 @@ fn state_path(output_dir: &Path) -> PathBuf {
 fn manifest_path(output_dir: &Path) -> PathBuf {
     output_dir.join("manifest.jsonl")
 }
+
+/// Number of successfully-fetched messages between manifest checkpoints
+/// during [`fetch_and_archive_messages`]'s fetch fan-out.
+///
+/// Bounds how much re-fetch work a crash mid-backfill can cost to about one
+/// interval's worth (~4s at the documented 50 msg/s quota ceiling for `200`
+/// messages), while keeping the number of full-manifest rewrites
+/// proportional to `total / interval` rather than `total` (#1467).
+const MANIFEST_CHECKPOINT_INTERVAL: usize = 200;
 
 /// Runs one sync: resolves identity, decides backfill vs. incremental (with
 /// 404 fallback), fetches whatever's missing, and returns a report. Never
@@ -177,7 +189,7 @@ async fn run_full_sync(
         }
     }
 
-    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await;
+    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await?;
 
     let stale: Vec<String> = manifest
         .ids_not_deleted()
@@ -243,7 +255,7 @@ async fn run_incremental(
         }
     }
 
-    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await;
+    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await?;
 
     Ok(history
         .history_id
@@ -260,6 +272,13 @@ async fn run_incremental(
 /// future acquires its slot in that bound before drawing from `limiter` —
 /// debiting quota units before a concurrency slot is actually available
 /// would desync the bucket's notion of "spent" from real request issuance.
+///
+/// Results are applied as each fetch *completes* (not batched through an
+/// intermediate `Vec` after the whole fan-out finishes), and the manifest is
+/// checkpointed to disk every [`MANIFEST_CHECKPOINT_INTERVAL`] completions —
+/// see the module doc's interruption note. The final partial interval is
+/// still covered by `run_sync`'s own unconditional save once this function
+/// returns, so no extra flush is needed here on the way out.
 async fn fetch_and_archive_messages(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -267,7 +286,7 @@ async fn fetch_and_archive_messages(
     limiter: &TokenBucket,
     opts: &SyncOptions,
     report: &mut SyncReport,
-) {
+) -> Result<()> {
     let output_dir = &opts.output_dir;
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
@@ -288,28 +307,27 @@ async fn fetch_and_archive_messages(
         }
     }
     if to_fetch.is_empty() {
-        return;
+        return Ok(());
     }
 
     if opts.dry_run {
         for id in to_fetch {
             report.actions.push(SyncAction::WouldFetch { id });
         }
-        return;
+        return Ok(());
     }
 
     let concurrency = opts.concurrency.clamp(1, MAX_CONCURRENCY);
-    let results: Vec<(String, Result<ManifestRecord>)> = stream::iter(to_fetch)
+    let mut fetches = stream::iter(to_fetch)
         .map(|id| async move {
             limiter.acquire(MESSAGES_GET_COST_UNITS).await;
             let result = fetch_and_write_one(client, output_dir, &id).await;
             (id, result)
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
 
-    for (id, result) in results {
+    let mut since_checkpoint = 0usize;
+    while let Some((id, result)) = fetches.next().await {
         match result {
             Ok(record) => {
                 report.actions.push(SyncAction::Fetched {
@@ -324,7 +342,13 @@ async fn fetch_and_archive_messages(
                 reason: format!("{e:#}"),
             }),
         }
+        since_checkpoint += 1;
+        if since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
+            manifest.save(&manifest_path(output_dir))?;
+            since_checkpoint = 0;
+        }
     }
+    Ok(())
 }
 
 /// Fetches one message as `format=raw`, decodes it, writes the byte-exact
@@ -1213,5 +1237,152 @@ not-really-a-pdf\r\n\
             ids.len(),
             "every id should still be present and not soft-deleted"
         );
+    }
+
+    // ── manifest checkpointing during the fetch loop (#1467) ─────────────
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_checkpoints_the_manifest_across_multiple_intervals() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let total = MANIFEST_CHECKPOINT_INTERVAL * 2 + 5;
+        let ids: Vec<String> = (0..total).map(|i| format!("m{i}")).collect();
+        for id in &ids {
+            mount_raw_get(&server, id, "Hello").await;
+        }
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let opts = SyncOptions {
+            output_dir: output_dir.clone(),
+            query: None,
+            full: false,
+            concurrency: 20,
+            dry_run: false,
+        };
+
+        fetch_and_archive_messages(&client, &mut manifest, &ids, &limiter, &opts, &mut report)
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+
+        // Two checkpoint boundaries' worth of records should already have
+        // landed on disk *before* any final save — proving multiple
+        // checkpoints accumulate correctly rather than each one clobbering
+        // the last. `buffer_unordered` completes out of dispatch order, so
+        // this checks a count, not which specific ids made it.
+        let checkpointed = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let expected_checkpointed =
+            (total / MANIFEST_CHECKPOINT_INTERVAL) * MANIFEST_CHECKPOINT_INTERVAL;
+        assert_eq!(
+            checkpointed.ids_not_deleted().count(),
+            expected_checkpointed,
+            "expected exactly two checkpoints' worth of records on disk before any final save"
+        );
+
+        // The final partial interval (the last 5 ids) is only on disk once
+        // the caller does its own final save — the same thing `run_sync`
+        // always does after this function returns.
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+        let final_on_disk = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        for id in &ids {
+            assert!(
+                final_on_disk.get(id).is_some(),
+                "missing {id} after the final save"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_checkpoints_before_the_whole_batch_completes() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let fast_ids: Vec<String> = (0..MANIFEST_CHECKPOINT_INTERVAL)
+            .map(|i| format!("fast{i}"))
+            .collect();
+        let slow_ids: Vec<String> = (0..5).map(|i| format!("slow{i}")).collect();
+        for id in &fast_ids {
+            mount_raw_get(&server, id, "Hello").await;
+        }
+        for id in &slow_ids {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/gmail/v1/users/me/messages/{id}"
+                )))
+                .and(wiremock::matchers::query_param("format", "raw"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "id": id, "threadId": "t1", "labelIds": ["INBOX"],
+                            "internalDate": "1700000000000", "historyId": "500",
+                            "raw": raw_message_body(id, "Slow"),
+                        }))
+                        .set_delay(std::time::Duration::from_secs(3600)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let mut ids = fast_ids.clone();
+        ids.extend(slow_ids.clone());
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let opts = SyncOptions {
+            output_dir: output_dir.clone(),
+            query: None,
+            full: false,
+            concurrency: 20,
+            dry_run: false,
+        };
+
+        // The slow ids' 3600s delay never elapses within this test, so the
+        // only way `poll_checkpoint` can win this race is if the manifest
+        // was actually flushed to disk *during* the fetch loop — proving
+        // checkpointing isn't just an artifact of the final save `run_sync`
+        // does once this function returns.
+        let poll_checkpoint = async {
+            loop {
+                if let Ok(on_disk) = Manifest::load(&manifest_path(&output_dir)) {
+                    if fast_ids.iter().all(|id| on_disk.get(id).is_some()) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = fetch_and_archive_messages(
+                    &client, &mut manifest, &ids, &limiter, &opts, &mut report,
+                ) => {
+                    panic!(
+                        "fetch_and_archive_messages returned before the slow ids' delay could \
+                         possibly elapse — checkpointing must have regressed"
+                    );
+                }
+                () = poll_checkpoint => {}
+            }
+        })
+        .await
+        .expect("manifest was never checkpointed for the fast batch within 10s");
+
+        let on_disk = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        for id in &fast_ids {
+            assert!(
+                on_disk.get(id).is_some(),
+                "checkpoint should have covered {id}"
+            );
+        }
     }
 }
