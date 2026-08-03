@@ -426,11 +426,21 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("Failed to finalise {}", path.display()))
 }
 
+/// A 404 on `history.list` is Google's documented signal for a
+/// `startHistoryId` older than the mailbox's retention window. Treated as
+/// history-not-found when the error's `reason` is absent/unparseable (fails
+/// toward reconciling, matching `state.rs`'s disposable-state posture) or
+/// equals `"notFound"`; a 404 with a *different*, present reason is
+/// something else and must not silently trigger a full reconciliation —
+/// mirroring how [`crate::gmail::client`]'s 403 quota check requires a
+/// specific reason rather than matching on status alone.
 fn is_history_not_found(err: &anyhow::Error) -> bool {
-    matches!(
-        err.downcast_ref::<GmailError>(),
-        Some(GmailError::ApiRequestFailed { status: 404, .. })
-    )
+    match err.downcast_ref::<GmailError>() {
+        Some(e @ GmailError::ApiRequestFailed { status: 404, .. }) => {
+            e.reason().map_or(true, |r| r == "notFound")
+        }
+        _ => false,
+    }
 }
 
 /// Refuses an obviously-wrong `--output-dir`: `$HOME` itself, or anywhere
@@ -1456,5 +1466,57 @@ not-really-a-pdf\r\n\
             manifest_bytes_before,
             "dry-run must not mutate the manifest, in memory or on disk"
         );
+    }
+
+    // ── 404 reason-check tightening (#1467) ──────────────────────────────
+
+    #[tokio::test]
+    async fn run_sync_404_with_a_different_reason_is_not_treated_as_history_not_found() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "1".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"message": "Backend Error", "errors": [{"reason": "backendError"}]}
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Deliberately no mock for messages.list — a wrongly-triggered
+        // reconciliation would attempt one and fail differently than
+        // asserted below.
+
+        let err = run_sync(&client, &opts(output_dir.clone()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("backendError"));
+
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => {
+                assert_eq!(
+                    s.history_id, "1",
+                    "never treated as a reconciliation trigger"
+                );
+            }
+            _ => panic!("expected the original state to survive"),
+        }
     }
 }
