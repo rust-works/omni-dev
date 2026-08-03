@@ -270,7 +270,18 @@ async fn fetch_and_archive_messages(
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
     for id in ids {
-        if seen.insert(id.clone()) && !shard_path(output_dir, id).exists() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        // Not `shard_path(output_dir, id).exists()`: a not-yet-fetched
+        // message's shard depends on its `internal_date`, which isn't known
+        // until after it's fetched. The manifest's already-recorded `path`
+        // (the same check `run_full_sync` uses) is the only presence check
+        // available before a fetch happens.
+        let already_archived = manifest
+            .get(id)
+            .is_some_and(|record| output_dir.join(&record.path).exists());
+        if !already_archived {
             to_fetch.push(id.clone());
         }
     }
@@ -330,7 +341,7 @@ async fn fetch_and_write_one(
     let bytes = decode_raw_message(&message)?;
     let headers = extract_headers(&bytes, &["Subject", "From", "Message-Id"]);
 
-    let path = shard_path(output_dir, id);
+    let path = shard_path(output_dir, id, message.internal_date_utc());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -428,6 +439,7 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use chrono::DateTime;
 
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
@@ -517,6 +529,13 @@ mod tests {
             .await;
     }
 
+    /// The date `mount_raw_get`'s `internalDate` ("1700000000000") resolves
+    /// to — shared so tests asserting a fetched message's on-disk shard
+    /// location don't hardcode a second, independently-computed date.
+    fn mock_internal_date() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()
+    }
+
     fn opts(output_dir: PathBuf) -> SyncOptions {
         SyncOptions {
             output_dir,
@@ -546,7 +565,7 @@ mod tests {
             .actions
             .iter()
             .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
-        assert!(shard_path(&output_dir, "m1").exists());
+        assert!(shard_path(&output_dir, "m1", Some(mock_internal_date())).exists());
 
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {
@@ -635,7 +654,7 @@ mod tests {
         // both already archived, neither should be re-fetched or rewritten.
         let mut manifest = Manifest::default();
         for id in ["m2", "m3"] {
-            let path = shard_path(&output_dir, id);
+            let path = shard_path(&output_dir, id, None);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, format!("From: a@example.com\r\n\r\n{id} body")).unwrap();
             manifest.upsert(ManifestRecord {
@@ -653,7 +672,7 @@ mod tests {
             });
         }
         manifest.save(&manifest_path(&output_dir)).unwrap();
-        let m3_bytes_before = std::fs::read(shard_path(&output_dir, "m3")).unwrap();
+        let m3_bytes_before = std::fs::read(shard_path(&output_dir, "m3", None)).unwrap();
 
         mount_profile(&server, "user@example.com", "999").await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -685,14 +704,14 @@ mod tests {
             "m2 should be soft-deleted"
         );
         assert!(
-            shard_path(&output_dir, "m2").exists(),
+            shard_path(&output_dir, "m2", None).exists(),
             "m2's .eml must survive a soft-delete"
         );
         let m3 = manifest.get("m3").unwrap();
         assert!(m3.label_ids.contains(&"IMPORTANT".to_string()));
         assert!(!m3.label_ids.contains(&"UNREAD".to_string()));
         assert_eq!(
-            std::fs::read(shard_path(&output_dir, "m3")).unwrap(),
+            std::fs::read(shard_path(&output_dir, "m3", None)).unwrap(),
             m3_bytes_before,
             "a label-only change must never rewrite the .eml"
         );
@@ -803,7 +822,7 @@ mod tests {
         let output_dir = dir.path().join("archive");
 
         // An existing archive from a prior, already-completed run.
-        let eml_path = shard_path(&output_dir, "m1");
+        let eml_path = shard_path(&output_dir, "m1", None);
         std::fs::create_dir_all(eml_path.parent().unwrap()).unwrap();
         let original_bytes = b"From: a@example.com\r\n\r\nOriginal body.".to_vec();
         std::fs::write(&eml_path, &original_bytes).unwrap();
