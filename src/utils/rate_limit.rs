@@ -82,6 +82,15 @@ impl TokenBucket {
             }
         }
     }
+
+    /// Test-only introspection: the current token count (a real snapshot
+    /// behind the same mutex `acquire` locks, just without forcing a refill
+    /// computation first). Lets a caller's tests assert *how much* was
+    /// debited without needing real elapsed time to observe pacing.
+    #[cfg(test)]
+    pub(crate) async fn available(&self) -> f64 {
+        self.state.lock().await.tokens
+    }
 }
 
 #[cfg(test)]
