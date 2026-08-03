@@ -70,6 +70,10 @@ quick-xml = "0.41"
 # src/utils/http.rs name `http::Response::builder()` to reconstruct a
 # reqwest::Response from buffered parts (the retry_if 403/429 retry driver).
 http = "1"
+# Already in the tree transitively via url/reqwest; a direct dep lets
+# src/gmail/raw_message.rs decode RFC 2231 `filename*=...` attachment
+# filenames without pulling in a full MIME-parsing crate.
+percent-encoding = "2.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }

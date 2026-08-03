@@ -28,7 +28,9 @@ use crate::gmail::messages_api::{
     MESSAGES_GET_COST_UNITS,
 };
 use crate::gmail::profile_api::{Profile, ProfileApi};
-use crate::gmail::raw_message::{decode_raw_message, extract_headers};
+use crate::gmail::raw_message::{
+    decode_raw_message, extract_attachment_filenames, extract_headers,
+};
 use crate::utils::rate_limit::TokenBucket;
 
 use super::manifest::{Manifest, ManifestRecord};
@@ -339,7 +341,18 @@ async fn fetch_and_write_one(
         .get(id, MessageFormat::Raw, &[])
         .await?;
     let bytes = decode_raw_message(&message)?;
-    let headers = extract_headers(&bytes, &["Subject", "From", "Message-Id"]);
+    let headers = extract_headers(
+        &bytes,
+        &[
+            "Subject",
+            "From",
+            "To",
+            "Message-Id",
+            "In-Reply-To",
+            "References",
+        ],
+    );
+    let attachments = extract_attachment_filenames(&bytes);
 
     let path = shard_path(output_dir, id, message.internal_date_utc());
     if let Some(parent) = path.parent() {
@@ -356,7 +369,12 @@ async fn fetch_and_write_one(
         internal_date: message.internal_date,
         subject: headers.get("Subject").cloned(),
         from: headers.get("From").cloned(),
+        to: headers.get("To").cloned(),
         rfc822_msgid: headers.get("Message-Id").cloned(),
+        in_reply_to: headers.get("In-Reply-To").cloned(),
+        references: headers.get("References").cloned(),
+        attachment_count: attachments.count as u32,
+        attachment_filenames: attachments.filenames,
         path: relative,
         size: bytes.len() as u64,
         history_id: message.history_id,
@@ -581,6 +599,63 @@ mod tests {
         assert_eq!(record.from.as_deref(), Some("a@example.com"));
     }
 
+    #[tokio::test]
+    async fn run_sync_records_threading_headers_and_attachment_metadata() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        mount_message_list(&server, &["m1"]).await;
+
+        let source = "Subject: Report\r\n\
+From: a@example.com\r\n\
+To: b@example.com\r\n\
+Message-Id: <m1@example.com>\r\n\
+In-Reply-To: <parent@example.com>\r\n\
+References: <parent@example.com>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+\r\n\
+--BOUNDARY\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Hello\r\n\
+--BOUNDARY\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+\r\n\
+not-really-a-pdf\r\n\
+--BOUNDARY--\r\n";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "labelIds": ["INBOX"],
+                    "internalDate": "1700000000000",
+                    "historyId": "500",
+                    "raw": encoded,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+        assert!(report.errors.is_empty());
+
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert_eq!(record.to.as_deref(), Some("b@example.com"));
+        assert_eq!(record.in_reply_to.as_deref(), Some("<parent@example.com>"));
+        assert_eq!(record.references.as_deref(), Some("<parent@example.com>"));
+        assert_eq!(record.attachment_count, 1);
+        assert_eq!(record.attachment_filenames, vec!["report.pdf".to_string()]);
+    }
+
     // ── 404 → reconciliation ─────────────────────────────────────────
 
     #[tokio::test]
@@ -664,7 +739,12 @@ mod tests {
                 internal_date: None,
                 subject: None,
                 from: None,
+                to: None,
                 rfc822_msgid: None,
+                in_reply_to: None,
+                references: None,
+                attachment_count: 0,
+                attachment_filenames: Vec::new(),
                 path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
                 size: std::fs::metadata(&path).unwrap().len(),
                 history_id: Some("50".to_string()),
@@ -834,7 +914,12 @@ mod tests {
             internal_date: None,
             subject: None,
             from: None,
+            to: None,
             rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
             path: eml_path.strip_prefix(&output_dir).unwrap().to_path_buf(),
             size: original_bytes.len() as u64,
             history_id: Some("1".to_string()),

@@ -32,7 +32,26 @@ pub(crate) struct ManifestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rfc822_msgid: Option<String>,
+    /// The `In-Reply-To` header — together with `references`, what lets a
+    /// conversation be reconstructed from the manifest alone without
+    /// re-parsing every `.eml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) references: Option<String>,
+    /// Number of `Content-Disposition: attachment` MIME parts found,
+    /// regardless of whether a filename was parseable — see
+    /// `crate::gmail::raw_message::extract_attachment_filenames`.
+    #[serde(default)]
+    pub(crate) attachment_count: u32,
+    /// Filenames actually extracted (a subset of `attachment_count`, since
+    /// not every attachment part names itself). Metadata only — attachments
+    /// stay inline in the `.eml`, never extracted to separate files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attachment_filenames: Vec<String>,
     /// Path to the `.eml` file, relative to the archive root.
     pub(crate) path: PathBuf,
     pub(crate) size: u64,
@@ -182,8 +201,13 @@ mod tests {
             internal_date: Some("1700000000000".to_string()),
             subject: Some("Hello".to_string()),
             from: Some("a@example.com".to_string()),
+            to: Some("b@example.com".to_string()),
             rfc822_msgid: Some("<1@example.com>".to_string()),
-            path: PathBuf::from(format!("messages/{}/{}.eml", &id[..2.min(id.len())], id)),
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: PathBuf::from(format!("messages/2026/01/01/{id}.eml")),
             size: 42,
             history_id: Some("1000".to_string()),
             deleted_at: None,

@@ -2455,6 +2455,7 @@ dependencies = [
  "mime_guess",
  "nix",
  "objc2-core-foundation",
+ "percent-encoding",
  "proptest",
  "quick-xml",
  "rand 0.10.2",
