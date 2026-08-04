@@ -48,8 +48,10 @@ pub(crate) struct ManifestRecord {
     #[serde(default)]
     pub(crate) attachment_count: u32,
     /// Filenames actually extracted (a subset of `attachment_count`, since
-    /// not every attachment part names itself). Metadata only — attachments
-    /// stay inline in the `.eml`, never extracted to separate files.
+    /// not every attachment part names itself). Always from the same cheap
+    /// heuristic scan, regardless of `--extract-attachments` — this field
+    /// is independent of whatever that flag wrote to disk this run; see
+    /// `crate::gmail::attachments` / ADR-0065.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) attachment_filenames: Vec<String>,
     /// Path to the `.eml` file, relative to the archive root.

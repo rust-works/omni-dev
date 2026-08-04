@@ -64,6 +64,19 @@ pub struct SyncCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Also writes each message's attachment MIME parts to disk as
+    /// separate files under `<eml-shard-dir>/<id>/attachments/<filename>`,
+    /// alongside the existing `.eml`. Off by default: extraction is
+    /// additional I/O/disk usage per message, and the `.eml` stays the
+    /// lossless source of truth regardless. Only applies to messages
+    /// actually fetched this run — presence-on-disk still skips an
+    /// already-archived message, so turning this on does not
+    /// retroactively backfill an existing archive (delete the affected
+    /// `.eml` files, or the whole archive, and re-run `--full` to force
+    /// re-extraction).
+    #[arg(long)]
+    pub extract_attachments: bool,
+
     /// Report format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -81,6 +94,7 @@ impl SyncCommand {
                 full: self.full,
                 concurrency: self.concurrency,
                 dry_run: self.dry_run,
+                extract_attachments: self.extract_attachments,
             },
             &self.output,
         )
@@ -209,6 +223,7 @@ mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
+    use base64::Engine as _;
 
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
@@ -374,6 +389,7 @@ mod tests {
                 full: false,
                 concurrency: 4,
                 dry_run: true,
+                extract_attachments: false,
             },
             &OutputFormat::Table,
         )
@@ -418,6 +434,7 @@ mod tests {
                 full: false,
                 concurrency: 4,
                 dry_run: false,
+                extract_attachments: false,
             },
             &OutputFormat::Table,
         )
@@ -453,8 +470,134 @@ mod tests {
             full: false,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,
+            extract_attachments: false,
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
+    }
+
+    // ── --extract-attachments ────────────────────────────────────────
+
+    fn multipart_with_base64_attachment() -> String {
+        let encoded_attachment = base64::engine::general_purpose::STANDARD.encode(b"PDF-CONTENT");
+        format!(
+            "Subject: Report\r\n\
+From: a@example.com\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+\r\n\
+--BOUNDARY\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Hello\r\n\
+--BOUNDARY\r\n\
+Content-Type: application/pdf\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+\r\n\
+{encoded_attachment}\r\n\
+--BOUNDARY--\r\n"
+        )
+    }
+
+    /// Mounts a single-message mailbox (`m1`, a multipart message with one
+    /// base64-encoded `application/pdf` attachment) for the
+    /// `--extract-attachments` tests below.
+    async fn mount_single_message_with_attachment(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "user@example.com", "messagesTotal": 1, "threadsTotal": 1, "historyId": "1"
+            })))
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": [{"id": "m1", "threadId": "t1"}]
+                })),
+            )
+            .mount(server)
+            .await;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(multipart_with_base64_attachment());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "labelIds": ["INBOX"],
+                    "internalDate": "1700000000000",
+                    "historyId": "500",
+                    "raw": encoded,
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn expected_attachment_path(output_dir: &std::path::Path) -> PathBuf {
+        let date = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        shard::attachments_dir(output_dir, "m1", Some(date)).join("report.pdf")
+    }
+
+    #[tokio::test]
+    async fn run_sync_command_extract_attachments_writes_attachment_files() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_single_message_with_attachment(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        run_sync_command(
+            &client,
+            SyncOptions {
+                output_dir: output_dir.clone(),
+                query: None,
+                full: false,
+                concurrency: 4,
+                dry_run: false,
+                extract_attachments: true,
+            },
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        let contents = std::fs::read(expected_attachment_path(&output_dir)).unwrap();
+        assert_eq!(contents, b"PDF-CONTENT");
+    }
+
+    #[tokio::test]
+    async fn run_sync_command_without_extract_attachments_writes_no_attachment_files() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_single_message_with_attachment(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        run_sync_command(
+            &client,
+            SyncOptions {
+                output_dir: output_dir.clone(),
+                query: None,
+                full: false,
+                concurrency: 4,
+                dry_run: false,
+                extract_attachments: false,
+            },
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        assert!(!expected_attachment_path(&output_dir).exists());
+        assert!(!expected_attachment_path(&output_dir)
+            .parent()
+            .unwrap()
+            .exists());
     }
 }
