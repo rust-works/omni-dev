@@ -5,9 +5,9 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     model::{
-        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities,
-        ServerInfo,
+        CallToolResponse, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+        ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool_handler, ErrorData as McpError, RoleServer, ServerHandler,
@@ -78,7 +78,7 @@ impl ServerHandler for OmniDevServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let tool = request.name.to_string();
         let ctx = request_log::RequestLogContext::mcp(tool.clone());
         request_log::CTX
@@ -144,12 +144,13 @@ impl ServerHandler for OmniDevServer {
         &self,
         request: ReadResourceRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri;
         let parsed =
             resources::ResourceUri::parse(&uri).map_err(|err| resources::not_found(&uri, err))?;
         resources::read_resource(&parsed, &uri)
             .await
+            .map(Into::into)
             .map_err(|err| resources::not_found(&uri, err))
     }
 }

@@ -317,20 +317,12 @@ pub fn not_found(uri: &str, reason: impl std::fmt::Display) -> McpError {
 
 /// Builds the full [`ListResourcesResult`] payload.
 pub fn list_resources_result() -> ListResourcesResult {
-    ListResourcesResult {
-        resources: resource_listing(),
-        next_cursor: None,
-        meta: None,
-    }
+    ListResourcesResult::with_all_items(resource_listing())
 }
 
 /// Builds the full [`ListResourceTemplatesResult`] payload.
 pub fn list_resource_templates_result() -> ListResourceTemplatesResult {
-    ListResourceTemplatesResult {
-        resource_templates: resource_templates(),
-        next_cursor: None,
-        meta: None,
-    }
+    ListResourceTemplatesResult::with_all_items(resource_templates())
 }
 
 #[cfg(test)]
