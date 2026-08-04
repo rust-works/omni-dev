@@ -67,3 +67,111 @@ pub(crate) struct SyncError {
     pub(crate) id: String,
     pub(crate) reason: String,
 }
+
+/// Aggregate counts derived from `actions`/`errors` — see [`SyncReport::summary`].
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct SyncSummary {
+    pub(crate) fetched: usize,
+    pub(crate) would_fetch: usize,
+    pub(crate) labels_updated: usize,
+    pub(crate) deleted: usize,
+    pub(crate) undeleted: usize,
+    pub(crate) would_delete: usize,
+    pub(crate) would_undelete: usize,
+    pub(crate) errors: usize,
+}
+
+impl SyncReport {
+    /// Tallies `actions` by variant plus `errors.len()`. Recomputed on
+    /// demand — `actions`/`errors` are pushed to directly throughout
+    /// `engine::run_sync`, so there is no single point to accumulate a
+    /// stored counter without risking drift.
+    pub(crate) fn summary(&self) -> SyncSummary {
+        let mut summary = SyncSummary {
+            errors: self.errors.len(),
+            ..SyncSummary::default()
+        };
+        for action in &self.actions {
+            match action {
+                SyncAction::Fetched { .. } => summary.fetched += 1,
+                SyncAction::WouldFetch { .. } => summary.would_fetch += 1,
+                SyncAction::LabelsUpdated { .. } => summary.labels_updated += 1,
+                SyncAction::Deleted { .. } => summary.deleted += 1,
+                SyncAction::Undeleted { .. } => summary.undeleted += 1,
+                SyncAction::WouldDelete { .. } => summary.would_delete += 1,
+                SyncAction::WouldUndelete { .. } => summary.would_undelete += 1,
+                // Informational only — not part of the tally (#1488).
+                SyncAction::Note { .. } => {}
+            }
+        }
+        summary
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_counts_each_action_variant() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::Fetched {
+                    id: "m1".to_string(),
+                    path: PathBuf::from("m1.eml"),
+                    bytes: 1,
+                },
+                SyncAction::WouldFetch {
+                    id: "m2".to_string(),
+                },
+                SyncAction::LabelsUpdated {
+                    id: "m3".to_string(),
+                    added: vec!["IMPORTANT".to_string()],
+                    removed: vec![],
+                },
+                SyncAction::Deleted {
+                    id: "m4".to_string(),
+                },
+                SyncAction::Undeleted {
+                    id: "m5".to_string(),
+                },
+                SyncAction::WouldDelete {
+                    id: "m6".to_string(),
+                },
+                SyncAction::WouldUndelete {
+                    id: "m7".to_string(),
+                },
+                SyncAction::Note {
+                    message: "one note".to_string(),
+                },
+                SyncAction::Note {
+                    message: "another note".to_string(),
+                },
+            ],
+            errors: vec![SyncError {
+                id: "m8".to_string(),
+                reason: "boom".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            report.summary(),
+            SyncSummary {
+                fetched: 1,
+                would_fetch: 1,
+                labels_updated: 1,
+                deleted: 1,
+                undeleted: 1,
+                would_delete: 1,
+                would_undelete: 1,
+                errors: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_of_empty_report_is_all_zero() {
+        assert_eq!(SyncReport::default().summary(), SyncSummary::default());
+    }
+}

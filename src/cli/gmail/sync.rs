@@ -18,12 +18,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::Serialize;
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, write_scalar_jsonl, JsonlSerialize, OutputFormat};
 use crate::gmail::client::GmailClient;
 
 use engine::SyncOptions;
-use report::{SyncAction, SyncReport};
+use report::{SyncAction, SyncError, SyncReport, SyncSummary};
 
 /// Default `--concurrency`: an in-flight-request cap layered under the
 /// token-bucket rate limiter (which is the actual quota-compliance
@@ -102,7 +103,12 @@ async fn run_sync_command(
 ) -> Result<()> {
     let report = engine::run_sync(client, &opts).await?;
 
-    if !output_as(&report, output)? {
+    let output_view = SyncReportOutput {
+        actions: &report.actions,
+        errors: &report.errors,
+        summary: report.summary(),
+    };
+    if !output_as(&output_view, output)? {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
         render_report_text(&report, &mut handle)?;
@@ -115,6 +121,26 @@ async fn run_sync_command(
         );
     }
     Ok(())
+}
+
+/// `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` view of a [`SyncReport`]: the
+/// same `actions`/`errors` plus a computed `summary` field, so a machine
+/// consumer gets the same at-a-glance total the text output gains (#1488).
+/// Mirrors `SyncOutput` in `src/cli/ai/claude/history.rs`, which adds a
+/// `dry_run` field the same way — a borrowing wrapper rather than a field on
+/// `SyncReport` itself, since `summary` is only ever valid once a run has
+/// finished pushing to `actions`/`errors`.
+#[derive(Serialize)]
+struct SyncReportOutput<'a> {
+    actions: &'a [SyncAction],
+    errors: &'a [SyncError],
+    summary: SyncSummary,
+}
+
+impl JsonlSerialize for SyncReportOutput<'_> {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
 }
 
 /// Renders a report as one line per action, then one line per error.
@@ -151,7 +177,30 @@ fn render_report_text(report: &SyncReport, out: &mut dyn Write) -> Result<()> {
         writeln!(out, "Error: {} failed: {}", error.id, error.reason)
             .context("Failed to write sync report")?;
     }
+    writeln!(out, "{}", format_summary_line(&report.summary()))
+        .context("Failed to write sync report")?;
     Ok(())
+}
+
+/// Formats `summary` as a trailing comma-separated line, e.g.
+/// `"3 fetched, 1 deleted, 0 errors"`. Zero counts are omitted except
+/// `errors`, which is always shown so a clean run is visible at a glance.
+fn format_summary_line(summary: &SyncSummary) -> String {
+    let mut parts = Vec::new();
+    let mut push = |count: usize, label: &str| {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    };
+    push(summary.fetched, "fetched");
+    push(summary.would_fetch, "would fetch");
+    push(summary.labels_updated, "labels updated");
+    push(summary.deleted, "deleted");
+    push(summary.undeleted, "undeleted");
+    push(summary.would_delete, "would delete");
+    push(summary.would_undelete, "would undelete");
+    parts.push(format!("{} errors", summary.errors));
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -160,7 +209,6 @@ mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
-    use report::SyncError;
 
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
@@ -226,7 +274,8 @@ mod tests {
         assert!(text.contains("Fetched m1"));
         assert!(text.contains("Deleted m2"));
         assert!(text.contains("Error: m3 failed: boom"));
-        assert_eq!(text.lines().count(), 3);
+        assert!(text.contains("1 fetched, 1 deleted, 1 errors"));
+        assert_eq!(text.lines().count(), 4);
     }
 
     #[test]
@@ -244,6 +293,52 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("+IMPORTANT"));
         assert!(text.contains("-UNREAD"));
+    }
+
+    #[test]
+    fn render_report_text_summary_line_omits_zero_counts_under_dry_run() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::WouldFetch {
+                    id: "m1".to_string(),
+                },
+                SyncAction::WouldDelete {
+                    id: "m2".to_string(),
+                },
+                SyncAction::WouldUndelete {
+                    id: "m3".to_string(),
+                },
+            ],
+            errors: vec![],
+        };
+        let mut buf = Vec::new();
+        render_report_text(&report, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("1 would fetch, 1 would delete, 1 would undelete, 0 errors"));
+        assert!(!text.contains("fetched,"));
+        assert!(!text.contains("deleted,"));
+    }
+
+    // ── SyncReportOutput (`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`) ─────
+
+    #[test]
+    fn sync_report_output_yaml_includes_summary_field() {
+        let report = SyncReport {
+            actions: vec![SyncAction::Fetched {
+                id: "m1".to_string(),
+                path: PathBuf::from("m1.eml"),
+                bytes: 1,
+            }],
+            errors: vec![],
+        };
+        let output_view = SyncReportOutput {
+            actions: &report.actions,
+            errors: &report.errors,
+            summary: report.summary(),
+        };
+        let yaml = serde_yaml::to_string(&output_view).unwrap();
+        assert!(yaml.contains("summary:"));
+        assert!(yaml.contains("fetched: 1"));
     }
 
     // ── run_sync_command / SyncCommand::execute glue ────────────────────
