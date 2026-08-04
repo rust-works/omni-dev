@@ -1,13 +1,18 @@
 //! CLI commands for Gmail credential management.
 
-use anyhow::{anyhow, Result};
+use std::io::{self, Write};
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::gmail::auth::{self, BrowserConfig, GmailScope};
 use crate::gmail::client::GmailClient;
 use crate::gmail::profile_api::ProfileApi;
-use crate::utils::env::{EnvSource, SystemEnv};
+use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
+use crate::utils::settings::SettingsEnv;
 
 /// Manages Gmail OAuth2 credentials.
 #[derive(Parser)]
@@ -52,42 +57,107 @@ pub struct LoginCommand {
 
 impl LoginCommand {
     /// Reads the user's Google Cloud OAuth2 client credentials from the
-    /// environment and runs the login flow.
+    /// environment or settings.json, prompting interactively when neither
+    /// has them, then runs the login flow.
     pub async fn execute(self) -> Result<()> {
-        run_login(&SystemEnv, self.modify).await
+        run_login(&SettingsEnv::load(), self.modify).await
     }
 }
 
-/// [`LoginCommand::execute`] over an injected [`EnvSource`].
+/// [`LoginCommand::execute`] over an injected [`EnvSource`]. Production
+/// passes a [`SettingsEnv`] (process env, falling back to settings.json);
+/// tests pass a plain `MapEnv` representing the already-resolved value.
 async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
-    let client_id = env.var(auth::GMAIL_CLIENT_ID).ok_or_else(|| {
-        anyhow!(
-            "GMAIL_CLIENT_ID is not set. Create your own Google Cloud OAuth2 client (see \
-             docs/gmail.md) and set GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET before running \
-             `omni-dev gmail auth login`."
-        )
-    })?;
-    let client_secret = env.var(auth::GMAIL_CLIENT_SECRET).ok_or_else(|| {
-        anyhow!(
-            "GMAIL_CLIENT_SECRET is not set. Create your own Google Cloud OAuth2 client (see \
-             docs/gmail.md) and set GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET before running \
-             `omni-dev gmail auth login`."
-        )
-    })?;
+    let (client_id, client_secret) =
+        resolve_login_credentials(env, prompt_client_id, prompt_client_secret)?;
     let scope = resolve_scope(modify);
 
-    let status = auth::login(
-        &client_id,
-        &Secret::new(client_secret),
-        scope,
-        &BrowserConfig::default(),
-    )
-    .await?;
+    let status = auth::login(&client_id, &client_secret, scope, &BrowserConfig::default()).await?;
 
     println!("\nCredentials saved to ~/.omni-dev/settings.json");
     println!("  Granted scope: {}", status.scope.unwrap_or_default());
     println!("\nRun `omni-dev gmail auth status` to verify.");
     Ok(())
+}
+
+/// Resolves the OAuth2 client id/secret from `env`, falling back to the
+/// given prompts when either is absent — the pure decision extracted from
+/// [`run_login`] so it's testable without a real terminal.
+fn resolve_login_credentials(
+    env: &impl EnvSource,
+    prompt_client_id: impl FnOnce() -> Result<String>,
+    prompt_client_secret: impl FnOnce() -> Result<Secret>,
+) -> Result<(String, Secret)> {
+    let client_id = match env.var(auth::GMAIL_CLIENT_ID) {
+        Some(v) => v,
+        None => prompt_client_id()?,
+    };
+    let client_secret = match env.var(auth::GMAIL_CLIENT_SECRET) {
+        Some(v) => Secret::new(v),
+        None => prompt_client_secret()?,
+    };
+    Ok((client_id, client_secret))
+}
+
+/// Prompts for the OAuth2 client id on stdin. Echoes normally — the id
+/// isn't secret (it's visible in the browser's own network traffic during
+/// login regardless, same rationale as `GmailCredentials::client_id`).
+fn prompt_client_id() -> Result<String> {
+    print!(
+        "GMAIL_CLIENT_ID is not set. Run `omni-dev gmail auth import` first, or paste it here \
+         (see docs/gmail.md).\nClient id: "
+    );
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read user input")?;
+    Ok(input.trim().to_string())
+}
+
+/// Guard that disables raw mode on drop — mirrors `cli::ai::chat`'s
+/// `RawModeGuard`, duplicated locally rather than shared since it's a
+/// five-line `Drop` impl and this keeps the change scoped to Gmail.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Prompts for the OAuth2 client secret on stdin without echoing it —
+/// raw-mode key-by-key reading via `crossterm`, printing nothing per
+/// keystroke (not even a placeholder character, to avoid leaking the
+/// secret's length).
+fn prompt_client_secret() -> Result<Secret> {
+    print!("Client secret: ");
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    enable_raw_mode().context("Failed to enable terminal raw mode")?;
+    let guard = RawModeGuard;
+
+    let mut buffer = String::new();
+    loop {
+        if let Event::Key(key_event) = event::read().context("Failed to read terminal input")? {
+            match key_event.code {
+                KeyCode::Enter => break,
+                KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    anyhow::bail!("Aborted");
+                }
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(guard);
+    println!();
+
+    Ok(Secret::new(buffer))
 }
 
 /// Maps `--modify` to the scope requested at login.
@@ -183,18 +253,14 @@ mod tests {
     }
 
     // ── AuthCommand::execute dispatch ───────────────────────────────
-
-    #[tokio::test]
-    async fn auth_command_execute_routes_login_and_surfaces_missing_credentials() {
-        let guard = EnvGuard::take();
-        let _dir = guard.clear_credentials();
-
-        let cmd = AuthCommand {
-            command: AuthSubcommands::Login(LoginCommand { modify: false }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("GMAIL_CLIENT_ID"));
-    }
+    //
+    // Login's execute() prompts on stdin when credentials are missing (no
+    // more hard "missing credentials" error to assert against without a
+    // real terminal), so its dispatch is covered by the no-IO
+    // `auth_command_login_dispatch` test above instead — same reasoning
+    // `datadog`/`atlassian`'s always-prompting `LoginCommand::execute`
+    // already follow (no automated test of the real stdin path, only of
+    // the extracted pure logic below).
 
     #[tokio::test]
     async fn auth_command_execute_routes_logout() {
@@ -235,32 +301,72 @@ mod tests {
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
     }
 
-    // ── run_login env validation ──────────────────────────────────
+    // ── resolve_login_credentials ───────────────────────────────────
 
-    #[tokio::test]
-    async fn run_login_errors_when_client_id_missing() {
-        let env = MapEnv::new().with(GMAIL_CLIENT_SECRET, "s");
-        let err = run_login(&env, false).await.unwrap_err();
-        assert!(err.to_string().contains("GMAIL_CLIENT_ID"));
+    #[test]
+    fn resolve_login_credentials_uses_env_when_present() {
+        let env = MapEnv::new()
+            .with(GMAIL_CLIENT_ID, "id")
+            .with(GMAIL_CLIENT_SECRET, "sec");
+        let (id, secret) = resolve_login_credentials(
+            &env,
+            || anyhow::bail!("should not prompt for client id"),
+            || anyhow::bail!("should not prompt for client secret"),
+        )
+        .unwrap();
+        assert_eq!(id, "id");
+        assert_eq!(secret.expose_secret(), "sec");
     }
 
-    #[tokio::test]
-    async fn run_login_errors_when_client_secret_missing() {
-        let env = MapEnv::new().with(GMAIL_CLIENT_ID, "c");
-        let err = run_login(&env, false).await.unwrap_err();
-        assert!(err.to_string().contains("GMAIL_CLIENT_SECRET"));
+    #[test]
+    fn resolve_login_credentials_prompts_for_missing_client_id_only() {
+        let env = MapEnv::new().with(GMAIL_CLIENT_SECRET, "sec");
+        let (id, secret) = resolve_login_credentials(
+            &env,
+            || Ok("prompted-id".to_string()),
+            || anyhow::bail!("should not prompt for client secret"),
+        )
+        .unwrap();
+        assert_eq!(id, "prompted-id");
+        assert_eq!(secret.expose_secret(), "sec");
     }
 
-    // ── LoginCommand::execute glue ──────────────────────────────────
+    #[test]
+    fn resolve_login_credentials_prompts_for_missing_client_secret_only() {
+        let env = MapEnv::new().with(GMAIL_CLIENT_ID, "id");
+        let (id, secret) = resolve_login_credentials(
+            &env,
+            || anyhow::bail!("should not prompt for client id"),
+            || Ok(Secret::new("prompted-secret")),
+        )
+        .unwrap();
+        assert_eq!(id, "id");
+        assert_eq!(secret.expose_secret(), "prompted-secret");
+    }
 
-    #[tokio::test]
-    async fn login_command_execute_errors_when_credentials_missing() {
-        let guard = EnvGuard::take();
-        let _dir = guard.clear_credentials();
+    #[test]
+    fn resolve_login_credentials_prompts_for_both_when_env_empty() {
+        let env = MapEnv::new();
+        let (id, secret) = resolve_login_credentials(
+            &env,
+            || Ok("prompted-id".to_string()),
+            || Ok(Secret::new("prompted-secret")),
+        )
+        .unwrap();
+        assert_eq!(id, "prompted-id");
+        assert_eq!(secret.expose_secret(), "prompted-secret");
+    }
 
-        let cmd = LoginCommand { modify: false };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("GMAIL_CLIENT_ID"));
+    #[test]
+    fn resolve_login_credentials_propagates_prompt_error() {
+        let env = MapEnv::new();
+        let err = resolve_login_credentials(
+            &env,
+            || anyhow::bail!("Aborted"),
+            || anyhow::bail!("should not be called"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborted"));
     }
 
     // ── run_logout / LogoutCommand::execute ─────────────────────────
