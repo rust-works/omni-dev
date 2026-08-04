@@ -234,8 +234,12 @@ Maintains a durable, greppable local archive of a mailbox — full-fidelity
 `.eml` files plus a JSONL manifest — incrementally updated on each run.
 Unlike every other Gmail command, `sync` is a genuinely long-running bulk
 operation: **a first sync of a several-thousand-message mailbox takes
-minutes, not seconds**, and a 50k-message mailbox roughly 15-20 minutes,
-bounded by Gmail's per-second quota (see
+minutes, not seconds**. A 50k-message mailbox is roughly 15-20 minutes at
+Gmail's theoretical 50 msg/s quota ceiling, but real-world throughput
+depends on message sizes and network too — a measured run against a
+5,824-message mailbox sustained 36.4 msg/s, which extrapolates to roughly
+23 minutes for 50k. Either figure is bounded by Gmail's per-second quota
+(see
 [Rate limits](#rate-limits-and-retry-behaviour) below). A re-run against an
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
@@ -248,7 +252,8 @@ already-synced mailbox with no new mail is fast — typically a single
   manifest.jsonl               # one record per message: id, thread_id, label_ids,
                                 #   internal_date, subject, from, to, rfc822_msgid,
                                 #   in_reply_to, references, attachment_count,
-                                #   attachment_filenames, path
+                                #   attachment_filenames, path, size, history_id,
+                                #   deleted_at (soft-deleted messages only)
   messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
   messages/<year>/<month>/<day>/<id>/attachments/<filename>  # only with --extract-attachments
 ```
