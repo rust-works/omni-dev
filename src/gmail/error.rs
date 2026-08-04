@@ -88,6 +88,15 @@ pub enum GmailError {
     #[error("Gmail OAuth token response was malformed: missing `{0}`")]
     MalformedTokenResponse(&'static str),
 
+    /// Google's token response carried no Gmail scope at all — e.g. the
+    /// Gmail permission was left unticked on the consent screen.
+    #[error(
+        "Google did not grant a Gmail scope (received: {0}).\n  On the consent screen, tick the \
+         Gmail permission — restricted scopes are not granted by default. Re-run \
+         `omni-dev gmail auth login`."
+    )]
+    NoGmailScopeGranted(String),
+
     /// The configured browser launch command was invalid.
     #[error("Invalid browser launch command: {0}")]
     InvalidBrowserCommand(String),
@@ -254,5 +263,14 @@ mod tests {
     fn invalid_browser_command_display_includes_detail() {
         let err = GmailError::InvalidBrowserCommand("empty command".to_string());
         assert!(err.to_string().contains("empty command"));
+    }
+
+    #[test]
+    fn no_gmail_scope_granted_display_names_the_received_scopes() {
+        let err = GmailError::NoGmailScopeGranted("openid, email, profile".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("openid, email, profile"));
+        assert!(msg.contains("consent screen"));
+        assert!(msg.contains("auth login"));
     }
 }
