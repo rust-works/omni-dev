@@ -1079,6 +1079,13 @@ mod tests {
     // task can dial it directly — `login_to` binds the real listener before
     // opening the browser, so the connector retries briefly to cover the
     // small window before that bind completes.
+    //
+    // That reserve-then-drop is itself a TOCTOU race against the rest of the
+    // parallel test suite: another test can grab the same ephemeral port
+    // before `login_to`'s own bind runs, which fails outright rather than
+    // retrying (see issue #1489). `run_with_port_retry` bounds a retry of
+    // the whole reserve/connect/bind attempt on exactly that failure, so a
+    // lost race just tries again with a fresh port instead of flaking.
 
     async fn connect_and_send(port: u16, request_line: &[u8]) {
         let mut stream = loop {
@@ -1098,72 +1105,99 @@ mod tests {
             .port()
     }
 
-    #[tokio::test]
-    async fn login_to_rejects_a_callback_with_mismatched_state() {
-        let port = reserve_free_port();
-        let browser = BrowserConfig {
-            launch: BrowserLaunch::Manual,
-            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            callback_port: port,
-        };
-        let connector = tokio::spawn(connect_and_send(
-            port,
-            b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
-        ));
+    /// True if `err` is `bind_callback_listener`'s wrapped `AddrInUse` —
+    /// i.e. some other process/test won the race for the port reserved by
+    /// [`reserve_free_port`] before `login_to` could rebind it.
+    fn is_callback_bind_conflict(err: &anyhow::Error) -> bool {
+        err.to_string()
+            .contains("Failed to start the local OAuth callback listener")
+    }
 
+    const PORT_RETRY_ATTEMPTS: u32 = 5;
+
+    /// Runs `attempt`, which reserves its own port via [`reserve_free_port`]
+    /// and returns `login_to`'s result, retrying up to
+    /// [`PORT_RETRY_ATTEMPTS`] times when the attempt loses the ephemeral
+    /// port race (see the module comment above `connect_and_send`).
+    async fn run_with_port_retry<F, Fut>(mut attempt: F) -> Result<GmailAuthStatus>
+    where
+        F: FnMut(u16) -> Fut,
+        Fut: std::future::Future<Output = Result<GmailAuthStatus>>,
+    {
+        for remaining in (0..PORT_RETRY_ATTEMPTS).rev() {
+            let result = attempt(reserve_free_port()).await;
+            let is_retryable_conflict =
+                matches!(&result, Err(err) if remaining > 0 && is_callback_bind_conflict(err));
+            if !is_retryable_conflict {
+                return result;
+            }
+        }
+        unreachable!("loop always returns on its last iteration")
+    }
+
+    /// Shared body for the three `login_to_*` tests that drive a single
+    /// fixed callback request line through `login_to` and expect it to
+    /// error: reserves a port, spawns the connector, calls `login_to`, and
+    /// retries the whole attempt (via [`run_with_port_retry`]) if it loses
+    /// the ephemeral-port race. Asserts no settings file was written and
+    /// returns the resulting error for the caller to inspect.
+    async fn run_login_to_expect_err(request_line: &'static [u8]) -> anyhow::Error {
         std::fs::create_dir_all("tmp").ok();
         let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
         let settings_path = temp_dir.path().join("settings.json");
 
-        let err = login_to(
-            &settings_path,
-            None,
-            "client-id",
-            &Secret::new("client-secret"),
-            GmailScope::ReadOnly,
-            &browser,
-            "http://127.0.0.1:1/token", // never reached — state check fails first
-        )
-        .await
-        .unwrap_err();
-        connector.await.unwrap();
+        let result = run_with_port_retry(|port| {
+            let settings_path = settings_path.clone();
+            async move {
+                let browser = BrowserConfig {
+                    launch: BrowserLaunch::Manual,
+                    callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    callback_port: port,
+                };
+                let connector = tokio::spawn(connect_and_send(port, request_line));
+
+                let result = login_to(
+                    &settings_path,
+                    None,
+                    "client-id",
+                    &Secret::new("client-secret"),
+                    GmailScope::ReadOnly,
+                    &browser,
+                    "http://127.0.0.1:1/token", // never reached — fails before exchange
+                )
+                .await;
+
+                match &result {
+                    Err(err) if is_callback_bind_conflict(err) => connector.abort(),
+                    _ => connector.await.unwrap(),
+                }
+                result
+            }
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(!settings_path.exists());
+        err
+    }
+
+    #[tokio::test]
+    async fn login_to_rejects_a_callback_with_mismatched_state() {
+        let err =
+            run_login_to_expect_err(b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n").await;
 
         assert!(matches!(
             err.downcast_ref::<GmailError>(),
             Some(GmailError::StateMismatch)
         ));
-        assert!(!settings_path.exists());
     }
 
     #[tokio::test]
     async fn login_to_surfaces_access_denied_from_the_callback() {
-        let port = reserve_free_port();
-        let browser = BrowserConfig {
-            launch: BrowserLaunch::Manual,
-            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            callback_port: port,
-        };
-        let connector = tokio::spawn(connect_and_send(
-            port,
+        let err = run_login_to_expect_err(
             b"GET /?error=access_denied&error_description=user+declined HTTP/1.1\r\n\r\n",
-        ));
-
-        std::fs::create_dir_all("tmp").ok();
-        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
-        let settings_path = temp_dir.path().join("settings.json");
-
-        let err = login_to(
-            &settings_path,
-            None,
-            "client-id",
-            &Secret::new("client-secret"),
-            GmailScope::ReadOnly,
-            &browser,
-            "http://127.0.0.1:1/token", // never reached — denied before exchange
         )
-        .await
-        .unwrap_err();
-        connector.await.unwrap();
+        .await;
 
         match err.downcast_ref::<GmailError>() {
             Some(GmailError::AuthorizationDenied(message)) => {
@@ -1172,41 +1206,16 @@ mod tests {
             }
             other => panic!("expected AuthorizationDenied, got {other:?}"),
         }
-        assert!(!settings_path.exists());
     }
 
     #[tokio::test]
     async fn login_to_rejects_a_callback_missing_code_and_state() {
-        let port = reserve_free_port();
-        let browser = BrowserConfig {
-            launch: BrowserLaunch::Manual,
-            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            callback_port: port,
-        };
-        let connector = tokio::spawn(connect_and_send(port, b"GET /?foo=bar HTTP/1.1\r\n\r\n"));
-
-        std::fs::create_dir_all("tmp").ok();
-        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
-        let settings_path = temp_dir.path().join("settings.json");
-
-        let err = login_to(
-            &settings_path,
-            None,
-            "client-id",
-            &Secret::new("client-secret"),
-            GmailScope::ReadOnly,
-            &browser,
-            "http://127.0.0.1:1/token", // never reached — malformed before exchange
-        )
-        .await
-        .unwrap_err();
-        connector.await.unwrap();
+        let err = run_login_to_expect_err(b"GET /?foo=bar HTTP/1.1\r\n\r\n").await;
 
         assert!(matches!(
             err.downcast_ref::<GmailError>(),
             Some(GmailError::MalformedCallback)
         ));
-        assert!(!settings_path.exists());
     }
 
     #[tokio::test]
