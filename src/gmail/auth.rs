@@ -88,16 +88,22 @@ impl GmailScope {
     }
 
     /// Parses Google's space-separated granted-scope response, treating the
-    /// presence of the modify scope anywhere in it as [`Modify`](Self::Modify).
+    /// presence of the modify scope anywhere in it as [`Modify`](Self::Modify)
+    /// and the readonly scope (with no modify) as [`ReadOnly`](Self::ReadOnly).
+    ///
+    /// Returns `None` when neither Gmail scope is present — e.g. the user
+    /// left the Gmail permission unticked on Google's consent screen — so
+    /// callers can reject the grant instead of silently defaulting to
+    /// [`ReadOnly`](Self::ReadOnly).
     #[must_use]
-    pub fn from_granted(granted: &str) -> Self {
-        if granted
-            .split_whitespace()
-            .any(|scope| scope == SCOPE_MODIFY)
-        {
-            Self::Modify
+    pub fn from_granted(granted: &str) -> Option<Self> {
+        let tokens: Vec<&str> = granted.split_whitespace().collect();
+        if tokens.contains(&SCOPE_MODIFY) {
+            Some(Self::Modify)
+        } else if tokens.contains(&SCOPE_READONLY) {
+            Some(Self::ReadOnly)
         } else {
-            Self::ReadOnly
+            None
         }
     }
 
@@ -162,7 +168,7 @@ pub(crate) fn load_credentials_with(
         .ok_or(GmailError::CredentialsNotFound)?;
     let scope = env
         .var(GMAIL_SCOPE)
-        .map(|s| GmailScope::from_granted(&s))
+        .and_then(|s| GmailScope::from_granted(&s))
         .unwrap_or_default();
 
     Ok(GmailCredentials {
@@ -766,7 +772,18 @@ pub(crate) async fn login_to(
     let refresh_token = tokens
         .refresh_token
         .ok_or(GmailError::MalformedTokenResponse("refresh_token"))?;
-    let granted_scope = tokens.scope.map_or(scope, |s| GmailScope::from_granted(&s));
+    let granted_raw = tokens.scope.unwrap_or_default();
+    let granted_scope = GmailScope::from_granted(&granted_raw).ok_or_else(|| {
+        let received = if granted_raw.trim().is_empty() {
+            "none".to_string()
+        } else {
+            granted_raw
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        GmailError::NoGmailScopeGranted(received)
+    })?;
 
     let credentials = GmailCredentials {
         client_id: client_id.to_string(),
@@ -805,13 +822,26 @@ mod tests {
     fn scope_from_granted_detects_modify_anywhere_in_the_list() {
         assert_eq!(
             GmailScope::from_granted(&format!("{SCOPE_READONLY} {SCOPE_MODIFY}")),
-            GmailScope::Modify
+            Some(GmailScope::Modify)
         );
+    }
+
+    #[test]
+    fn scope_from_granted_detects_readonly_with_no_modify() {
         assert_eq!(
             GmailScope::from_granted(SCOPE_READONLY),
-            GmailScope::ReadOnly
+            Some(GmailScope::ReadOnly)
         );
-        assert_eq!(GmailScope::from_granted(""), GmailScope::ReadOnly);
+    }
+
+    #[test]
+    fn scope_from_granted_is_none_when_no_gmail_scope_present() {
+        assert_eq!(GmailScope::from_granted("openid email profile"), None);
+    }
+
+    #[test]
+    fn scope_from_granted_is_none_for_empty_string() {
+        assert_eq!(GmailScope::from_granted(""), None);
     }
 
     #[test]
@@ -1432,6 +1462,114 @@ mod tests {
         let saved = std::fs::read_to_string(&settings_path).unwrap();
         assert!(saved.contains("rt-1"));
         assert!(saved.contains("client-id"));
+    }
+
+    /// Full mocked login round trip (real state nonce echoed back via the
+    /// captured-authorization-URL trick, like
+    /// `login_to_completes_full_success_flow_and_persists_credentials`
+    /// above), with an injectable token-response body — the seam the
+    /// scope-validation tests below use to simulate Google granting no
+    /// Gmail scope.
+    async fn run_login_to_with_token_response(
+        token_response_body: serde_json::Value,
+    ) -> (Result<GmailAuthStatus>, std::path::PathBuf) {
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let capture_path = temp_dir.path().join("captured-url.txt");
+        let settings_path = temp_dir.path().join("settings.json");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&token_response_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = run_with_port_retry(|port| {
+            let capture_path = capture_path.clone();
+            let settings_path = settings_path.clone();
+            let token_endpoint = format!("{}/token", server.uri());
+            async move {
+                let browser = BrowserConfig {
+                    launch: BrowserLaunch::Command(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf '%s' \"$0\" > '{}'", capture_path.display()),
+                        "{url}".to_string(),
+                    ]),
+                    callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    callback_port: port,
+                };
+
+                let connector = tokio::spawn(async move {
+                    let auth_url = wait_for_captured_url(&capture_path).await;
+                    let parsed = Url::parse(&auth_url).unwrap();
+                    let state = parsed
+                        .query_pairs()
+                        .find(|(k, _)| k == "state")
+                        .map(|(_, v)| v.into_owned())
+                        .expect("authorization URL must carry a state param");
+                    connect_and_send(
+                        port,
+                        format!("GET /?code=auth-code&state={state} HTTP/1.1\r\n\r\n").as_bytes(),
+                    )
+                    .await;
+                });
+
+                let result = login_to(
+                    &settings_path,
+                    None,
+                    "client-id",
+                    &Secret::new("client-secret"),
+                    GmailScope::ReadOnly,
+                    &browser,
+                    &token_endpoint,
+                )
+                .await;
+
+                finish_connector(connector, &result).await;
+                result
+            }
+        })
+        .await;
+
+        (result, settings_path)
+    }
+
+    #[tokio::test]
+    async fn login_to_rejects_a_grant_with_no_gmail_scope() {
+        let (result, settings_path) = run_login_to_with_token_response(serde_json::json!({
+            "access_token": "at-1",
+            "refresh_token": "rt-1",
+            "expires_in": 3600,
+            "scope": "openid email profile",
+        }))
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<GmailError>(),
+            Some(GmailError::NoGmailScopeGranted(received)) if received == "openid, email, profile"
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_to_rejects_a_grant_with_missing_scope_field() {
+        let (result, settings_path) = run_login_to_with_token_response(serde_json::json!({
+            "access_token": "at-1",
+            "refresh_token": "rt-1",
+            "expires_in": 3600,
+        }))
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<GmailError>(),
+            Some(GmailError::NoGmailScopeGranted(received)) if received == "none"
+        ));
+        assert!(!settings_path.exists());
     }
 
     #[tokio::test]
