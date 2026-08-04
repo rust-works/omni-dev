@@ -27,7 +27,8 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Gmail Integration
 
-- **[Gmail Guide](gmail.md)** - OAuth2 authentication, search, messages, threads, labels; CLI and MCP forms
+- **[Gmail Quickstart](gmail-quickstart.md)** - zero-to-synced-archive walkthrough: OAuth2 setup, authentication, and your first `gmail sync`
+- **[Gmail Guide](gmail.md)** - OAuth2 authentication, search, messages, threads, labels, mailbox sync/archive; CLI and MCP forms
 
 ### Browser Bridge
 
@@ -147,7 +148,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
-| **Gmail Integration** | [Gmail Guide](gmail.md) | [User Guide - Gmail](user-guide.md#gmail-integration) · [README - Gmail](../README.md#-gmail-integration) |
+| **Gmail Integration** | [Gmail Guide](gmail.md) | [Gmail Quickstart](gmail-quickstart.md) · [User Guide - Gmail](user-guide.md#gmail-integration) · [README - Gmail](../README.md#-gmail-integration) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 | **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 

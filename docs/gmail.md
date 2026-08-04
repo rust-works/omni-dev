@@ -7,6 +7,10 @@ identical across both surfaces; the MCP tools simply return YAML matching the
 CLI's `-o yaml` output. For the MCP-tool reference (parameters only), see
 [docs/mcp.md](mcp.md#gmail-5-tools).
 
+New to this integration? Follow the
+[Gmail Quickstart](gmail-quickstart.md) for a linear, zero-to-synced-archive
+walkthrough — this page is the topic-by-topic reference.
+
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
@@ -33,6 +37,16 @@ burden, so **each user creates their own Google Cloud OAuth2 client**:
 3. Create an OAuth2 client of type **Desktop app** (not "Web application" —
    the loopback-redirect flow below requires it).
 4. Note the client's **Client ID** and **Client secret**.
+5. When you run `gmail auth login` below, Google's consent screen lists
+   Gmail as its **own separate permission tick-box**, distinct from the
+   basic profile/email checkboxes it also requests. **Explicitly tick
+   it.** Leaving it unticked lets login succeed and return a valid
+   refresh token while granting only `openid`/`email`/`profile` — no
+   Gmail scope at all — so every subsequent Gmail call fails with
+   `insufficientPermissions`. Run `omni-dev gmail auth status`
+   immediately after login: it makes a live Gmail API call, so it fails
+   loudly if the scope is missing. See
+   [Troubleshooting](#insufficientpermissions) for the exact error.
 
 **Prominent callout:** a freshly created OAuth2 client's consent screen
 defaults to **Testing** publishing status. In that status, Google expires
@@ -224,8 +238,12 @@ Maintains a durable, greppable local archive of a mailbox — full-fidelity
 `.eml` files plus a JSONL manifest — incrementally updated on each run.
 Unlike every other Gmail command, `sync` is a genuinely long-running bulk
 operation: **a first sync of a several-thousand-message mailbox takes
-minutes, not seconds**, and a 50k-message mailbox roughly 15-20 minutes,
-bounded by Gmail's per-second quota (see
+minutes, not seconds**. A 50k-message mailbox is roughly 15-20 minutes at
+Gmail's theoretical 50 msg/s quota ceiling, but real-world throughput
+depends on message sizes and network too — a measured run against a
+5,824-message mailbox sustained 36.4 msg/s, which extrapolates to roughly
+23 minutes for 50k. Either figure is bounded by Gmail's per-second quota
+(see
 [Rate limits](#rate-limits-and-retry-behaviour) below). A re-run against an
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
@@ -238,7 +256,8 @@ already-synced mailbox with no new mail is fast — typically a single
   manifest.jsonl               # one record per message: id, thread_id, label_ids,
                                 #   internal_date, subject, from, to, rfc822_msgid,
                                 #   in_reply_to, references, attachment_count,
-                                #   attachment_filenames, path
+                                #   attachment_filenames, path, size, history_id,
+                                #   deleted_at (soft-deleted messages only)
   messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
   messages/<year>/<month>/<day>/<id>/attachments/<filename>  # only with --extract-attachments
 ```
@@ -412,14 +431,27 @@ to open (e.g. over SSH, or in a headless environment), the authorization
 URL is printed to the terminal for you to open manually — no CLI flag is
 needed to force this fallback; it's the same code path.
 
-### `insufficientPermissions` (label add/remove)
+### `insufficientPermissions`
 
 ```
 Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
 ```
 
-Only `gmail.readonly` was granted. Fix is `omni-dev gmail auth login
---modify` (re-consent with the write scope), not a retry.
+Two distinct causes produce this same error — check whether a *read*
+command works first:
+
+**No Gmail scope was granted at all** — `gmail search`, `gmail read`, and
+even `gmail auth status` all fail with this error. Cause: the consent
+screen's Gmail permission tick-box (see [Prerequisites](#prerequisites))
+was left unticked, so login granted only `openid`/`email`/`profile`. Fix:
+re-run `omni-dev gmail auth login` and tick the Gmail permission this
+time — `--modify` does not help here, since the problem isn't *which*
+Gmail scope was granted, it's that none was.
+
+**`gmail.readonly` was granted, but `label add`/`remove` fails** — read
+commands (`search`, `read`, `thread`, `auth status`) all work fine; only
+label mutation 403s. Fix is `omni-dev gmail auth login --modify`
+(re-consent with the write scope), not a retry.
 
 ### MCP server cannot see credentials
 
@@ -432,6 +464,8 @@ the process started.
 
 ## See also
 
+- [Gmail Quickstart](gmail-quickstart.md) — a linear, zero-to-synced-archive
+  walkthrough for first-time setup.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
 - [MCP Reference — Gmail](mcp.md#gmail-5-tools) — parameter-only listing of

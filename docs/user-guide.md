@@ -1668,10 +1668,13 @@ Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
 ## Gmail Integration
 
 omni-dev exposes read access (and, opt-in, label mutation) to the Gmail v1
-API through the `omni-dev gmail` command tree. The full reference —
-prerequisites (bring-your-own Google Cloud OAuth2 client), authentication,
-every subcommand with worked examples, rate-limit behaviour, and
-troubleshooting — lives in **[docs/gmail.md](gmail.md)**.
+API through the `omni-dev gmail` command tree, plus a durable local
+archive via `gmail sync`. New to this integration? Follow the
+**[Gmail Quickstart](gmail-quickstart.md)** for a zero-to-synced-archive
+walkthrough. The full reference — prerequisites (bring-your-own Google
+Cloud OAuth2 client), authentication, every subcommand with worked
+examples, rate-limit behaviour, and troubleshooting — lives in
+**[docs/gmail.md](gmail.md)**.
 
 Quick orientation:
 
@@ -1692,11 +1695,15 @@ omni-dev gmail label list
 # Label mutation needs the gmail.modify scope (auth login --modify)
 omni-dev gmail label add <message-id> --label IMPORTANT
 omni-dev gmail label remove <message-id> --label UNREAD
+
+# Maintain a durable local archive (.eml files + a JSONL manifest)
+omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
 ```
 
-Every read-only Gmail CLI subcommand has a matching `gmail_*` MCP tool — see
-[docs/mcp.md](mcp.md#gmail-5-tools). Label mutation is CLI-only in this
-release.
+Every read-only Gmail CLI subcommand except `sync` has a matching
+`gmail_*` MCP tool — see [docs/mcp.md](mcp.md#gmail-5-tools). Label
+mutation and `sync` (a long-running bulk filesystem operation, a poor fit
+for a synchronous MCP call) are CLI-only in this release.
 
 ## Contextual Intelligence
 
