@@ -4112,6 +4112,7 @@ Commands:
   read    Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
   thread  Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
   label   Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+  sync    Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4270,6 +4271,24 @@ Options:
       --enrich                     Enrich each hit with From/Subject/Date/snippet via one extra `messages.get` request per hit. Without this flag, `search` returns only `id`/`threadId` — the cheap, quota-safe default. Combined with `--limit 0` this can issue thousands of requests; use deliberately
       --concurrency <CONCURRENCY>  Bounds concurrent `messages.get` calls when `--enrich` is set (has no effect otherwise). Modelled on `confluence download`'s `--concurrency`. Clamped to 1..=50 — Gmail's quota is 250 units/user/second and `messages.get` costs 5 units, so a higher value could burst past it [default: 4]
   -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                       Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail sync - Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
+
+Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
+
+Usage: sync [OPTIONS] --output-dir <PATH>
+
+Options:
+      --output-dir <PATH>          Directory to maintain the archive in. Created if missing
+      --query <QUERY>              Restrict the archive to messages matching this Gmail search query (same syntax as `gmail search --query`). Only applied on backfill/`--full`/reconciliation passes — an incremental sync's `history.list` has no query filter, so newly-arrived mail matching the query is only picked up by a later `--full` re-run (see docs/gmail.md's Sync section)
+      --full                       Forces a full backfill/reconciliation pass even if a valid watermark exists
+      --concurrency <CONCURRENCY>  Bounds concurrent message fetches. Clamped to `1..=gmail::messages_api::MAX_CONCURRENCY` [default: 20]
+      --dry-run                    Reports the planned actions without writing any files
+  -o, --output <OUTPUT>            Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                       Print help (see more with '--help')
 
 

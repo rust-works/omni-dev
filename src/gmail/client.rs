@@ -15,7 +15,7 @@ use crate::gmail::auth::{GmailCredentials, GmailSession};
 use crate::gmail::error::GmailError;
 use crate::request_log;
 use crate::utils::env::{EnvSource, SystemEnv};
-use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
+use crate::utils::http::{retry_if, REQUEST_TIMEOUT};
 
 /// HTTP client for the Gmail v1 REST API.
 pub struct GmailClient {
@@ -208,11 +208,12 @@ impl GmailClient {
     where
         F: Fn(&Client, &str) -> reqwest::RequestBuilder + Send + Sync,
     {
-        retry_429(
+        retry_if(
             || build(&self.client, token),
             |started, result| {
                 request_log::record_http_result("gmail", method, url, started, result);
             },
+            |status, body| status == 429 || is_gmail_quota_exceeded(status, body),
         )
         .await
         .with_context(|| format!("Failed to send {method} request to Gmail API"))
@@ -222,13 +223,11 @@ impl GmailClient {
     ///
     /// Parses Gmail's `{"error":{"message":...,"errors":[{"reason":...}]}}`
     /// envelope into a human message when present (falls back to the raw
-    /// body otherwise). Note: Gmail signals quota exhaustion as **403**
-    /// `rateLimitExceeded`/`userRateLimitExceeded`, not `429` —
-    /// [`retry_429`](crate::utils::http::retry_429) only retries literal
-    /// 429s, so these are not auto-retried in Phase 1 (a known,
-    /// deliberately out-of-scope gap in the shared retry driver). Surfacing
-    /// the `reason` at least makes the un-retried error actionable instead
-    /// of a raw JSON dump.
+    /// body otherwise). Gmail signals quota exhaustion as **403**
+    /// `rateLimitExceeded`/`userRateLimitExceeded`, not `429` — unlike plain
+    /// 429s, that shape now also drives a retry (see [`is_gmail_quota_exceeded`]
+    /// via [`retry_if`](crate::utils::http::retry_if)), so this only sees the
+    /// error once retries are exhausted (or the reason didn't match).
     pub async fn response_to_error(response: Response) -> GmailError {
         let status = response.status().as_u16();
         let raw = response.text().await.unwrap_or_default();
@@ -237,20 +236,46 @@ impl GmailClient {
     }
 }
 
-fn extract_gmail_error_message(body: &str) -> Option<String> {
+/// Extracts the `error.errors[0].reason` field from Gmail's JSON error
+/// envelope, if present and the body parses as that shape.
+fn gmail_error_reason(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let message = value.get("error")?.get("message")?.as_str()?;
-    let reason = value
+    value
         .get("error")
         .and_then(|e| e.get("errors"))
         .and_then(|e| e.as_array())
         .and_then(|a| a.first())
         .and_then(|e| e.get("reason"))
-        .and_then(|r| r.as_str());
+        .and_then(|r| r.as_str())
+        .map(str::to_string)
+}
+
+fn extract_gmail_error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = value.get("error")?.get("message")?.as_str()?;
+    let reason = gmail_error_reason(body);
     Some(reason.map_or_else(
         || message.to_string(),
         |r| format!("{message} (reason: {r})"),
     ))
+}
+
+/// Whether a response is Gmail's quota-exhaustion signal — **403** with
+/// `reason` of `rateLimitExceeded` or `userRateLimitExceeded` specifically,
+/// not any 403 with a `reason` field: e.g. `insufficientPermissions` is also
+/// a 403 and must never be retried (retrying a scope/permission error just
+/// wastes the backoff window before failing anyway).
+fn is_gmail_quota_exceeded(status: u16, body: &[u8]) -> bool {
+    if status != 403 {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    matches!(
+        gmail_error_reason(text).as_deref(),
+        Some("rateLimitExceeded" | "userRateLimitExceeded")
+    )
 }
 
 /// Test-only seam letting sibling API-façade test modules (which can't
@@ -451,6 +476,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_json_retries_403_rate_limit_exceeded_then_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403)
+                    .append_header("Retry-After", "0")
+                    .set_body_json(serde_json::json!({
+                        "error": {"message": "Rate Limit Exceeded", "errors": [{"reason": "rateLimitExceeded"}]}
+                    })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_retry_insufficient_permissions_403() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {"message": "Insufficient Permission", "errors": [{"reason": "insufficientPermissions"}]}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403);
+    }
+
+    #[tokio::test]
     async fn get_json_refreshes_and_retries_once_on_401() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -531,15 +609,20 @@ mod tests {
     async fn response_to_error_extracts_gmail_message_and_reason() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
+        // `userRateLimitExceeded` is now retryable (`is_gmail_quota_exceeded`),
+        // so without a zero-delay `Retry-After` this test would wait through
+        // the real exponential backoff before giving up.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/test"))
             .respond_with(
-                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                    "error": {
-                        "message": "User Rate Limit Exceeded",
-                        "errors": [{"reason": "userRateLimitExceeded"}],
-                    }
-                })),
+                wiremock::ResponseTemplate::new(403)
+                    .append_header("Retry-After", "0")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "message": "User Rate Limit Exceeded",
+                            "errors": [{"reason": "userRateLimitExceeded"}],
+                        }
+                    })),
             )
             .mount(&server)
             .await;

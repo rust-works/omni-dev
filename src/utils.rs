@@ -5,6 +5,7 @@ pub mod env;
 pub(crate) mod http;
 pub(crate) mod path;
 pub mod preflight;
+pub(crate) mod rate_limit;
 pub mod secret;
 pub mod settings;
 
