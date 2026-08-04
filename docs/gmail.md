@@ -40,13 +40,11 @@ burden, so **each user creates their own Google Cloud OAuth2 client**:
 5. When you run `gmail auth login` below, Google's consent screen lists
    Gmail as its **own separate permission tick-box**, distinct from the
    basic profile/email checkboxes it also requests. **Explicitly tick
-   it.** Leaving it unticked lets login succeed and return a valid
-   refresh token while granting only `openid`/`email`/`profile` — no
-   Gmail scope at all — so every subsequent Gmail call fails with
-   `insufficientPermissions`. Run `omni-dev gmail auth status`
-   immediately after login: it makes a live Gmail API call, so it fails
-   loudly if the scope is missing. See
-   [Troubleshooting](#insufficientpermissions) for the exact error.
+   it.** Leaving it unticked makes login fail immediately with an error
+   naming the scopes Google actually granted (e.g. `openid`, `email`,
+   `profile` — no Gmail scope at all) instead of writing an unusable
+   refresh token to `settings.json`. See
+   [Troubleshooting](#no-gmail-scope-was-granted) for the exact error.
 
 **Prominent callout:** a freshly created OAuth2 client's consent screen
 defaults to **Testing** publishing status. In that status, Google expires
@@ -70,16 +68,39 @@ self-scoped read/label-modify request). See
 | `GMAIL_SCOPE`           | Written by `gmail auth login`; records the granted scope (`gmail.readonly` or `gmail.modify`) so `auth status` can report it without a network call. | _none_ |
 | `GMAIL_API_URL`         | Explicit API base URL; overrides the real `gmail.googleapis.com` host entirely. Use for a proxy or a forced egress gateway. | _unset_ |
 
-`GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET` must be set (in your shell profile,
-or in `~/.omni-dev/settings.json`'s `env` map) before running
-`gmail auth login` — unlike the refresh token, login does not prompt for
-them interactively.
+`GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET` can reach `gmail auth login` three
+ways: run `omni-dev gmail auth import [PATH]` first to read them straight
+out of the `client_secret.json` Google Cloud Console hands out (the
+secret never transits a shell, an env var, or an agent's context — see
+[below](#interactive-setup)); set them by hand (in your shell profile, or
+in `~/.omni-dev/settings.json`'s `env` map); or leave them unset and
+`gmail auth login` prompts for them interactively — the client id echoes
+normally, the secret does not.
 
 ### Interactive setup
 
+If you downloaded the OAuth client's `client_secret.json` from the Cloud
+console, import it directly — the client id/secret are saved to
+`settings.json` without ever passing through your shell:
+
 ```bash
-$ export GMAIL_CLIENT_ID=...            # from your Google Cloud OAuth2 client
-$ export GMAIL_CLIENT_SECRET=...
+$ omni-dev gmail auth import
+Found ~/Downloads/client_secret_1234.apps.googleusercontent.com.json (Desktop app client)
+Client id/secret saved to ~/.omni-dev/settings.json
+
+Run `omni-dev gmail auth login` to authorize.
+```
+
+`PATH` is optional: discovery tries `$GMAIL_CLIENT_SECRET_FILE`, then
+`~/.config/gws/client_secret.json`, then the most-recently-modified
+`~/Downloads/client_secret_*.apps.googleusercontent.com.json` (the Cloud
+console's default download name).
+
+Then run `auth login` — if `auth import` wasn't run and the client
+id/secret aren't in the environment or `settings.json` either, it prompts
+for them instead:
+
+```bash
 $ omni-dev gmail auth login
 
 Credentials saved to ~/.omni-dev/settings.json
@@ -384,8 +405,10 @@ Error: Gmail credentials not configured. Run `omni-dev gmail auth login`
 ```
 
 Means `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, or `GMAIL_REFRESH_TOKEN` is
-missing. The first two must be set by hand before `auth login`; the third
-is written by `auth login` itself.
+missing from both the environment and `settings.json`. Run
+`omni-dev gmail auth import` or just `omni-dev gmail auth login` — it
+prompts for the first two if they're still absent — to fix the first two;
+the third is written by `auth login` itself.
 
 ### `invalid_grant`
 
@@ -431,24 +454,30 @@ to open (e.g. over SSH, or in a headless environment), the authorization
 URL is printed to the terminal for you to open manually — no CLI flag is
 needed to force this fallback; it's the same code path.
 
+### No Gmail scope was granted
+
+```
+Error: Google did not grant a Gmail scope (received: openid, email, profile).
+  On the consent screen, tick the Gmail permission — restricted scopes are
+  not granted by default. Re-run `omni-dev gmail auth login`.
+```
+
+Cause: the consent screen's Gmail permission tick-box (see
+[Prerequisites](#prerequisites)) was left unticked, so Google granted only
+`openid`/`email`/`profile` — no Gmail scope at all. `auth login` rejects
+this immediately, naming the scopes Google actually granted, and writes
+nothing to `settings.json`. Fix: re-run `omni-dev gmail auth login` and
+tick the Gmail permission this time — `--modify` does not help here,
+since the problem isn't *which* Gmail scope was granted, it's that none
+was.
+
 ### `insufficientPermissions`
 
 ```
 Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
 ```
 
-Two distinct causes produce this same error — check whether a *read*
-command works first:
-
-**No Gmail scope was granted at all** — `gmail search`, `gmail read`, and
-even `gmail auth status` all fail with this error. Cause: the consent
-screen's Gmail permission tick-box (see [Prerequisites](#prerequisites))
-was left unticked, so login granted only `openid`/`email`/`profile`. Fix:
-re-run `omni-dev gmail auth login` and tick the Gmail permission this
-time — `--modify` does not help here, since the problem isn't *which*
-Gmail scope was granted, it's that none was.
-
-**`gmail.readonly` was granted, but `label add`/`remove` fails** — read
+`gmail.readonly` was granted, but `label add`/`remove` fails — read
 commands (`search`, `read`, `thread`, `auth status`) all work fine; only
 label mutation 403s. Fix is `omni-dev gmail auth login --modify`
 (re-consent with the write scope), not a retry.
