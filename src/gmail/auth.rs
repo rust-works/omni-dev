@@ -788,6 +788,8 @@ pub(crate) async fn login_to(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -1135,6 +1137,34 @@ mod tests {
         unreachable!("loop always returns on its last iteration")
     }
 
+    /// Awaits `connector` normally, unless `result` shows `login_to` lost
+    /// the callback-port race — in which case the connector, which will
+    /// never see a connection on the now-taken port, is aborted instead of
+    /// hung.
+    async fn finish_connector(
+        connector: tokio::task::JoinHandle<()>,
+        result: &Result<GmailAuthStatus>,
+    ) {
+        match result {
+            Err(err) if is_callback_bind_conflict(err) => connector.abort(),
+            _ => connector.await.unwrap(),
+        }
+    }
+
+    /// Polls `path` until it holds non-empty content, then returns it —
+    /// used to read back the authorization URL that `open_browser`'s
+    /// captured shell command writes asynchronously.
+    async fn wait_for_captured_url(path: &Path) -> String {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if !contents.is_empty() {
+                    return contents;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     /// Shared body for the three `login_to_*` tests that drive a single
     /// fixed callback request line through `login_to` and expect it to
     /// error: reserves a port, spawns the connector, calls `login_to`, and
@@ -1167,10 +1197,7 @@ mod tests {
                 )
                 .await;
 
-                match &result {
-                    Err(err) if is_callback_bind_conflict(err) => connector.abort(),
-                    _ => connector.await.unwrap(),
-                }
+                finish_connector(connector, &result).await;
                 result
             }
         })
@@ -1179,6 +1206,106 @@ mod tests {
         let err = result.unwrap_err();
         assert!(!settings_path.exists());
         err
+    }
+
+    #[tokio::test]
+    async fn run_with_port_retry_retries_after_a_callback_bind_conflict_then_succeeds() {
+        let attempts = AtomicU32::new(0);
+
+        let status = run_with_port_retry(|_port| {
+            let attempt_no = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt_no == 0 {
+                    Err(anyhow::anyhow!(
+                        "Failed to start the local OAuth callback listener: address in use"
+                    ))
+                } else {
+                    Ok(GmailAuthStatus {
+                        has_client_id: true,
+                        has_client_secret: true,
+                        has_refresh_token: true,
+                        scope: None,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(status.has_client_id);
+    }
+
+    #[tokio::test]
+    async fn run_with_port_retry_does_not_retry_a_non_conflict_error() {
+        let attempts = AtomicU32::new(0);
+
+        let result = run_with_port_retry(|_port| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move { Err(anyhow::anyhow!("some other failure")) }
+        })
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_connector_aborts_when_login_to_lost_the_port_race() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let connector = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            let _ = tx.send(());
+        });
+        let result: Result<GmailAuthStatus> = Err(anyhow::anyhow!(
+            "Failed to start the local OAuth callback listener: address in use"
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), finish_connector(connector, &result))
+            .await
+            .expect("finish_connector must not wait for an aborted connector");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "connector must have been aborted, not run to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_connector_awaits_connector_when_login_to_succeeds() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        let connector = tokio::spawn(async move {
+            ran_clone.store(true, Ordering::SeqCst);
+        });
+        let result = Ok(GmailAuthStatus {
+            has_client_id: true,
+            has_client_secret: true,
+            has_refresh_token: true,
+            scope: None,
+        });
+
+        finish_connector(connector, &result).await;
+
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn wait_for_captured_url_polls_until_content_is_written() {
+        std::fs::create_dir_all("tmp").ok();
+        let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let path = temp_dir.path().join("captured-url.txt");
+
+        let write_path = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            std::fs::write(&write_path, "").unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            std::fs::write(&write_path, "https://example.com/authorize").unwrap();
+        });
+
+        let contents = wait_for_captured_url(&path).await;
+        assert_eq!(contents, "https://example.com/authorize");
     }
 
     #[tokio::test]
@@ -1228,21 +1355,10 @@ mod tests {
         // — letting this test drive the full success path (state echoed
         // correctly, token exchange, credential persistence) without ever
         // opening a real browser or needing to predict the CSRF nonce.
-        let port = reserve_free_port();
         std::fs::create_dir_all("tmp").ok();
         let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
         let capture_path = temp_dir.path().join("captured-url.txt");
-
-        let browser = BrowserConfig {
-            launch: BrowserLaunch::Command(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                format!("printf '%s' \"$0\" > '{}'", capture_path.display()),
-                "{url}".to_string(),
-            ]),
-            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            callback_port: port,
-        };
+        let settings_path = temp_dir.path().join("settings.json");
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1259,41 +1375,54 @@ mod tests {
             .mount(&server)
             .await;
 
-        let connector = tokio::spawn(async move {
-            let auth_url = loop {
-                if let Ok(contents) = std::fs::read_to_string(&capture_path) {
-                    if !contents.is_empty() {
-                        break contents;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            };
-            let parsed = Url::parse(&auth_url).unwrap();
-            let state = parsed
-                .query_pairs()
-                .find(|(k, _)| k == "state")
-                .map(|(_, v)| v.into_owned())
-                .expect("authorization URL must carry a state param");
-            connect_and_send(
-                port,
-                format!("GET /?code=auth-code&state={state} HTTP/1.1\r\n\r\n").as_bytes(),
-            )
-            .await;
-        });
+        let status = run_with_port_retry(|port| {
+            let capture_path = capture_path.clone();
+            let settings_path = settings_path.clone();
+            let token_endpoint = format!("{}/token", server.uri());
+            async move {
+                let browser = BrowserConfig {
+                    launch: BrowserLaunch::Command(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf '%s' \"$0\" > '{}'", capture_path.display()),
+                        "{url}".to_string(),
+                    ]),
+                    callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    callback_port: port,
+                };
 
-        let settings_path = temp_dir.path().join("settings.json");
-        let status = login_to(
-            &settings_path,
-            None,
-            "client-id",
-            &Secret::new("client-secret"),
-            GmailScope::ReadOnly,
-            &browser,
-            &format!("{}/token", server.uri()),
-        )
+                let connector = tokio::spawn(async move {
+                    let auth_url = wait_for_captured_url(&capture_path).await;
+                    let parsed = Url::parse(&auth_url).unwrap();
+                    let state = parsed
+                        .query_pairs()
+                        .find(|(k, _)| k == "state")
+                        .map(|(_, v)| v.into_owned())
+                        .expect("authorization URL must carry a state param");
+                    connect_and_send(
+                        port,
+                        format!("GET /?code=auth-code&state={state} HTTP/1.1\r\n\r\n").as_bytes(),
+                    )
+                    .await;
+                });
+
+                let result = login_to(
+                    &settings_path,
+                    None,
+                    "client-id",
+                    &Secret::new("client-secret"),
+                    GmailScope::ReadOnly,
+                    &browser,
+                    &token_endpoint,
+                )
+                .await;
+
+                finish_connector(connector, &result).await;
+                result
+            }
+        })
         .await
         .unwrap();
-        connector.await.unwrap();
 
         assert!(status.has_client_id);
         assert!(status.has_client_secret);
