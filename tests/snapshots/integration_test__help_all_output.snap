@@ -4288,6 +4288,7 @@ Options:
       --full                       Forces a full backfill/reconciliation pass even if a valid watermark exists
       --concurrency <CONCURRENCY>  Bounds concurrent message fetches. Clamped to `1..=gmail::messages_api::MAX_CONCURRENCY` [default: 20]
       --dry-run                    Reports the planned actions without writing any files
+      --extract-attachments        Also writes each message's attachment MIME parts to disk as separate files under `<eml-shard-dir>/<id>/attachments/<filename>`, alongside the existing `.eml`. Off by default: extraction is additional I/O/disk usage per message, and the `.eml` stays the lossless source of truth regardless. Only applies to messages actually fetched this run — presence-on-disk still skips an already-archived message, so turning this on does not retroactively backfill an existing archive (delete the affected `.eml` files, or the whole archive, and re-run `--full` to force re-extraction)
   -o, --output <OUTPUT>            Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                       Print help (see more with '--help')
 

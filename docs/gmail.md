@@ -217,6 +217,7 @@ $ omni-dev gmail sync --output-dir ~/mail-archive
 $ omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
 $ omni-dev gmail sync --output-dir ~/mail-archive --full
 $ omni-dev gmail sync --output-dir ~/mail-archive --dry-run
+$ omni-dev gmail sync --output-dir ~/mail-archive --extract-attachments
 ```
 
 Maintains a durable, greppable local archive of a mailbox — full-fidelity
@@ -239,6 +240,7 @@ already-synced mailbox with no new mail is fast — typically a single
                                 #   in_reply_to, references, attachment_count,
                                 #   attachment_filenames, path
   messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
+  messages/<year>/<month>/<day>/<id>/attachments/<filename>  # only with --extract-attachments
 ```
 
 `.eml` files are **immutable** once written — Gmail labels aren't part of
@@ -284,8 +286,28 @@ reconstructed from the manifest alone, without re-parsing every `.eml`.
 many MIME parts are marked `Content-Disposition: attachment` and whichever
 filenames could be parsed from them (including RFC 2231 percent-encoded
 filenames), scanned from the same already-decoded bytes — no second fetch.
-This is metadata only: attachments stay inline inside the `.eml` (lossless,
-since `format=raw` preserves them), not extracted to separate files.
+This is metadata only, computed the same way regardless of
+`--extract-attachments` (see [ADR-0065](adrs/adr-0065.md)): attachments
+always stay inline inside the `.eml` too (lossless, since `format=raw`
+preserves them).
+
+**`--extract-attachments`** additionally writes each message's
+`Content-Disposition: attachment` MIME parts to disk as separate files
+under `messages/<year>/<month>/<day>/<id>/attachments/<filename>` — a
+sibling directory of the message's own `.eml`. Off by default: it's extra
+I/O and disk usage per message, and the `.eml` remains the lossless source
+of truth either way, so this is purely a convenience projection, never a
+new archive contract. Filenames are sanitised against path traversal; a
+second attachment in one message that sanitises to an already-used name
+gets a `-N` suffix (`image.png` -> `image-1.png`); an attachment with no
+usable filename gets a synthesised one. A message that fails to parse as
+MIME simply yields no attachment files — it never fails the `.eml` fetch
+itself. Because `sync` only ever fetches messages missing on disk
+(presence-on-disk is the archive's idempotence mechanism — see above),
+turning this flag on does **not** retroactively extract attachments for
+messages already archived by an earlier run, even under `--full`; delete
+the affected `.eml` files (or the whole archive) and re-run `--full
+--extract-attachments` to force re-extraction.
 
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
 `-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally alongside the
