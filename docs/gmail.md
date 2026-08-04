@@ -7,6 +7,10 @@ identical across both surfaces; the MCP tools simply return YAML matching the
 CLI's `-o yaml` output. For the MCP-tool reference (parameters only), see
 [docs/mcp.md](mcp.md#gmail-5-tools).
 
+New to this integration? Follow the
+[Gmail Quickstart](gmail-quickstart.md) for a linear, zero-to-synced-archive
+walkthrough — this page is the topic-by-topic reference.
+
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
@@ -460,6 +464,8 @@ the process started.
 
 ## See also
 
+- [Gmail Quickstart](gmail-quickstart.md) — a linear, zero-to-synced-archive
+  walkthrough for first-time setup.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
 - [MCP Reference — Gmail](mcp.md#gmail-5-tools) — parameter-only listing of
