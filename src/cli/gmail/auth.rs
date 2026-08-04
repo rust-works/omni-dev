@@ -1,6 +1,7 @@
 //! CLI commands for Gmail credential management.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -9,10 +10,11 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::gmail::auth::{self, BrowserConfig, GmailScope};
 use crate::gmail::client::GmailClient;
+use crate::gmail::import;
 use crate::gmail::profile_api::ProfileApi;
-use crate::utils::env::EnvSource;
+use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
-use crate::utils::settings::SettingsEnv;
+use crate::utils::settings::{active_profile_from, profile_suffix, SettingsEnv};
 
 /// Manages Gmail OAuth2 credentials.
 #[derive(Parser)]
@@ -25,6 +27,8 @@ pub struct AuthCommand {
 /// Auth subcommands.
 #[derive(Subcommand)]
 pub enum AuthSubcommands {
+    /// Imports an OAuth2 client id/secret from a downloaded `client_secret.json`.
+    Import(ImportCommand),
     /// Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only —
     /// login has no MCP equivalent.
     Login(LoginCommand),
@@ -38,10 +42,34 @@ impl AuthCommand {
     /// Executes the auth command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
+            AuthSubcommands::Import(cmd) => cmd.execute(),
             AuthSubcommands::Login(cmd) => cmd.execute().await,
             AuthSubcommands::Logout(cmd) => cmd.execute(),
             AuthSubcommands::Status(cmd) => cmd.execute().await,
         }
+    }
+}
+
+/// Imports an OAuth2 client id/secret from `client_secret.json`.
+#[derive(Parser)]
+pub struct ImportCommand {
+    /// Explicit path to client_secret.json. Omit to auto-discover via
+    /// $GMAIL_CLIENT_SECRET_FILE, ~/.config/gws/client_secret.json, or
+    /// ~/Downloads/client_secret_*.apps.googleusercontent.com.json.
+    pub path: Option<PathBuf>,
+}
+
+impl ImportCommand {
+    /// Discovers, parses, and saves the client id/secret.
+    pub fn execute(self) -> Result<()> {
+        let outcome = import::import_client_credentials(self.path.as_deref())?;
+        println!("Found {} (Desktop app client)", outcome.path.display());
+        println!(
+            "Client id/secret saved to ~/.omni-dev/settings.json{}",
+            profile_suffix(active_profile_from(&SystemEnv).as_deref())
+        );
+        println!("\nRun `omni-dev gmail auth login` to authorize.");
+        Ok(())
     }
 }
 
@@ -242,6 +270,14 @@ mod tests {
             command: AuthSubcommands::Login(LoginCommand { modify: false }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Login(_)));
+    }
+
+    #[test]
+    fn auth_command_import_dispatch() {
+        let cmd = AuthCommand {
+            command: AuthSubcommands::Import(ImportCommand { path: None }),
+        };
+        assert!(matches!(cmd.command, AuthSubcommands::Import(_)));
     }
 
     // ── resolve_scope ────────────────────────────────────────────
