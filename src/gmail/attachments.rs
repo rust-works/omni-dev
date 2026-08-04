@@ -65,9 +65,15 @@ pub(crate) fn extract_attachments(raw: &[u8]) -> Vec<ExtractedAttachment> {
 /// Appends a `-N` suffix before the extension the first time `name` repeats
 /// within one call's `seen` set (e.g. `image.png` -> `image-1.png` ->
 /// `image-2.png`), so two same-named attachments in one message don't
-/// overwrite each other on disk.
+/// overwrite each other on disk. Collisions are detected case-*insensitively*
+/// (`seen` is keyed by the lowercased name, though the returned filename
+/// keeps its original casing) because the destination filesystem might be
+/// too: macOS (APFS) and Windows (NTFS) both default to case-insensitive,
+/// so `Report.PDF` and `report.pdf` name the same directory entry there and
+/// a case-sensitive check would let the second silently overwrite the
+/// first.
 fn dedupe_filename(seen: &mut HashSet<String>, name: String) -> String {
-    if seen.insert(name.clone()) {
+    if seen.insert(name.to_ascii_lowercase()) {
         return name;
     }
     let (stem, ext) = match name.rsplit_once('.') {
@@ -80,7 +86,7 @@ fn dedupe_filename(seen: &mut HashSet<String>, name: String) -> String {
             Some(ext) => format!("{stem}-{n}.{ext}"),
             None => format!("{stem}-{n}"),
         };
-        if seen.insert(candidate.clone()) {
+        if seen.insert(candidate.to_ascii_lowercase()) {
             return candidate;
         }
         n += 1;
@@ -172,6 +178,18 @@ Content-Disposition: attachment; filename=\"notes.txt\"\r\n\r\nCaf=C3=A9\r\n\
         assert_eq!(extracted.len(), 2);
         assert_eq!(extracted[0].filename, "image.png");
         assert_eq!(extracted[1].filename, "image-1.png");
+    }
+
+    #[test]
+    fn extract_attachments_dedupes_names_differing_only_by_case() {
+        let raw = b"Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"Report.PDF\"\r\n\r\nfirst\r\n\
+--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nsecond\r\n\
+--B--\r\n";
+        let extracted = extract_attachments(raw);
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].filename, "Report.PDF");
+        assert_eq!(extracted[1].filename, "report-1.pdf");
     }
 
     #[test]
