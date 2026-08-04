@@ -282,8 +282,11 @@ every family with worked examples, see [docs/datadog.md](docs/datadog.md).
 ### 📧 Gmail Integration
 
 Authenticate against your own Gmail account via OAuth2 (loopback
-authorization-code + PKCE) and search, read, and label messages and
-threads. See the [Gmail integration guide](docs/gmail.md) for
+authorization-code + PKCE), search/read/label messages and threads, and
+maintain a durable local archive with `gmail sync`. New to this
+integration? Start with the
+[Gmail Quickstart](docs/gmail-quickstart.md) for a zero-to-synced-archive
+walkthrough; see the [Gmail integration guide](docs/gmail.md) for
 prerequisites (you bring your own Google Cloud OAuth2 client — Gmail read
 scopes require Google's CASA security assessment to distribute otherwise),
 authentication setup, rate-limit behaviour, and troubleshooting.
@@ -303,6 +306,9 @@ omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
 omni-dev gmail read <message-id>
 omni-dev gmail thread <thread-id>
 omni-dev gmail label list
+
+# Maintain a durable local archive (.eml files + a JSONL manifest)
+omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
 ```
 
 An OAuth2 client left in Google's "Testing" publishing status issues
@@ -310,9 +316,11 @@ refresh tokens that expire after 7 days — see
 [docs/gmail.md](docs/gmail.md#prerequisites) for how to avoid re-running
 `auth login` weekly.
 
-Every read-only Gmail subcommand is also exposed as an MCP tool
-(`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-5-tools). For the full
-guide, see [docs/gmail.md](docs/gmail.md).
+Every read-only Gmail subcommand except `sync` is also exposed as an MCP
+tool (`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-5-tools); `sync` is
+CLI-only (a long-running bulk filesystem operation, a poor fit for a
+synchronous MCP call). For the full guide, see
+[docs/gmail.md](docs/gmail.md).
 
 ### 🎙️ Transcript Fetching
 
