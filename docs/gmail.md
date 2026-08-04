@@ -287,6 +287,15 @@ filenames), scanned from the same already-decoded bytes — no second fetch.
 This is metadata only: attachments stay inline inside the `.eml` (lossless,
 since `format=raw` preserves them), not extracted to separate files.
 
+**Report summary:** every report — table/text and `-o json`/`-o yaml`/
+`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally alongside the
+per-action listing, e.g. `5,794 fetched, 30 deleted, 0 errors` in text
+output, or an explicit `summary` field (`fetched`/`would_fetch`/
+`labels_updated`/`deleted`/`undeleted`/`would_delete`/`would_undelete`/
+`errors` counts) alongside `actions`/`errors` in the structured formats —
+useful since a large sync's per-action listing can run into the thousands
+of lines.
+
 **`--dry-run`** reports every action sync would take without writing any
 file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
 
