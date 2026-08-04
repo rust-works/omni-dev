@@ -13,6 +13,7 @@ pub mod auth;
 pub mod client;
 pub mod error;
 pub mod history_api;
+pub mod import;
 pub mod labels_api;
 pub mod messages_api;
 pub mod profile_api;
