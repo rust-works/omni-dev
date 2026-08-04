@@ -84,7 +84,7 @@ nix = { version = "0.31", default-features = false, features = ["fs", "hostname"
 # direct dependency. `tao` provides the main-thread macOS event loop the tray
 # requires; `arboard` backs the "Copy console snippet" clipboard action.
 arboard = { version = "3.6.1", optional = true }
-tao = { version = "0.35.3", optional = true }
+tao = { version = "0.36.0", optional = true }
 tray-icon = { version = "0.24.1", optional = true }
 # CoreFoundation types for the worktrees service's Accessibility backend
 # (`reposition`, #1407): CFString/CFArray/CFBoolean for AX attribute values,
