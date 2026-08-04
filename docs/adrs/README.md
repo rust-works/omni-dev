@@ -88,3 +88,4 @@ by Michael Nygard.
 | [ADR-0062](adr-0062.md)  | ✅ Accepted                              | 2026-08-01 | Drop the VS Code Rebase Confirmation Modal                                                  |
 | [ADR-0063](adr-0063.md)  | ✅ Accepted                              | 2026-08-01 | OAuth2 Authorization-Code + PKCE for Gmail, with Bring-Your-Own Google Cloud Project        |
 | [ADR-0064](adr-0064.md)  | ✅ Accepted                              | 2026-08-03 | Presence-on-Disk Idempotence and Immutable-`.eml`/Mutable-Manifest Split for `gmail sync`   |
+| [ADR-0065](adr-0065.md)  | ✅ Accepted                              | 2026-08-04 | `gmail sync --extract-attachments`                                                          |
