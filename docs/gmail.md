@@ -33,6 +33,16 @@ burden, so **each user creates their own Google Cloud OAuth2 client**:
 3. Create an OAuth2 client of type **Desktop app** (not "Web application" —
    the loopback-redirect flow below requires it).
 4. Note the client's **Client ID** and **Client secret**.
+5. When you run `gmail auth login` below, Google's consent screen lists
+   Gmail as its **own separate permission tick-box**, distinct from the
+   basic profile/email checkboxes it also requests. **Explicitly tick
+   it.** Leaving it unticked lets login succeed and return a valid
+   refresh token while granting only `openid`/`email`/`profile` — no
+   Gmail scope at all — so every subsequent Gmail call fails with
+   `insufficientPermissions`. Run `omni-dev gmail auth status`
+   immediately after login: it makes a live Gmail API call, so it fails
+   loudly if the scope is missing. See
+   [Troubleshooting](#insufficientpermissions) for the exact error.
 
 **Prominent callout:** a freshly created OAuth2 client's consent screen
 defaults to **Testing** publishing status. In that status, Google expires
@@ -412,14 +422,27 @@ to open (e.g. over SSH, or in a headless environment), the authorization
 URL is printed to the terminal for you to open manually — no CLI flag is
 needed to force this fallback; it's the same code path.
 
-### `insufficientPermissions` (label add/remove)
+### `insufficientPermissions`
 
 ```
 Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
 ```
 
-Only `gmail.readonly` was granted. Fix is `omni-dev gmail auth login
---modify` (re-consent with the write scope), not a retry.
+Two distinct causes produce this same error — check whether a *read*
+command works first:
+
+**No Gmail scope was granted at all** — `gmail search`, `gmail read`, and
+even `gmail auth status` all fail with this error. Cause: the consent
+screen's Gmail permission tick-box (see [Prerequisites](#prerequisites))
+was left unticked, so login granted only `openid`/`email`/`profile`. Fix:
+re-run `omni-dev gmail auth login` and tick the Gmail permission this
+time — `--modify` does not help here, since the problem isn't *which*
+Gmail scope was granted, it's that none was.
+
+**`gmail.readonly` was granted, but `label add`/`remove` fails** — read
+commands (`search`, `read`, `thread`, `auth status`) all work fine; only
+label mutation 403s. Fix is `omni-dev gmail auth login --modify`
+(re-consent with the write scope), not a retry.
 
 ### MCP server cannot see credentials
 
