@@ -3,7 +3,9 @@
 //! `messages.list` uses **cursor pagination** (`nextPageToken`), like
 //! Datadog's v2 logs search — [`MessagesApi::search`] issues a single page,
 //! [`MessagesApi::search_all`] auto-paginates up to a caller-supplied limit
-//! (or [`HARD_CAP`] when the limit is `0`). Gmail's list endpoint is
+//! (or [`HARD_CAP`] when the limit is `0`), and
+//! [`MessagesApi::search_all_unbounded`] auto-paginates with no cap at all
+//! for `gmail sync`'s full-listing pass (#1467). Gmail's list endpoint is
 //! GET-with-query-params (not POST-with-body like Datadog's logs search),
 //! so URL construction follows the free `build_*_url` pattern from
 //! `src/datadog/monitors_api.rs` instead.
@@ -18,6 +20,7 @@ use url::Url;
 
 use crate::gmail::client::GmailClient;
 use crate::gmail::types::{Message, MessageListResponse};
+use crate::utils::rate_limit::TokenBucket;
 
 /// Maximum page size accepted by `GET /gmail/v1/users/{userId}/messages`.
 pub const MAX_PAGE_LIMIT: usize = 500;
@@ -35,6 +38,20 @@ pub const HARD_CAP: usize = 10_000;
 /// completes within a second — the flag exists to bound the fan-out against
 /// that quota, so it shouldn't itself accept a value that can blow past it.
 pub const MAX_CONCURRENCY: usize = 50;
+
+/// Gmail's documented quota ceiling, in quota units per user per second.
+///
+/// The load-bearing constraint behind [`MAX_CONCURRENCY`] above and behind
+/// `gmail sync`'s proactive token-bucket limiter
+/// (`src/cli/gmail/sync/engine.rs`) — the single biggest determinant of
+/// whether a bulk sync is pleasant or infuriating (#1467).
+pub const GMAIL_QUOTA_UNITS_PER_SECOND: u32 = 250;
+
+/// Quota-unit cost of one `messages.get` call, regardless of `format`.
+pub const MESSAGES_GET_COST_UNITS: u32 = 5;
+
+/// Quota-unit cost of one `messages.list` page request.
+pub const MESSAGES_LIST_COST_UNITS: u32 = 5;
 
 /// Default `limit` for a search when the caller doesn't specify one.
 ///
@@ -165,23 +182,72 @@ impl<'a> MessagesApi<'a> {
 
     /// Searches messages, auto-paginating via cursor as needed.
     ///
-    /// `limit == 0` means "fetch every match up to [`HARD_CAP`]".
-    /// Termination is cursor-only, never a short page: a `q`-filtered list
-    /// can return zero messages on a page alongside a valid
-    /// `nextPageToken` — a scan that hasn't found a match on this page yet.
-    /// Only an absent token stops the loop.
+    /// `limit == 0` means "fetch every match up to [`HARD_CAP`]". This cap
+    /// is a deliberate safety limit for this interactive surface — see
+    /// [`Self::search_all_unbounded`] for the one caller that must not have
+    /// it.
     pub async fn search_all(
         &self,
         query: Option<&str>,
         label_ids: &[&str],
         limit: usize,
     ) -> Result<MessageListResponse> {
-        let cap = effective_cap(limit);
+        self.paginate(query, label_ids, Some(effective_cap(limit)), None)
+            .await
+    }
+
+    /// Searches messages, auto-paginating with **no cap** — every page is
+    /// fetched until Gmail stops returning a `nextPageToken`, however large
+    /// the mailbox.
+    ///
+    /// Deliberately not exposed to [`Self::search_all`]'s interactive
+    /// callers (`gmail search`/`gmail thread`), which rely on [`HARD_CAP`]
+    /// as a safety limit against an accidental unbounded pull. `gmail
+    /// sync`'s full-listing pass (backfill / `--full` / 404-triggered
+    /// reconciliation) is the one caller for which a partial listing is a
+    /// correctness bug rather than a safety feature: truncating here either
+    /// silently stops archiving mail past the cap, or — worse, during
+    /// reconciliation — marks every already-archived message outside the
+    /// truncated listing as deleted (#1467).
+    ///
+    /// `limiter` paces each page request at [`MESSAGES_LIST_COST_UNITS`]
+    /// against the caller's quota budget, proactively rather than relying
+    /// on reactive 429/403 retry — the same principle `messages.get`
+    /// fetches already follow in `src/cli/gmail/sync/engine.rs`.
+    pub(crate) async fn search_all_unbounded(
+        &self,
+        query: Option<&str>,
+        label_ids: &[&str],
+        limiter: &TokenBucket,
+    ) -> Result<MessageListResponse> {
+        self.paginate(query, label_ids, None, Some(limiter)).await
+    }
+
+    /// Shared pagination loop backing [`Self::search_all`] and
+    /// [`Self::search_all_unbounded`].
+    ///
+    /// `cap: None` means no ceiling at all — termination is cursor-only,
+    /// never a short page: a `q`-filtered list can return zero messages on a
+    /// page alongside a valid `nextPageToken` (a scan that hasn't found a
+    /// match on this page yet), so only an absent token stops the loop.
+    async fn paginate(
+        &self,
+        query: Option<&str>,
+        label_ids: &[&str],
+        cap: Option<usize>,
+        limiter: Option<&TokenBucket>,
+    ) -> Result<MessageListResponse> {
         let mut acc: Option<MessageListResponse> = None;
         let mut page_token: Option<String> = None;
         loop {
             let collected = acc.as_ref().map_or(0, |r| r.messages.len());
-            let page_size = (cap - collected).min(MAX_PAGE_LIMIT);
+            let page_size = match cap {
+                Some(cap) => (cap - collected).min(MAX_PAGE_LIMIT),
+                None => MAX_PAGE_LIMIT,
+            };
+            if let Some(limiter) = limiter {
+                limiter.acquire(MESSAGES_LIST_COST_UNITS).await;
+            }
             let page = self
                 .search(query, label_ids, page_size, page_token.as_deref())
                 .await?;
@@ -195,13 +261,16 @@ impl<'a> MessagesApi<'a> {
                 None => acc = Some(page),
             }
             let collected = acc.as_ref().map_or(0, |r| r.messages.len());
-            if collected >= cap || next_token.is_none() {
+            let cap_reached = cap.is_some_and(|cap| collected >= cap);
+            if cap_reached || next_token.is_none() {
                 break;
             }
             page_token = next_token;
         }
         let mut result = acc.unwrap_or_default();
-        result.messages.truncate(cap);
+        if let Some(cap) = cap {
+            result.messages.truncate(cap);
+        }
         Ok(result)
     }
 
@@ -405,6 +474,35 @@ mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::utils::secret::Secret;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A `messages.list` responder that serves `full_pages` full pages (each
+    /// with a fresh `nextPageToken`) followed by one terminating page with no
+    /// token — used to prove [`MessagesApi::search_all_unbounded`] keeps
+    /// paginating past whatever [`HARD_CAP`] would have stopped
+    /// [`MessagesApi::search_all`] at.
+    struct SequentialPages {
+        full_pages: usize,
+        calls: AtomicUsize,
+    }
+
+    impl wiremock::Respond for SequentialPages {
+        fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.full_pages {
+                let page: Vec<serde_json::Value> = (0..MAX_PAGE_LIMIT)
+                    .map(|i| message_ref_json(&format!("p{call}-m{i}")))
+                    .collect();
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": page,
+                    "nextPageToken": format!("token-{}", call + 1),
+                }))
+            } else {
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": Vec::<serde_json::Value>::new()}))
+            }
+        }
+    }
 
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
@@ -739,6 +837,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── search_all_unbounded ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_all_unbounded_does_not_truncate_past_hard_cap() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // One more full page than `search_all` would allow before hitting
+        // `HARD_CAP` — a regression back to the capped pagination path would
+        // truncate this result to exactly `HARD_CAP`.
+        let full_pages = HARD_CAP / MAX_PAGE_LIMIT + 1;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(SequentialPages {
+                full_pages,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let result = MessagesApi::new(&client)
+            .search_all_unbounded(None, &[], &limiter)
+            .await
+            .unwrap();
+
+        assert_eq!(result.messages.len(), full_pages * MAX_PAGE_LIMIT);
+        assert!(result.messages.len() > HARD_CAP);
+    }
+
+    #[tokio::test]
+    async fn search_all_unbounded_draws_the_limiter_once_per_page() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let full_pages = 4;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(SequentialPages {
+                full_pages,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        // Zero refill: capacity alone is large enough that `acquire` never
+        // actually waits, and with no refill between real HTTP round trips
+        // the token count accurately reflects cumulative debits — a nonzero
+        // refill rate this large would otherwise replenish the bucket back
+        // to full between each network round trip, masking how many times
+        // `acquire` was really called. This test only proves each of the 5
+        // page requests (4 full + 1 terminating) draws
+        // `MESSAGES_LIST_COST_UNITS`; `TokenBucket` pacing itself is already
+        // covered by `rate_limit.rs`'s own tests.
+        let limiter = TokenBucket::new(1_000_000, 0);
+        MessagesApi::new(&client)
+            .search_all_unbounded(None, &[], &limiter)
+            .await
+            .unwrap();
+
+        let page_requests = 5;
+        let expected_spent = f64::from(page_requests * MESSAGES_LIST_COST_UNITS);
+        // Exact integer-valued floats (units are whole numbers well within
+        // f64's precision) — cast to compare, avoiding a lint against
+        // strict floating-point equality that doesn't apply here.
+        assert_eq!(
+            limiter.available().await as i64,
+            (1_000_000.0 - expected_spent) as i64
+        );
     }
 
     // ── get ───────────────────────────────────────────────────────────

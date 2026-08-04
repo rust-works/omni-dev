@@ -110,6 +110,24 @@ impl GmailError {
         };
         Self::AuthorizationDenied(detail)
     }
+
+    /// The Gmail-specific `reason` embedded in an
+    /// [`ApiRequestFailed`](Self::ApiRequestFailed)'s body, if
+    /// `GmailClient::response_to_error` found one.
+    ///
+    /// That constructor already discards the raw JSON error envelope in
+    /// favour of a human-readable `"{message} (reason: {reason})"` string
+    /// (`client.rs`'s `extract_gmail_error_message`), so this parses that
+    /// fixed suffix convention rather than re-parsing JSON that isn't kept
+    /// around by the time this variant exists.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            Self::ApiRequestFailed { body, .. } => body
+                .rsplit_once("(reason: ")
+                .and_then(|(_, rest)| rest.strip_suffix(')')),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +156,29 @@ mod tests {
     #[test]
     fn state_mismatch_display_mentions_state() {
         assert!(GmailError::StateMismatch.to_string().contains("state"));
+    }
+
+    #[test]
+    fn reason_extracts_the_formatted_suffix() {
+        let err = GmailError::ApiRequestFailed {
+            status: 404,
+            body: "Not Found (reason: notFound)".to_string(),
+        };
+        assert_eq!(err.reason(), Some("notFound"));
+    }
+
+    #[test]
+    fn reason_is_none_when_body_has_no_reason_suffix() {
+        let err = GmailError::ApiRequestFailed {
+            status: 500,
+            body: "Internal Server Error".to_string(),
+        };
+        assert_eq!(err.reason(), None);
+    }
+
+    #[test]
+    fn reason_is_none_for_non_api_request_failed_variants() {
+        assert_eq!(GmailError::StateMismatch.reason(), None);
     }
 
     #[test]

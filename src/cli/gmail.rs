@@ -6,6 +6,7 @@ pub(crate) mod helpers;
 pub(crate) mod label;
 pub(crate) mod read;
 pub(crate) mod search;
+pub(crate) mod sync;
 pub(crate) mod thread;
 
 use anyhow::Result;
@@ -34,6 +35,8 @@ pub enum GmailSubcommands {
     Thread(thread::ThreadCommand),
     /// Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1).
     Label(label::LabelCommand),
+    /// Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent).
+    Sync(sync::SyncCommand),
 }
 
 impl GmailCommand {
@@ -69,6 +72,7 @@ impl GmailSubcommands {
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Thread(cmd) => cmd.execute(client).await,
             Self::Label(cmd) => cmd.execute(client).await,
+            Self::Sync(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -213,6 +217,19 @@ mod tests {
                 force: true,
                 dry_run: false,
             }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sync() {
+        let cmd = GmailSubcommands::Sync(sync::SyncCommand {
+            output_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            query: None,
+            full: false,
+            concurrency: 4,
+            dry_run: false,
+            output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
