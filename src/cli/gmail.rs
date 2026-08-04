@@ -229,6 +229,7 @@ mod tests {
             full: false,
             concurrency: 4,
             dry_run: false,
+            extract_attachments: false,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());

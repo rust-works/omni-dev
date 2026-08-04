@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::stream::{self, StreamExt as _};
 
+use crate::gmail::attachments::extract_attachments;
 use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
 use crate::gmail::history_api::HistoryApi;
@@ -38,7 +39,7 @@ use crate::utils::rate_limit::TokenBucket;
 
 use super::manifest::{Manifest, ManifestRecord};
 use super::report::{SyncAction, SyncError, SyncReport};
-use super::shard::shard_path;
+use super::shard::{attachments_dir, shard_path};
 use super::state::{self, ArchiveState, LoadOutcome};
 
 /// Options for one `gmail sync` invocation.
@@ -48,6 +49,7 @@ pub(crate) struct SyncOptions {
     pub(crate) full: bool,
     pub(crate) concurrency: usize,
     pub(crate) dry_run: bool,
+    pub(crate) extract_attachments: bool,
 }
 
 fn state_path(output_dir: &Path) -> PathBuf {
@@ -331,7 +333,8 @@ async fn fetch_and_archive_messages(
     let mut fetches = stream::iter(to_fetch)
         .map(|id| async move {
             limiter.acquire(MESSAGES_GET_COST_UNITS).await;
-            let result = fetch_and_write_one(client, output_dir, &id).await;
+            let result =
+                fetch_and_write_one(client, output_dir, &id, opts.extract_attachments).await;
             (id, result)
         })
         .buffer_unordered(concurrency);
@@ -366,10 +369,18 @@ async fn fetch_and_archive_messages(
 /// come from scanning the already-decoded bytes ([`extract_headers`]), not
 /// a second `format=metadata` round-trip, since a second fetch would double
 /// the request volume for data already in hand.
+///
+/// When `extract_attachments` is set, also writes each `Content-Disposition:
+/// attachment` part's decoded bytes into the message's `attachments/`
+/// directory (see [`extract_attachments`] / ADR-0065) — a purely additive
+/// step that never touches the manifest record built here, which keeps
+/// coming from the cheap [`extract_attachment_filenames`] heuristic exactly
+/// as before.
 async fn fetch_and_write_one(
     client: &GmailClient,
     output_dir: &Path,
     id: &str,
+    extract_attachments_flag: bool,
 ) -> Result<ManifestRecord> {
     let message = MessagesApi::new(client)
         .get(id, MessageFormat::Raw, &[])
@@ -387,14 +398,27 @@ async fn fetch_and_write_one(
         ],
     );
     let attachments = extract_attachment_filenames(&bytes);
+    let date = message.internal_date_utc();
 
-    let path = shard_path(output_dir, id, message.internal_date_utc());
+    let path = shard_path(output_dir, id, date);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
     write_atomic(&path, &bytes)?;
     let relative = path.strip_prefix(output_dir).unwrap_or(&path).to_path_buf();
+
+    if extract_attachments_flag {
+        let extracted = extract_attachments(&bytes);
+        if !extracted.is_empty() {
+            let dir = attachments_dir(output_dir, id, date);
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+            for attachment in &extracted {
+                write_atomic(&dir.join(&attachment.filename), &attachment.contents)?;
+            }
+        }
+    }
 
     Ok(ManifestRecord {
         id: id.to_string(),
@@ -606,6 +630,7 @@ mod tests {
             full: false,
             concurrency: 4,
             dry_run: false,
+            extract_attachments: false,
         }
     }
 
@@ -1096,6 +1121,7 @@ not-really-a-pdf\r\n\
                 full: false,
                 concurrency: 4,
                 dry_run: true,
+                extract_attachments: false,
             },
         )
         .await
@@ -1284,6 +1310,7 @@ not-really-a-pdf\r\n\
             full: false,
             concurrency: 20,
             dry_run: false,
+            extract_attachments: false,
         };
 
         fetch_and_archive_messages(&client, &mut manifest, &ids, &limiter, &opts, &mut report)
@@ -1363,6 +1390,7 @@ not-really-a-pdf\r\n\
             full: false,
             concurrency: 20,
             dry_run: false,
+            extract_attachments: false,
         };
 
         // The slow ids' 3600s delay never elapses within this test, so the
@@ -1452,6 +1480,7 @@ not-really-a-pdf\r\n\
                 full: false,
                 concurrency: 4,
                 dry_run: true,
+                extract_attachments: false,
             },
         )
         .await

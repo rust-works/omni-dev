@@ -38,6 +38,23 @@ pub(crate) fn shard_path(archive_root: &Path, id: &str, date: Option<DateTime<Ut
     path
 }
 
+/// Builds `<archive_root>/messages/<year>/<month>/<day>/<id>/attachments`,
+/// the directory `gmail sync --extract-attachments` writes a message's
+/// attachment files into. A sibling of [`shard_path`]'s `<id>.eml` within
+/// the same day-bucket, not a new top-level scheme — `<id>.eml` (a file)
+/// and `<id>/` (a directory) are distinct filesystem entries, so the two
+/// never collide.
+pub(crate) fn attachments_dir(
+    archive_root: &Path,
+    id: &str,
+    date: Option<DateTime<Utc>>,
+) -> PathBuf {
+    let mut path = shard_path(archive_root, id, date);
+    path.set_extension("");
+    path.push("attachments");
+    path
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -94,5 +111,32 @@ mod tests {
         let a = shard_path(root, "id", Some(date(2026, 6, 1)));
         let b = shard_path(root, "id", Some(date(2026, 6, 2)));
         assert_ne!(a.parent(), b.parent());
+    }
+
+    #[test]
+    fn attachments_dir_places_dir_under_year_month_day() {
+        let dir = attachments_dir(Path::new("/archive"), "abc123", Some(date(2026, 3, 5)));
+        assert_eq!(
+            dir,
+            PathBuf::from("/archive/messages/2026/03/05/abc123/attachments")
+        );
+    }
+
+    #[test]
+    fn attachments_dir_falls_back_to_unknown_date_bucket() {
+        let dir = attachments_dir(Path::new("/archive"), "id1", None);
+        assert_eq!(
+            dir,
+            PathBuf::from("/archive/messages/unknown-date/id1/attachments")
+        );
+    }
+
+    #[test]
+    fn attachments_dir_is_sibling_of_the_eml_file() {
+        let root = Path::new("/archive");
+        let d = Some(date(2026, 6, 1));
+        let eml = shard_path(root, "id", d);
+        let dir = attachments_dir(root, "id", d);
+        assert_eq!(dir.parent().unwrap().parent(), eml.parent());
     }
 }
