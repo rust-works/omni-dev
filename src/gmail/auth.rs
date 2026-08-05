@@ -298,6 +298,11 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthS
 /// can fail — once named accounts exist, resolution itself can (e.g. an
 /// unknown or ambiguous account) — so callers that want [`status`]'s
 /// never-fails presence report keep calling that instead.
+///
+/// Only compiled with the `mcp` feature — the MCP `gmail_auth_status` tool
+/// is its sole consumer; the CLI's `gmail auth status` goes through
+/// [`load_credentials_for`] instead.
+#[cfg(feature = "mcp")]
 pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
     match resolve(&settings.gmail, explicit)? {
@@ -308,6 +313,10 @@ pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
 
 /// Builds a [`GmailAuthStatus`] from `gmail.accounts.<name>`'s presence
 /// flags — the named-account counterpart of [`status_with`].
+///
+/// Only compiled with the `mcp` feature — see [`status_for`], its sole
+/// caller.
+#[cfg(feature = "mcp")]
 fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
     let account = gmail.accounts.get(name);
     GmailAuthStatus {
@@ -2406,6 +2415,7 @@ mod tests {
         assert!(val["gmail"]["accounts"].get("work").is_none());
     }
 
+    #[cfg(feature = "mcp")]
     #[test]
     fn status_for_named_reports_presence_from_account() {
         let guard = crate::gmail::test_support::EnvGuard::take();
@@ -2425,6 +2435,7 @@ mod tests {
         assert_eq!(status.scope.as_deref(), Some(SCOPE_READONLY));
     }
 
+    #[cfg(feature = "mcp")]
     #[test]
     fn status_for_legacy_matches_status_with_when_accounts_empty() {
         let guard = crate::gmail::test_support::EnvGuard::take();
