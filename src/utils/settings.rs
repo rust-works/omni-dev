@@ -130,6 +130,53 @@ pub struct McpSettings {
     pub max_response_bytes: Option<usize>,
 }
 
+/// A single named Gmail account's stored OAuth2 credentials, inside the
+/// `gmail.accounts` map (issue #1500, [ADR-0066](../../docs/adrs/adr-0066.md)).
+///
+/// Orthogonal to [`Profile`]: selecting a Gmail account never changes the
+/// active `--profile`, and vice versa. `email_address` is a display-only
+/// cache populated opportunistically by `gmail auth status` — never used for
+/// auth, never written by `login`/`import`.
+#[derive(Debug, Default, Deserialize)]
+pub struct GmailAccountSettings {
+    /// OAuth2 client id from the account's Google Cloud project.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// OAuth2 client secret from the account's Google Cloud project.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// The long-lived refresh token obtained by `gmail auth login`.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// The OAuth2 scope this account was authorized with.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Display-only mailbox address, populated opportunistically by
+    /// `gmail auth status`. Never used for authentication.
+    #[serde(default)]
+    pub email_address: Option<String>,
+}
+
+/// The `gmail` section of `settings.json` — named Gmail accounts, selected
+/// per invocation via `--account` / `OMNI_DEV_GMAIL_ACCOUNT`
+/// (issue #1500, [ADR-0066](../../docs/adrs/adr-0066.md)).
+///
+/// An absent `gmail` block (or an empty `accounts` map) leaves Gmail
+/// credential resolution on today's exact legacy path — see
+/// `crate::gmail::account::resolve_account`.
+#[derive(Debug, Default, Deserialize)]
+pub struct GmailSettings {
+    /// The account `gmail account list`/credential resolution falls back to
+    /// when `--account`/`OMNI_DEV_GMAIL_ACCOUNT` is unset and more than one
+    /// account is configured.
+    #[serde(default)]
+    pub default_account: Option<String>,
+
+    /// Named accounts, keyed by the name passed to `--account`.
+    #[serde(default)]
+    pub accounts: HashMap<String, GmailAccountSettings>,
+}
+
 /// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
@@ -147,6 +194,11 @@ pub struct Settings {
     /// [`McpSettings::default`].
     #[serde(default)]
     pub mcp: McpSettings,
+
+    /// Named Gmail accounts (issue #1500); an absent block yields
+    /// [`GmailSettings::default`], which is an empty account map.
+    #[serde(default)]
+    pub gmail: GmailSettings,
 }
 
 /// Returns the active profile name from `raw` (the process environment), or
@@ -395,55 +447,141 @@ impl Settings {
             "unknown profile '{name}'; known profiles: {known}"
         ))
     }
+
+    /// Merges the given key/value pairs into `gmail.accounts.<account>`,
+    /// creating the file, its parent directory, and any missing intermediate
+    /// objects as needed (issue #1500,
+    /// [ADR-0066](../../docs/adrs/adr-0066.md)). Same hardening and
+    /// unknown-field preservation as [`Settings::upsert_env_vars_in`] — no
+    /// new file-handling code.
+    pub fn upsert_gmail_account(path: &Path, account: &str, vars: &[(&str, &str)]) -> Result<()> {
+        let mut settings_value = read_or_default_settings(path)?;
+
+        let entry = ensure_object_at(&mut settings_value, &["gmail", "accounts", account])?;
+        for (key, value) in vars {
+            entry.insert(
+                (*key).to_string(),
+                serde_json::Value::String((*value).to_string()),
+            );
+        }
+
+        write_settings(path, &settings_value)
+    }
+
+    /// Removes `gmail.accounts.<account>` entirely — an account is coherent
+    /// as a unit, unlike the key-by-key removal
+    /// [`Settings::remove_env_vars_in`] does. Returns `true` if the account
+    /// was present and removed, `false` when the file, `gmail`,
+    /// `gmail.accounts`, or the named account did not exist (the file is
+    /// left untouched in that case).
+    pub fn remove_gmail_account(path: &Path, account: &str) -> Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut settings_value = read_or_default_settings(path)?;
+
+        let removed = object_at_mut(&mut settings_value, &["gmail", "accounts"])
+            .is_some_and(|accounts| accounts.remove(account).is_some());
+
+        if removed {
+            write_settings(path, &settings_value)?;
+        }
+        Ok(removed)
+    }
+
+    /// Sets (`Some`) or clears (`None`) `gmail.default_account`. Always
+    /// writes, mirroring [`Settings::upsert_env_vars_in`]'s unconditional-write
+    /// semantics rather than [`Settings::remove_env_vars_in`]'s
+    /// changed-only one, since this is fundamentally an upsert of a single
+    /// scalar rather than a set of keys.
+    pub fn set_gmail_default_account(path: &Path, account: Option<&str>) -> Result<()> {
+        let mut settings_value = read_or_default_settings(path)?;
+
+        match account {
+            Some(name) => {
+                let gmail = ensure_object_at(&mut settings_value, &["gmail"])?;
+                gmail.insert(
+                    "default_account".to_string(),
+                    serde_json::Value::String(name.to_string()),
+                );
+            }
+            None => {
+                if let Some(gmail) = object_at_mut(&mut settings_value, &["gmail"]) {
+                    gmail.remove("default_account");
+                }
+            }
+        }
+
+        write_settings(path, &settings_value)
+    }
 }
 
 /// Navigates `root` to the env object targeted by `profile` — the base `env`
-/// when `None`, `profiles.<name>.env` when `Some` — creating missing
-/// intermediate objects and replacing non-object nodes along the way.
-/// The creating counterpart of [`env_object_mut`], for upserts.
+/// when `None`, `profiles.<name>.env` when `Some`. Thin specialization of
+/// [`ensure_object_at`] for the two-level `env`/`profiles.<name>.env` shape.
 fn ensure_env_object<'a>(
     root: &'a mut serde_json::Value,
     profile: Option<&str>,
 ) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
-    let parent = match profile {
-        Some(name) => {
-            if !root
-                .get("profiles")
-                .is_some_and(serde_json::Value::is_object)
-            {
-                root["profiles"] = serde_json::json!({});
-            }
-            let profiles = &mut root["profiles"];
-            if !profiles.get(name).is_some_and(serde_json::Value::is_object) {
-                profiles[name] = serde_json::json!({});
-            }
-            &mut profiles[name]
-        }
-        None => root,
-    };
-
-    if !parent.get("env").is_some_and(serde_json::Value::is_object) {
-        parent["env"] = serde_json::json!({});
+    match profile {
+        Some(name) => ensure_object_at(root, &["profiles", name, "env"]),
+        None => ensure_object_at(root, &["env"]),
     }
-    parent["env"]
-        .as_object_mut()
-        .context("Internal error: env key is not an object after initialization")
 }
 
 /// Navigates `root` to the env object targeted by `profile`, or `None` when
-/// any node on the way is absent or not an object. The non-creating
-/// counterpart of [`ensure_env_object`], for removals.
+/// any node on the way is absent or not an object. Thin specialization of
+/// [`object_at_mut`] for the two-level `env`/`profiles.<name>.env` shape.
 fn env_object_mut<'a>(
     root: &'a mut serde_json::Value,
     profile: Option<&str>,
 ) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
-    let parent = match profile {
-        Some(name) => root.get_mut("profiles")?.get_mut(name)?,
-        None => root,
-    };
-    parent
-        .get_mut("env")
-        .and_then(serde_json::Value::as_object_mut)
+    match profile {
+        Some(name) => object_at_mut(root, &["profiles", name, "env"]),
+        None => object_at_mut(root, &["env"]),
+    }
+}
+
+/// Navigates `root` through each of `segments` in turn, creating missing
+/// intermediate objects and replacing non-object nodes along the way, and
+/// returns the object at the end of the path. The creating counterpart of
+/// [`object_at_mut`], for upserts. Generalizes what were previously two
+/// hardcoded two-level walks (`env`, `profiles.<name>.env`) to an arbitrary
+/// depth, so a third settings substructure (`gmail.accounts.<name>`, issue
+/// #1500) reuses the same file-handling code rather than duplicating it.
+fn ensure_object_at<'a>(
+    root: &'a mut serde_json::Value,
+    segments: &[&str],
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let mut current = root;
+    for segment in segments {
+        if !current
+            .get(*segment)
+            .is_some_and(serde_json::Value::is_object)
+        {
+            current[*segment] = serde_json::json!({});
+        }
+        current = current
+            .get_mut(*segment)
+            .context("Internal error: target key missing immediately after being created")?;
+    }
+    current
+        .as_object_mut()
+        .context("Internal error: target key is not an object after initialization")
+}
+
+/// Navigates `root` through each of `segments` in turn, or returns `None`
+/// when any node on the way is absent or not an object. The non-creating
+/// counterpart of [`ensure_object_at`], for removals.
+fn object_at_mut<'a>(
+    root: &'a mut serde_json::Value,
+    segments: &[&str],
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let mut current = root;
+    for segment in segments {
+        current = current.get_mut(*segment)?;
+    }
+    current.as_object_mut()
 }
 
 /// Reads and parses the settings file at `path` as a generic JSON value
@@ -905,6 +1043,42 @@ mod tests {
         assert!(settings.mcp.max_response_bytes.is_none());
     }
 
+    #[test]
+    fn settings_parse_gmail_section_from_json() {
+        let json = r#"{
+            "gmail": {
+                "default_account": "work",
+                "accounts": {
+                    "work": {
+                        "client_id": "id",
+                        "client_secret": "secret",
+                        "refresh_token": "token",
+                        "scope": "https://www.googleapis.com/auth/gmail.modify",
+                        "email_address": "alice@work.com"
+                    }
+                }
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.gmail.default_account.as_deref(), Some("work"));
+        let account = settings.gmail.accounts.get("work").unwrap();
+        assert_eq!(account.client_id.as_deref(), Some("id"));
+        assert_eq!(account.client_secret.as_deref(), Some("secret"));
+        assert_eq!(account.refresh_token.as_deref(), Some("token"));
+        assert_eq!(
+            account.scope.as_deref(),
+            Some("https://www.googleapis.com/auth/gmail.modify")
+        );
+        assert_eq!(account.email_address.as_deref(), Some("alice@work.com"));
+    }
+
+    #[test]
+    fn settings_without_gmail_key_defaults_empty() {
+        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
+        assert!(settings.gmail.default_account.is_none());
+        assert!(settings.gmail.accounts.is_empty());
+    }
+
     // ── free get_env_var seam (pure: injected raw env + lazy settings loader) ──
 
     #[test]
@@ -1276,5 +1450,104 @@ mod tests {
         let val = read_json(&path);
         assert!(val["env"].get("A_KEY").is_none());
         assert_eq!(val["profiles"]["work"]["env"]["A_KEY"], "work");
+    }
+
+    // ── generalized path-segment walkers (issue #1500) ────────────────
+
+    #[test]
+    fn ensure_object_at_creates_nested_path_at_arbitrary_depth() {
+        let mut root = serde_json::json!({});
+        {
+            let map = ensure_object_at(&mut root, &["gmail", "accounts", "work"]).unwrap();
+            map.insert("client_id".to_string(), serde_json::json!("id"));
+        }
+        assert_eq!(root["gmail"]["accounts"]["work"]["client_id"], "id");
+    }
+
+    #[test]
+    fn ensure_object_at_replaces_non_object_nodes_along_path() {
+        let mut root = serde_json::json!({"gmail": "bogus"});
+        {
+            let map = ensure_object_at(&mut root, &["gmail", "accounts", "work"]).unwrap();
+            map.insert("client_id".to_string(), serde_json::json!("id"));
+        }
+        assert_eq!(root["gmail"]["accounts"]["work"]["client_id"], "id");
+    }
+
+    #[test]
+    fn object_at_mut_none_when_any_segment_absent() {
+        let mut root = serde_json::json!({"gmail": {"accounts": {}}});
+        assert!(object_at_mut(&mut root, &["gmail", "accounts", "work"]).is_none());
+        assert!(object_at_mut(&mut root, &["missing", "accounts"]).is_none());
+    }
+
+    // ── gmail account writes (issue #1500) ─────────────────────────────
+
+    #[test]
+    fn upsert_gmail_account_creates_nested_path_and_preserves_siblings() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"SHARED": "base"}, "gmail": {"accounts": {"personal": {"client_id": "keep"}}}, "extra": true}"#,
+        )
+        .unwrap();
+
+        Settings::upsert_gmail_account(
+            &path,
+            "work",
+            &[("client_id", "id"), ("refresh_token", "token")],
+        )
+        .unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "id");
+        assert_eq!(val["gmail"]["accounts"]["work"]["refresh_token"], "token");
+        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
+        assert_eq!(val["env"]["SHARED"], "base");
+        assert_eq!(val["extra"], true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(file_mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn remove_gmail_account_true_when_present_false_when_absent() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"gmail": {"accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
+        let val = read_json(&path);
+        assert!(val["gmail"]["accounts"].get("work").is_none());
+        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
+
+        assert!(!Settings::remove_gmail_account(&path, "work").unwrap());
+    }
+
+    #[test]
+    fn remove_gmail_account_false_when_file_missing() {
+        let (_tmp, path) = temp_settings_path();
+        assert!(!Settings::remove_gmail_account(&path, "work").unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn set_gmail_default_account_sets_and_clears() {
+        let (_tmp, path) = temp_settings_path();
+
+        Settings::set_gmail_default_account(&path, Some("work")).unwrap();
+        assert_eq!(read_json(&path)["gmail"]["default_account"], "work");
+
+        Settings::set_gmail_default_account(&path, None).unwrap();
+        assert!(read_json(&path)["gmail"].get("default_account").is_none());
     }
 }
