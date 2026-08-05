@@ -8,13 +8,15 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
+use crate::cli::gmail::helpers;
+use crate::gmail::account;
 use crate::gmail::auth::{self, BrowserConfig, GmailScope};
 use crate::gmail::client::GmailClient;
 use crate::gmail::import;
 use crate::gmail::profile_api::ProfileApi;
 use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
-use crate::utils::settings::{active_profile_from, profile_suffix, SettingsEnv};
+use crate::utils::settings::{active_profile_from, profile_suffix, Settings, SettingsEnv};
 
 /// Manages Gmail OAuth2 credentials.
 #[derive(Parser)]
@@ -60,9 +62,10 @@ pub struct ImportCommand {
 }
 
 impl ImportCommand {
-    /// Discovers, parses, and saves the client id/secret.
+    /// Discovers, parses, and saves the client id/secret. Honors
+    /// `--account`/`OMNI_DEV_GMAIL_ACCOUNT` (issue #1500).
     pub fn execute(self) -> Result<()> {
-        let outcome = import::import_client_credentials(self.path.as_deref())?;
+        let outcome = import::import_client_credentials_for(None, self.path.as_deref())?;
         println!("Found {} (Desktop app client)", outcome.path.display());
         println!("  Client id: {}", outcome.client_id);
         println!(
@@ -101,7 +104,32 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
         resolve_login_credentials(env, prompt_client_id, prompt_client_secret)?;
     let scope = resolve_scope(modify);
 
-    let status = auth::login(&client_id, &client_secret, scope, &BrowserConfig::default()).await?;
+    // Snapshot whether this call could be the first empty→non-empty
+    // transition (issue #1500) *before* logging in — `login_for` mutates
+    // settings.json on success, so the check must run first.
+    let might_shadow_legacy = {
+        let settings = Settings::load().unwrap_or_default();
+        let legacy = auth::status();
+        let had_legacy =
+            legacy.has_client_id || legacy.has_client_secret || legacy.has_refresh_token;
+        account::is_first_legacy_to_named_transition(&settings.gmail, had_legacy)
+    };
+
+    let status = auth::login_for(
+        None,
+        &client_id,
+        &client_secret,
+        scope,
+        &BrowserConfig::default(),
+    )
+    .await?;
+
+    if might_shadow_legacy {
+        let settings = Settings::load().unwrap_or_default();
+        if !settings.gmail.accounts.is_empty() {
+            helpers::print_shadowing_notice();
+        }
+    }
 
     println!("\nCredentials saved to ~/.omni-dev/settings.json");
     println!("  Granted scope: {}", status.scope.unwrap_or_default());
@@ -240,15 +268,16 @@ fn resolve_scope(modify: bool) -> GmailScope {
 pub struct LogoutCommand;
 
 impl LogoutCommand {
-    /// Removes Gmail credential keys from settings.json — from the active
-    /// profile's `env` map when a profile is selected.
+    /// Removes Gmail credential keys from settings.json — from the
+    /// resolved account (issue #1500), falling back to the active
+    /// profile's `env` map / base `env` when no named account applies.
     pub fn execute(self) -> Result<()> {
         run_logout()
     }
 }
 
 fn run_logout() -> Result<()> {
-    let removed = auth::remove_credentials()?;
+    let removed = auth::remove_credentials_for(None)?;
     if removed {
         println!("Gmail credentials removed from ~/.omni-dev/settings.json");
     } else {
@@ -259,7 +288,13 @@ fn run_logout() -> Result<()> {
 
 /// Shows the current authentication status.
 #[derive(Parser)]
-pub struct StatusCommand;
+pub struct StatusCommand {
+    /// Reports status for every configured Gmail account instead of just
+    /// the resolved one. Degenerates to today's single-account output when
+    /// no named accounts are configured (issue #1500).
+    #[arg(long)]
+    pub all: bool,
+}
 
 impl StatusCommand {
     /// Verifies credentials by calling `users.getProfile` — deliberately
@@ -267,16 +302,62 @@ impl StatusCommand {
     /// report, since that's the point of a CLI status command a human runs
     /// interactively.
     pub async fn execute(self) -> Result<()> {
-        let credentials = auth::load_credentials()?;
+        if self.all {
+            return run_auth_status_all().await;
+        }
+        let credentials = auth::load_credentials_for(None)?;
         let scope = credentials.scope;
         let client = GmailClient::from_credentials(&credentials)?;
         run_auth_status(&client, scope).await
     }
 }
 
+/// `gmail auth status --all`: reports one status block per configured
+/// account, backfilling each account's cached `email_address` on success.
+/// Degenerates to [`run_auth_status`]'s single-account behavior when no
+/// named accounts are configured (the zero-migration path).
+async fn run_auth_status_all() -> Result<()> {
+    let settings = Settings::load().unwrap_or_default();
+    let accounts = account::list_accounts(&settings.gmail);
+    if accounts.is_empty() {
+        let credentials = auth::load_credentials_for(None)?;
+        let scope = credentials.scope;
+        let client = GmailClient::from_credentials(&credentials)?;
+        return run_auth_status(&client, scope).await;
+    }
+    for summary in &accounts {
+        println!("\n== {} ==", summary.name);
+        if let Err(err) = report_one_account_status(&summary.name).await {
+            println!("  error: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// Loads `name`'s credentials, builds a client, and reports its status —
+/// the per-account body of [`run_auth_status_all`]'s loop.
+async fn report_one_account_status(name: &str) -> Result<()> {
+    let credentials = auth::load_credentials_for(Some(name))?;
+    let scope = credentials.scope;
+    let client = GmailClient::from_credentials(&credentials)?;
+    run_auth_status_for(&client, scope, Some(name)).await
+}
+
 /// Calls `users.getProfile` and reports whether the stored refresh token is
 /// still accepted.
 async fn run_auth_status(client: &GmailClient, scope: GmailScope) -> Result<()> {
+    run_auth_status_for(client, scope, None).await
+}
+
+/// [`run_auth_status`], additionally backfilling `account_name`'s cached
+/// `email_address` in settings.json on success when given (`gmail auth
+/// status --all`, issue #1500) — the single-account path (`account_name:
+/// None`) never touches settings.json.
+async fn run_auth_status_for(
+    client: &GmailClient,
+    scope: GmailScope,
+    account_name: Option<&str>,
+) -> Result<()> {
     println!("Checking Gmail authentication...");
 
     let profile = ProfileApi::new(client).get().await?;
@@ -291,6 +372,10 @@ async fn run_auth_status(client: &GmailClient, scope: GmailScope) -> Result<()> 
             "gmail.readonly"
         }
     );
+
+    if let Some(name) = account_name {
+        auth::record_account_email(name, &profile.email_address)?;
+    }
     Ok(())
 }
 
@@ -441,7 +526,7 @@ mod tests {
         let _dir = guard.clear_credentials();
 
         let cmd = AuthCommand {
-            command: AuthSubcommands::Status(StatusCommand),
+            command: AuthSubcommands::Status(StatusCommand { all: false }),
         };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
@@ -458,7 +543,7 @@ mod tests {
     #[test]
     fn auth_command_status_dispatch() {
         let cmd = AuthCommand {
-            command: AuthSubcommands::Status(StatusCommand),
+            command: AuthSubcommands::Status(StatusCommand { all: false }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
     }
@@ -586,7 +671,7 @@ mod tests {
         let guard = EnvGuard::take();
         let _dir = guard.clear_credentials();
 
-        let err = StatusCommand.execute().await.unwrap_err();
+        let err = StatusCommand { all: false }.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
 
