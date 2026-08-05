@@ -5,7 +5,7 @@ API through the `omni-dev gmail` command tree, with a matching `gmail_*` MCP
 tool for every read-only subcommand. Authentication and output formats are
 identical across both surfaces; the MCP tools simply return YAML matching the
 CLI's `-o yaml` output. For the MCP-tool reference (parameters only), see
-[docs/mcp.md](mcp.md#gmail-5-tools).
+[docs/mcp.md](mcp.md#gmail-6-tools).
 
 New to this integration? Follow the
 [Gmail Quickstart](gmail-quickstart.md) for a linear, zero-to-synced-archive
@@ -15,15 +15,16 @@ walkthrough — this page is the topic-by-topic reference.
 
 1. [Prerequisites](#prerequisites)
 2. [Authentication](#authentication)
-3. [Output formats](#output-formats)
-4. [Search](#search)
-5. [Messages](#messages)
-6. [Threads](#threads)
-7. [Labels](#labels)
-8. [Sync](#sync)
-9. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-10. [Troubleshooting](#troubleshooting)
-11. [See also](#see-also)
+3. [Multiple accounts](#multiple-accounts)
+4. [Output formats](#output-formats)
+5. [Search](#search)
+6. [Messages](#messages)
+7. [Threads](#threads)
+8. [Labels](#labels)
+9. [Sync](#sync)
+10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+11. [Troubleshooting](#troubleshooting)
+12. [See also](#see-also)
 
 ## Prerequisites
 
@@ -134,6 +135,31 @@ This calls `users.getProfile`, a live network call. The matching MCP tool,
 only — it never calls the Gmail API, so it can't confirm the refresh token
 is still accepted.
 
+Pass `--all` to report every configured named account (see
+[Multiple accounts](#multiple-accounts)) in one call instead of just the
+resolved one:
+
+```bash
+$ omni-dev gmail auth status --all
+
+== work ==
+Checking Gmail authentication...
+Authenticated as: alice@work.com
+Messages in mailbox: 12034
+Granted scope: gmail.readonly, gmail.modify
+
+== personal ==
+Checking Gmail authentication...
+Authenticated as: alice@gmail.com
+Messages in mailbox: 5842
+Granted scope: gmail.readonly
+```
+
+`--all` degenerates to the single-account output above when no named
+accounts are configured. Each successful check also backfills that
+account's cached `email_address` in `settings.json` (display-only; never
+used for authentication).
+
 ### Removing credentials
 
 ```bash
@@ -142,7 +168,106 @@ Gmail credentials removed from ~/.omni-dev/settings.json
 ```
 
 Idempotent: if no credentials are configured, it prints
-`No Gmail credentials were configured.` and exits successfully.
+`No Gmail credentials were configured.` and exits successfully. Removes
+the resolved account (see [Multiple accounts](#multiple-accounts) below) —
+pass `--account NAME` to target a specific named account.
+
+## Multiple accounts
+
+`--profile` (see [Prerequisites](#prerequisites) and
+[ADR-0045](adrs/adr-0045.md)) selects a whole credential bundle — Atlassian,
+Datadog, the Claude API key, *and* Gmail all at once. That's the wrong tool
+for "I just want a second mailbox while everything else about my
+environment stays the same," so Gmail accounts are a second, independent
+axis: named entries in a `gmail` block of `~/.omni-dev/settings.json`,
+selected per invocation via an `--account NAME` flag or the
+`OMNI_DEV_GMAIL_ACCOUNT` environment variable (AWS-CLI style, mirroring
+`--profile`). `--account` is scoped to the `gmail` command tree — usable
+either right after `gmail` or after the leaf subcommand
+(`gmail --account work search ...` or `gmail search --account work ...`),
+but not before `gmail` itself, since it isn't a CLI-wide flag. See
+[ADR-0066](adrs/adr-0066.md) for the full design rationale.
+
+**Zero-migration guarantee:** an installation that never configures a named
+account behaves exactly as before — every command in this guide works
+identically whether or not you ever touch `--account`.
+
+### Configuring accounts
+
+Create a second (or subsequent) account the same way you configured the
+first, adding `--account NAME`:
+
+```bash
+$ omni-dev gmail auth import --account personal
+$ omni-dev gmail auth login --account personal
+```
+
+`--account` need not already exist — `auth login`/`auth import` are how an
+account comes into existence. Every other Gmail command (`search`, `read`,
+`thread`, `label`, `sync`, `auth status`, `auth logout`) also accepts
+`--account NAME` to target a specific mailbox, and the MCP tools accept the
+equivalent `account` parameter.
+
+If you already have a single-account setup and want to migrate it into a
+named account instead of starting over:
+
+```bash
+$ omni-dev gmail account import-legacy --name work
+Legacy Gmail credentials migrated to account 'work'. Legacy credentials left
+in place — pass --remove-legacy to delete them.
+```
+
+Non-destructive by default; pass `--remove-legacy` to delete the old
+credentials once you've confirmed the migration worked. `import-legacy`
+takes `--name`, not `--account` — `--account` is inherited by every `gmail`
+subcommand (including `import-legacy`) and selects an *existing* account,
+while this one names the account being *created*, and clap doesn't allow a
+subcommand to redefine an inherited flag. `--name` defaults to the literal
+name `default` if omitted.
+
+**One sharp edge:** the moment a first named account is created — via
+`auth login --account NAME` or `account import-legacy` — while legacy
+credentials still exist, those legacy credentials become **shadowed**: a
+no-`--account` invocation from then on resolves through the named-account
+rules below and no longer falls back to them. omni-dev prints a one-time
+stderr notice at that exact transition, pointing at `gmail account
+import-legacy` (to migrate any other legacy account) or `gmail auth logout`
+(to remove the now-unreachable legacy credentials).
+
+### Managing accounts
+
+```bash
+$ omni-dev gmail account list
+NAME      EMAIL              SCOPE                          DEFAULT
+personal  alice@gmail.com    gmail.readonly                 
+work      alice@work.com     gmail.readonly, gmail.modify   *
+
+$ omni-dev gmail account set-default work
+Default Gmail account set to 'work'.
+```
+
+`gmail account list` reads only `settings.json` — no network call, no
+secret ever rendered. The matching MCP tool is `gmail_account_list`; call
+it before passing an `account` parameter to any other Gmail tool, since an
+unknown name is a hard error rather than a silent fallback.
+
+### Resolution order
+
+When a command runs, the account it uses is resolved in this order:
+
+1. A literal `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`/`GMAIL_REFRESH_TOKEN`
+   set directly in the process environment bypasses account resolution
+   entirely — today's exact single-account behaviour, unchanged.
+2. `--account NAME` / `OMNI_DEV_GMAIL_ACCOUNT`, if set, selects that named
+   account. An unknown name is a hard error listing the accounts that
+   *are* configured — never a silent fallback to the wrong mailbox.
+3. No explicit account, with one or more named accounts configured: the
+   configured default (`gmail account set-default`) if it still names a
+   real account, else the sole account if exactly one is configured, else
+   a hard error naming both remedies.
+4. No named accounts configured at all: falls through unchanged to the
+   pre-multi-account resolution (process env → the active `--profile`'s
+   `env` map → the base `env` map) — the zero-migration path.
 
 ## Output formats
 
@@ -497,9 +622,12 @@ the process started.
   walkthrough for first-time setup.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
-- [MCP Reference — Gmail](mcp.md#gmail-5-tools) — parameter-only listing of
-  all 5 `gmail_*` MCP tools.
+- [MCP Reference — Gmail](mcp.md#gmail-6-tools) — parameter-only listing of
+  all 6 `gmail_*` MCP tools.
 - [ADR-0063](adrs/adr-0063.md) — OAuth2 authorization-code + PKCE design,
   refresh-token-only persistence, and the bring-your-own Google Cloud
   project rationale.
+- [ADR-0066](adrs/adr-0066.md) — the named-account store behind
+  [Multiple accounts](#multiple-accounts), and why it's orthogonal to
+  `--profile`.
 - [Gmail API documentation](https://developers.google.com/workspace/gmail/api/reference/rest) — upstream reference.
