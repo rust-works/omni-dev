@@ -89,3 +89,4 @@ by Michael Nygard.
 | [ADR-0063](adr-0063.md)  | ✅ Accepted                              | 2026-08-01 | OAuth2 Authorization-Code + PKCE for Gmail, with Bring-Your-Own Google Cloud Project        |
 | [ADR-0064](adr-0064.md)  | ✅ Accepted                              | 2026-08-03 | Presence-on-Disk Idempotence and Immutable-`.eml`/Mutable-Manifest Split for `gmail sync`   |
 | [ADR-0065](adr-0065.md)  | ✅ Accepted                              | 2026-08-04 | `gmail sync --extract-attachments`                                                          |
+| [ADR-0066](adr-0066.md)  | ✅ Accepted                              | 2026-08-05 | A Gmail-Specific Named-Account Store, Orthogonal to `--profile`                             |
