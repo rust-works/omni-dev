@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use crate::gmail::auth::{GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET};
+use crate::gmail::account::ResolvedAccount;
+use crate::gmail::auth::{self, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET};
 use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
 use crate::utils::settings::{active_profile_from, Settings};
@@ -65,6 +66,45 @@ pub(crate) fn import_client_credentials_to(
     let path = discover_client_secret_file(env, home, explicit)?;
     let credentials = parse_client_secret_file(&path)?;
     save_client_credentials_to(settings_path, profile, &credentials)?;
+    Ok(ImportOutcome {
+        path,
+        client_id: credentials.client_id,
+    })
+}
+
+/// [`import_client_credentials`], but honoring the named-account resolution
+/// added by issue #1500.
+///
+/// `explicit_account` is the already-resolved `--account`/
+/// [`crate::gmail::account::GMAIL_ACCOUNT_ENV`] override, if any — resolved
+/// via `auth::resolve_for_write`, so an explicit name need not already be
+/// configured (this is how a new account is created); `explicit_path` is
+/// the `client_secret.json` path argument, resolved exactly as in
+/// [`import_client_credentials`].
+pub fn import_client_credentials_for(
+    explicit_account: Option<&str>,
+    explicit_path: Option<&Path>,
+) -> Result<ImportOutcome> {
+    let path = discover_client_secret_file(&SystemEnv, dirs::home_dir().as_deref(), explicit_path)?;
+    let credentials = parse_client_secret_file(&path)?;
+
+    let settings = Settings::load().unwrap_or_default();
+    match auth::resolve_for_write(&settings.gmail, explicit_account)? {
+        ResolvedAccount::Legacy => save_client_credentials_to(
+            &Settings::get_settings_path()?,
+            active_profile_from(&SystemEnv).as_deref(),
+            &credentials,
+        )?,
+        ResolvedAccount::Named(name) => Settings::upsert_gmail_account(
+            &Settings::get_settings_path()?,
+            &name,
+            &[
+                ("client_id", credentials.client_id.as_str()),
+                ("client_secret", credentials.client_secret.expose_secret()),
+            ],
+        )?,
+    }
+
     Ok(ImportOutcome {
         path,
         client_id: credentials.client_id,
@@ -485,5 +525,75 @@ mod tests {
             value["profiles"]["work"]["env"]["GMAIL_CLIENT_ID"],
             "profile-id"
         );
+    }
+
+    // ── import_client_credentials_for (issue #1500) ─────────────────────
+    //
+    // These exercise the production wrapper, which resolves the settings
+    // path from `HOME` (like `import_client_credentials` itself), so they
+    // redirect it via `EnvGuard`. Passing an explicit `client_secret.json`
+    // path bypasses discovery entirely, so no env/home mocking is needed
+    // for that half.
+
+    #[test]
+    fn import_for_named_account_writes_gmail_accounts_not_env() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "placeholder")])
+            .unwrap();
+
+        let secret_dir = temp_dir();
+        let secret_path = secret_dir.path().join("client_secret.json");
+        write_installed_json(&secret_path, "the-id", "the-secret");
+
+        let outcome = import_client_credentials_for(Some("work"), Some(&secret_path)).unwrap();
+        assert_eq!(outcome.client_id, "the-id");
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "the-id");
+        assert_eq!(
+            val["gmail"]["accounts"]["work"]["client_secret"],
+            "the-secret"
+        );
+        assert!(val.get("env").is_none());
+    }
+
+    #[test]
+    fn import_for_creates_brand_new_named_account_without_prior_validation() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        // No account named "fresh" exists yet — import must still succeed,
+        // since import is how a new named account is created.
+
+        let secret_dir = temp_dir();
+        let secret_path = secret_dir.path().join("client_secret.json");
+        write_installed_json(&secret_path, "the-id", "the-secret");
+
+        import_client_credentials_for(Some("fresh"), Some(&secret_path)).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["gmail"]["accounts"]["fresh"]["client_id"], "the-id");
+    }
+
+    #[test]
+    fn import_for_legacy_when_no_account_given_and_none_configured() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        let secret_dir = temp_dir();
+        let secret_path = secret_dir.path().join("client_secret.json");
+        write_installed_json(&secret_path, "the-id", "the-secret");
+
+        import_client_credentials_for(None, Some(&secret_path)).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["GMAIL_CLIENT_ID"], "the-id");
+        assert!(val.get("gmail").is_none());
     }
 }

@@ -8,6 +8,7 @@
 //! watermark) and `profile_api.rs` (`users.getProfile`) back Phase 2's
 //! `gmail sync` (see [ADR-0064](../../docs/adrs/adr-0064.md)).
 
+pub mod account;
 pub mod attachments;
 pub mod auth;
 pub mod client;

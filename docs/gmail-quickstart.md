@@ -163,7 +163,7 @@ are documented in [gmail.md#sync](gmail.md#sync).
 - **User Guide overview** —
   [user-guide.md#gmail-integration](user-guide.md#gmail-integration).
 - **MCP tools** — every read-only Gmail subcommand has a matching
-  `gmail_*` MCP tool: [mcp.md#gmail-5-tools](mcp.md#gmail-5-tools).
+  `gmail_*` MCP tool: [mcp.md#gmail-6-tools](mcp.md#gmail-6-tools).
 
 ## Troubleshooting quick links
 

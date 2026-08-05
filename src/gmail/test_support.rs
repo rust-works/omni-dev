@@ -7,6 +7,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::gmail::account::GMAIL_ACCOUNT_ENV;
 use crate::gmail::auth::{GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SCOPE};
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the Gmail
@@ -37,6 +38,7 @@ impl EnvGuard {
             GMAIL_CLIENT_SECRET,
             GMAIL_REFRESH_TOKEN,
             GMAIL_SCOPE,
+            GMAIL_ACCOUNT_ENV,
         ];
         let snapshot = keys
             .into_iter()
@@ -63,6 +65,7 @@ impl EnvGuard {
         std::env::remove_var(GMAIL_CLIENT_SECRET);
         std::env::remove_var(GMAIL_REFRESH_TOKEN);
         std::env::remove_var(GMAIL_SCOPE);
+        std::env::remove_var(GMAIL_ACCOUNT_ENV);
         dir
     }
 }
