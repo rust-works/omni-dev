@@ -4104,16 +4104,78 @@ omni-dev gmail - Gmail: search, read, and label messages via OAuth2
 
 Gmail: search, read, and label messages via OAuth2
 
-Usage: gmail <COMMAND>
+Usage: gmail [OPTIONS] <COMMAND>
 
 Commands:
-  auth    Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
-  search  Searches Gmail messages (mirrors the `gmail_search` MCP tool)
-  read    Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
-  thread  Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
-  label   Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
-  sync    Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
-  help    Print this message or the help of the given subcommand(s)
+  auth     Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
+  account  Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`)
+  search   Searches Gmail messages (mirrors the `gmail_search` MCP tool)
+  read     Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
+  thread   Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
+  label    Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+  sync     Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --account <NAME>  Selects a named Gmail account configured in `~/.omni-dev/settings.json` (AWS-CLI style, mirrors the top-level `--profile`) for this invocation
+  -h, --help            Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail account - Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`)
+
+Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`)
+
+Usage: account <COMMAND>
+
+Commands:
+  list           Lists configured Gmail accounts (name/email/scope/default only — no secrets, no network)
+  set-default    Sets the account resolved when `--account`/`OMNI_DEV_GMAIL_ACCOUNT` is not given
+  import-legacy  Migrates today's legacy (profile/base `env`) Gmail credentials into a named account
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail account import-legacy - Migrates today's legacy (profile/base `env`) Gmail credentials into a named account
+
+Migrates today's legacy (profile/base `env`) Gmail credentials into a named account
+
+Usage: import-legacy [OPTIONS]
+
+Options:
+      --name <NAME>    Name to migrate the legacy credentials into [default: default]
+      --remove-legacy  Also remove the legacy credentials after a successful migration
+  -h, --help           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail account list - Lists configured Gmail accounts (name/email/scope/default only — no secrets, no network)
+
+Lists configured Gmail accounts (name/email/scope/default only — no secrets, no network)
+
+Usage: list [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail account set-default - Sets the account resolved when `--account`/`OMNI_DEV_GMAIL_ACCOUNT` is not given
+
+Sets the account resolved when `--account`/`OMNI_DEV_GMAIL_ACCOUNT` is not given
+
+Usage: set-default <NAME>
+
+Arguments:
+  <NAME>  The account name to make the default. Must already be configured
 
 Options:
   -h, --help  Print help
@@ -4184,9 +4246,10 @@ omni-dev gmail auth status - Shows the current authentication status (mirrors th
 
 Shows the current authentication status (mirrors the `gmail_auth_status` MCP tool)
 
-Usage: status
+Usage: status [OPTIONS]
 
 Options:
+      --all   Reports status for every configured Gmail account instead of just the resolved one. Degenerates to today's single-account output when no named accounts are configured (issue #1500)
   -h, --help  Print help
 
 
