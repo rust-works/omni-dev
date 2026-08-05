@@ -4128,10 +4128,26 @@ Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `
 Usage: auth <COMMAND>
 
 Commands:
+  import  Imports an OAuth2 client id/secret from a downloaded `client_secret.json`
   login   Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only — login has no MCP equivalent
   logout  Removes the stored Gmail refresh token from settings.json
   status  Shows the current authentication status (mirrors the `gmail_auth_status` MCP tool)
   help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail auth import - Imports an OAuth2 client id/secret from a downloaded `client_secret.json`
+
+Imports an OAuth2 client id/secret from a downloaded `client_secret.json`
+
+Usage: import [PATH]
+
+Arguments:
+  [PATH]  Explicit path to client_secret.json. Omit to auto-discover via $GMAIL_CLIENT_SECRET_FILE, ~/.config/gws/client_secret.json, or ~/Downloads/client_secret_*.apps.googleusercontent.com.json
 
 Options:
   -h, --help  Print help
