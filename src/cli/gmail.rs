@@ -1,5 +1,6 @@
 //! Gmail CLI commands.
 
+pub(crate) mod account;
 pub(crate) mod auth;
 pub(crate) mod format;
 pub(crate) mod helpers;
@@ -12,11 +13,27 @@ pub(crate) mod thread;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::gmail::account::GMAIL_ACCOUNT_ENV;
 use crate::gmail::client::GmailClient;
 
 /// Gmail: read Gmail messages, threads, and labels (and, with `gmail.modify`, mutate labels).
 #[derive(Parser)]
 pub struct GmailCommand {
+    /// Selects a named Gmail account configured in
+    /// `~/.omni-dev/settings.json` (AWS-CLI style, mirrors the top-level
+    /// `--profile`) for this invocation.
+    ///
+    /// Orthogonal to `--profile`: switching the Gmail account never changes
+    /// which profile is active, and vice versa (see
+    /// [ADR-0066](../../../docs/adrs/adr-0066.md)). Overrides
+    /// `OMNI_DEV_GMAIL_ACCOUNT`. Scoped to the `gmail` subtree — unlike
+    /// `--profile`/`--instance` it is not usable before the `gmail`
+    /// subcommand name, only after it (`gmail --account NAME <cmd>` or
+    /// `gmail <cmd> --account NAME`), so it can't collide with an unrelated
+    /// subcommand's own `--account` flag elsewhere in the CLI (e.g.
+    /// `snowflake query --account`).
+    #[arg(long, global = true, value_name = "NAME")]
+    pub account: Option<String>,
     /// The Gmail subcommand to execute.
     #[command(subcommand)]
     pub command: GmailSubcommands,
@@ -27,6 +44,8 @@ pub struct GmailCommand {
 pub enum GmailSubcommands {
     /// Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`).
     Auth(auth::AuthCommand),
+    /// Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`).
+    Account(account::AccountCommand),
     /// Searches Gmail messages (mirrors the `gmail_search` MCP tool).
     Search(search::SearchCommand),
     /// Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool).
@@ -42,13 +61,25 @@ pub enum GmailSubcommands {
 impl GmailCommand {
     /// Executes the Gmail command.
     ///
-    /// `auth` manages credentials and must run without them; every other
-    /// subcommand needs an authenticated client, which is resolved **once**
-    /// here and threaded down so each leaf takes `&GmailClient` and stays
-    /// free of process env.
+    /// `auth` manages credentials and must run without them; `account`
+    /// manages which named account is selected and must equally run
+    /// without a resolved client (`import-legacy`'s whole point is working
+    /// in a pre-migration state). Every other subcommand needs an
+    /// authenticated client, which is resolved **once** here and threaded
+    /// down so each leaf takes `&GmailClient` and stays free of process
+    /// env.
     pub async fn execute(self) -> Result<()> {
+        // Propagates --account to the env var `gmail::account::resolve_account`
+        // reads (issue #1500), mirroring `Cli::propagate_global_flags`'s
+        // pattern: only set when present, so an existing ambient
+        // OMNI_DEV_GMAIL_ACCOUNT still works when the flag is omitted.
+        if let Some(account) = &self.account {
+            std::env::set_var(GMAIL_ACCOUNT_ENV, account);
+        }
+
         match self.command {
             GmailSubcommands::Auth(cmd) => cmd.execute().await,
+            GmailSubcommands::Account(cmd) => cmd.execute(),
             data => {
                 let client = helpers::create_client()?;
                 data.dispatch(&client).await
@@ -58,15 +89,18 @@ impl GmailCommand {
 }
 
 impl GmailSubcommands {
-    /// Routes a non-`Auth` subcommand against the shared client. Kept separate
-    /// from credential resolution so it is testable without env (tests pass a
-    /// client pointed at an unreachable URL). The `Auth` arm is unreachable
-    /// because it is handled before client resolution in
-    /// [`GmailCommand::execute`].
+    /// Routes a non-`Auth`/`Account` subcommand against the shared client.
+    /// Kept separate from credential resolution so it is testable without
+    /// env (tests pass a client pointed at an unreachable URL). The `Auth`
+    /// and `Account` arms are unreachable because both are handled before
+    /// client resolution in [`GmailCommand::execute`].
     async fn dispatch(self, client: &GmailClient) -> Result<()> {
         match self {
             Self::Auth(_) => {
                 unreachable!("Auth is dispatched before client resolution")
+            }
+            Self::Account(_) => {
+                unreachable!("Account is dispatched before client resolution")
             }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
@@ -119,8 +153,9 @@ mod tests {
         let _dir = guard.clear_credentials();
 
         let cmd = GmailCommand {
+            account: None,
             command: GmailSubcommands::Auth(auth::AuthCommand {
-                command: auth::AuthSubcommands::Status(auth::StatusCommand),
+                command: auth::AuthSubcommands::Status(auth::StatusCommand { all: false }),
             }),
         };
         let err = cmd.execute().await.unwrap_err();
@@ -133,6 +168,7 @@ mod tests {
         let _dir = guard.clear_credentials();
 
         let cmd = GmailCommand {
+            account: None,
             command: GmailSubcommands::Search(search::SearchCommand {
                 query: "label:finance".to_string(),
                 limit: 10,
@@ -148,11 +184,85 @@ mod tests {
     #[test]
     fn gmail_subcommands_auth_variant() {
         let cmd = GmailCommand {
+            account: None,
             command: GmailSubcommands::Auth(auth::AuthCommand {
-                command: auth::AuthSubcommands::Status(auth::StatusCommand),
+                command: auth::AuthSubcommands::Status(auth::StatusCommand { all: false }),
             }),
         };
         assert!(matches!(cmd.command, GmailSubcommands::Auth(_)));
+    }
+
+    #[test]
+    fn gmail_subcommands_account_variant() {
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, GmailSubcommands::Account(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_propagates_account_flag_to_env_var() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            account: Some("work".to_string()),
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        cmd.execute().await.unwrap();
+        assert_eq!(
+            std::env::var(GMAIL_ACCOUNT_ENV).ok().as_deref(),
+            Some("work")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_absent_account_leaves_ambient_env_var_untouched() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(GMAIL_ACCOUNT_ENV, "personal");
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        cmd.execute().await.unwrap();
+        assert_eq!(
+            std::env::var(GMAIL_ACCOUNT_ENV).ok().as_deref(),
+            Some("personal")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_routes_account_list_without_client_resolution() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        // Succeeds even with zero credentials configured — proving Account
+        // subcommands never resolve a client (unlike every other
+        // subcommand, which errors on missing credentials).
+        cmd.execute().await.unwrap();
     }
 
     #[tokio::test]

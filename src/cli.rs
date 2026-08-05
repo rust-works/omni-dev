@@ -42,9 +42,9 @@ pub use crate::claude::backend::AiBackend;
 ///
 /// Global flags (`--ai-backend`, `--model`, `--beta-header`,
 /// `--claude-cli-allow-tools`, `--claude-cli-allow-mcp`,
-/// `--claude-cli-max-budget-usd`, `--models-yaml`) are propagated to
-/// environment variables read by downstream factories before dispatching to a
-/// [`Commands`] variant.
+/// `--claude-cli-max-budget-usd`, `--models-yaml`, `--profile`, `--instance`)
+/// are propagated to environment variables read by downstream factories
+/// before dispatching to a [`Commands`] variant.
 #[derive(Parser)]
 #[command(name = "omni-dev")]
 #[command(
@@ -638,34 +638,74 @@ mod tests {
         use clap::CommandFactory;
         use std::collections::HashSet;
 
-        fn walk(cmd: &clap::Command, globals: &HashSet<String>, path: &str) {
+        // A global arg isn't only declared at the root (`--profile`,
+        // `--instance`, …) — a subcommand can scope its own `global = true`
+        // arg to just its subtree (e.g. `gmail`'s `--account`, inherited by
+        // every `gmail` subcommand but not by sibling top-level commands
+        // like `snowflake`). So globals accumulate as the walk descends,
+        // not just once at the root.
+        //
+        // Two distinct clap failure modes share this same root cause and
+        // are both checked here:
+        // - id collision: a subcommand-local arg id equal to an inherited
+        //   global's id silently shadows it at read time instead of
+        //   erroring (#1420).
+        // - long-flag collision: two args bound to the same `--flag`
+        //   string on one effective command is a hard clap panic
+        //   ("Long option names must be unique for each argument") — this
+        //   is the *actual* constraint; a differently-named id with the
+        //   same `long` still collides.
+        fn walk(
+            cmd: &clap::Command,
+            inherited_ids: &HashSet<String>,
+            inherited_longs: &HashSet<String>,
+            path: &str,
+        ) {
+            let mut ids = inherited_ids.clone();
+            let mut longs = inherited_longs.clone();
+            for arg in cmd.get_arguments().filter(|a| a.is_global_set()) {
+                ids.insert(arg.get_id().as_str().to_string());
+                if let Some(long) = arg.get_long() {
+                    longs.insert(long.to_string());
+                }
+            }
+
             for sub in cmd.get_subcommands() {
                 let sub_path = format!("{path} {}", sub.get_name());
                 for arg in sub.get_arguments() {
                     let id = arg.get_id().as_str();
                     assert!(
-                        !globals.contains(id),
-                        "`{sub_path}` defines an arg with id `{id}`, which is a \
-                         global arg id — clap propagates globals by id, so this \
-                         shadows the global and panics when it is read (#1420). \
-                         Rename the subcommand-local field.",
+                        !ids.contains(id),
+                        "`{sub_path}` defines an arg with id `{id}`, which is an \
+                         inherited global arg id — clap propagates globals by id, \
+                         so this shadows the global and panics when it is read \
+                         (#1420). Rename the subcommand-local field.",
                     );
+                    if let Some(long) = arg.get_long() {
+                        assert!(
+                            !longs.contains(long),
+                            "`{sub_path}` defines `--{long}`, already an inherited \
+                             global flag — clap rejects two args on the same \
+                             command sharing a long flag name (issue #1500). \
+                             Rename the subcommand-local flag.",
+                        );
+                    }
                 }
-                walk(sub, globals, &sub_path);
+                walk(sub, &ids, &longs, &sub_path);
             }
         }
 
         let cmd = Cli::command();
-        let globals: HashSet<String> = cmd
+        let root_globals: HashSet<String> = cmd
             .get_arguments()
             .filter(|a| a.is_global_set())
             .map(|a| a.get_id().as_str().to_string())
             .collect();
         assert!(
-            !globals.is_empty(),
+            !root_globals.is_empty(),
             "expected the root command to declare global args"
         );
-        walk(&cmd, &globals, "omni-dev");
+        walk(&cmd, &HashSet::new(), &HashSet::new(), "omni-dev");
     }
 
     // ── propagate_global_flags() tests ──

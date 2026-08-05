@@ -227,12 +227,18 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 | `datadog_hosts_list` | List active hosts |
 | `datadog_downtime_list` | List downtimes; supports `active_only` |
 
-### Gmail (5 tools)
+### Gmail (6 tools)
 
 Read access (search, messages, threads, labels) via OAuth2. Authentication
 uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
 `omni-dev gmail auth login`. See [Gmail Guide](gmail.md) and
 [ADR-0063](adrs/adr-0063.md).
+
+Every tool below (except `gmail_account_list`) takes an optional `account`
+parameter selecting a named Gmail account configured via `gmail account`
+(see [Gmail Guide — Multiple accounts](gmail.md#multiple-accounts) and
+[ADR-0066](adrs/adr-0066.md)); call `gmail_account_list` first to discover
+valid names.
 
 | Tool | Purpose |
 |------|---------|
@@ -241,6 +247,7 @@ uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
 | `gmail_message_read` | Read a single message (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes to disk |
 | `gmail_thread_read` | Read a full thread (every message); always truncation-guarded |
 | `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
+| `gmail_account_list` | List configured Gmail accounts — name, cached email, scope, default. Never a secret |
 
 ### AI / Config (5 tools)
 

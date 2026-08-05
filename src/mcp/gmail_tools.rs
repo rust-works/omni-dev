@@ -1,16 +1,26 @@
 //! MCP tool handlers for Gmail read (and label-list) operations.
 //!
 //! Each tool builds a fresh [`GmailClient`] via
-//! [`crate::cli::gmail::helpers::create_client`] and then delegates to the
-//! same API façade (`MessagesApi`, `ThreadsApi`, `LabelsApi`) that the CLI
-//! uses under `src/cli/gmail/`. Tool outputs are YAML serialisations of the
-//! typed response structs, matching the CLI `-o yaml` output.
+//! [`crate::cli::gmail::helpers::create_client_for`] and then delegates to
+//! the same API façade (`MessagesApi`, `ThreadsApi`, `LabelsApi`) that the
+//! CLI uses under `src/cli/gmail/`. Tool outputs are YAML serialisations of
+//! the typed response structs, matching the CLI `-o yaml` output.
 //!
 //! `gmail auth login` has no MCP equivalent — it's an interactive browser
 //! flow with no non-interactive analogue. `gmail_label_modify`
 //! (`label add`/`remove`) is deferred to a fast-follow issue: the issue's
-//! own "Initial tools" list names exactly the five tools below, and the
-//! mutating tool's confirm-gating deserves its own focused review.
+//! own "Initial tools" list names exactly five of the six tools below —
+//! `gmail_account_list` (issue #1500) is the one addition, letting a client
+//! discover account names before passing one to the other five. The
+//! mutating `label add`/`remove` tool's confirm-gating deserves its own
+//! focused review.
+//!
+//! Every tool below takes an optional `account` parameter (issue #1500,
+//! [ADR-0066](../../docs/adrs/adr-0066.md)): `Some(name)` forces that
+//! named Gmail account, `None` falls through to ambient
+//! `--account`/`OMNI_DEV_GMAIL_ACCOUNT` resolution (relevant if the MCP
+//! server process itself was launched with that env var pinned) — see
+//! [`crate::gmail::account::resolve_account`].
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -20,12 +30,14 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cli::gmail::helpers::create_client;
+use crate::cli::gmail::helpers::create_client_for;
+use crate::gmail::account;
 use crate::gmail::auth;
 use crate::gmail::client::GmailClient;
 use crate::gmail::labels_api::LabelsApi;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi, DEFAULT_SEARCH_LIMIT};
 use crate::gmail::threads_api::{ThreadFormat, ThreadsApi};
+use crate::utils::settings::Settings;
 
 use super::error::tool_error;
 use super::git_tools::build_truncated_result;
@@ -34,9 +46,24 @@ use super::server::OmniDevServer;
 
 // ── Parameter structs ───────────────────────────────────────────────
 
-/// Parameters for `gmail_auth_status` (none).
+/// Doc comment shared by every `account` parameter below (issue #1500) —
+/// kept as one string so the five copies can't drift.
+macro_rules! account_param_doc {
+    () => {
+        "Selects a named Gmail account instead of the ambient \
+         `--account`/`OMNI_DEV_GMAIL_ACCOUNT` resolution — e.g. `work`. Omit to use the \
+         resolved default account (or the legacy single-account credentials, if no named \
+         accounts are configured). Call `gmail_account_list` to discover configured names."
+    };
+}
+
+/// Parameters for `gmail_auth_status`.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-pub struct GmailAuthStatusParams {}
+pub struct GmailAuthStatusParams {
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
 
 /// Parameters for the `gmail_search` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -60,6 +87,9 @@ pub struct GmailSearchParams {
     /// `messages.get` costs 5 units, so a higher value could burst past it.
     #[serde(default)]
     pub concurrency: Option<usize>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// Parameters for the `gmail_message_read` tool.
@@ -78,6 +108,9 @@ pub struct GmailMessageReadParams {
     /// window.
     #[serde(default)]
     pub output_file: Option<String>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// Parameters for the `gmail_thread_read` tool.
@@ -85,11 +118,22 @@ pub struct GmailMessageReadParams {
 pub struct GmailThreadReadParams {
     /// Gmail thread id. Required.
     pub thread_id: String,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
-/// Parameters for `gmail_label_list` (none).
+/// Parameters for `gmail_label_list`.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-pub struct GmailLabelListParams {}
+pub struct GmailLabelListParams {
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for `gmail_account_list` (none — issue #1500).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GmailAccountListParams {}
 
 // ── Tool handlers ────────────────────────────────────────────────────
 
@@ -109,13 +153,13 @@ impl OmniDevServer {
                        not call the Gmail API and cannot confirm the refresh token is still \
                        accepted (a testing-mode Google Cloud project's refresh tokens expire \
                        after 7 days — use the CLI status command to actually verify). \
-                       Read-only, no parameters. Mirrors `omni-dev gmail auth status`."
+                       Read-only. Mirrors `omni-dev gmail auth status`."
     )]
     pub async fn gmail_auth_status(
         &self,
-        Parameters(_params): Parameters<GmailAuthStatusParams>,
+        Parameters(params): Parameters<GmailAuthStatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let yaml = run_auth_status().map_err(tool_error)?;
+        let yaml = run_auth_status(params.account.as_deref()).map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
@@ -134,7 +178,7 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<GmailSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let client = create_client().map_err(tool_error)?;
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
         let yaml = run_search(&client, &params).await.map_err(tool_error)?;
         Ok(build_truncated_result(yaml))
     }
@@ -154,7 +198,7 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<GmailMessageReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let client = create_client().map_err(tool_error)?;
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
         let wrote_to_file = params.output_file.is_some();
         let text = run_message_read(&client, &params)
             .await
@@ -179,7 +223,7 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<GmailThreadReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let client = create_client().map_err(tool_error)?;
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
         let yaml = run_thread_read(&client, &params)
             .await
             .map_err(tool_error)?;
@@ -192,15 +236,32 @@ impl OmniDevServer {
                        and user-created ones), with unread/total message counts. Adding or \
                        removing labels on messages is CLI-only in this release \
                        (`omni-dev gmail label add`/`remove`) — no MCP tool mutates labels yet. \
-                       Read-only, no parameters. \
+                       Read-only. \
                        Mirrors `omni-dev gmail label list`. Output is YAML."
     )]
     pub async fn gmail_label_list(
         &self,
-        Parameters(_params): Parameters<GmailLabelListParams>,
+        Parameters(params): Parameters<GmailLabelListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let client = create_client().map_err(tool_error)?;
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
         let yaml = run_label_list(&client).await.map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
+    }
+
+    /// Tool: list configured named Gmail accounts.
+    #[tool(
+        description = "List Gmail accounts configured in ~/.omni-dev/settings.json — name, \
+                       cached email address (if known), granted scope, and which one is the \
+                       default. Call this first to discover valid `account` values before \
+                       passing one to `gmail_search`/`gmail_message_read`/`gmail_thread_read`/\
+                       `gmail_label_list`/`gmail_auth_status`. Never returns a secret. \
+                       Read-only, no parameters. Mirrors `omni-dev gmail account list`."
+    )]
+    pub async fn gmail_account_list(
+        &self,
+        Parameters(_params): Parameters<GmailAccountListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_account_list().map_err(tool_error)?;
         Ok(build_truncated_result(yaml))
     }
 }
@@ -216,9 +277,20 @@ impl OmniDevServer {
 /// Renders the credential-presence summary as YAML.
 ///
 /// Pure: never touches the network and never reads any secret values.
-fn run_auth_status() -> Result<String> {
-    let status = auth::status();
+/// `account`, when `Some`, forces that named account (issue #1500) instead
+/// of falling through to ambient `--account`/`OMNI_DEV_GMAIL_ACCOUNT`
+/// resolution.
+fn run_auth_status(account: Option<&str>) -> Result<String> {
+    let status = auth::status_for(account)?;
     serde_yaml::to_string(&status).context("Failed to serialize Gmail auth status")
+}
+
+/// Renders the configured Gmail accounts (name/email/scope/default) as
+/// YAML — never a secret, never a network call.
+fn run_account_list() -> Result<String> {
+    let settings = Settings::load().unwrap_or_default();
+    let accounts = account::list_accounts(&settings.gmail);
+    yaml_result(&accounts)
 }
 
 async fn run_search(client: &GmailClient, params: &GmailSearchParams) -> Result<String> {
@@ -403,7 +475,7 @@ mod tests {
         let guard = EnvGuard::take();
         let _dir = guard.clear_credentials();
 
-        let yaml = run_auth_status().unwrap();
+        let yaml = run_auth_status(None).unwrap();
         assert!(yaml.contains("has_client_id: false"));
         assert!(yaml.contains("has_refresh_token: false"));
     }
@@ -429,7 +501,7 @@ mod tests {
         std::env::remove_var(auth::GMAIL_REFRESH_TOKEN);
         std::env::remove_var(auth::GMAIL_SCOPE);
 
-        let yaml = run_auth_status().unwrap();
+        let yaml = run_auth_status(None).unwrap();
         assert!(yaml.contains("has_client_id: true"));
         assert!(yaml.contains("client-visible") || yaml.contains("has_client_id: true"));
         assert!(!yaml.contains("sekret-do-not-leak"));
@@ -462,6 +534,7 @@ mod tests {
                 limit: Some(10),
                 enrich: None,
                 concurrency: None,
+                account: None,
             },
         )
         .await
@@ -496,6 +569,7 @@ mod tests {
                 limit: None,
                 enrich: None,
                 concurrency: None,
+                account: None,
             },
         )
         .await
@@ -535,6 +609,7 @@ mod tests {
                 limit: Some(10),
                 enrich: Some(true),
                 concurrency: Some(2),
+                account: None,
             },
         )
         .await
@@ -559,6 +634,7 @@ mod tests {
                 limit: None,
                 enrich: None,
                 concurrency: None,
+                account: None,
             },
         )
         .await
@@ -590,6 +666,7 @@ mod tests {
                 message_id: "m1".to_string(),
                 format: None,
                 output_file: None,
+                account: None,
             },
         )
         .await
@@ -617,6 +694,7 @@ mod tests {
                 message_id: "m1".to_string(),
                 format: None,
                 output_file: Some(path.to_str().unwrap().to_string()),
+                account: None,
             },
         )
         .await
@@ -638,6 +716,7 @@ mod tests {
                 message_id: "m1".to_string(),
                 format: Some("bogus".to_string()),
                 output_file: None,
+                account: None,
             },
         )
         .await
@@ -667,6 +746,7 @@ mod tests {
             &client,
             &GmailThreadReadParams {
                 thread_id: "t1".to_string(),
+                account: None,
             },
         )
         .await
@@ -739,6 +819,7 @@ mod tests {
                 limit: None,
                 enrich: None,
                 concurrency: None,
+                account: None,
             }))
             .await
             .unwrap_err();
@@ -760,9 +841,87 @@ mod tests {
                 message_id: "m1".to_string(),
                 format: Some("bogus".to_string()),
                 output_file: None,
+                account: None,
             }))
             .await
             .unwrap_err();
         assert!(err.message.contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gmail_search_handler_honors_named_account_param() {
+        // A named `account` reaches `create_client_for` — an unknown name
+        // surfaces as the account-resolution error, not the generic
+        // "not configured" one, proving the param actually propagates
+        // (issue #1500).
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .gmail_search(Parameters(GmailSearchParams {
+                query: "*".to_string(),
+                limit: None,
+                enrich: None,
+                concurrency: None,
+                account: Some("bogus".to_string()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("unknown Gmail account 'bogus'"));
+    }
+
+    // ── run_account_list / gmail_account_list (issue #1500) ────────────
+
+    #[test]
+    fn run_account_list_renders_configured_accounts() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[
+                ("client_id", "id"),
+                ("email_address", "me@work.com"),
+                ("scope", "readonly"),
+            ],
+        )
+        .unwrap();
+        Settings::set_gmail_default_account(&settings_path, Some("work")).unwrap();
+
+        let yaml = run_account_list().unwrap();
+        assert!(yaml.contains("work"));
+        assert!(yaml.contains("me@work.com"));
+        assert!(yaml.contains("is_default: true"));
+    }
+
+    #[test]
+    fn run_account_list_empty_when_none_configured() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let yaml = run_account_list().unwrap();
+        assert_eq!(yaml.trim(), "[]");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gmail_account_list_handler_returns_yaml_no_client_needed() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+
+        let server = OmniDevServer::new();
+        // Succeeds with no legacy credentials configured at all — proving
+        // this tool never resolves a client.
+        let result = server
+            .gmail_account_list(Parameters(GmailAccountListParams::default()))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("work"));
     }
 }
