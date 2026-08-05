@@ -21,11 +21,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
+use crate::gmail::account::{self, ResolvedAccount};
 use crate::gmail::error::{GmailError, GrantContext};
 use crate::request_log;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
-use crate::utils::settings::{active_profile_from, Settings};
+use crate::utils::settings::{active_profile_from, GmailSettings, Settings};
 
 /// Environment variable / settings key for the user's Google Cloud OAuth2
 /// client id.
@@ -142,10 +143,99 @@ pub struct GmailAuthStatus {
     pub scope: Option<String>,
 }
 
+/// Resolves the active Gmail account for this call (issue #1500), folding an
+/// explicit per-call override together with the ambient
+/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] value. The one seam every
+/// credential CRUD entry point in this module and [`crate::gmail::import`]
+/// routes through.
+pub(crate) fn resolve(gmail: &GmailSettings, explicit: Option<&str>) -> Result<ResolvedAccount> {
+    let explicit = fold_explicit(explicit);
+    account::resolve_account(&SystemEnv, gmail, explicit.as_deref())
+}
+
+/// Like [`resolve`], but for account-creating writes (`gmail auth login`,
+/// `gmail auth import`) — see
+/// [`account::resolve_account_for_write`] for why an explicit target need
+/// not already exist.
+pub(crate) fn resolve_for_write(
+    gmail: &GmailSettings,
+    explicit: Option<&str>,
+) -> Result<ResolvedAccount> {
+    let explicit = fold_explicit(explicit);
+    account::resolve_account_for_write(&SystemEnv, gmail, explicit.as_deref())
+}
+
+/// Folds an explicit per-call account override together with the ambient
+/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] value — shared by [`resolve`]
+/// and [`resolve_for_write`].
+fn fold_explicit(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| account::active_gmail_account_from(&SystemEnv))
+}
+
 /// Loads Gmail credentials from environment variables or settings.json.
 ///
 /// Environment variables take precedence over the settings file.
 pub fn load_credentials() -> Result<GmailCredentials> {
+    load_credentials_with(&crate::utils::settings::SettingsEnv::load())
+}
+
+/// [`load_credentials`], but honoring the named-account resolution added by
+/// issue #1500. `explicit` is the already-resolved `--account`/
+/// [`account::GMAIL_ACCOUNT_ENV`] override, if any (`None` still resolves
+/// the ambient env var — see [`resolve`]). Falls through to
+/// [`load_credentials_with`]'s exact legacy behavior when no named account
+/// applies — the zero-migration guarantee.
+pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<GmailCredentials> {
+    let settings = Settings::load().unwrap_or_default();
+    match resolve(&settings.gmail, explicit)? {
+        ResolvedAccount::Legacy => {
+            load_credentials_with(&crate::utils::settings::SettingsEnv::load())
+        }
+        ResolvedAccount::Named(name) => load_named_credentials(&settings.gmail, &name),
+    }
+}
+
+/// Reads `gmail.accounts.<name>` into [`GmailCredentials`], wrapping
+/// `client_secret`/`refresh_token` into [`Secret`] immediately, mirroring
+/// [`load_credentials_with`].
+fn load_named_credentials(gmail: &GmailSettings, name: &str) -> Result<GmailCredentials> {
+    let account = gmail
+        .accounts
+        .get(name)
+        .ok_or(GmailError::CredentialsNotFound)?;
+    let client_id = account
+        .client_id
+        .clone()
+        .ok_or(GmailError::CredentialsNotFound)?;
+    let client_secret = account
+        .client_secret
+        .clone()
+        .ok_or(GmailError::CredentialsNotFound)?;
+    let refresh_token = account
+        .refresh_token
+        .clone()
+        .ok_or(GmailError::CredentialsNotFound)?;
+    let scope = account
+        .scope
+        .as_deref()
+        .and_then(GmailScope::from_granted)
+        .unwrap_or_default();
+
+    Ok(GmailCredentials {
+        client_id,
+        client_secret: client_secret.into(),
+        refresh_token: refresh_token.into(),
+        scope,
+    })
+}
+
+/// Forces the legacy (pre-migration) credential path regardless of any
+/// active named account. Used only by `gmail account import-legacy`, which
+/// must read the *true* legacy env-resolved credentials to migrate, not
+/// whatever named account happens to be ambient.
+pub(crate) fn load_credentials_legacy() -> Result<GmailCredentials> {
     load_credentials_with(&crate::utils::settings::SettingsEnv::load())
 }
 
@@ -202,6 +292,43 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthS
     }
 }
 
+/// [`status`], but honoring the named-account resolution added by issue
+/// #1500. `explicit` is the already-resolved `--account`/
+/// [`account::GMAIL_ACCOUNT_ENV`] override, if any. Unlike [`status`], this
+/// can fail — once named accounts exist, resolution itself can (e.g. an
+/// unknown or ambiguous account) — so callers that want [`status`]'s
+/// never-fails presence report keep calling that instead.
+pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
+    let settings = Settings::load().unwrap_or_default();
+    match resolve(&settings.gmail, explicit)? {
+        ResolvedAccount::Legacy => Ok(status_with(&crate::utils::settings::SettingsEnv::load())),
+        ResolvedAccount::Named(name) => Ok(status_from_named(&settings.gmail, &name)),
+    }
+}
+
+/// Builds a [`GmailAuthStatus`] from `gmail.accounts.<name>`'s presence
+/// flags — the named-account counterpart of [`status_with`].
+fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
+    let account = gmail.accounts.get(name);
+    GmailAuthStatus {
+        has_client_id: account.is_some_and(|a| a.client_id.is_some()),
+        has_client_secret: account.is_some_and(|a| a.client_secret.is_some()),
+        has_refresh_token: account.is_some_and(|a| a.refresh_token.is_some()),
+        scope: account.and_then(|a| a.scope.clone()),
+    }
+}
+
+/// Opportunistic `email_address` backfill for `name`, populated by `gmail
+/// auth status --all` after a successful live `users.getProfile` call.
+/// Never used for authentication, never written by `login`/`import`.
+pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
+    Settings::upsert_gmail_account(
+        &Settings::get_settings_path()?,
+        name,
+        &[("email_address", email)],
+    )
+}
+
 /// Saves Gmail credentials to `~/.omni-dev/settings.json`.
 ///
 /// Merges the four credential keys into the active profile's `env` map (the
@@ -239,6 +366,18 @@ pub(crate) fn save_credentials_to(
     )
 }
 
+/// The `gmail.accounts.<name>` field names/values for `credentials` — the
+/// named-account counterpart of the flat `GMAIL_*` env keys
+/// [`save_credentials_to`] writes.
+fn named_account_vars(credentials: &GmailCredentials) -> [(&str, &str); 4] {
+    [
+        ("client_id", credentials.client_id.as_str()),
+        ("client_secret", credentials.client_secret.expose_secret()),
+        ("refresh_token", credentials.refresh_token.expose_secret()),
+        ("scope", credentials.scope.as_str()),
+    ]
+}
+
 /// Removes Gmail credential keys from `~/.omni-dev/settings.json` — this
 /// *is* `gmail auth logout`.
 ///
@@ -264,6 +403,23 @@ pub(crate) fn remove_credentials_at(settings_path: &Path, profile: Option<&str>)
             GMAIL_SCOPE,
         ],
     )
+}
+
+/// [`remove_credentials`], but honoring the named-account resolution added
+/// by issue #1500. `explicit` is the already-resolved `--account`/
+/// [`account::GMAIL_ACCOUNT_ENV`] override, if any. Removes the whole
+/// `gmail.accounts.<name>` entry — an account is coherent as a unit.
+pub(crate) fn remove_credentials_for(explicit: Option<&str>) -> Result<bool> {
+    let settings = Settings::load().unwrap_or_default();
+    match resolve(&settings.gmail, explicit)? {
+        ResolvedAccount::Legacy => remove_credentials_at(
+            &Settings::get_settings_path()?,
+            active_profile_from(&SystemEnv).as_deref(),
+        ),
+        ResolvedAccount::Named(name) => {
+            Settings::remove_gmail_account(&Settings::get_settings_path()?, &name)
+        }
+    }
 }
 
 // ── Browser launch ──────────────────────────────────────────────────────
@@ -722,7 +878,6 @@ pub async fn login(
 
 /// [`login`], writing to an explicit settings-file path/profile and against
 /// an explicit token endpoint — the test seam for a wiremock server.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn login_to(
     settings_path: &Path,
     profile: Option<&str>,
@@ -732,6 +887,64 @@ pub(crate) async fn login_to(
     browser: &BrowserConfig,
     token_endpoint: &str,
 ) -> Result<GmailAuthStatus> {
+    let credentials =
+        run_login_flow(client_id, client_secret, scope, browser, token_endpoint).await?;
+    save_credentials_to(settings_path, profile, &credentials)?;
+    Ok(status_from_credentials(&credentials))
+}
+
+/// [`login`], but honoring the named-account resolution added by issue
+/// #1500: runs the same OAuth2 flow, then persists to
+/// `gmail.accounts.<name>` when a named account is active instead of the
+/// legacy `env`/profile map. `explicit` is the already-resolved
+/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] override, if any — resolved
+/// via [`resolve_for_write`], so an explicit name need not already be
+/// configured (this is how a new account is created).
+pub(crate) async fn login_for(
+    explicit: Option<&str>,
+    client_id: &str,
+    client_secret: &Secret,
+    scope: GmailScope,
+    browser: &BrowserConfig,
+) -> Result<GmailAuthStatus> {
+    let settings = Settings::load().unwrap_or_default();
+    match resolve_for_write(&settings.gmail, explicit)? {
+        ResolvedAccount::Legacy => {
+            login_to(
+                &Settings::get_settings_path()?,
+                active_profile_from(&SystemEnv).as_deref(),
+                client_id,
+                client_secret,
+                scope,
+                browser,
+                TOKEN_ENDPOINT,
+            )
+            .await
+        }
+        ResolvedAccount::Named(name) => {
+            let credentials =
+                run_login_flow(client_id, client_secret, scope, browser, TOKEN_ENDPOINT).await?;
+            Settings::upsert_gmail_account(
+                &Settings::get_settings_path()?,
+                &name,
+                &named_account_vars(&credentials),
+            )?;
+            Ok(status_from_credentials(&credentials))
+        }
+    }
+}
+
+/// Runs the OAuth2 authorization-code + PKCE flow against `token_endpoint`
+/// and returns the resulting credentials, without persisting them — the
+/// shared core both [`login_to`] (legacy path) and [`login_for`]'s Named
+/// branch build on.
+async fn run_login_flow(
+    client_id: &str,
+    client_secret: &Secret,
+    scope: GmailScope,
+    browser: &BrowserConfig,
+    token_endpoint: &str,
+) -> Result<GmailCredentials> {
     let (listener, port) = bind_callback_listener(browser).await?;
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
@@ -790,20 +1003,23 @@ pub(crate) async fn login_to(
         GmailError::NoGmailScopeGranted(received)
     })?;
 
-    let credentials = GmailCredentials {
+    Ok(GmailCredentials {
         client_id: client_id.to_string(),
         client_secret: client_secret.clone(),
         refresh_token: refresh_token.into(),
         scope: granted_scope,
-    };
-    save_credentials_to(settings_path, profile, &credentials)?;
+    })
+}
 
-    Ok(GmailAuthStatus {
+/// Builds the "just authenticated" [`GmailAuthStatus`] from freshly-obtained
+/// `credentials` (all fields present by construction).
+fn status_from_credentials(credentials: &GmailCredentials) -> GmailAuthStatus {
+    GmailAuthStatus {
         has_client_id: true,
         has_client_secret: true,
         has_refresh_token: true,
-        scope: Some(granted_scope.as_str().to_string()),
-    })
+        scope: Some(credentials.scope.as_str().to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -2100,5 +2316,222 @@ mod tests {
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(val["env"].get("GMAIL_CLIENT_ID").is_none());
+    }
+
+    // ── named-account dispatch (issue #1500) ───────────────────────────
+    //
+    // These exercise the production `*_for` wrappers, so — like
+    // `save_and_remove_credentials_resolve_default_settings_path` above —
+    // they must redirect `HOME` via `EnvGuard`.
+
+    #[test]
+    fn load_credentials_for_named_reads_from_gmail_accounts() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[
+                ("client_id", "work-id"),
+                ("client_secret", "work-secret"),
+                ("refresh_token", "work-refresh"),
+                ("scope", SCOPE_MODIFY),
+            ],
+        )
+        .unwrap();
+
+        let creds = load_credentials_for(Some("work")).unwrap();
+        assert_eq!(creds.client_id, "work-id");
+        assert_eq!(creds.client_secret.expose_secret(), "work-secret");
+        assert_eq!(creds.refresh_token.expose_secret(), "work-refresh");
+        assert_eq!(creds.scope, GmailScope::Modify);
+    }
+
+    #[test]
+    fn load_credentials_for_unknown_named_account_errors() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "work-id")])
+            .unwrap();
+
+        let err = load_credentials_for(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("unknown Gmail account 'bogus'"));
+    }
+
+    #[test]
+    fn load_credentials_for_falls_back_to_legacy_when_accounts_empty() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
+        std::env::set_var(GMAIL_CLIENT_SECRET, "legacy-secret");
+        std::env::set_var(GMAIL_REFRESH_TOKEN, "legacy-refresh");
+
+        let creds = load_credentials_for(None).unwrap();
+        assert_eq!(creds.client_id, "legacy-id");
+    }
+
+    #[test]
+    fn load_credentials_for_none_honors_ambient_account_env_var() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[
+                ("client_id", "work-id"),
+                ("client_secret", "work-secret"),
+                ("refresh_token", "work-refresh"),
+            ],
+        )
+        .unwrap();
+        std::env::set_var(account::GMAIL_ACCOUNT_ENV, "work");
+
+        let creds = load_credentials_for(None).unwrap();
+        assert_eq!(creds.client_id, "work-id");
+    }
+
+    #[test]
+    fn remove_credentials_for_named_removes_whole_account() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+
+        assert!(remove_credentials_for(Some("work")).unwrap());
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["gmail"]["accounts"].get("work").is_none());
+    }
+
+    #[test]
+    fn status_for_named_reports_presence_from_account() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", "id"), ("scope", SCOPE_READONLY)],
+        )
+        .unwrap();
+
+        let status = status_for(Some("work")).unwrap();
+        assert!(status.has_client_id);
+        assert!(!status.has_client_secret);
+        assert!(!status.has_refresh_token);
+        assert_eq!(status.scope.as_deref(), Some(SCOPE_READONLY));
+    }
+
+    #[test]
+    fn status_for_legacy_matches_status_with_when_accounts_empty() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
+
+        let status = status_for(None).unwrap();
+        assert!(status.has_client_id);
+        assert!(!status.has_refresh_token);
+    }
+
+    #[test]
+    fn load_credentials_legacy_ignores_active_named_account() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        // A named default account is configured...
+        Settings::set_gmail_default_account(&settings_path, Some("work")).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[
+                ("client_id", "named-id"),
+                ("client_secret", "named-secret"),
+                ("refresh_token", "named-refresh"),
+            ],
+        )
+        .unwrap();
+        // ...and legacy credentials also exist in the base `env` map (not
+        // process env, so rule 1's literal-env bypass does not apply).
+        Settings::upsert_env_vars(
+            &settings_path,
+            &[
+                (GMAIL_CLIENT_ID, "legacy-id"),
+                (GMAIL_CLIENT_SECRET, "legacy-secret"),
+                (GMAIL_REFRESH_TOKEN, "legacy-refresh"),
+            ],
+        )
+        .unwrap();
+
+        // The account-aware wrapper resolves to the named default...
+        let via_resolution = load_credentials_for(None).unwrap();
+        assert_eq!(via_resolution.client_id, "named-id");
+
+        // ...but load_credentials_legacy forces the legacy path regardless.
+        let forced_legacy = load_credentials_legacy().unwrap();
+        assert_eq!(forced_legacy.client_id, "legacy-id");
+    }
+
+    #[test]
+    fn record_account_email_writes_email_address_only() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+
+        record_account_email("work", "alice@work.com").unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["gmail"]["accounts"]["work"]["email_address"],
+            "alice@work.com"
+        );
+        assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "id");
+    }
+
+    /// The zero-migration guarantee (issue #1500): with `gmail.accounts`
+    /// empty, the account-aware `_for(None, ...)` wrappers must behave
+    /// byte-identically to the pre-#1500 wrappers they sit beside. Both
+    /// sandboxes are seeded via the same unchanged [`save_credentials`] (no
+    /// account-aware save wrapper exists — `login_for`/
+    /// `import_client_credentials_for` persist directly, since a
+    /// resolve-then-save round trip would reject the very name being
+    /// created), so this isolates `load`/`remove`.
+    #[test]
+    fn zero_migration_load_remove_byte_identical_when_accounts_empty() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let creds = GmailCredentials {
+            client_id: "id".to_string(),
+            client_secret: "secret".into(),
+            refresh_token: "refresh".into(),
+            scope: GmailScope::Modify,
+        };
+
+        let dir_legacy = guard.clear_credentials();
+        save_credentials(&creds).unwrap();
+        let legacy_written =
+            fs::read_to_string(dir_legacy.path().join(".omni-dev").join("settings.json")).unwrap();
+        let legacy_loaded = load_credentials().unwrap();
+        let legacy_removed = remove_credentials().unwrap();
+
+        let dir_for = guard.clear_credentials();
+        save_credentials(&creds).unwrap();
+        let for_written =
+            fs::read_to_string(dir_for.path().join(".omni-dev").join("settings.json")).unwrap();
+        let for_loaded = load_credentials_for(None).unwrap();
+        let for_removed = remove_credentials_for(None).unwrap();
+
+        assert_eq!(legacy_written, for_written);
+        assert_eq!(legacy_loaded.client_id, for_loaded.client_id);
+        assert_eq!(
+            legacy_loaded.client_secret.expose_secret(),
+            for_loaded.client_secret.expose_secret()
+        );
+        assert_eq!(legacy_loaded.scope, for_loaded.scope);
+        assert_eq!(legacy_removed, for_removed);
     }
 }
