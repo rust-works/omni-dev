@@ -8,7 +8,7 @@ everything it glosses over.
 ## What you'll do
 
 1. Create a Google Cloud project and enable the Gmail API.
-2. Create an OAuth2 client and export its credentials.
+2. Create an OAuth2 client and import its credentials.
 3. Log in — and correctly grant the Gmail permission, which Google hides
    behind its own tick-box.
 4. Verify the grant actually worked, before touching `sync`.
@@ -36,13 +36,18 @@ OAuth2 client rather than using a shared one — see
 
 Still in Google Cloud console, create an OAuth2 client of type **Desktop
 app** — not "Web application"; the loopback-redirect flow `auth login`
-uses below requires it. Note the **Client ID** and **Client secret** it
-gives you, then export them:
+uses below requires it. Download its `client_secret.json`, then import it
+directly — the client id/secret are saved to `settings.json` without ever
+passing through your shell:
 
 ```bash
-export GMAIL_CLIENT_ID=...
-export GMAIL_CLIENT_SECRET=...
+omni-dev gmail auth import
 ```
+
+(Discovery finds the file automatically if it's still in `~/Downloads`;
+pass an explicit path otherwise.) If you'd rather not save the file,
+skip this and `auth login` in step 3 will prompt for the client id/secret
+interactively instead.
 
 If your OAuth client's consent screen is still in Google's **Testing**
 publishing status (the default for a freshly created client), refresh
@@ -61,12 +66,11 @@ This opens a browser to Google's consent screen. **The Gmail permission is
 its own separate tick-box there**, distinct from the basic
 profile/email checkboxes the screen also shows. **Explicitly tick it.**
 
-This is the step that actually catches new users: leaving it unticked lets
-login *succeed* and write a valid refresh token, while granting only
-`openid`/`email`/`profile` — no Gmail access at all. Nothing in the login
-output tells you this happened; every Gmail call you make afterward will
-simply fail with `insufficientPermissions`. That's exactly what step 4
-below is for.
+This is the step that actually catches new users: leaving it unticked
+makes `auth login` fail immediately with an error naming the scopes
+Google actually granted (`openid`, `email`, `profile` — no Gmail access
+at all), and nothing is written to `settings.json`. Tick the box and
+re-run the command.
 
 Pass `--modify` instead if you also want to manage labels
 (`gmail label add`/`remove`) — not needed for sync:
@@ -91,12 +95,13 @@ Granted scope: gmail.readonly
 ```
 
 **Treat this as a gate, not a formality.** It makes a live
-`users.getProfile` call, so it's the only step in this whole walkthrough
-that fails loudly if step 3's tick-box was missed. If it errors with
-`insufficientPermissions`, don't retry `sync` — go back to step 3, re-run
-`auth login`, and tick the box this time (see
+`users.getProfile` call, so it catches anything a successful `auth login`
+can't — a revoked grant, a stale refresh token, or (if you're planning to
+use `label add`/`remove`) a `gmail.readonly`-only scope that needs
+`auth login --modify` instead. If it errors, don't retry `sync` — fix
+what it reports first (see
 [gmail.md#insufficientpermissions](gmail.md#insufficientpermissions) for
-the full diagnosis).
+the label-scope case).
 
 If this succeeds, everything downstream will work — you're clear to sync.
 
@@ -162,9 +167,9 @@ are documented in [gmail.md#sync](gmail.md#sync).
 
 ## Troubleshooting quick links
 
-- `insufficientPermissions` on every Gmail call, including `auth status` →
-  [gmail.md#insufficientpermissions](gmail.md#insufficientpermissions) —
-  you missed the tick-box in step 3.
+- `auth login` fails with "Google did not grant a Gmail scope" →
+  [gmail.md#no-gmail-scope-was-granted](gmail.md#no-gmail-scope-was-granted)
+  — you missed the tick-box in step 3.
 - `insufficientPermissions` only on `label add`/`remove` →
   [gmail.md#insufficientpermissions](gmail.md#insufficientpermissions) —
   re-run `auth login --modify`.
