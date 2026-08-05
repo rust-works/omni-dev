@@ -633,6 +633,33 @@ this persists the refresh token (plus client id/secret) to
 `~/.omni-dev/settings.json`, read by every invocation regardless of how
 the process started.
 
+### `operation timed out` fetching a message during `sync`
+
+```
+Error: <id> failed: Failed to parse messages.get response: error decoding response body for url (...): request or response body error: operation timed out
+```
+
+`messages.get?format=raw` returns the whole message (headers, body, and
+every attachment, base64-encoded) in one response, and the Gmail client's
+30-second default request timeout covers the *entire* download, not just
+connecting. A handful of large messages (tens of MB — attachment-heavy
+mail) downloading concurrently under `--concurrency` divide the available
+bandwidth, so each one can individually outrun the timeout even though
+nothing is actually stuck. This is more likely the more of `--concurrency`
+is spent on large messages at once, not a sign of a broken connection.
+
+`sync` is safe to just re-run: a run with errors never advances the
+watermark, and presence-on-disk means already-archived messages are
+skipped, so a re-run only retries what failed. Two ways to make it
+succeed:
+
+- Lower `--concurrency` (even down to `1`) so each large download gets
+  more of the available bandwidth to itself.
+- Raise the timeout instead via `OMNI_DEV_HTTP_TIMEOUT_SECS` (whole
+  seconds; a missing, non-numeric, or non-positive value falls back to the
+  30-second default) — shared by the Gmail, Atlassian, and Datadog REST
+  clients, e.g. `OMNI_DEV_HTTP_TIMEOUT_SECS=120 omni-dev gmail sync ...`.
+
 ## See also
 
 - [Gmail Quickstart](gmail-quickstart.md) — a linear, zero-to-synced-archive

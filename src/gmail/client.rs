@@ -15,7 +15,7 @@ use crate::gmail::auth::{GmailCredentials, GmailSession};
 use crate::gmail::error::GmailError;
 use crate::request_log;
 use crate::utils::env::{EnvSource, SystemEnv};
-use crate::utils::http::{retry_if, REQUEST_TIMEOUT};
+use crate::utils::http::{request_timeout, retry_if};
 
 /// HTTP client for the Gmail v1 REST API.
 pub struct GmailClient {
@@ -51,7 +51,7 @@ impl GmailClient {
     /// pass a wiremock URL directly.
     pub fn new(base_url: &str, credentials: &GmailCredentials) -> Result<Self> {
         let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout())
             .build()
             .context("Failed to build HTTP client")?;
         let session = GmailSession::new(client.clone(), credentials);

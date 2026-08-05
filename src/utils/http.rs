@@ -13,8 +13,49 @@ use std::time::{Duration, Instant};
 
 use reqwest::{Response, ResponseBuilderExt as _};
 
-/// Standard HTTP request timeout shared by the REST clients.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default HTTP request timeout for the REST clients (Atlassian, Datadog,
+/// Gmail). Overridable per invocation via [`TIMEOUT_ENV_VAR`].
+///
+/// `reqwest`'s `.timeout()` covers the *entire* request — connect, send, and
+/// receive the full response body — so this is also a ceiling on how long a
+/// single response can take to download. Gmail's `messages.get?format=raw`
+/// in particular can return tens of megabytes for an attachment-heavy
+/// message; several of those downloading concurrently (bounded by `gmail
+/// sync --concurrency`) divide the available bandwidth, so a message that
+/// would download in seconds alone can outrun a fixed timeout under load
+/// even though nothing is actually hung (#1502 follow-up).
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Env var overriding [`DEFAULT_REQUEST_TIMEOUT`] for the REST clients
+/// (Atlassian, Datadog, Gmail). Value is whole seconds; a missing,
+/// non-numeric, or non-positive value falls back to the default.
+///
+/// Separate from `claude::ai::TIMEOUT_ENV_VAR`
+/// (`OMNI_DEV_AI_TIMEOUT_SECS`) so each transport can be tuned
+/// independently, mirroring the existing
+/// `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS`/`OMNI_DEV_AI_TIMEOUT_SECS` split.
+pub(crate) const TIMEOUT_ENV_VAR: &str = "OMNI_DEV_HTTP_TIMEOUT_SECS";
+
+/// Resolves the HTTP request timeout, honouring [`TIMEOUT_ENV_VAR`].
+///
+/// Reads through the settings helper so the override can also come from a
+/// `settings.json` `env` bundle, consistent with `claude::ai::request_timeout`.
+pub(crate) fn request_timeout() -> Duration {
+    timeout_from_secs(crate::utils::settings::get_env_var(TIMEOUT_ENV_VAR).ok())
+}
+
+/// Parses a whole-seconds timeout override, falling back to
+/// [`DEFAULT_REQUEST_TIMEOUT`] for an absent, non-numeric, or non-positive
+/// value.
+///
+/// A 0-second (or negative) HTTP timeout would abort every request
+/// immediately, so it is treated as unset rather than honoured. Pure so it
+/// is unit-testable without mutating the process environment.
+fn timeout_from_secs(raw: Option<String>) -> Duration {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs)
+}
 
 /// Maximum number of retries on a retryable response (attempts =
 /// `MAX_RETRIES` + 1).
@@ -140,6 +181,33 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── timeout_from_secs ────────────────────────────────────────────────
+
+    #[test]
+    fn timeout_from_secs_parses_valid_override() {
+        assert_eq!(
+            timeout_from_secs(Some("120".to_string())),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn timeout_from_secs_falls_back_for_absent_zero_or_garbage() {
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("abc".to_string()),
+            Some("-5".to_string()),
+        ] {
+            assert_eq!(
+                timeout_from_secs(raw.clone()),
+                DEFAULT_REQUEST_TIMEOUT,
+                "expected default for {raw:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn retries_429_then_succeeds_and_logs_each_attempt() {

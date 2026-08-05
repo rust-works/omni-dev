@@ -43,7 +43,7 @@ use crate::atlassian::jira_types::{
     JiraWorklogResponse, TEXTAREA_CUSTOM_TYPE,
 };
 use crate::request_log;
-use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
+use crate::utils::http::{request_timeout, retry_429};
 
 /// Internal page size for auto-pagination. Individual API calls request
 /// this many items per page; the `limit` parameter controls the total.
@@ -6502,7 +6502,7 @@ impl AtlassianClient {
     /// Constructs the Basic Auth header from the email and API token.
     pub fn new(instance_url: &str, email: &str, api_token: &str) -> Result<Self> {
         let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout())
             .build()
             .context("Failed to build HTTP client")?;
 
