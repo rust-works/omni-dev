@@ -166,6 +166,11 @@ pub(crate) fn load_credentials_with(
     let refresh_token = env
         .var(GMAIL_REFRESH_TOKEN)
         .ok_or(GmailError::CredentialsNotFound)?;
+    // Unlike login (which rejects an unparseable grant outright), a stored
+    // scope that no longer parses degrades to ReadOnly rather than erroring:
+    // it was already validated when written, and failing closed here is
+    // safe (a stale Modify silently becoming ReadOnly still fails at the
+    // API, not open).
     let scope = env
         .var(GMAIL_SCOPE)
         .and_then(|s| GmailScope::from_granted(&s))

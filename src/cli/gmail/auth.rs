@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::gmail::auth::{self, BrowserConfig, GmailScope};
@@ -64,6 +64,7 @@ impl ImportCommand {
     pub fn execute(self) -> Result<()> {
         let outcome = import::import_client_credentials(self.path.as_deref())?;
         println!("Found {} (Desktop app client)", outcome.path.display());
+        println!("  Client id: {}", outcome.client_id);
         println!(
             "Client id/secret saved to ~/.omni-dev/settings.json{}",
             profile_suffix(active_profile_from(&SystemEnv).as_deref())
@@ -169,16 +170,10 @@ fn prompt_client_secret() -> Result<Secret> {
     let mut buffer = String::new();
     loop {
         if let Event::Key(key_event) = event::read().context("Failed to read terminal input")? {
-            match key_event.code {
-                KeyCode::Enter => break,
-                KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                    anyhow::bail!("Aborted");
-                }
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
-                _ => {}
+            match apply_secret_key(&mut buffer, key_event) {
+                SecretKeyOutcome::Continue => {}
+                SecretKeyOutcome::Finished => break,
+                SecretKeyOutcome::Aborted => anyhow::bail!("Aborted"),
             }
         }
     }
@@ -186,6 +181,49 @@ fn prompt_client_secret() -> Result<Secret> {
     println!();
 
     Ok(Secret::new(buffer))
+}
+
+/// Result of feeding one key event to [`apply_secret_key`].
+#[derive(Debug, PartialEq, Eq)]
+enum SecretKeyOutcome {
+    /// The buffer was updated (or the event was ignored); keep reading.
+    Continue,
+    /// Enter was pressed; the secret is complete.
+    Finished,
+    /// Ctrl+C was pressed; the prompt should abort.
+    Aborted,
+}
+
+/// Applies one key event to the in-progress secret `buffer` — the pure
+/// decision extracted from [`prompt_client_secret`]'s read loop so it's
+/// unit-testable with synthesized [`KeyEvent`]s instead of a real terminal.
+///
+/// Ignores anything that isn't a `Press`: crossterm delivers both `Press`
+/// and `Release` for every keystroke on Windows (unconditionally — see
+/// `KeyEvent::kind`'s own doc) and on Unix when the kitty keyboard protocol
+/// is enabled, so without this filter every character would be pushed onto
+/// `buffer` twice. Because this prompt echoes nothing, that doubling would
+/// be invisible until it surfaced later as a misattributed `invalid_client`
+/// error at `auth login`.
+fn apply_secret_key(buffer: &mut String, key: KeyEvent) -> SecretKeyOutcome {
+    if key.kind != KeyEventKind::Press {
+        return SecretKeyOutcome::Continue;
+    }
+    match key.code {
+        KeyCode::Enter => SecretKeyOutcome::Finished,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            SecretKeyOutcome::Aborted
+        }
+        KeyCode::Char(c) => {
+            buffer.push(c);
+            SecretKeyOutcome::Continue
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            SecretKeyOutcome::Continue
+        }
+        _ => SecretKeyOutcome::Continue,
+    }
 }
 
 /// Maps `--modify` to the scope requested at login.
@@ -286,6 +324,94 @@ mod tests {
     fn resolve_scope_maps_modify_flag() {
         assert_eq!(resolve_scope(true), GmailScope::Modify);
         assert_eq!(resolve_scope(false), GmailScope::ReadOnly);
+    }
+
+    // ── apply_secret_key ─────────────────────────────────────────
+
+    #[test]
+    fn apply_secret_key_pushes_a_pressed_character() {
+        let mut buffer = String::new();
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Continue);
+        assert_eq!(buffer, "a");
+    }
+
+    #[test]
+    fn apply_secret_key_ignores_a_release_event_for_the_same_character() {
+        // Regression for the Windows/kitty-keyboard-protocol case: crossterm
+        // delivers both Press and Release for every keystroke there, so a
+        // naive match on `code` alone (ignoring `kind`) would push 'a' twice.
+        let mut buffer = String::new();
+        apply_secret_key(
+            &mut buffer,
+            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press),
+        );
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Continue);
+        assert_eq!(buffer, "a");
+    }
+
+    #[test]
+    fn apply_secret_key_backspace_pops_the_last_character() {
+        let mut buffer = "ab".to_string();
+        apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(buffer, "a");
+    }
+
+    #[test]
+    fn apply_secret_key_backspace_on_empty_buffer_is_a_no_op() {
+        let mut buffer = String::new();
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Continue);
+        assert_eq!(buffer, "");
+    }
+
+    #[test]
+    fn apply_secret_key_enter_finishes() {
+        let mut buffer = "secret".to_string();
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Finished);
+        assert_eq!(buffer, "secret");
+    }
+
+    #[test]
+    fn apply_secret_key_ctrl_c_aborts() {
+        let mut buffer = "partial".to_string();
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Aborted);
+    }
+
+    #[test]
+    fn apply_secret_key_plain_c_is_not_mistaken_for_ctrl_c() {
+        let mut buffer = String::new();
+        let outcome = apply_secret_key(
+            &mut buffer,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert_eq!(outcome, SecretKeyOutcome::Continue);
+        assert_eq!(buffer, "c");
     }
 
     // ── AuthCommand::execute dispatch ───────────────────────────────
