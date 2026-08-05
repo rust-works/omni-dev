@@ -394,6 +394,18 @@ depends on message sizes and network too — a measured run against a
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
 
+On a terminal, a backfill/`--full`/reconciliation run shows two live
+progress indicators on stderr — a listing spinner (pages fetched, ids
+discovered so far) and a fetch bar (messages fetched so far out of the
+currently-known total, plus a running error count) — updated as the
+mailbox is listed and fetched *concurrently*, rather than only printing a
+report once the entire run finishes. Total wall-clock time is unchanged
+(still bounded by the same per-second quota above); what changes is that
+fetching now begins as soon as the first listing page arrives, instead of
+waiting for the whole mailbox to be listed first. Pass `--quiet` to
+suppress the bars; they're also disabled automatically when stderr isn't a
+terminal or when `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` is selected.
+
 **Archive layout:**
 
 ```
@@ -415,21 +427,26 @@ regenerated from the `.eml` files; it is the sole record of each message's
 Gmail-side metadata (labels, thread, watermark).
 
 **Backfill vs. incremental:** the first run (or `--full`) lists the whole
-mailbox and fetches whatever's missing on disk — presence-on-disk is the
-real idempotence mechanism, so an interrupted backfill simply picks up
-where it left off on the next run, no cursor required. The manifest itself
-is checkpointed to disk every 200 fetched messages during a large backfill
-(not only once at the end), so a crash loses at most that many messages'
-worth of already-completed work, not the whole run. Subsequent runs use
-`history.list` from the stored watermark, applying
-`messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved` events.
-Google does not guarantee history availability past roughly **one week**;
-a `startHistoryId` older than that gets a 404, which `sync` treats as a
-signal to fall back to the same full-listing pass as a backfill (not a
+mailbox and fetches whatever's missing on disk — listing and fetching are
+pipelined, so the fetch fan-out for early-listed messages starts
+immediately rather than waiting for the whole mailbox to be listed first.
+Presence-on-disk is the real idempotence mechanism, so an interrupted
+backfill simply picks up where it left off on the next run, no cursor
+required. The manifest itself is checkpointed to disk every 200 fetched
+messages during a large backfill (not only once at the end), so a crash
+loses at most that many messages' worth of already-completed work, not the
+whole run. Subsequent runs use `history.list` from the stored watermark,
+applying `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
+events. Google does not guarantee history availability past roughly **one
+week**; a `startHistoryId` older than that gets a 404, which `sync` treats
+as a signal to fall back to the same full-listing pass as a backfill (not a
 silent gap, and not a blind re-download of everything) — the `historyId`
 watermark is purely an optimisation over that fallback, never a
-correctness requirement. A run that hits a per-item error never advances
-the watermark, so the next run safely re-examines the same range (already
+correctness requirement. (An incremental run's own `history.list` pass is
+not pipelined — it's typically a single page already, so there's little to
+overlap; only the full-listing path above gains concurrent
+listing+fetching.) A run that hits a per-item error never advances the
+watermark, so the next run safely re-examines the same range (already
 -archived messages are skipped for free).
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
