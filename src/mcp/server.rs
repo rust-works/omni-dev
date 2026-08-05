@@ -383,6 +383,7 @@ mod tests {
             "gmail_message_read",
             "gmail_thread_read",
             "gmail_label_list",
+            "gmail_account_list",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }
