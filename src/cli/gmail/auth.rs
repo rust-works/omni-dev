@@ -394,12 +394,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_login_credentials_propagates_prompt_error() {
+    fn resolve_login_credentials_propagates_client_id_prompt_error() {
         let env = MapEnv::new();
         let err = resolve_login_credentials(
             &env,
             || anyhow::bail!("Aborted"),
             || anyhow::bail!("should not be called"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborted"));
+    }
+
+    #[test]
+    fn resolve_login_credentials_propagates_client_secret_prompt_error() {
+        let env = MapEnv::new().with(GMAIL_CLIENT_ID, "id");
+        let err = resolve_login_credentials(
+            &env,
+            || anyhow::bail!("should not prompt for client id"),
+            || anyhow::bail!("Aborted"),
         )
         .unwrap_err();
         assert!(err.to_string().contains("Aborted"));
