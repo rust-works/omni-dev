@@ -98,7 +98,8 @@ impl<'a> HistoryApi<'a> {
     /// [`HARD_CAP`] (e.g. a large bulk label operation from another client)
     /// would otherwise silently drop `messagesAdded`/`messagesDeleted`/
     /// `labelsAdded`/`labelsRemoved` events past the cap (#1467), the same
-    /// class of bug [`crate::gmail::messages_api::MessagesApi::search_all_unbounded`]
+    /// class of bug
+    /// [`crate::gmail::messages_api::MessagesApi::search_all_unbounded_streaming`]
     /// fixes for the full-mailbox listing path.
     ///
     /// `limiter` paces each page request at [`HISTORY_LIST_COST_UNITS`]
