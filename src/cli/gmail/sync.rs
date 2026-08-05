@@ -9,6 +9,7 @@
 
 pub(crate) mod engine;
 pub(crate) mod manifest;
+pub(crate) mod progress;
 pub(crate) mod report;
 pub(crate) mod shard;
 pub(crate) mod state;

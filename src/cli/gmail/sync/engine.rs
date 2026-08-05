@@ -1,34 +1,41 @@
 //! `gmail sync`'s control flow: backfill vs. incremental, 404-triggered
 //! reconciliation, and the throttled fetch fan-out.
 //!
-//! [`run_sync`] does no stdout/stderr I/O itself — it returns a
-//! [`SyncReport`] for the caller (`src/cli/gmail/sync/mod.rs`) to render and
-//! turn into a process exit code, mirroring
-//! `src/cli/ai/claude/history/sync.rs::run`'s compute → render → decide
-//! split.
+//! [`run_sync`] does no direct stdout/stderr I/O itself — it (via
+//! [`run_sync_with_progress`]) returns a [`SyncReport`] for the caller
+//! (`src/cli/gmail/sync.rs`) to render and turn into a process exit code,
+//! mirroring `src/cli/ai/claude/history/sync.rs::run`'s compute → render →
+//! decide split. It may optionally emit [`super::progress::SyncProgressEvent`]s
+//! over a caller-supplied channel — see ADR-0064's amendment for #1502 —
+//! but never touches a terminal itself; only `sync.rs` does that.
 //!
 //! Presence-on-disk is the real idempotence mechanism (an interrupted
 //! backfill needs no cursor to resume correctly): backfill, `--full`, and
 //! 404-triggered reconciliation are therefore all the *same* code path,
 //! [`run_full_sync`], which lists the whole mailbox and fetches only what's
-//! missing on disk. For that to actually hold across a real interruption
-//! (not just a clean run), the manifest itself must reach disk periodically
-//! during the fetch fan-out, not only once at the very end — see
-//! [`fetch_and_archive_messages`]'s [`MANIFEST_CHECKPOINT_INTERVAL`] (#1467).
+//! missing on disk — listing and fetching are pipelined (#1502), so the
+//! fetch fan-out for early-listed messages starts immediately rather than
+//! waiting for the whole mailbox to be listed first. For idempotence to
+//! actually hold across a real interruption (not just a clean run), the
+//! manifest itself must reach disk periodically during the fetch fan-out,
+//! not only once at the very end — see
+//! [`fetch_and_archive_messages_streaming`]'s [`MANIFEST_CHECKPOINT_INTERVAL`]
+//! (#1467).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::stream::{self, StreamExt as _};
+use futures::stream::{self, FuturesUnordered, StreamExt as _};
+use tokio::sync::mpsc;
 
 use crate::gmail::attachments::extract_attachments;
 use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
 use crate::gmail::history_api::HistoryApi;
 use crate::gmail::messages_api::{
-    MessageFormat, MessagesApi, GMAIL_QUOTA_UNITS_PER_SECOND, MAX_CONCURRENCY,
+    ListingProgress, MessageFormat, MessagesApi, GMAIL_QUOTA_UNITS_PER_SECOND, MAX_CONCURRENCY,
     MESSAGES_GET_COST_UNITS,
 };
 use crate::gmail::profile_api::{Profile, ProfileApi};
@@ -38,6 +45,7 @@ use crate::gmail::raw_message::{
 use crate::utils::rate_limit::TokenBucket;
 
 use super::manifest::{Manifest, ManifestRecord};
+use super::progress::SyncProgressEvent;
 use super::report::{SyncAction, SyncError, SyncReport};
 use super::shard::{attachments_dir, shard_path};
 use super::state::{self, ArchiveState, LoadOutcome};
@@ -71,8 +79,31 @@ const MANIFEST_CHECKPOINT_INTERVAL: usize = 200;
 
 /// Runs one sync: resolves identity, decides backfill vs. incremental (with
 /// 404 fallback), fetches whatever's missing, and returns a report. Never
-/// panics on per-message failures — see [`fetch_and_archive_messages`].
+/// panics on per-message failures — see
+/// [`fetch_and_archive_messages_streaming`].
+///
+/// A thin wrapper around [`run_sync_with_progress`] with no progress
+/// channel — kept as its own function so every existing caller/test stays
+/// unaffected by #1502's progress-reporting addition.
 pub(crate) async fn run_sync(client: &GmailClient, opts: &SyncOptions) -> Result<SyncReport> {
+    run_sync_with_progress(client, opts, None).await
+}
+
+/// [`run_sync`], plus an optional channel to emit
+/// [`SyncProgressEvent`]s to during the full-mailbox pass (backfill /
+/// `--full` / 404-triggered reconciliation). `run_incremental`'s
+/// `history.list` pass is typically a single page already, so it emits no
+/// progress events regardless of whether `progress` is set.
+///
+/// Still performs no direct stdout/stderr I/O — `progress`, if present, is
+/// just another channel this function writes structured data to, the same
+/// as `report`; only the caller (`src/cli/gmail/sync.rs`) may render
+/// anything (ADR-0064's amendment for #1502).
+pub(crate) async fn run_sync_with_progress(
+    client: &GmailClient,
+    opts: &SyncOptions,
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
+) -> Result<SyncReport> {
     guard_output_dir(&opts.output_dir)?;
     if !opts.dry_run {
         let messages_dir = opts.output_dir.join("messages");
@@ -105,8 +136,16 @@ pub(crate) async fn run_sync(client: &GmailClient, opts: &SyncOptions) -> Result
                         message: "watermark expired (404 on startHistoryId); reconciling"
                             .to_string(),
                     });
-                    run_full_sync(client, &mut manifest, &profile, opts, &limiter, &mut report)
-                        .await?
+                    run_full_sync(
+                        client,
+                        &mut manifest,
+                        &profile,
+                        opts,
+                        &limiter,
+                        &mut report,
+                        progress,
+                    )
+                    .await?
                 }
                 Err(e) => return Err(e),
             }
@@ -116,16 +155,43 @@ pub(crate) async fn run_sync(client: &GmailClient, opts: &SyncOptions) -> Result
             // identity — a forced reconciliation is not an excuse to skip
             // the one check that prevents mixing two mailboxes.
             state::validate_identity(&state, &profile.email_address)?;
-            run_full_sync(client, &mut manifest, &profile, opts, &limiter, &mut report).await?
+            run_full_sync(
+                client,
+                &mut manifest,
+                &profile,
+                opts,
+                &limiter,
+                &mut report,
+                progress,
+            )
+            .await?
         }
         LoadOutcome::Absent => {
-            run_full_sync(client, &mut manifest, &profile, opts, &limiter, &mut report).await?
+            run_full_sync(
+                client,
+                &mut manifest,
+                &profile,
+                opts,
+                &limiter,
+                &mut report,
+                progress,
+            )
+            .await?
         }
         LoadOutcome::Corrupt(reason) => {
             report.actions.push(SyncAction::Note {
                 message: format!("state.json unreadable ({reason}); reconciling"),
             });
-            run_full_sync(client, &mut manifest, &profile, opts, &limiter, &mut report).await?
+            run_full_sync(
+                client,
+                &mut manifest,
+                &profile,
+                opts,
+                &limiter,
+                &mut report,
+                progress,
+            )
+            .await?
         }
     };
 
@@ -160,6 +226,17 @@ pub(crate) async fn run_sync(client: &GmailClient, opts: &SyncOptions) -> Result
 /// missing on disk (an interrupted prior run's already-archived messages
 /// are skipped for free), and soft-delete manifest records for ids that no
 /// longer appear.
+///
+/// Listing and fetching run *concurrently*, joined on this one task via
+/// [`tokio::join!`] rather than [`tokio::spawn`] (#1502) — that's what lets
+/// both sides keep sharing a single `&TokenBucket` borrow with no `Arc`, and
+/// what confines `&mut Manifest` to exactly one side (the fetch consumer,
+/// [`fetch_and_archive_messages_streaming`]) with no `Arc<Mutex<_>>` either.
+/// The two manifest-mutating passes that need the *complete* listing
+/// (undelete-on-reappearance, stale-id soft-deletion) both run after the
+/// join — previously undelete ran before the (then-sequential) fetch phase
+/// and stale-deletion ran after, so this can change the *order* actions
+/// appear in a [`SyncReport`], never which actions occur.
 async fn run_full_sync(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -167,20 +244,38 @@ async fn run_full_sync(
     opts: &SyncOptions,
     limiter: &TokenBucket,
     report: &mut SyncReport,
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<String> {
-    let listed = MessagesApi::new(client)
-        .search_all_unbounded(opts.query.as_deref(), &[], limiter)
-        .await?;
-    let listed_ids: HashSet<String> = listed.messages.iter().map(|m| m.id.clone()).collect();
+    let (ids_tx, ids_rx) = mpsc::unbounded_channel::<String>();
+    let messages_api = MessagesApi::new(client);
 
-    let to_fetch: Vec<String> = listed_ids
-        .iter()
-        .filter(|id| match manifest.get(id) {
-            None => true,
-            Some(record) => !opts.output_dir.join(&record.path).exists(),
-        })
-        .cloned()
-        .collect();
+    let listing = messages_api.search_all_unbounded_streaming(
+        opts.query.as_deref(),
+        &[],
+        limiter,
+        ids_tx,
+        |p: ListingProgress| {
+            if let Some(tx) = progress {
+                let _ = tx.send(SyncProgressEvent::ListingPage {
+                    pages: p.page_no,
+                    ids_discovered: p.ids_so_far,
+                });
+            }
+        },
+    );
+    let fetching = fetch_and_archive_messages_streaming(
+        client, manifest, ids_rx, limiter, opts, report, progress,
+    );
+
+    let (listing_result, fetch_result) = tokio::join!(listing, fetching);
+    // A real `messages.list` failure is the more actionable root cause when
+    // both sides error (the fetch side would just be draining a channel
+    // that stopped growing) — check it first.
+    listing_result?;
+    let listed_ids = fetch_result?;
+    if let Some(tx) = progress {
+        let _ = tx.send(SyncProgressEvent::ListingDone);
+    }
 
     for id in &listed_ids {
         if manifest.get(id).is_some_and(|r| r.deleted_at.is_some()) {
@@ -196,8 +291,6 @@ async fn run_full_sync(
             }
         }
     }
-
-    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await?;
 
     let stale: Vec<String> = manifest
         .ids_not_deleted()
@@ -274,6 +367,122 @@ async fn run_incremental(
         .unwrap_or_else(|| start_history_id.to_string()))
 }
 
+/// [`run_full_sync`]'s fetch/consumer side of the listing+fetch pipeline
+/// (#1502): the presence-on-disk filter, the bounded/throttled fan-out, and
+/// the manifest checkpointing all still work exactly as
+/// [`fetch_and_archive_messages`] describes below — the only thing that
+/// changed is that ids now arrive one at a time from `ids_rx` instead of as
+/// a pre-collected `Vec`.
+///
+/// A plain `stream::iter(..).buffer_unordered(..)` (as
+/// [`fetch_and_archive_messages`] uses) can't work here: that combinator
+/// needs a complete `Vec` of ids *before* it borrows `manifest` for the
+/// drain loop, so the presence-check filter and the drain loop never borrow
+/// `manifest` at the same time. Once ids stream in instead, that filter has
+/// to run per-id, interleaved with the drain loop — both wanting
+/// `&mut Manifest` at once, which the borrow checker rejects as chained
+/// stream combinators. Instead this is a manual pump loop: `tokio::select!`
+/// alternates between pulling the next id (and synchronously filtering it
+/// against `manifest`) and draining the next completed fetch (and
+/// synchronously applying its result to `manifest`) — every manifest touch
+/// is a synchronous statement inside a `select!` arm, never inside a future
+/// stored in `in_flight`, so only one borrow of `manifest` is ever live.
+///
+/// Also returns every id seen on `ids_rx` (regardless of whether it needed
+/// fetching) — [`run_full_sync`] needs that complete set, once listing
+/// finishes, for its undelete/stale-deletion passes.
+async fn fetch_and_archive_messages_streaming(
+    client: &GmailClient,
+    manifest: &mut Manifest,
+    mut ids_rx: mpsc::UnboundedReceiver<String>,
+    limiter: &TokenBucket,
+    opts: &SyncOptions,
+    report: &mut SyncReport,
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
+) -> Result<HashSet<String>> {
+    let output_dir = &opts.output_dir;
+    let concurrency = opts.concurrency.clamp(1, MAX_CONCURRENCY);
+    let mut seen = HashSet::new();
+    let mut listed_ids = HashSet::new();
+    let mut in_flight = FuturesUnordered::new();
+    let mut since_checkpoint = 0usize;
+    let mut ids_open = true;
+
+    loop {
+        tokio::select! {
+            maybe_id = ids_rx.recv(), if ids_open && in_flight.len() < concurrency => {
+                match maybe_id {
+                    Some(id) => {
+                        listed_ids.insert(id.clone());
+                        if !seen.insert(id.clone()) {
+                            continue;
+                        }
+                        // Not `shard_path(output_dir, id).exists()`: a
+                        // not-yet-fetched message's shard depends on its
+                        // `internal_date`, which isn't known until after
+                        // it's fetched. The manifest's already-recorded
+                        // `path` is the only presence check available
+                        // before a fetch happens.
+                        let already_archived = manifest
+                            .get(&id)
+                            .is_some_and(|record| output_dir.join(&record.path).exists());
+                        if already_archived {
+                            continue;
+                        }
+                        if opts.dry_run {
+                            report.actions.push(SyncAction::WouldFetch { id });
+                            continue;
+                        }
+                        let extract_attachments_flag = opts.extract_attachments;
+                        in_flight.push(async move {
+                            limiter.acquire(MESSAGES_GET_COST_UNITS).await;
+                            let result = fetch_and_write_one(
+                                client,
+                                output_dir,
+                                &id,
+                                extract_attachments_flag,
+                            )
+                            .await;
+                            (id, result)
+                        });
+                        if let Some(tx) = progress {
+                            let _ = tx.send(SyncProgressEvent::FetchQueued);
+                        }
+                    }
+                    None => ids_open = false,
+                }
+            }
+            Some((id, result)) = in_flight.next(), if !in_flight.is_empty() => {
+                let failed = result.is_err();
+                match result {
+                    Ok(record) => {
+                        report.actions.push(SyncAction::Fetched {
+                            id,
+                            path: record.path.clone(),
+                            bytes: record.size,
+                        });
+                        manifest.upsert(record);
+                    }
+                    Err(e) => report.errors.push(SyncError {
+                        id,
+                        reason: format!("{e:#}"),
+                    }),
+                }
+                since_checkpoint += 1;
+                if since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
+                    manifest.save(&manifest_path(output_dir))?;
+                    since_checkpoint = 0;
+                }
+                if let Some(tx) = progress {
+                    let _ = tx.send(SyncProgressEvent::FetchCompleted { failed });
+                }
+            }
+            else => break,
+        }
+    }
+    Ok(listed_ids)
+}
+
 /// The one place presence-on-disk is checked before any fetch, and the
 /// bounded, throttled fan-out over whatever's actually missing.
 ///
@@ -291,6 +500,9 @@ async fn run_incremental(
 /// see the module doc's interruption note. The final partial interval is
 /// still covered by `run_sync`'s own unconditional save once this function
 /// returns, so no extra flush is needed here on the way out.
+///
+/// Used by [`run_incremental`] only — [`run_full_sync`]'s pipelined listing
+/// uses [`fetch_and_archive_messages_streaming`] instead (#1502).
 async fn fetch_and_archive_messages(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -1432,6 +1644,281 @@ not-really-a-pdf\r\n\
                 "checkpoint should have covered {id}"
             );
         }
+    }
+
+    // ── pipelined listing+fetch and progress events (#1502) ──────────────
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_streaming_checkpoints_the_manifest_across_multiple_intervals(
+    ) {
+        // Mirrors `fetch_and_archive_messages_checkpoints_the_manifest_across_multiple_intervals`
+        // above, but feeds ids through a channel instead of a slice — the
+        // highest-risk piece of new async control flow (the `select!` pump)
+        // must preserve the exact same checkpointing behavior.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let total = MANIFEST_CHECKPOINT_INTERVAL * 2 + 5;
+        let ids: Vec<String> = (0..total).map(|i| format!("m{i}")).collect();
+        for id in &ids {
+            mount_raw_get(&server, id, "Hello").await;
+        }
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let opts = SyncOptions {
+            output_dir: output_dir.clone(),
+            query: None,
+            full: false,
+            concurrency: 20,
+            dry_run: false,
+            extract_attachments: false,
+        };
+
+        let (ids_tx, ids_rx) = mpsc::unbounded_channel();
+        for id in &ids {
+            ids_tx.send(id.clone()).unwrap();
+        }
+        drop(ids_tx);
+
+        let listed_ids = fetch_and_archive_messages_streaming(
+            &client,
+            &mut manifest,
+            ids_rx,
+            &limiter,
+            &opts,
+            &mut report,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(listed_ids.len(), total);
+
+        let checkpointed = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let expected_checkpointed =
+            (total / MANIFEST_CHECKPOINT_INTERVAL) * MANIFEST_CHECKPOINT_INTERVAL;
+        assert_eq!(
+            checkpointed.ids_not_deleted().count(),
+            expected_checkpointed,
+            "expected exactly two checkpoints' worth of records on disk before any final save"
+        );
+
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+        let final_on_disk = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        for id in &ids {
+            assert!(
+                final_on_disk.get(id).is_some(),
+                "missing {id} after the final save"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_streaming_emits_queued_and_completed_progress_events() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        mount_raw_get(&server, "ok1", "Hello").await;
+        mount_raw_get(&server, "ok2", "Hello").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/bad1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let opts = opts(output_dir.clone());
+
+        let (ids_tx, ids_rx) = mpsc::unbounded_channel();
+        for id in ["ok1", "ok2", "bad1"] {
+            ids_tx.send(id.to_string()).unwrap();
+        }
+        drop(ids_tx);
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        fetch_and_archive_messages_streaming(
+            &client,
+            &mut manifest,
+            ids_rx,
+            &limiter,
+            &opts,
+            &mut report,
+            Some(&progress_tx),
+        )
+        .await
+        .unwrap();
+        drop(progress_tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = progress_rx.recv().await {
+            events.push(event);
+        }
+
+        assert_eq!(report.errors.len(), 1);
+        let queued = events
+            .iter()
+            .filter(|e| matches!(e, SyncProgressEvent::FetchQueued))
+            .count();
+        let completed_ok = events
+            .iter()
+            .filter(|e| matches!(e, SyncProgressEvent::FetchCompleted { failed: false }))
+            .count();
+        let completed_failed = events
+            .iter()
+            .filter(|e| matches!(e, SyncProgressEvent::FetchCompleted { failed: true }))
+            .count();
+        assert_eq!(queued, 3, "one FetchQueued per dispatched fetch");
+        assert_eq!(completed_ok, 2);
+        assert_eq!(completed_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn run_sync_with_progress_emits_listing_events_ending_in_listing_done() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        mount_message_list(&server, &["m1", "m2"]).await;
+        mount_raw_get(&server, "m1", "Hello").await;
+        mount_raw_get(&server, "m2", "Hello").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let report = run_sync_with_progress(&client, &opts(output_dir), Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        assert!(report.errors.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncProgressEvent::ListingPage { .. })),
+            "expected at least one ListingPage event"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::ListingDone))
+                .count(),
+            1,
+            "expected exactly one ListingDone event"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::FetchQueued))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::FetchCompleted { failed: false }))
+                .count(),
+            2
+        );
+        // Both sides of the `tokio::join!` have already finished by the
+        // time `run_full_sync` sends `ListingDone` — it's always the last
+        // event this run emits.
+        assert!(matches!(
+            events.last(),
+            Some(SyncProgressEvent::ListingDone)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_reconciliation_undeletes_reappeared_mail_and_deletes_vanished_mail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "999").await;
+        // Only "back" is listed as still present on the server; "gone" no
+        // longer appears at all.
+        mount_message_list(&server, &["back"]).await;
+        mount_raw_get(&server, "back", "Hello").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let back_path = shard_path(&output_dir, "back", None);
+        std::fs::create_dir_all(back_path.parent().unwrap()).unwrap();
+        std::fs::write(&back_path, b"From: a@example.com\r\n\r\nbody").unwrap();
+        let gone_path = shard_path(&output_dir, "gone", None);
+        std::fs::write(&gone_path, b"From: a@example.com\r\n\r\nbody").unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.upsert(ManifestRecord {
+            id: "back".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: back_path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: 4,
+            history_id: Some("1".to_string()),
+            // Previously soft-deleted; the server lists it again this run.
+            deleted_at: Some(Utc::now()),
+        });
+        manifest.upsert(ManifestRecord {
+            id: "gone".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: gone_path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: 4,
+            history_id: Some("1".to_string()),
+            deleted_at: None,
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "back")));
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Deleted { id } if id == "gone")));
+
+        let on_disk = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(on_disk.get("back").unwrap().deleted_at.is_none());
+        assert!(on_disk.get("gone").unwrap().deleted_at.is_some());
     }
 
     // ── --dry-run reconciliation reports planned actions (#1467) ────────
