@@ -12,7 +12,7 @@ use url::Url;
 use crate::datadog::auth::{base_url_for_site, DatadogCredentials};
 use crate::datadog::error::DatadogError;
 use crate::request_log;
-use crate::utils::http::{request_timeout, retry_429};
+use crate::utils::http::{connect_timeout, read_timeout, retry_429};
 use crate::utils::secret::Secret;
 
 /// HTTP client for Datadog REST APIs.
@@ -32,7 +32,8 @@ impl DatadogClient {
     /// pass a wiremock URL directly.
     pub fn new(base_url: &str, api_key: &str, app_key: &str) -> Result<Self> {
         let client = Client::builder()
-            .timeout(request_timeout())
+            .connect_timeout(connect_timeout())
+            .read_timeout(read_timeout())
             .build()
             .context("Failed to build HTTP client")?;
 

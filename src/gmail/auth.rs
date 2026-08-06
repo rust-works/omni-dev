@@ -983,7 +983,8 @@ async fn run_login_flow(
     }
 
     let http = reqwest::Client::builder()
-        .timeout(crate::utils::http::request_timeout())
+        .connect_timeout(crate::utils::http::connect_timeout())
+        .read_timeout(crate::utils::http::read_timeout())
         .build()
         .context("Failed to build HTTP client")?;
     let tokens = exchange_code_for_tokens(
