@@ -516,7 +516,7 @@ async fn fetch_and_archive_messages_streaming(
                 }
             }
             Some((id, result)) = in_flight.next(), if !in_flight.is_empty() => {
-                let failed = result.is_err();
+                let mut failed = false;
                 match result {
                     Ok(record) => {
                         report.actions.push(SyncAction::Fetched {
@@ -526,10 +526,16 @@ async fn fetch_and_archive_messages_streaming(
                         });
                         manifest.upsert(record);
                     }
-                    Err(e) => report.errors.push(SyncError {
-                        id,
-                        reason: format!("{e:#}"),
-                    }),
+                    Err(e) if is_message_not_found(&e) => {
+                        report.actions.push(SyncAction::Vanished { id });
+                    }
+                    Err(e) => {
+                        failed = true;
+                        report.errors.push(SyncError {
+                            id,
+                            reason: format!("{e:#}"),
+                        });
+                    }
                 }
                 since_checkpoint += 1;
                 if since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
@@ -641,7 +647,7 @@ async fn fetch_and_archive_messages(
 
     let mut since_checkpoint = 0usize;
     while let Some((id, result)) = fetches.next().await {
-        let failed = result.is_err();
+        let mut failed = false;
         match result {
             Ok(record) => {
                 report.actions.push(SyncAction::Fetched {
@@ -651,10 +657,16 @@ async fn fetch_and_archive_messages(
                 });
                 manifest.upsert(record);
             }
-            Err(e) => report.errors.push(SyncError {
-                id,
-                reason: format!("{e:#}"),
-            }),
+            Err(e) if is_message_not_found(&e) => {
+                report.actions.push(SyncAction::Vanished { id });
+            }
+            Err(e) => {
+                failed = true;
+                report.errors.push(SyncError {
+                    id,
+                    reason: format!("{e:#}"),
+                });
+            }
         }
         since_checkpoint += 1;
         if since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
@@ -766,6 +778,22 @@ fn is_history_not_found(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<GmailError>() {
         Some(e @ GmailError::ApiRequestFailed { status: 404, .. }) => {
             e.reason().map_or(true, |r| r == "notFound")
+        }
+        _ => false,
+    }
+}
+
+/// A 404 on `messages.get` for an id `history.list` just reported as added
+/// means the message was permanently deleted from the server in the window
+/// between the two calls — a real race under concurrent fetch fan-out, and
+/// never going to succeed on retry (#1509). Unlike [`is_history_not_found`],
+/// this does *not* fail open on an absent/unparseable reason: a message
+/// fetch 404 for any other reason is a real failure that must still surface
+/// as a [`SyncError`].
+fn is_message_not_found(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<GmailError>() {
+        Some(e @ GmailError::ApiRequestFailed { status: 404, .. }) => {
+            e.reason() == Some("notFound")
         }
         _ => false,
     }
@@ -1534,6 +1562,142 @@ not-really-a-pdf\r\n\
 
         let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
         assert_eq!(report.errors.len(), 1);
+
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => {
+                assert_eq!(s.history_id, "100", "watermark must not advance");
+            }
+            _ => panic!("expected the pre-existing state to survive"),
+        }
+    }
+
+    // ── vanished message during fetch (#1509) ───────────────────────────
+
+    #[tokio::test]
+    async fn run_sync_treats_a_vanished_message_404_as_benign_not_an_error() {
+        // A message reported by history.list can be permanently deleted from
+        // the server before its own messages.get call runs — real once you
+        // add concurrency to the fetch fan-out. Unlike an ordinary
+        // per-message failure, this can never succeed on retry, so it must
+        // not withhold the watermark (unlike
+        // `run_sync_leaves_the_watermark_untouched_after_an_incremental_failure`
+        // above, whose 500 genuinely is worth retrying).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [{"message": {"id": "vanished1", "threadId": "t1"}}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/gmail/v1/users/me/messages/vanished1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"message": "Not Found", "errors": [{"reason": "notFound"}]}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(
+            report.errors.is_empty(),
+            "a vanished message must not be a SyncError"
+        );
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Vanished { id } if id == "vanished1")));
+
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => assert_eq!(
+                s.history_id, "300",
+                "watermark must advance past a vanished-message 404"
+            ),
+            _ => panic!("expected the watermark to be saved"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sync_message_404_with_a_different_reason_is_still_an_error() {
+        // The reason check must not fail open the way `is_history_not_found`
+        // deliberately does for `history.list` — a 404 on messages.get for
+        // any reason other than `notFound` is a real failure and must still
+        // withhold the watermark.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"message": "Backend error", "errors": [{"reason": "backendError"}]}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].id, "m1");
+        assert!(!report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Vanished { .. })));
 
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {

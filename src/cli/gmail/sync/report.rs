@@ -56,6 +56,13 @@ pub(crate) enum SyncAction {
     WouldDelete { id: String },
     /// `--dry-run` only: a message would have been undeleted.
     WouldUndelete { id: String },
+    /// A message listed by `history.list` no longer exists on the server by
+    /// the time it was fetched (`messages.get` 404, reason `notFound`) — the
+    /// history event was stale. Not treated as an error: unlike [`Deleted`],
+    /// no manifest record exists yet to soft-delete (#1509).
+    ///
+    /// [`Deleted`]: SyncAction::Deleted
+    Vanished { id: String },
     /// An informational note about the run (e.g. why reconciliation ran).
     Note { message: String },
 }
@@ -73,6 +80,7 @@ pub(crate) struct SyncError {
 pub(crate) struct SyncSummary {
     pub(crate) fetched: usize,
     pub(crate) would_fetch: usize,
+    pub(crate) vanished: usize,
     pub(crate) labels_updated: usize,
     pub(crate) deleted: usize,
     pub(crate) undeleted: usize,
@@ -100,6 +108,7 @@ impl SyncReport {
                 SyncAction::Undeleted { .. } => summary.undeleted += 1,
                 SyncAction::WouldDelete { .. } => summary.would_delete += 1,
                 SyncAction::WouldUndelete { .. } => summary.would_undelete += 1,
+                SyncAction::Vanished { .. } => summary.vanished += 1,
                 // Informational only — not part of the tally (#1488).
                 SyncAction::Note { .. } => {}
             }
@@ -142,6 +151,9 @@ mod tests {
                 SyncAction::WouldUndelete {
                     id: "m7".to_string(),
                 },
+                SyncAction::Vanished {
+                    id: "m8".to_string(),
+                },
                 SyncAction::Note {
                     message: "one note".to_string(),
                 },
@@ -150,7 +162,7 @@ mod tests {
                 },
             ],
             errors: vec![SyncError {
-                id: "m8".to_string(),
+                id: "m9".to_string(),
                 reason: "boom".to_string(),
             }],
         };
@@ -160,6 +172,7 @@ mod tests {
             SyncSummary {
                 fetched: 1,
                 would_fetch: 1,
+                vanished: 1,
                 labels_updated: 1,
                 deleted: 1,
                 undeleted: 1,
