@@ -239,6 +239,8 @@ mod tests {
             refresh_token: Some("token".to_string()),
             scope: scope.map(str::to_string),
             email_address: email.map(str::to_string),
+            chrome_profile_from_email: false,
+            browser_command: None,
         }
     }
 
@@ -259,6 +261,8 @@ mod tests {
                             refresh_token: acc.refresh_token.clone(),
                             scope: acc.scope.clone(),
                             email_address: acc.email_address.clone(),
+                            chrome_profile_from_email: acc.chrome_profile_from_email,
+                            browser_command: acc.browser_command.clone(),
                         },
                     )
                 })

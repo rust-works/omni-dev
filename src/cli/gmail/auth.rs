@@ -10,7 +10,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::cli::gmail::helpers;
 use crate::gmail::account;
-use crate::gmail::auth::{self, BrowserConfig, GmailScope};
+use crate::gmail::auth::{self, GmailScope};
 use crate::gmail::client::GmailClient;
 use crate::gmail::import;
 use crate::gmail::profile_api::ProfileApi;
@@ -107,22 +107,16 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
     // Snapshot whether this call could be the first empty→non-empty
     // transition (issue #1500) *before* logging in — `login_for` mutates
     // settings.json on success, so the check must run first.
+    let settings = Settings::load().unwrap_or_default();
     let might_shadow_legacy = {
-        let settings = Settings::load().unwrap_or_default();
         let legacy = auth::status();
         let had_legacy =
             legacy.has_client_id || legacy.has_client_secret || legacy.has_refresh_token;
         account::is_first_legacy_to_named_transition(&settings.gmail, had_legacy)
     };
+    let browser = auth::resolve_browser_config_for(&settings.gmail, None)?;
 
-    let status = auth::login_for(
-        None,
-        &client_id,
-        &client_secret,
-        scope,
-        &BrowserConfig::default(),
-    )
-    .await?;
+    let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
 
     if might_shadow_legacy {
         let settings = Settings::load().unwrap_or_default();
@@ -626,6 +620,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Aborted"));
+    }
+
+    // ── run_login ─────────────────────────────────────────────────
+    //
+    // The OAuth2 exchange itself (`login_for`, reached only after browser
+    // resolution succeeds) needs a real loopback callback and is covered at
+    // the `gmail::auth::login_to` layer instead — see the "AuthCommand::execute
+    // dispatch" note above for why `run_login`'s happy path stays untested
+    // here. This covers the settings-load/browser-resolution prelude that
+    // runs before that exchange, by making browser resolution itself fail
+    // fast (a malformed `browser_command`) so the flow never reaches the
+    // network.
+
+    #[tokio::test]
+    async fn run_login_surfaces_a_malformed_browser_command_before_the_oauth_exchange() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("browser_command", "chrome \"--flag")],
+        )
+        .unwrap();
+
+        let env = MapEnv::new()
+            .with(GMAIL_CLIENT_ID, "id")
+            .with(GMAIL_CLIENT_SECRET, "secret");
+
+        let err = run_login(&env, false).await.unwrap_err();
+        assert!(err.to_string().contains("browser_command"));
     }
 
     // ── run_logout / LogoutCommand::execute ─────────────────────────

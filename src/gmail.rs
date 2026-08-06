@@ -11,6 +11,7 @@
 pub mod account;
 pub mod attachments;
 pub mod auth;
+mod chrome_profile;
 pub mod client;
 pub mod error;
 pub mod history_api;
