@@ -33,7 +33,12 @@ use report::{SyncAction, SyncError, SyncReport, SyncSummary};
 /// token-bucket rate limiter (which is the actual quota-compliance
 /// mechanism — see `engine.rs`), so it can be generous without risking a
 /// quota burst.
-const DEFAULT_SYNC_CONCURRENCY: usize = 20;
+///
+/// `pub(crate)` — also `sync-all`'s fallback when neither its own
+/// `--concurrency` flag nor `gmail-sync.yaml`'s `concurrency` is set
+/// (ADR-0068), so the two commands share one default rather than risking
+/// drift between two constants.
+pub(crate) const DEFAULT_SYNC_CONCURRENCY: usize = 20;
 
 /// Maintains a durable local archive of a Gmail mailbox (no MCP equivalent
 /// — a bulk, potentially long-running filesystem operation is a poor fit
@@ -266,7 +271,10 @@ fn render_report_text(
 /// Formats `summary` as a trailing comma-separated line, e.g.
 /// `"3 fetched, 1 deleted, 0 errors"`. Zero counts are omitted except
 /// `errors`, which is always shown so a clean run is visible at a glance.
-fn format_summary_line(summary: &SyncSummary) -> String {
+///
+/// `pub(crate)` so `sync-all` (ADR-0068) can reuse the exact same
+/// formatting for its per-account and combined-total lines.
+pub(crate) fn format_summary_line(summary: &SyncSummary) -> String {
     let mut parts = Vec::new();
     let mut push = |count: usize, label: &str| {
         if count > 0 {

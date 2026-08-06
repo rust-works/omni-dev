@@ -8,6 +8,7 @@ pub(crate) mod label;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod sync;
+pub(crate) mod sync_all;
 pub(crate) mod thread;
 
 use anyhow::Result;
@@ -56,6 +57,10 @@ pub enum GmailSubcommands {
     Label(label::LabelCommand),
     /// Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent).
     Sync(sync::SyncCommand),
+    /// Maintains durable local archives for every account in
+    /// `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP
+    /// equivalent; ADR-0068).
+    SyncAll(sync_all::SyncAllCommand),
 }
 
 impl GmailCommand {
@@ -64,36 +69,56 @@ impl GmailCommand {
     /// `auth` manages credentials and must run without them; `account`
     /// manages which named account is selected and must equally run
     /// without a resolved client (`import-legacy`'s whole point is working
-    /// in a pre-migration state). Every other subcommand needs an
-    /// authenticated client, which is resolved **once** here and threaded
-    /// down so each leaf takes `&GmailClient` and stays free of process
-    /// env.
+    /// in a pre-migration state). `sync-all` also runs without the shared
+    /// client: it resolves one client per configured account itself
+    /// (`helpers::create_client_for`, never the env var below, which is
+    /// unsafe across its concurrent tasks — ADR-0068). Every other
+    /// subcommand needs an authenticated client, which is resolved **once**
+    /// here and threaded down so each leaf takes `&GmailClient` and stays
+    /// free of process env.
     pub async fn execute(self) -> Result<()> {
-        // Propagates --account to the env var `gmail::account::resolve_account`
-        // reads (issue #1500), mirroring `Cli::propagate_global_flags`'s
-        // pattern: only set when present, so an existing ambient
-        // OMNI_DEV_GMAIL_ACCOUNT still works when the flag is omitted.
-        if let Some(account) = &self.account {
-            std::env::set_var(GMAIL_ACCOUNT_ENV, account);
-        }
-
+        let account = self.account;
         match self.command {
-            GmailSubcommands::Auth(cmd) => cmd.execute().await,
-            GmailSubcommands::Account(cmd) => cmd.execute(),
-            data => {
-                let client = helpers::create_client()?;
-                data.dispatch(&client).await
+            GmailSubcommands::SyncAll(cmd) => {
+                anyhow::ensure!(
+                    account.is_none(),
+                    "--account is not compatible with sync-all; configure accounts in \
+                     .omni-dev/gmail-sync.yaml instead"
+                );
+                cmd.execute().await
+            }
+            command => {
+                // Propagates --account to the env var
+                // `gmail::account::resolve_account` reads (issue #1500),
+                // mirroring `Cli::propagate_global_flags`'s pattern: only
+                // set when present, so an existing ambient
+                // OMNI_DEV_GMAIL_ACCOUNT still works when the flag is
+                // omitted.
+                if let Some(account) = &account {
+                    std::env::set_var(GMAIL_ACCOUNT_ENV, account);
+                }
+
+                match command {
+                    GmailSubcommands::Auth(cmd) => cmd.execute().await,
+                    GmailSubcommands::Account(cmd) => cmd.execute(),
+                    data => {
+                        let client = helpers::create_client()?;
+                        data.dispatch(&client).await
+                    }
+                }
             }
         }
     }
 }
 
 impl GmailSubcommands {
-    /// Routes a non-`Auth`/`Account` subcommand against the shared client.
-    /// Kept separate from credential resolution so it is testable without
-    /// env (tests pass a client pointed at an unreachable URL). The `Auth`
-    /// and `Account` arms are unreachable because both are handled before
-    /// client resolution in [`GmailCommand::execute`].
+    /// Routes a non-`Auth`/`Account`/`SyncAll` subcommand against the
+    /// shared client. Kept separate from credential resolution so it is
+    /// testable without env (tests pass a client pointed at an unreachable
+    /// URL). The `Auth`, `Account`, and `SyncAll` arms are unreachable
+    /// because all three are handled before client resolution in
+    /// [`GmailCommand::execute`] — `SyncAll` builds its own per-account
+    /// clients instead of using the shared one (ADR-0068).
     async fn dispatch(self, client: &GmailClient) -> Result<()> {
         match self {
             Self::Auth(_) => {
@@ -101,6 +126,9 @@ impl GmailSubcommands {
             }
             Self::Account(_) => {
                 unreachable!("Account is dispatched before client resolution")
+            }
+            Self::SyncAll(_) => {
+                unreachable!("SyncAll is dispatched before client resolution")
             }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
@@ -344,5 +372,52 @@ mod tests {
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    fn sync_all_command() -> sync_all::SyncAllCommand {
+        sync_all::SyncAllCommand {
+            context_dir: None,
+            concurrency: None,
+            full: false,
+            dry_run: false,
+            quiet: false,
+            output: OutputFormat::Table,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_account_flag_with_sync_all() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            account: Some("work".to_string()),
+            command: GmailSubcommands::SyncAll(sync_all_command()),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--account is not compatible with sync-all"));
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_never_sets_the_account_env_var() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::SyncAll(sync_all::SyncAllCommand {
+                context_dir: Some(dir.path().to_path_buf()),
+                ..sync_all_command()
+            }),
+        };
+        // No gmail-sync.yaml exists under `dir` — this is expected to
+        // fail with a config-loading error, never a network/dispatch
+        // error, proving `SyncAll` never reached the shared-client
+        // `dispatch` path (which would panic on `unreachable!()`).
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("no gmail-sync.yaml found"));
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
     }
 }
