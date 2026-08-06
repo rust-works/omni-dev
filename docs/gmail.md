@@ -632,20 +632,25 @@ independently (see [Rate limits](#rate-limits-and-retry-behaviour) below) —
 the shared cap is a purely local resource limit, unrelated to quota
 compliance.
 
-**Progress and output:** unlike a single `gmail sync`, `sync-all` shows no
-live per-message progress bars — running one bar pair per account
-concurrently would mean several independent renderers fighting over one
-terminal. Instead, a one-line summary prints per account as soon as that
-account finishes (not only once every account is done), e.g.
-`jky.greens: 42 fetched, 0 errors`, followed by a trailing `combined: ...`
-total once every account has finished. `--quiet` suppresses the per-account
-lines; the combined total and any per-message error lines always print
-regardless. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` instead emit one
-structured record per account (`account`, `actions`, `errors`, `summary`,
-and — only for an account whose task failed before producing a report at
-all, e.g. bad credentials or a rejected output directory — `account_error`)
-plus a `combined_summary`, once every account has finished — the same
-`summary` shape [Sync](#sync)'s own **Report summary** describes.
+**Progress and output:** on the same interactive-terminal condition a single
+`gmail sync` uses (`-o table`, not `--quiet`, a `stderr` that's actually a
+tty), every account gets its own listing spinner + fetch bar, all registered
+on one shared `MultiProgress` — a single shared renderer, rather than each
+account's bars fighting another's over the same terminal, is what lets them
+all advance concurrently and stay legible. Independent of the bars, a
+one-line summary still prints per account as soon as that account finishes
+(not only once every account is done), e.g. `jky.greens: 42 fetched, 0
+errors`, followed by a trailing `combined: ...` total once every account has
+finished — that line prints through the bars (via `suspend`) rather than
+racing their redraw. `--quiet` suppresses both the live bars and the
+per-account summary lines; the combined total and any per-message error
+lines always print regardless. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl`
+instead emit one structured record per account (`account`, `actions`,
+`errors`, `summary`, and — only for an account whose task failed before
+producing a report at all, e.g. bad credentials or a rejected output
+directory — `account_error`) plus a `combined_summary`, once every account
+has finished — the same `summary` shape [Sync](#sync)'s own **Report
+summary** describes.
 
 **Exit code:** non-zero if *any* configured account either failed outright
 (bad credentials, a rejected output directory, …) or reported one or more
