@@ -622,6 +622,37 @@ mod tests {
         assert!(err.to_string().contains("Aborted"));
     }
 
+    // ── run_login ─────────────────────────────────────────────────
+    //
+    // The OAuth2 exchange itself (`login_for`, reached only after browser
+    // resolution succeeds) needs a real loopback callback and is covered at
+    // the `gmail::auth::login_to` layer instead — see the "AuthCommand::execute
+    // dispatch" note above for why `run_login`'s happy path stays untested
+    // here. This covers the settings-load/browser-resolution prelude that
+    // runs before that exchange, by making browser resolution itself fail
+    // fast (a malformed `browser_command`) so the flow never reaches the
+    // network.
+
+    #[tokio::test]
+    async fn run_login_surfaces_a_malformed_browser_command_before_the_oauth_exchange() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("browser_command", "chrome \"--flag")],
+        )
+        .unwrap();
+
+        let env = MapEnv::new()
+            .with(GMAIL_CLIENT_ID, "id")
+            .with(GMAIL_CLIENT_SECRET, "secret");
+
+        let err = run_login(&env, false).await.unwrap_err();
+        assert!(err.to_string().contains("browser_command"));
+    }
+
     // ── run_logout / LogoutCommand::execute ─────────────────────────
 
     #[test]
