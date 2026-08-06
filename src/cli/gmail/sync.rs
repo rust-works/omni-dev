@@ -187,7 +187,16 @@ async fn run_sync_command(
 /// [`std::io::IsTerminal`] itself, so tests can exercise every combination
 /// without depending on the test runner's own stderr (which is typically
 /// captured, i.e. never a terminal) — see STYLE-0028.
-fn should_show_progress(quiet: bool, output: &OutputFormat, stderr_is_terminal: bool) -> bool {
+///
+/// `pub(crate)` — also `sync-all`'s gate for its own shared-`MultiProgress`
+/// bars (ADR-0068's Decision 4 follow-up, #1504), so the two commands agree
+/// on exactly when live progress rendering makes sense rather than risking
+/// the conditions drifting apart.
+pub(crate) fn should_show_progress(
+    quiet: bool,
+    output: &OutputFormat,
+    stderr_is_terminal: bool,
+) -> bool {
     !quiet && matches!(output, OutputFormat::Table) && stderr_is_terminal
 }
 

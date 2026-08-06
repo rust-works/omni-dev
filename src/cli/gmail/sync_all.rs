@@ -9,7 +9,16 @@
 //! each account's own local `--concurrency`. See ADR-0068 for the full
 //! rationale; this file is CLI glue plus the config loader, mirroring how
 //! `sync.rs` relates to `sync/engine.rs`.
+//!
+//! On an interactive terminal (same [`super::sync::should_show_progress`]
+//! gate `gmail sync` uses), every account also gets its own listing-spinner
+//! and fetch-bar pair, all registered on one shared `indicatif::MultiProgress`
+//! via [`super::sync::progress::SyncProgressBars::new_in`]. ADR-0068's
+//! Decision 4 originally deferred this (N accounts' independent
+//! `MultiProgress`es would fight over one stderr); a single shared instance
+//! sidesteps that entirely.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +26,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::claude::context::discovery;
 use crate::gmail::account::validate_account;
@@ -27,8 +36,9 @@ use crate::utils::settings::Settings;
 use super::format::{output_as, write_scalar_jsonl, JsonlSerialize, OutputFormat};
 use super::helpers;
 use super::sync::engine::{self, SyncOptions};
+use super::sync::progress::{SyncProgressBars, SyncProgressEvent};
 use super::sync::report::{SyncAction, SyncError, SyncReport, SyncSummary};
-use super::sync::{format_summary_line, DEFAULT_SYNC_CONCURRENCY};
+use super::sync::{format_summary_line, should_show_progress, DEFAULT_SYNC_CONCURRENCY};
 
 /// `.omni-dev/gmail-sync.yaml`'s top level.
 #[derive(Debug, Default, Deserialize)]
@@ -139,8 +149,9 @@ pub struct SyncAllCommand {
     pub dry_run: bool,
 
     /// Suppresses the per-account summary line printed as each account
-    /// finishes; per-message errors and the trailing combined total still
-    /// print regardless.
+    /// finishes, and the live per-account progress bars a run shows on an
+    /// interactive terminal; per-message errors and the trailing combined
+    /// total still print regardless.
     #[arg(long)]
     pub quiet: bool,
 
@@ -238,6 +249,16 @@ async fn run_sync_all(
 ) -> Result<()> {
     let pool = Arc::new(Semaphore::new(effective_concurrency));
 
+    // Same gate `gmail sync` uses (`should_show_progress`): only stand up
+    // live bars when a human is actually watching a `-o table` run on an
+    // interactive stderr. One shared `MultiProgress` — rather than each
+    // account's own, which would fight over the same stderr — is what makes
+    // rendering N accounts' bars concurrently safe (ADR-0068's Decision 4
+    // follow-up, #1504).
+    let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
+    let multi = show_progress.then(indicatif::MultiProgress::new);
+    let mut render_tasks = Vec::new();
+
     let mut tasks = FuturesUnordered::new();
     for entry in &config.accounts {
         let account = entry.account.clone();
@@ -255,10 +276,24 @@ async fn run_sync_all(
             extract_attachments: entry.extract_attachments.unwrap_or(false),
             shared_pool: Some(Arc::clone(&pool)),
         };
+        let progress_tx = multi.as_ref().map(|multi| {
+            let bars = SyncProgressBars::new_in(multi, &account);
+            let (tx, rx) = mpsc::unbounded_channel();
+            render_tasks.push(tokio::spawn(bars.drain(rx)));
+            tx
+        });
         let spawn_account = account.clone();
         let spawn_client_for = Arc::clone(&client_for);
         let join = tokio::spawn(async move {
-            run_one_account(&spawn_account, &opts, spawn_client_for.as_ref()).await
+            run_one_account(
+                &spawn_account,
+                &opts,
+                spawn_client_for.as_ref(),
+                progress_tx.as_ref(),
+            )
+            .await
+            // `progress_tx` drops here, closing its channel so the
+            // corresponding `bars.drain` render task above can exit.
         });
         tasks.push(async move {
             let outcome = match join.await {
@@ -273,9 +308,23 @@ async fn run_sync_all(
     let mut outcomes: Vec<(String, Result<SyncReport>)> = Vec::with_capacity(config.accounts.len());
     while let Some((account, outcome)) = tasks.next().await {
         if show_text {
-            print_account_line(&account, &outcome, quiet);
+            // While bars are live, print through `suspend` so this stdout
+            // line doesn't land mid-redraw of the stderr bars below it —
+            // `suspend` clears every registered bar first and redraws once
+            // the closure returns, regardless of which stream it writes to.
+            match &multi {
+                Some(multi) => multi.suspend(|| print_account_line(&account, &outcome, quiet)),
+                None => print_account_line(&account, &outcome, quiet),
+            }
         }
         outcomes.push((account, outcome));
+    }
+
+    // Best-effort: a panicking/cancelled render task shouldn't fail an
+    // otherwise-successful sync — it only ever formats bars. Awaited before
+    // the combined summary prints so every bar has finished/cleared first.
+    for render_task in render_tasks {
+        let _ = render_task.await;
     }
 
     let mut combined = SyncSummary::default();
@@ -333,17 +382,20 @@ async fn run_sync_all(
 }
 
 /// Runs one account's sync from its own client, wrapping a client-build
-/// failure and an `engine::run_sync` failure in the same `Result` so the
-/// caller treats both as one task-level failure — see [`run_sync_all`]'s
-/// `any_failed` handling.
+/// failure and an `engine::run_sync_with_progress` failure in the same
+/// `Result` so the caller treats both as one task-level failure — see
+/// [`run_sync_all`]'s `any_failed` handling. `progress` is `None` whenever
+/// [`run_sync_all`] didn't stand up live bars for this run (`--quiet`, a
+/// non-table `-o` format, or a non-interactive stderr).
 async fn run_one_account(
     account: &str,
     opts: &SyncOptions,
     client_for: &(dyn Fn(&str) -> Result<GmailClient> + Send + Sync),
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<SyncReport> {
     let client = client_for(account)
         .with_context(|| format!("account '{account}': failed to build a Gmail client"))?;
-    engine::run_sync(&client, opts)
+    engine::run_sync_with_progress(&client, opts, progress)
         .await
         .with_context(|| format!("account '{account}': sync failed"))
 }
