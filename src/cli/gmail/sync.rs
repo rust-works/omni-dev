@@ -126,7 +126,8 @@ async fn run_sync_command(
     quiet: bool,
     output: &OutputFormat,
 ) -> Result<()> {
-    let report = if should_show_progress(quiet, output, std::io::stderr().is_terminal()) {
+    let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
+    let report = if show_progress {
         let (tx, rx) = mpsc::unbounded_channel();
         let bars = SyncProgressBars::new();
         let render_task = tokio::spawn(bars.drain(rx));
@@ -151,7 +152,12 @@ async fn run_sync_command(
     if !output_as(&output_view, output)? {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
-        render_report_text(&report, &mut handle)?;
+        // Bars already rendered every fetch/delete live, and `--quiet`
+        // asked for exactly this suppression explicitly — see
+        // `render_report_text`'s doc comment for why `quiet` is checked
+        // again here rather than just reusing `show_progress` (a non-tty
+        // stderr makes both false, but that case still wants full detail).
+        render_report_text(&report, &mut handle, !quiet && !show_progress)?;
     }
 
     if !report.errors.is_empty() {
@@ -200,12 +206,30 @@ impl JsonlSerialize for SyncReportOutput<'_> {
 }
 
 /// Renders a report as one line per action, then one line per error.
-fn render_report_text(report: &SyncReport, out: &mut dyn Write) -> Result<()> {
+///
+/// `show_action_detail` gates the per-item lines (`Fetched`/`Deleted`/...,
+/// but never `Note`, `Error`, or the trailing summary — see the call site):
+/// when live progress bars already rendered every fetch/delete as it
+/// happened, or `--quiet` asked for exactly this, repeating the whole batch
+/// as text on top would just be a second, redundant dump — the "silent,
+/// then dump everything at once" experience #1502 introduced bars to fix
+/// in the first place. `false` is only for the cases neither of those
+/// covers (a non-interactive `stderr`, e.g. a redirected/cron log): there,
+/// this text *is* the only record of what happened, so it still gets the
+/// full detail — see ADR-0064's authoritative-record framing.
+fn render_report_text(
+    report: &SyncReport,
+    out: &mut dyn Write,
+    show_action_detail: bool,
+) -> Result<()> {
     if report.actions.is_empty() && report.errors.is_empty() {
         writeln!(out, "Nothing to do.").context("Failed to write sync report")?;
         return Ok(());
     }
     for action in &report.actions {
+        if !show_action_detail && !matches!(action, SyncAction::Note { .. }) {
+            continue;
+        }
         let line = match action {
             SyncAction::Fetched { id, path, bytes } => {
                 format!("Fetched {id} -> {} ({bytes} bytes)", path.display())
@@ -346,7 +370,7 @@ mod tests {
     fn render_report_text_reports_nothing_to_do_when_empty() {
         let report = SyncReport::default();
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "Nothing to do.\n");
     }
 
@@ -369,7 +393,7 @@ mod tests {
             }],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Fetched m1"));
         assert!(text.contains("Deleted m2"));
@@ -389,7 +413,7 @@ mod tests {
             errors: vec![],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("+IMPORTANT"));
         assert!(text.contains("-UNREAD"));
@@ -412,11 +436,57 @@ mod tests {
             errors: vec![],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("1 would fetch, 1 would delete, 1 would undelete, 0 errors"));
         assert!(!text.contains("fetched,"));
         assert!(!text.contains("deleted,"));
+    }
+
+    #[test]
+    fn render_report_text_suppresses_per_item_actions_but_keeps_notes_errors_and_summary() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::Fetched {
+                    id: "m1".to_string(),
+                    path: PathBuf::from("messages/m1/m1.eml"),
+                    bytes: 100,
+                },
+                SyncAction::Deleted {
+                    id: "m2".to_string(),
+                },
+                SyncAction::Note {
+                    message: "watermark expired (404 on startHistoryId); reconciling".to_string(),
+                },
+            ],
+            errors: vec![SyncError {
+                id: "m3".to_string(),
+                reason: "boom".to_string(),
+            }],
+        };
+        let mut buf = Vec::new();
+        render_report_text(&report, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains("Fetched m1"),
+            "flood actions must be suppressed"
+        );
+        assert!(
+            !text.contains("Deleted m2"),
+            "flood actions must be suppressed"
+        );
+        assert!(
+            text.contains("Note: watermark expired"),
+            "a rare contextual Note must survive suppression"
+        );
+        assert!(
+            text.contains("Error: m3 failed: boom"),
+            "errors must survive suppression"
+        );
+        assert!(
+            text.contains("1 fetched, 1 deleted, 1 errors"),
+            "the summary must survive suppression"
+        );
     }
 
     // ── SyncReportOutput (`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`) ─────

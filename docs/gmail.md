@@ -405,6 +405,10 @@ fetching now begins as soon as the first listing page arrives, instead of
 waiting for the whole mailbox to be listed first. Pass `--quiet` to
 suppress the bars; they're also disabled automatically when stderr isn't a
 terminal or when `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` is selected.
+Whenever the bars ran (or `--quiet` was passed), the final text report
+skips the per-action listing too (see **Report summary** below), since
+bars already showed every fetch/delete live and repeating them as text
+would just be a second, redundant dump.
 
 **Archive layout:**
 
@@ -492,13 +496,20 @@ the affected `.eml` files (or the whole archive) and re-run `--full
 --extract-attachments` to force re-extraction.
 
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
-`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally alongside the
-per-action listing, e.g. `5,794 fetched, 30 deleted, 0 errors` in text
-output, or an explicit `summary` field (`fetched`/`would_fetch`/
-`labels_updated`/`deleted`/`undeleted`/`would_delete`/`would_undelete`/
-`errors` counts) alongside `actions`/`errors` in the structured formats —
-useful since a large sync's per-action listing can run into the thousands
-of lines.
+`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally, e.g.
+`5,794 fetched, 30 deleted, 0 errors` in text output, or an explicit
+`summary` field (`fetched`/`would_fetch`/`labels_updated`/`deleted`/
+`undeleted`/`would_delete`/`would_undelete`/`errors` counts) in the
+structured formats. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` always
+include the full per-action listing alongside `summary` too — the
+authoritative, complete record. Text output includes the per-action
+listing only when nothing else already showed it: if the live progress
+bars ran, or `--quiet` was passed, text output shows just `Note`s, errors,
+and the summary — a large sync's per-action listing can run into the
+thousands of lines, and printing it again once bars already rendered it
+live would just be a second, redundant dump. A non-interactive `stderr`
+(no bars possible) still gets the full per-action listing in text, since
+it's the only record of what happened in that case.
 
 **`--dry-run`** reports every action sync would take without writing any
 file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
