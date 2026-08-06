@@ -22,11 +22,13 @@ use tokio::net::TcpListener;
 use url::Url;
 
 use crate::gmail::account::{self, ResolvedAccount};
+use crate::gmail::chrome_profile;
 use crate::gmail::error::{GmailError, GrantContext};
 use crate::request_log;
+use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
-use crate::utils::settings::{active_profile_from, GmailSettings, Settings};
+use crate::utils::settings::{active_profile_from, GmailAccountSettings, GmailSettings, Settings};
 
 /// Environment variable / settings key for the user's Google Cloud OAuth2
 /// client id.
@@ -172,6 +174,77 @@ fn fold_explicit(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::to_string)
         .or_else(|| account::active_gmail_account_from(&SystemEnv))
+}
+
+/// Resolves the [`BrowserConfig`] `gmail auth login` should open the
+/// authorization URL with, honoring a named account's manual
+/// `browser_command` override and opt-in automatic Chrome-profile
+/// resolution (issue #1505). `explicit` is folded exactly like
+/// [`resolve_for_write`]'s. A [`ResolvedAccount::Legacy`] account (no named
+/// accounts configured, or a literal credential env set) always yields
+/// today's [`BrowserLaunch::Auto`] — zero migration.
+pub(crate) fn resolve_browser_config_for(
+    gmail: &GmailSettings,
+    explicit: Option<&str>,
+) -> Result<BrowserConfig> {
+    match resolve_for_write(gmail, explicit)? {
+        ResolvedAccount::Legacy => Ok(BrowserConfig::default()),
+        ResolvedAccount::Named(name) => build_browser_config(
+            gmail.accounts.get(&name),
+            chrome_profile::resolve_launch_command,
+        ),
+    }
+}
+
+/// The pure/injectable core of [`resolve_browser_config_for`] —
+/// `resolve_chrome_profile` is [`chrome_profile::resolve_launch_command`] in
+/// production, a stub in tests, so this stays testable without touching a
+/// real Chrome install.
+///
+/// Precedence:
+/// 1. `account.browser_command` set (non-blank) → used verbatim; a
+///    malformed command is a hard error.
+/// 2. `account.chrome_profile_from_email` set *and* `account.email_address`
+///    set → automatic resolution; any resolution failure (per
+///    `resolve_chrome_profile`'s fail-open contract) falls back to `Auto`.
+/// 3. Otherwise → `Auto`.
+fn build_browser_config(
+    account: Option<&GmailAccountSettings>,
+    resolve_chrome_profile: impl FnOnce(&str) -> Option<Vec<String>>,
+) -> Result<BrowserConfig> {
+    let Some(account) = account else {
+        return Ok(BrowserConfig::default());
+    };
+
+    if let Some(command) = account
+        .browser_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        return Ok(BrowserConfig {
+            launch: BrowserLaunch::Command(split_browser_command("browser_command", command)?),
+            ..BrowserConfig::default()
+        });
+    }
+
+    if account.chrome_profile_from_email {
+        if let Some(email) = account.email_address.as_deref() {
+            if let Some(args) = resolve_chrome_profile(email) {
+                return Ok(BrowserConfig {
+                    launch: BrowserLaunch::Command(args),
+                    ..BrowserConfig::default()
+                });
+            }
+        } else {
+            tracing::info!(
+                "chrome_profile_from_email is set but email_address is not; \
+                 falling back to the default browser"
+            );
+        }
+    }
+
+    Ok(BrowserConfig::default())
 }
 
 /// Loads Gmail credentials from environment variables or settings.json.
@@ -1212,6 +1285,107 @@ mod tests {
         let launch = BrowserLaunch::Command(vec![]);
         let err = open_browser(&launch, "u").unwrap_err();
         assert!(err.to_string().contains("empty browser command"));
+    }
+
+    // ── build_browser_config (issue #1505) ──────────────────────────────
+
+    fn assert_is_auto(config: BrowserConfig) {
+        assert!(matches!(config.launch, BrowserLaunch::Auto));
+    }
+
+    #[test]
+    fn build_browser_config_defaults_to_auto_with_no_account() {
+        assert_is_auto(build_browser_config(None, |_| panic!("must not be called")).unwrap());
+    }
+
+    #[test]
+    fn build_browser_config_defaults_to_auto_with_no_opt_in() {
+        let account = GmailAccountSettings {
+            email_address: Some("alice@example.com".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        // chrome_profile_from_email is false, so the resolver must never run
+        // even though email_address is set.
+        assert_is_auto(
+            build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn build_browser_config_uses_browser_command_verbatim() {
+        let account = GmailAccountSettings {
+            browser_command: Some("chrome --new-window {url}".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        let config =
+            build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap();
+        assert!(matches!(
+            config.launch,
+            BrowserLaunch::Command(args) if args == vec!["chrome", "--new-window", "{url}"]
+        ));
+    }
+
+    #[test]
+    fn build_browser_config_browser_command_wins_over_chrome_profile_from_email() {
+        let account = GmailAccountSettings {
+            browser_command: Some("chrome {url}".to_string()),
+            chrome_profile_from_email: true,
+            email_address: Some("alice@example.com".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        let config =
+            build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap();
+        assert!(matches!(config.launch, BrowserLaunch::Command(_)));
+    }
+
+    #[test]
+    fn build_browser_config_rejects_a_malformed_browser_command() {
+        let account = GmailAccountSettings {
+            browser_command: Some("chrome \"--flag".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        let err =
+            build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap_err();
+        assert!(err.to_string().contains("browser_command"));
+    }
+
+    #[test]
+    fn build_browser_config_resolves_the_chrome_profile_when_opted_in() {
+        let account = GmailAccountSettings {
+            chrome_profile_from_email: true,
+            email_address: Some("alice@example.com".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        let config = build_browser_config(Some(&account), |email| {
+            assert_eq!(email, "alice@example.com");
+            Some(vec!["chrome-stub".to_string(), "{url}".to_string()])
+        })
+        .unwrap();
+        assert!(matches!(
+            config.launch,
+            BrowserLaunch::Command(args) if args == vec!["chrome-stub", "{url}"]
+        ));
+    }
+
+    #[test]
+    fn build_browser_config_falls_back_to_auto_when_chrome_resolution_fails() {
+        let account = GmailAccountSettings {
+            chrome_profile_from_email: true,
+            email_address: Some("alice@example.com".to_string()),
+            ..GmailAccountSettings::default()
+        };
+        assert_is_auto(build_browser_config(Some(&account), |_| None).unwrap());
+    }
+
+    #[test]
+    fn build_browser_config_is_auto_when_opted_in_but_no_email_address() {
+        let account = GmailAccountSettings {
+            chrome_profile_from_email: true,
+            ..GmailAccountSettings::default()
+        };
+        assert_is_auto(
+            build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap(),
+        );
     }
 
     // ── Loopback listener (real sockets, no wiremock) ───────────────────

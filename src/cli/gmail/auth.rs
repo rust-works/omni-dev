@@ -10,7 +10,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::cli::gmail::helpers;
 use crate::gmail::account;
-use crate::gmail::auth::{self, BrowserConfig, GmailScope};
+use crate::gmail::auth::{self, GmailScope};
 use crate::gmail::client::GmailClient;
 use crate::gmail::import;
 use crate::gmail::profile_api::ProfileApi;
@@ -107,22 +107,16 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
     // Snapshot whether this call could be the first empty→non-empty
     // transition (issue #1500) *before* logging in — `login_for` mutates
     // settings.json on success, so the check must run first.
+    let settings = Settings::load().unwrap_or_default();
     let might_shadow_legacy = {
-        let settings = Settings::load().unwrap_or_default();
         let legacy = auth::status();
         let had_legacy =
             legacy.has_client_id || legacy.has_client_secret || legacy.has_refresh_token;
         account::is_first_legacy_to_named_transition(&settings.gmail, had_legacy)
     };
+    let browser = auth::resolve_browser_config_for(&settings.gmail, None)?;
 
-    let status = auth::login_for(
-        None,
-        &client_id,
-        &client_secret,
-        scope,
-        &BrowserConfig::default(),
-    )
-    .await?;
+    let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
 
     if might_shadow_legacy {
         let settings = Settings::load().unwrap_or_default();
