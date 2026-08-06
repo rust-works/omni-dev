@@ -4107,14 +4107,15 @@ Gmail: search, read, and label messages via OAuth2
 Usage: gmail [OPTIONS] <COMMAND>
 
 Commands:
-  auth     Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
-  account  Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`)
-  search   Searches Gmail messages (mirrors the `gmail_search` MCP tool)
-  read     Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
-  thread   Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
-  label    Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
-  sync     Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
-  help     Print this message or the help of the given subcommand(s)
+  auth      Manages Gmail OAuth2 credentials (mirrors the `gmail_auth_status` MCP tool for `status`)
+  account   Manages named Gmail accounts (mirrors the `gmail_account_list` MCP tool for `list`)
+  search    Searches Gmail messages (mirrors the `gmail_search` MCP tool)
+  read      Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
+  thread    Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
+  label     Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+  sync      Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
+  sync-all  Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --account <NAME>  Selects a named Gmail account configured in `~/.omni-dev/settings.json` (AWS-CLI style, mirrors the top-level `--profile`) for this invocation
@@ -4371,6 +4372,24 @@ Options:
       --quiet                      Only shows errors/warnings, suppresses info-level output — including the live progress bars a backfill/`--full`/reconciliation pass shows on an interactive terminal (#1502)
   -o, --output <OUTPUT>            Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                       Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail sync-all - Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
+
+Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
+
+Usage: sync-all [OPTIONS]
+
+Options:
+      --context-dir <PATH>  Overrides the standard `.omni-dev/` discovery (walk-up from CWD, `OMNI_DEV_CONFIG_DIR`, `local/` shadow) used to locate `gmail-sync.yaml`
+      --concurrency <N>     Overrides `gmail-sync.yaml`'s `concurrency` — a fetch-request cap shared across every configured account this run. Left unset, the YAML value applies; if that's unset too, falls back to the same default as `gmail sync --concurrency`
+      --full                Forces a full backfill/reconciliation pass for every account, same as `gmail sync --full`
+      --dry-run             Reports the planned actions for every account without writing any files
+      --quiet               Suppresses the per-account summary line printed as each account finishes, and the live per-account progress bars a run shows on an interactive terminal; per-message errors and the trailing combined total still print regardless
+  -o, --output <OUTPUT>     Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================

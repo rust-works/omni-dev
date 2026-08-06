@@ -4,8 +4,11 @@
 //! [`SyncProgressEvent`] is the boundary: `engine.rs` may emit these over a
 //! caller-supplied channel but never imports `indicatif` itself, so it keeps
 //! performing no direct stdout/stderr I/O (ADR-0064's amendment for #1502).
-//! Only [`SyncProgressBars`], constructed and driven exclusively by
-//! `src/cli/gmail/sync.rs`, actually renders anything.
+//! Only [`SyncProgressBars`], constructed and driven by `src/cli/gmail/
+//! sync.rs` (one bar pair, its own `MultiProgress`) and `src/cli/gmail/
+//! sync_all.rs` (one bar pair per account, all registered on one shared
+//! `MultiProgress` via [`SyncProgressBars::new_in`] — ADR-0068's Decision 4
+//! follow-up, #1504), actually renders anything.
 
 use std::time::Duration;
 
@@ -39,15 +42,38 @@ pub(crate) struct SyncProgressBars {
 
 impl SyncProgressBars {
     pub(crate) fn new() -> Self {
-        let multi = indicatif::MultiProgress::new();
+        Self::build(indicatif::MultiProgress::new(), None)
+    }
+
+    /// One listing-spinner + fetch-bar pair registered on an existing
+    /// `MultiProgress`, each row prefixed with `label`.
+    ///
+    /// Lets `gmail sync-all` (ADR-0068) render every concurrently-syncing
+    /// account's two bars under one shared terminal area instead of each
+    /// account's [`SyncProgressBars::new`] fighting over stderr with its
+    /// own `MultiProgress` — `MultiProgress` is a cheap `Clone` (an `Arc`
+    /// handle), so cloning it into each account's `SyncProgressBars` just
+    /// keeps that shared instance alive, it doesn't create a second one.
+    pub(crate) fn new_in(multi: &indicatif::MultiProgress, label: &str) -> Self {
+        Self::build(multi.clone(), Some(label))
+    }
+
+    fn build(multi: indicatif::MultiProgress, label: Option<&str>) -> Self {
+        let prefixed = label.is_some();
 
         let listing = multi.add(indicatif::ProgressBar::new_spinner());
-        listing.set_style(listing_style());
+        listing.set_style(listing_style(prefixed));
+        if let Some(label) = label {
+            listing.set_prefix(label.to_string());
+        }
         listing.enable_steady_tick(Duration::from_millis(100));
         listing.set_message("0 pages, 0 ids found");
 
         let fetch = multi.add(indicatif::ProgressBar::new(0));
-        fetch.set_style(fetch_style());
+        fetch.set_style(fetch_style(prefixed));
+        if let Some(label) = label {
+            fetch.set_prefix(label.to_string());
+        }
 
         Self {
             listing,
@@ -89,15 +115,29 @@ impl SyncProgressBars {
     }
 }
 
-#[allow(clippy::expect_used)] // Compile-time constant template literal
-fn listing_style() -> indicatif::ProgressStyle {
-    indicatif::ProgressStyle::with_template("{spinner:.cyan} Listing mailbox… {msg}")
-        .expect("valid indicatif template literal")
+/// `prefixed` selects a `{prefix}`-leading template for [`SyncProgressBars::
+/// new_in`]'s multi-account rows; [`SyncProgressBars::new`]'s single-account
+/// bars keep the plain template byte-identical to before #1504.
+// The `{spinner}`/`{msg}`/`{prefix}` placeholders are indicatif's own
+// template syntax, not a Rust format string.
+#[allow(clippy::expect_used, clippy::literal_string_with_formatting_args)] // Compile-time constant template literals
+fn listing_style(prefixed: bool) -> indicatif::ProgressStyle {
+    let template = if prefixed {
+        "{prefix:.bold} {spinner:.cyan} Listing mailbox… {msg}"
+    } else {
+        "{spinner:.cyan} Listing mailbox… {msg}"
+    };
+    indicatif::ProgressStyle::with_template(template).expect("valid indicatif template literal")
 }
 
-#[allow(clippy::expect_used)] // Compile-time constant template literal
-fn fetch_style() -> indicatif::ProgressStyle {
-    indicatif::ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} messages fetched {msg}")
+#[allow(clippy::expect_used, clippy::literal_string_with_formatting_args)] // Compile-time constant template literals
+fn fetch_style(prefixed: bool) -> indicatif::ProgressStyle {
+    let template = if prefixed {
+        "{prefix:.bold} {bar:40.cyan/blue} {pos}/{len} messages fetched {msg}"
+    } else {
+        "{bar:40.cyan/blue} {pos}/{len} messages fetched {msg}"
+    };
+    indicatif::ProgressStyle::with_template(template)
         .expect("valid indicatif template literal")
         .progress_chars("##-")
 }
@@ -206,5 +246,51 @@ mod tests {
 
         assert!(listing.is_finished());
         assert!(fetch.is_finished());
+    }
+
+    // ── new_in (#1504, ADR-0068's Decision 4 follow-up) ──────────────────
+
+    #[test]
+    fn new_in_prefixes_both_bars_with_the_account_label() {
+        let multi = indicatif::MultiProgress::new();
+        let bars = SyncProgressBars::new_in(&multi, "jky.greens");
+
+        assert_eq!(bars.listing.prefix(), "jky.greens");
+        assert_eq!(bars.fetch.prefix(), "jky.greens");
+    }
+
+    #[tokio::test]
+    async fn new_in_two_accounts_drain_independently_on_one_shared_multi_progress() {
+        let multi = indicatif::MultiProgress::new();
+        let account_a = SyncProgressBars::new_in(&multi, "acct-a");
+        let account_b = SyncProgressBars::new_in(&multi, "acct-b");
+        let fetch_a = account_a.fetch.clone();
+        let fetch_b = account_b.fetch.clone();
+
+        let (tx_a, rx_a) = mpsc::unbounded_channel();
+        let (tx_b, rx_b) = mpsc::unbounded_channel();
+        tx_a.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx_a.send(SyncProgressEvent::FetchCompleted { failed: false })
+            .unwrap();
+        drop(tx_a);
+        tx_b.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx_b.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx_b.send(SyncProgressEvent::FetchCompleted { failed: true })
+            .unwrap();
+        tx_b.send(SyncProgressEvent::FetchCompleted { failed: false })
+            .unwrap();
+        drop(tx_b);
+
+        // Both accounts' bars live on the *same* `MultiProgress` (the whole
+        // point of #1504's shared-instance design, vs. each account's
+        // `SyncProgressBars::new` fighting over stderr with its own), yet
+        // their `drain` loops and bar state stay per-account-independent.
+        account_a.drain(rx_a).await;
+        account_b.drain(rx_b).await;
+
+        assert_eq!(fetch_a.position(), 1);
+        assert_eq!(fetch_b.position(), 2);
+        assert_eq!(fetch_b.length(), Some(2));
+        assert_eq!(fetch_b.message(), "(1 errors)");
     }
 }

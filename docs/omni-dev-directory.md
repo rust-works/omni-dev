@@ -36,13 +36,16 @@ chain — see [settings.json](#settingsjson).
 | `commit-guidelines.md` | Commit-message rules consumed by `git commit message check` / `twiddle` | Markdown | project / user / XDG / `~/.omni-dev/` | Chain A | [`src/claude/context/discovery.rs:456`](../src/claude/context/discovery.rs#L456) |
 | `pr-guidelines.md` | PR title / body rules consumed by `git pr` flows | Markdown | same as above | Chain A | [`src/claude/context/discovery.rs:471`](../src/claude/context/discovery.rs#L471) |
 | `scopes.yaml` | Commit/PR scope vocabulary; merged with ecosystem defaults | YAML | same as above | Chain A | [`src/claude/context/discovery.rs:486`](../src/claude/context/discovery.rs#L486) |
+| `gmail-sync.yaml` | The account list + output dirs `gmail sync-all` fans out to concurrently ([ADR-0068](adrs/adr-0068.md)) | YAML | project / user / XDG / `~/.omni-dev/` | Chain A (loaded strictly — see [Validation behaviour](#gmail-syncyaml-1)) | [`src/cli/gmail/sync_all.rs:70`](../src/cli/gmail/sync_all.rs#L70) |
 | `models.yaml` | AI model catalog overrides | YAML | project / user / embedded | Chain B | [`src/claude/model_config.rs:178`](../src/claude/model_config.rs#L178) |
 | `context/feature-contexts/*.yaml` | Per-feature AI prompt context fragments | YAML | inside the active `.omni-dev/` (plus `local/` override) | Chain A (variant) | [`src/claude/context/discovery.rs:502`](../src/claude/context/discovery.rs#L502) |
 | `local/<any>` | Gitignored personal overrides for any of the above | follows the underlying file | personal | top of Chain A | [`src/claude/context/discovery.rs:44`](../src/claude/context/discovery.rs#L44) |
 | `~/.omni-dev/settings.json` | API credentials and env-var fallbacks (Atlassian / Datadog / etc.); written `0600` inside a `0700` dir | JSON | user (home) only | none — single path | [`src/utils/settings.rs:130`](../src/utils/settings.rs#L130) |
 
 Missing files are not an error. Each loader falls through to a lower-precedence
-tier (or to the embedded default, where one exists) and omni-dev continues.
+tier (or to the embedded default, where one exists) and omni-dev continues —
+except `gmail-sync.yaml`, whose absence is a hard error; see its own
+[Validation behaviour](#gmail-syncyaml-1) entry.
 
 ## Precedence
 
@@ -199,6 +202,38 @@ scopes:
 All four fields (`name`, `description`, `examples`, `file_patterns`) are
 required per scope. Extra fields are ignored.
 
+### `gmail-sync.yaml`
+
+YAML listing the named Gmail accounts `omni-dev gmail sync-all` archives
+concurrently, and where. `account` is a lookup key into
+`~/.omni-dev/settings.json`'s `gmail.accounts` map (see
+[Settings](#settingsjson)) — this file only says *which* accounts to sync
+and *where*, never a second credential store. Loaded into
+`GmailSyncAllConfig` by
+[`load_gmail_sync_config`](../src/cli/gmail/sync_all.rs#L70). See
+[ADR-0068](adrs/adr-0068.md) for the full design.
+
+Minimal valid example:
+
+```yaml
+concurrency: 20
+accounts:
+  - account: jky.greens
+    output_dir: emails/jky.greens/
+  - account: newhoggy
+    output_dir: emails/newhoggy/
+    query: "-in:spam"
+    extract_attachments: true
+```
+
+`accounts` (a non-empty list) and each entry's `account`/`output_dir` are
+required; top-level `concurrency` and each entry's `query`/
+`extract_attachments` are optional. `output_dir` resolves relative to the
+project root (the parent of the discovered `.omni-dev/`) unless absolute.
+Unlike every other Chain A file, a missing, empty, or malformed
+`gmail-sync.yaml` is a hard error, not a silent fallback — see
+[Validation behaviour](#gmail-syncyaml-1).
+
 ### `models.yaml`
 
 YAML overriding the embedded model catalog. The schema version is currently
@@ -327,6 +362,21 @@ current source — you can grep your logs against them verbatim.
 | [`src/claude/context/discovery.rs:248-251`](../src/claude/context/discovery.rs#L248-L251) | `warn!` | File exists but is malformed YAML — `load_project_scopes` returns `vec![]` | `Ignoring malformed scopes file {}: {e}` |
 | [`src/claude/context/discovery.rs:494-497`](../src/claude/context/discovery.rs#L494-L497) | `warn!` | Same condition, but encountered while loading the wider `.omni-dev/` config — `load_omni_dev_config` skips the scopes update | `Ignoring malformed scopes file {}: {e}` |
 
+### `gmail-sync.yaml`
+
+Deliberately the one Chain A file that never silently falls back — a
+silently-empty account list would look like a successful no-op for a
+command whose entire job is fanning out to every configured account (see
+[ADR-0068](adrs/adr-0068.md)). Every case below is a hard `Result::Err`,
+propagated before any Gmail client is built.
+
+| File:line | Trigger | Message |
+|---|---|---|
+| [`src/cli/gmail/sync_all.rs:73`](../src/cli/gmail/sync_all.rs#L73) | No `gmail-sync.yaml` found at any Chain A tier | `no gmail-sync.yaml found (looked under {}); add one with an ``accounts:`` list, or point --context-dir/OMNI_DEV_CONFIG_DIR at a directory containing one` |
+| [`src/cli/gmail/sync_all.rs:84`](../src/cli/gmail/sync_all.rs#L84) | File exists but its `accounts:` list is empty | `{} has no accounts configured; add entries to its ``accounts:`` list` |
+| — (`serde_yaml::from_str`, wrapped with `anyhow::Context`) | File exists but is malformed YAML | `Failed to parse {}` |
+| [`src/cli/gmail/sync_all.rs:105`](../src/cli/gmail/sync_all.rs#L105) | An `account` entry doesn't match any key in `~/.omni-dev/settings.json`'s `gmail.accounts` map — batches every unknown name into one error | `gmail-sync.yaml references unknown Gmail account(s): {names}. Run ``gmail account list`` to see configured accounts.` |
+
 ### Feature contexts
 
 | File:line | Level | Trigger | Message |
@@ -361,6 +411,7 @@ prompt falls back to
 - [ADR-0018](adrs/adr-0018.md) — Automatic Context Detection for Adaptive AI Prompts.
 - [ADR-0019](adrs/adr-0019.md) — Ecosystem-Aware Scope Auto-Detection (`scopes.yaml` merge).
 - [ADR-0022](adrs/adr-0022.md) — Layered Model Catalog with User and Project Overrides (Chain B).
+- [ADR-0068](adrs/adr-0068.md) — Concurrent Multi-Account Gmail Sync via `gmail-sync.yaml` and a Shared Fetch Semaphore.
 - [Configuration Guide](configuration.md) — narrative walkthrough with worked examples.
 - [User Guide](user-guide.md) — end-to-end setup including `.omni-dev/` bootstrap.
 - [Style Guide](STYLE_GUIDE.md) — commit-message-authoring conventions for this repository.

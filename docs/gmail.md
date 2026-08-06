@@ -22,9 +22,10 @@ walkthrough — this page is the topic-by-topic reference.
 7. [Threads](#threads)
 8. [Labels](#labels)
 9. [Sync](#sync)
-10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-11. [Troubleshooting](#troubleshooting)
-12. [See also](#see-also)
+10. [Sync all accounts](#sync-all-accounts)
+11. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+12. [Troubleshooting](#troubleshooting)
+13. [See also](#see-also)
 
 ## Prerequisites
 
@@ -571,6 +572,96 @@ No MCP equivalent — a bulk, potentially long-running filesystem operation
 is a poor fit for a synchronous MCP tool call (the same reasoning that kept
 label mutation CLI-only above).
 
+## Sync all accounts
+
+```bash
+$ omni-dev gmail sync-all
+$ omni-dev gmail sync-all --concurrency 10
+$ omni-dev gmail sync-all --full --dry-run
+$ omni-dev gmail sync-all -o json
+```
+
+Runs [`sync`](#sync) for every account listed in `.omni-dev/gmail-sync.yaml`,
+concurrently, replacing a wrapper script that loops `gmail sync --account
+...` over each mailbox one at a time. Each account keeps its own archive
+and its own [rate limit](#rate-limits-and-retry-behaviour) budget — nothing
+about a single account's sync changes, only that several now run at once.
+See [ADR-0068](adrs/adr-0068.md) for the full design rationale.
+
+**Config file:** `.omni-dev/gmail-sync.yaml`, discovered the same way as
+every other `.omni-dev/` file (see
+[docs/omni-dev-directory.md](omni-dev-directory.md#gmail-syncyaml)) — walk-up
+from the current directory, a `local/` override, `--context-dir`/
+`OMNI_DEV_CONFIG_DIR`:
+
+```yaml
+concurrency: 20
+accounts:
+  - account: jky.greens
+    output_dir: emails/jky.greens/
+  - account: newhoggy
+    output_dir: emails/newhoggy/
+    query: "-in:spam"
+    extract_attachments: true
+```
+
+`account` must name an account already configured under
+[Multiple accounts](#multiple-accounts) — `gmail-sync.yaml` says only
+*which* accounts to sync and *where*, never a second credential store.
+`output_dir` resolves relative to the project root (the parent of the
+discovered `.omni-dev/`) unless absolute. Unlike every other `.omni-dev/`
+config file, a missing, empty, or malformed `gmail-sync.yaml`, or one
+naming an account `gmail account list` doesn't know about, is a hard error
+before any network call is made — see
+[docs/omni-dev-directory.md's Validation behaviour](omni-dev-directory.md#gmail-syncyaml-1).
+
+**`--account` is incompatible with `sync-all`:** the global `--account`/
+`OMNI_DEV_GMAIL_ACCOUNT` selector picks one mailbox; `sync-all` always
+targets the whole `gmail-sync.yaml` list, so passing both is a hard error
+rather than a silent no-op or an ignored flag.
+
+**Concurrency:** two independent caps compose. Each account's own fetch
+fan-out is still bounded by the same local concurrency `gmail sync` itself
+uses — unaffected by this command. A second, *shared* cap —
+`sync-all --concurrency` if given, else `gmail-sync.yaml`'s top-level
+`concurrency`, else the same default as `gmail sync --concurrency` — bounds
+how many fetch requests are in flight *across every account combined* at
+once, so one account can never claim the whole shared budget for itself.
+Each account still paces its own requests against its own Gmail quota
+independently (see [Rate limits](#rate-limits-and-retry-behaviour) below) —
+the shared cap is a purely local resource limit, unrelated to quota
+compliance.
+
+**Progress and output:** on the same interactive-terminal condition a single
+`gmail sync` uses (`-o table`, not `--quiet`, a `stderr` that's actually a
+tty), every account gets its own listing spinner + fetch bar, all registered
+on one shared `MultiProgress` — a single shared renderer, rather than each
+account's bars fighting another's over the same terminal, is what lets them
+all advance concurrently and stay legible. Independent of the bars, a
+one-line summary still prints per account as soon as that account finishes
+(not only once every account is done), e.g. `jky.greens: 42 fetched, 0
+errors`, followed by a trailing `combined: ...` total once every account has
+finished — that line prints through the bars (via `suspend`) rather than
+racing their redraw. `--quiet` suppresses both the live bars and the
+per-account summary lines; the combined total and any per-message error
+lines always print regardless. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl`
+instead emit one structured record per account (`account`, `actions`,
+`errors`, `summary`, and — only for an account whose task failed before
+producing a report at all, e.g. bad credentials or a rejected output
+directory — `account_error`) plus a `combined_summary`, once every account
+has finished — the same `summary` shape [Sync](#sync)'s own **Report
+summary** describes.
+
+**Exit code:** non-zero if *any* configured account either failed outright
+(bad credentials, a rejected output directory, …) or reported one or more
+per-message errors — one account's failure is never silently swallowed
+because the others succeeded. Every other account still runs to completion
+regardless of an earlier one's failure.
+
+No MCP equivalent — same reasoning as `sync` itself, doubled: a bulk,
+potentially long-running filesystem operation across several mailboxes at
+once is an even poorer fit for a synchronous MCP tool call.
+
 ## Rate limits and retry behaviour
 
 Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
@@ -750,4 +841,7 @@ succeed:
 - [ADR-0066](adrs/adr-0066.md) — the named-account store behind
   [Multiple accounts](#multiple-accounts), and why it's orthogonal to
   `--profile`.
+- [ADR-0068](adrs/adr-0068.md) — the `gmail-sync.yaml` config file and
+  shared-semaphore concurrency model behind
+  [Sync all accounts](#sync-all-accounts).
 - [Gmail API documentation](https://developers.google.com/workspace/gmail/api/reference/rest) — upstream reference.

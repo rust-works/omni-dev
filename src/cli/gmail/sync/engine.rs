@@ -24,11 +24,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::stream::{self, FuturesUnordered, StreamExt as _};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::gmail::attachments::extract_attachments;
 use crate::gmail::client::GmailClient;
@@ -58,6 +59,12 @@ pub(crate) struct SyncOptions {
     pub(crate) concurrency: usize,
     pub(crate) dry_run: bool,
     pub(crate) extract_attachments: bool,
+    /// A concurrency cap shared across every account's fetches in one
+    /// `gmail sync-all` run (ADR-0068), layered underneath `concurrency`
+    /// (each account's own local `buffer_unordered`/`FuturesUnordered`
+    /// clamp). `None` for every single-account caller — `gmail sync`'s
+    /// behavior is unaffected.
+    pub(crate) shared_pool: Option<Arc<Semaphore>>,
 }
 
 fn state_path(output_dir: &Path) -> PathBuf {
@@ -474,7 +481,23 @@ async fn fetch_and_archive_messages_streaming(
                             continue;
                         }
                         let extract_attachments_flag = opts.extract_attachments;
+                        let shared_pool = opts.shared_pool.clone();
                         in_flight.push(async move {
+                            let _permit = match &shared_pool {
+                                Some(pool) => match pool.acquire().await {
+                                    Ok(permit) => Some(permit),
+                                    Err(e) => {
+                                        return (
+                                            id,
+                                            Err(anyhow::anyhow!(
+                                                "sync-all's shared semaphore closed \
+                                                 unexpectedly: {e}"
+                                            )),
+                                        );
+                                    }
+                                },
+                                None => None,
+                            };
                             limiter.acquire(MESSAGES_GET_COST_UNITS).await;
                             let result = fetch_and_write_one(
                                 client,
@@ -595,6 +618,20 @@ async fn fetch_and_archive_messages(
     let concurrency = opts.concurrency.clamp(1, MAX_CONCURRENCY);
     let mut fetches = stream::iter(to_fetch)
         .map(|id| async move {
+            let _permit = match opts.shared_pool.as_ref() {
+                Some(pool) => match pool.acquire().await {
+                    Ok(permit) => Some(permit),
+                    Err(e) => {
+                        return (
+                            id,
+                            Err(anyhow::anyhow!(
+                                "sync-all's shared semaphore closed unexpectedly: {e}"
+                            )),
+                        );
+                    }
+                },
+                None => None,
+            };
             limiter.acquire(MESSAGES_GET_COST_UNITS).await;
             let result =
                 fetch_and_write_one(client, output_dir, &id, opts.extract_attachments).await;
@@ -898,6 +935,7 @@ mod tests {
             concurrency: 4,
             dry_run: false,
             extract_attachments: false,
+            shared_pool: None,
         }
     }
 
@@ -1527,6 +1565,7 @@ not-really-a-pdf\r\n\
                 concurrency: 4,
                 dry_run: true,
                 extract_attachments: false,
+                shared_pool: None,
             },
         )
         .await
@@ -1716,6 +1755,7 @@ not-really-a-pdf\r\n\
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
+            shared_pool: None,
         };
 
         fetch_and_archive_messages(
@@ -1804,6 +1844,7 @@ not-really-a-pdf\r\n\
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
+            shared_pool: None,
         };
 
         // The slow ids' 3600s delay never elapses within this test, so the
@@ -1878,6 +1919,7 @@ not-really-a-pdf\r\n\
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
+            shared_pool: None,
         };
 
         let (ids_tx, ids_rx) = mpsc::unbounded_channel();
@@ -2169,6 +2211,7 @@ not-really-a-pdf\r\n\
                 concurrency: 4,
                 dry_run: true,
                 extract_attachments: false,
+                shared_pool: None,
             },
         )
         .await
@@ -2235,5 +2278,190 @@ not-really-a-pdf\r\n\
             }
             _ => panic!("expected the original state to survive"),
         }
+    }
+
+    // ── shared concurrency pool for `sync-all` (ADR-0068) ────────────────
+
+    #[tokio::test]
+    async fn shared_pool_of_one_never_lets_two_fetches_be_in_flight_at_once() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        // Both ids' responses never arrive within this test — the only way
+        // a second `messages.get` request could ever reach the server is if
+        // the shared semaphore (sized to 1) incorrectly let a second fetch
+        // start before the first one's permit was released.
+        let slow_ids = ["slow0", "slow1"];
+        for id in slow_ids {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/gmail/v1/users/me/messages/{id}"
+                )))
+                .and(wiremock::matchers::query_param("format", "raw"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "id": id, "threadId": "t1", "labelIds": ["INBOX"],
+                            "internalDate": "1700000000000", "historyId": "500",
+                            "raw": raw_message_body(id, "Slow"),
+                        }))
+                        .set_delay(std::time::Duration::from_secs(3600)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let ids: Vec<String> = slow_ids.iter().copied().map(str::to_string).collect();
+        let opts = SyncOptions {
+            output_dir: output_dir.clone(),
+            query: None,
+            full: false,
+            // A generous *local* concurrency: only the shared pool should
+            // be the thing capping in-flight requests to 1 here.
+            concurrency: 20,
+            dry_run: false,
+            extract_attachments: false,
+            shared_pool: Some(Arc::new(Semaphore::new(1))),
+        };
+
+        let never_more_than_one_in_flight = async {
+            // Wait for the one fetch the semaphore should admit.
+            loop {
+                let received = server.received_requests().await.unwrap_or_default();
+                if received
+                    .iter()
+                    .any(|r| r.url.path().contains("/messages/slow"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Give a broken (unbounded) implementation ample opportunity to
+            // also have started the second fetch by now.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let received = server.received_requests().await.unwrap_or_default();
+            let in_flight = received
+                .iter()
+                .filter(|r| r.url.path().contains("/messages/slow"))
+                .count();
+            assert_eq!(
+                in_flight, 1,
+                "shared_pool sized to 1 should never admit a second concurrent fetch"
+            );
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = fetch_and_archive_messages(
+                    &client, &mut manifest, &ids, &limiter, &opts, &mut report, None,
+                ) => {
+                    panic!(
+                        "fetch_and_archive_messages returned before the slow ids' 3600s delay \
+                         could possibly elapse"
+                    );
+                }
+                () = never_more_than_one_in_flight => {}
+            }
+        })
+        .await
+        .expect("the single admitted fetch was never observed within 5s");
+    }
+
+    // A closed `Semaphore` can't happen through any code path today (nothing
+    // ever calls `Semaphore::close`) — these two tests exercise the
+    // defensive `pool.acquire()` error arms directly, the same way a real
+    // `AcquireError` would surface, rather than leaving them unreachable in
+    // practice and untested in principle.
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_streaming_reports_error_when_shared_pool_closed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let pool = Arc::new(Semaphore::new(1));
+        pool.close();
+        let opts = SyncOptions {
+            output_dir,
+            query: None,
+            full: false,
+            concurrency: 4,
+            dry_run: false,
+            extract_attachments: false,
+            shared_pool: Some(pool),
+        };
+
+        let (ids_tx, ids_rx) = mpsc::unbounded_channel();
+        ids_tx.send("id1".to_string()).unwrap();
+        drop(ids_tx);
+
+        fetch_and_archive_messages_streaming(
+            &client,
+            &mut manifest,
+            ids_rx,
+            &limiter,
+            &opts,
+            &mut report,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0]
+            .reason
+            .contains("sync-all's shared semaphore closed unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_reports_error_when_shared_pool_closed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let pool = Arc::new(Semaphore::new(1));
+        pool.close();
+        let opts = SyncOptions {
+            output_dir,
+            query: None,
+            full: false,
+            concurrency: 4,
+            dry_run: false,
+            extract_attachments: false,
+            shared_pool: Some(pool),
+        };
+
+        fetch_and_archive_messages(
+            &client,
+            &mut manifest,
+            &["id1".to_string()],
+            &limiter,
+            &opts,
+            &mut report,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0]
+            .reason
+            .contains("sync-all's shared semaphore closed unexpectedly"));
     }
 }
