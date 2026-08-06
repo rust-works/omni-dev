@@ -316,6 +316,17 @@ async fn run_full_sync(
 /// Applies `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
 /// history events since `start_history_id`. A 404 (watermark past Gmail's
 /// retention window) propagates unchanged for [`run_sync`] to catch.
+///
+/// A message can be added and deleted again within the same history
+/// window (routine server-side churn — an auto-filtered message, a sent
+/// mail immediately recalled) — every deleted id is pre-scanned across the
+/// *whole* response first specifically so `to_fetch` can exclude them:
+/// fetching one would just 404 (it's already gone by the time we'd ask),
+/// and that 404 has nothing to do with a real failure. Symmetrically,
+/// [`SyncAction::Deleted`] is only reported — and the manifest only
+/// touched — for an id [`Manifest::mark_deleted`] actually had a record
+/// for; a same-window churn id never got archived, so there's nothing to
+/// report deleting.
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -328,19 +339,28 @@ async fn run_incremental(
         .list_all_unbounded(start_history_id, &[], limiter)
         .await?;
 
+    let deleted_ids: HashSet<String> = history
+        .history
+        .iter()
+        .flat_map(|record| &record.messages_deleted)
+        .map(|deleted| deleted.message.id.clone())
+        .collect();
+
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
     for record in &history.history {
         for added in &record.messages_added {
-            if seen.insert(added.message.id.clone()) {
+            if !deleted_ids.contains(&added.message.id) && seen.insert(added.message.id.clone()) {
                 to_fetch.push(added.message.id.clone());
             }
         }
         for deleted in &record.messages_deleted {
-            manifest.mark_deleted(&deleted.message.id, Utc::now());
-            report.actions.push(SyncAction::Deleted {
-                id: deleted.message.id.clone(),
-            });
+            if manifest.get(&deleted.message.id).is_some() {
+                manifest.mark_deleted(&deleted.message.id, Utc::now());
+                report.actions.push(SyncAction::Deleted {
+                    id: deleted.message.id.clone(),
+                });
+            }
         }
         for change in &record.labels_added {
             manifest.add_labels(&change.message.id, &change.label_ids);
@@ -1082,6 +1102,64 @@ not-really-a-pdf\r\n\
             LoadOutcome::Present(s) => assert_eq!(s.history_id, "300"),
             _ => panic!("expected the new historyId to be persisted"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_sync_ignores_a_message_added_and_deleted_within_the_same_history_window() {
+        // Routine server-side churn (an auto-filtered message, a sent mail
+        // immediately recalled): a message can be added and deleted again
+        // before the next sync ever sees it. Fetching it would just 404,
+        // and that isn't a real failure — see `run_incremental`'s doc
+        // comment.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [{"message": {"id": "churn1", "threadId": "t1"}}],
+                        "messagesDeleted": [{"message": {"id": "churn1", "threadId": "t1"}}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Deliberately no mock for GET .../messages/churn1 — fetching it at
+        // all (not just erroring) is the bug this test guards against.
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Deleted { id } if id == "churn1")),
+            "a message never archived shouldn't be reported as deleted"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(
+            manifest.get("churn1").is_none(),
+            "a same-window add+delete should never create a manifest record"
+        );
     }
 
     // ── account-identity validation ────────────────────────────────────
