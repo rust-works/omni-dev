@@ -127,6 +127,7 @@ pub(crate) async fn run_sync_with_progress(
                 opts,
                 &limiter,
                 &mut report,
+                progress,
             )
             .await
             {
@@ -327,6 +328,15 @@ async fn run_full_sync(
 /// touched — for an id [`Manifest::mark_deleted`] actually had a record
 /// for; a same-window churn id never got archived, so there's nothing to
 /// report deleting.
+///
+/// `history.list`'s own pagination isn't streamed (unlike
+/// [`run_full_sync`]'s listing — see its module-level rationale): this path
+/// is typically a single page already (`docs/gmail.md`'s Sync section), so
+/// this only emits one before/after [`SyncProgressEvent::ListingPage`]/
+/// [`SyncProgressEvent::ListingDone`] pair around the whole call rather than
+/// per-page updates — enough that `sync`'s progress bars don't sit frozen
+/// at their initial state for an incremental run's entire duration, without
+/// a second streaming primitive to get there.
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -334,6 +344,7 @@ async fn run_incremental(
     opts: &SyncOptions,
     limiter: &TokenBucket,
     report: &mut SyncReport,
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<String> {
     let history = HistoryApi::new(client)
         .list_all_unbounded(start_history_id, &[], limiter)
@@ -380,7 +391,16 @@ async fn run_incremental(
         }
     }
 
-    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report).await?;
+    if let Some(tx) = progress {
+        let _ = tx.send(SyncProgressEvent::ListingPage {
+            pages: 1,
+            ids_discovered: to_fetch.len(),
+        });
+        let _ = tx.send(SyncProgressEvent::ListingDone);
+    }
+
+    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report, progress)
+        .await?;
 
     Ok(history
         .history_id
@@ -530,6 +550,7 @@ async fn fetch_and_archive_messages(
     limiter: &TokenBucket,
     opts: &SyncOptions,
     report: &mut SyncReport,
+    progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<()> {
     let output_dir = &opts.output_dir;
     let mut seen = HashSet::new();
@@ -561,6 +582,16 @@ async fn fetch_and_archive_messages(
         return Ok(());
     }
 
+    // The whole batch is already known (unlike run_full_sync's live-streamed
+    // listing), so the fetch bar's total is knowable up front — one
+    // `FetchQueued` per item gives a fully determinate bar from the start
+    // rather than one that grows as ids trickle in.
+    if let Some(tx) = progress {
+        for _ in 0..to_fetch.len() {
+            let _ = tx.send(SyncProgressEvent::FetchQueued);
+        }
+    }
+
     let concurrency = opts.concurrency.clamp(1, MAX_CONCURRENCY);
     let mut fetches = stream::iter(to_fetch)
         .map(|id| async move {
@@ -573,6 +604,7 @@ async fn fetch_and_archive_messages(
 
     let mut since_checkpoint = 0usize;
     while let Some((id, result)) = fetches.next().await {
+        let failed = result.is_err();
         match result {
             Ok(record) => {
                 report.actions.push(SyncAction::Fetched {
@@ -591,6 +623,9 @@ async fn fetch_and_archive_messages(
         if since_checkpoint >= MANIFEST_CHECKPOINT_INTERVAL {
             manifest.save(&manifest_path(output_dir))?;
             since_checkpoint = 0;
+        }
+        if let Some(tx) = progress {
+            let _ = tx.send(SyncProgressEvent::FetchCompleted { failed });
         }
     }
     Ok(())
@@ -1162,6 +1197,86 @@ not-really-a-pdf\r\n\
         );
     }
 
+    #[tokio::test]
+    async fn run_incremental_via_run_sync_with_progress_emits_fetch_events() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_raw_get(&server, "m1", "New message").await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let report = run_sync_with_progress(&client, &opts(output_dir), Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        assert!(report.errors.is_empty());
+        // The bars must not sit frozen at their initial state for an
+        // incremental run's whole duration (the bug this test guards
+        // against): at least one real listing update plus a matched
+        // queued/completed pair for the one message fetched.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SyncProgressEvent::ListingPage {
+                ids_discovered: 1,
+                ..
+            }
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::ListingDone))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::FetchQueued))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SyncProgressEvent::FetchCompleted { failed: false }))
+                .count(),
+            1
+        );
+    }
+
     // ── account-identity validation ────────────────────────────────────
 
     #[tokio::test]
@@ -1603,9 +1718,17 @@ not-really-a-pdf\r\n\
             extract_attachments: false,
         };
 
-        fetch_and_archive_messages(&client, &mut manifest, &ids, &limiter, &opts, &mut report)
-            .await
-            .unwrap();
+        fetch_and_archive_messages(
+            &client,
+            &mut manifest,
+            &ids,
+            &limiter,
+            &opts,
+            &mut report,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(report.errors.is_empty());
 
         // Two checkpoint boundaries' worth of records should already have
@@ -1702,7 +1825,7 @@ not-really-a-pdf\r\n\
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::select! {
                 _ = fetch_and_archive_messages(
-                    &client, &mut manifest, &ids, &limiter, &opts, &mut report,
+                    &client, &mut manifest, &ids, &limiter, &opts, &mut report, None,
                 ) => {
                     panic!(
                         "fetch_and_archive_messages returned before the slow ids' delay could \
