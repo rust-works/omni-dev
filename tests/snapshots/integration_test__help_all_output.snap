@@ -4261,14 +4261,14 @@ omni-dev gmail extract-attachments - Retroactively extracts attachments for alre
 
 Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
 
-Usage: extract-attachments [OPTIONS] --output-dir <PATH>
+Usage: extract-attachments [OPTIONS] --archive-dir <PATH>
 
 Options:
-      --output-dir <PATH>  Archive directory previously populated by `gmail sync`/`sync-all`
-      --dry-run            Reports which messages would gain extracted attachments without writing any file
-      --quiet              Only shows errors, suppresses the per-message action lines
-  -o, --output <OUTPUT>    Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help               Print help (see more with '--help')
+      --archive-dir <PATH>  Archive directory previously populated by `gmail sync`/`sync-all`
+      --dry-run             Reports which messages would gain extracted attachments without writing any file
+      --quiet               Only shows errors, suppresses the per-message action lines
+  -o, --output <OUTPUT>     Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================
