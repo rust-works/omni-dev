@@ -5,7 +5,7 @@
 //!
 //! Opt-in per account via `chrome_profile_from_email`
 //! (`crate::utils::settings::GmailAccountSettings`) — see
-//! [`super::auth::build_browser_config`], the sole caller. Chrome-only for
+//! `super::auth::build_browser_config`, the sole caller. Chrome-only for
 //! v1; the manual `browser_command` escape hatch already covers every other
 //! browser.
 //!
