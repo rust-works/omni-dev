@@ -134,9 +134,9 @@ pub struct McpSettings {
 /// `gmail.accounts` map (issue #1500, [ADR-0066](../../docs/adrs/adr-0066.md)).
 ///
 /// Orthogonal to [`Profile`]: selecting a Gmail account never changes the
-/// active `--profile`, and vice versa. `email_address` is a display-only
-/// cache populated opportunistically by `gmail auth status` — never used for
-/// auth, never written by `login`/`import`.
+/// active `--profile`, and vice versa. See `email_address`'s own doc
+/// comment below for how it's populated and used — never for
+/// authentication itself.
 #[derive(Debug, Default, Deserialize)]
 pub struct GmailAccountSettings {
     /// OAuth2 client id from the account's Google Cloud project.
@@ -151,10 +151,33 @@ pub struct GmailAccountSettings {
     /// The OAuth2 scope this account was authorized with.
     #[serde(default)]
     pub scope: Option<String>,
-    /// Display-only mailbox address, populated opportunistically by
-    /// `gmail auth status`. Never used for authentication.
+    /// Mailbox address for this account. Populated opportunistically by
+    /// `gmail auth status` when absent, but may also be set by hand ahead of
+    /// the first login — e.g. to opt into `chrome_profile_from_email` below.
+    /// An explicit value is never overwritten by the `gmail auth status`
+    /// backfill. Never used for authentication itself, only for browser
+    /// targeting.
     #[serde(default)]
     pub email_address: Option<String>,
+
+    /// Opt-in (default `false`): resolve which local Chrome profile is
+    /// signed into `email_address` and launch `gmail auth login`'s
+    /// authorization URL targeting that profile, instead of the OS default
+    /// browser. Resolution failure (Chrome not installed, zero or multiple
+    /// matching profiles, ...) always falls back to the default browser —
+    /// never a hard login failure. Ignored when `browser_command` is set.
+    /// (issue #1505, [ADR-0067](../../docs/adrs/adr-0067.md))
+    #[serde(default)]
+    pub chrome_profile_from_email: bool,
+
+    /// Explicit browser launch command for `gmail auth login`, `{url}`
+    /// templated (or appended if no placeholder is present) — the manual
+    /// escape hatch, e.g. to target a specific Chrome profile by hand or a
+    /// non-Chrome browser entirely. Mirrors `SNOWFLAKE_BROWSER_COMMAND`
+    /// (`crate::snowflake`). Takes precedence over `chrome_profile_from_email`.
+    /// (issue #1505)
+    #[serde(default)]
+    pub browser_command: Option<String>,
 }
 
 /// The `gmail` section of `settings.json` — named Gmail accounts, selected
