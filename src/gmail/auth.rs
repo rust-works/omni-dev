@@ -329,8 +329,19 @@ fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
 
 /// Opportunistic `email_address` backfill for `name`, populated by `gmail
 /// auth status --all` after a successful live `users.getProfile` call.
-/// Never used for authentication, never written by `login`/`import`.
+/// Never used for authentication, never written by `login`/`import`. A
+/// no-op when `name` already has an `email_address` — an explicit or
+/// previously-backfilled value is never overwritten (issue #1505).
 pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
+    let settings = Settings::load().unwrap_or_default();
+    if settings
+        .gmail
+        .accounts
+        .get(name)
+        .is_some_and(|account| account.email_address.is_some())
+    {
+        return Ok(());
+    }
     Settings::upsert_gmail_account(
         &Settings::get_settings_path()?,
         name,
@@ -2503,6 +2514,28 @@ mod tests {
             "alice@work.com"
         );
         assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "id");
+    }
+
+    #[test]
+    fn record_account_email_does_not_overwrite_an_existing_value() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("email_address", "manually-set@work.com")],
+        )
+        .unwrap();
+
+        record_account_email("work", "alice@work.com").unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["gmail"]["accounts"]["work"]["email_address"],
+            "manually-set@work.com"
+        );
     }
 
     /// The zero-migration guarantee (issue #1500): with `gmail.accounts`
