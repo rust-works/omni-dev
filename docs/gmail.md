@@ -24,9 +24,10 @@ walkthrough — this page is the topic-by-topic reference.
 9. [Sync](#sync)
 10. [Sync all accounts](#sync-all-accounts)
 11. [Extract attachments](#extract-attachments)
-12. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-13. [Troubleshooting](#troubleshooting)
-14. [See also](#see-also)
+12. [Render](#render)
+13. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+14. [Troubleshooting](#troubleshooting)
+15. [See also](#see-also)
 
 ## Prerequisites
 
@@ -333,6 +334,10 @@ only on `gmail read`, the one command with a naturally file-shaped payload
 (a message body/attachment source worth writing to disk); no other Gmail
 leaf has a use for it.
 
+`gmail read` additionally accepts `-o markdown` — a human-readable
+Markdown rendering of the message rather than a machine-readable format;
+see [Messages](#messages) and [Render](#render).
+
 ## Search
 
 ```bash
@@ -367,6 +372,8 @@ $ omni-dev gmail read <message-id>
 $ omni-dev gmail read <message-id> --detail minimal
 $ omni-dev gmail read <message-id> --detail metadata
 $ omni-dev gmail read <message-id> --detail raw --out-file message.eml
+$ omni-dev gmail read <message-id> -o markdown
+$ omni-dev gmail read <message-id> -o markdown --out-file message.md
 ```
 
 `--detail` controls how much of the message is fetched — named `--detail`,
@@ -381,6 +388,18 @@ instead of stdout for `minimal`/`metadata`/`full`; for `raw` it decodes the
 base64url payload first and writes the literal RFC 2822 bytes, so
 `--detail raw --out-file message.eml` produces a genuine `.eml` rather than
 still-encoded text.
+
+**`-o markdown`** renders the message as human-readable Markdown: a header
+block (Subject/From/To/Cc/Date/Message-Id/In-Reply-To/References, RFC
+2047-decoded — unlike the raw wire encoding [Sync](#sync)'s manifest
+fields keep), the body (`text/plain` preferred, `text/html` converted to
+Markdown otherwise), and an attachment filename list. It always fetches the
+complete raw MIME message regardless of `--detail` (rendering needs the
+full structure), so `--detail` is ignored when combined with `-o markdown`.
+The same rendering function backs [`gmail render`](#render) for already-
+archived `.eml` files — `-o markdown` is the live-fetch equivalent, useful
+when you want readable text for one message without archiving the whole
+mailbox first.
 
 ### MCP equivalent(s)
 
@@ -529,7 +548,10 @@ raw message bytes (no second network request), and are stored as their raw
 wire encoding — non-ASCII subjects encoded per RFC 2047
 (`=?UTF-8?B?...?=`) are **not** decoded to human-readable text in this
 release. `in_reply_to`/`references` are what let a conversation be
-reconstructed from the manifest alone, without re-parsing every `.eml`.
+reconstructed from the manifest alone, without re-parsing every `.eml`. To
+read an individual archived message with its headers properly decoded, use
+[`gmail render`](#render) against its `.eml` file (or `gmail read -o
+markdown` for a live, not-yet-archived message) rather than the manifest.
 
 **Attachments:** `attachment_count` and `attachment_filenames` record how
 many MIME parts are marked `Content-Disposition: attachment` and whichever
@@ -718,6 +740,55 @@ structured formats, with the full per-action listing always included in
 
 No MCP equivalent — a bulk filesystem operation is as poor a fit here as
 it is for `sync` itself.
+
+## Render
+
+```bash
+$ omni-dev gmail render message.eml
+$ omni-dev gmail render messages/2026/01/*/*/*.eml
+$ omni-dev gmail render message.eml --out-dir rendered/
+$ omni-dev gmail render *.eml -o json
+```
+
+Renders one or more `.eml` files as human-readable Markdown: a header
+block (Subject/From/To/Cc/Date/Message-Id/In-Reply-To/References, RFC
+2047-decoded), the body (`text/plain` preferred, `text/html` converted to
+Markdown otherwise), and an attachment filename list (listed, never
+embedded — this is a readable rendering, not an export). Purely local and
+fast, like [Extract attachments](#extract-attachments): it never resolves
+a client, so no credentials, `--account`, or network access are needed.
+
+Unlike every other Gmail subcommand, `render` takes bare file paths
+instead of a message id or `--archive-dir` — it has no dependency on the
+mailbox having been synced by this tool at all. This works equally well
+piped a glob from a `gmail sync` archive
+(`messages/<year>/<month>/<day>/*.eml`) or any other `.eml` file, from
+anywhere. The same rendering function backs `gmail read -o markdown`; see
+[Messages](#messages).
+
+By default (no `--out-dir`), each input's rendered Markdown is printed
+directly to stdout — with more than one input, successive renderings are
+separated by a `---` thematic break — so `omni-dev gmail render *.eml >
+combined.md` produces clean, redirectable Markdown as long as every input
+renders successfully. **`--out-dir DIR`** instead writes one `.md` file
+per input into `DIR` (named after the input's stem, e.g. `abc123.eml` ->
+`abc123.md`; `DIR` is created if missing), printing a `Saved to:` line per
+file instead.
+
+A per-file read/parse/write failure (a missing path, a permission error)
+is recorded against that file rather than aborting the run — the rest of
+the batch still renders — but the command still exits non-zero if any
+file failed. An unparseable message degrades to a short placeholder rather
+than failing outright, the same posture
+[`extract-attachments`](#extract-attachments) takes for a message whose
+real MIME parse disagrees with the cheap heuristic.
+
+`-o json`/`-o yaml`/`-o yamls`/`-o jsonl` emit one structured record per
+input (`path`, and either `markdown` or `saved_to`, plus `error` for a
+failed file) instead of the Table view above.
+
+No MCP equivalent — same reasoning as
+[Extract attachments](#extract-attachments).
 
 ## Rate limits and retry behaviour
 
