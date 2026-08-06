@@ -121,11 +121,13 @@ fn build_launch_command(profile_dir: &str) -> Vec<String> {
     build_launch_command_for(current_chrome_os(), profile_dir)
 }
 
-/// The default per-OS location of Chrome's `Local State` file, or `None`
-/// when the OS's user-data directory can't be determined (e.g. `$HOME`
-/// unset) — the fail-open case that skips resolution entirely.
-fn default_local_state_path() -> Option<PathBuf> {
-    match current_chrome_os() {
+/// The default `Local State` file location for `os` — parameterized like
+/// [`build_launch_command_for`] so all three shapes are unit-testable
+/// regardless of the host running the tests. `None` when the OS's
+/// user-data directory can't be determined (e.g. `$HOME` unset) — the
+/// fail-open case that skips resolution entirely.
+fn default_local_state_path_for(os: ChromeOs) -> Option<PathBuf> {
+    match os {
         ChromeOs::Macos => {
             dirs::config_dir().map(|dir| dir.join("Google").join("Chrome").join("Local State"))
         }
@@ -139,6 +141,11 @@ fn default_local_state_path() -> Option<PathBuf> {
                 .join("Local State")
         }),
     }
+}
+
+/// [`default_local_state_path_for`] against the current host OS.
+fn default_local_state_path() -> Option<PathBuf> {
+    default_local_state_path_for(current_chrome_os())
 }
 
 /// Attempts to resolve a Chrome-profile launch command for `email` by
@@ -198,6 +205,46 @@ pub(crate) fn resolve_launch_command(email: &str) -> Option<Vec<String>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Thread-scoped log buffer, mirroring the `capture_info`/`CaptureWriter`
+    /// pattern in `daemon/services/worktrees.rs`: `tracing`'s events only
+    /// evaluate their field expressions (e.g. `path.display()`) when some
+    /// subscriber is actually listening, so a test that never installs one
+    /// leaves those expressions — and the coverage they'd otherwise add —
+    /// unexercised even though the surrounding branch runs.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` under a thread-local INFO-level subscriber and returns
+    /// everything it logged. `f` must be fully synchronous on this thread.
+    fn capture_info(f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+        logs
+    }
 
     const FIXTURE: &str = r#"{
         "profile": {
@@ -314,7 +361,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist");
 
-        assert_eq!(resolve_launch_command_at("alice@example.com", &path), None);
+        let mut result = None;
+        let logs = capture_info(|| {
+            result = Some(resolve_launch_command_at("alice@example.com", &path));
+        });
+        assert_eq!(result, Some(None));
+        assert!(logs.contains("could not read"));
     }
 
     #[test]
@@ -323,7 +375,12 @@ mod tests {
         let path = dir.path().join("Local State");
         fs::write(&path, "not json").unwrap();
 
-        assert_eq!(resolve_launch_command_at("alice@example.com", &path), None);
+        let mut result = None;
+        let logs = capture_info(|| {
+            result = Some(resolve_launch_command_at("alice@example.com", &path));
+        });
+        assert_eq!(result, Some(None));
+        assert!(logs.contains("could not parse"));
     }
 
     #[test]
@@ -349,6 +406,57 @@ mod tests {
         }"#;
         fs::write(&path, fixture).unwrap();
 
-        assert_eq!(resolve_launch_command_at("shared@example.com", &path), None);
+        let mut result = None;
+        let logs = capture_info(|| {
+            result = Some(resolve_launch_command_at("shared@example.com", &path));
+        });
+        assert_eq!(result, Some(None));
+        assert!(logs.contains("multiple Chrome profiles"));
+    }
+
+    // ── default_local_state_path (per-OS paths) ─────────────────────────
+
+    #[test]
+    fn default_local_state_path_for_macos_targets_application_support() {
+        let path =
+            default_local_state_path_for(ChromeOs::Macos).expect("config_dir resolves in tests");
+        assert!(path.ends_with("Google/Chrome/Local State"));
+    }
+
+    #[test]
+    fn default_local_state_path_for_linux_targets_dot_config() {
+        let path =
+            default_local_state_path_for(ChromeOs::Linux).expect("config_dir resolves in tests");
+        assert!(path.ends_with("google-chrome/Local State"));
+    }
+
+    #[test]
+    fn default_local_state_path_for_windows_targets_local_app_data() {
+        let path = default_local_state_path_for(ChromeOs::Windows)
+            .expect("data_local_dir resolves in tests");
+        assert!(path.ends_with("Google/Chrome/User Data/Local State"));
+    }
+
+    #[test]
+    fn default_local_state_path_delegates_to_the_current_host_os() {
+        assert_eq!(
+            default_local_state_path(),
+            default_local_state_path_for(current_chrome_os())
+        );
+    }
+
+    // ── resolve_launch_command (public entry point) ─────────────────────
+
+    #[test]
+    fn resolve_launch_command_falls_open_for_an_unmatched_email() {
+        // Exercises the real per-OS `Local State` path without depending on
+        // (or reading) any real Chrome profile data on the host: no
+        // installed profile is plausibly signed into this email, so every
+        // fail-open branch (missing/unreadable file, no match) converges on
+        // `None` regardless of the host running the test.
+        assert_eq!(
+            resolve_launch_command("definitely-not-a-real-account+omni-dev-test@invalid.example"),
+            None
+        );
     }
 }
