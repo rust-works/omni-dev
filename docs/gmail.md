@@ -157,8 +157,10 @@ Granted scope: gmail.readonly
 
 `--all` degenerates to the single-account output above when no named
 accounts are configured. Each successful check also backfills that
-account's cached `email_address` in `settings.json` (display-only; never
-used for authentication).
+account's cached `email_address` in `settings.json` if it isn't already
+set (never used for authentication itself — only for the browser-profile
+targeting below) — an explicit value, whether you set it by hand or a
+previous check backfilled it, is never overwritten.
 
 ### Removing credentials
 
@@ -268,6 +270,57 @@ When a command runs, the account it uses is resolved in this order:
 4. No named accounts configured at all: falls through unchanged to the
    pre-multi-account resolution (process env → the active `--profile`'s
    `env` map → the base `env` map) — the zero-migration path.
+
+### Browser profile targeting
+
+With several named accounts, `gmail auth login` opening whatever profile
+your default browser happens to be on means you have to switch Google
+identities by hand on the consent screen — easy to get wrong, and it can
+land the refresh token on the wrong mailbox entirely. Two escape hatches,
+both configured per account in `settings.json`'s `gmail.accounts.<name>`
+and both opt-in — neither changes behaviour for an account that sets
+neither:
+
+**Manual — `browser_command`.** An explicit launch command, with `{url}`
+substituted for the authorization URL (or appended, if no `{url}`
+placeholder is present). Takes precedence over automatic resolution below.
+Works for any browser, not just Chrome:
+
+```json
+"gmail": {
+  "accounts": {
+    "jky.greens": {
+      "browser_command": "open -na \"Google Chrome\" --args --profile-directory=\"Profile 7\" {url}"
+    }
+  }
+}
+```
+
+**Automatic — `chrome_profile_from_email`.** Set this `true` alongside
+`email_address` (see [Verifying credentials](#verifying-credentials) above
+— set it by hand, or let `gmail auth status --all` backfill it after a
+first login) and `gmail auth login` looks up which local Chrome profile is
+signed into that address, launching the authorization URL targeting it
+instead of the OS default browser:
+
+```json
+"gmail": {
+  "accounts": {
+    "jky.greens": {
+      "email_address": "jky.greens@example.com",
+      "chrome_profile_from_email": true
+    }
+  }
+}
+```
+
+Chrome-only for now (no Chromium/Brave/Edge support yet — use
+`browser_command` for those). Resolution reads Chrome's own `Local State`
+file and never guesses: zero matching profiles or more than one profile
+signed into the same address both fall back to the OS default browser
+rather than picking one, same as Chrome not being installed or the file
+being unreadable — resolution failure is always a fallback, never a login
+failure. See [ADR-0067](adrs/adr-0067.md) for the full design rationale.
 
 ## Output formats
 
@@ -606,6 +659,10 @@ process.
 to open (e.g. over SSH, or in a headless environment), the authorization
 URL is printed to the terminal for you to open manually — no CLI flag is
 needed to force this fallback; it's the same code path.
+
+If it opens the *wrong* browser profile (mixing up which named account
+lands on which Google identity), see [Browser profile
+targeting](#browser-profile-targeting) above.
 
 ### No Gmail scope was granted
 

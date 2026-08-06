@@ -90,3 +90,4 @@ by Michael Nygard.
 | [ADR-0064](adr-0064.md)  | ✅ Accepted                              | 2026-08-03 | Presence-on-Disk Idempotence and Immutable-`.eml`/Mutable-Manifest Split for `gmail sync`   |
 | [ADR-0065](adr-0065.md)  | ✅ Accepted                              | 2026-08-04 | `gmail sync --extract-attachments`                                                          |
 | [ADR-0066](adr-0066.md)  | ✅ Accepted                              | 2026-08-05 | A Gmail-Specific Named-Account Store, Orthogonal to `--profile`                             |
+| [ADR-0067](adr-0067.md)  | ✅ Accepted                              | 2026-08-06 | Automatic Chrome-Profile Resolution for Gmail Login, Opt-In Per Account                     |
