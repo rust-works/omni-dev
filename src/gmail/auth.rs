@@ -1388,6 +1388,39 @@ mod tests {
         );
     }
 
+    // ── resolve_browser_config_for (issue #1505) ────────────────────────
+
+    #[test]
+    fn resolve_browser_config_for_legacy_account_defaults_to_auto() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
+        std::env::set_var(GMAIL_CLIENT_SECRET, "legacy-secret");
+        std::env::set_var(GMAIL_REFRESH_TOKEN, "legacy-refresh");
+
+        let gmail = GmailSettings::default();
+        assert_is_auto(resolve_browser_config_for(&gmail, None).unwrap());
+    }
+
+    #[test]
+    fn resolve_browser_config_for_named_account_without_chrome_opt_in_defaults_to_auto() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let mut gmail = GmailSettings::default();
+        gmail.accounts.insert(
+            "work".to_string(),
+            GmailAccountSettings {
+                email_address: Some("alice@example.com".to_string()),
+                ..GmailAccountSettings::default()
+            },
+        );
+
+        // chrome_profile_from_email is false, so this never touches the
+        // real chrome_profile::resolve_launch_command resolver.
+        assert_is_auto(resolve_browser_config_for(&gmail, Some("work")).unwrap());
+    }
+
     // ── Loopback listener (real sockets, no wiremock) ───────────────────
 
     #[tokio::test]
