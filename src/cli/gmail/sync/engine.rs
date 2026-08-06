@@ -31,7 +31,7 @@ use chrono::Utc;
 use futures::stream::{self, FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::gmail::attachments::extract_attachments;
+use crate::gmail::attachments::{extract_attachments, ExtractedAttachment};
 use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
 use crate::gmail::history_api::HistoryApi;
@@ -71,7 +71,10 @@ fn state_path(output_dir: &Path) -> PathBuf {
     output_dir.join("state.json")
 }
 
-fn manifest_path(output_dir: &Path) -> PathBuf {
+/// `pub(crate)` — also used by `gmail extract-attachments`
+/// (`cli/gmail/extract_attachments/engine.rs`), which reads the same
+/// on-disk manifest without going through a full `run_sync`.
+pub(crate) fn manifest_path(output_dir: &Path) -> PathBuf {
     output_dir.join("manifest.jsonl")
 }
 
@@ -728,11 +731,7 @@ async fn fetch_and_write_one(
         let extracted = extract_attachments(&bytes);
         if !extracted.is_empty() {
             let dir = attachments_dir(output_dir, id, date);
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("Failed to create {}", dir.display()))?;
-            for attachment in &extracted {
-                write_atomic(&dir.join(&attachment.filename), &attachment.contents)?;
-            }
+            write_attachments_atomically(&dir, &extracted)?;
         }
     }
 
@@ -759,11 +758,53 @@ async fn fetch_and_write_one(
 /// Writes `contents` to `path` via a sibling dotfile + rename, so a crash
 /// mid-write can never leave a partial `.eml` that a later run's
 /// presence-on-disk check would mistake for a complete archive.
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+///
+/// `pub(crate)` — also used by `gmail extract-attachments`
+/// (`cli/gmail/extract_attachments/engine.rs`) to write extracted
+/// attachment files, the exact same durability requirement this was
+/// written for.
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
     let tmp = path.with_file_name(format!(".{file_name}.tmp"));
     std::fs::write(&tmp, contents).with_context(|| format!("Failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("Failed to finalise {}", path.display()))
+}
+
+/// Writes every attachment in `attachments` into `dir`, publishing the
+/// whole set in one atomic step — the directory-level counterpart of
+/// [`write_atomic`]. Builds the files in a hidden sibling directory first
+/// and only `rename`s it to `dir` once every file has landed, so a
+/// mid-batch failure (disk full, a permission error, ...) never leaves
+/// `dir` existing-but-partial: either `dir` ends up fully populated, or it
+/// never exists at all. That is load-bearing for callers that treat
+/// `dir.exists()` as "already extracted" — `gmail extract-attachments`
+/// (`cli/gmail/extract_attachments/engine.rs`) relies on exactly that to
+/// decide whether a message is safe to skip on a re-run, and a
+/// partially-written `dir` would otherwise be skipped forever, never
+/// retried.
+///
+/// `pub(crate)` — shared by [`fetch_and_write_one`] and
+/// `extract_attachments::engine::run_extract_attachments`, which both
+/// write a `Vec<ExtractedAttachment>` into a message's `attachments/`
+/// directory.
+pub(crate) fn write_attachments_atomically(
+    dir: &Path,
+    attachments: &[ExtractedAttachment],
+) -> Result<()> {
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    let tmp_dir = dir.with_file_name(format!(".{dir_name}.tmp"));
+    if tmp_dir.exists() {
+        // Left behind by an earlier run that failed partway through this
+        // same message — clear it before rebuilding from scratch.
+        std::fs::remove_dir_all(&tmp_dir)
+            .with_context(|| format!("Failed to clear stale {}", tmp_dir.display()))?;
+    }
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("Failed to create {}", tmp_dir.display()))?;
+    for attachment in attachments {
+        write_atomic(&tmp_dir.join(&attachment.filename), &attachment.contents)?;
+    }
+    std::fs::rename(&tmp_dir, dir).with_context(|| format!("Failed to finalise {}", dir.display()))
 }
 
 /// A 404 on `history.list` is Google's documented signal for a
@@ -965,6 +1006,79 @@ mod tests {
             extract_attachments: false,
             shared_pool: None,
         }
+    }
+
+    // ── write_attachments_atomically ────────────────────────────────
+
+    #[test]
+    fn write_attachments_atomically_writes_every_file_and_leaves_no_tmp_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("m1").join("attachments");
+        let attachments = vec![
+            ExtractedAttachment {
+                filename: "a.txt".to_string(),
+                contents: b"A".to_vec(),
+            },
+            ExtractedAttachment {
+                filename: "b.txt".to_string(),
+                contents: b"B".to_vec(),
+            },
+        ];
+
+        write_attachments_atomically(&dir, &attachments).unwrap();
+
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"A");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"B");
+        assert!(!dir.with_file_name(".attachments.tmp").exists());
+    }
+
+    #[test]
+    fn write_attachments_atomically_never_leaves_a_partial_dir_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("m1").join("attachments");
+        let attachments = vec![
+            ExtractedAttachment {
+                filename: "a.txt".to_string(),
+                contents: b"A".to_vec(),
+            },
+            // A NUL byte is never a filename `extract_attachments` would
+            // actually produce (its `attachment_filename` sanitiser rules
+            // it out), but it's a deterministic, portable way to force
+            // `write_atomic` to fail partway through the batch here.
+            ExtractedAttachment {
+                filename: "b\0.txt".to_string(),
+                contents: b"B".to_vec(),
+            },
+        ];
+
+        assert!(write_attachments_atomically(&dir, &attachments).is_err());
+
+        // The whole point: a failure partway through must never leave
+        // `dir` existing-but-partial, since callers key their
+        // already-extracted skip on `dir.exists()` alone. A stray hidden
+        // tmp dir is fine — the next attempt clears it before rebuilding.
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn write_attachments_atomically_recovers_from_a_stale_tmp_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("m1").join("attachments");
+        let tmp_dir = dir.with_file_name(".attachments.tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("leftover-from-a-crash.bin"), b"stale").unwrap();
+
+        let attachments = vec![ExtractedAttachment {
+            filename: "a.txt".to_string(),
+            contents: b"A".to_vec(),
+        }];
+
+        write_attachments_atomically(&dir, &attachments).unwrap();
+
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"A");
+        // The stale leftover from the aborted attempt must not survive
+        // into the finalised directory.
+        assert!(!dir.join("leftover-from-a-crash.bin").exists());
     }
 
     // ── backfill ─────────────────────────────────────────────────────
