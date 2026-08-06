@@ -1588,6 +1588,81 @@ not-really-a-pdf\r\n\
         assert!(err.to_string().contains("Failed to parse manifest"));
     }
 
+    // ── `--full` forces reconciliation even with a valid watermark ──────
+
+    #[tokio::test]
+    async fn run_sync_full_flag_forces_reconciliation_even_with_a_valid_watermark() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1"]).await;
+        mount_raw_get(&server, "m1", "Hello").await;
+        // Deliberately no mock for GET .../history — `--full` must take the
+        // full-listing path even though a valid watermark exists, never
+        // fall through to `run_incremental`.
+
+        let mut o = opts(output_dir.clone());
+        o.full = true;
+        let report = run_sync(&client, &o).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => assert_eq!(
+                s.history_id, "999",
+                "the reconciliation's historyId, not the pre-existing watermark, must be persisted"
+            ),
+            _ => panic!("expected state.json to still be present after --full"),
+        }
+    }
+
+    // ── a corrupt state.json is a reconciliation trigger, not a hard error ──
+
+    #[tokio::test]
+    async fn run_sync_reconciles_when_state_json_is_corrupt() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(state_path(&output_dir), "not json\n").unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1"]).await;
+        mount_raw_get(&server, "m1", "Hello").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            report.actions.iter().any(
+                |a| matches!(a, SyncAction::Note { message } if message.contains("state.json unreadable"))
+            ),
+            "a corrupt watermark should be reported as a reconciliation note"
+        );
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => assert_eq!(s.history_id, "999"),
+            _ => panic!("expected a fresh state.json to replace the corrupt one"),
+        }
+    }
+
     // ── reconciliation must not truncate at HARD_CAP (#1467) ────────────
 
     #[tokio::test]
@@ -1982,6 +2057,63 @@ not-really-a-pdf\r\n\
         assert_eq!(queued, 3, "one FetchQueued per dispatched fetch");
         assert_eq!(completed_ok, 2);
         assert_eq!(completed_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_archive_messages_streaming_dedupes_a_repeated_id() {
+        // A page-boundary race in the live-streamed listing can re-observe
+        // the same id twice — the second occurrence must be a no-op, not a
+        // second fetch, and `listed_ids` must still only contain it once.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1", "threadId": "t1", "labelIds": ["INBOX"],
+                    "internalDate": "1700000000000", "historyId": "500",
+                    "raw": raw_message_body("m1", "Hello"),
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut manifest = Manifest::default();
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let mut report = SyncReport::default();
+        let o = opts(output_dir.clone());
+
+        let (ids_tx, ids_rx) = mpsc::unbounded_channel();
+        for id in ["m1", "m1"] {
+            ids_tx.send(id.to_string()).unwrap();
+        }
+        drop(ids_tx);
+
+        let listed_ids = fetch_and_archive_messages_streaming(
+            &client,
+            &mut manifest,
+            ids_rx,
+            &limiter,
+            &o,
+            &mut report,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(listed_ids.len(), 1, "listed_ids must dedupe too");
+        assert_eq!(
+            report.actions.len(),
+            1,
+            "the duplicate id must not be fetched a second time"
+        );
+        assert!(matches!(&report.actions[0], SyncAction::Fetched { id, .. } if id == "m1"));
     }
 
     #[tokio::test]
