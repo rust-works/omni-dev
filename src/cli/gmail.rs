@@ -2,6 +2,7 @@
 
 pub(crate) mod account;
 pub(crate) mod auth;
+pub(crate) mod extract_attachments;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod label;
@@ -61,6 +62,10 @@ pub enum GmailSubcommands {
     /// `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP
     /// equivalent; ADR-0068).
     SyncAll(sync_all::SyncAllCommand),
+    /// Retroactively extracts attachments for already-archived messages,
+    /// without re-fetching from Gmail (CLI-only; no MCP equivalent; purely
+    /// local, no client/credentials needed; #1510).
+    ExtractAttachments(extract_attachments::ExtractAttachmentsCommand),
 }
 
 impl GmailCommand {
@@ -72,10 +77,13 @@ impl GmailCommand {
     /// in a pre-migration state). `sync-all` also runs without the shared
     /// client: it resolves one client per configured account itself
     /// (`helpers::create_client_for`, never the env var below, which is
-    /// unsafe across its concurrent tasks — ADR-0068). Every other
-    /// subcommand needs an authenticated client, which is resolved **once**
-    /// here and threaded down so each leaf takes `&GmailClient` and stays
-    /// free of process env.
+    /// unsafe across its concurrent tasks — ADR-0068). `extract-attachments`
+    /// also runs without a client — it never contacts Gmail at all, only
+    /// the local archive under `--archive-dir`, so `--account` has no
+    /// meaning for it either (#1510). Every other subcommand needs an
+    /// authenticated client, which is resolved **once** here and threaded
+    /// down so each leaf takes `&GmailClient` and stays free of process
+    /// env.
     pub async fn execute(self) -> Result<()> {
         let account = self.account;
         match self.command {
@@ -86,6 +94,14 @@ impl GmailCommand {
                      .omni-dev/gmail-sync.yaml instead"
                 );
                 cmd.execute().await
+            }
+            GmailSubcommands::ExtractAttachments(cmd) => {
+                anyhow::ensure!(
+                    account.is_none(),
+                    "--account is not compatible with extract-attachments; it operates on a \
+                     local archive directory only"
+                );
+                cmd.execute()
             }
             command => {
                 // Propagates --account to the env var
@@ -112,13 +128,14 @@ impl GmailCommand {
 }
 
 impl GmailSubcommands {
-    /// Routes a non-`Auth`/`Account`/`SyncAll` subcommand against the
-    /// shared client. Kept separate from credential resolution so it is
-    /// testable without env (tests pass a client pointed at an unreachable
-    /// URL). The `Auth`, `Account`, and `SyncAll` arms are unreachable
-    /// because all three are handled before client resolution in
+    /// Routes a non-`Auth`/`Account`/`SyncAll`/`ExtractAttachments`
+    /// subcommand against the shared client. Kept separate from credential
+    /// resolution so it is testable without env (tests pass a client
+    /// pointed at an unreachable URL). Those four arms are unreachable
+    /// because all four are handled before client resolution in
     /// [`GmailCommand::execute`] — `SyncAll` builds its own per-account
-    /// clients instead of using the shared one (ADR-0068).
+    /// clients instead of using the shared one (ADR-0068), and
+    /// `ExtractAttachments` needs no client at all (#1510).
     async fn dispatch(self, client: &GmailClient) -> Result<()> {
         match self {
             Self::Auth(_) => {
@@ -129,6 +146,9 @@ impl GmailSubcommands {
             }
             Self::SyncAll(_) => {
                 unreachable!("SyncAll is dispatched before client resolution")
+            }
+            Self::ExtractAttachments(_) => {
+                unreachable!("ExtractAttachments is dispatched before client resolution")
             }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
@@ -418,6 +438,54 @@ mod tests {
         // `dispatch` path (which would panic on `unreachable!()`).
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("no gmail-sync.yaml found"));
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
+    }
+
+    #[tokio::test]
+    async fn execute_routes_extract_attachments_without_client_resolution() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let archive_dir = tempfile::tempdir().unwrap();
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::ExtractAttachments(
+                extract_attachments::ExtractAttachmentsCommand {
+                    archive_dir: archive_dir.path().to_path_buf(),
+                    dry_run: false,
+                    quiet: true,
+                    output: OutputFormat::Table,
+                },
+            ),
+        };
+        // Succeeds even with zero credentials configured (an empty
+        // archive is simply "nothing to do") — proving
+        // `ExtractAttachments` never resolves a client, unlike every
+        // subcommand routed through `dispatch`.
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_account_flag_with_extract_attachments() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let archive_dir = tempfile::tempdir().unwrap();
+
+        let cmd = GmailCommand {
+            account: Some("work".to_string()),
+            command: GmailSubcommands::ExtractAttachments(
+                extract_attachments::ExtractAttachmentsCommand {
+                    archive_dir: archive_dir.path().to_path_buf(),
+                    dry_run: false,
+                    quiet: true,
+                    output: OutputFormat::Table,
+                },
+            ),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--account is not compatible with extract-attachments"));
         assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
     }
 }
