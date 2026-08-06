@@ -505,7 +505,15 @@ not pipelined — it's typically a single page already, so there's little to
 overlap; only the full-listing path above gains concurrent
 listing+fetching.) A run that hits a per-item error never advances the
 watermark, so the next run safely re-examines the same range (already
--archived messages are skipped for free).
+-archived messages are skipped for free). One exception: a message that
+vanishes from the server in the window between being listed and being
+fetched (`messages.get` returns a 404 with reason `notFound`) is not an
+error — it's recorded as a `Vanished` action instead, since Gmail's
+`history.list` and `messages.get` aren't perfectly consistent and retrying
+that particular id can never succeed. Withholding the watermark for it
+would only wedge the account, re-discovering and re-failing on the same
+stale history event on every run for up to a week; see the Troubleshooting
+section below.
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
 backfill/`--full`/reconciliation pass, but `history.list` has no query
@@ -826,6 +834,25 @@ succeed:
   `OMNI_DEV_HTTP_READ_TIMEOUT_SECS=300 omni-dev gmail sync ...`. The
   connect timeout has its own override, `OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS`
   (default 10s), for the unrelated case of a slow-to-establish connection.
+
+### `Vanished <id>` in a `sync` report
+
+```
+Vanished m1a2b3c4 (message no longer existed on the server; skipped, not an error)
+```
+
+This is expected and benign, not something to fix by re-running: Gmail's
+`history.list` and `messages.get` aren't perfectly consistent, so a message
+can be permanently deleted from the server in the window between being
+listed and being fetched — auto-filtered mail, a sent message recalled
+immediately, and similar routine churn. Unlike every other per-item
+failure, this can never succeed on retry, so it is not counted as an error
+(`report.errors` stays empty), does not withhold the watermark, and does
+not fail `sync`'s or `sync-all`'s exit code — only a message vanishing for
+any *other* reason (a 404 with a different `reason`, or any non-404
+failure) still surfaces as an ordinary error and still withholds the
+watermark. See [ADR-0064](adrs/adr-0064.md)'s 2026-08-06 amendment for
+#1509.
 
 ## See also
 

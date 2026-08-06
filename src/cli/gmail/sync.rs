@@ -223,7 +223,8 @@ impl JsonlSerialize for SyncReportOutput<'_> {
 /// Renders a report as one line per action, then one line per error.
 ///
 /// `show_action_detail` gates the per-item lines (`Fetched`/`Deleted`/...,
-/// but never `Note`, `Error`, or the trailing summary — see the call site):
+/// but never `Note`, `Vanished`, `Error`, or the trailing summary — see the
+/// call site):
 /// when live progress bars already rendered every fetch/delete as it
 /// happened, or `--quiet` asked for exactly this, repeating the whole batch
 /// as text on top would just be a second, redundant dump — the "silent,
@@ -242,7 +243,12 @@ fn render_report_text(
         return Ok(());
     }
     for action in &report.actions {
-        if !show_action_detail && !matches!(action, SyncAction::Note { .. }) {
+        if !show_action_detail
+            && !matches!(
+                action,
+                SyncAction::Note { .. } | SyncAction::Vanished { .. }
+            )
+        {
             continue;
         }
         let line = match action {
@@ -264,6 +270,9 @@ fn render_report_text(
             SyncAction::Undeleted { id } => format!("Undeleted {id}"),
             SyncAction::WouldDelete { id } => format!("Would delete {id}"),
             SyncAction::WouldUndelete { id } => format!("Would undelete {id}"),
+            SyncAction::Vanished { id } => {
+                format!("Vanished {id} (message no longer existed on the server; skipped, not an error)")
+            }
             SyncAction::Note { message } => format!("Note: {message}"),
         };
         writeln!(out, "{line}").context("Failed to write sync report")?;
@@ -292,6 +301,7 @@ pub(crate) fn format_summary_line(summary: &SyncSummary) -> String {
     };
     push(summary.fetched, "fetched");
     push(summary.would_fetch, "would fetch");
+    push(summary.vanished, "vanished");
     push(summary.labels_updated, "labels updated");
     push(summary.deleted, "deleted");
     push(summary.undeleted, "undeleted");
