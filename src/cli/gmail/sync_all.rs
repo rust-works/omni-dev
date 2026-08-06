@@ -424,6 +424,7 @@ fn print_account_line(account: &str, outcome: &Result<SyncReport>, quiet: bool) 
 fn add_summary(total: &mut SyncSummary, summary: &SyncSummary) {
     total.fetched += summary.fetched;
     total.would_fetch += summary.would_fetch;
+    total.vanished += summary.vanished;
     total.labels_updated += summary.labels_updated;
     total.deleted += summary.deleted;
     total.undeleted += summary.undeleted;
