@@ -640,11 +640,16 @@ Error: <id> failed: Failed to parse messages.get response: error decoding respon
 ```
 
 `messages.get?format=raw` returns the whole message (headers, body, and
-every attachment, base64-encoded) in one response, and the Gmail client's
-30-second default request timeout covers the *entire* download, not just
-connecting. A handful of large messages (tens of MB — attachment-heavy
-mail) downloading concurrently under `--concurrency` divide the available
-bandwidth, so each one can individually outrun the timeout even though
+every attachment, base64-encoded) in one response. The Gmail client (like
+the Atlassian and Datadog clients) sets two independent timeouts, not one:
+a 10-second connect timeout (DNS + TCP + TLS handshake) and a 120-second
+**read** timeout that covers each individual read of the response body and
+resets on every successful one — it's a stall detector, not a fixed total
+deadline, so a download that's slow-but-still-progressing keeps extending
+it rather than getting cut off partway through. A handful of large
+messages (tens of MB — attachment-heavy mail) downloading concurrently
+under `--concurrency` divide the available bandwidth, so each read can
+individually stall long enough to trip the read timeout even though
 nothing is actually stuck. This is more likely the more of `--concurrency`
 is spent on large messages at once, not a sign of a broken connection.
 
@@ -655,10 +660,13 @@ succeed:
 
 - Lower `--concurrency` (even down to `1`) so each large download gets
   more of the available bandwidth to itself.
-- Raise the timeout instead via `OMNI_DEV_HTTP_TIMEOUT_SECS` (whole
-  seconds; a missing, non-numeric, or non-positive value falls back to the
-  30-second default) — shared by the Gmail, Atlassian, and Datadog REST
-  clients, e.g. `OMNI_DEV_HTTP_TIMEOUT_SECS=120 omni-dev gmail sync ...`.
+- Raise the read timeout instead via `OMNI_DEV_HTTP_READ_TIMEOUT_SECS`
+  (whole seconds; a missing, non-numeric, or non-positive value falls back
+  to the 120-second default) — shared by the Gmail, Atlassian, and Datadog
+  REST clients, e.g.
+  `OMNI_DEV_HTTP_READ_TIMEOUT_SECS=300 omni-dev gmail sync ...`. The
+  connect timeout has its own override, `OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS`
+  (default 10s), for the unrelated case of a slow-to-establish connection.
 
 ## See also
 
