@@ -23,9 +23,10 @@ walkthrough — this page is the topic-by-topic reference.
 8. [Labels](#labels)
 9. [Sync](#sync)
 10. [Sync all accounts](#sync-all-accounts)
-11. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-12. [Troubleshooting](#troubleshooting)
-13. [See also](#see-also)
+11. [Extract attachments](#extract-attachments)
+12. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+13. [Troubleshooting](#troubleshooting)
+14. [See also](#see-also)
 
 ## Prerequisites
 
@@ -553,9 +554,10 @@ MIME simply yields no attachment files — it never fails the `.eml` fetch
 itself. Because `sync` only ever fetches messages missing on disk
 (presence-on-disk is the archive's idempotence mechanism — see above),
 turning this flag on does **not** retroactively extract attachments for
-messages already archived by an earlier run, even under `--full`; delete
-the affected `.eml` files (or the whole archive) and re-run `--full
---extract-attachments` to force re-extraction.
+messages already archived by an earlier run, even under `--full`; run
+[`gmail extract-attachments`](#extract-attachments) with `--archive-dir`
+pointed at the same directory instead — it extracts from the `.eml` files
+already on disk, no re-fetch required.
 
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
 `-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally, e.g.
@@ -669,6 +671,53 @@ regardless of an earlier one's failure.
 No MCP equivalent — same reasoning as `sync` itself, doubled: a bulk,
 potentially long-running filesystem operation across several mailboxes at
 once is an even poorer fit for a synchronous MCP tool call.
+
+## Extract attachments
+
+```bash
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive --dry-run
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive -o json
+```
+
+Retroactively extracts attachments for messages [`sync`](#sync)/[`sync-all`](#sync-all-accounts)
+already archived, without contacting Gmail at all — the fix for
+[`--extract-attachments`](#sync)'s "no retroactive backfill" limitation
+(see [ADR-0065](adrs/adr-0065.md)). Purely local and fast: it reads the
+manifest and `.eml` files already under `--archive-dir` and never resolves
+a client, so no credentials, `--account`, or network access are needed —
+unlike every other `gmail` subcommand. Named `--archive-dir` rather than
+`sync`'s `--output-dir` since this command's primary interaction with the
+directory is reading an existing archive, not producing one — it happens
+to also write new `attachments/` subdirectories into it, but that's
+incidental to what the flag names.
+
+For each message in the manifest, it trusts `attachment_count > 0` (the
+same cheap heuristic scan `sync` always runs, regardless of whether
+`--extract-attachments` was ever passed — see [Sync](#sync)'s Attachments
+paragraph) as a fast-path filter, skipping the rest without opening their
+`.eml`. A candidate whose `messages/<year>/<month>/<day>/<id>/attachments/`
+directory already exists is skipped too — the same presence-on-disk
+idempotence `sync` itself relies on, which is what makes this command safe
+to re-run at any time to pick up whatever an earlier run missed (including
+a partial/interrupted one). Everything else is read from disk, parsed with
+the same real MIME parser `sync --extract-attachments` uses, and written
+out identically. A message whose real parse finds nothing — the rare
+heuristic/parser disagreement ADR-0065 documents — is silently skipped,
+not an error; a missing or unreadable `.eml` is recorded as a per-message
+error and the run continues with the rest of the archive.
+
+**`--dry-run`** parses every candidate `.eml` (so its reported counts are
+accurate, not just an echo of the heuristic) and reports what it would
+extract without writing any file.
+
+**Report summary:** mirrors [Sync](#sync)'s — a trailing `N extracted, N
+would extract, N errors` tally in text output, or a `summary` field in the
+structured formats, with the full per-action listing always included in
+`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`.
+
+No MCP equivalent — a bulk filesystem operation is as poor a fit here as
+it is for `sync` itself.
 
 ## Rate limits and retry behaviour
 
