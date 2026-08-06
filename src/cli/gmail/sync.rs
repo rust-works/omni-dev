@@ -9,21 +9,24 @@
 
 pub(crate) mod engine;
 pub(crate) mod manifest;
+pub(crate) mod progress;
 pub(crate) mod report;
 pub(crate) mod shard;
 pub(crate) mod state;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use crate::cli::gmail::format::{output_as, write_scalar_jsonl, JsonlSerialize, OutputFormat};
 use crate::gmail::client::GmailClient;
 
 use engine::SyncOptions;
+use progress::SyncProgressBars;
 use report::{SyncAction, SyncError, SyncReport, SyncSummary};
 
 /// Default `--concurrency`: an in-flight-request cap layered under the
@@ -77,6 +80,12 @@ pub struct SyncCommand {
     #[arg(long)]
     pub extract_attachments: bool,
 
+    /// Only shows errors/warnings, suppresses info-level output — including
+    /// the live progress bars a backfill/`--full`/reconciliation pass shows
+    /// on an interactive terminal (#1502).
+    #[arg(long)]
+    pub quiet: bool,
+
     /// Report format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -96,6 +105,7 @@ impl SyncCommand {
                 dry_run: self.dry_run,
                 extract_attachments: self.extract_attachments,
             },
+            self.quiet,
             &self.output,
         )
         .await
@@ -113,9 +123,26 @@ impl SyncCommand {
 async fn run_sync_command(
     client: &GmailClient,
     opts: SyncOptions,
+    quiet: bool,
     output: &OutputFormat,
 ) -> Result<()> {
-    let report = engine::run_sync(client, &opts).await?;
+    let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
+    let report = if show_progress {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bars = SyncProgressBars::new();
+        let render_task = tokio::spawn(bars.drain(rx));
+        let result = engine::run_sync_with_progress(client, &opts, Some(&tx)).await;
+        // Dropping `tx` (rather than waiting for `run_sync_with_progress`'s
+        // return to go out of scope) is what lets the renderer's
+        // `rx.recv()` loop actually end.
+        drop(tx);
+        // Best-effort: a panicking/cancelled render task shouldn't fail an
+        // otherwise-successful sync — it only ever formats bars.
+        let _ = render_task.await;
+        result?
+    } else {
+        engine::run_sync(client, &opts).await?
+    };
 
     let output_view = SyncReportOutput {
         actions: &report.actions,
@@ -125,7 +152,12 @@ async fn run_sync_command(
     if !output_as(&output_view, output)? {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
-        render_report_text(&report, &mut handle)?;
+        // Bars already rendered every fetch/delete live, and `--quiet`
+        // asked for exactly this suppression explicitly — see
+        // `render_report_text`'s doc comment for why `quiet` is checked
+        // again here rather than just reusing `show_progress` (a non-tty
+        // stderr makes both false, but that case still wants full detail).
+        render_report_text(&report, &mut handle, !quiet && !show_progress)?;
     }
 
     if !report.errors.is_empty() {
@@ -135,6 +167,22 @@ async fn run_sync_command(
         );
     }
     Ok(())
+}
+
+/// Live progress bars are only worth constructing when a human is actually
+/// watching an interactive terminal render `-o table` text: `--quiet`
+/// suppresses them explicitly, a machine `-o` format would otherwise mix
+/// indicatif's escape sequences into output a script parses, and a
+/// non-terminal stderr (redirected to a file, CI) is exactly what
+/// `indicatif` itself would no-op on anyway — checking it here means that
+/// no-op is a decision this function makes rather than one left implicit.
+///
+/// Takes `stderr_is_terminal` as a value rather than calling
+/// [`std::io::IsTerminal`] itself, so tests can exercise every combination
+/// without depending on the test runner's own stderr (which is typically
+/// captured, i.e. never a terminal) — see STYLE-0028.
+fn should_show_progress(quiet: bool, output: &OutputFormat, stderr_is_terminal: bool) -> bool {
+    !quiet && matches!(output, OutputFormat::Table) && stderr_is_terminal
 }
 
 /// `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` view of a [`SyncReport`]: the
@@ -158,12 +206,30 @@ impl JsonlSerialize for SyncReportOutput<'_> {
 }
 
 /// Renders a report as one line per action, then one line per error.
-fn render_report_text(report: &SyncReport, out: &mut dyn Write) -> Result<()> {
+///
+/// `show_action_detail` gates the per-item lines (`Fetched`/`Deleted`/...,
+/// but never `Note`, `Error`, or the trailing summary — see the call site):
+/// when live progress bars already rendered every fetch/delete as it
+/// happened, or `--quiet` asked for exactly this, repeating the whole batch
+/// as text on top would just be a second, redundant dump — the "silent,
+/// then dump everything at once" experience #1502 introduced bars to fix
+/// in the first place. `false` is only for the cases neither of those
+/// covers (a non-interactive `stderr`, e.g. a redirected/cron log): there,
+/// this text *is* the only record of what happened, so it still gets the
+/// full detail — see ADR-0064's authoritative-record framing.
+fn render_report_text(
+    report: &SyncReport,
+    out: &mut dyn Write,
+    show_action_detail: bool,
+) -> Result<()> {
     if report.actions.is_empty() && report.errors.is_empty() {
         writeln!(out, "Nothing to do.").context("Failed to write sync report")?;
         return Ok(());
     }
     for action in &report.actions {
+        if !show_action_detail && !matches!(action, SyncAction::Note { .. }) {
+            continue;
+        }
         let line = match action {
             SyncAction::Fetched { id, path, bytes } => {
                 format!("Fetched {id} -> {} ({bytes} bytes)", path.display())
@@ -255,13 +321,56 @@ mod tests {
         client
     }
 
+    // ── should_show_progress (#1502) ─────────────────────────────────────
+
+    #[test]
+    fn should_show_progress_gate() {
+        let cases = [
+            (
+                "quiet suppresses even on a tty",
+                true,
+                OutputFormat::Table,
+                true,
+                false,
+            ),
+            (
+                "machine format suppresses even on a tty",
+                false,
+                OutputFormat::Json,
+                true,
+                false,
+            ),
+            (
+                "non-tty stderr suppresses",
+                false,
+                OutputFormat::Table,
+                false,
+                false,
+            ),
+            (
+                "table + not quiet + tty shows bars",
+                false,
+                OutputFormat::Table,
+                true,
+                true,
+            ),
+        ];
+        for (case, quiet, output, stderr_is_terminal, expected) in cases {
+            assert_eq!(
+                should_show_progress(quiet, &output, stderr_is_terminal),
+                expected,
+                "case: {case}"
+            );
+        }
+    }
+
     // ── render_report_text ─────────────────────────────────────────────
 
     #[test]
     fn render_report_text_reports_nothing_to_do_when_empty() {
         let report = SyncReport::default();
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "Nothing to do.\n");
     }
 
@@ -284,7 +393,7 @@ mod tests {
             }],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Fetched m1"));
         assert!(text.contains("Deleted m2"));
@@ -304,7 +413,7 @@ mod tests {
             errors: vec![],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("+IMPORTANT"));
         assert!(text.contains("-UNREAD"));
@@ -327,11 +436,57 @@ mod tests {
             errors: vec![],
         };
         let mut buf = Vec::new();
-        render_report_text(&report, &mut buf).unwrap();
+        render_report_text(&report, &mut buf, true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("1 would fetch, 1 would delete, 1 would undelete, 0 errors"));
         assert!(!text.contains("fetched,"));
         assert!(!text.contains("deleted,"));
+    }
+
+    #[test]
+    fn render_report_text_suppresses_per_item_actions_but_keeps_notes_errors_and_summary() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::Fetched {
+                    id: "m1".to_string(),
+                    path: PathBuf::from("messages/m1/m1.eml"),
+                    bytes: 100,
+                },
+                SyncAction::Deleted {
+                    id: "m2".to_string(),
+                },
+                SyncAction::Note {
+                    message: "watermark expired (404 on startHistoryId); reconciling".to_string(),
+                },
+            ],
+            errors: vec![SyncError {
+                id: "m3".to_string(),
+                reason: "boom".to_string(),
+            }],
+        };
+        let mut buf = Vec::new();
+        render_report_text(&report, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains("Fetched m1"),
+            "flood actions must be suppressed"
+        );
+        assert!(
+            !text.contains("Deleted m2"),
+            "flood actions must be suppressed"
+        );
+        assert!(
+            text.contains("Note: watermark expired"),
+            "a rare contextual Note must survive suppression"
+        );
+        assert!(
+            text.contains("Error: m3 failed: boom"),
+            "errors must survive suppression"
+        );
+        assert!(
+            text.contains("1 fetched, 1 deleted, 1 errors"),
+            "the summary must survive suppression"
+        );
     }
 
     // ── SyncReportOutput (`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`) ─────
@@ -391,6 +546,7 @@ mod tests {
                 dry_run: true,
                 extract_attachments: false,
             },
+            false,
             &OutputFormat::Table,
         )
         .await
@@ -436,6 +592,7 @@ mod tests {
                 dry_run: false,
                 extract_attachments: false,
             },
+            false,
             &OutputFormat::Table,
         )
         .await
@@ -471,6 +628,7 @@ mod tests {
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,
             extract_attachments: false,
+            quiet: false,
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
@@ -562,6 +720,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
                 dry_run: false,
                 extract_attachments: true,
             },
+            false,
             &OutputFormat::Table,
         )
         .await
@@ -589,6 +748,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
                 dry_run: false,
                 extract_attachments: false,
             },
+            false,
             &OutputFormat::Table,
         )
         .await

@@ -340,6 +340,7 @@ mod tests {
             concurrency: 4,
             dry_run: false,
             extract_attachments: false,
+            quiet: false,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());

@@ -394,6 +394,22 @@ depends on message sizes and network too — a measured run against a
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
 
+On a terminal, a backfill/`--full`/reconciliation run shows two live
+progress indicators on stderr — a listing spinner (pages fetched, ids
+discovered so far) and a fetch bar (messages fetched so far out of the
+currently-known total, plus a running error count) — updated as the
+mailbox is listed and fetched *concurrently*, rather than only printing a
+report once the entire run finishes. Total wall-clock time is unchanged
+(still bounded by the same per-second quota above); what changes is that
+fetching now begins as soon as the first listing page arrives, instead of
+waiting for the whole mailbox to be listed first. Pass `--quiet` to
+suppress the bars; they're also disabled automatically when stderr isn't a
+terminal or when `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` is selected.
+Whenever the bars ran (or `--quiet` was passed), the final text report
+skips the per-action listing too (see **Report summary** below), since
+bars already showed every fetch/delete live and repeating them as text
+would just be a second, redundant dump.
+
 **Archive layout:**
 
 ```
@@ -415,21 +431,26 @@ regenerated from the `.eml` files; it is the sole record of each message's
 Gmail-side metadata (labels, thread, watermark).
 
 **Backfill vs. incremental:** the first run (or `--full`) lists the whole
-mailbox and fetches whatever's missing on disk — presence-on-disk is the
-real idempotence mechanism, so an interrupted backfill simply picks up
-where it left off on the next run, no cursor required. The manifest itself
-is checkpointed to disk every 200 fetched messages during a large backfill
-(not only once at the end), so a crash loses at most that many messages'
-worth of already-completed work, not the whole run. Subsequent runs use
-`history.list` from the stored watermark, applying
-`messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved` events.
-Google does not guarantee history availability past roughly **one week**;
-a `startHistoryId` older than that gets a 404, which `sync` treats as a
-signal to fall back to the same full-listing pass as a backfill (not a
+mailbox and fetches whatever's missing on disk — listing and fetching are
+pipelined, so the fetch fan-out for early-listed messages starts
+immediately rather than waiting for the whole mailbox to be listed first.
+Presence-on-disk is the real idempotence mechanism, so an interrupted
+backfill simply picks up where it left off on the next run, no cursor
+required. The manifest itself is checkpointed to disk every 200 fetched
+messages during a large backfill (not only once at the end), so a crash
+loses at most that many messages' worth of already-completed work, not the
+whole run. Subsequent runs use `history.list` from the stored watermark,
+applying `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
+events. Google does not guarantee history availability past roughly **one
+week**; a `startHistoryId` older than that gets a 404, which `sync` treats
+as a signal to fall back to the same full-listing pass as a backfill (not a
 silent gap, and not a blind re-download of everything) — the `historyId`
 watermark is purely an optimisation over that fallback, never a
-correctness requirement. A run that hits a per-item error never advances
-the watermark, so the next run safely re-examines the same range (already
+correctness requirement. (An incremental run's own `history.list` pass is
+not pipelined — it's typically a single page already, so there's little to
+overlap; only the full-listing path above gains concurrent
+listing+fetching.) A run that hits a per-item error never advances the
+watermark, so the next run safely re-examines the same range (already
 -archived messages are skipped for free).
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
@@ -475,13 +496,20 @@ the affected `.eml` files (or the whole archive) and re-run `--full
 --extract-attachments` to force re-extraction.
 
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
-`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally alongside the
-per-action listing, e.g. `5,794 fetched, 30 deleted, 0 errors` in text
-output, or an explicit `summary` field (`fetched`/`would_fetch`/
-`labels_updated`/`deleted`/`undeleted`/`would_delete`/`would_undelete`/
-`errors` counts) alongside `actions`/`errors` in the structured formats —
-useful since a large sync's per-action listing can run into the thousands
-of lines.
+`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally, e.g.
+`5,794 fetched, 30 deleted, 0 errors` in text output, or an explicit
+`summary` field (`fetched`/`would_fetch`/`labels_updated`/`deleted`/
+`undeleted`/`would_delete`/`would_undelete`/`errors` counts) in the
+structured formats. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` always
+include the full per-action listing alongside `summary` too — the
+authoritative, complete record. Text output includes the per-action
+listing only when nothing else already showed it: if the live progress
+bars ran, or `--quiet` was passed, text output shows just `Note`s, errors,
+and the summary — a large sync's per-action listing can run into the
+thousands of lines, and printing it again once bars already rendered it
+live would just be a second, redundant dump. A non-interactive `stderr`
+(no bars possible) still gets the full per-action listing in text, since
+it's the only record of what happened in that case.
 
 **`--dry-run`** reports every action sync would take without writing any
 file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
@@ -615,6 +643,41 @@ the server from that same shell. Run `omni-dev gmail auth login` once —
 this persists the refresh token (plus client id/secret) to
 `~/.omni-dev/settings.json`, read by every invocation regardless of how
 the process started.
+
+### `operation timed out` fetching a message during `sync`
+
+```
+Error: <id> failed: Failed to parse messages.get response: error decoding response body for url (...): request or response body error: operation timed out
+```
+
+`messages.get?format=raw` returns the whole message (headers, body, and
+every attachment, base64-encoded) in one response. The Gmail client (like
+the Atlassian and Datadog clients) sets two independent timeouts, not one:
+a 10-second connect timeout (DNS + TCP + TLS handshake) and a 120-second
+**read** timeout that covers each individual read of the response body and
+resets on every successful one — it's a stall detector, not a fixed total
+deadline, so a download that's slow-but-still-progressing keeps extending
+it rather than getting cut off partway through. A handful of large
+messages (tens of MB — attachment-heavy mail) downloading concurrently
+under `--concurrency` divide the available bandwidth, so each read can
+individually stall long enough to trip the read timeout even though
+nothing is actually stuck. This is more likely the more of `--concurrency`
+is spent on large messages at once, not a sign of a broken connection.
+
+`sync` is safe to just re-run: a run with errors never advances the
+watermark, and presence-on-disk means already-archived messages are
+skipped, so a re-run only retries what failed. Two ways to make it
+succeed:
+
+- Lower `--concurrency` (even down to `1`) so each large download gets
+  more of the available bandwidth to itself.
+- Raise the read timeout instead via `OMNI_DEV_HTTP_READ_TIMEOUT_SECS`
+  (whole seconds; a missing, non-numeric, or non-positive value falls back
+  to the 120-second default) — shared by the Gmail, Atlassian, and Datadog
+  REST clients, e.g.
+  `OMNI_DEV_HTTP_READ_TIMEOUT_SECS=300 omni-dev gmail sync ...`. The
+  connect timeout has its own override, `OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS`
+  (default 10s), for the unrelated case of a slow-to-establish connection.
 
 ## See also
 

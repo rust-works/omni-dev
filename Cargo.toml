@@ -78,6 +78,10 @@ percent-encoding = "2.3"
 # `gmail sync --extract-attachments` (real boundary parsing + CTE decoding,
 # which raw_message.rs's cheap heuristic scanner deliberately avoids).
 mail-parser = "0.11"
+# Live stderr progress bars for `gmail sync`'s full-mailbox pass
+# (`src/cli/gmail/sync/progress.rs`, #1502) — the only consumer; no-ops
+# automatically when stderr isn't a terminal.
+indicatif = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }
