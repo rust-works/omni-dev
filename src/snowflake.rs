@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
 use crate::utils::settings::Settings;
@@ -269,7 +270,9 @@ fn resolve_auth_method(
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty())
             {
-                Some(cmd) => BrowserLaunch::Command(split_browser_command(&cmd)?),
+                Some(cmd) => {
+                    BrowserLaunch::Command(split_browser_command(ENV_BROWSER_COMMAND, &cmd)?)
+                }
                 None => BrowserLaunch::Auto,
             };
             Ok(AuthMethod::ExternalBrowser(BrowserConfig {
@@ -313,93 +316,6 @@ fn resolve_auth_method(
              (expected externalbrowser, programmatic_access_token, or snowflake_jwt)"
         )),
     }
-}
-
-/// Tokenizes a `SNOWFLAKE_BROWSER_COMMAND` value into program + args with
-/// POSIX-style quoting so a program path or an argument value may contain
-/// spaces (`Google Chrome.app`, `--profile-directory="Profile 1"`):
-///
-/// - unquoted whitespace separates tokens;
-/// - single quotes take their contents literally;
-/// - double quotes group while a backslash escapes only `"` or `\` (so
-///   Windows-style paths keep their other backslashes);
-/// - an unquoted backslash escapes the next character.
-///
-/// The `{url}` placeholder is left intact here; the client's `open_browser`
-/// substitutes it (or appends the URL) at launch time.
-///
-/// # Errors
-///
-/// If a quote is left unterminated, or the value tokenizes to zero words.
-fn split_browser_command(raw: &str) -> Result<Vec<String>> {
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    // Distinguishes an empty quoted arg (`""`) from "no arg accumulated yet".
-    let mut has_word = false;
-    let mut chars = raw.chars();
-
-    while let Some(c) = chars.next() {
-        match c {
-            c if c.is_whitespace() => {
-                if has_word {
-                    words.push(std::mem::take(&mut current));
-                    has_word = false;
-                }
-            }
-            '\'' => {
-                has_word = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => current.push(ch),
-                        None => {
-                            bail!("{ENV_BROWSER_COMMAND} has an unterminated single quote: {raw}")
-                        }
-                    }
-                }
-            }
-            '"' => {
-                has_word = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(ch @ ('"' | '\\')) => current.push(ch),
-                            Some(ch) => {
-                                current.push('\\');
-                                current.push(ch);
-                            }
-                            None => bail!(
-                                "{ENV_BROWSER_COMMAND} has an unterminated double quote: {raw}"
-                            ),
-                        },
-                        Some(ch) => current.push(ch),
-                        None => {
-                            bail!("{ENV_BROWSER_COMMAND} has an unterminated double quote: {raw}")
-                        }
-                    }
-                }
-            }
-            '\\' => {
-                has_word = true;
-                match chars.next() {
-                    Some(ch) => current.push(ch),
-                    None => current.push('\\'),
-                }
-            }
-            ch => {
-                has_word = true;
-                current.push(ch);
-            }
-        }
-    }
-    if has_word {
-        words.push(current);
-    }
-    if words.is_empty() {
-        bail!("{ENV_BROWSER_COMMAND} is set but contains no command");
-    }
-    Ok(words)
 }
 
 /// A single arbitrary-SQL query request routed to the engine.
@@ -1032,55 +948,6 @@ mod tests {
             )),
             Some("acct.privatelink.snowflakecomputing.com".to_string())
         );
-    }
-
-    #[test]
-    fn split_browser_command_splits_on_unquoted_whitespace() {
-        assert_eq!(
-            split_browser_command("chrome --new-window {url}").unwrap(),
-            vec!["chrome", "--new-window", "{url}"]
-        );
-    }
-
-    #[test]
-    fn split_browser_command_keeps_quoted_spaces_together() {
-        // The motivating case: a program path and an argument value both with
-        // spaces, plus the `{url}` placeholder left intact for later substitution.
-        assert_eq!(
-            split_browser_command(
-                "'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
-                 --profile-directory=\"Profile 1\" --new-window {url}"
-            )
-            .unwrap(),
-            vec![
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "--profile-directory=Profile 1",
-                "--new-window",
-                "{url}",
-            ]
-        );
-    }
-
-    #[test]
-    fn split_browser_command_handles_backslash_escapes() {
-        // An unquoted backslash escapes the next char; inside double quotes only
-        // `\"` and `\\` are escapes, so other backslashes (Windows paths) survive.
-        assert_eq!(
-            split_browser_command(r#"chrome a\ b "c\"d" "e\\f" "g\h""#).unwrap(),
-            vec!["chrome", "a b", "c\"d", "e\\f", "g\\h"]
-        );
-    }
-
-    #[test]
-    fn split_browser_command_rejects_unterminated_quotes() {
-        assert!(split_browser_command("chrome \"--flag").is_err());
-        assert!(split_browser_command("chrome '--flag").is_err());
-    }
-
-    #[test]
-    fn split_browser_command_rejects_an_empty_command() {
-        assert!(split_browser_command("   ").is_err());
-        assert!(split_browser_command("").is_err());
     }
 
     #[test]
