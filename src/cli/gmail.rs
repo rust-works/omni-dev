@@ -7,6 +7,7 @@ pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod label;
 pub(crate) mod read;
+pub(crate) mod render;
 pub(crate) mod search;
 pub(crate) mod sync;
 pub(crate) mod sync_all;
@@ -66,6 +67,10 @@ pub enum GmailSubcommands {
     /// without re-fetching from Gmail (CLI-only; no MCP equivalent; purely
     /// local, no client/credentials needed; #1510).
     ExtractAttachments(extract_attachments::ExtractAttachmentsCommand),
+    /// Renders one or more archived `.eml` files as human-readable Markdown
+    /// (CLI-only; no MCP equivalent; purely local, no client/credentials
+    /// needed; #1513).
+    Render(render::RenderCommand),
 }
 
 impl GmailCommand {
@@ -83,7 +88,9 @@ impl GmailCommand {
     /// meaning for it either (#1510). Every other subcommand needs an
     /// authenticated client, which is resolved **once** here and threaded
     /// down so each leaf takes `&GmailClient` and stays free of process
-    /// env.
+    /// env. `render` also runs without a client — like
+    /// `extract-attachments`, it only ever reads `.eml` files already on
+    /// disk (#1513).
     pub async fn execute(self) -> Result<()> {
         let account = self.account;
         match self.command {
@@ -100,6 +107,14 @@ impl GmailCommand {
                     account.is_none(),
                     "--account is not compatible with extract-attachments; it operates on a \
                      local archive directory only"
+                );
+                cmd.execute()
+            }
+            GmailSubcommands::Render(cmd) => {
+                anyhow::ensure!(
+                    account.is_none(),
+                    "--account is not compatible with render; it operates on local .eml files \
+                     only"
                 );
                 cmd.execute()
             }
@@ -128,14 +143,14 @@ impl GmailCommand {
 }
 
 impl GmailSubcommands {
-    /// Routes a non-`Auth`/`Account`/`SyncAll`/`ExtractAttachments`
+    /// Routes a non-`Auth`/`Account`/`SyncAll`/`ExtractAttachments`/`Render`
     /// subcommand against the shared client. Kept separate from credential
     /// resolution so it is testable without env (tests pass a client
-    /// pointed at an unreachable URL). Those four arms are unreachable
-    /// because all four are handled before client resolution in
+    /// pointed at an unreachable URL). Those five arms are unreachable
+    /// because all five are handled before client resolution in
     /// [`GmailCommand::execute`] — `SyncAll` builds its own per-account
     /// clients instead of using the shared one (ADR-0068), and
-    /// `ExtractAttachments` needs no client at all (#1510).
+    /// `ExtractAttachments`/`Render` need no client at all (#1510, #1513).
     async fn dispatch(self, client: &GmailClient) -> Result<()> {
         match self {
             Self::Auth(_) => {
@@ -149,6 +164,9 @@ impl GmailSubcommands {
             }
             Self::ExtractAttachments(_) => {
                 unreachable!("ExtractAttachments is dispatched before client resolution")
+            }
+            Self::Render(_) => {
+                unreachable!("Render is dispatched before client resolution")
             }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
@@ -331,7 +349,7 @@ mod tests {
             message_id: "msg1".to_string(),
             out_file: None,
             detail: read::ReadDetail::Full,
-            output: OutputFormat::Table,
+            output: read::ReadOutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
@@ -486,6 +504,51 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--account is not compatible with extract-attachments"));
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
+    }
+
+    #[tokio::test]
+    async fn execute_routes_render_without_client_resolution() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m1.eml");
+        std::fs::write(&path, "Subject: Hi\r\n\r\nBody.").unwrap();
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::Render(render::RenderCommand {
+                paths: vec![path],
+                out_dir: None,
+                output: OutputFormat::Table,
+            }),
+        };
+        // Succeeds even with zero credentials configured — proving `Render`
+        // never resolves a client, unlike every subcommand routed through
+        // `dispatch`.
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_account_flag_with_render() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m1.eml");
+        std::fs::write(&path, "Subject: Hi\r\n\r\nBody.").unwrap();
+
+        let cmd = GmailCommand {
+            account: Some("work".to_string()),
+            command: GmailSubcommands::Render(render::RenderCommand {
+                paths: vec![path],
+                out_dir: None,
+                output: OutputFormat::Table,
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--account is not compatible with render"));
         assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
     }
 }

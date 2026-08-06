@@ -20,6 +20,7 @@ pub mod labels_api;
 pub mod messages_api;
 pub mod profile_api;
 pub mod raw_message;
+pub mod render;
 pub mod threads_api;
 pub mod types;
 
