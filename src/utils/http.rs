@@ -13,8 +13,78 @@ use std::time::{Duration, Instant};
 
 use reqwest::{Response, ResponseBuilderExt as _};
 
-/// Standard HTTP request timeout shared by the REST clients.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for just the connect phase (TCP + TLS handshake) of a
+/// REST client request (Atlassian, Datadog, Gmail). Overridable via
+/// [`CONNECT_TIMEOUT_ENV_VAR`].
+///
+/// Deliberately short and independent of [`DEFAULT_READ_TIMEOUT`]: a
+/// connection either establishes quickly or something is actually wrong
+/// (DNS, network, a dead host), unlike a slow-but-progressing large
+/// download, which is [`DEFAULT_READ_TIMEOUT`]'s concern instead.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for each individual read operation of a REST client
+/// response body (Atlassian, Datadog, Gmail). Overridable via
+/// [`READ_TIMEOUT_ENV_VAR`].
+///
+/// `reqwest`'s `read_timeout` resets on every successful read rather than
+/// imposing one fixed deadline on the whole response — the right shape for
+/// Gmail's `messages.get?format=raw`, which can return tens of megabytes
+/// for an attachment-heavy message. A single caller downloading that alone
+/// finishes in seconds, but several downloading concurrently (bounded by
+/// `gmail sync --concurrency`) divide the available bandwidth, and a fixed
+/// *total* deadline can trip even though every read is still making
+/// progress — the failure mode a total `.timeout()` (the previous, single-
+/// knob design) couldn't distinguish from an actually-stalled connection
+/// (#1502 follow-up).
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Env var overriding [`DEFAULT_CONNECT_TIMEOUT`]. Value is whole seconds;
+/// a missing, non-numeric, or non-positive value falls back to the default.
+pub(crate) const CONNECT_TIMEOUT_ENV_VAR: &str = "OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS";
+
+/// Env var overriding [`DEFAULT_READ_TIMEOUT`]. Value is whole seconds; a
+/// missing, non-numeric, or non-positive value falls back to the default.
+///
+/// Both env vars are separate from `claude::ai::TIMEOUT_ENV_VAR`
+/// (`OMNI_DEV_AI_TIMEOUT_SECS`) so the REST-client family can be tuned
+/// independently of the AI backends, mirroring the existing
+/// `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS`/`OMNI_DEV_AI_TIMEOUT_SECS` split.
+pub(crate) const READ_TIMEOUT_ENV_VAR: &str = "OMNI_DEV_HTTP_READ_TIMEOUT_SECS";
+
+/// Resolves the connect-phase timeout, honouring [`CONNECT_TIMEOUT_ENV_VAR`].
+///
+/// Reads through the settings helper so the override can also come from a
+/// `settings.json` `env` bundle, consistent with `claude::ai::request_timeout`.
+pub(crate) fn connect_timeout() -> Duration {
+    duration_from_secs(
+        crate::utils::settings::get_env_var(CONNECT_TIMEOUT_ENV_VAR).ok(),
+        DEFAULT_CONNECT_TIMEOUT,
+    )
+}
+
+/// Resolves the per-read timeout, honouring [`READ_TIMEOUT_ENV_VAR`]. See
+/// [`connect_timeout`] for the settings-helper rationale.
+pub(crate) fn read_timeout() -> Duration {
+    duration_from_secs(
+        crate::utils::settings::get_env_var(READ_TIMEOUT_ENV_VAR).ok(),
+        DEFAULT_READ_TIMEOUT,
+    )
+}
+
+/// Parses a whole-seconds timeout override, falling back to `default` for
+/// an absent, non-numeric, or non-positive value.
+///
+/// A 0-second (or negative) timeout would abort every request/read
+/// immediately, so it is treated as unset rather than honoured. Pure so it
+/// is unit-testable without mutating the process environment; shared by
+/// [`connect_timeout`] and [`read_timeout`] since both need the identical
+/// parse-or-fall-back rule, just against different defaults.
+fn duration_from_secs(raw: Option<String>, default: Duration) -> Duration {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(default, Duration::from_secs)
+}
 
 /// Maximum number of retries on a retryable response (attempts =
 /// `MAX_RETRIES` + 1).
@@ -140,6 +210,44 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── duration_from_secs ───────────────────────────────────────────────
+
+    #[test]
+    fn duration_from_secs_parses_valid_override() {
+        assert_eq!(
+            duration_from_secs(Some("45".to_string()), DEFAULT_CONNECT_TIMEOUT),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn duration_from_secs_falls_back_for_absent_zero_or_garbage() {
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("abc".to_string()),
+            Some("-5".to_string()),
+        ] {
+            assert_eq!(
+                duration_from_secs(raw.clone(), DEFAULT_READ_TIMEOUT),
+                DEFAULT_READ_TIMEOUT,
+                "expected default for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_and_read_timeouts_default_to_documented_values_when_unset() {
+        // Both resolvers read through `settings::get_env_var`, which also
+        // consults `settings.json` — so this only pins the *default*
+        // behaviour, not full isolation from the process environment (no
+        // per-module env mutex, per STYLE-0028); it's the fixed 10s/120s
+        // values themselves that matter here, not the env-reading path.
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(DEFAULT_READ_TIMEOUT, Duration::from_secs(120));
+    }
 
     #[tokio::test]
     async fn retries_429_then_succeeds_and_logs_each_attempt() {
