@@ -82,6 +82,11 @@ mail-parser = "0.11"
 # (`src/cli/gmail/sync/progress.rs`, #1502) — the only consumer; no-ops
 # automatically when stderr isn't a terminal.
 indicatif = "0.18"
+# HTML-to-Markdown conversion (html5ever under the hood), used only by
+# src/gmail/render.rs to back `gmail render`/`gmail read -o markdown`'s
+# text/html body fallback (#1513) when a message has no text/plain part —
+# mail-parser resolves MIME structure but does no HTML rendering itself.
+htmd = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }
