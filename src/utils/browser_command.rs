@@ -145,6 +145,21 @@ mod tests {
     }
 
     #[test]
+    fn split_browser_command_rejects_a_double_quote_left_open_by_a_trailing_escape() {
+        // The backslash is the very last character, so the escape has
+        // nothing to escape and the quote is left unterminated.
+        assert!(split_browser_command("LABEL", "\"abc\\").is_err());
+    }
+
+    #[test]
+    fn split_browser_command_treats_a_trailing_unquoted_backslash_as_literal() {
+        assert_eq!(
+            split_browser_command("LABEL", "chrome\\").unwrap(),
+            vec!["chrome\\"]
+        );
+    }
+
+    #[test]
     fn split_browser_command_rejects_an_empty_command() {
         assert!(split_browser_command("LABEL", "   ").is_err());
         assert!(split_browser_command("LABEL", "").is_err());
