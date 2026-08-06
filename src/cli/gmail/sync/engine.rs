@@ -60,7 +60,7 @@ pub(crate) struct SyncOptions {
     pub(crate) dry_run: bool,
     pub(crate) extract_attachments: bool,
     /// A concurrency cap shared across every account's fetches in one
-    /// `gmail sync-all` run (ADR-0067), layered underneath `concurrency`
+    /// `gmail sync-all` run (ADR-0068), layered underneath `concurrency`
     /// (each account's own local `buffer_unordered`/`FuturesUnordered`
     /// clamp). `None` for every single-account caller — `gmail sync`'s
     /// behavior is unaffected.
@@ -2280,7 +2280,7 @@ not-really-a-pdf\r\n\
         }
     }
 
-    // ── shared concurrency pool for `sync-all` (ADR-0067) ────────────────
+    // ── shared concurrency pool for `sync-all` (ADR-0068) ────────────────
 
     #[tokio::test]
     async fn shared_pool_of_one_never_lets_two_fetches_be_in_flight_at_once() {
