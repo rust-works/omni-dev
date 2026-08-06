@@ -4387,7 +4387,7 @@ Options:
       --concurrency <N>     Overrides `gmail-sync.yaml`'s `concurrency` — a fetch-request cap shared across every configured account this run. Left unset, the YAML value applies; if that's unset too, falls back to the same default as `gmail sync --concurrency`
       --full                Forces a full backfill/reconciliation pass for every account, same as `gmail sync --full`
       --dry-run             Reports the planned actions for every account without writing any files
-      --quiet               Suppresses the per-account summary line printed as each account finishes; per-message errors and the trailing combined total still print regardless
+      --quiet               Suppresses the per-account summary line printed as each account finishes, and the live per-account progress bars a run shows on an interactive terminal; per-message errors and the trailing combined total still print regardless
   -o, --output <OUTPUT>     Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
 
