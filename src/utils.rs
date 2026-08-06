@@ -1,6 +1,7 @@
 //! Utility functions and helpers.
 
 pub mod ai_scratch;
+pub(crate) mod browser_command;
 pub mod env;
 pub(crate) mod http;
 pub(crate) mod path;
