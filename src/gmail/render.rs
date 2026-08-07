@@ -220,4 +220,45 @@ mod tests {
         assert!(!markdown.contains("**In-Reply-To:**"));
         assert!(!markdown.contains("**References:**"));
     }
+
+    #[test]
+    fn render_markdown_includes_in_reply_to_and_references_when_present() {
+        let raw = b"Subject: Re: Hi\r\nIn-Reply-To: <id1@example.com>\r\nReferences: <id1@example.com> <id2@example.com>\r\n\r\nBody.";
+        let markdown = render_markdown(raw);
+        assert!(markdown.contains("- **In-Reply-To:** id1@example.com"));
+        assert!(markdown.contains("- **References:** id1@example.com id2@example.com"));
+    }
+
+    #[test]
+    fn render_markdown_renders_a_bare_display_name_address_without_an_email() {
+        // mail-parser leniently parses a `From:` header with no `<email>`
+        // as an address with a name but no address.
+        let raw = b"Subject: Hi\r\nFrom: Alice\r\n\r\nBody.";
+        let markdown = render_markdown(raw);
+        assert!(markdown.contains("- **From:** Alice"));
+    }
+
+    #[test]
+    fn format_addr_renders_empty_string_when_name_and_address_are_both_absent() {
+        // Not reachable through mail-parser's own output (it drops
+        // malformed address entries rather than yielding one with neither
+        // field set) — exercised directly against the pure helper instead.
+        assert_eq!(
+            format_addr(&Addr {
+                name: None,
+                address: None
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn body_markdown_falls_back_to_no_body_placeholder_when_the_only_part_is_an_attachment() {
+        let raw = b"Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"a.txt\"\r\n\r\nAttached text\r\n\
+--B--\r\n";
+        let raw = raw.to_vec();
+        let message = MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(body_markdown(&message), "*(no body)*");
+    }
 }

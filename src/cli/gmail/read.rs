@@ -594,6 +594,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_read_yaml_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Yaml,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_yamls_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Yamls,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_jsonl_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Jsonl,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn run_read_propagates_api_errors() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
