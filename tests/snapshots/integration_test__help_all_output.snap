@@ -4116,6 +4116,7 @@ Commands:
   sync                 Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
   sync-all             Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
   extract-attachments  Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
+  render               Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
   help                 Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4350,7 +4351,24 @@ Arguments:
 Options:
       --out-file <PATH>  Output file (writes to stdout if omitted)
       --detail <DETAIL>  How much of the message to fetch [default: full] [possible values: minimal, metadata, full, raw]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail render - Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
+
+Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
+
+Usage: render [OPTIONS] <PATH>...
+
+Arguments:
+  <PATH>...  One or more `.eml` file paths to render
+
+Options:
+      --out-dir <DIR>    Writes one `.md` file per input (named after the input's stem) into this directory instead of printing Markdown to stdout
+  -o, --output <OUTPUT>  Report format. `Table` (default) prints each input's rendered Markdown directly to stdout — or, with `--out-dir`, a `Saved to:` line per file — so redirecting stdout to a file yields clean Markdown; json/yaml/yamls/jsonl instead emit one structured record per input [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
