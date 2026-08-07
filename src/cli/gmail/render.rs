@@ -311,6 +311,28 @@ mod tests {
     }
 
     #[test]
+    fn md_filename_falls_back_to_message_when_input_has_no_file_stem() {
+        assert_eq!(md_filename(Path::new("..")), PathBuf::from("message.md"));
+    }
+
+    #[test]
+    fn render_paths_records_error_when_writing_the_output_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        // A directory sitting where the rendered `.md` file would be
+        // written makes `fs::write` fail with "Is a directory".
+        fs::create_dir_all(out_dir.join("m1.md")).unwrap();
+
+        let rendered = render_paths(&[path], Some(&out_dir)).unwrap();
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].saved_to.is_none());
+        assert!(rendered[0].markdown.is_none());
+        assert!(rendered[0].error.is_some());
+    }
+
+    #[test]
     fn render_report_text_joins_multiple_files_with_thematic_break() {
         let rendered = vec![
             RenderedFile {
@@ -344,5 +366,32 @@ mod tests {
         render_report_text(&rendered, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Error: a.eml: No such file or directory"));
+    }
+
+    #[test]
+    fn render_report_text_reports_saved_to_lines() {
+        let rendered = vec![RenderedFile {
+            path: PathBuf::from("a.eml"),
+            saved_to: Some(PathBuf::from("out/a.md")),
+            markdown: None,
+            error: None,
+        }];
+        let mut buf = Vec::new();
+        render_report_text(&rendered, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, "Saved to: out/a.md\n");
+    }
+
+    #[test]
+    fn render_report_text_writes_nothing_for_an_entry_with_no_output() {
+        let rendered = vec![RenderedFile {
+            path: PathBuf::from("a.eml"),
+            saved_to: None,
+            markdown: None,
+            error: None,
+        }];
+        let mut buf = Vec::new();
+        render_report_text(&rendered, &mut buf).unwrap();
+        assert!(buf.is_empty());
     }
 }

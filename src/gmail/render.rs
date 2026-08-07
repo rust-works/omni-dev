@@ -12,6 +12,8 @@
 use std::fmt::Write as _;
 
 use mail_parser::{Addr, Address, HeaderValue, Message, MessageParser, MimeHeaders};
+#[cfg(test)]
+use mail_parser::{ContentType, Encoding, Header, HeaderName, MessagePart, PartType};
 
 use crate::gmail::attachments::extract_attachments;
 
@@ -219,5 +221,111 @@ mod tests {
         assert!(!markdown.contains("**Cc:**"));
         assert!(!markdown.contains("**In-Reply-To:**"));
         assert!(!markdown.contains("**References:**"));
+    }
+
+    #[test]
+    fn render_markdown_includes_in_reply_to_and_references_when_present() {
+        let raw = b"Subject: Re: Hi\r\nIn-Reply-To: <id1@example.com>\r\nReferences: <id1@example.com> <id2@example.com>\r\n\r\nBody.";
+        let markdown = render_markdown(raw);
+        assert!(markdown.contains("- **In-Reply-To:** id1@example.com"));
+        assert!(markdown.contains("- **References:** id1@example.com id2@example.com"));
+    }
+
+    #[test]
+    fn render_markdown_renders_a_bare_display_name_address_without_an_email() {
+        // mail-parser leniently parses a `From:` header with no `<email>`
+        // as an address with a name but no address.
+        let raw = b"Subject: Hi\r\nFrom: Alice\r\n\r\nBody.";
+        let markdown = render_markdown(raw);
+        assert!(markdown.contains("- **From:** Alice"));
+    }
+
+    #[test]
+    fn format_addr_renders_empty_string_when_name_and_address_are_both_absent() {
+        // Not reachable through mail-parser's own output (it drops
+        // malformed address entries rather than yielding one with neither
+        // field set) — exercised directly against the pure helper instead.
+        assert_eq!(
+            format_addr(&Addr {
+                name: None,
+                address: None
+            }),
+            ""
+        );
+    }
+
+    /// Builds a single-part synthetic `Message` whose one part declares
+    /// `type_`/`subtype` as its Content-Type header and carries `body` as
+    /// its parsed content, with `text_body` (and no `html_body`) pointing
+    /// at it. `mail-parser`'s own parser always keeps a part's declared
+    /// Content-Type and its parsed [`PartType`] in sync (a `text/plain`
+    /// header is always parsed as `PartType::Text`, never
+    /// `PartType::Binary`), so the mismatches below aren't reachable through
+    /// real parsing — this constructs them directly, the same workaround
+    /// `format_addr_renders_empty_string_when_name_and_address_are_both_absent`
+    /// above uses for a state `mail-parser` itself never produces.
+    fn synthetic_single_part_message(
+        type_: &str,
+        subtype: &str,
+        body: PartType<'static>,
+    ) -> Message<'static> {
+        let part = MessagePart {
+            headers: vec![Header {
+                name: HeaderName::ContentType,
+                value: HeaderValue::ContentType(ContentType {
+                    c_type: type_.to_string().into(),
+                    c_subtype: Some(subtype.to_string().into()),
+                    attributes: None,
+                }),
+                offset_field: 0,
+                offset_start: 0,
+                offset_end: 0,
+            }],
+            is_encoding_problem: false,
+            body,
+            encoding: Encoding::None,
+            offset_header: 0,
+            offset_body: 0,
+            offset_end: 0,
+        };
+        Message {
+            html_body: vec![],
+            text_body: vec![0],
+            attachments: vec![],
+            parts: vec![part],
+            raw_message: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn body_markdown_falls_back_past_a_declared_plain_text_part_with_no_actual_text_body() {
+        // text_part(0) reports text/plain, but the part's actual body is
+        // PartType::Binary — a state real parsing never produces (see
+        // `synthetic_single_part_message`'s doc comment).
+        let message = synthetic_single_part_message(
+            "text",
+            "plain",
+            PartType::Binary(b"irrelevant".as_slice().into()),
+        );
+        assert_eq!(body_markdown(&message), "*(no body)*");
+    }
+
+    #[test]
+    fn body_markdown_falls_back_to_plain_text_body_for_a_non_plain_text_part() {
+        // text_part(0) reports text/csv (not text/plain), so the genuine-
+        // plain-text branch is skipped; there's no html_body entry, so this
+        // falls through to the final body_text(0) fallback.
+        let message = synthetic_single_part_message("text", "csv", PartType::Text("a,b,c".into()));
+        assert_eq!(body_markdown(&message), "a,b,c");
+    }
+
+    #[test]
+    fn body_markdown_falls_back_to_no_body_placeholder_when_the_only_part_is_an_attachment() {
+        let raw = b"Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+--B\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"a.txt\"\r\n\r\nAttached text\r\n\
+--B--\r\n";
+        let raw = raw.to_vec();
+        let message = MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(body_markdown(&message), "*(no body)*");
     }
 }
