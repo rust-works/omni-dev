@@ -113,6 +113,7 @@ impl SyncCommand {
             },
             self.quiet,
             &self.output,
+            std::io::stderr().is_terminal(),
         )
         .await
     }
@@ -126,13 +127,19 @@ impl SyncCommand {
 /// render it, and only *then* decide the process exit condition — a
 /// non-empty `errors` becomes a failing exit code after everything already
 /// ran and printed, never silently.
+///
+/// Takes `stderr_is_terminal` as a value for the same reason
+/// [`should_show_progress`] does — so tests can force the live-progress
+/// branch without depending on the test runner's own (never-a-terminal)
+/// stderr.
 async fn run_sync_command(
     client: &GmailClient,
     opts: SyncOptions,
     quiet: bool,
     output: &OutputFormat,
+    stderr_is_terminal: bool,
 ) -> Result<()> {
-    let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
+    let show_progress = should_show_progress(quiet, output, stderr_is_terminal);
     let report = if show_progress {
         let (tx, rx) = mpsc::unbounded_channel();
         let bars = SyncProgressBars::new();
@@ -577,6 +584,7 @@ mod tests {
             },
             false,
             &OutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -624,10 +632,74 @@ mod tests {
             },
             false,
             &OutputFormat::Table,
+            false,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("1 message(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn run_sync_command_with_stderr_is_terminal_takes_the_live_progress_path() {
+        // `stderr_is_terminal: true` is what `should_show_progress` needs to
+        // pick the live-progress branch — the test runner's own stderr is
+        // never a terminal, hence injecting it here rather than relying on
+        // `std::io::IsTerminal` (see `run_sync_command`'s doc comment).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "user@example.com", "messagesTotal": 1, "threadsTotal": 1, "historyId": "1"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": [{"id": "m1", "threadId": "t1"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1", "threadId": "t1", "labelIds": ["INBOX"],
+                    "internalDate": "1700000000000", "historyId": "500",
+                    "raw": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode("From: a@example.com\r\n\r\nBody of m1."),
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        run_sync_command(
+            &client,
+            SyncOptions {
+                output_dir: output_dir.clone(),
+                query: None,
+                full: false,
+                concurrency: 4,
+                dry_run: false,
+                extract_attachments: false,
+            },
+            false,
+            &OutputFormat::Table,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output_dir.exists(),
+            "the live-progress run must still archive the message"
+        );
     }
 
     #[tokio::test]
@@ -753,6 +825,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             },
             false,
             &OutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -782,6 +855,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             },
             false,
             &OutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
