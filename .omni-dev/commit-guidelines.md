@@ -62,6 +62,7 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `data` - Data structures and serialization
 - `datadog` - Datadog monitoring integration and REST API client
 - `docs` - Documentation and planning
+- `drive` - Google Drive integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
 - `git` - Git operations and repository analysis
 - `gmail` - Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
 - `mcp` - MCP server implementation and tool handlers
