@@ -30,6 +30,12 @@ pub const HARD_CAP: usize = 10_000;
 /// `crate::gmail::messages_api::DEFAULT_SEARCH_LIMIT`.
 pub const DEFAULT_SEARCH_LIMIT: usize = 50;
 
+/// Refuses to buffer a [`FilesApi::download`] response body larger than
+/// this into memory. `files.export` already has Drive's own 10 MB cap, but
+/// `files.get?alt=media` has none — an unbounded read of a very large file
+/// risks exhausting process memory.
+const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
+
 /// `fields` value for `files.list` — enough for `drive search`'s
 /// table/JSON output with zero follow-up calls per hit.
 const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,\
@@ -148,12 +154,28 @@ impl<'a> FilesApi<'a> {
         if !response.status().is_success() {
             return Err(DriveClient::response_to_error(response).await.into());
         }
+        check_download_size(response.content_length())?;
         let bytes = response
             .bytes()
             .await
             .context("Failed to read response body")?;
         Ok(bytes.to_vec())
     }
+}
+
+/// Refuses a download whose declared `Content-Length` exceeds
+/// [`MAX_DOWNLOAD_BYTES`]. A missing length (e.g. chunked transfer
+/// encoding) is allowed through — there's nothing to check up front in
+/// that case.
+fn check_download_size(content_length: Option<u64>) -> Result<()> {
+    if let Some(len) = content_length {
+        anyhow::ensure!(
+            len <= MAX_DOWNLOAD_BYTES,
+            "refusing to load {len} bytes into memory (limit: {MAX_DOWNLOAD_BYTES} bytes); \
+             this file is too large for `drive read --content`"
+        );
+    }
+    Ok(())
 }
 
 fn build_files_list_url(
@@ -227,6 +249,7 @@ fn effective_cap(limit: usize) -> usize {
 mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, SCOPE_READONLY};
+    use crate::drive::types::Owner;
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -257,6 +280,82 @@ mod tests {
             &format!("{}/token", server.uri()),
         );
         client
+    }
+
+    // ── fields= selector coverage ────────────────────────────────────
+    //
+    // LIST_FIELDS/GET_FIELDS are hand-maintained `fields=` selector
+    // strings with no compiler-enforced link to DriveFile/Owner. These
+    // tests construct every field explicitly (no `..Default::default()`),
+    // so adding a struct field forces a compile error here until the test
+    // — and, by extension, the selector strings — are updated to match.
+
+    fn fully_populated_drive_file() -> DriveFile {
+        DriveFile {
+            id: "f1".to_string(),
+            name: "n".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: Some("1".to_string()),
+            modified_time: Some("2026-01-01T00:00:00Z".to_string()),
+            parents: vec!["p1".to_string()],
+            web_view_link: Some("https://example.com/view".to_string()),
+            owners: vec![Owner {
+                display_name: Some("Alice".to_string()),
+                email_address: Some("alice@example.com".to_string()),
+            }],
+            drive_id: Some("d1".to_string()),
+            export_links: Some(std::collections::HashMap::from([(
+                "text/markdown".to_string(),
+                "https://export.example.com/md".to_string(),
+            )])),
+        }
+    }
+
+    #[test]
+    fn get_fields_requests_every_drive_file_field() {
+        let json = serde_json::to_value(fully_populated_drive_file()).unwrap();
+        for key in json.as_object().unwrap().keys() {
+            assert!(
+                GET_FIELDS.contains(key.as_str()),
+                "GET_FIELDS is missing `{key}` — add it, or update this test if that's \
+                 deliberate"
+            );
+        }
+    }
+
+    #[test]
+    fn list_fields_requests_every_drive_file_field_except_export_links() {
+        let json = serde_json::to_value(fully_populated_drive_file()).unwrap();
+        for key in json.as_object().unwrap().keys() {
+            if key == "exportLinks" {
+                // Deliberately excluded — see DriveFile::export_links' doc comment.
+                continue;
+            }
+            assert!(
+                LIST_FIELDS.contains(key.as_str()),
+                "LIST_FIELDS is missing `{key}` — add it, or update this test if that's \
+                 deliberate"
+            );
+        }
+    }
+
+    #[test]
+    fn fields_selectors_request_every_owner_field() {
+        let owner = Owner {
+            display_name: Some("Alice".to_string()),
+            email_address: Some("alice@example.com".to_string()),
+        };
+        let json = serde_json::to_value(owner).unwrap();
+        for key in json.as_object().unwrap().keys() {
+            assert!(
+                GET_FIELDS.contains(key.as_str()),
+                "GET_FIELDS' owners() selector is missing `{key}`"
+            );
+            assert!(
+                LIST_FIELDS.contains(key.as_str()),
+                "LIST_FIELDS' owners() selector is missing `{key}`"
+            );
+        }
     }
 
     // ── URL builders ─────────────────────────────────────────────────
@@ -602,6 +701,24 @@ mod tests {
 
         let err = FilesApi::new(&client).download("f1").await.unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    // ── check_download_size ─────────────────────────────────────────
+
+    #[test]
+    fn check_download_size_rejects_a_length_over_the_cap() {
+        let err = check_download_size(Some(MAX_DOWNLOAD_BYTES + 1)).unwrap_err();
+        assert!(err.to_string().contains("refusing to load"), "{err}");
+    }
+
+    #[test]
+    fn check_download_size_allows_a_length_at_the_cap() {
+        assert!(check_download_size(Some(MAX_DOWNLOAD_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn check_download_size_allows_a_missing_length() {
+        assert!(check_download_size(None).is_ok());
     }
 
     // ── effective_cap ────────────────────────────────────────────────

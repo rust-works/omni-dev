@@ -21,10 +21,18 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Owner {
     /// The owner's display name.
-    #[serde(default, rename = "displayName")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "displayName"
+    )]
     pub display_name: Option<String>,
     /// The owner's email address.
-    #[serde(default, rename = "emailAddress")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "emailAddress"
+    )]
     pub email_address: Option<String>,
 }
 
