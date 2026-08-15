@@ -144,6 +144,18 @@ impl DriveClient {
         .await
     }
 
+    /// Sends an authenticated GET request without forcing an `Accept:
+    /// application/json` header, for endpoints that return raw bytes rather
+    /// than JSON (`files.export`, `files.get?alt=media`) — see
+    /// [`Self::get_json`] for the JSON counterpart. Retries exactly once on
+    /// HTTP 401, identically to `get_json`.
+    pub async fn get_bytes(&self, url: &str) -> Result<Response> {
+        self.send_authorized(url, "GET", |client, token| {
+            client.get(url).bearer_auth(token)
+        })
+        .await
+    }
+
     /// Sends an authenticated POST request with a JSON body and returns the
     /// raw response.
     pub async fn post_json<T: serde::Serialize + Sync + ?Sized>(
@@ -454,6 +466,108 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn get_bytes_sends_bearer_auth_header_without_json_accept_header() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(b"raw bytes".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get_bytes(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let bytes = resp.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"raw bytes");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_retries_on_429() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get_bytes(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_refreshes_and_retries_once_on_401() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "refreshed-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer refreshed-token",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get_bytes(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_propagates_network_errors() {
+        let client = DriveClient::new("http://127.0.0.1:1", &test_credentials()).unwrap();
+        let result = client.get_bytes("http://127.0.0.1:1/test").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

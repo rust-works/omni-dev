@@ -19,6 +19,7 @@ pub mod claude_wrap;
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
+pub mod drive;
 pub mod format;
 pub mod git;
 pub mod gmail;

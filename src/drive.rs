@@ -14,11 +14,14 @@
 //! this crate. Remove this once either child issue lands and calls into it.
 #![allow(dead_code)]
 
+pub mod about_api;
 pub mod account;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
 pub mod error;
+pub mod files_api;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod types;
