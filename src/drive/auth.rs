@@ -1,11 +1,14 @@
-//! Gmail OAuth2 authentication: authorization-code + PKCE login, credential
+//! Drive OAuth2 authentication: authorization-code + PKCE login, credential
 //! storage, and in-memory access-token refresh.
 //!
-//! See [ADR-0063](../../../docs/adrs/adr-0063.md) for the design rationale.
-//! The loopback-listener + browser-launch shape follows the Snowflake
-//! client's external-browser SSO flow (`crate::snowflake::client`'s private
-//! `auth` module), extended with PKCE (RFC 7636), a `state` nonce, and an
-//! `error=` branch — none of which a static-token or SSO-only flow needs.
+//! See [ADR-0069](../../../docs/adrs/adr-0069.md) for the design rationale
+//! (applying [ADR-0063](../../../docs/adrs/adr-0063.md), Gmail's OAuth2
+//! credential-storage design, to a second Google API). The loopback-listener
+//! and browser-launch shape follows `crate::gmail::auth`, itself following
+//! the Snowflake client's external-browser SSO flow
+//! (`crate::snowflake::client`'s private `auth` module), extended with PKCE
+//! (RFC 7636), a `state` nonce, and an `error=` branch — none of which a
+//! static-token or SSO-only flow needs.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -21,46 +24,49 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
-use crate::gmail::account::{self, ResolvedAccount};
-use crate::gmail::chrome_profile;
-use crate::gmail::error::{GmailError, GrantContext};
+use crate::drive::account::{self, ResolvedAccount};
+use crate::drive::chrome_profile;
+use crate::drive::error::{DriveError, GrantContext};
 use crate::request_log;
 use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
-use crate::utils::settings::{active_profile_from, GmailAccountSettings, GmailSettings, Settings};
+use crate::utils::settings::{active_profile_from, DriveAccountSettings, DriveSettings, Settings};
 
 /// Environment variable / settings key for the user's Google Cloud OAuth2
 /// client id.
-pub const GMAIL_CLIENT_ID: &str = "GMAIL_CLIENT_ID";
+pub const DRIVE_CLIENT_ID: &str = "DRIVE_CLIENT_ID";
 /// Environment variable / settings key for the user's Google Cloud OAuth2
 /// client secret.
-pub const GMAIL_CLIENT_SECRET: &str = "GMAIL_CLIENT_SECRET";
+pub const DRIVE_CLIENT_SECRET: &str = "DRIVE_CLIENT_SECRET";
 /// Environment variable / settings key for the stored OAuth2 refresh token.
-pub const GMAIL_REFRESH_TOKEN: &str = "GMAIL_REFRESH_TOKEN";
+pub const DRIVE_REFRESH_TOKEN: &str = "DRIVE_REFRESH_TOKEN";
 /// Environment variable / settings key recording the scope granted at login.
-pub const GMAIL_SCOPE: &str = "GMAIL_SCOPE";
-/// Environment variable overriding the real Gmail API host.
+pub const DRIVE_SCOPE: &str = "DRIVE_SCOPE";
+/// Environment variable overriding the real Drive API host.
 ///
 /// Process-env only — never written to `settings.json` by `auth login`,
-/// unlike the four keys above (`crate::gmail::client::GmailClient`'s
+/// unlike the four keys above (`crate::drive::client::DriveClient`'s
 /// default base URL). Useful for:
 /// - Tests that point at a wiremock server (e.g. `http://127.0.0.1:PORT`).
 /// - Environments where outbound traffic must go through a forced proxy.
 ///
-/// Mirrors `DATADOG_API_URL` (`crate::datadog::auth`); unlike Datadog, Gmail
-/// has no per-tenant site/region the override is *deriving from* — it's a
-/// flat replacement of the one real host, not a site substitution.
-pub const GMAIL_API_URL: &str = "GMAIL_API_URL";
+/// Mirrors `GMAIL_API_URL` (`crate::gmail::auth`); Drive has no per-tenant
+/// site/region the override is *deriving from* — it's a flat replacement of
+/// the one real host, not a site substitution.
+pub const DRIVE_API_URL: &str = "DRIVE_API_URL";
 
-/// Google's OAuth2 authorization endpoint.
+/// Google's OAuth2 authorization endpoint. Identical to Gmail's — shared
+/// Google infrastructure, not a Drive-specific host.
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-/// Google's OAuth2 token endpoint.
+/// Google's OAuth2 token endpoint. Identical to Gmail's.
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-/// Read-only Gmail scope — the default.
-pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
-/// Read-write Gmail scope — required for label add/remove; opt-in.
-pub const SCOPE_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// The single read-only Drive scope this feature ever requests.
+///
+/// Unlike Gmail's readonly/modify split, there is no `DriveScope` enum —
+/// this feature is read-only by design (see
+/// [ADR-0069](../../../docs/adrs/adr-0069.md) §2).
+pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/drive.readonly";
 
 /// How long to wait for the browser sign-in callback before giving up.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -68,58 +74,9 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 /// proactively refreshing it.
 const REFRESH_SKEW: TimeDelta = TimeDelta::seconds(60);
 
-/// The Gmail OAuth2 scope granted at login.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GmailScope {
-    /// List/read messages, threads, labels, and history. Default; never
-    /// requests send.
-    #[default]
-    ReadOnly,
-    /// Everything [`ReadOnly`](Self::ReadOnly) grants, plus label add/remove
-    /// (`batchModify`).
-    Modify,
-}
-
-impl GmailScope {
-    /// Returns the wire scope string Google expects.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => SCOPE_READONLY,
-            Self::Modify => SCOPE_MODIFY,
-        }
-    }
-
-    /// Parses Google's space-separated granted-scope response, treating the
-    /// presence of the modify scope anywhere in it as [`Modify`](Self::Modify)
-    /// and the readonly scope (with no modify) as [`ReadOnly`](Self::ReadOnly).
-    ///
-    /// Returns `None` when neither Gmail scope is present — e.g. the user
-    /// left the Gmail permission unticked on Google's consent screen — so
-    /// callers can reject the grant instead of silently defaulting to
-    /// [`ReadOnly`](Self::ReadOnly).
-    #[must_use]
-    pub fn from_granted(granted: &str) -> Option<Self> {
-        let tokens: Vec<&str> = granted.split_whitespace().collect();
-        if tokens.contains(&SCOPE_MODIFY) {
-            Some(Self::Modify)
-        } else if tokens.contains(&SCOPE_READONLY) {
-            Some(Self::ReadOnly)
-        } else {
-            None
-        }
-    }
-
-    /// Whether this scope allows label-mutating calls (`batchModify`).
-    #[must_use]
-    pub fn allows_modify(self) -> bool {
-        matches!(self, Self::Modify)
-    }
-}
-
-/// Gmail OAuth2 credentials.
+/// Drive OAuth2 credentials.
 #[derive(Debug, Clone)]
-pub struct GmailCredentials {
+pub struct DriveCredentials {
     /// OAuth2 client id (not secret — visible in the browser's own network
     /// traffic during login regardless).
     pub client_id: String,
@@ -128,69 +85,70 @@ pub struct GmailCredentials {
     /// The stored refresh token (redacted in `Debug` output).
     pub refresh_token: Secret,
     /// The scope granted at the login that produced this refresh token.
-    pub scope: GmailScope,
+    /// Always [`SCOPE_READONLY`] once granted — stored as a plain `String`
+    /// (not an enum, unlike Gmail's `GmailScope`) purely for
+    /// status-reporting parity with Gmail.
+    pub scope: String,
 }
 
 /// Secret-free presence/scope report, safe to serialise (e.g. over MCP).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GmailAuthStatus {
-    /// Whether [`GMAIL_CLIENT_ID`] is present.
+pub struct DriveAuthStatus {
+    /// Whether [`DRIVE_CLIENT_ID`] is present.
     pub has_client_id: bool,
-    /// Whether [`GMAIL_CLIENT_SECRET`] is present.
+    /// Whether [`DRIVE_CLIENT_SECRET`] is present.
     pub has_client_secret: bool,
-    /// Whether [`GMAIL_REFRESH_TOKEN`] is present.
+    /// Whether [`DRIVE_REFRESH_TOKEN`] is present.
     pub has_refresh_token: bool,
     /// The granted scope, if recorded. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
 }
 
-/// Resolves the active Gmail account for this call (issue #1500), folding an
-/// explicit per-call override together with the ambient
-/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] value. The one seam every
-/// credential CRUD entry point in this module and [`crate::gmail::import`]
-/// routes through.
-pub(crate) fn resolve(gmail: &GmailSettings, explicit: Option<&str>) -> Result<ResolvedAccount> {
+/// Resolves the active Drive account for this call (mirrors Gmail's issue
+/// #1500), folding an explicit per-call override together with the ambient
+/// `--account`/[`account::DRIVE_ACCOUNT_ENV`] value. The one seam every
+/// credential CRUD entry point in this module routes through.
+pub(crate) fn resolve(drive: &DriveSettings, explicit: Option<&str>) -> Result<ResolvedAccount> {
     let explicit = fold_explicit(explicit);
-    account::resolve_account(&SystemEnv, gmail, explicit.as_deref())
+    account::resolve_account(&SystemEnv, drive, explicit.as_deref())
 }
 
-/// Like [`resolve`], but for account-creating writes (`gmail auth login`,
-/// `gmail auth import`) — see
-/// [`account::resolve_account_for_write`] for why an explicit target need
-/// not already exist.
+/// Like [`resolve`], but for account-creating writes (`drive auth login`,
+/// `drive auth import`) — see [`account::resolve_account_for_write`] for why
+/// an explicit target need not already exist.
 pub(crate) fn resolve_for_write(
-    gmail: &GmailSettings,
+    drive: &DriveSettings,
     explicit: Option<&str>,
 ) -> Result<ResolvedAccount> {
     let explicit = fold_explicit(explicit);
-    account::resolve_account_for_write(&SystemEnv, gmail, explicit.as_deref())
+    account::resolve_account_for_write(&SystemEnv, drive, explicit.as_deref())
 }
 
 /// Folds an explicit per-call account override together with the ambient
-/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] value — shared by [`resolve`]
+/// `--account`/[`account::DRIVE_ACCOUNT_ENV`] value — shared by [`resolve`]
 /// and [`resolve_for_write`].
 fn fold_explicit(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::to_string)
-        .or_else(|| account::active_gmail_account_from(&SystemEnv))
+        .or_else(|| account::active_drive_account_from(&SystemEnv))
 }
 
-/// Resolves the [`BrowserConfig`] `gmail auth login` should open the
+/// Resolves the [`BrowserConfig`] `drive auth login` should open the
 /// authorization URL with, honoring a named account's manual
 /// `browser_command` override and opt-in automatic Chrome-profile
-/// resolution (issue #1505). `explicit` is folded exactly like
-/// [`resolve_for_write`]'s. A [`ResolvedAccount::Legacy`] account (no named
-/// accounts configured, or a literal credential env set) always yields
-/// today's [`BrowserLaunch::Auto`] — zero migration.
+/// resolution (mirrors Gmail's issue #1505). `explicit` is folded exactly
+/// like [`resolve_for_write`]'s. A [`ResolvedAccount::Unconfigured`] account
+/// (no named accounts configured, or a literal credential env set) always
+/// yields [`BrowserLaunch::Auto`].
 pub(crate) fn resolve_browser_config_for(
-    gmail: &GmailSettings,
+    drive: &DriveSettings,
     explicit: Option<&str>,
 ) -> Result<BrowserConfig> {
-    match resolve_for_write(gmail, explicit)? {
-        ResolvedAccount::Legacy => Ok(BrowserConfig::default()),
+    match resolve_for_write(drive, explicit)? {
+        ResolvedAccount::Unconfigured => Ok(BrowserConfig::default()),
         ResolvedAccount::Named(name) => build_browser_config(
-            gmail.accounts.get(&name),
+            drive.accounts.get(&name),
             chrome_profile::resolve_launch_command,
         ),
     }
@@ -209,7 +167,7 @@ pub(crate) fn resolve_browser_config_for(
 ///    `resolve_chrome_profile`'s fail-open contract) falls back to `Auto`.
 /// 3. Otherwise → `Auto`.
 fn build_browser_config(
-    account: Option<&GmailAccountSettings>,
+    account: Option<&DriveAccountSettings>,
     resolve_chrome_profile: impl FnOnce(&str) -> Option<Vec<String>>,
 ) -> Result<BrowserConfig> {
     let Some(account) = account else {
@@ -247,69 +205,63 @@ fn build_browser_config(
     Ok(BrowserConfig::default())
 }
 
-/// Loads Gmail credentials from environment variables or settings.json.
+/// Loads Drive credentials from environment variables or settings.json.
 ///
 /// Environment variables take precedence over the settings file.
-pub fn load_credentials() -> Result<GmailCredentials> {
+pub fn load_credentials() -> Result<DriveCredentials> {
     load_credentials_with(&crate::utils::settings::SettingsEnv::load())
 }
 
-/// [`load_credentials`], but honoring the named-account resolution added by
-/// issue #1500. `explicit` is the already-resolved `--account`/
-/// [`account::GMAIL_ACCOUNT_ENV`] override, if any (`None` still resolves
+/// [`load_credentials`], but honoring the named-account resolution (mirrors
+/// Gmail's issue #1500). `explicit` is the already-resolved `--account`/
+/// [`account::DRIVE_ACCOUNT_ENV`] override, if any (`None` still resolves
 /// the ambient env var — see [`resolve`]). Falls through to
-/// [`load_credentials_with`]'s exact legacy behavior when no named account
-/// applies — the zero-migration guarantee.
-pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<GmailCredentials> {
+/// [`load_credentials_with`]'s exact behavior when no named account applies
+/// — an empty `drive.accounts` map or the literal-env bypass both resolve
+/// to [`ResolvedAccount::Unconfigured`], and [`load_credentials_with`]
+/// naturally fails loudly with [`DriveError::CredentialsNotFound`] (whose
+/// message names `drive auth login`) when there is nothing to load.
+pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<DriveCredentials> {
     let settings = Settings::load().unwrap_or_default();
-    match resolve(&settings.gmail, explicit)? {
-        ResolvedAccount::Legacy => {
+    match resolve(&settings.drive, explicit)? {
+        ResolvedAccount::Unconfigured => {
             load_credentials_with(&crate::utils::settings::SettingsEnv::load())
         }
-        ResolvedAccount::Named(name) => load_named_credentials(&settings.gmail, &name),
+        ResolvedAccount::Named(name) => load_named_credentials(&settings.drive, &name),
     }
 }
 
-/// Reads `gmail.accounts.<name>` into [`GmailCredentials`], wrapping
+/// Reads `drive.accounts.<name>` into [`DriveCredentials`], wrapping
 /// `client_secret`/`refresh_token` into [`Secret`] immediately, mirroring
 /// [`load_credentials_with`].
-fn load_named_credentials(gmail: &GmailSettings, name: &str) -> Result<GmailCredentials> {
-    let account = gmail
+fn load_named_credentials(drive: &DriveSettings, name: &str) -> Result<DriveCredentials> {
+    let account = drive
         .accounts
         .get(name)
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .ok_or(DriveError::CredentialsNotFound)?;
     let client_id = account
         .client_id
         .clone()
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .ok_or(DriveError::CredentialsNotFound)?;
     let client_secret = account
         .client_secret
         .clone()
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .ok_or(DriveError::CredentialsNotFound)?;
     let refresh_token = account
         .refresh_token
         .clone()
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .ok_or(DriveError::CredentialsNotFound)?;
     let scope = account
         .scope
-        .as_deref()
-        .and_then(GmailScope::from_granted)
-        .unwrap_or_default();
+        .clone()
+        .unwrap_or_else(|| SCOPE_READONLY.to_string());
 
-    Ok(GmailCredentials {
+    Ok(DriveCredentials {
         client_id,
         client_secret: client_secret.into(),
         refresh_token: refresh_token.into(),
         scope,
     })
-}
-
-/// Forces the legacy (pre-migration) credential path regardless of any
-/// active named account. Used only by `gmail account import-legacy`, which
-/// must read the *true* legacy env-resolved credentials to migrate, not
-/// whatever named account happens to be ambient.
-pub(crate) fn load_credentials_legacy() -> Result<GmailCredentials> {
-    load_credentials_with(&crate::utils::settings::SettingsEnv::load())
 }
 
 /// [`load_credentials`] over an injected
@@ -319,27 +271,21 @@ pub(crate) fn load_credentials_legacy() -> Result<GmailCredentials> {
 /// mutating the process environment (issue #1030 / STYLE-0028).
 pub(crate) fn load_credentials_with(
     env: &impl crate::utils::env::EnvSource,
-) -> Result<GmailCredentials> {
+) -> Result<DriveCredentials> {
     let client_id = env
-        .var(GMAIL_CLIENT_ID)
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .var(DRIVE_CLIENT_ID)
+        .ok_or(DriveError::CredentialsNotFound)?;
     let client_secret = env
-        .var(GMAIL_CLIENT_SECRET)
-        .ok_or(GmailError::CredentialsNotFound)?;
+        .var(DRIVE_CLIENT_SECRET)
+        .ok_or(DriveError::CredentialsNotFound)?;
     let refresh_token = env
-        .var(GMAIL_REFRESH_TOKEN)
-        .ok_or(GmailError::CredentialsNotFound)?;
-    // Unlike login (which rejects an unparseable grant outright), a stored
-    // scope that no longer parses degrades to ReadOnly rather than erroring:
-    // it was already validated when written, and failing closed here is
-    // safe (a stale Modify silently becoming ReadOnly still fails at the
-    // API, not open).
+        .var(DRIVE_REFRESH_TOKEN)
+        .ok_or(DriveError::CredentialsNotFound)?;
     let scope = env
-        .var(GMAIL_SCOPE)
-        .and_then(|s| GmailScope::from_granted(&s))
-        .unwrap_or_default();
+        .var(DRIVE_SCOPE)
+        .unwrap_or_else(|| SCOPE_READONLY.to_string());
 
-    Ok(GmailCredentials {
+    Ok(DriveCredentials {
         client_id,
         client_secret: client_secret.into(),
         refresh_token: refresh_token.into(),
@@ -347,52 +293,54 @@ pub(crate) fn load_credentials_with(
     })
 }
 
-/// Builds a [`GmailAuthStatus`] from the current settings / environment.
+/// Builds a [`DriveAuthStatus`] from the current settings / environment.
 ///
 /// Reports credential presence without leaking any secret values. Safe to
 /// call with no credentials configured.
-pub fn status() -> GmailAuthStatus {
+pub fn status() -> DriveAuthStatus {
     status_with(&crate::utils::settings::SettingsEnv::load())
 }
 
 /// [`status`] over an injected [`EnvSource`](crate::utils::env::EnvSource).
-pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthStatus {
-    GmailAuthStatus {
-        has_client_id: env.var(GMAIL_CLIENT_ID).is_some(),
-        has_client_secret: env.var(GMAIL_CLIENT_SECRET).is_some(),
-        has_refresh_token: env.var(GMAIL_REFRESH_TOKEN).is_some(),
-        scope: env.var(GMAIL_SCOPE),
+pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> DriveAuthStatus {
+    DriveAuthStatus {
+        has_client_id: env.var(DRIVE_CLIENT_ID).is_some(),
+        has_client_secret: env.var(DRIVE_CLIENT_SECRET).is_some(),
+        has_refresh_token: env.var(DRIVE_REFRESH_TOKEN).is_some(),
+        scope: env.var(DRIVE_SCOPE),
     }
 }
 
-/// [`status`], but honoring the named-account resolution added by issue
-/// #1500. `explicit` is the already-resolved `--account`/
-/// [`account::GMAIL_ACCOUNT_ENV`] override, if any. Unlike [`status`], this
+/// [`status`], but honoring the named-account resolution (mirrors Gmail's
+/// issue #1500). `explicit` is the already-resolved `--account`/
+/// [`account::DRIVE_ACCOUNT_ENV`] override, if any. Unlike [`status`], this
 /// can fail — once named accounts exist, resolution itself can (e.g. an
 /// unknown or ambiguous account) — so callers that want [`status`]'s
 /// never-fails presence report keep calling that instead.
 ///
-/// Only compiled with the `mcp` feature — the MCP `gmail_auth_status` tool
-/// is its sole consumer; the CLI's `gmail auth status` goes through
+/// Only compiled with the `mcp` feature — the MCP `drive_auth_status` tool
+/// is its sole consumer; the CLI's `drive auth status` goes through
 /// [`load_credentials_for`] instead.
 #[cfg(feature = "mcp")]
-pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
+pub(crate) fn status_for(explicit: Option<&str>) -> Result<DriveAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
-    match resolve(&settings.gmail, explicit)? {
-        ResolvedAccount::Legacy => Ok(status_with(&crate::utils::settings::SettingsEnv::load())),
-        ResolvedAccount::Named(name) => Ok(status_from_named(&settings.gmail, &name)),
+    match resolve(&settings.drive, explicit)? {
+        ResolvedAccount::Unconfigured => {
+            Ok(status_with(&crate::utils::settings::SettingsEnv::load()))
+        }
+        ResolvedAccount::Named(name) => Ok(status_from_named(&settings.drive, &name)),
     }
 }
 
-/// Builds a [`GmailAuthStatus`] from `gmail.accounts.<name>`'s presence
+/// Builds a [`DriveAuthStatus`] from `drive.accounts.<name>`'s presence
 /// flags — the named-account counterpart of [`status_with`].
 ///
 /// Only compiled with the `mcp` feature — see [`status_for`], its sole
 /// caller.
 #[cfg(feature = "mcp")]
-fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
-    let account = gmail.accounts.get(name);
-    GmailAuthStatus {
+fn status_from_named(drive: &DriveSettings, name: &str) -> DriveAuthStatus {
+    let account = drive.accounts.get(name);
+    DriveAuthStatus {
         has_client_id: account.is_some_and(|a| a.client_id.is_some()),
         has_client_secret: account.is_some_and(|a| a.client_secret.is_some()),
         has_refresh_token: account.is_some_and(|a| a.refresh_token.is_some()),
@@ -400,22 +348,22 @@ fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
     }
 }
 
-/// Opportunistic `email_address` backfill for `name`, populated by `gmail
-/// auth status --all` after a successful live `users.getProfile` call.
-/// Never used for authentication, never written by `login`/`import`. A
-/// no-op when `name` already has an `email_address` — an explicit or
-/// previously-backfilled value is never overwritten (issue #1505).
+/// Opportunistic `email_address` backfill for `name`, populated by `drive
+/// auth status --all` after a successful live API call. Never used for
+/// authentication, never written by `login`/`import`. A no-op when `name`
+/// already has an `email_address` — an explicit or previously-backfilled
+/// value is never overwritten (mirrors Gmail's issue #1505).
 pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
     let settings = Settings::load().unwrap_or_default();
     if settings
-        .gmail
+        .drive
         .accounts
         .get(name)
         .is_some_and(|account| account.email_address.is_some())
     {
         return Ok(());
     }
-    Settings::upsert_gmail_account(
+    Settings::upsert_drive_account(
         &Settings::get_settings_path()?,
         name,
         &[(
@@ -425,11 +373,11 @@ pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
     )
 }
 
-/// Saves Gmail credentials to `~/.omni-dev/settings.json`.
+/// Saves Drive credentials to `~/.omni-dev/settings.json`.
 ///
 /// Merges the four credential keys into the active profile's `env` map (the
 /// base `env` when no profile is active), preserving all other settings.
-pub fn save_credentials(credentials: &GmailCredentials) -> Result<()> {
+pub fn save_credentials(credentials: &DriveCredentials) -> Result<()> {
     save_credentials_to(
         &Settings::get_settings_path()?,
         active_profile_from(&SystemEnv).as_deref(),
@@ -442,30 +390,30 @@ pub fn save_credentials(credentials: &GmailCredentials) -> Result<()> {
 pub(crate) fn save_credentials_to(
     settings_path: &Path,
     profile: Option<&str>,
-    credentials: &GmailCredentials,
+    credentials: &DriveCredentials,
 ) -> Result<()> {
     Settings::upsert_env_vars_in(
         settings_path,
         profile,
         &[
-            (GMAIL_CLIENT_ID, credentials.client_id.as_str()),
+            (DRIVE_CLIENT_ID, credentials.client_id.as_str()),
             (
-                GMAIL_CLIENT_SECRET,
+                DRIVE_CLIENT_SECRET,
                 credentials.client_secret.expose_secret(),
             ),
             (
-                GMAIL_REFRESH_TOKEN,
+                DRIVE_REFRESH_TOKEN,
                 credentials.refresh_token.expose_secret(),
             ),
-            (GMAIL_SCOPE, credentials.scope.as_str()),
+            (DRIVE_SCOPE, credentials.scope.as_str()),
         ],
     )
 }
 
-/// The `gmail.accounts.<name>` field names/values for `credentials` — the
-/// named-account counterpart of the flat `GMAIL_*` env keys
+/// The `drive.accounts.<name>` field names/values for `credentials` — the
+/// named-account counterpart of the flat `DRIVE_*` env keys
 /// [`save_credentials_to`] writes.
-fn named_account_vars(credentials: &GmailCredentials) -> [(&str, serde_json::Value); 4] {
+fn named_account_vars(credentials: &DriveCredentials) -> [(&str, serde_json::Value); 4] {
     [
         (
             "client_id",
@@ -481,15 +429,15 @@ fn named_account_vars(credentials: &GmailCredentials) -> [(&str, serde_json::Val
         ),
         (
             "scope",
-            serde_json::Value::String(credentials.scope.as_str().to_string()),
+            serde_json::Value::String(credentials.scope.clone()),
         ),
     ]
 }
 
-/// Removes Gmail credential keys from `~/.omni-dev/settings.json` — this
-/// *is* `gmail auth logout`.
+/// Removes Drive credential keys from `~/.omni-dev/settings.json` — this
+/// *is* `drive auth logout`.
 ///
-/// Returns `true` if any Gmail key was present and removed, `false`
+/// Returns `true` if any Drive key was present and removed, `false`
 /// otherwise.
 pub fn remove_credentials() -> Result<bool> {
     remove_credentials_at(
@@ -505,27 +453,27 @@ pub(crate) fn remove_credentials_at(settings_path: &Path, profile: Option<&str>)
         settings_path,
         profile,
         &[
-            GMAIL_CLIENT_ID,
-            GMAIL_CLIENT_SECRET,
-            GMAIL_REFRESH_TOKEN,
-            GMAIL_SCOPE,
+            DRIVE_CLIENT_ID,
+            DRIVE_CLIENT_SECRET,
+            DRIVE_REFRESH_TOKEN,
+            DRIVE_SCOPE,
         ],
     )
 }
 
-/// [`remove_credentials`], but honoring the named-account resolution added
-/// by issue #1500. `explicit` is the already-resolved `--account`/
-/// [`account::GMAIL_ACCOUNT_ENV`] override, if any. Removes the whole
-/// `gmail.accounts.<name>` entry — an account is coherent as a unit.
+/// [`remove_credentials`], but honoring the named-account resolution
+/// (mirrors Gmail's issue #1500). `explicit` is the already-resolved
+/// `--account`/[`account::DRIVE_ACCOUNT_ENV`] override, if any. Removes the
+/// whole `drive.accounts.<name>` entry — an account is coherent as a unit.
 pub(crate) fn remove_credentials_for(explicit: Option<&str>) -> Result<bool> {
     let settings = Settings::load().unwrap_or_default();
-    match resolve(&settings.gmail, explicit)? {
-        ResolvedAccount::Legacy => remove_credentials_at(
+    match resolve(&settings.drive, explicit)? {
+        ResolvedAccount::Unconfigured => remove_credentials_at(
             &Settings::get_settings_path()?,
             active_profile_from(&SystemEnv).as_deref(),
         ),
         ResolvedAccount::Named(name) => {
-            Settings::remove_gmail_account(&Settings::get_settings_path()?, &name)
+            Settings::remove_drive_account(&Settings::get_settings_path()?, &name)
         }
     }
 }
@@ -534,10 +482,12 @@ pub(crate) fn remove_credentials_for(explicit: Option<&str>) -> Result<bool> {
 
 /// How to open the authorization URL during login.
 ///
-/// Deliberately duplicated from (not shared with)
-/// [`crate::snowflake::client::config::BrowserLaunch`] — a small, stable
+/// Deliberately duplicated from (not shared with) `crate::gmail::auth`'s
+/// identical type (itself duplicated from
+/// [`crate::snowflake::client::config::BrowserLaunch`]) — a small, stable
 /// shape with no existing "generic browser launch" module to promote into;
-/// extract only on a third consumer.
+/// extract only on a third consumer (see
+/// [ADR-0069](../../../docs/adrs/adr-0069.md) §4).
 #[derive(Clone, Debug, Default)]
 pub enum BrowserLaunch {
     /// Open with the OS default handler (`open` / `xdg-open` / `start`).
@@ -579,14 +529,14 @@ impl Default for BrowserConfig {
 fn open_browser(launch: &BrowserLaunch, url: &str) -> Result<()> {
     match launch {
         BrowserLaunch::Manual => {
-            tracing::info!("Open this URL in a browser to sign in to Gmail:\n{url}");
+            tracing::info!("Open this URL in a browser to sign in to Drive:\n{url}");
             Ok(())
         }
         BrowserLaunch::Command(args) => {
             let mut parts = args.iter();
             let program = parts
                 .next()
-                .ok_or_else(|| GmailError::InvalidBrowserCommand("empty browser command".into()))?;
+                .ok_or_else(|| DriveError::InvalidBrowserCommand("empty browser command".into()))?;
             let mut command = Command::new(program);
             let mut placed = false;
             for arg in parts {
@@ -654,17 +604,16 @@ fn code_challenge(code_verifier: &str) -> String {
 fn build_authorization_url(
     client_id: &str,
     redirect_uri: &str,
-    scope: GmailScope,
     state: &str,
     code_challenge: &str,
 ) -> Result<Url> {
     let mut url =
-        Url::parse(AUTHORIZATION_ENDPOINT).context("Invalid Gmail authorization endpoint")?;
+        Url::parse(AUTHORIZATION_ENDPOINT).context("Invalid Drive authorization endpoint")?;
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("response_type", "code")
-        .append_pair("scope", scope.as_str())
+        .append_pair("scope", SCOPE_READONLY)
         .append_pair("state", state)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
@@ -723,7 +672,7 @@ pub(crate) async fn wait_for_callback_with_timeout(
 ) -> Result<CallbackResult> {
     let (mut stream, _addr) = tokio::time::timeout(timeout, listener.accept())
         .await
-        .map_err(|_| GmailError::CallbackTimeout(timeout.as_secs()))?
+        .map_err(|_| DriveError::CallbackTimeout(timeout.as_secs()))?
         .context("Failed to accept the browser's callback connection")?;
 
     let mut buf = vec![0u8; 8192];
@@ -733,13 +682,13 @@ pub(crate) async fn wait_for_callback_with_timeout(
         .context("Failed to read the callback request")?;
     let request = String::from_utf8_lossy(&buf[..n]);
 
-    let result = parse_callback(&request).ok_or(GmailError::MalformedCallback)?;
-    tracing::info!("Gmail OAuth callback received");
+    let result = parse_callback(&request).ok_or(DriveError::MalformedCallback)?;
+    tracing::info!("Drive OAuth callback received");
 
     let body = if result.error.is_some() {
         "<html><body>Sign-in failed. You can close this tab and check the terminal.</body></html>"
     } else {
-        "<html><body>Gmail sign-in complete. You can close this tab.</body></html>"
+        "<html><body>Drive sign-in complete. You can close this tab.</body></html>"
     };
     let response =
         format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}");
@@ -840,14 +789,14 @@ async fn post_token_request(
 ) -> Result<TokenResponse> {
     let started = std::time::Instant::now();
     let result = http.post(token_endpoint).form(params).send().await;
-    request_log::record_http_result("gmail", "POST", token_endpoint, started, &result);
+    request_log::record_http_result("drive", "POST", token_endpoint, started, &result);
     let response = result.context("Failed to send token request to Google")?;
 
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
         if let Ok(err) = serde_json::from_str::<TokenErrorResponse>(&body) {
             if err.error == "invalid_grant" {
-                return Err(GmailError::InvalidGrant(context).into());
+                return Err(DriveError::InvalidGrant(context).into());
             }
             return Err(anyhow::anyhow!(
                 "Google token endpoint rejected the request: {} ({})",
@@ -868,25 +817,22 @@ async fn post_token_request(
 
 // ── Session (in-memory access-token lifecycle) ──────────────────────────
 
-/// The mutable access-token state, refreshed by [`GmailSession::refresh_locked`].
+/// The mutable access-token state, refreshed by [`DriveSession::refresh_locked`].
 struct TokenState {
     access_token: Secret,
     expires_at: DateTime<Utc>,
 }
 
-/// A live Gmail OAuth2 session: holds the refresh token and the current
+/// A live Drive OAuth2 session: holds the refresh token and the current
 /// in-memory access token, refreshing on demand.
 ///
 /// Uses [`tokio::sync::Mutex`] (not `std::sync::Mutex`) held *across* the
-/// refresh network call — unlike
-/// [`SnowflakeSession::renew`](crate::snowflake::client::SnowflakeSession::renew),
-/// which releases its lock before the network call and accepts concurrent
-/// refreshes racing each other. Gmail's design requires single-flight
-/// refresh (issue #1465's explicit "concurrent callers don't stampede"
-/// requirement): a second concurrent caller blocks on this mutex and, once
-/// unblocked, observes the already-refreshed token instead of issuing a
-/// second POST.
-pub struct GmailSession {
+/// refresh network call — mirrors `crate::gmail::auth::GmailSession`'s
+/// explicit single-flight-refresh design (issue #1465's "concurrent callers
+/// don't stampede" requirement): a second concurrent caller blocks on this
+/// mutex and, once unblocked, observes the already-refreshed token instead
+/// of issuing a second POST.
+pub struct DriveSession {
     http: reqwest::Client,
     client_id: String,
     client_secret: Secret,
@@ -895,9 +841,9 @@ pub struct GmailSession {
     state: tokio::sync::Mutex<TokenState>,
 }
 
-impl GmailSession {
+impl DriveSession {
     /// Creates a session against Google's real token endpoint.
-    pub(crate) fn new(http: reqwest::Client, credentials: &GmailCredentials) -> Self {
+    pub(crate) fn new(http: reqwest::Client, credentials: &DriveCredentials) -> Self {
         Self::new_with_token_endpoint(http, credentials, TOKEN_ENDPOINT)
     }
 
@@ -905,7 +851,7 @@ impl GmailSession {
     /// for pointing at a wiremock server.
     pub(crate) fn new_with_token_endpoint(
         http: reqwest::Client,
-        credentials: &GmailCredentials,
+        credentials: &DriveCredentials,
         token_endpoint: &str,
     ) -> Self {
         Self {
@@ -969,15 +915,13 @@ impl GmailSession {
 pub async fn login(
     client_id: &str,
     client_secret: &Secret,
-    scope: GmailScope,
     browser: &BrowserConfig,
-) -> Result<GmailAuthStatus> {
+) -> Result<DriveAuthStatus> {
     login_to(
         &Settings::get_settings_path()?,
         active_profile_from(&SystemEnv).as_deref(),
         client_id,
         client_secret,
-        scope,
         browser,
         TOKEN_ENDPOINT,
     )
@@ -991,39 +935,35 @@ pub(crate) async fn login_to(
     profile: Option<&str>,
     client_id: &str,
     client_secret: &Secret,
-    scope: GmailScope,
     browser: &BrowserConfig,
     token_endpoint: &str,
-) -> Result<GmailAuthStatus> {
-    let credentials =
-        run_login_flow(client_id, client_secret, scope, browser, token_endpoint).await?;
+) -> Result<DriveAuthStatus> {
+    let credentials = run_login_flow(client_id, client_secret, browser, token_endpoint).await?;
     save_credentials_to(settings_path, profile, &credentials)?;
     Ok(status_from_credentials(&credentials))
 }
 
-/// [`login`], but honoring the named-account resolution added by issue
-/// #1500: runs the same OAuth2 flow, then persists to
-/// `gmail.accounts.<name>` when a named account is active instead of the
+/// [`login`], but honoring the named-account resolution (mirrors Gmail's
+/// issue #1500): runs the same OAuth2 flow, then persists to
+/// `drive.accounts.<name>` when a named account is active instead of the
 /// legacy `env`/profile map. `explicit` is the already-resolved
-/// `--account`/[`account::GMAIL_ACCOUNT_ENV`] override, if any — resolved
+/// `--account`/[`account::DRIVE_ACCOUNT_ENV`] override, if any — resolved
 /// via [`resolve_for_write`], so an explicit name need not already be
 /// configured (this is how a new account is created).
 pub(crate) async fn login_for(
     explicit: Option<&str>,
     client_id: &str,
     client_secret: &Secret,
-    scope: GmailScope,
     browser: &BrowserConfig,
-) -> Result<GmailAuthStatus> {
+) -> Result<DriveAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
-    match resolve_for_write(&settings.gmail, explicit)? {
-        ResolvedAccount::Legacy => {
+    match resolve_for_write(&settings.drive, explicit)? {
+        ResolvedAccount::Unconfigured => {
             login_to(
                 &Settings::get_settings_path()?,
                 active_profile_from(&SystemEnv).as_deref(),
                 client_id,
                 client_secret,
-                scope,
                 browser,
                 TOKEN_ENDPOINT,
             )
@@ -1031,8 +971,8 @@ pub(crate) async fn login_for(
         }
         ResolvedAccount::Named(name) => {
             let credentials =
-                run_login_flow(client_id, client_secret, scope, browser, TOKEN_ENDPOINT).await?;
-            Settings::upsert_gmail_account(
+                run_login_flow(client_id, client_secret, browser, TOKEN_ENDPOINT).await?;
+            Settings::upsert_drive_account(
                 &Settings::get_settings_path()?,
                 &name,
                 &named_account_vars(&credentials),
@@ -1049,36 +989,34 @@ pub(crate) async fn login_for(
 async fn run_login_flow(
     client_id: &str,
     client_secret: &Secret,
-    scope: GmailScope,
     browser: &BrowserConfig,
     token_endpoint: &str,
-) -> Result<GmailCredentials> {
+) -> Result<DriveCredentials> {
     let (listener, port) = bind_callback_listener(browser).await?;
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let pending = generate_pending_login();
     let challenge = code_challenge(&pending.code_verifier);
-    let auth_url =
-        build_authorization_url(client_id, &redirect_uri, scope, &pending.state, &challenge)?;
+    let auth_url = build_authorization_url(client_id, &redirect_uri, &pending.state, &challenge)?;
     open_browser(&browser.launch, auth_url.as_str())?;
 
     let callback = wait_for_callback(listener).await?;
     if let Some(error) = callback.error {
-        return Err(GmailError::authorization_denied(
+        return Err(DriveError::authorization_denied(
             &error,
             callback.error_description.as_deref(),
         )
         .into());
     }
     let (Some(code), Some(returned_state)) = (callback.code, callback.state) else {
-        return Err(GmailError::MalformedCallback.into());
+        return Err(DriveError::MalformedCallback.into());
     };
     // Plain equality, not constant-time: `state` is a CSRF nonce carried in
     // a browser-visible URL, not a secret — there's nothing for a timing
     // side-channel to extract here (unlike `constant_time_eq`'s real use
     // guarding a bridge auth token in `src/browser/auth.rs`).
     if returned_state != pending.state {
-        return Err(GmailError::StateMismatch.into());
+        return Err(DriveError::StateMismatch.into());
     }
 
     let http = reqwest::Client::builder()
@@ -1098,9 +1036,9 @@ async fn run_login_flow(
     .await?;
     let refresh_token = tokens
         .refresh_token
-        .ok_or(GmailError::MalformedTokenResponse("refresh_token"))?;
+        .ok_or(DriveError::MalformedTokenResponse("refresh_token"))?;
     let granted_raw = tokens.scope.unwrap_or_default();
-    let granted_scope = GmailScope::from_granted(&granted_raw).ok_or_else(|| {
+    if !granted_raw.split_whitespace().any(|s| s == SCOPE_READONLY) {
         let received = if granted_raw.trim().is_empty() {
             "none".to_string()
         } else {
@@ -1109,25 +1047,25 @@ async fn run_login_flow(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        GmailError::NoGmailScopeGranted(received)
-    })?;
+        return Err(DriveError::NoScopeGranted(received).into());
+    }
 
-    Ok(GmailCredentials {
+    Ok(DriveCredentials {
         client_id: client_id.to_string(),
         client_secret: client_secret.clone(),
         refresh_token: refresh_token.into(),
-        scope: granted_scope,
+        scope: SCOPE_READONLY.to_string(),
     })
 }
 
-/// Builds the "just authenticated" [`GmailAuthStatus`] from freshly-obtained
+/// Builds the "just authenticated" [`DriveAuthStatus`] from freshly-obtained
 /// `credentials` (all fields present by construction).
-fn status_from_credentials(credentials: &GmailCredentials) -> GmailAuthStatus {
-    GmailAuthStatus {
+fn status_from_credentials(credentials: &DriveCredentials) -> DriveAuthStatus {
+    DriveAuthStatus {
         has_client_id: true,
         has_client_secret: true,
         has_refresh_token: true,
-        scope: Some(credentials.scope.as_str().to_string()),
+        scope: Some(credentials.scope.clone()),
     }
 }
 
@@ -1141,44 +1079,6 @@ mod tests {
     use super::*;
 
     // ── Pure helpers ─────────────────────────────────────────────────
-
-    #[test]
-    fn scope_as_str_matches_google_scope_strings() {
-        assert_eq!(GmailScope::ReadOnly.as_str(), SCOPE_READONLY);
-        assert_eq!(GmailScope::Modify.as_str(), SCOPE_MODIFY);
-    }
-
-    #[test]
-    fn scope_from_granted_detects_modify_anywhere_in_the_list() {
-        assert_eq!(
-            GmailScope::from_granted(&format!("{SCOPE_READONLY} {SCOPE_MODIFY}")),
-            Some(GmailScope::Modify)
-        );
-    }
-
-    #[test]
-    fn scope_from_granted_detects_readonly_with_no_modify() {
-        assert_eq!(
-            GmailScope::from_granted(SCOPE_READONLY),
-            Some(GmailScope::ReadOnly)
-        );
-    }
-
-    #[test]
-    fn scope_from_granted_is_none_when_no_gmail_scope_present() {
-        assert_eq!(GmailScope::from_granted("openid email profile"), None);
-    }
-
-    #[test]
-    fn scope_from_granted_is_none_for_empty_string() {
-        assert_eq!(GmailScope::from_granted(""), None);
-    }
-
-    #[test]
-    fn scope_allows_modify() {
-        assert!(!GmailScope::ReadOnly.allows_modify());
-        assert!(GmailScope::Modify.allows_modify());
-    }
 
     #[test]
     fn code_challenge_matches_rfc_7636_test_vector() {
@@ -1212,7 +1112,6 @@ mod tests {
         let url = build_authorization_url(
             "client-123",
             "http://127.0.0.1:5555",
-            GmailScope::ReadOnly,
             "state-abc",
             "challenge-xyz",
         )
@@ -1227,14 +1126,6 @@ mod tests {
         assert_eq!(query.get("code_challenge_method").unwrap(), "S256");
         assert_eq!(query.get("access_type").unwrap(), "offline");
         assert_eq!(query.get("prompt").unwrap(), "consent");
-    }
-
-    #[test]
-    fn build_authorization_url_uses_modify_scope_when_requested() {
-        let url = build_authorization_url("c", "http://127.0.0.1:1", GmailScope::Modify, "s", "ch")
-            .unwrap();
-        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
-        assert_eq!(query.get("scope").unwrap(), SCOPE_MODIFY);
     }
 
     #[test]
@@ -1302,7 +1193,40 @@ mod tests {
         assert!(err.to_string().contains("empty browser command"));
     }
 
-    // ── build_browser_config (issue #1505) ──────────────────────────────
+    // ── named_account_vars ───────────────────────────────────────────────
+
+    #[test]
+    fn named_account_vars_maps_credentials_to_json_string_values() {
+        let credentials = DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: SCOPE_READONLY.to_string(),
+        };
+        assert_eq!(
+            named_account_vars(&credentials),
+            [
+                (
+                    "client_id",
+                    serde_json::Value::String("client-1".to_string())
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("secret-1".to_string())
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("refresh-1".to_string())
+                ),
+                (
+                    "scope",
+                    serde_json::Value::String(SCOPE_READONLY.to_string())
+                ),
+            ]
+        );
+    }
+
+    // ── build_browser_config (mirrors Gmail's issue #1505) ──────────────
 
     fn assert_is_auto(config: BrowserConfig) {
         assert!(matches!(config.launch, BrowserLaunch::Auto));
@@ -1315,9 +1239,9 @@ mod tests {
 
     #[test]
     fn build_browser_config_defaults_to_auto_with_no_opt_in() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             email_address: Some("alice@example.com".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         // chrome_profile_from_email is false, so the resolver must never run
         // even though email_address is set.
@@ -1328,9 +1252,9 @@ mod tests {
 
     #[test]
     fn build_browser_config_uses_browser_command_verbatim() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             browser_command: Some("chrome --new-window {url}".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         let config =
             build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap();
@@ -1342,11 +1266,11 @@ mod tests {
 
     #[test]
     fn build_browser_config_browser_command_wins_over_chrome_profile_from_email() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             browser_command: Some("chrome {url}".to_string()),
             chrome_profile_from_email: true,
             email_address: Some("alice@example.com".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         let config =
             build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap();
@@ -1355,9 +1279,9 @@ mod tests {
 
     #[test]
     fn build_browser_config_rejects_a_malformed_browser_command() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             browser_command: Some("chrome \"--flag".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         let err =
             build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap_err();
@@ -1366,10 +1290,10 @@ mod tests {
 
     #[test]
     fn build_browser_config_resolves_the_chrome_profile_when_opted_in() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             chrome_profile_from_email: true,
             email_address: Some("alice@example.com".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         let config = build_browser_config(Some(&account), |email| {
             assert_eq!(email, "alice@example.com");
@@ -1384,56 +1308,56 @@ mod tests {
 
     #[test]
     fn build_browser_config_falls_back_to_auto_when_chrome_resolution_fails() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             chrome_profile_from_email: true,
             email_address: Some("alice@example.com".to_string()),
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         assert_is_auto(build_browser_config(Some(&account), |_| None).unwrap());
     }
 
     #[test]
     fn build_browser_config_is_auto_when_opted_in_but_no_email_address() {
-        let account = GmailAccountSettings {
+        let account = DriveAccountSettings {
             chrome_profile_from_email: true,
-            ..GmailAccountSettings::default()
+            ..DriveAccountSettings::default()
         };
         assert_is_auto(
             build_browser_config(Some(&account), |_| panic!("must not be called")).unwrap(),
         );
     }
 
-    // ── resolve_browser_config_for (issue #1505) ────────────────────────
+    // ── resolve_browser_config_for (mirrors Gmail's issue #1505) ────────
 
     #[test]
-    fn resolve_browser_config_for_legacy_account_defaults_to_auto() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+    fn resolve_browser_config_for_unconfigured_account_defaults_to_auto() {
+        let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
-        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
-        std::env::set_var(GMAIL_CLIENT_SECRET, "legacy-secret");
-        std::env::set_var(GMAIL_REFRESH_TOKEN, "legacy-refresh");
+        std::env::set_var(DRIVE_CLIENT_ID, "literal-id");
+        std::env::set_var(DRIVE_CLIENT_SECRET, "literal-secret");
+        std::env::set_var(DRIVE_REFRESH_TOKEN, "literal-refresh");
 
-        let gmail = GmailSettings::default();
-        assert_is_auto(resolve_browser_config_for(&gmail, None).unwrap());
+        let drive = DriveSettings::default();
+        assert_is_auto(resolve_browser_config_for(&drive, None).unwrap());
     }
 
     #[test]
     fn resolve_browser_config_for_named_account_without_chrome_opt_in_defaults_to_auto() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
 
-        let mut gmail = GmailSettings::default();
-        gmail.accounts.insert(
+        let mut drive = DriveSettings::default();
+        drive.accounts.insert(
             "work".to_string(),
-            GmailAccountSettings {
+            DriveAccountSettings {
                 email_address: Some("alice@example.com".to_string()),
-                ..GmailAccountSettings::default()
+                ..DriveAccountSettings::default()
             },
         );
 
         // chrome_profile_from_email is false, so this never touches the
         // real chrome_profile::resolve_launch_command resolver.
-        assert_is_auto(resolve_browser_config_for(&gmail, Some("work")).unwrap());
+        assert_is_auto(resolve_browser_config_for(&drive, Some("work")).unwrap());
     }
 
     // ── Loopback listener (real sockets, no wiremock) ───────────────────
@@ -1446,8 +1370,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::CallbackTimeout(_))
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::CallbackTimeout(_))
         ));
     }
 
@@ -1487,8 +1411,8 @@ mod tests {
         let err = wait_for_callback(listener).await.unwrap_err();
         client.await.unwrap();
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::MalformedCallback)
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::MalformedCallback)
         ));
     }
 
@@ -1579,9 +1503,10 @@ mod tests {
     // That reserve-then-drop is itself a TOCTOU race against the rest of the
     // parallel test suite: another test can grab the same ephemeral port
     // before `login_to`'s own bind runs, which fails outright rather than
-    // retrying (see issue #1489). `run_with_port_retry` bounds a retry of
-    // the whole reserve/connect/bind attempt on exactly that failure, so a
-    // lost race just tries again with a fresh port instead of flaking.
+    // retrying (mirrors Gmail's issue #1489). `run_with_port_retry` bounds a
+    // retry of the whole reserve/connect/bind attempt on exactly that
+    // failure, so a lost race just tries again with a fresh port instead of
+    // flaking.
 
     async fn connect_and_send(port: u16, request_line: &[u8]) {
         let mut stream = loop {
@@ -1615,10 +1540,10 @@ mod tests {
     /// and returns `login_to`'s result, retrying up to
     /// [`PORT_RETRY_ATTEMPTS`] times when the attempt loses the ephemeral
     /// port race (see the module comment above `connect_and_send`).
-    async fn run_with_port_retry<F, Fut>(mut attempt: F) -> Result<GmailAuthStatus>
+    async fn run_with_port_retry<F, Fut>(mut attempt: F) -> Result<DriveAuthStatus>
     where
         F: FnMut(u16) -> Fut,
-        Fut: std::future::Future<Output = Result<GmailAuthStatus>>,
+        Fut: std::future::Future<Output = Result<DriveAuthStatus>>,
     {
         for remaining in (0..PORT_RETRY_ATTEMPTS).rev() {
             let result = attempt(reserve_free_port()).await;
@@ -1637,7 +1562,7 @@ mod tests {
     /// hung.
     async fn finish_connector(
         connector: tokio::task::JoinHandle<()>,
-        result: &Result<GmailAuthStatus>,
+        result: &Result<DriveAuthStatus>,
     ) {
         match result {
             Err(err) if is_callback_bind_conflict(err) => connector.abort(),
@@ -1685,7 +1610,6 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    GmailScope::ReadOnly,
                     &browser,
                     "http://127.0.0.1:1/token", // never reached — fails before exchange
                 )
@@ -1714,7 +1638,7 @@ mod tests {
                         "Failed to start the local OAuth callback listener: address in use"
                     ))
                 } else {
-                    Ok(GmailAuthStatus {
+                    Ok(DriveAuthStatus {
                         has_client_id: true,
                         has_client_secret: true,
                         has_refresh_token: true,
@@ -1751,7 +1675,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             let _ = tx.send(());
         });
-        let result: Result<GmailAuthStatus> = Err(anyhow::anyhow!(
+        let result: Result<DriveAuthStatus> = Err(anyhow::anyhow!(
             "Failed to start the local OAuth callback listener: address in use"
         ));
 
@@ -1772,7 +1696,7 @@ mod tests {
         let connector = tokio::spawn(async move {
             ran_clone.store(true, Ordering::SeqCst);
         });
-        let result = Ok(GmailAuthStatus {
+        let result = Ok(DriveAuthStatus {
             has_client_id: true,
             has_client_secret: true,
             has_refresh_token: true,
@@ -1808,8 +1732,8 @@ mod tests {
             run_login_to_expect_err(b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n").await;
 
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::StateMismatch)
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::StateMismatch)
         ));
     }
 
@@ -1820,8 +1744,8 @@ mod tests {
         )
         .await;
 
-        match err.downcast_ref::<GmailError>() {
-            Some(GmailError::AuthorizationDenied(message)) => {
+        match err.downcast_ref::<DriveError>() {
+            Some(DriveError::AuthorizationDenied(message)) => {
                 assert!(message.contains("access_denied"));
                 assert!(message.contains("user declined"));
             }
@@ -1834,8 +1758,8 @@ mod tests {
         let err = run_login_to_expect_err(b"GET /?foo=bar HTTP/1.1\r\n\r\n").await;
 
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::MalformedCallback)
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::MalformedCallback)
         ));
     }
 
@@ -1905,7 +1829,6 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    GmailScope::ReadOnly,
                     &browser,
                     &token_endpoint,
                 )
@@ -1933,10 +1856,10 @@ mod tests {
     /// `login_to_completes_full_success_flow_and_persists_credentials`
     /// above), with an injectable token-response body — the seam the
     /// scope-validation tests below use to simulate Google granting no
-    /// Gmail scope.
+    /// Drive scope.
     async fn run_login_to_with_token_response(
         token_response_body: serde_json::Value,
-    ) -> (Result<GmailAuthStatus>, std::path::PathBuf) {
+    ) -> (Result<DriveAuthStatus>, std::path::PathBuf) {
         std::fs::create_dir_all("tmp").ok();
         let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
         let capture_path = temp_dir.path().join("captured-url.txt");
@@ -1986,7 +1909,6 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    GmailScope::ReadOnly,
                     &browser,
                     &token_endpoint,
                 )
@@ -2002,7 +1924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_to_rejects_a_grant_with_no_gmail_scope() {
+    async fn login_to_rejects_a_grant_with_no_drive_scope() {
         let (result, settings_path) = run_login_to_with_token_response(serde_json::json!({
             "access_token": "at-1",
             "refresh_token": "rt-1",
@@ -2013,8 +1935,8 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::NoGmailScopeGranted(received)) if received == "openid, email, profile"
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::NoScopeGranted(received)) if received == "openid, email, profile"
         ));
         assert!(!settings_path.exists());
     }
@@ -2030,8 +1952,91 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(
-            err.downcast_ref::<GmailError>(),
-            Some(GmailError::NoGmailScopeGranted(received)) if received == "none"
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::NoScopeGranted(received)) if received == "none"
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    // ── login_for (named-account login orchestration, mirrors Gmail's
+    // issue #1500) ───────────────────────────────────────────────────────
+    //
+    // `login_for` hardcodes the real `TOKEN_ENDPOINT` in both branches
+    // (unlike `login_to`, which takes one as an explicit test seam), so a
+    // full success round trip can't be driven against a wiremock server
+    // here. These instead drive a callback with a mismatched `state` —
+    // which `run_login_flow` rejects *before* ever reaching the token
+    // endpoint — to exercise account resolution (`Settings::load` +
+    // `resolve_for_write`) and, for the named branch, the `run_login_flow`
+    // call site itself, without any real network call.
+
+    #[tokio::test]
+    async fn login_for_unconfigured_account_rejects_a_callback_with_mismatched_state() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        let result = run_with_port_retry(|port| async move {
+            let browser = BrowserConfig {
+                launch: BrowserLaunch::Manual,
+                callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                callback_port: port,
+            };
+            let connector = tokio::spawn(connect_and_send(
+                port,
+                b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
+            ));
+
+            let result =
+                login_for(None, "client-id", &Secret::new("client-secret"), &browser).await;
+
+            finish_connector(connector, &result).await;
+            result
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::StateMismatch)
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_for_named_account_rejects_a_callback_with_mismatched_state() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        let result = run_with_port_retry(|port| async move {
+            let browser = BrowserConfig {
+                launch: BrowserLaunch::Manual,
+                callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                callback_port: port,
+            };
+            let connector = tokio::spawn(connect_and_send(
+                port,
+                b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
+            ));
+
+            let result = login_for(
+                Some("work"),
+                "client-id",
+                &Secret::new("client-secret"),
+                &browser,
+            )
+            .await;
+
+            finish_connector(connector, &result).await;
+            result
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::StateMismatch)
         ));
         assert!(!settings_path.exists());
     }
@@ -2123,40 +2128,15 @@ mod tests {
         assert!(err.to_string().contains("Failed to parse"));
     }
 
-    // ── GmailSession ─────────────────────────────────────────────────
+    // ── DriveSession ─────────────────────────────────────────────────
 
-    fn test_credentials() -> GmailCredentials {
-        GmailCredentials {
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
             client_id: "client-1".to_string(),
             client_secret: "secret-1".into(),
             refresh_token: "refresh-1".into(),
-            scope: GmailScope::ReadOnly,
+            scope: SCOPE_READONLY.to_string(),
         }
-    }
-
-    #[test]
-    fn named_account_vars_maps_credentials_to_json_string_values() {
-        assert_eq!(
-            named_account_vars(&test_credentials()),
-            [
-                (
-                    "client_id",
-                    serde_json::Value::String("client-1".to_string())
-                ),
-                (
-                    "client_secret",
-                    serde_json::Value::String("secret-1".to_string())
-                ),
-                (
-                    "refresh_token",
-                    serde_json::Value::String("refresh-1".to_string())
-                ),
-                (
-                    "scope",
-                    serde_json::Value::String(SCOPE_READONLY.to_string())
-                ),
-            ]
-        );
     }
 
     #[tokio::test]
@@ -2173,7 +2153,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let session = GmailSession::new_with_token_endpoint(
+        let session = DriveSession::new_with_token_endpoint(
             reqwest::Client::new(),
             &test_credentials(),
             &server.uri(),
@@ -2196,7 +2176,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let session = GmailSession::new_with_token_endpoint(
+        let session = DriveSession::new_with_token_endpoint(
             reqwest::Client::new(),
             &test_credentials(),
             &server.uri(),
@@ -2221,7 +2201,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let session = GmailSession::new_with_token_endpoint(
+        let session = DriveSession::new_with_token_endpoint(
             reqwest::Client::new(),
             &test_credentials(),
             &server.uri(),
@@ -2256,7 +2236,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let session = GmailSession::new_with_token_endpoint(
+        let session = DriveSession::new_with_token_endpoint(
             reqwest::Client::new(),
             &test_credentials(),
             &server.uri(),
@@ -2300,7 +2280,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let session = GmailSession::new_with_token_endpoint(
+        let session = DriveSession::new_with_token_endpoint(
             reqwest::Client::new(),
             &test_credentials(),
             &server.uri(),
@@ -2322,15 +2302,15 @@ mod tests {
     // ── Secret non-leakage ───────────────────────────────────────────
 
     #[test]
-    fn gmail_credentials_debug_redacts_client_secret_and_refresh_token() {
-        let creds = GmailCredentials {
+    fn drive_credentials_debug_redacts_client_secret_and_refresh_token() {
+        let creds = DriveCredentials {
             client_id: "client-visible".to_string(),
             client_secret: "sekret-client-secret".into(),
             refresh_token: "sekret-refresh-token".into(),
-            scope: GmailScope::ReadOnly,
+            scope: SCOPE_READONLY.to_string(),
         };
         let debug = format!("{creds:?}");
-        assert!(debug.contains("GmailCredentials"));
+        assert!(debug.contains("DriveCredentials"));
         assert!(debug.contains("client-visible"));
         assert!(!debug.contains("sekret-client-secret"));
         assert!(!debug.contains("sekret-refresh-token"));
@@ -2339,12 +2319,12 @@ mod tests {
     }
 
     #[test]
-    fn gmail_auth_status_yaml_serialization_contains_no_secret_values() {
+    fn drive_auth_status_yaml_serialization_contains_no_secret_values() {
         let env = crate::test_support::env::MapEnv::new()
-            .with(GMAIL_CLIENT_ID, "client-id-value")
-            .with(GMAIL_CLIENT_SECRET, "sekret-do-not-leak")
-            .with(GMAIL_REFRESH_TOKEN, "sekret-refresh-do-not-leak")
-            .with(GMAIL_SCOPE, SCOPE_READONLY);
+            .with(DRIVE_CLIENT_ID, "client-id-value")
+            .with(DRIVE_CLIENT_SECRET, "sekret-do-not-leak")
+            .with(DRIVE_REFRESH_TOKEN, "sekret-refresh-do-not-leak")
+            .with(DRIVE_SCOPE, SCOPE_READONLY);
         let status = status_with(&env);
         let yaml = serde_yaml::to_string(&status).unwrap();
         assert!(!yaml.contains("sekret-do-not-leak"));
@@ -2366,16 +2346,16 @@ mod tests {
 
     #[test]
     fn status_reports_scope_when_present() {
-        let env = MapEnv::new().with(GMAIL_SCOPE, SCOPE_MODIFY);
+        let env = MapEnv::new().with(DRIVE_SCOPE, SCOPE_READONLY);
         let status = status_with(&env);
-        assert_eq!(status.scope.as_deref(), Some(SCOPE_MODIFY));
+        assert_eq!(status.scope.as_deref(), Some(SCOPE_READONLY));
     }
 
     #[test]
     fn load_credentials_errors_when_client_id_missing() {
         let env = MapEnv::new()
-            .with(GMAIL_CLIENT_SECRET, "s")
-            .with(GMAIL_REFRESH_TOKEN, "r");
+            .with(DRIVE_CLIENT_SECRET, "s")
+            .with(DRIVE_REFRESH_TOKEN, "r");
         let err = load_credentials_with(&env).unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
@@ -2383,28 +2363,28 @@ mod tests {
     #[test]
     fn load_credentials_errors_when_client_secret_missing() {
         let env = MapEnv::new()
-            .with(GMAIL_CLIENT_ID, "c")
-            .with(GMAIL_REFRESH_TOKEN, "r");
+            .with(DRIVE_CLIENT_ID, "c")
+            .with(DRIVE_REFRESH_TOKEN, "r");
         assert!(load_credentials_with(&env).is_err());
     }
 
     #[test]
     fn load_credentials_errors_when_refresh_token_missing() {
         let env = MapEnv::new()
-            .with(GMAIL_CLIENT_ID, "c")
-            .with(GMAIL_CLIENT_SECRET, "s");
+            .with(DRIVE_CLIENT_ID, "c")
+            .with(DRIVE_CLIENT_SECRET, "s");
         assert!(load_credentials_with(&env).is_err());
     }
 
     #[test]
     fn load_credentials_succeeds_with_all_three_present() {
         let env = MapEnv::new()
-            .with(GMAIL_CLIENT_ID, "c")
-            .with(GMAIL_CLIENT_SECRET, "s")
-            .with(GMAIL_REFRESH_TOKEN, "r");
+            .with(DRIVE_CLIENT_ID, "c")
+            .with(DRIVE_CLIENT_SECRET, "s")
+            .with(DRIVE_REFRESH_TOKEN, "r");
         let creds = load_credentials_with(&env).unwrap();
         assert_eq!(creds.client_id, "c");
-        assert_eq!(creds.scope, GmailScope::ReadOnly);
+        assert_eq!(creds.scope, SCOPE_READONLY);
     }
 
     /// Save + remove round-trip against injected settings-file paths — no
@@ -2419,21 +2399,21 @@ mod tests {
             };
             let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
 
-            let creds = GmailCredentials {
+            let creds = DriveCredentials {
                 client_id: "client-1".to_string(),
                 client_secret: "secret-1".into(),
                 refresh_token: "refresh-1".into(),
-                scope: GmailScope::ReadOnly,
+                scope: SCOPE_READONLY.to_string(),
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
             assert!(settings_path.exists());
             let val: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-            assert_eq!(val["env"]["GMAIL_CLIENT_ID"], "client-1");
-            assert_eq!(val["env"]["GMAIL_CLIENT_SECRET"], "secret-1");
-            assert_eq!(val["env"]["GMAIL_REFRESH_TOKEN"], "refresh-1");
-            assert_eq!(val["env"]["GMAIL_SCOPE"], SCOPE_READONLY);
+            assert_eq!(val["env"]["DRIVE_CLIENT_ID"], "client-1");
+            assert_eq!(val["env"]["DRIVE_CLIENT_SECRET"], "secret-1");
+            assert_eq!(val["env"]["DRIVE_REFRESH_TOKEN"], "refresh-1");
+            assert_eq!(val["env"]["DRIVE_SCOPE"], SCOPE_READONLY);
 
             #[cfg(unix)]
             {
@@ -2458,11 +2438,11 @@ mod tests {
             )
             .unwrap();
 
-            let creds = GmailCredentials {
+            let creds = DriveCredentials {
                 client_id: "client-2".to_string(),
                 client_secret: "secret-2".into(),
                 refresh_token: "refresh-2".into(),
-                scope: GmailScope::Modify,
+                scope: SCOPE_READONLY.to_string(),
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -2470,7 +2450,7 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
             assert_eq!(val["env"]["OTHER_KEY"], "keep_me");
             assert_eq!(val["extra"], true);
-            assert_eq!(val["env"]["GMAIL_SCOPE"], SCOPE_MODIFY);
+            assert_eq!(val["env"]["DRIVE_SCOPE"], SCOPE_READONLY);
         }
 
         // ── Part 3: remove clears the four keys, preserves others ──
@@ -2485,10 +2465,10 @@ mod tests {
             fs::write(
                 &settings_path,
                 r#"{"env": {
-                    "GMAIL_CLIENT_ID": "a",
-                    "GMAIL_CLIENT_SECRET": "b",
-                    "GMAIL_REFRESH_TOKEN": "c",
-                    "GMAIL_SCOPE": "d",
+                    "DRIVE_CLIENT_ID": "a",
+                    "DRIVE_CLIENT_SECRET": "b",
+                    "DRIVE_REFRESH_TOKEN": "c",
+                    "DRIVE_SCOPE": "d",
                     "OTHER_KEY": "keep"
                 }}"#,
             )
@@ -2499,10 +2479,10 @@ mod tests {
 
             let val: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-            assert!(val["env"].get("GMAIL_CLIENT_ID").is_none());
-            assert!(val["env"].get("GMAIL_CLIENT_SECRET").is_none());
-            assert!(val["env"].get("GMAIL_REFRESH_TOKEN").is_none());
-            assert!(val["env"].get("GMAIL_SCOPE").is_none());
+            assert!(val["env"].get("DRIVE_CLIENT_ID").is_none());
+            assert!(val["env"].get("DRIVE_CLIENT_SECRET").is_none());
+            assert!(val["env"].get("DRIVE_REFRESH_TOKEN").is_none());
+            assert!(val["env"].get("DRIVE_SCOPE").is_none());
             assert_eq!(val["env"]["OTHER_KEY"], "keep");
         }
 
@@ -2530,21 +2510,21 @@ mod tests {
         let settings_path = omni_dir.join("settings.json");
         fs::write(&settings_path, r#"{"env": {"OTHER_KEY": "keep_me"}}"#).unwrap();
 
-        let creds = GmailCredentials {
+        let creds = DriveCredentials {
             client_id: "client-p".to_string(),
             client_secret: "secret-p".into(),
             refresh_token: "refresh-p".into(),
-            scope: GmailScope::ReadOnly,
+            scope: SCOPE_READONLY.to_string(),
         };
         save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
 
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
-            val["profiles"]["work"]["env"]["GMAIL_CLIENT_ID"],
+            val["profiles"]["work"]["env"]["DRIVE_CLIENT_ID"],
             "client-p"
         );
-        assert!(val["env"].get("GMAIL_CLIENT_ID").is_none());
+        assert!(val["env"].get("DRIVE_CLIENT_ID").is_none());
         assert_eq!(val["env"]["OTHER_KEY"], "keep_me");
 
         let removed = remove_credentials_at(&settings_path, Some("work")).unwrap();
@@ -2552,7 +2532,7 @@ mod tests {
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(val["profiles"]["work"]["env"]
-            .get("GMAIL_CLIENT_ID")
+            .get("DRIVE_CLIENT_ID")
             .is_none());
 
         let removed = remove_credentials_at(&settings_path, Some("work")).unwrap();
@@ -2561,43 +2541,43 @@ mod tests {
 
     /// The production wrappers resolve `~/.omni-dev/settings.json` from
     /// `HOME` and the active profile from `OMNI_DEV_PROFILE`, so this one
-    /// test must redirect both via [`crate::gmail::test_support::EnvGuard`].
+    /// test must redirect both via [`crate::drive::test_support::EnvGuard`].
     #[test]
     fn save_and_remove_credentials_resolve_default_settings_path() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
 
-        let creds = GmailCredentials {
+        let creds = DriveCredentials {
             client_id: "wrapper-client".to_string(),
             client_secret: "wrapper-secret".into(),
             refresh_token: "wrapper-refresh".into(),
-            scope: GmailScope::ReadOnly,
+            scope: SCOPE_READONLY.to_string(),
         };
         save_credentials(&creds).unwrap();
 
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(val["env"]["GMAIL_CLIENT_ID"], "wrapper-client");
+        assert_eq!(val["env"]["DRIVE_CLIENT_ID"], "wrapper-client");
 
         assert!(remove_credentials().unwrap());
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert!(val["env"].get("GMAIL_CLIENT_ID").is_none());
+        assert!(val["env"].get("DRIVE_CLIENT_ID").is_none());
     }
 
-    // ── named-account dispatch (issue #1500) ───────────────────────────
+    // ── named-account dispatch (mirrors Gmail's issue #1500) ────────────
     //
     // These exercise the production `*_for` wrappers, so — like
     // `save_and_remove_credentials_resolve_default_settings_path` above —
     // they must redirect `HOME` via `EnvGuard`.
 
     #[test]
-    fn load_credentials_for_named_reads_from_gmail_accounts() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+    fn load_credentials_for_named_reads_from_drive_accounts() {
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[
@@ -2613,7 +2593,10 @@ mod tests {
                     "refresh_token",
                     serde_json::Value::String("work-refresh".to_string()),
                 ),
-                ("scope", serde_json::Value::String(SCOPE_MODIFY.to_string())),
+                (
+                    "scope",
+                    serde_json::Value::String(SCOPE_READONLY.to_string()),
+                ),
             ],
         )
         .unwrap();
@@ -2622,15 +2605,15 @@ mod tests {
         assert_eq!(creds.client_id, "work-id");
         assert_eq!(creds.client_secret.expose_secret(), "work-secret");
         assert_eq!(creds.refresh_token.expose_secret(), "work-refresh");
-        assert_eq!(creds.scope, GmailScope::Modify);
+        assert_eq!(creds.scope, SCOPE_READONLY);
     }
 
     #[test]
     fn load_credentials_for_unknown_named_account_errors() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[(
@@ -2641,27 +2624,27 @@ mod tests {
         .unwrap();
 
         let err = load_credentials_for(Some("bogus")).unwrap_err();
-        assert!(err.to_string().contains("unknown Gmail account 'bogus'"));
+        assert!(err.to_string().contains("unknown Drive account 'bogus'"));
     }
 
     #[test]
-    fn load_credentials_for_falls_back_to_legacy_when_accounts_empty() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+    fn load_credentials_for_falls_back_to_env_when_accounts_empty() {
+        let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
-        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
-        std::env::set_var(GMAIL_CLIENT_SECRET, "legacy-secret");
-        std::env::set_var(GMAIL_REFRESH_TOKEN, "legacy-refresh");
+        std::env::set_var(DRIVE_CLIENT_ID, "literal-id");
+        std::env::set_var(DRIVE_CLIENT_SECRET, "literal-secret");
+        std::env::set_var(DRIVE_REFRESH_TOKEN, "literal-refresh");
 
         let creds = load_credentials_for(None).unwrap();
-        assert_eq!(creds.client_id, "legacy-id");
+        assert_eq!(creds.client_id, "literal-id");
     }
 
     #[test]
     fn load_credentials_for_none_honors_ambient_account_env_var() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[
@@ -2680,7 +2663,7 @@ mod tests {
             ],
         )
         .unwrap();
-        std::env::set_var(account::GMAIL_ACCOUNT_ENV, "work");
+        std::env::set_var(account::DRIVE_ACCOUNT_ENV, "work");
 
         let creds = load_credentials_for(None).unwrap();
         assert_eq!(creds.client_id, "work-id");
@@ -2688,10 +2671,10 @@ mod tests {
 
     #[test]
     fn remove_credentials_for_named_removes_whole_account() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[("client_id", serde_json::Value::String("id".to_string()))],
@@ -2701,16 +2684,16 @@ mod tests {
         assert!(remove_credentials_for(Some("work")).unwrap());
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert!(val["gmail"]["accounts"].get("work").is_none());
+        assert!(val["drive"]["accounts"].get("work").is_none());
     }
 
     #[cfg(feature = "mcp")]
     #[test]
     fn status_for_named_reports_presence_from_account() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[
@@ -2732,10 +2715,10 @@ mod tests {
 
     #[cfg(feature = "mcp")]
     #[test]
-    fn status_for_legacy_matches_status_with_when_accounts_empty() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+    fn status_for_unconfigured_matches_status_with_when_accounts_empty() {
+        let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
-        std::env::set_var(GMAIL_CLIENT_ID, "legacy-id");
+        std::env::set_var(DRIVE_CLIENT_ID, "literal-id");
 
         let status = status_for(None).unwrap();
         assert!(status.has_client_id);
@@ -2743,59 +2726,11 @@ mod tests {
     }
 
     #[test]
-    fn load_credentials_legacy_ignores_active_named_account() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
-        let dir = guard.clear_credentials();
-        let settings_path = dir.path().join(".omni-dev").join("settings.json");
-
-        // A named default account is configured...
-        Settings::set_gmail_default_account(&settings_path, Some("work")).unwrap();
-        Settings::upsert_gmail_account(
-            &settings_path,
-            "work",
-            &[
-                (
-                    "client_id",
-                    serde_json::Value::String("named-id".to_string()),
-                ),
-                (
-                    "client_secret",
-                    serde_json::Value::String("named-secret".to_string()),
-                ),
-                (
-                    "refresh_token",
-                    serde_json::Value::String("named-refresh".to_string()),
-                ),
-            ],
-        )
-        .unwrap();
-        // ...and legacy credentials also exist in the base `env` map (not
-        // process env, so rule 1's literal-env bypass does not apply).
-        Settings::upsert_env_vars(
-            &settings_path,
-            &[
-                (GMAIL_CLIENT_ID, "legacy-id"),
-                (GMAIL_CLIENT_SECRET, "legacy-secret"),
-                (GMAIL_REFRESH_TOKEN, "legacy-refresh"),
-            ],
-        )
-        .unwrap();
-
-        // The account-aware wrapper resolves to the named default...
-        let via_resolution = load_credentials_for(None).unwrap();
-        assert_eq!(via_resolution.client_id, "named-id");
-
-        // ...but load_credentials_legacy forces the legacy path regardless.
-        let forced_legacy = load_credentials_legacy().unwrap();
-        assert_eq!(forced_legacy.client_id, "legacy-id");
-    }
-
-    #[test]
     fn record_account_email_writes_email_address_only() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[("client_id", serde_json::Value::String("id".to_string()))],
@@ -2807,18 +2742,18 @@ mod tests {
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
-            val["gmail"]["accounts"]["work"]["email_address"],
+            val["drive"]["accounts"]["work"]["email_address"],
             "alice@work.com"
         );
-        assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "id");
+        assert_eq!(val["drive"]["accounts"]["work"]["client_id"], "id");
     }
 
     #[test]
     fn record_account_email_does_not_overwrite_an_existing_value() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
+        let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(
+        Settings::upsert_drive_account(
             &settings_path,
             "work",
             &[(
@@ -2833,35 +2768,35 @@ mod tests {
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
-            val["gmail"]["accounts"]["work"]["email_address"],
+            val["drive"]["accounts"]["work"]["email_address"],
             "manually-set@work.com"
         );
     }
 
-    /// The zero-migration guarantee (issue #1500): with `gmail.accounts`
-    /// empty, the account-aware `_for(None, ...)` wrappers must behave
-    /// byte-identically to the pre-#1500 wrappers they sit beside. Both
-    /// sandboxes are seeded via the same unchanged [`save_credentials`] (no
-    /// account-aware save wrapper exists — `login_for`/
-    /// `import_client_credentials_for` persist directly, since a
-    /// resolve-then-save round trip would reject the very name being
-    /// created), so this isolates `load`/`remove`.
+    /// The empty-`drive.accounts` fallback path (mirrors Gmail's issue
+    /// #1500 zero-migration guarantee): with `drive.accounts` empty, the
+    /// account-aware `_for(None, ...)` wrappers must behave byte-identically
+    /// to the direct env/settings wrappers they sit beside. Both sandboxes
+    /// are seeded via the same unchanged [`save_credentials`] (no
+    /// account-aware save wrapper exists — `login_for` persists directly,
+    /// since a resolve-then-save round trip would reject the very name
+    /// being created), so this isolates `load`/`remove`.
     #[test]
-    fn zero_migration_load_remove_byte_identical_when_accounts_empty() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
-        let creds = GmailCredentials {
+    fn accounts_empty_load_remove_byte_identical_via_direct_and_for_wrappers() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let creds = DriveCredentials {
             client_id: "id".to_string(),
             client_secret: "secret".into(),
             refresh_token: "refresh".into(),
-            scope: GmailScope::Modify,
+            scope: SCOPE_READONLY.to_string(),
         };
 
-        let dir_legacy = guard.clear_credentials();
+        let dir_direct = guard.clear_credentials();
         save_credentials(&creds).unwrap();
-        let legacy_written =
-            fs::read_to_string(dir_legacy.path().join(".omni-dev").join("settings.json")).unwrap();
-        let legacy_loaded = load_credentials().unwrap();
-        let legacy_removed = remove_credentials().unwrap();
+        let direct_written =
+            fs::read_to_string(dir_direct.path().join(".omni-dev").join("settings.json")).unwrap();
+        let direct_loaded = load_credentials().unwrap();
+        let direct_removed = remove_credentials().unwrap();
 
         let dir_for = guard.clear_credentials();
         save_credentials(&creds).unwrap();
@@ -2870,13 +2805,13 @@ mod tests {
         let for_loaded = load_credentials_for(None).unwrap();
         let for_removed = remove_credentials_for(None).unwrap();
 
-        assert_eq!(legacy_written, for_written);
-        assert_eq!(legacy_loaded.client_id, for_loaded.client_id);
+        assert_eq!(direct_written, for_written);
+        assert_eq!(direct_loaded.client_id, for_loaded.client_id);
         assert_eq!(
-            legacy_loaded.client_secret.expose_secret(),
+            direct_loaded.client_secret.expose_secret(),
             for_loaded.client_secret.expose_secret()
         );
-        assert_eq!(legacy_loaded.scope, for_loaded.scope);
-        assert_eq!(legacy_removed, for_removed);
+        assert_eq!(direct_loaded.scope, for_loaded.scope);
+        assert_eq!(direct_removed, for_removed);
     }
 }

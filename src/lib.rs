@@ -47,6 +47,7 @@ pub mod coverage;
 pub mod daemon;
 pub mod data;
 pub mod datadog;
+pub mod drive;
 pub mod git;
 pub mod github_metrics;
 pub mod github_rate_limit;

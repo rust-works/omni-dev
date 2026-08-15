@@ -562,15 +562,25 @@ impl Settings {
     /// [ADR-0066](../../docs/adrs/adr-0066.md)). Same hardening and
     /// unknown-field preservation as [`Settings::upsert_env_vars_in`] — no
     /// new file-handling code.
-    pub fn upsert_gmail_account(path: &Path, account: &str, vars: &[(&str, &str)]) -> Result<()> {
+    ///
+    /// `vars` takes [`serde_json::Value`] rather than `&str` (widened in
+    /// #1523, PR #1528 review) because `GmailAccountSettings` has non-string
+    /// fields (`chrome_profile_from_email: bool`) — a hard-coded
+    /// `Value::String` wrap would write the JSON string `"true"` into a
+    /// `bool` field, and since `Settings` deserializes as one unit, the next
+    /// `Settings::load()` would hard-fail parsing the *entire* file. Callers
+    /// writing a string field pass `serde_json::Value::String(...)`
+    /// explicitly.
+    pub fn upsert_gmail_account(
+        path: &Path,
+        account: &str,
+        vars: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
         let mut settings_value = read_or_default_settings(path)?;
 
         let entry = ensure_object_at(&mut settings_value, &["gmail", "accounts", account])?;
         for (key, value) in vars {
-            entry.insert(
-                (*key).to_string(),
-                serde_json::Value::String((*value).to_string()),
-            );
+            entry.insert((*key).to_string(), value.clone());
         }
 
         write_settings(path, &settings_value)
@@ -629,15 +639,21 @@ impl Settings {
     /// [ADR-0069](../../docs/adrs/adr-0069.md)). Same hardening and
     /// unknown-field preservation as [`Settings::upsert_env_vars_in`] — no
     /// new file-handling code.
-    pub fn upsert_drive_account(path: &Path, account: &str, vars: &[(&str, &str)]) -> Result<()> {
+    ///
+    /// `vars` takes [`serde_json::Value`], not `&str` — see
+    /// [`Settings::upsert_gmail_account`]'s doc comment for why (this
+    /// helper's twin, and the write path the PR #1528 review comment
+    /// flagged the bug against).
+    pub fn upsert_drive_account(
+        path: &Path,
+        account: &str,
+        vars: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
         let mut settings_value = read_or_default_settings(path)?;
 
         let entry = ensure_object_at(&mut settings_value, &["drive", "accounts", account])?;
         for (key, value) in vars {
-            entry.insert(
-                (*key).to_string(),
-                serde_json::Value::String((*value).to_string()),
-            );
+            entry.insert((*key).to_string(), value.clone());
         }
 
         write_settings(path, &settings_value)
@@ -1705,7 +1721,13 @@ mod tests {
         Settings::upsert_gmail_account(
             &path,
             "work",
-            &[("client_id", "id"), ("refresh_token", "token")],
+            &[
+                ("client_id", serde_json::Value::String("id".to_string())),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("token".to_string()),
+                ),
+            ],
         )
         .unwrap();
 
@@ -1722,6 +1744,36 @@ mod tests {
             let file_mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(file_mode & 0o777, 0o600);
         }
+    }
+
+    /// Regression test for the PR #1528 review comment: writing a non-string
+    /// field (e.g. `chrome_profile_from_email: bool`) through
+    /// `upsert_gmail_account` must round-trip through `Settings::load()` —
+    /// before the `vars` type was widened to `serde_json::Value`, this
+    /// silently wrote the JSON string `"true"` into a `bool` field and broke
+    /// parsing of the entire settings file on next load.
+    #[test]
+    fn upsert_gmail_account_writes_a_bool_value_that_round_trips_through_settings_load() {
+        let (_tmp, path) = temp_settings_path();
+
+        Settings::upsert_gmail_account(
+            &path,
+            "work",
+            &[("chrome_profile_from_email", serde_json::Value::Bool(true))],
+        )
+        .unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(
+            val["gmail"]["accounts"]["work"]["chrome_profile_from_email"],
+            true
+        );
+
+        let settings = Settings::load_from_path(&path).unwrap();
+        assert!(
+            settings.gmail.accounts["work"].chrome_profile_from_email,
+            "the bool field must deserialize back to `true`, not the string \"true\""
+        );
     }
 
     #[test]
@@ -1775,7 +1827,13 @@ mod tests {
         Settings::upsert_drive_account(
             &path,
             "work",
-            &[("client_id", "id"), ("refresh_token", "token")],
+            &[
+                ("client_id", serde_json::Value::String("id".to_string())),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("token".to_string()),
+                ),
+            ],
         )
         .unwrap();
 
@@ -1792,6 +1850,34 @@ mod tests {
             let file_mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(file_mode & 0o777, 0o600);
         }
+    }
+
+    /// Drive's twin of
+    /// `upsert_gmail_account_writes_a_bool_value_that_round_trips_through_settings_load`
+    /// — see that test's doc comment for the PR #1528 review comment this
+    /// closes.
+    #[test]
+    fn upsert_drive_account_writes_a_bool_value_that_round_trips_through_settings_load() {
+        let (_tmp, path) = temp_settings_path();
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[("chrome_profile_from_email", serde_json::Value::Bool(true))],
+        )
+        .unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(
+            val["drive"]["accounts"]["work"]["chrome_profile_from_email"],
+            true
+        );
+
+        let settings = Settings::load_from_path(&path).unwrap();
+        assert!(
+            settings.drive.accounts["work"].chrome_profile_from_email,
+            "the bool field must deserialize back to `true`, not the string \"true\""
+        );
     }
 
     #[test]

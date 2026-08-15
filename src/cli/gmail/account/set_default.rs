@@ -36,7 +36,12 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         let err = SetDefaultCommand {
             name: "bogus".to_string(),
@@ -51,7 +56,12 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         SetDefaultCommand {
             name: "work".to_string(),
