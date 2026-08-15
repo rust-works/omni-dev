@@ -11,6 +11,8 @@ use crate::drive::types::DriveFile;
 const GOOGLE_DOC: &str = "application/vnd.google-apps.document";
 const GOOGLE_SHEET: &str = "application/vnd.google-apps.spreadsheet";
 const GOOGLE_SLIDES: &str = "application/vnd.google-apps.presentation";
+const GOOGLE_FOLDER: &str = "application/vnd.google-apps.folder";
+const GOOGLE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
 /// Reads a single Drive file's metadata or content.
 #[derive(Parser)]
@@ -135,6 +137,21 @@ async fn run_read_content(
 ) -> Result<()> {
     let api = FilesApi::new(client);
     let meta = api.get_metadata(file_id).await?;
+
+    if meta.mime_type == GOOGLE_FOLDER {
+        anyhow::bail!(
+            "'{}' is a folder; folders have no content to read — use `drive search` to list \
+             what it contains",
+            meta.name
+        );
+    }
+    if meta.mime_type == GOOGLE_SHORTCUT {
+        anyhow::bail!(
+            "'{}' is a shortcut; `drive read --content` doesn't follow shortcuts to their \
+             target file — resolve the target file's id and read that instead",
+            meta.name
+        );
+    }
 
     let (bytes, content_mime_type) = if meta.is_google_native() {
         let export_mime = resolve_export_mime_type(&meta, export_mime_type)?;
@@ -498,6 +515,51 @@ mod tests {
         run_read(&client, "f1", true, None, None, &OutputFormat::Table)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_content_rejects_folder_with_actionable_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "My Folder", "mimeType": GOOGLE_FOLDER,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("'My Folder' is a folder"), "{message}");
+        assert!(message.contains("drive search"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn run_read_content_rejects_shortcut_with_actionable_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "My Shortcut", "mimeType": GOOGLE_SHORTCUT,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("'My Shortcut' is a shortcut"), "{message}");
     }
 
     #[tokio::test]
