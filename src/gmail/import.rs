@@ -99,8 +99,16 @@ pub fn import_client_credentials_for(
             &Settings::get_settings_path()?,
             &name,
             &[
-                ("client_id", credentials.client_id.as_str()),
-                ("client_secret", credentials.client_secret.expose_secret()),
+                (
+                    "client_id",
+                    serde_json::Value::String(credentials.client_id.clone()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String(
+                        credentials.client_secret.expose_secret().to_string(),
+                    ),
+                ),
             ],
         )?,
     }
@@ -540,8 +548,15 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "placeholder")])
-            .unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[(
+                "client_id",
+                serde_json::Value::String("placeholder".to_string()),
+            )],
+        )
+        .unwrap();
 
         let secret_dir = temp_dir();
         let secret_path = secret_dir.path().join("client_secret.json");
