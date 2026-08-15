@@ -321,6 +321,10 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> DriveAuthS
 /// Only compiled with the `mcp` feature — the MCP `drive_auth_status` tool
 /// is its sole consumer; the CLI's `drive auth status` goes through
 /// [`load_credentials_for`] instead.
+///
+/// Unused until the Drive MCP surface (#1525) calls this — narrow allow
+/// here rather than a crate-wide one (removed in #1524).
+#[allow(dead_code)]
 #[cfg(feature = "mcp")]
 pub(crate) fn status_for(explicit: Option<&str>) -> Result<DriveAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
@@ -337,6 +341,10 @@ pub(crate) fn status_for(explicit: Option<&str>) -> Result<DriveAuthStatus> {
 ///
 /// Only compiled with the `mcp` feature — see [`status_for`], its sole
 /// caller.
+///
+/// Unused until the Drive MCP surface (#1525) calls this — narrow allow
+/// here rather than a crate-wide one (removed in #1524).
+#[allow(dead_code)]
 #[cfg(feature = "mcp")]
 fn status_from_named(drive: &DriveSettings, name: &str) -> DriveAuthStatus {
     let account = drive.accounts.get(name);
