@@ -331,6 +331,27 @@ mod tests {
     }
 
     #[test]
+    fn is_drive_quota_exceeded_false_on_non_utf8_body() {
+        assert!(!is_drive_quota_exceeded(403, &[0xff, 0xfe]));
+    }
+
+    #[test]
+    fn is_drive_quota_exceeded_false_on_non_403_status() {
+        assert!(!is_drive_quota_exceeded(
+            429,
+            br#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#
+        ));
+    }
+
+    #[test]
+    fn is_drive_quota_exceeded_true_on_matching_403_reason() {
+        assert!(is_drive_quota_exceeded(
+            403,
+            br#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#
+        ));
+    }
+
+    #[test]
     fn new_client_strips_trailing_slash() {
         let client = DriveClient::new("https://www.googleapis.com/", &test_credentials()).unwrap();
         assert_eq!(client.base_url(), "https://www.googleapis.com");
@@ -713,5 +734,26 @@ mod tests {
             .get_parsed(&format!("{}/test", server.uri()), "test context")
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_parsed_errors_on_non_success_status_without_parsing_the_body() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"message": "File not found"}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let result: Result<serde_json::Value> = client
+            .get_parsed(&format!("{}/test", server.uri()), "test context")
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("File not found"));
     }
 }
