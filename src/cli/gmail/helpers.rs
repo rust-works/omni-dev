@@ -72,9 +72,18 @@ mod tests {
             &settings_path,
             "work",
             &[
-                ("client_id", "work-id"),
-                ("client_secret", "work-secret"),
-                ("refresh_token", "work-refresh"),
+                (
+                    "client_id",
+                    serde_json::Value::String("work-id".to_string()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("work-secret".to_string()),
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("work-refresh".to_string()),
+                ),
             ],
         )
         .unwrap();
