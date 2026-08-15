@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::enable_raw_mode;
 
 use crate::drive::about_api::AboutApi;
 use crate::drive::account;
@@ -14,6 +14,7 @@ use crate::drive::client::DriveClient;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
 use crate::utils::settings::{Settings, SettingsEnv};
+use crate::utils::terminal::RawModeGuard;
 
 /// Manages Drive OAuth2 credentials.
 #[derive(Parser)]
@@ -115,17 +116,6 @@ fn prompt_client_id() -> Result<String> {
         .read_line(&mut input)
         .context("Failed to read user input")?;
     Ok(input.trim().to_string())
-}
-
-/// Guard that disables raw mode on drop — mirrors `cli::ai::chat`'s
-/// `RawModeGuard`, duplicated locally rather than shared since it's a
-/// five-line `Drop` impl and this keeps the change scoped to Drive.
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
 }
 
 /// Prompts for the OAuth2 client secret on stdin without echoing it —

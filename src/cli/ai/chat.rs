@@ -6,8 +6,10 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::enable_raw_mode,
 };
+
+use crate::utils::terminal::RawModeGuard;
 
 /// Interactive AI chat session.
 ///
@@ -82,15 +84,6 @@ async fn chat_loop(client: &crate::claude::client::ClaudeClient) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Guard that disables raw mode on drop.
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
 }
 
 /// Reads multiline user input with "> " prompt.
