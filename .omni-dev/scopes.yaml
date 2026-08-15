@@ -39,6 +39,10 @@ scopes:
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
     file_patterns: ["src/git/**"]
+  - name: "drive"
+    description: "Google Drive integration: typed API client, OAuth2 auth, and CLI/MCP surfaces"
+    examples: ["drive: add OAuth2 PKCE login flow", "drive: implement file search"]
+    file_patterns: ["src/drive/**", "src/cli/drive.rs", "src/cli/drive/**"]
   - name: "gmail"
     description: "Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces"
     examples: ["gmail: add OAuth2 PKCE login flow", "gmail: implement message search"]

@@ -92,3 +92,4 @@ by Michael Nygard.
 | [ADR-0066](adr-0066.md)  | ✅ Accepted                              | 2026-08-05 | A Gmail-Specific Named-Account Store, Orthogonal to `--profile`                             |
 | [ADR-0067](adr-0067.md)  | ✅ Accepted                              | 2026-08-06 | Automatic Chrome-Profile Resolution for Gmail Login, Opt-In Per Account                     |
 | [ADR-0068](adr-0068.md)  | ✅ Accepted                              | 2026-08-06 | Concurrent Multi-Account Gmail Sync via `gmail-sync.yaml` and a Shared Fetch Semaphore      |
+| [ADR-0069](adr-0069.md)  | ✅ Accepted                              | 2026-08-15 | A Drive-Specific Named-Account Store and Read-Only OAuth2 Client, Mirroring Gmail's Design  |
