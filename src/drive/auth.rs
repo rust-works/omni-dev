@@ -1193,6 +1193,39 @@ mod tests {
         assert!(err.to_string().contains("empty browser command"));
     }
 
+    // ── named_account_vars ───────────────────────────────────────────────
+
+    #[test]
+    fn named_account_vars_maps_credentials_to_json_string_values() {
+        let credentials = DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: SCOPE_READONLY.to_string(),
+        };
+        assert_eq!(
+            named_account_vars(&credentials),
+            [
+                (
+                    "client_id",
+                    serde_json::Value::String("client-1".to_string())
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("secret-1".to_string())
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("refresh-1".to_string())
+                ),
+                (
+                    "scope",
+                    serde_json::Value::String(SCOPE_READONLY.to_string())
+                ),
+            ]
+        );
+    }
+
     // ── build_browser_config (mirrors Gmail's issue #1505) ──────────────
 
     fn assert_is_auto(config: BrowserConfig) {
@@ -1921,6 +1954,89 @@ mod tests {
         assert!(matches!(
             err.downcast_ref::<DriveError>(),
             Some(DriveError::NoScopeGranted(received)) if received == "none"
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    // ── login_for (named-account login orchestration, mirrors Gmail's
+    // issue #1500) ───────────────────────────────────────────────────────
+    //
+    // `login_for` hardcodes the real `TOKEN_ENDPOINT` in both branches
+    // (unlike `login_to`, which takes one as an explicit test seam), so a
+    // full success round trip can't be driven against a wiremock server
+    // here. These instead drive a callback with a mismatched `state` —
+    // which `run_login_flow` rejects *before* ever reaching the token
+    // endpoint — to exercise account resolution (`Settings::load` +
+    // `resolve_for_write`) and, for the named branch, the `run_login_flow`
+    // call site itself, without any real network call.
+
+    #[tokio::test]
+    async fn login_for_unconfigured_account_rejects_a_callback_with_mismatched_state() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        let result = run_with_port_retry(|port| async move {
+            let browser = BrowserConfig {
+                launch: BrowserLaunch::Manual,
+                callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                callback_port: port,
+            };
+            let connector = tokio::spawn(connect_and_send(
+                port,
+                b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
+            ));
+
+            let result =
+                login_for(None, "client-id", &Secret::new("client-secret"), &browser).await;
+
+            finish_connector(connector, &result).await;
+            result
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::StateMismatch)
+        ));
+        assert!(!settings_path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_for_named_account_rejects_a_callback_with_mismatched_state() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+
+        let result = run_with_port_retry(|port| async move {
+            let browser = BrowserConfig {
+                launch: BrowserLaunch::Manual,
+                callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                callback_port: port,
+            };
+            let connector = tokio::spawn(connect_and_send(
+                port,
+                b"GET /?code=abc&state=the-wrong-state HTTP/1.1\r\n\r\n",
+            ));
+
+            let result = login_for(
+                Some("work"),
+                "client-id",
+                &Secret::new("client-secret"),
+                &browser,
+            )
+            .await;
+
+            finish_connector(connector, &result).await;
+            result
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DriveError>(),
+            Some(DriveError::StateMismatch)
         ));
         assert!(!settings_path.exists());
     }
