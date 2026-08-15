@@ -129,6 +129,13 @@ impl DriveError {
     /// (`client.rs`'s `extract_drive_error_message`), so this parses that
     /// fixed suffix convention rather than re-parsing JSON that isn't kept
     /// around by the time this variant exists.
+    ///
+    /// Unused for now: Gmail's twin (`GmailError::reason`) is used by
+    /// `gmail sync`'s reconciliation engine, which Drive has no equivalent
+    /// of (explicitly out of scope) — reserved for a future error-reason
+    /// sensitive consumer. Narrow allow here rather than a crate-wide one
+    /// (removed in #1524).
+    #[allow(dead_code)]
     pub(crate) fn reason(&self) -> Option<&str> {
         match self {
             Self::ApiRequestFailed { body, .. } => body

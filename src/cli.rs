@@ -19,6 +19,7 @@ pub mod claude_wrap;
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
+pub mod drive;
 pub mod format;
 pub mod git;
 pub mod gmail;
@@ -188,6 +189,8 @@ pub enum Commands {
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
+    /// Drive: search and read Google Drive files via OAuth2 (read-only).
+    Drive(drive::DriveCommand),
     /// Gmail: search, read, and label messages via OAuth2.
     Gmail(gmail::GmailCommand),
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
@@ -333,6 +336,7 @@ impl Cli {
             #[cfg(unix)]
             Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            Commands::Drive(cmd) => cmd.execute().await,
             Commands::Gmail(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
@@ -384,6 +388,20 @@ mod tests {
         let _dir = guard.clear_credentials();
 
         let cli = Cli::try_parse_from(["omni-dev", "gmail", "auth", "status"]).unwrap();
+        let err = cli.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    // `execute()`'s command dispatch is otherwise only exercised by spawning
+    // the real binary in integration tests; this covers the `Drive` arm
+    // in-process (deterministic, network-free: missing credentials fail
+    // fast before any Drive API call).
+    #[tokio::test]
+    async fn execute_routes_drive_subcommand() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cli = Cli::try_parse_from(["omni-dev", "drive", "auth", "status"]).unwrap();
         let err = cli.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
