@@ -418,7 +418,10 @@ pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
     Settings::upsert_gmail_account(
         &Settings::get_settings_path()?,
         name,
-        &[("email_address", email)],
+        &[(
+            "email_address",
+            serde_json::Value::String(email.to_string()),
+        )],
     )
 }
 
@@ -462,12 +465,24 @@ pub(crate) fn save_credentials_to(
 /// The `gmail.accounts.<name>` field names/values for `credentials` — the
 /// named-account counterpart of the flat `GMAIL_*` env keys
 /// [`save_credentials_to`] writes.
-fn named_account_vars(credentials: &GmailCredentials) -> [(&str, &str); 4] {
+fn named_account_vars(credentials: &GmailCredentials) -> [(&str, serde_json::Value); 4] {
     [
-        ("client_id", credentials.client_id.as_str()),
-        ("client_secret", credentials.client_secret.expose_secret()),
-        ("refresh_token", credentials.refresh_token.expose_secret()),
-        ("scope", credentials.scope.as_str()),
+        (
+            "client_id",
+            serde_json::Value::String(credentials.client_id.clone()),
+        ),
+        (
+            "client_secret",
+            serde_json::Value::String(credentials.client_secret.expose_secret().to_string()),
+        ),
+        (
+            "refresh_token",
+            serde_json::Value::String(credentials.refresh_token.expose_secret().to_string()),
+        ),
+        (
+            "scope",
+            serde_json::Value::String(credentials.scope.as_str().to_string()),
+        ),
     ]
 }
 
@@ -2561,10 +2576,19 @@ mod tests {
             &settings_path,
             "work",
             &[
-                ("client_id", "work-id"),
-                ("client_secret", "work-secret"),
-                ("refresh_token", "work-refresh"),
-                ("scope", SCOPE_MODIFY),
+                (
+                    "client_id",
+                    serde_json::Value::String("work-id".to_string()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("work-secret".to_string()),
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("work-refresh".to_string()),
+                ),
+                ("scope", serde_json::Value::String(SCOPE_MODIFY.to_string())),
             ],
         )
         .unwrap();
@@ -2581,8 +2605,15 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "work-id")])
-            .unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[(
+                "client_id",
+                serde_json::Value::String("work-id".to_string()),
+            )],
+        )
+        .unwrap();
 
         let err = load_credentials_for(Some("bogus")).unwrap_err();
         assert!(err.to_string().contains("unknown Gmail account 'bogus'"));
@@ -2609,9 +2640,18 @@ mod tests {
             &settings_path,
             "work",
             &[
-                ("client_id", "work-id"),
-                ("client_secret", "work-secret"),
-                ("refresh_token", "work-refresh"),
+                (
+                    "client_id",
+                    serde_json::Value::String("work-id".to_string()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("work-secret".to_string()),
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("work-refresh".to_string()),
+                ),
             ],
         )
         .unwrap();
@@ -2626,7 +2666,12 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         assert!(remove_credentials_for(Some("work")).unwrap());
         let val: serde_json::Value =
@@ -2643,7 +2688,13 @@ mod tests {
         Settings::upsert_gmail_account(
             &settings_path,
             "work",
-            &[("client_id", "id"), ("scope", SCOPE_READONLY)],
+            &[
+                ("client_id", serde_json::Value::String("id".to_string())),
+                (
+                    "scope",
+                    serde_json::Value::String(SCOPE_READONLY.to_string()),
+                ),
+            ],
         )
         .unwrap();
 
@@ -2678,9 +2729,18 @@ mod tests {
             &settings_path,
             "work",
             &[
-                ("client_id", "named-id"),
-                ("client_secret", "named-secret"),
-                ("refresh_token", "named-refresh"),
+                (
+                    "client_id",
+                    serde_json::Value::String("named-id".to_string()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("named-secret".to_string()),
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("named-refresh".to_string()),
+                ),
             ],
         )
         .unwrap();
@@ -2710,7 +2770,12 @@ mod tests {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         record_account_email("work", "alice@work.com").unwrap();
 
@@ -2731,7 +2796,10 @@ mod tests {
         Settings::upsert_gmail_account(
             &settings_path,
             "work",
-            &[("email_address", "manually-set@work.com")],
+            &[(
+                "email_address",
+                serde_json::Value::String("manually-set@work.com".to_string()),
+            )],
         )
         .unwrap();
 

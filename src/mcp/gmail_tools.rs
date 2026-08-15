@@ -857,7 +857,12 @@ mod tests {
         let guard = EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         let server = OmniDevServer::new();
         let err = server
@@ -884,9 +889,12 @@ mod tests {
             &settings_path,
             "work",
             &[
-                ("client_id", "id"),
-                ("email_address", "me@work.com"),
-                ("scope", "readonly"),
+                ("client_id", serde_json::Value::String("id".to_string())),
+                (
+                    "email_address",
+                    serde_json::Value::String("me@work.com".to_string()),
+                ),
+                ("scope", serde_json::Value::String("readonly".to_string())),
             ],
         )
         .unwrap();
@@ -912,7 +920,12 @@ mod tests {
         let guard = EnvGuard::take();
         let dir = guard.clear_credentials();
         let settings_path = dir.path().join(".omni-dev").join("settings.json");
-        Settings::upsert_gmail_account(&settings_path, "work", &[("client_id", "id")]).unwrap();
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
 
         let server = OmniDevServer::new();
         // Succeeds with no legacy credentials configured at all — proving

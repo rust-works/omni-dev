@@ -641,7 +641,10 @@ mod tests {
         Settings::upsert_gmail_account(
             &settings_path,
             "work",
-            &[("browser_command", "chrome \"--flag")],
+            &[(
+                "browser_command",
+                serde_json::Value::String("chrome \"--flag".to_string()),
+            )],
         )
         .unwrap();
 
