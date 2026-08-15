@@ -2134,6 +2134,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn named_account_vars_maps_credentials_to_json_string_values() {
+        assert_eq!(
+            named_account_vars(&test_credentials()),
+            [
+                (
+                    "client_id",
+                    serde_json::Value::String("client-1".to_string())
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String("secret-1".to_string())
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String("refresh-1".to_string())
+                ),
+                (
+                    "scope",
+                    serde_json::Value::String(SCOPE_READONLY.to_string())
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn access_token_refreshes_on_first_call() {
         let server = wiremock::MockServer::start().await;
