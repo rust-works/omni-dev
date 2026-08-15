@@ -9,6 +9,7 @@ pub mod preflight;
 pub(crate) mod rate_limit;
 pub mod secret;
 pub mod settings;
+pub(crate) mod terminal;
 
 pub use env::{EnvSource, SystemEnv};
 
