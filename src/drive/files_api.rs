@@ -93,7 +93,13 @@ impl<'a> FilesApi<'a> {
     /// Pagination loop backing [`Self::search_all`] — structurally
     /// identical to `crate::gmail::messages_api::MessagesApi::paginate`,
     /// `messages` renamed to `files`, `result_size_estimate` renamed to
-    /// `incomplete_search` (Drive has no result-count estimate field).
+    /// `incomplete_search` (Drive has no result-count estimate field),
+    /// with one deliberate divergence: when the accumulated total exceeds
+    /// `cap`, this method clears `next_page_token`/`incomplete_search`
+    /// before truncating `files`, so a caller can never resume pagination
+    /// past files that were fetched but then discarded (#1536). Gmail's
+    /// `paginate` still has the matching bug — issue #1536 was scoped to
+    /// Drive only.
     async fn paginate(&self, query: Option<&str>, cap: usize) -> Result<FileListResponse> {
         let mut acc: Option<FileListResponse> = None;
         let mut page_token: Option<String> = None;
@@ -117,7 +123,11 @@ impl<'a> FilesApi<'a> {
             page_token = next_token;
         }
         let mut result = acc.unwrap_or_default();
-        result.files.truncate(cap);
+        if result.files.len() > cap {
+            result.files.truncate(cap);
+            result.next_page_token = None;
+            result.incomplete_search = None;
+        }
         Ok(result)
     }
 
@@ -531,6 +541,7 @@ mod tests {
                         {"id": "f3", "name": "c"},
                     ],
                     "nextPageToken": "page2",
+                    "incompleteSearch": true,
                 })),
             )
             .mount(&server)
@@ -538,6 +549,38 @@ mod tests {
 
         let result = FilesApi::new(&client).search_all(None, 2).await.unwrap();
         assert_eq!(result.files.len(), 2);
+        // Truncation discarded fetched-but-unreturned files, so the cursor
+        // fields must be cleared rather than pointing past them (#1536).
+        assert_eq!(result.next_page_token, None);
+        assert_eq!(result.incomplete_search, None);
+    }
+
+    #[tokio::test]
+    async fn search_all_preserves_next_page_token_at_exact_cap() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "files": [
+                        {"id": "f1", "name": "a"},
+                        {"id": "f2", "name": "b"},
+                        {"id": "f3", "name": "c"},
+                    ],
+                    "nextPageToken": "page2",
+                    "incompleteSearch": true,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let result = FilesApi::new(&client).search_all(None, 3).await.unwrap();
+        assert_eq!(result.files.len(), 3);
+        // No files were discarded, so the cursor is still accurate and
+        // must be preserved, not cleared.
+        assert_eq!(result.next_page_token.as_deref(), Some("page2"));
+        assert_eq!(result.incomplete_search, Some(true));
     }
 
     #[tokio::test]

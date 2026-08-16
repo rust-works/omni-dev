@@ -108,6 +108,11 @@ pub struct FileListResponse {
     #[serde(default)]
     pub files: Vec<DriveFile>,
     /// Cursor for the next page, when more results are available.
+    /// [`crate::drive::files_api::FilesApi::search_all`] clears this rather
+    /// than leaving it pointing past files it discarded when a
+    /// caller-supplied limit truncates the result — `None` here means
+    /// either no more results exist upstream, or the search was capped,
+    /// never a false invitation to keep paging.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -115,7 +120,10 @@ pub struct FileListResponse {
     )]
     pub next_page_token: Option<String>,
     /// Whether the search process was incomplete (partial results returned
-    /// due to a transient issue on Google's side).
+    /// due to a transient issue on Google's side). Also cleared by
+    /// [`crate::drive::files_api::FilesApi::search_all`] when truncation
+    /// discards fetched files, for the same reason as
+    /// [`Self::next_page_token`].
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
