@@ -322,6 +322,44 @@ CLI-only (a long-running bulk filesystem operation, a poor fit for a
 synchronous MCP call). For the full guide, see
 [docs/gmail.md](docs/gmail.md).
 
+### 📁 Drive Integration (read-only)
+
+Authenticate against your own Google Drive account via OAuth2 (loopback
+authorization-code + PKCE, the same flow as Gmail), then search files and
+read their metadata or content. Unlike Gmail, Drive requests exactly one
+scope, `drive.readonly` — there is no upload/create/rename/move/trash/share
+capability anywhere in this surface. New to this integration? Start with
+the [Drive Quickstart](docs/drive-quickstart.md) for a zero-to-first-search
+walkthrough; see the [Drive integration guide](docs/drive.md) for
+prerequisites (you bring your own Google Cloud OAuth2 client, independent
+of Gmail's), authentication setup, rate-limit behaviour, and
+troubleshooting.
+
+```bash
+# One-time: create your own Google Cloud OAuth2 client (see docs/drive.md),
+# then authenticate (opens a browser)
+export DRIVE_CLIENT_ID=...
+export DRIVE_CLIENT_SECRET=...
+omni-dev drive auth login
+
+# Verify the credentials by calling about.get
+omni-dev drive auth status
+
+# Search and read file metadata/content
+omni-dev drive search "name contains 'report'"
+omni-dev drive read <file-id>
+omni-dev drive read <file-id> --content --out-file report.pdf
+```
+
+An OAuth2 client left in Google's "Testing" publishing status issues
+refresh tokens that expire after 7 days — see
+[docs/drive.md](docs/drive.md#prerequisites) for how to avoid re-running
+`auth login` weekly.
+
+MCP tools (`drive_*`) are planned but not yet available — tracked by
+[issue #1525](https://github.com/rust-works/omni-dev/issues/1525). For the
+full guide, see [docs/drive.md](docs/drive.md).
+
 ### 🎙️ Transcript Fetching
 
 Pull captions and transcripts from external media platforms. YouTube is the
