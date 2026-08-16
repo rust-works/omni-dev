@@ -520,6 +520,8 @@ mod tests {
             account: None,
             command: GmailSubcommands::Render(render::RenderCommand {
                 paths: vec![path],
+                archive_dir: None,
+                all: false,
                 out_dir: None,
                 output: OutputFormat::Table,
                 fold_quotes: false,
@@ -528,6 +530,29 @@ mod tests {
         // Succeeds even with zero credentials configured — proving `Render`
         // never resolves a client, unlike every subcommand routed through
         // `dispatch`.
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_routes_render_archive_dir_without_client_resolution() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let archive_dir = tempfile::tempdir().unwrap();
+
+        let cmd = GmailCommand {
+            account: None,
+            command: GmailSubcommands::Render(render::RenderCommand {
+                paths: Vec::new(),
+                archive_dir: Some(archive_dir.path().to_path_buf()),
+                all: true,
+                out_dir: None,
+                output: OutputFormat::Table,
+                fold_quotes: false,
+            }),
+        };
+        // Succeeds even with zero credentials configured (an empty archive
+        // is simply "nothing to render") — proving `Render`'s
+        // `--archive-dir --all` mode never resolves a client either.
         cmd.execute().await.unwrap();
     }
 
@@ -543,6 +568,8 @@ mod tests {
             account: Some("work".to_string()),
             command: GmailSubcommands::Render(render::RenderCommand {
                 paths: vec![path],
+                archive_dir: None,
+                all: false,
                 out_dir: None,
                 output: OutputFormat::Table,
                 fold_quotes: false,

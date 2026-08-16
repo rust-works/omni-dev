@@ -4519,16 +4519,18 @@ omni-dev gmail render - Renders one or more archived `.eml` files as human-reada
 
 Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
 
-Usage: render [OPTIONS] <PATH>...
+Usage: render [OPTIONS] <PATH|--archive-dir <PATH>>
 
 Arguments:
-  <PATH>...  One or more `.eml` file paths to render
+  [PATH]...  One or more `.eml` file paths to render. Mutually exclusive with `--archive-dir`
 
 Options:
-      --out-dir <DIR>    Writes one `.md` file per input (named after the input's stem) into this directory instead of printing Markdown to stdout
-  -o, --output <OUTPUT>  Report format. `Table` (default) prints each input's rendered Markdown directly to stdout — or, with `--out-dir`, a `Saved to:` line per file — so redirecting stdout to a file yields clean Markdown; json/yaml/yamls/jsonl instead emit one structured record per input [default: table] [possible values: table, json, yaml, yamls, jsonl]
-      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
-  -h, --help             Print help (see more with '--help')
+      --archive-dir <PATH>  Archive directory previously populated by `gmail sync`/`sync-all`. Renders every non-deleted message from its `manifest.jsonl`. Mutually exclusive with positional `PATH` arguments; requires `--all`
+      --all                 Confirms whole-archive rendering with `--archive-dir`. Requires `--archive-dir`. A separate flag (rather than `--archive-dir` alone implying it) reserves room for a future non-`--all` selector, e.g. by message id
+      --out-dir <DIR>       Writes one `.md` file per input (named after the input's stem) into this directory instead of printing Markdown to stdout. With `--archive-dir --all`, also makes a message already rendered by a prior run into this directory skipped on this run
+  -o, --output <OUTPUT>     Report format. `Table` (default) prints each input's rendered Markdown directly to stdout — or, with `--out-dir`, a `Saved to:` line per file — so redirecting stdout to a file yields clean Markdown; json/yaml/yamls/jsonl instead emit one structured record per input [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --fold-quotes         Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================
