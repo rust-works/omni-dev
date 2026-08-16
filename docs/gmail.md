@@ -763,6 +763,7 @@ $ omni-dev gmail render messages/2026/01/*/*/*.eml
 $ omni-dev gmail render message.eml --out-dir rendered/
 $ omni-dev gmail render *.eml -o json
 $ omni-dev gmail render message.eml --fold-quotes
+$ omni-dev gmail render --archive-dir archive/ --all --out-dir rendered/
 ```
 
 Renders one or more `.eml` files as human-readable Markdown: a header
@@ -773,13 +774,23 @@ embedded — this is a readable rendering, not an export). Purely local and
 fast, like [Extract attachments](#extract-attachments): it never resolves
 a client, so no credentials, `--account`, or network access are needed.
 
-Unlike every other Gmail subcommand, `render` takes bare file paths
-instead of a message id or `--archive-dir` — it has no dependency on the
-mailbox having been synced by this tool at all. This works equally well
+By default `render` takes bare file paths, with no dependency on the
+mailbox having been synced by this tool at all — this works equally well
 piped a glob from a `gmail sync` archive
 (`messages/<year>/<month>/<day>/*.eml`) or any other `.eml` file, from
 anywhere. The same rendering function backs `gmail read -o markdown`; see
 [Messages](#messages).
+
+**`--archive-dir PATH --all`** is the alternative for rendering an entire
+synced archive: it reads `PATH`'s `manifest.jsonl` and renders every
+non-deleted message, in place of gathering paths yourself. `--all` is
+required alongside `--archive-dir` (rather than `--archive-dir` alone
+implying it), reserving room for a future non-`--all` selector; the two
+are mutually exclusive with positional `PATH` arguments. Paired with
+`--out-dir`, a message whose `.md` file already exists there is silently
+skipped, mirroring [`extract-attachments`](#extract-attachments)'s own
+presence-on-disk idempotence for `attachments/` dirs — so re-running
+against a growing archive only renders what's new.
 
 By default (no `--out-dir`), each input's rendered Markdown is printed
 directly to stdout — with more than one input, successive renderings are
