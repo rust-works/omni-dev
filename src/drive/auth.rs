@@ -73,6 +73,12 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 /// How much slack to leave before an access token's tracked expiry before
 /// proactively refreshing it.
 const REFRESH_SKEW: TimeDelta = TimeDelta::seconds(60);
+/// Upper bound on a trusted `expires_in` from the token endpoint. Comfortably
+/// inside what `TimeDelta::seconds` and `DateTime<Utc>` addition can
+/// represent without panicking, and far beyond any real OAuth token
+/// lifetime — an out-of-range value is clamped rather than trusted, so a
+/// misbehaving or malicious token endpoint can't crash the process (#1531).
+const MAX_EXPIRES_IN_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 
 /// Drive OAuth2 credentials.
 #[derive(Debug, Clone)]
@@ -903,7 +909,8 @@ impl DriveSession {
         )
         .await?;
         state.access_token = response.access_token.into();
-        state.expires_at = Utc::now() + TimeDelta::seconds(response.expires_in);
+        let expires_in = response.expires_in.clamp(0, MAX_EXPIRES_IN_SECONDS);
+        state.expires_at = Utc::now() + TimeDelta::seconds(expires_in);
         Ok(())
     }
 }
@@ -2197,6 +2204,56 @@ mod tests {
                     "expires_in": 30,
                 })),
             )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let session = DriveSession::new_with_token_endpoint(
+            reqwest::Client::new(),
+            &test_credentials(),
+            &server.uri(),
+        );
+        session.access_token().await.unwrap();
+        session.access_token().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn access_token_refresh_clamps_overflowing_expires_in_without_panicking() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-overflow",
+                    // Unvalidated, this overflows both TimeDelta::seconds and
+                    // the subsequent DateTime<Utc> addition (#1531).
+                    "expires_in": i64::MAX,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = DriveSession::new_with_token_endpoint(
+            reqwest::Client::new(),
+            &test_credentials(),
+            &server.uri(),
+        );
+        let token = session.access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "at-overflow");
+    }
+
+    #[tokio::test]
+    async fn access_token_refresh_clamps_negative_expires_in_to_immediately_expired() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-negative",
+                    "expires_in": -3600,
+                })),
+            )
+            // Negative expires_in clamps to 0, so the token is already
+            // stale and the second call refreshes again.
             .expect(2)
             .mount(&server)
             .await;
