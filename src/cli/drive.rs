@@ -53,14 +53,18 @@ impl DriveCommand {
     /// other subcommand resolves one shared client **once** here and
     /// threads it down via [`DriveSubcommands::dispatch`].
     pub async fn execute(self) -> Result<()> {
-        // Propagates --account to DRIVE_ACCOUNT_ENV
-        // (crate::drive::account::resolve_account reads it), only when
-        // present — mirrors GmailCommand::execute. Set *before* matching
-        // Auth/Account: those subcommands need the resolved account too
-        // (e.g. `drive auth login --account work`).
-        if let Some(account) = &self.account {
-            std::env::set_var(DRIVE_ACCOUNT_ENV, account);
-        }
+        // Propagates --account to DRIVE_ACCOUNT_ENV for the duration of this
+        // call only (crate::drive::account::resolve_account reads it),
+        // mirroring GmailCommand::execute. Set *before* matching Auth/
+        // Account: those subcommands need the resolved account too (e.g.
+        // `drive auth login --account work`). The guard restores the
+        // ambient value (or removes the var) on drop at the end of this
+        // function, so execute() is safe to call more than once per process
+        // (#1538).
+        let _account_guard = self
+            .account
+            .as_ref()
+            .map(|account| crate::utils::env::ScopedEnvVar::set(DRIVE_ACCOUNT_ENV, account));
 
         match self.command {
             DriveSubcommands::Auth(cmd) => cmd.execute().await,
@@ -141,7 +145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_propagates_account_flag_to_env_var() {
+    async fn execute_restores_account_env_var_after_return() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
 
@@ -154,10 +158,55 @@ mod tests {
             }),
         };
         cmd.execute().await.unwrap();
+        assert_eq!(std::env::var(DRIVE_ACCOUNT_ENV).ok(), None);
+    }
+
+    #[tokio::test]
+    async fn execute_restores_previous_account_env_var_after_return() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(DRIVE_ACCOUNT_ENV, "personal");
+
+        let cmd = DriveCommand {
+            account: Some("work".to_string()),
+            command: DriveSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        cmd.execute().await.unwrap();
         assert_eq!(
             std::env::var(DRIVE_ACCOUNT_ENV).ok().as_deref(),
-            Some("work")
+            Some("personal")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_leak_account_across_sequential_calls() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let account_list_cmd = || DriveCommand {
+            account: None,
+            command: DriveSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+
+        let first = DriveCommand {
+            account: Some("alpha".to_string()),
+            ..account_list_cmd()
+        };
+        first.execute().await.unwrap();
+        assert_eq!(std::env::var(DRIVE_ACCOUNT_ENV).ok(), None);
+
+        // If the first call's value had leaked, this second call — which
+        // omits --account entirely — would still see it via the env var.
+        account_list_cmd().execute().await.unwrap();
+        assert_eq!(std::env::var(DRIVE_ACCOUNT_ENV).ok(), None);
     }
 
     #[tokio::test]
