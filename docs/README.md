@@ -30,6 +30,11 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Gmail Quickstart](gmail-quickstart.md)** - zero-to-synced-archive walkthrough: OAuth2 setup, authentication, and your first `gmail sync`
 - **[Gmail Guide](gmail.md)** - OAuth2 authentication, search, messages, threads, labels, mailbox sync/archive; CLI and MCP forms
 
+### Drive Integration
+
+- **[Drive Quickstart](drive-quickstart.md)** - zero-to-first-search walkthrough: OAuth2 setup, authentication, and your first `drive search`/`drive read`
+- **[Drive Guide](drive.md)** - OAuth2 authentication (read-only `drive.readonly` scope), multiple accounts, search, read metadata/content; CLI form (MCP tools tracked by [issue #1525](https://github.com/rust-works/omni-dev/issues/1525))
+
 ### Browser Bridge
 
 - **[Browser Bridge Guide](browser-bridge.md)** - Drive authenticated HTTP requests through a browser tab (Grafana/Loki, internal dashboards); the two planes, the `request` thin client, and the security model
@@ -149,6 +154,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
 | **Gmail Integration** | [Gmail Guide](gmail.md) | [Gmail Quickstart](gmail-quickstart.md) · [User Guide - Gmail](user-guide.md#gmail-integration) · [README - Gmail](../README.md#-gmail-integration) |
+| **Drive Integration** | [Drive Guide](drive.md) | [Drive Quickstart](drive-quickstart.md) · [README - Drive](../README.md#-drive-integration-read-only) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 | **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 
