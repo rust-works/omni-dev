@@ -588,8 +588,12 @@ impl Settings {
 
     /// Removes `gmail.accounts.<account>` entirely — an account is coherent
     /// as a unit, unlike the key-by-key removal
-    /// [`Settings::remove_env_vars_in`] does. Returns `true` if the account
-    /// was present and removed, `false` when the file, `gmail`,
+    /// [`Settings::remove_env_vars_in`] does. Also clears
+    /// `gmail.default_account` if it named the removed account, so
+    /// resolution (`src/gmail/account.rs::resolve_default_account`) falls
+    /// back to the sole-remaining-account rule instead of hard-erroring on
+    /// a dangling pointer (issue #1529). Returns `true` if the account was
+    /// present and removed, `false` when the file, `gmail`,
     /// `gmail.accounts`, or the named account did not exist (the file is
     /// left untouched in that case).
     pub fn remove_gmail_account(path: &Path, account: &str) -> Result<bool> {
@@ -602,6 +606,11 @@ impl Settings {
             .is_some_and(|accounts| accounts.remove(account).is_some());
 
         if removed {
+            if let Some(gmail) = object_at_mut(&mut settings_value, &["gmail"]) {
+                if gmail.get("default_account").and_then(|v| v.as_str()) == Some(account) {
+                    gmail.remove("default_account");
+                }
+            }
             write_settings(path, &settings_value)?;
         }
         Ok(removed)
@@ -660,10 +669,14 @@ impl Settings {
     }
 
     /// Removes `drive.accounts.<account>` entirely — an account is coherent
-    /// as a unit, exactly like [`Settings::remove_gmail_account`]. Returns
-    /// `true` if the account was present and removed, `false` when the file,
-    /// `drive`, `drive.accounts`, or the named account did not exist (the
-    /// file is left untouched in that case).
+    /// as a unit, exactly like [`Settings::remove_gmail_account`]. Also
+    /// clears `drive.default_account` if it named the removed account, for
+    /// the same dangling-pointer reason (issue #1529) — Drive has no
+    /// legacy-credential fallback to soften a stale default the way
+    /// Gmail's resolution table can (ADR-0069 §3), so the failure would be
+    /// total. Returns `true` if the account was present and removed,
+    /// `false` when the file, `drive`, `drive.accounts`, or the named
+    /// account did not exist (the file is left untouched in that case).
     pub fn remove_drive_account(path: &Path, account: &str) -> Result<bool> {
         if !path.exists() {
             return Ok(false);
@@ -674,6 +687,11 @@ impl Settings {
             .is_some_and(|accounts| accounts.remove(account).is_some());
 
         if removed {
+            if let Some(drive) = object_at_mut(&mut settings_value, &["drive"]) {
+                if drive.get("default_account").and_then(|v| v.as_str()) == Some(account) {
+                    drive.remove("default_account");
+                }
+            }
             write_settings(path, &settings_value)?;
         }
         Ok(removed)
@@ -1795,6 +1813,37 @@ mod tests {
     }
 
     #[test]
+    fn remove_gmail_account_clears_default_account_when_it_named_the_removed_account() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"gmail": {"default_account": "work", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
+        let val = read_json(&path);
+        assert!(val["gmail"].get("default_account").is_none());
+        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
+    }
+
+    #[test]
+    fn remove_gmail_account_leaves_default_account_untouched_when_it_names_a_different_account() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"gmail": {"default_account": "personal", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
+        let val = read_json(&path);
+        assert_eq!(val["gmail"]["default_account"], "personal");
+    }
+
+    #[test]
     fn remove_gmail_account_false_when_file_missing() {
         let (_tmp, path) = temp_settings_path();
         assert!(!Settings::remove_gmail_account(&path, "work").unwrap());
@@ -1896,6 +1945,37 @@ mod tests {
         assert_eq!(val["drive"]["accounts"]["personal"]["client_id"], "keep");
 
         assert!(!Settings::remove_drive_account(&path, "work").unwrap());
+    }
+
+    #[test]
+    fn remove_drive_account_clears_default_account_when_it_named_the_removed_account() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"drive": {"default_account": "work", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_drive_account(&path, "work").unwrap());
+        let val = read_json(&path);
+        assert!(val["drive"].get("default_account").is_none());
+        assert_eq!(val["drive"]["accounts"]["personal"]["client_id"], "keep");
+    }
+
+    #[test]
+    fn remove_drive_account_leaves_default_account_untouched_when_it_names_a_different_account() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"drive": {"default_account": "personal", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_drive_account(&path, "work").unwrap());
+        let val = read_json(&path);
+        assert_eq!(val["drive"]["default_account"], "personal");
     }
 
     #[test]
