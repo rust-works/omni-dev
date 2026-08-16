@@ -405,6 +405,16 @@ archived `.eml` files — `-o markdown` is the live-fetch equivalent, useful
 when you want readable text for one message without archiving the whole
 mailbox first.
 
+**`--fold-quotes`** (only relevant with `-o markdown`; ignored otherwise,
+the reverse of `--detail`'s asymmetry) collapses `>`-quoted reply history
+nested more than one level deep into a one-line `*(N quoted lines
+omitted)*` marker, so a thread with 10-20+ levels of quoting doesn't drown
+its new content in repeated older quotes. The immediately-preceding
+reply's quote (depth 1) always stays visible for context; only deeper
+nesting folds. Off by default — verbatim rendering is fully
+information-preserving, and the full text is one re-render away without
+the flag.
+
 ### MCP equivalent(s)
 
 `gmail_message_read` — takes the same `format` values (`minimal` /
@@ -752,6 +762,7 @@ $ omni-dev gmail render message.eml
 $ omni-dev gmail render messages/2026/01/*/*/*.eml
 $ omni-dev gmail render message.eml --out-dir rendered/
 $ omni-dev gmail render *.eml -o json
+$ omni-dev gmail render message.eml --fold-quotes
 ```
 
 Renders one or more `.eml` files as human-readable Markdown: a header
@@ -790,6 +801,11 @@ real MIME parse disagrees with the cheap heuristic.
 `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` emit one structured record per
 input (`path`, and either `markdown` or `saved_to`, plus `error` for a
 failed file) instead of the Table view above.
+
+**`--fold-quotes`** collapses deeply-nested `>`-quoted reply history in
+each rendered body — see [Messages](#messages)'s `-o markdown` section for
+the full description; the behavior is identical since both call the same
+rendering function.
 
 No MCP equivalent — same reasoning as
 [Extract attachments](#extract-attachments).

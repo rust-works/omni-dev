@@ -24,11 +24,15 @@ use crate::gmail::attachments::extract_attachments;
 /// filenames (listed, never embedded — this is a readable rendering, not an
 /// export).
 ///
+/// `fold_quotes` controls whether deeply-nested `>`-quoted reply history in
+/// the body is collapsed into one-line markers (#1514) — see
+/// [`fold_quoted_lines`].
+///
 /// Never fails: an unparseable message degrades to a short placeholder
 /// rather than erroring, the same posture
 /// [`extract_attachments`] takes so a batch caller like `gmail render`
 /// never has one bad file abort the whole run.
-pub(crate) fn render_markdown(raw: &[u8]) -> String {
+pub(crate) fn render_markdown(raw: &[u8], fold_quotes: bool) -> String {
     let Some(message) = MessageParser::default().parse(raw) else {
         return "*(unable to parse this message)*\n".to_string();
     };
@@ -61,7 +65,7 @@ pub(crate) fn render_markdown(raw: &[u8]) -> String {
     );
 
     out.push('\n');
-    out.push_str(body_markdown(&message).trim_end());
+    out.push_str(body_markdown(&message, fold_quotes).trim_end());
     out.push('\n');
 
     let attachments = extract_attachments(raw);
@@ -129,22 +133,111 @@ fn format_header_value(value: &HeaderValue) -> Option<String> {
 /// would silently take priority over `htmd`'s much better Markdown
 /// conversion for the overwhelmingly common HTML-only-marketing-mail case
 /// (see #1513) unless genuineness is checked first.
-fn body_markdown(message: &Message) -> String {
+fn body_markdown(message: &Message, fold_quotes: bool) -> String {
     if message
         .text_part(0)
         .is_some_and(|part| part.is_content_type("text", "plain"))
     {
         if let Some(text) = message.body_text(0) {
-            return text.into_owned();
+            return finish_body(text.into_owned(), fold_quotes);
         }
     }
     if let Some(html) = message.body_html(0) {
-        return htmd::convert(&html).unwrap_or_else(|_| html.into_owned());
+        let converted = htmd::convert(&html).unwrap_or_else(|_| html.into_owned());
+        return finish_body(converted, fold_quotes);
     }
     if let Some(text) = message.body_text(0) {
-        return text.into_owned();
+        return finish_body(text.into_owned(), fold_quotes);
     }
     "*(no body)*".to_string()
+}
+
+/// Applies [`fold_quoted_lines`] to a resolved body when requested. Shared
+/// by every `body_markdown` return branch (genuine plain-text, `htmd`-
+/// converted HTML, and the final plain-text fallback) so folding behaves
+/// identically regardless of which branch produced the body.
+fn finish_body(body: String, fold_quotes: bool) -> String {
+    if fold_quotes {
+        fold_quoted_lines(&body)
+    } else {
+        body
+    }
+}
+
+/// Depth beyond which a quote block is folded (#1514). The immediately-
+/// preceding reply's quote (depth 1) stays visible for context; anything
+/// nested deeper is replaced with a one-line marker. A fixed constant
+/// rather than a CLI-configurable number — nothing yet motivates per-call
+/// tuning, and the originating issue only asked for "some threshold".
+const FOLD_QUOTE_DEPTH_THRESHOLD: u32 = 1;
+
+/// Counts a line's leading `>` quote markers, tolerating any amount of
+/// whitespace between them — so `>>>`, `> > >`, and mixed spacing like
+/// `>>  >` all count as depth 3. A line with no leading `>` has depth 0.
+fn quote_depth(line: &str) -> u32 {
+    let mut depth = 0;
+    let mut rest = line;
+    while let Some(next) = rest.trim_start_matches(' ').strip_prefix('>') {
+        depth += 1;
+        rest = next;
+    }
+    depth
+}
+
+/// Folds `>`-quoted lines nested deeper than [`FOLD_QUOTE_DEPTH_THRESHOLD`]
+/// into a one-line `*(N quoted lines omitted)*` marker, leaving shallower
+/// quote levels and unquoted content untouched. Operates purely on
+/// `>`-prefixed lines, so it applies identically to native plain-text
+/// quoting and to `htmd`'s `<blockquote>`-to-`>`-line conversion (both
+/// converge on the same per-line `>`-depth shape by the time a body reaches
+/// this function — see the module doc comment).
+///
+/// A run of blank lines sitting between two foldable quote blocks is
+/// bridged into the fold rather than left as a visible gap, so a lone blank
+/// quote-separator line doesn't fragment one nested quote block into
+/// several tiny markers.
+fn fold_quoted_lines(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut foldable: Vec<bool> = lines
+        .iter()
+        .map(|line| quote_depth(line) > FOLD_QUOTE_DEPTH_THRESHOLD)
+        .collect();
+
+    let mut i = 0;
+    while i < foldable.len() {
+        if foldable[i] || !lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        let gap_start = i;
+        while i < foldable.len() && !foldable[i] && lines[i].trim().is_empty() {
+            i += 1;
+        }
+        let bridged = gap_start > 0 && foldable[gap_start - 1] && i < foldable.len() && foldable[i];
+        if bridged {
+            for folded in &mut foldable[gap_start..i] {
+                *folded = true;
+            }
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !foldable[i] {
+            out.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < lines.len() && foldable[i] {
+            i += 1;
+        }
+        let count = i - start;
+        let plural = if count == 1 { "" } else { "s" };
+        out.push(format!("*({count} quoted line{plural} omitted)*"));
+    }
+    out.join("\n")
 }
 
 #[cfg(test)]
@@ -156,7 +249,7 @@ mod tests {
     fn render_markdown_renders_plain_text_message() {
         let raw =
             b"Subject: Hello\r\nFrom: Alice <a@example.com>\r\nTo: b@example.com\r\n\r\nHi there.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("# Hello"));
         assert!(markdown.contains("- **From:** Alice <a@example.com>"));
         assert!(markdown.contains("- **To:** b@example.com"));
@@ -169,7 +262,7 @@ mod tests {
 --B\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n\
 --B\r\nContent-Type: text/html\r\n\r\n<p>HTML body</p>\r\n\
 --B--\r\n";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("Plain body"));
         assert!(!markdown.contains("HTML body"));
     }
@@ -177,14 +270,14 @@ mod tests {
     #[test]
     fn render_markdown_falls_back_to_html_when_no_plain_text_part() {
         let raw = b"Subject: Hi\r\nContent-Type: text/html\r\n\r\n<p>Only <b>HTML</b> here.</p>";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("Only **HTML** here."));
     }
 
     #[test]
     fn render_markdown_decodes_rfc2047_encoded_subject() {
         let raw = b"Subject: =?utf-8?Q?You=20have=20a=20new=20message?=\r\nFrom: a@example.com\r\n\r\nBody.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("# You have a new message"));
     }
 
@@ -194,7 +287,7 @@ mod tests {
 --B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n\
 --B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\ndata\r\n\
 --B--\r\n";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("See attached."));
         assert!(markdown.contains("## Attachments"));
         assert!(markdown.contains("- report.pdf"));
@@ -204,20 +297,20 @@ mod tests {
     #[test]
     fn render_markdown_omits_attachments_section_when_none_present() {
         let raw = b"Subject: Hi\r\nFrom: a@example.com\r\n\r\nJust text.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(!markdown.contains("## Attachments"));
     }
 
     #[test]
     fn render_markdown_degrades_gracefully_on_unparseable_input() {
-        let markdown = render_markdown(b"");
+        let markdown = render_markdown(b"", false);
         assert!(!markdown.is_empty());
     }
 
     #[test]
     fn render_markdown_omits_absent_optional_headers() {
         let raw = b"Subject: Hi\r\nFrom: a@example.com\r\n\r\nBody.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(!markdown.contains("**Cc:**"));
         assert!(!markdown.contains("**In-Reply-To:**"));
         assert!(!markdown.contains("**References:**"));
@@ -226,7 +319,7 @@ mod tests {
     #[test]
     fn render_markdown_includes_in_reply_to_and_references_when_present() {
         let raw = b"Subject: Re: Hi\r\nIn-Reply-To: <id1@example.com>\r\nReferences: <id1@example.com> <id2@example.com>\r\n\r\nBody.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("- **In-Reply-To:** id1@example.com"));
         assert!(markdown.contains("- **References:** id1@example.com id2@example.com"));
     }
@@ -236,7 +329,7 @@ mod tests {
         // mail-parser leniently parses a `From:` header with no `<email>`
         // as an address with a name but no address.
         let raw = b"Subject: Hi\r\nFrom: Alice\r\n\r\nBody.";
-        let markdown = render_markdown(raw);
+        let markdown = render_markdown(raw, false);
         assert!(markdown.contains("- **From:** Alice"));
     }
 
@@ -307,7 +400,7 @@ mod tests {
             "plain",
             PartType::Binary(b"irrelevant".as_slice().into()),
         );
-        assert_eq!(body_markdown(&message), "*(no body)*");
+        assert_eq!(body_markdown(&message, false), "*(no body)*");
     }
 
     #[test]
@@ -316,7 +409,7 @@ mod tests {
         // plain-text branch is skipped; there's no html_body entry, so this
         // falls through to the final body_text(0) fallback.
         let message = synthetic_single_part_message("text", "csv", PartType::Text("a,b,c".into()));
-        assert_eq!(body_markdown(&message), "a,b,c");
+        assert_eq!(body_markdown(&message, false), "a,b,c");
     }
 
     #[test]
@@ -326,6 +419,72 @@ mod tests {
 --B--\r\n";
         let raw = raw.to_vec();
         let message = MessageParser::default().parse(&raw).unwrap();
-        assert_eq!(body_markdown(&message), "*(no body)*");
+        assert_eq!(body_markdown(&message, false), "*(no body)*");
+    }
+
+    #[test]
+    fn quote_depth_counts_various_quote_marker_spacings() {
+        assert_eq!(quote_depth("no quote here"), 0);
+        assert_eq!(quote_depth(">>> text"), 3);
+        assert_eq!(quote_depth("> > > text"), 3);
+        assert_eq!(quote_depth(">>  > text"), 3);
+        assert_eq!(quote_depth("> text"), 1);
+    }
+
+    #[test]
+    fn fold_quoted_lines_leaves_unquoted_text_unchanged() {
+        let body = "New reply.\n\nSecond paragraph.";
+        assert_eq!(fold_quoted_lines(body), body);
+    }
+
+    #[test]
+    fn fold_quoted_lines_leaves_a_single_quote_level_unchanged() {
+        let body = "New reply.\n\n> Quoted line one.\n> Quoted line two.";
+        assert_eq!(fold_quoted_lines(body), body);
+    }
+
+    #[test]
+    fn fold_quoted_lines_folds_a_nested_quote_block_into_a_marker() {
+        let body = "New reply.\n\n> Alice wrote:\n>> Original line one.\n>> Original line two.";
+        assert_eq!(
+            fold_quoted_lines(body),
+            "New reply.\n\n> Alice wrote:\n*(2 quoted lines omitted)*"
+        );
+    }
+
+    #[test]
+    fn fold_quoted_lines_folds_both_spaced_and_unspaced_nested_quote_markers() {
+        let body = ">> unspaced nested\n> > spaced nested";
+        assert_eq!(fold_quoted_lines(body), "*(2 quoted lines omitted)*");
+    }
+
+    #[test]
+    fn fold_quoted_lines_bridges_an_unprefixed_blank_line_inside_a_nested_quote_run() {
+        let body = ">> First nested paragraph.\n\n>> Second nested paragraph.";
+        assert_eq!(fold_quoted_lines(body), "*(3 quoted lines omitted)*");
+    }
+
+    #[test]
+    fn fold_quoted_lines_does_not_bridge_a_blank_line_outside_a_foldable_run() {
+        let body = "New reply.\n\n>> Nested quote.";
+        assert_eq!(
+            fold_quoted_lines(body),
+            "New reply.\n\n*(1 quoted line omitted)*"
+        );
+    }
+
+    #[test]
+    fn render_markdown_folds_nested_html_blockquotes_when_fold_quotes_is_true() {
+        let raw = b"Subject: Hi\r\nContent-Type: text/html\r\n\r\n\
+<p>New reply.</p><blockquote>Alice wrote:<blockquote>Bob's original message.</blockquote></blockquote>";
+
+        let folded = render_markdown(raw, true);
+        assert!(folded.contains("New reply."));
+        assert!(folded.contains("omitted"));
+        assert!(!folded.contains("Bob's original message."));
+
+        let unfolded = render_markdown(raw, false);
+        assert!(unfolded.contains("Bob's original message."));
+        assert!(!unfolded.contains("omitted"));
     }
 }

@@ -41,13 +41,25 @@ pub struct RenderCommand {
     /// per input.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+
+    /// Collapses `>`-quoted reply history nested more than one level deep
+    /// into a one-line `*(N quoted lines omitted)*` marker (#1514). Off by
+    /// default: verbatim rendering is fully information-preserving, and the
+    /// full text is one re-render away without this flag.
+    #[arg(long)]
+    pub fold_quotes: bool,
 }
 
 impl RenderCommand {
     /// Purely local and synchronous — no client, no `.await` anywhere in
     /// this command, mirroring `ExtractAttachmentsCommand::execute`.
     pub fn execute(self) -> Result<()> {
-        run_render_command(&self.paths, self.out_dir.as_deref(), &self.output)
+        run_render_command(
+            &self.paths,
+            self.out_dir.as_deref(),
+            &self.output,
+            self.fold_quotes,
+        )
     }
 }
 
@@ -77,8 +89,9 @@ fn run_render_command(
     paths: &[PathBuf],
     out_dir: Option<&Path>,
     output: &OutputFormat,
+    fold_quotes: bool,
 ) -> Result<()> {
-    let rendered = render_paths(paths, out_dir)?;
+    let rendered = render_paths(paths, out_dir, fold_quotes)?;
 
     if !output_as(&rendered, output)? {
         let stdout = std::io::stdout();
@@ -101,16 +114,23 @@ fn run_render_command(
 /// that file's [`RenderedFile::error`] rather than aborting the batch — the
 /// same "don't let one bad file kill the whole run" posture
 /// `gmail extract-attachments` takes.
-fn render_paths(paths: &[PathBuf], out_dir: Option<&Path>) -> Result<Vec<RenderedFile>> {
+fn render_paths(
+    paths: &[PathBuf],
+    out_dir: Option<&Path>,
+    fold_quotes: bool,
+) -> Result<Vec<RenderedFile>> {
     if let Some(dir) = out_dir {
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create output directory {}", dir.display()))?;
     }
 
-    Ok(paths.iter().map(|path| render_one(path, out_dir)).collect())
+    Ok(paths
+        .iter()
+        .map(|path| render_one(path, out_dir, fold_quotes))
+        .collect())
 }
 
-fn render_one(path: &Path, out_dir: Option<&Path>) -> RenderedFile {
+fn render_one(path: &Path, out_dir: Option<&Path>, fold_quotes: bool) -> RenderedFile {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(err) => {
@@ -122,7 +142,7 @@ fn render_one(path: &Path, out_dir: Option<&Path>) -> RenderedFile {
             }
         }
     };
-    let markdown = render_markdown(&raw);
+    let markdown = render_markdown(&raw, fold_quotes);
 
     let Some(dir) = out_dir else {
         return RenderedFile {
@@ -215,7 +235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
 
-        run_render_command(&[path], None, &OutputFormat::Table).unwrap();
+        run_render_command(&[path], None, &OutputFormat::Table, false).unwrap();
     }
 
     #[test]
@@ -223,7 +243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
 
-        let rendered = render_paths(std::slice::from_ref(&path), None).unwrap();
+        let rendered = render_paths(std::slice::from_ref(&path), None, false).unwrap();
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].path, path);
         assert!(rendered[0].saved_to.is_none());
@@ -241,7 +261,7 @@ mod tests {
         let path = write_eml(dir.path(), "abc123.eml", PLAIN_MESSAGE);
         let out_dir = dir.path().join("out");
 
-        let rendered = render_paths(&[path], Some(&out_dir)).unwrap();
+        let rendered = render_paths(&[path], Some(&out_dir), false).unwrap();
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].markdown.is_none());
         let saved_to = rendered[0].saved_to.clone().unwrap();
@@ -256,7 +276,7 @@ mod tests {
         let out_dir = dir.path().join("nested").join("out");
         assert!(!out_dir.exists());
 
-        render_paths(&[path], Some(&out_dir)).unwrap();
+        render_paths(&[path], Some(&out_dir), false).unwrap();
         assert!(out_dir.is_dir());
     }
 
@@ -266,7 +286,7 @@ mod tests {
         let good = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
         let missing = dir.path().join("does-not-exist.eml");
 
-        let rendered = render_paths(&[good, missing.clone()], None).unwrap();
+        let rendered = render_paths(&[good, missing.clone()], None, false).unwrap();
         assert_eq!(rendered.len(), 2);
         assert!(rendered[0].markdown.is_some());
         assert!(rendered[0].error.is_none());
@@ -280,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.eml");
 
-        let err = run_render_command(&[missing], None, &OutputFormat::Table).unwrap_err();
+        let err = run_render_command(&[missing], None, &OutputFormat::Table, false).unwrap_err();
         assert!(err.to_string().contains("1 of 1 file(s) failed to render"));
     }
 
@@ -290,7 +310,7 @@ mod tests {
         let good = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
         let missing = dir.path().join("does-not-exist.eml");
 
-        let rendered = render_paths(&[good, missing], None).unwrap();
+        let rendered = render_paths(&[good, missing], None, false).unwrap();
         assert_eq!(rendered.iter().filter(|f| f.error.is_none()).count(), 1);
     }
 
@@ -299,7 +319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
 
-        run_render_command(&[path], None, &OutputFormat::Json).unwrap();
+        run_render_command(&[path], None, &OutputFormat::Json, false).unwrap();
     }
 
     #[test]
@@ -325,11 +345,24 @@ mod tests {
         // written makes `fs::write` fail with "Is a directory".
         fs::create_dir_all(out_dir.join("m1.md")).unwrap();
 
-        let rendered = render_paths(&[path], Some(&out_dir)).unwrap();
+        let rendered = render_paths(&[path], Some(&out_dir), false).unwrap();
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].saved_to.is_none());
         assert!(rendered[0].markdown.is_none());
         assert!(rendered[0].error.is_some());
+    }
+
+    #[test]
+    fn render_paths_folds_nested_quotes_when_fold_quotes_is_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "Subject: Hi\r\nFrom: a@example.com\r\nContent-Type: text/plain\r\n\r\nNew reply.\r\n\r\n> Alice wrote:\r\n>> Original message.\r\n";
+        let path = write_eml(dir.path(), "m1.eml", raw);
+
+        let rendered = render_paths(&[path], None, true).unwrap();
+        let markdown = rendered[0].markdown.as_deref().unwrap();
+        assert!(markdown.contains("New reply."));
+        assert!(markdown.contains("omitted"));
+        assert!(!markdown.contains("Original message."));
     }
 
     #[test]

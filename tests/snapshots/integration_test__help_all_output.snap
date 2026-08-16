@@ -4509,6 +4509,7 @@ Options:
       --out-file <PATH>  Output file (writes to stdout if omitted)
       --detail <DETAIL>  How much of the message to fetch [default: full] [possible values: minimal, metadata, full, raw]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
+      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Only affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it is silently ignored elsewhere). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
   -h, --help             Print help (see more with '--help')
 
 
@@ -4526,6 +4527,7 @@ Arguments:
 Options:
       --out-dir <DIR>    Writes one `.md` file per input (named after the input's stem) into this directory instead of printing Markdown to stdout
   -o, --output <OUTPUT>  Report format. `Table` (default) prints each input's rendered Markdown directly to stdout — or, with `--out-dir`, a `Saved to:` line per file — so redirecting stdout to a file yields clean Markdown; json/yaml/yamls/jsonl instead emit one structured record per input [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
   -h, --help             Print help (see more with '--help')
 
 
