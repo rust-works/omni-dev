@@ -11,8 +11,10 @@ use crate::drive::types::DriveFile;
 const GOOGLE_DOC: &str = "application/vnd.google-apps.document";
 const GOOGLE_SHEET: &str = "application/vnd.google-apps.spreadsheet";
 const GOOGLE_SLIDES: &str = "application/vnd.google-apps.presentation";
-const GOOGLE_FOLDER: &str = "application/vnd.google-apps.folder";
-const GOOGLE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
+/// Reused by the `drive_file_read` MCP tool's content-mode folder rejection.
+pub(crate) const GOOGLE_FOLDER: &str = "application/vnd.google-apps.folder";
+/// Reused by the `drive_file_read` MCP tool's content-mode shortcut rejection.
+pub(crate) const GOOGLE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
 /// Reads a single Drive file's metadata or content.
 #[derive(Parser)]
@@ -196,7 +198,10 @@ async fn run_read_content(
 /// every other Google-native type has no safe default and requires
 /// `--export-mime-type`, so the error lists the file's actually supported
 /// export MIME types from `exportLinks`.
-fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<String> {
+///
+/// `pub(crate)`: also reused by the `drive_file_read` MCP tool
+/// (`src/mcp/drive_tools.rs`, issue #1525) for its `format: "content"` path.
+pub(crate) fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<String> {
     if let Some(mime) = explicit {
         return Ok(mime.to_string());
     }
@@ -230,8 +235,10 @@ fn default_export_mime_type(mime_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether `mime_type` is safe to print directly to a terminal.
-fn is_texty(mime_type: &str) -> bool {
+/// Whether `mime_type` is safe to print directly to a terminal (or return
+/// inline from the `drive_file_read` MCP tool, its other `pub(crate)`
+/// consumer — issue #1525).
+pub(crate) fn is_texty(mime_type: &str) -> bool {
     mime_type.starts_with("text/") || mime_type == "application/json"
 }
 
