@@ -1,36 +1,66 @@
 //! CLI command for `omni-dev gmail render`.
 //!
 //! Renders one or more `.eml` files as human-readable Markdown (CLI-only; no
-//! MCP equivalent; purely local, no client/credentials needed — #1513).
-//! Deliberately takes file paths rather than a `Manifest`/archive-dir +
+//! MCP equivalent; purely local, no client/credentials needed — #1513). By
+//! default it takes bare file paths rather than a `Manifest`/archive-dir +
 //! message id, so it works on any `.eml` file — piped a glob from a `gmail
 //! sync` archive (`messages/<y>/<m>/<d>/*.eml`) or any other source — with
-//! no dependency on this tool having synced the mailbox at all. The actual
-//! rendering lives in [`crate::gmail::render::render_markdown`], shared with
-//! `gmail read -o markdown` (`src/cli/gmail/read.rs`) so "MIME bytes ->
-//! readable Markdown" logic is written once regardless of whether the bytes
-//! came from disk or a live API fetch.
+//! no dependency on this tool having synced the mailbox at all.
+//! `--archive-dir PATH --all` is the opt-in alternative for the common
+//! "render everything I've synced" case (#1515): it reads `manifest.jsonl`
+//! and resolves the same paths a caller's own glob would have, but skips
+//! soft-deleted messages and (with `--out-dir`) messages already rendered by
+//! a prior run, mirroring `gmail extract-attachments --archive-dir`'s
+//! presence-on-disk idempotence (#1510). The actual rendering lives in
+//! [`crate::gmail::render::render_markdown`], shared with `gmail read -o
+//! markdown` (`src/cli/gmail/read.rs`) so "MIME bytes -> readable Markdown"
+//! logic is written once regardless of whether the bytes came from disk or a
+//! live API fetch.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use serde::Serialize;
 
 use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::sync::engine::manifest_path;
+use crate::cli::gmail::sync::manifest::Manifest;
 use crate::gmail::render::render_markdown;
 
 /// Renders one or more archived `.eml` files as Markdown.
 #[derive(Parser)]
+#[command(group(
+    ArgGroup::new("render_source")
+        .required(true)
+        .args(["paths", "archive_dir"]),
+))]
 pub struct RenderCommand {
-    /// One or more `.eml` file paths to render.
-    #[arg(required = true, value_name = "PATH")]
+    /// One or more `.eml` file paths to render. Mutually exclusive with
+    /// `--archive-dir`.
+    #[arg(value_name = "PATH", group = "render_source")]
     pub paths: Vec<PathBuf>,
 
+    /// Archive directory previously populated by `gmail sync`/`sync-all`.
+    /// Renders every non-deleted message from its `manifest.jsonl`.
+    /// Mutually exclusive with positional `PATH` arguments; requires
+    /// `--all`.
+    #[arg(long, value_name = "PATH", group = "render_source", requires = "all")]
+    pub archive_dir: Option<PathBuf>,
+
+    /// Confirms whole-archive rendering with `--archive-dir`. Requires
+    /// `--archive-dir`. A separate flag (rather than `--archive-dir` alone
+    /// implying it) reserves room for a future non-`--all` selector, e.g.
+    /// by message id.
+    #[arg(long, requires = "archive_dir")]
+    pub all: bool,
+
     /// Writes one `.md` file per input (named after the input's stem) into
-    /// this directory instead of printing Markdown to stdout.
+    /// this directory instead of printing Markdown to stdout. With
+    /// `--archive-dir --all`, also makes a message already rendered by a
+    /// prior run into this directory skipped on this run.
     #[arg(long = "out-dir", value_name = "DIR")]
     pub out_dir: Option<PathBuf>,
 
@@ -54,13 +84,39 @@ impl RenderCommand {
     /// Purely local and synchronous — no client, no `.await` anywhere in
     /// this command, mirroring `ExtractAttachmentsCommand::execute`.
     pub fn execute(self) -> Result<()> {
+        let paths = match &self.archive_dir {
+            Some(archive_dir) => resolve_archive_paths(archive_dir, self.out_dir.as_deref())?,
+            None => self.paths,
+        };
         run_render_command(
-            &self.paths,
+            &paths,
             self.out_dir.as_deref(),
             &self.output,
             self.fold_quotes,
         )
     }
+}
+
+/// Resolves every non-deleted manifest record under `archive_dir` to its
+/// archived `.eml` path, for `--archive-dir --all`. Skips a record whose
+/// rendered `.md` already exists under `out_dir` — the same
+/// presence-on-disk idempotence `gmail extract-attachments` relies on for
+/// `attachments/` dirs (#1510), silently, matching its "already extracted"
+/// skip — so a large archive can be re-rendered incrementally without
+/// redoing work. No skip is applied when `out_dir` is `None`: stdout has
+/// nothing durable to check a re-run against. Reuses [`md_filename`] so this
+/// skip check's notion of "already rendered" can never drift from where
+/// [`render_one`] actually writes the file.
+fn resolve_archive_paths(archive_dir: &Path, out_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let manifest = Manifest::load(&manifest_path(archive_dir))?;
+    Ok(manifest
+        .records_not_deleted()
+        .map(|record| archive_dir.join(&record.path))
+        .filter(|eml_path| match out_dir {
+            Some(dir) => !dir.join(md_filename(eml_path)).exists(),
+            None => true,
+        })
+        .collect())
 }
 
 /// One rendered (or failed) input, in input order. A plain, flat record
@@ -426,5 +482,184 @@ mod tests {
         let mut buf = Vec::new();
         render_report_text(&rendered, &mut buf).unwrap();
         assert!(buf.is_empty());
+    }
+
+    // ── --archive-dir --all ─────────────────────────────────────────
+
+    use crate::cli::gmail::sync::manifest::ManifestRecord;
+
+    /// Writes `.eml` bytes under `archive_dir` at `eml_relative` and
+    /// upserts a matching manifest record, creating/updating
+    /// `manifest.jsonl` as needed — mirrors
+    /// `extract_attachments.rs::write_manifest_with_attachment`.
+    fn write_manifest_record(
+        archive_dir: &Path,
+        id: &str,
+        eml_relative: &str,
+        raw: &str,
+        deleted: bool,
+    ) {
+        let eml_path = archive_dir.join(eml_relative);
+        fs::create_dir_all(eml_path.parent().unwrap()).unwrap();
+        fs::write(&eml_path, raw).unwrap();
+
+        let manifest_file = manifest_path(archive_dir);
+        let mut manifest = if manifest_file.exists() {
+            Manifest::load(&manifest_file).unwrap()
+        } else {
+            Manifest::default()
+        };
+        manifest.upsert(ManifestRecord {
+            id: id.to_string(),
+            thread_id: None,
+            label_ids: Vec::new(),
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: PathBuf::from(eml_relative),
+            size: raw.len() as u64,
+            history_id: None,
+            deleted_at: deleted.then(chrono::Utc::now),
+        });
+        manifest.save(&manifest_file).unwrap();
+    }
+
+    #[test]
+    fn resolve_archive_paths_resolves_non_deleted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+
+        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        assert_eq!(resolved, vec![archive_dir.join("messages/m1.eml")]);
+    }
+
+    #[test]
+    fn resolve_archive_paths_skips_soft_deleted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+        write_manifest_record(&archive_dir, "m2", "messages/m2.eml", PLAIN_MESSAGE, true);
+
+        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        assert_eq!(resolved, vec![archive_dir.join("messages/m1.eml")]);
+    }
+
+    #[test]
+    fn resolve_archive_paths_skips_already_rendered_files_under_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("m1.md"), "already rendered").unwrap();
+
+        let resolved = resolve_archive_paths(&archive_dir, Some(&out_dir)).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_archive_paths_applies_no_skip_without_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+
+        // No out_dir given, so there is nothing durable to skip against,
+        // even though a same-named file happens to exist elsewhere.
+        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn resolve_archive_paths_empty_for_missing_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("does-not-exist");
+
+        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn execute_archive_dir_all_renders_then_skips_on_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+        let out_dir = dir.path().join("out");
+
+        let cmd = RenderCommand {
+            paths: Vec::new(),
+            archive_dir: Some(archive_dir.clone()),
+            all: true,
+            out_dir: Some(out_dir.clone()),
+            output: OutputFormat::Table,
+            fold_quotes: false,
+        };
+        cmd.execute().unwrap();
+        let md_path = out_dir.join("m1.md");
+        assert!(fs::read_to_string(&md_path).unwrap().contains("Hi there."));
+        let first_write = fs::metadata(&md_path).unwrap().modified().unwrap();
+
+        // Re-running must be a clean no-op: the file already exists under
+        // `out_dir`, so `resolve_archive_paths` skips it and nothing is
+        // rewritten.
+        let cmd = RenderCommand {
+            paths: Vec::new(),
+            archive_dir: Some(archive_dir),
+            all: true,
+            out_dir: Some(out_dir),
+            output: OutputFormat::Table,
+            fold_quotes: false,
+        };
+        cmd.execute().unwrap();
+        assert_eq!(
+            fs::metadata(&md_path).unwrap().modified().unwrap(),
+            first_write
+        );
+    }
+
+    #[test]
+    fn archive_dir_without_all_fails_to_parse() {
+        assert!(
+            RenderCommand::try_parse_from(["render", "--archive-dir", "/tmp/archive"]).is_err()
+        );
+    }
+
+    #[test]
+    fn all_without_archive_dir_fails_to_parse() {
+        assert!(RenderCommand::try_parse_from(["render", "--all"]).is_err());
+    }
+
+    #[test]
+    fn paths_combined_with_archive_dir_fails_to_parse() {
+        assert!(RenderCommand::try_parse_from([
+            "render",
+            "m1.eml",
+            "--archive-dir",
+            "/tmp/archive",
+            "--all",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn neither_paths_nor_archive_dir_fails_to_parse() {
+        assert!(RenderCommand::try_parse_from(["render"]).is_err());
+    }
+
+    #[test]
+    fn bare_paths_still_parse() {
+        let cmd = RenderCommand::try_parse_from(["render", "m1.eml", "m2.eml"]).unwrap();
+        assert_eq!(
+            cmd.paths,
+            vec![PathBuf::from("m1.eml"), PathBuf::from("m2.eml")]
+        );
+        assert!(cmd.archive_dir.is_none());
+        assert!(!cmd.all);
     }
 }
