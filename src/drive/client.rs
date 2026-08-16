@@ -247,8 +247,13 @@ impl DriveClient {
     pub async fn response_to_error(response: Response) -> DriveError {
         let status = response.status().as_u16();
         let raw = response.text().await.unwrap_or_default();
+        let reason = drive_error_reason(&raw);
         let body = extract_drive_error_message(&raw).unwrap_or(raw);
-        DriveError::ApiRequestFailed { status, body }
+        DriveError::ApiRequestFailed {
+            status,
+            body,
+            reason,
+        }
     }
 }
 
@@ -781,6 +786,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("User Rate Limit Exceeded"));
         assert!(msg.contains("userRateLimitExceeded"));
+        assert_eq!(err.reason(), Some("userRateLimitExceeded"));
     }
 
     #[tokio::test]
@@ -807,6 +813,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Invalid request"));
         assert!(!msg.contains("reason:"));
+        assert_eq!(err.reason(), None);
     }
 
     #[tokio::test]

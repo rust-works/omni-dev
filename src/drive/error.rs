@@ -53,6 +53,10 @@ pub enum DriveError {
         /// Response body text (or an extracted `error.message`/`reason`
         /// summary when the body is Drive's JSON error envelope).
         body: String,
+        /// The `error.errors[0].reason` field from Drive's JSON error
+        /// envelope, if the body parsed as that shape. Populated directly by
+        /// `DriveClient::response_to_error` — not re-derived from `body`.
+        reason: Option<String>,
     },
 
     /// The OAuth callback's `state` did not match the value generated at the
@@ -120,15 +124,9 @@ impl DriveError {
         Self::AuthorizationDenied(detail)
     }
 
-    /// The Drive-specific `reason` embedded in an
-    /// [`ApiRequestFailed`](Self::ApiRequestFailed)'s body, if
+    /// The Drive-specific `reason` field of an
+    /// [`ApiRequestFailed`](Self::ApiRequestFailed), if
     /// `DriveClient::response_to_error` found one.
-    ///
-    /// That constructor already discards the raw JSON error envelope in
-    /// favour of a human-readable `"{message} (reason: {reason})"` string
-    /// (`client.rs`'s `extract_drive_error_message`), so this parses that
-    /// fixed suffix convention rather than re-parsing JSON that isn't kept
-    /// around by the time this variant exists.
     ///
     /// Unused for now: Gmail's twin (`GmailError::reason`) is used by
     /// `gmail sync`'s reconciliation engine, which Drive has no equivalent
@@ -138,9 +136,7 @@ impl DriveError {
     #[allow(dead_code)]
     pub(crate) fn reason(&self) -> Option<&str> {
         match self {
-            Self::ApiRequestFailed { body, .. } => body
-                .rsplit_once("(reason: ")
-                .and_then(|(_, rest)| rest.strip_suffix(')')),
+            Self::ApiRequestFailed { reason, .. } => reason.as_deref(),
             _ => None,
         }
     }
@@ -163,6 +159,7 @@ mod tests {
         let err = DriveError::ApiRequestFailed {
             status: 403,
             body: "insufficientPermissions".to_string(),
+            reason: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("403"));
@@ -175,19 +172,31 @@ mod tests {
     }
 
     #[test]
-    fn reason_extracts_the_formatted_suffix() {
+    fn reason_returns_the_structured_field() {
         let err = DriveError::ApiRequestFailed {
             status: 404,
             body: "Not Found (reason: notFound)".to_string(),
+            reason: Some("notFound".to_string()),
         };
         assert_eq!(err.reason(), Some("notFound"));
     }
 
     #[test]
-    fn reason_is_none_when_body_has_no_reason_suffix() {
+    fn reason_is_none_when_the_structured_field_is_absent() {
         let err = DriveError::ApiRequestFailed {
             status: 500,
             body: "Internal Server Error".to_string(),
+            reason: None,
+        };
+        assert_eq!(err.reason(), None);
+    }
+
+    #[test]
+    fn reason_ignores_a_reason_like_substring_embedded_in_the_body() {
+        let err = DriveError::ApiRequestFailed {
+            status: 400,
+            body: "Message already explains itself (reason: not the real one)".to_string(),
+            reason: None,
         };
         assert_eq!(err.reason(), None);
     }
