@@ -59,6 +59,20 @@ pub trait JsonlSerialize {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()>;
 }
 
+/// Strips control characters (C0, DEL, C1) from a server- or
+/// writer-supplied string before it reaches the terminal.
+///
+/// Every CSI escape sequence starts with ESC (a C0 control character), so
+/// this neutralizes embedded ANSI escape sequences at the source without
+/// needing sequence-aware parsing; it also strips embedded newlines that
+/// could otherwise be used to spoof extra output rows. The one place a
+/// newline legitimately appears in rendered output is the record separator
+/// the renderer itself writes between rows — never a value coming from a
+/// sanitized field (#1137).
+pub fn sanitize_for_terminal(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Writes each item in an iterator as a single compact JSON line.
 pub fn write_items_jsonl<'a, I, T>(items: I, out: &mut dyn Write) -> Result<()>
 where
@@ -150,6 +164,29 @@ pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat)
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ── sanitize_for_terminal ──────────────────────────────────────
+
+    #[test]
+    fn sanitize_for_terminal_leaves_clean_string_unchanged() {
+        assert_eq!(sanitize_for_terminal("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_ansi_escape_sequence() {
+        assert_eq!(sanitize_for_terminal("evil\x1b[31mrepo"), "evil[31mrepo");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_c0_c1_and_del_control_bytes() {
+        let input = "a\rb\x07c\u{7f}d\u{9b}e";
+        assert_eq!(sanitize_for_terminal(input), "abcde");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_embedded_newlines() {
+        assert_eq!(sanitize_for_terminal("line1\nline2"), "line1line2");
+    }
 
     #[test]
     fn output_default_is_table() {
