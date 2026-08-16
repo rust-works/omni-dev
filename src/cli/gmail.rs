@@ -119,15 +119,17 @@ impl GmailCommand {
                 cmd.execute()
             }
             command => {
-                // Propagates --account to the env var
-                // `gmail::account::resolve_account` reads (issue #1500),
-                // mirroring `Cli::propagate_global_flags`'s pattern: only
-                // set when present, so an existing ambient
+                // Propagates --account to the env var for the duration of
+                // this call only (`gmail::account::resolve_account` reads
+                // it, issue #1500), mirroring `Cli::propagate_global_flags`'s
+                // pattern: only set when present, so an existing ambient
                 // OMNI_DEV_GMAIL_ACCOUNT still works when the flag is
-                // omitted.
-                if let Some(account) = &account {
-                    std::env::set_var(GMAIL_ACCOUNT_ENV, account);
-                }
+                // omitted. The guard restores/removes it on drop at the end
+                // of this scope, so execute() is safe to call more than once
+                // per process (#1538).
+                let _account_guard = account.as_ref().map(|account| {
+                    crate::utils::env::ScopedEnvVar::set(GMAIL_ACCOUNT_ENV, account)
+                });
 
                 match command {
                     GmailSubcommands::Auth(cmd) => cmd.execute().await,
@@ -272,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_propagates_account_flag_to_env_var() {
+    async fn execute_restores_account_env_var_after_return() {
         let guard = crate::gmail::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
 
@@ -285,10 +287,55 @@ mod tests {
             }),
         };
         cmd.execute().await.unwrap();
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
+    }
+
+    #[tokio::test]
+    async fn execute_restores_previous_account_env_var_after_return() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(GMAIL_ACCOUNT_ENV, "personal");
+
+        let cmd = GmailCommand {
+            account: Some("work".to_string()),
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        cmd.execute().await.unwrap();
         assert_eq!(
             std::env::var(GMAIL_ACCOUNT_ENV).ok().as_deref(),
-            Some("work")
+            Some("personal")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_leak_account_across_sequential_calls() {
+        let guard = crate::gmail::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let account_list_cmd = || GmailCommand {
+            account: None,
+            command: GmailSubcommands::Account(account::AccountCommand {
+                command: account::AccountSubcommands::List(account::list::ListCommand {
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+
+        let first = GmailCommand {
+            account: Some("alpha".to_string()),
+            ..account_list_cmd()
+        };
+        first.execute().await.unwrap();
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
+
+        // If the first call's value had leaked, this second call — which
+        // omits --account entirely — would still see it via the env var.
+        account_list_cmd().execute().await.unwrap();
+        assert_eq!(std::env::var(GMAIL_ACCOUNT_ENV).ok(), None);
     }
 
     #[tokio::test]
