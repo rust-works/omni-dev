@@ -16,7 +16,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use crate::cli::format::TableOrJson;
+use crate::cli::format::{sanitize_for_terminal, TableOrJson};
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
@@ -1927,7 +1927,7 @@ fn folder_summary(window: &Value) -> String {
 /// a malicious `register` payload cannot inject terminal escape sequences into
 /// the rendered table (#1137). The `--json` path stays verbatim.
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    sanitize_for_terminal(s)
 }
 
 /// Seconds elapsed since an RFC 3339 timestamp (0 if absent/unparseable).
