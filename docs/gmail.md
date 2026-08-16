@@ -978,6 +978,8 @@ watermark. See [ADR-0064](adrs/adr-0064.md)'s 2026-08-06 amendment for
 
 - [Gmail Quickstart](gmail-quickstart.md) — a linear, zero-to-synced-archive
   walkthrough for first-time setup.
+- [Drive Integration](drive.md) — the sibling Google integration; shares
+  the same named-account/OAuth2 storage pattern.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
 - [MCP Reference — Gmail](mcp.md#gmail-6-tools) — parameter-only listing of
