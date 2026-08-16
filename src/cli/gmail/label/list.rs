@@ -5,7 +5,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::labels_api::LabelsApi;
 use crate::gmail::types::Label;
@@ -50,40 +50,40 @@ fn render_label_table(labels: &[Label], out: &mut dyn Write) -> Result<()> {
         return Ok(());
     }
 
-    let unread_strings: Vec<String> = labels
+    // Sanitize server-supplied strings *before* computing column widths, so
+    // a stripped control byte can't leave a column one character too wide
+    // for what's actually written (#1537). `messages_unread`/`messages_total`
+    // are numeric, locally formatted, and not attacker-controlled.
+    let rows: Vec<[String; 5]> = labels
         .iter()
         .map(|l| {
-            l.messages_unread
-                .map_or_else(|| "-".to_string(), |n| n.to_string())
-        })
-        .collect();
-    let total_strings: Vec<String> = labels
-        .iter()
-        .map(|l| {
-            l.messages_total
-                .map_or_else(|| "-".to_string(), |n| n.to_string())
+            [
+                sanitize_for_terminal(&l.id),
+                sanitize_for_terminal(&l.name),
+                sanitize_for_terminal(l.label_type.as_deref().unwrap_or("-")),
+                l.messages_unread
+                    .map_or_else(|| "-".to_string(), |n| n.to_string()),
+                l.messages_total
+                    .map_or_else(|| "-".to_string(), |n| n.to_string()),
+            ]
         })
         .collect();
 
     let id_width = "ID"
         .len()
-        .max(labels.iter().map(|l| l.id.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[0].len()).max().unwrap_or(0));
     let name_width = "NAME"
         .len()
-        .max(labels.iter().map(|l| l.name.len()).max().unwrap_or(0));
-    let type_width = "TYPE".len().max(
-        labels
-            .iter()
-            .map(|l| l.label_type.as_deref().unwrap_or("-").len())
-            .max()
-            .unwrap_or(0),
-    );
+        .max(rows.iter().map(|r| r[1].len()).max().unwrap_or(0));
+    let type_width = "TYPE"
+        .len()
+        .max(rows.iter().map(|r| r[2].len()).max().unwrap_or(0));
     let unread_width = "UNREAD"
         .len()
-        .max(unread_strings.iter().map(String::len).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[3].len()).max().unwrap_or(0));
     let total_width = "TOTAL"
         .len()
-        .max(total_strings.iter().map(String::len).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[4].len()).max().unwrap_or(0));
 
     write_row(
         out,
@@ -111,14 +111,14 @@ fn render_label_table(labels: &[Label], out: &mut dyn Write) -> Result<()> {
         unread_width,
         total_width,
     )?;
-    for (i, label) in labels.iter().enumerate() {
+    for row in &rows {
         write_row(
             out,
-            &label.id,
-            &label.name,
-            label.label_type.as_deref().unwrap_or("-"),
-            &unread_strings[i],
-            &total_strings[i],
+            &row[0],
+            &row[1],
+            &row[2],
+            &row[3],
+            &row[4],
             id_width,
             name_width,
             type_width,
@@ -221,6 +221,31 @@ mod tests {
         assert!(out.contains("TOTAL"));
         assert!(out.contains("L1"));
         assert_eq!(out.lines().count(), 4);
+    }
+
+    #[test]
+    fn render_table_strips_control_bytes_and_keeps_columns_aligned() {
+        let labels = [
+            Label {
+                id: "evil\x1b[31mid".to_string(),
+                name: "na\rme".to_string(),
+                label_type: Some("us\x07er".to_string()),
+                messages_unread: Some(2),
+                messages_total: Some(10),
+                ..Default::default()
+            },
+            sample_label("L2"),
+        ];
+        let mut buf = Vec::new();
+        render_label_table(&labels, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        assert!(out.contains("evil[31mid"), "{out:?}");
+        let lengths: Vec<usize> = out.lines().map(str::len).collect();
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{out:?}");
     }
 
     #[test]

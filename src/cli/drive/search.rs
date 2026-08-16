@@ -5,7 +5,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::drive::format::{output_as, OutputFormat};
+use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::{FilesApi, DEFAULT_SEARCH_LIMIT};
 use crate::drive::types::DriveFile;
@@ -68,30 +68,37 @@ fn render_search_table(files: &[DriveFile], out: &mut dyn Write) -> Result<()> {
         return Ok(());
     }
 
-    let sizes: Vec<&str> = files
+    // Sanitize server-supplied strings *before* computing column widths, so
+    // a stripped control byte can't leave the width one character too wide
+    // for what's actually written (#1537).
+    let rows: Vec<[String; 5]> = files
         .iter()
-        .map(|f| f.size.as_deref().unwrap_or("-"))
-        .collect();
-    let modifieds: Vec<&str> = files
-        .iter()
-        .map(|f| f.modified_time.as_deref().unwrap_or("-"))
+        .map(|f| {
+            [
+                sanitize_for_terminal(&f.id),
+                sanitize_for_terminal(&f.name),
+                sanitize_for_terminal(&f.mime_type),
+                sanitize_for_terminal(f.modified_time.as_deref().unwrap_or("-")),
+                sanitize_for_terminal(f.size.as_deref().unwrap_or("-")),
+            ]
+        })
         .collect();
 
     let id_width = "ID"
         .len()
-        .max(files.iter().map(|f| f.id.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[0].len()).max().unwrap_or(0));
     let name_width = "NAME"
         .len()
-        .max(files.iter().map(|f| f.name.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[1].len()).max().unwrap_or(0));
     let mime_width = "MIMETYPE"
         .len()
-        .max(files.iter().map(|f| f.mime_type.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[2].len()).max().unwrap_or(0));
     let modified_width = "MODIFIED"
         .len()
-        .max(modifieds.iter().map(|s| s.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[3].len()).max().unwrap_or(0));
     let size_width = "SIZE"
         .len()
-        .max(sizes.iter().map(|s| s.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[4].len()).max().unwrap_or(0));
 
     write_row(
         out,
@@ -106,14 +113,14 @@ fn render_search_table(files: &[DriveFile], out: &mut dyn Write) -> Result<()> {
         modified_width,
         size_width,
     )?;
-    for (i, file) in files.iter().enumerate() {
+    for row in &rows {
         write_row(
             out,
-            &file.id,
-            &file.name,
-            &file.mime_type,
-            modifieds[i],
-            sizes[i],
+            &row[0],
+            &row[1],
+            &row[2],
+            &row[3],
+            &row[4],
             id_width,
             name_width,
             mime_width,
@@ -219,6 +226,32 @@ mod tests {
         assert!(out.contains("f1"));
         assert!(out.contains("f2"));
         assert_eq!(out.lines().count(), 3);
+    }
+
+    #[test]
+    fn render_table_strips_control_bytes_and_keeps_columns_aligned() {
+        let files = [
+            DriveFile {
+                id: "f1".to_string(),
+                name: "evil\x1b[31mname".to_string(),
+                mime_type: "text/plain\r\x07".to_string(),
+                ..Default::default()
+            },
+            sample_file("f2"),
+        ];
+        let mut buf = Vec::new();
+        render_search_table(&files, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        assert!(out.contains("evil[31mname"), "{out:?}");
+        // Header + 2 data rows, every line the same length (alignment
+        // survived sanitizing before width calculation).
+        let lengths: Vec<usize> = out.lines().map(str::len).collect();
+        assert_eq!(lengths.len(), 3);
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{out:?}");
     }
 
     struct FailAfter {
