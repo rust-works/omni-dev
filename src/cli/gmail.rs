@@ -350,6 +350,7 @@ mod tests {
             out_file: None,
             detail: read::ReadDetail::Full,
             output: read::ReadOutputFormat::Table,
+            fold_quotes: false,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
@@ -521,6 +522,7 @@ mod tests {
                 paths: vec![path],
                 out_dir: None,
                 output: OutputFormat::Table,
+                fold_quotes: false,
             }),
         };
         // Succeeds even with zero credentials configured — proving `Render`
@@ -543,6 +545,7 @@ mod tests {
                 paths: vec![path],
                 out_dir: None,
                 output: OutputFormat::Table,
+                fold_quotes: false,
             }),
         };
         let err = cmd.execute().await.unwrap_err();
