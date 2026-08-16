@@ -842,7 +842,9 @@ mod tests {
         let err = run_file_read(&client, &read_params("f1", Some("content"), None, None))
             .await
             .unwrap_err();
+        // Names both surfaces' syntax — an MCP caller can't type a CLI flag.
         assert!(err.to_string().contains("--export-mime-type"));
+        assert!(err.to_string().contains("export_mime_type"));
         assert!(err.to_string().contains("application/zip"));
     }
 
