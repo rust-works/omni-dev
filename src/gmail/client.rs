@@ -242,10 +242,9 @@ impl GmailClient {
     }
 }
 
-/// Extracts the `error.errors[0].reason` field from Gmail's JSON error
-/// envelope, if present and the body parses as that shape.
-fn gmail_error_reason(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+/// Extracts the `error.errors[0].reason` field from Gmail's already-parsed
+/// JSON error envelope, if present.
+fn gmail_error_reason(value: &serde_json::Value) -> Option<String> {
     value
         .get("error")
         .and_then(|e| e.get("errors"))
@@ -256,10 +255,13 @@ fn gmail_error_reason(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Parses `body` once and extracts both the human message and the reason
+/// from the same [`serde_json::Value`] — avoids parsing the identical JSON
+/// twice (issue #1533).
 fn extract_gmail_error_message(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let message = value.get("error")?.get("message")?.as_str()?;
-    let reason = gmail_error_reason(body);
+    let reason = gmail_error_reason(&value);
     Some(reason.map_or_else(
         || message.to_string(),
         |r| format!("{message} (reason: {r})"),
@@ -278,8 +280,11 @@ fn is_gmail_quota_exceeded(status: u16, body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return false;
     };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
     matches!(
-        gmail_error_reason(text).as_deref(),
+        gmail_error_reason(&value).as_deref(),
         Some("rateLimitExceeded" | "userRateLimitExceeded")
     )
 }
