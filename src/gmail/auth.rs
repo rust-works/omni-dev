@@ -270,7 +270,11 @@ pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<GmailCreden
     let settings = Settings::load().unwrap_or_default();
     match resolve(&settings.gmail, explicit)? {
         ResolvedAccount::Legacy => {
-            load_credentials_with(&crate::utils::settings::SettingsEnv::load())
+            let profile = active_profile_from(&SystemEnv);
+            load_credentials_with(&crate::utils::settings::SettingsEnv::from_settings(
+                settings,
+                profile.as_deref(),
+            ))
         }
         ResolvedAccount::Named(name) => load_named_credentials(&settings.gmail, &name),
     }
@@ -385,7 +389,12 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthS
 pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
     match resolve(&settings.gmail, explicit)? {
-        ResolvedAccount::Legacy => Ok(status_with(&crate::utils::settings::SettingsEnv::load())),
+        ResolvedAccount::Legacy => {
+            let profile = active_profile_from(&SystemEnv);
+            Ok(status_with(
+                &crate::utils::settings::SettingsEnv::from_settings(settings, profile.as_deref()),
+            ))
+        }
         ResolvedAccount::Named(name) => Ok(status_from_named(&settings.gmail, &name)),
     }
 }

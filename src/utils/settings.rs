@@ -359,6 +359,19 @@ impl SettingsEnv {
             active_profile: profile.map(str::to_string),
         }
     }
+
+    /// Wraps an already-loaded [`Settings`], skipping the disk read/parse
+    /// [`load`](Self::load)/[`load_with_profile`](Self::load_with_profile)
+    /// perform — for callers (e.g. `load_credentials_for`/`status_for` in
+    /// `crate::gmail::auth`/`crate::drive::auth`) that already loaded
+    /// `Settings` to resolve an account and would otherwise discard it just
+    /// to re-read the same file a second time (issue #1533).
+    pub fn from_settings(settings: Settings, profile: Option<&str>) -> Self {
+        Self {
+            settings,
+            active_profile: profile.map(str::to_string),
+        }
+    }
 }
 
 impl EnvSource for SettingsEnv {
