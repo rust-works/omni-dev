@@ -284,10 +284,13 @@ login failure.
 
 ## Output formats
 
-Every leaf subcommand accepts `-o <format>` (`table` / `json` / `yaml` /
-`yamls` / `jsonl`, default `table`) — the same convention as every other
-`omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `--out-file` exists
-only on `drive read --content` — metadata always renders via `-o/--output`.
+Every subcommand that renders a list or record (`search`, `read`,
+`account list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` /
+`jsonl`, default `table`) — the same convention as every other `omni-dev`
+domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
+status`/`account set-default` print a fixed human-readable status line
+instead and have no `-o` flag. `--out-file` exists only on `drive read
+--content` — metadata always renders via `-o/--output`.
 
 ## Search
 
