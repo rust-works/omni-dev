@@ -232,8 +232,16 @@ impl GmailClient {
     pub async fn response_to_error(response: Response) -> GmailError {
         let status = response.status().as_u16();
         let raw = response.text().await.unwrap_or_default();
-        let reason = gmail_error_reason(&raw);
-        let body = extract_gmail_error_message(&raw).unwrap_or(raw);
+        let value = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        let reason = value.as_ref().and_then(gmail_error_reason);
+        let body = value
+            .as_ref()
+            .and_then(gmail_error_message)
+            .map(|message| match &reason {
+                Some(r) => format!("{message} (reason: {r})"),
+                None => message,
+            })
+            .unwrap_or(raw);
         GmailError::ApiRequestFailed {
             status,
             body,
@@ -242,10 +250,9 @@ impl GmailClient {
     }
 }
 
-/// Extracts the `error.errors[0].reason` field from Gmail's JSON error
-/// envelope, if present and the body parses as that shape.
-fn gmail_error_reason(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+/// Extracts the `error.errors[0].reason` field from Gmail's already-parsed
+/// JSON error envelope, if present.
+fn gmail_error_reason(value: &serde_json::Value) -> Option<String> {
     value
         .get("error")
         .and_then(|e| e.get("errors"))
@@ -256,14 +263,14 @@ fn gmail_error_reason(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn extract_gmail_error_message(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let message = value.get("error")?.get("message")?.as_str()?;
-    let reason = gmail_error_reason(body);
-    Some(reason.map_or_else(
-        || message.to_string(),
-        |r| format!("{message} (reason: {r})"),
-    ))
+/// Extracts the `error.message` field from Gmail's already-parsed JSON
+/// error envelope, if present.
+fn gmail_error_message(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Whether a response is Gmail's quota-exhaustion signal — **403** with
@@ -278,8 +285,11 @@ fn is_gmail_quota_exceeded(status: u16, body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return false;
     };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
     matches!(
-        gmail_error_reason(text).as_deref(),
+        gmail_error_reason(&value).as_deref(),
         Some("rateLimitExceeded" | "userRateLimitExceeded")
     )
 }
