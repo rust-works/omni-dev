@@ -6,7 +6,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi};
 use crate::gmail::raw_message::decode_raw_message;
@@ -217,16 +217,24 @@ fn render_plain_text(message: &Message) -> String {
 /// sense of "one command, one rendering," not a literal grid, matching the
 /// Datadog `monitor get` precedent for single-record views.
 fn render_read_table(message: &Message, out: &mut dyn Write) -> Result<()> {
-    writeln!(out, "Id: {}", message.id).context("Failed to write read row")?;
+    writeln!(out, "Id: {}", sanitize_for_terminal(&message.id))
+        .context("Failed to write read row")?;
     if let Some(thread_id) = &message.thread_id {
-        writeln!(out, "Thread-Id: {thread_id}").context("Failed to write read row")?;
-    }
-    if !message.label_ids.is_empty() {
-        writeln!(out, "Labels: {}", message.label_ids.join(", "))
+        writeln!(out, "Thread-Id: {}", sanitize_for_terminal(thread_id))
             .context("Failed to write read row")?;
     }
+    if !message.label_ids.is_empty() {
+        let labels = message
+            .label_ids
+            .iter()
+            .map(|l| sanitize_for_terminal(l))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "Labels: {labels}").context("Failed to write read row")?;
+    }
     if let Some(snippet) = &message.snippet {
-        writeln!(out, "Snippet: {snippet}").context("Failed to write read row")?;
+        writeln!(out, "Snippet: {}", sanitize_for_terminal(snippet))
+            .context("Failed to write read row")?;
     }
     Ok(())
 }
@@ -335,6 +343,25 @@ mod tests {
         render_read_table(&message, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text, "Id: m1\n");
+    }
+
+    #[test]
+    fn render_read_table_strips_control_bytes_from_server_strings() {
+        let message = Message {
+            id: "m1".to_string(),
+            thread_id: Some("t\x1b[31m1".to_string()),
+            label_ids: vec!["IN\rBOX".to_string()],
+            snippet: Some("evil\x07snippet\u{9b}2J".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_read_table(&message, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains(|c: char| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("Snippet: evilsnippet2J"), "{text:?}");
     }
 
     // ── run_read ─────────────────────────────────────────────────────
