@@ -242,46 +242,88 @@ async fn run_auth_status_all() -> Result<()> {
         let client = DriveClient::from_credentials(&credentials)?;
         return run_auth_status(&client, &scope).await;
     }
-    for summary in &accounts {
-        println!("\n== {} ==", summary.name);
-        if let Err(err) = report_one_account_status(&summary.name).await {
-            println!("  error: {err}");
+    let client_for = |name: &str| -> Result<(DriveClient, String)> {
+        let credentials = auth::load_credentials_for(Some(name))?;
+        let scope = credentials.scope.clone();
+        let client = DriveClient::from_credentials(&credentials)?;
+        Ok((client, scope))
+    };
+    run_auth_status_all_with(&accounts, &client_for).await
+}
+
+/// Runs every account's status check concurrently and prints the results back
+/// out in `accounts`' original order — `join_all`'s output preserves input
+/// order regardless of completion order, so no extra bookkeeping is needed to
+/// undo the concurrency once the results are in hand.
+///
+/// `client_for` is a seam: production builds a client from stored
+/// credentials, tests point it at a `wiremock` server per account name.
+async fn run_auth_status_all_with<F>(
+    accounts: &[account::AccountSummary],
+    client_for: &F,
+) -> Result<()>
+where
+    F: Fn(&str) -> Result<(DriveClient, String)> + Sync,
+{
+    let futs = accounts.iter().map(|summary| async move {
+        (
+            summary.name.clone(),
+            report_one_account_status(&summary.name, client_for).await,
+        )
+    });
+    let results = futures::future::join_all(futs).await;
+    for (name, result) in results {
+        println!("\n== {name} ==");
+        match result {
+            Ok(body) => print!("{body}"),
+            Err(err) => println!("  error: {err}"),
         }
     }
     Ok(())
 }
 
-async fn report_one_account_status(name: &str) -> Result<()> {
-    let credentials = auth::load_credentials_for(Some(name))?;
-    let scope = credentials.scope.clone();
-    let client = DriveClient::from_credentials(&credentials)?;
+async fn report_one_account_status<F>(name: &str, client_for: &F) -> Result<String>
+where
+    F: Fn(&str) -> Result<(DriveClient, String)> + Sync,
+{
+    let (client, scope) = client_for(name)?;
     run_auth_status_for(&client, &scope, Some(name)).await
 }
 
 async fn run_auth_status(client: &DriveClient, scope: &str) -> Result<()> {
-    run_auth_status_for(client, scope, None).await
+    let body = run_auth_status_for(client, scope, None).await?;
+    print!("{body}");
+    Ok(())
 }
 
 /// Calls `about.get` and reports whether the stored refresh token is still
 /// accepted; backfills `account_name`'s cached `email_address` on success.
+/// Returns the formatted report rather than printing it, so callers running
+/// several accounts concurrently (`run_auth_status_all_with`) can print them
+/// back out in a stable order instead of interleaving live `println!`s.
 async fn run_auth_status_for(
     client: &DriveClient,
     scope: &str,
     account_name: Option<&str>,
-) -> Result<()> {
-    println!("Checking Drive authentication...");
+) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("Checking Drive authentication...\n");
 
     let about = AboutApi::new(client).get().await?;
     let email = about.user.email_address.unwrap_or_default();
 
-    println!("Authenticated as: {email}");
+    out.push_str(&format!("Authenticated as: {email}\n"));
     // Plain string — no allows_modify() (Drive has no modify scope).
-    println!("Granted scope: {scope}");
+    out.push_str(&format!("Granted scope: {scope}\n"));
 
     if let (Some(name), false) = (account_name, email.is_empty()) {
+        // Best-effort cache backfill: if two accounts in the same --all run
+        // both need a fresh email, concurrent read-modify-write to
+        // settings.json can drop one (no file lock). Self-heals on the next
+        // status check, which always re-fetches the email live.
         auth::record_account_email(name, &email)?;
     }
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -638,5 +680,160 @@ mod tests {
         run_auth_status_for(&client, auth::SCOPE_READONLY, None)
             .await
             .unwrap();
+    }
+
+    // ── run_auth_status_all_with ─────────────────────────────────────
+
+    fn account_summary(name: &str) -> account::AccountSummary {
+        account::AccountSummary {
+            name: name.to_string(),
+            email_address: None,
+            scope: None,
+            is_default: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_all_with_backfills_each_account_despite_uneven_latency() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        for name in ["work", "personal"] {
+            Settings::upsert_drive_account(
+                &settings_path,
+                name,
+                &[("client_id", serde_json::Value::String("id".to_string()))],
+            )
+            .unwrap();
+        }
+
+        // "work" is listed first but resolves last, proving the printed/
+        // recorded results line back up with their own account rather than
+        // whichever completed first.
+        let server_work = wiremock::MockServer::start().await;
+        let client_work = client_with_bootstrapped_token(&server_work).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/about"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(
+                        serde_json::json!({"user": {"emailAddress": "work@example.com"}}),
+                    )
+                    .set_delay(std::time::Duration::from_millis(50)),
+            )
+            .mount(&server_work)
+            .await;
+
+        let server_personal = wiremock::MockServer::start().await;
+        let client_personal = client_with_bootstrapped_token(&server_personal).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/about"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user": {"emailAddress": "personal@example.com"},
+                })),
+            )
+            .mount(&server_personal)
+            .await;
+
+        let clients = std::sync::Mutex::new(std::collections::HashMap::from([
+            (
+                "work".to_string(),
+                (client_work, auth::SCOPE_READONLY.to_string()),
+            ),
+            (
+                "personal".to_string(),
+                (client_personal, auth::SCOPE_READONLY.to_string()),
+            ),
+        ]));
+        let client_for = |name: &str| -> Result<(DriveClient, String)> {
+            clients
+                .lock()
+                .unwrap()
+                .remove(name)
+                .ok_or_else(|| anyhow::anyhow!("no test client for {name}"))
+        };
+
+        let accounts = vec![account_summary("work"), account_summary("personal")];
+        run_auth_status_all_with(&accounts, &client_for)
+            .await
+            .unwrap();
+
+        let settings = Settings::load().unwrap();
+        assert_eq!(
+            settings.drive.accounts["work"].email_address.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(
+            settings.drive.accounts["personal"].email_address.as_deref(),
+            Some("personal@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_all_with_reports_error_for_one_account() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        for name in ["work", "broken"] {
+            Settings::upsert_drive_account(
+                &settings_path,
+                name,
+                &[("client_id", serde_json::Value::String("id".to_string()))],
+            )
+            .unwrap();
+        }
+
+        let server_work = wiremock::MockServer::start().await;
+        let client_work = client_with_bootstrapped_token(&server_work).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/about"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user": {"emailAddress": "work@example.com"},
+                })),
+            )
+            .mount(&server_work)
+            .await;
+
+        let server_broken = wiremock::MockServer::start().await;
+        let client_broken = client_with_bootstrapped_token(&server_broken).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/about"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server_broken)
+            .await;
+
+        let clients = std::sync::Mutex::new(std::collections::HashMap::from([
+            (
+                "work".to_string(),
+                (client_work, auth::SCOPE_READONLY.to_string()),
+            ),
+            (
+                "broken".to_string(),
+                (client_broken, auth::SCOPE_READONLY.to_string()),
+            ),
+        ]));
+        let client_for = |name: &str| -> Result<(DriveClient, String)> {
+            clients
+                .lock()
+                .unwrap()
+                .remove(name)
+                .ok_or_else(|| anyhow::anyhow!("no test client for {name}"))
+        };
+
+        let accounts = vec![account_summary("work"), account_summary("broken")];
+        // Errors are per-account and non-fatal: the overall call still
+        // succeeds even though one account's status check failed.
+        run_auth_status_all_with(&accounts, &client_for)
+            .await
+            .unwrap();
+
+        let settings = Settings::load().unwrap();
+        assert_eq!(
+            settings.drive.accounts["work"].email_address.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(settings.drive.accounts["broken"].email_address, None);
     }
 }
