@@ -110,6 +110,15 @@ pub struct ReadCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = ReadOutputFormat::Table)]
     pub output: ReadOutputFormat,
+
+    /// Collapses `>`-quoted reply history nested more than one level deep
+    /// into a one-line `*(N quoted lines omitted)*` marker (#1514). Only
+    /// affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it
+    /// is silently ignored elsewhere). Off by default: verbatim rendering
+    /// is fully information-preserving, and the full text is one re-render
+    /// away without this flag.
+    #[arg(long)]
+    pub fold_quotes: bool,
 }
 
 impl ReadCommand {
@@ -122,6 +131,7 @@ impl ReadCommand {
             self.detail,
             self.out_file.as_deref(),
             &self.output,
+            self.fold_quotes,
         )
         .await
     }
@@ -137,6 +147,7 @@ async fn run_read(
     detail: ReadDetail,
     out_file: Option<&str>,
     output: &ReadOutputFormat,
+    fold_quotes: bool,
 ) -> Result<()> {
     if matches!(output, ReadOutputFormat::Markdown) {
         // Rendering needs the full raw MIME message regardless of
@@ -146,7 +157,7 @@ async fn run_read(
             .get(message_id, MessageFormat::Raw, &[])
             .await?;
         let bytes = decode_raw_message(&message)?;
-        let markdown = render_markdown(&bytes);
+        let markdown = render_markdown(&bytes, fold_quotes);
 
         if let Some(path) = out_file {
             fs::write(path, &markdown).with_context(|| format!("Failed to write to {path}"))?;
@@ -351,6 +362,7 @@ mod tests {
             ReadDetail::Full,
             Some(path.to_str().unwrap()),
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -385,6 +397,7 @@ mod tests {
             ReadDetail::Raw,
             Some(path.to_str().unwrap()),
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -415,6 +428,7 @@ mod tests {
             ReadDetail::Raw,
             Some(path.to_str().unwrap()),
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap_err();
@@ -450,6 +464,7 @@ mod tests {
             ReadDetail::Full,
             Some(path.to_str().unwrap()),
             &ReadOutputFormat::Markdown,
+            false,
         )
         .await
         .unwrap();
@@ -488,6 +503,7 @@ mod tests {
             ReadDetail::Minimal,
             None,
             &ReadOutputFormat::Markdown,
+            false,
         )
         .await
         .unwrap();
@@ -517,6 +533,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Markdown,
+            false,
         )
         .await
         .unwrap();
@@ -541,6 +558,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Markdown,
+            false,
         )
         .await
         .unwrap_err();
@@ -565,6 +583,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -588,6 +607,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Json,
+            false,
         )
         .await
         .unwrap();
@@ -611,6 +631,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Yaml,
+            false,
         )
         .await
         .unwrap();
@@ -634,6 +655,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Yamls,
+            false,
         )
         .await
         .unwrap();
@@ -657,6 +679,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Jsonl,
+            false,
         )
         .await
         .unwrap();
@@ -678,6 +701,7 @@ mod tests {
             ReadDetail::Full,
             None,
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap_err();
@@ -704,6 +728,7 @@ mod tests {
             ReadDetail::Metadata,
             None,
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -729,6 +754,7 @@ mod tests {
             ReadDetail::Minimal,
             None,
             &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -755,6 +781,7 @@ mod tests {
             out_file: None,
             detail: ReadDetail::Full,
             output: ReadOutputFormat::Json,
+            fold_quotes: false,
         };
         cmd.execute(&client).await.unwrap();
     }
