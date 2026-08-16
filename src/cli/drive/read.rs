@@ -11,8 +11,10 @@ use crate::drive::types::DriveFile;
 const GOOGLE_DOC: &str = "application/vnd.google-apps.document";
 const GOOGLE_SHEET: &str = "application/vnd.google-apps.spreadsheet";
 const GOOGLE_SLIDES: &str = "application/vnd.google-apps.presentation";
-const GOOGLE_FOLDER: &str = "application/vnd.google-apps.folder";
-const GOOGLE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
+/// Reused by the `drive_file_read` MCP tool's content-mode folder rejection.
+pub(crate) const GOOGLE_FOLDER: &str = "application/vnd.google-apps.folder";
+/// Reused by the `drive_file_read` MCP tool's content-mode shortcut rejection.
+pub(crate) const GOOGLE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
 /// Reads a single Drive file's metadata or content.
 #[derive(Parser)]
@@ -189,14 +191,19 @@ async fn run_read_content(
     );
 }
 
-/// Resolves the export MIME type: an explicit `--export-mime-type` always
-/// wins (never validated against `exportLinks` client-side — the server is
-/// authoritative and already returns a clear error for an unsupported
-/// value); otherwise Docs/Sheets/Slides fall back to a documented default;
-/// every other Google-native type has no safe default and requires
-/// `--export-mime-type`, so the error lists the file's actually supported
-/// export MIME types from `exportLinks`.
-fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<String> {
+/// Resolves the export MIME type: an explicit MIME type always wins (never
+/// validated against `exportLinks` client-side — the server is authoritative
+/// and already returns a clear error for an unsupported value); otherwise
+/// Docs/Sheets/Slides fall back to a documented default; every other
+/// Google-native type has no safe default and requires one, so the error
+/// lists the file's actually supported export MIME types from
+/// `exportLinks`.
+///
+/// `pub(crate)`: also reused by the `drive_file_read` MCP tool
+/// (`src/mcp/drive_tools.rs`, issue #1525) for its `format: "content"` path
+/// — the "how to specify one" clause in the error below names both
+/// surfaces' syntax accordingly, rather than assuming the CLI flag.
+pub(crate) fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<String> {
     if let Some(mime) = explicit {
         return Ok(mime.to_string());
     }
@@ -212,8 +219,9 @@ fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<
         },
     );
     Err(anyhow::anyhow!(
-        "'{}' (mimeType: {}) has no default export format; pass --export-mime-type. \
-         Supported export MIME types: {available}",
+        "'{}' (mimeType: {}) has no default export format; pass an explicit export MIME type \
+         (CLI: --export-mime-type, MCP drive_file_read: export_mime_type). Supported export \
+         MIME types: {available}",
         meta.name,
         meta.mime_type,
     ))
@@ -230,8 +238,10 @@ fn default_export_mime_type(mime_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether `mime_type` is safe to print directly to a terminal.
-fn is_texty(mime_type: &str) -> bool {
+/// Whether `mime_type` is safe to print directly to a terminal (or return
+/// inline from the `drive_file_read` MCP tool, its other `pub(crate)`
+/// consumer — issue #1525).
+pub(crate) fn is_texty(mime_type: &str) -> bool {
     mime_type.starts_with("text/") || mime_type == "application/json"
 }
 
