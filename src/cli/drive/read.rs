@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::drive::format::{output_as, OutputFormat};
+use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::types::DriveFile;
@@ -109,21 +109,31 @@ async fn run_read_metadata(
 /// in the sense of "one command, one rendering," not a literal grid,
 /// matching `crate::cli::gmail::read::render_read_table`'s precedent.
 fn render_metadata_table(file: &DriveFile, out: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(out, "Id: {}", file.id).context("Failed to write read row")?;
-    writeln!(out, "Name: {}", file.name).context("Failed to write read row")?;
-    writeln!(out, "MimeType: {}", file.mime_type).context("Failed to write read row")?;
+    writeln!(out, "Id: {}", sanitize_for_terminal(&file.id)).context("Failed to write read row")?;
+    writeln!(out, "Name: {}", sanitize_for_terminal(&file.name))
+        .context("Failed to write read row")?;
+    writeln!(out, "MimeType: {}", sanitize_for_terminal(&file.mime_type))
+        .context("Failed to write read row")?;
     if let Some(size) = &file.size {
-        writeln!(out, "Size: {size}").context("Failed to write read row")?;
-    }
-    if let Some(modified) = &file.modified_time {
-        writeln!(out, "Modified: {modified}").context("Failed to write read row")?;
-    }
-    if !file.parents.is_empty() {
-        writeln!(out, "Parents: {}", file.parents.join(", "))
+        writeln!(out, "Size: {}", sanitize_for_terminal(size))
             .context("Failed to write read row")?;
     }
+    if let Some(modified) = &file.modified_time {
+        writeln!(out, "Modified: {}", sanitize_for_terminal(modified))
+            .context("Failed to write read row")?;
+    }
+    if !file.parents.is_empty() {
+        let parents = file
+            .parents
+            .iter()
+            .map(|p| sanitize_for_terminal(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "Parents: {parents}").context("Failed to write read row")?;
+    }
     if let Some(link) = &file.web_view_link {
-        writeln!(out, "WebViewLink: {link}").context("Failed to write read row")?;
+        writeln!(out, "WebViewLink: {}", sanitize_for_terminal(link))
+            .context("Failed to write read row")?;
     }
     Ok(())
 }
@@ -319,6 +329,26 @@ mod tests {
         render_metadata_table(&file, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text, "Id: f1\nName: n\nMimeType: \n");
+    }
+
+    #[test]
+    fn render_metadata_table_strips_control_bytes_from_server_strings() {
+        let file = DriveFile {
+            id: "f1".to_string(),
+            name: "evil\x1b[31mname".to_string(),
+            mime_type: "text/plain\r\x07".to_string(),
+            parents: vec!["fold\x1b[0mer".to_string()],
+            web_view_link: Some("https://example.com/\u{9b}2J".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_metadata_table(&file, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains(|c: char| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("evil[31mname"), "{text:?}");
     }
 
     // ── default_export_mime_type ──────────────────────────────────────
