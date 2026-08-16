@@ -191,16 +191,18 @@ async fn run_read_content(
     );
 }
 
-/// Resolves the export MIME type: an explicit `--export-mime-type` always
-/// wins (never validated against `exportLinks` client-side — the server is
-/// authoritative and already returns a clear error for an unsupported
-/// value); otherwise Docs/Sheets/Slides fall back to a documented default;
-/// every other Google-native type has no safe default and requires
-/// `--export-mime-type`, so the error lists the file's actually supported
-/// export MIME types from `exportLinks`.
+/// Resolves the export MIME type: an explicit MIME type always wins (never
+/// validated against `exportLinks` client-side — the server is authoritative
+/// and already returns a clear error for an unsupported value); otherwise
+/// Docs/Sheets/Slides fall back to a documented default; every other
+/// Google-native type has no safe default and requires one, so the error
+/// lists the file's actually supported export MIME types from
+/// `exportLinks`.
 ///
 /// `pub(crate)`: also reused by the `drive_file_read` MCP tool
-/// (`src/mcp/drive_tools.rs`, issue #1525) for its `format: "content"` path.
+/// (`src/mcp/drive_tools.rs`, issue #1525) for its `format: "content"` path
+/// — the "how to specify one" clause in the error below names both
+/// surfaces' syntax accordingly, rather than assuming the CLI flag.
 pub(crate) fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>) -> Result<String> {
     if let Some(mime) = explicit {
         return Ok(mime.to_string());
@@ -217,8 +219,9 @@ pub(crate) fn resolve_export_mime_type(meta: &DriveFile, explicit: Option<&str>)
         },
     );
     Err(anyhow::anyhow!(
-        "'{}' (mimeType: {}) has no default export format; pass --export-mime-type. \
-         Supported export MIME types: {available}",
+        "'{}' (mimeType: {}) has no default export format; pass an explicit export MIME type \
+         (CLI: --export-mime-type, MCP drive_file_read: export_mime_type). Supported export \
+         MIME types: {available}",
         meta.name,
         meta.mime_type,
     ))
