@@ -5,7 +5,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageSummary, MessagesApi, DEFAULT_SEARCH_LIMIT};
 use crate::gmail::types::MessageRef;
@@ -118,12 +118,24 @@ fn render_id_table(refs: &[MessageRef], out: &mut dyn Write) -> Result<()> {
         return Ok(());
     }
 
+    // Sanitize before computing column widths (#1537) — see
+    // `render_search_table` below for the same treatment.
+    let rows: Vec<(String, String)> = refs
+        .iter()
+        .map(|r| {
+            (
+                sanitize_for_terminal(&r.id),
+                sanitize_for_terminal(&r.thread_id),
+            )
+        })
+        .collect();
+
     let id_width = "ID"
         .len()
-        .max(refs.iter().map(|r| r.id.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|(id, _)| id.len()).max().unwrap_or(0));
     let thread_width = "THREAD_ID"
         .len()
-        .max(refs.iter().map(|r| r.thread_id.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|(_, t)| t.len()).max().unwrap_or(0));
 
     writeln!(out, "{:<id_width$}  {:<thread_width$}", "ID", "THREAD_ID")
         .context("Failed to write search row")?;
@@ -134,8 +146,8 @@ fn render_id_table(refs: &[MessageRef], out: &mut dyn Write) -> Result<()> {
         "-".repeat(thread_width)
     )
     .context("Failed to write search row")?;
-    for r in refs {
-        writeln!(out, "{:<id_width$}  {:<thread_width$}", r.id, r.thread_id)
+    for (id, thread_id) in &rows {
+        writeln!(out, "{id:<id_width$}  {thread_id:<thread_width$}")
             .context("Failed to write search row")?;
     }
     Ok(())
@@ -153,23 +165,39 @@ pub(crate) fn render_search_table(summaries: &[MessageSummary], out: &mut dyn Wr
         return Ok(());
     }
 
-    let snippets: Vec<String> = summaries.iter().map(|s| truncate(&s.snippet)).collect();
+    // Sanitize server-supplied strings *before* computing column widths (and
+    // before truncating the snippet, so stripped control bytes don't eat
+    // into the visible-character budget) — a stripped control byte must not
+    // leave a column one character too wide for what's actually written
+    // (#1537).
+    let rows: Vec<[String; 5]> = summaries
+        .iter()
+        .map(|s| {
+            [
+                sanitize_for_terminal(&s.id),
+                sanitize_for_terminal(&s.from),
+                sanitize_for_terminal(&s.subject),
+                sanitize_for_terminal(&s.date),
+                truncate(&sanitize_for_terminal(&s.snippet)),
+            ]
+        })
+        .collect();
 
     let id_width = "ID"
         .len()
-        .max(summaries.iter().map(|s| s.id.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[0].len()).max().unwrap_or(0));
     let from_width = "FROM"
         .len()
-        .max(summaries.iter().map(|s| s.from.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[1].len()).max().unwrap_or(0));
     let subject_width = "SUBJECT"
         .len()
-        .max(summaries.iter().map(|s| s.subject.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[2].len()).max().unwrap_or(0));
     let date_width = "DATE"
         .len()
-        .max(summaries.iter().map(|s| s.date.len()).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[3].len()).max().unwrap_or(0));
     let snippet_width = "SNIPPET"
         .len()
-        .max(snippets.iter().map(String::len).max().unwrap_or(0));
+        .max(rows.iter().map(|r| r[4].len()).max().unwrap_or(0));
 
     write_row(
         out,
@@ -197,14 +225,14 @@ pub(crate) fn render_search_table(summaries: &[MessageSummary], out: &mut dyn Wr
         date_width,
         snippet_width,
     )?;
-    for (i, summary) in summaries.iter().enumerate() {
+    for row in &rows {
         write_row(
             out,
-            &summary.id,
-            &summary.from,
-            &summary.subject,
-            &summary.date,
-            &snippets[i],
+            &row[0],
+            &row[1],
+            &row[2],
+            &row[3],
+            &row[4],
             id_width,
             from_width,
             subject_width,
@@ -341,6 +369,27 @@ mod tests {
         assert_eq!(out.lines().count(), 4);
     }
 
+    #[test]
+    fn render_id_table_strips_control_bytes_and_keeps_columns_aligned() {
+        let refs = [
+            MessageRef {
+                id: "evil\x1b[31mid".to_string(),
+                thread_id: "t\r\x071".to_string(),
+            },
+            sample_ref("m2"),
+        ];
+        let mut buf = Vec::new();
+        render_id_table(&refs, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        assert!(out.contains("evil[31mid"), "{out:?}");
+        let lengths: Vec<usize> = out.lines().map(str::len).collect();
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{out:?}");
+    }
+
     // ── render_search_table ──────────────────────────────────────────
 
     #[test]
@@ -365,6 +414,31 @@ mod tests {
         assert!(out.contains("m2"));
         // Header + separator + 2 data rows = 4 lines.
         assert_eq!(out.lines().count(), 4);
+    }
+
+    #[test]
+    fn render_search_table_strips_control_bytes_and_keeps_columns_aligned() {
+        let summaries = [
+            MessageSummary {
+                id: "evil\x1b[31mid".to_string(),
+                thread_id: "t1".to_string(),
+                from: "a\r@example.com".to_string(),
+                subject: "Hi\x07There".to_string(),
+                date: "Mon, 1 Jan 2026".to_string(),
+                snippet: "snippet\u{9b}2J".to_string(),
+            },
+            sample_summary("m2"),
+        ];
+        let mut buf = Vec::new();
+        render_search_table(&summaries, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        assert!(out.contains("evil[31mid"), "{out:?}");
+        let lengths: Vec<usize> = out.lines().map(str::len).collect();
+        assert!(lengths.windows(2).all(|w| w[0] == w[1]), "{out:?}");
     }
 
     struct FailAfter {
