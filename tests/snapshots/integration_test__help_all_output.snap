@@ -3733,6 +3733,7 @@ Commands:
   search   Searches Drive files
   read     Reads a single Drive file's metadata or content
   dedupe   Finds Drive files sharing the same content hash
+  rename   Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3876,6 +3877,24 @@ Options:
       --verify                        Locally recomputes the SHA-256 checksum of the downloaded bytes and checks it against Drive's reported `sha256Checksum`. Only valid with `--content`, and only for non-Google-native files — Drive never returns a checksum for exported content, so this errors immediately on a Google-native file rather than exporting first. Prints a one-line confirmation on success; fails with a clear error on a mismatch or a missing checksum
   -o, --output <OUTPUT>               Output format (metadata only) [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                          Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive rename - Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
+
+Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
+
+Usage: rename [OPTIONS] <FILE_ID> <NEW_NAME>
+
+Arguments:
+  <FILE_ID>   Drive file id (from `drive search`, or the `id` segment of a Drive URL)
+  <NEW_NAME>  The new name
+
+Options:
+      --dry-run          Reports the current name without renaming
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

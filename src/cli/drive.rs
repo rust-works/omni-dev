@@ -6,6 +6,7 @@ pub(crate) mod dedupe;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod read;
+pub(crate) mod rename;
 pub(crate) mod search;
 
 use anyhow::Result;
@@ -14,7 +15,7 @@ use clap::{Parser, Subcommand};
 use crate::drive::account::DRIVE_ACCOUNT_ENV;
 use crate::drive::client::DriveClient;
 
-/// Drive: search and read Google Drive files via OAuth2 (read-only).
+/// Drive: search, read, rename, and move Google Drive files via OAuth2.
 #[derive(Parser)]
 pub struct DriveCommand {
     /// Selects a named Drive account configured in
@@ -48,6 +49,9 @@ pub enum DriveSubcommands {
     Read(read::ReadCommand),
     /// Finds Drive files sharing the same content hash.
     Dedupe(dedupe::DedupeCommand),
+    /// Renames a single Drive file. Requires the `drive.metadata` scope
+    /// (`drive auth login --write`).
+    Rename(rename::RenameCommand),
 }
 
 impl DriveCommand {
@@ -91,6 +95,7 @@ impl DriveSubcommands {
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
+            Self::Rename(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -278,6 +283,17 @@ mod tests {
         let cmd = DriveSubcommands::Dedupe(dedupe::DedupeCommand {
             query: "name contains 'x'".to_string(),
             limit: 10,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_rename() {
+        let cmd = DriveSubcommands::Rename(rename::RenameCommand {
+            file_id: "f1".to_string(),
+            new_name: "New Name".to_string(),
+            dry_run: false,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
