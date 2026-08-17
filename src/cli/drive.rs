@@ -100,7 +100,7 @@ impl DriveSubcommands {
 mod tests {
     use super::*;
     use crate::cli::drive::format::OutputFormat;
-    use crate::drive::auth::{DriveCredentials, SCOPE_READONLY};
+    use crate::drive::auth::{DriveCredentials, DriveScope};
     use crate::utils::secret::Secret;
 
     fn dead_credentials() -> DriveCredentials {
@@ -108,7 +108,7 @@ mod tests {
             client_id: "client".to_string(),
             client_secret: Secret::new("secret"),
             refresh_token: Secret::new("refresh"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 

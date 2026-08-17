@@ -331,7 +331,7 @@ pub(crate) fn verify_sha256_checksum(bytes: &[u8], expected: Option<&str>) -> Re
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, SCOPE_READONLY};
+    use crate::drive::auth::{DriveCredentials, DriveScope};
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -339,7 +339,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 

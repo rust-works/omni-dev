@@ -3809,10 +3809,11 @@ omni-dev drive auth login - Runs the Drive OAuth2 login flow (opens a browser)
 
 Runs the Drive OAuth2 login flow (opens a browser)
 
-Usage: login
+Usage: login [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --write  Request the `drive.metadata` scope (needed for `rename`/`move`) in addition to `drive.readonly`. Without this flag, only read access is granted
+  -h, --help   Print help
 
 
 ================================================================================
