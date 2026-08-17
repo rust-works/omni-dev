@@ -168,6 +168,37 @@ impl JsonlSerialize for DriveFile {
     }
 }
 
+/// A Drive permission, as returned by `permissions.list(fileId)`.
+///
+/// The building block `crate::drive::visibility` diffs to detect a move's
+/// effect on a file's visibility. Fetched by
+/// `crate::drive::permissions_api::PermissionsApi::list_all`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DrivePermission {
+    /// Permission id.
+    #[serde(default)]
+    pub id: String,
+    /// `"user"` / `"group"` / `"domain"` / `"anyone"`.
+    #[serde(default, rename = "type")]
+    pub permission_type: String,
+    /// The granted role (`"reader"`/`"writer"`/`"owner"`/...). Not used by
+    /// the visibility-diff algorithm — `crate::drive::visibility::Principal`
+    /// deliberately excludes role from its identity — kept only for
+    /// informational logging.
+    #[serde(default)]
+    pub role: String,
+    /// The user's or group's email address (`type: "user"`/`"group"` only).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "emailAddress"
+    )]
+    pub email_address: Option<String>,
+    /// The Workspace domain (`type: "domain"` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

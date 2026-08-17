@@ -33,10 +33,20 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `commit` (HEAD *before* removal), `had_uncommitted`, and `used_force`; for
   `prune`: a JSON `pruned` list of `{path, branch, commit}`. See
   [Recovering a removed worktree](#recovering-a-removed-worktree).
+- **`kind: "drivemutation"`** — one per `omni-dev drive rename`/`drive move`
+  attempt, written from *inside* the mutation itself so it covers every
+  current and future caller (CLI today, MCP later), not just the CLI.
+  Includes a refused `Blocked` move — no `files.update` call happens for
+  those, but the refusal is itself the security-relevant event. Tagged
+  `service: "drive"`, with `command` set to `["drive", "<operation>"]` and
+  the outcome detail in the free-form `context` map: `file_id`, `file_name`,
+  `status`, and — only when a visibility change was detected —
+  `added_principals`/`removed_principals` (comma-separated) and
+  `crosses_drive_boundary`. See [docs/drive.md](drive.md).
 
-Every HTTP, `gh`, and `worktree` record shares an `invocation_id` with the
-invocation that issued it, so you can pull a run and all of its requests with a
-single `--id`.
+Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
+`invocation_id` with the invocation that issued it, so you can pull a run and
+all of its requests with a single `--id`.
 
 **Coverage caveat:** `omni-dev`'s own in-process HTTP clients and its Rust `gh`
 calls (daemon *and* one-shot CLI) are recorded. The one gap left is the VS Code

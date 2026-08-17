@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use crate::drive::client::DriveClient;
+use crate::drive::error::DriveError;
 use crate::drive::types::{DriveFile, FileListResponse};
 
 /// Maximum `pageSize` accepted by `GET /drive/v3/files`.
@@ -157,6 +158,47 @@ impl<'a> FilesApi<'a> {
         self.fetch_bytes(&url).await
     }
 
+    /// Renames a file (`files.update` with a `name` body, no `parents`
+    /// change — renaming never affects visibility, see ADR-0070). Requires
+    /// the `drive.metadata` scope (`drive auth login --write`).
+    pub async fn rename(&self, file_id: &str, new_name: &str) -> Result<DriveFile> {
+        let url = build_file_update_url(self.client.base_url(), file_id, None, None)?;
+        let response = self
+            .client
+            .patch_json(url.as_str(), &serde_json::json!({ "name": new_name }))
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.update response")
+            .await
+            .map_err(append_write_scope_hint)
+    }
+
+    /// Moves a file between folders (`files.update` with `addParents`/
+    /// `removeParents` query params, comma-separated file ids — Drive v3 has
+    /// no separate move endpoint). Requires the `drive.metadata` scope
+    /// (`drive auth login --write`).
+    pub async fn move_to(
+        &self,
+        file_id: &str,
+        add_parents: &str,
+        remove_parents: &str,
+    ) -> Result<DriveFile> {
+        let url = build_file_update_url(
+            self.client.base_url(),
+            file_id,
+            Some(add_parents),
+            Some(remove_parents),
+        )?;
+        let response = self
+            .client
+            .patch_json(url.as_str(), &serde_json::json!({}))
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.update response")
+            .await
+            .map_err(append_write_scope_hint)
+    }
+
     /// Shared GET-then-check-status-then-collect-bytes body for
     /// [`Self::export`]/[`Self::download`] — both go through
     /// [`DriveClient::get_bytes`], not `get_json`/`get_parsed`.
@@ -245,6 +287,54 @@ fn build_download_url(base_url: &str, file_id: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// `files.update` URL for [`FilesApi::rename`]/[`FilesApi::move_to`].
+/// `add_parents`/`remove_parents` are Drive's `addParents`/`removeParents`
+/// query params (comma-separated file ids) — omitted entirely for a plain
+/// rename, present for a move.
+fn build_file_update_url(
+    base_url: &str,
+    file_id: &str,
+    add_parents: Option<&str>,
+    remove_parents: Option<&str>,
+) -> Result<Url> {
+    let mut url = DriveClient::api_url(base_url, &format!("/drive/v3/files/{file_id}"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("fields", GET_FIELDS);
+        pairs.append_pair("supportsAllDrives", "true");
+        if let Some(add) = add_parents {
+            pairs.append_pair("addParents", add);
+        }
+        if let Some(remove) = remove_parents {
+            pairs.append_pair("removeParents", remove);
+        }
+    }
+    Ok(url)
+}
+
+/// Appends an actionable hint to a `files.update` failure caused by an
+/// insufficient OAuth scope — the default `drive.readonly` scope cannot
+/// call `files.update` at all; only `--write`'s `drive.metadata` scope can.
+/// No client-side scope pre-check exists (mirrors Gmail's label-mutation
+/// commands): the PATCH is always attempted, and Google's 403 is made
+/// actionable here instead.
+fn append_write_scope_hint(err: anyhow::Error) -> anyhow::Error {
+    let is_insufficient_permissions = matches!(
+        err.downcast_ref::<DriveError>(),
+        Some(DriveError::ApiRequestFailed {
+            reason: Some(reason),
+            ..
+        }) if reason == "insufficientPermissions"
+    );
+    if is_insufficient_permissions {
+        return err.context(
+            "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
+             for rename/move",
+        );
+    }
+    err
+}
+
 /// Clamps a caller-supplied limit to [`HARD_CAP`], treating `0` as "fetch
 /// as many as the cap allows".
 fn effective_cap(limit: usize) -> usize {
@@ -259,7 +349,7 @@ fn effective_cap(limit: usize) -> usize {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, SCOPE_READONLY};
+    use crate::drive::auth::{DriveCredentials, DriveScope};
     use crate::drive::types::Owner;
     use crate::utils::secret::Secret;
 
@@ -268,7 +358,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 
@@ -750,6 +840,162 @@ mod tests {
 
         let err = FilesApi::new(&client).download("f1").await.unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    // ── rename / move_to ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_sends_name_body_and_no_parents_params() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("fields", GET_FIELDS))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"name": "New Name"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "New Name",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client)
+            .rename("f1", "New Name")
+            .await
+            .unwrap();
+        assert_eq!(file.name, "New Name");
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        assert!(req.url.query_pairs().all(|(k, _)| k != "addParents"));
+        assert!(req.url.query_pairs().all(|(k, _)| k != "removeParents"));
+    }
+
+    #[tokio::test]
+    async fn rename_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .rename("f1", "New Name")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn rename_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .rename("f1", "New Name")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("drive auth login --write"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_sends_add_and_remove_parents_query_params() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("addParents", "dest"))
+            .and(wiremock::matchers::query_param("removeParents", "src"))
+            .and(wiremock::matchers::body_json(serde_json::json!({})))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "a", "parents": ["dest"],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client)
+            .move_to("f1", "dest", "src")
+            .await
+            .unwrap();
+        assert_eq!(file.parents, vec!["dest".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn move_to_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .move_to("f1", "dest", "src")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn move_to_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .move_to("f1", "dest", "src")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("drive auth login --write"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn append_write_scope_hint_leaves_other_errors_unchanged() {
+        let err = anyhow::anyhow!("some other failure");
+        let msg = append_write_scope_hint(err).to_string();
+        assert_eq!(msg, "some other failure");
     }
 
     // ── check_download_size ─────────────────────────────────────────

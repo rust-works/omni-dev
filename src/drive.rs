@@ -15,7 +15,11 @@ pub mod auth;
 mod chrome_profile;
 pub mod client;
 pub mod error;
+pub mod file_move;
 pub mod files_api;
+pub mod permissions_api;
+pub mod rename;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
+pub mod visibility;
