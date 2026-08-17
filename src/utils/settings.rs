@@ -221,12 +221,16 @@ pub struct DriveAccountSettings {
     /// (issue #1523).
     #[serde(default)]
     pub refresh_token: Option<String>,
-    /// The OAuth2 scope this account was authorized with. Stored for
-    /// status-reporting parity with Gmail, but login only ever requests the
-    /// single read-only scope
-    /// `https://www.googleapis.com/auth/drive.readonly` — Drive offers no
-    /// scope choice, so there is no `DriveScope` enum
-    /// ([ADR-0069](../../docs/adrs/adr-0069.md)).
+    /// The OAuth2 scope this account was authorized with, as the raw string
+    /// Google granted. Stays a plain `String` here (unlike Gmail's
+    /// equivalent settings field, for the same reason): this is a
+    /// status-reporting cache of whatever was actually granted, not the
+    /// value driving a live login decision — that's
+    /// [`crate::drive::auth::DriveScope`], read from this field via
+    /// [`crate::drive::auth::DriveScope::from_granted`]
+    /// ([ADR-0070](../../docs/adrs/adr-0070.md), reversing
+    /// [ADR-0069](../../docs/adrs/adr-0069.md) §2's "no `DriveScope` enum,
+    /// read-only by design").
     #[serde(default)]
     pub scope: Option<String>,
     /// Google account address for this account. Populated opportunistically

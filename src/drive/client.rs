@@ -345,7 +345,7 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::SCOPE_READONLY;
+    use crate::drive::auth::DriveScope;
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -353,7 +353,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 
