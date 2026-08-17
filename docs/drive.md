@@ -1,9 +1,10 @@
 # Drive Integration
 
 omni-dev exposes access to the Google Drive v3 API through the `omni-dev
-drive` command tree — search, read a file's metadata or content, rename it,
-and move it between folders. `drive.readonly` (the default scope) is enough
-for search/read; rename/move need the opt-in `drive.metadata` scope
+drive` command tree — search, read a file's metadata or content, find
+duplicates, rename a file, and move it between folders. `drive.readonly`
+(the default scope) is enough for search/read/dedupe; rename/move need the
+opt-in `drive.metadata` scope
 (`drive auth login --write`), the narrowest write scope Google offers — it
 covers `files.update` on `name`/`parents` only, with no file-content access
 at all. There is still no upload/create/trash/share/permission-mutation
@@ -308,13 +309,14 @@ login failure.
 
 ## Output formats
 
-Every subcommand that renders a list or record (`search`, `read`, `rename`,
-`move`, `account list`) accepts `-o <format>` (`table` / `json` / `yaml` /
-`yamls` / `jsonl`, default `table`) — the same convention as every other
-`omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth
-logout`/`auth status`/`account set-default` print a fixed human-readable
-status line instead and have no `-o` flag. `--out-file` exists only on
-`drive read --content` — metadata always renders via `-o/--output`.
+Every subcommand that renders a list or record (`search`, `read`, `dedupe`,
+`rename`, `move`, `account list`) accepts `-o <format>` (`table` / `json` /
+`yaml` / `yamls` / `jsonl`, default `table`) — the same convention as every
+other `omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/
+`auth logout`/`auth status`/`account set-default` print a fixed
+human-readable status line instead and have no `-o` flag. `--out-file`
+exists only on `drive read --content` — metadata always renders via
+`-o/--output`.
 
 ## Search
 
