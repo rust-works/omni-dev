@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::drive::client::DriveClient;
@@ -45,6 +46,16 @@ pub struct ReadCommand {
     #[arg(long = "out-file", value_name = "PATH")]
     pub out_file: Option<String>,
 
+    /// Locally recomputes the SHA-256 checksum of the downloaded bytes and
+    /// checks it against Drive's reported `sha256Checksum`. Only valid with
+    /// `--content`, and only for non-Google-native files — Drive never
+    /// returns a checksum for exported content, so this errors immediately
+    /// on a Google-native file rather than exporting first. Prints a
+    /// one-line confirmation on success; fails with a clear error on a
+    /// mismatch or a missing checksum.
+    #[arg(long)]
+    pub verify: bool,
+
     /// Output format (metadata only).
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -60,6 +71,7 @@ impl ReadCommand {
             self.content,
             self.export_mime_type.as_deref(),
             self.out_file.as_deref(),
+            self.verify,
             &self.output,
         )
         .await
@@ -77,14 +89,20 @@ async fn run_read(
     content: bool,
     export_mime_type: Option<&str>,
     out_file: Option<&str>,
+    verify: bool,
     output: &OutputFormat,
 ) -> Result<()> {
     if content {
-        run_read_content(client, file_id, export_mime_type, out_file).await
+        run_read_content(client, file_id, export_mime_type, out_file, verify).await
     } else {
         anyhow::ensure!(
             out_file.is_none(),
             "--out-file requires --content; `drive read` without --content always renders \
+             metadata via -o/--output"
+        );
+        anyhow::ensure!(
+            !verify,
+            "--verify requires --content; `drive read` without --content always renders \
              metadata via -o/--output"
         );
         run_read_metadata(client, file_id, output).await
@@ -135,6 +153,18 @@ fn render_metadata_table(file: &DriveFile, out: &mut dyn std::io::Write) -> Resu
         writeln!(out, "WebViewLink: {}", sanitize_for_terminal(link))
             .context("Failed to write read row")?;
     }
+    if let Some(md5) = &file.md5_checksum {
+        writeln!(out, "Md5Checksum: {}", sanitize_for_terminal(md5))
+            .context("Failed to write read row")?;
+    }
+    if let Some(sha1) = &file.sha1_checksum {
+        writeln!(out, "Sha1Checksum: {}", sanitize_for_terminal(sha1))
+            .context("Failed to write read row")?;
+    }
+    if let Some(sha256) = &file.sha256_checksum {
+        writeln!(out, "Sha256Checksum: {}", sanitize_for_terminal(sha256))
+            .context("Failed to write read row")?;
+    }
     Ok(())
 }
 
@@ -146,6 +176,7 @@ async fn run_read_content(
     file_id: &str,
     export_mime_type: Option<&str>,
     out_file: Option<&str>,
+    verify: bool,
 ) -> Result<()> {
     let api = FilesApi::new(client);
     let meta = api.get_metadata(file_id).await?;
@@ -164,6 +195,12 @@ async fn run_read_content(
             meta.name
         );
     }
+    if verify && meta.is_google_native() {
+        anyhow::bail!(
+            "--verify is not supported for Google-native files: Drive does not return a \
+             checksum for exported content"
+        );
+    }
 
     let (bytes, content_mime_type) = if meta.is_google_native() {
         let export_mime = resolve_export_mime_type(&meta, export_mime_type)?;
@@ -173,6 +210,11 @@ async fn run_read_content(
         let bytes = api.download(file_id).await?;
         (bytes, meta.mime_type.clone())
     };
+
+    if verify {
+        verify_sha256_checksum(&bytes, meta.sha256_checksum.as_deref())?;
+        eprintln!("Verified sha256 checksum.");
+    }
 
     if let Some(path) = out_file {
         std::fs::write(path, &bytes).with_context(|| format!("Failed to write to {path}"))?;
@@ -255,6 +297,36 @@ pub(crate) fn is_texty(mime_type: &str) -> bool {
     mime_type.starts_with("text/") || mime_type == "application/json"
 }
 
+/// Encodes `bytes` as a lowercase hex string. No `hex` crate dependency
+/// exists in this project — this is small enough not to need one.
+pub(crate) fn to_hex_string(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        hex.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+/// Recomputes the SHA-256 checksum of `bytes` and checks it case-
+/// insensitively against `expected` (Drive's reported `sha256Checksum`).
+///
+/// `pub(crate)`: also reused by the `drive_file_read` MCP tool's `verify`
+/// param (`src/mcp/drive_tools.rs`).
+pub(crate) fn verify_sha256_checksum(bytes: &[u8], expected: Option<&str>) -> Result<()> {
+    let expected = expected.context(
+        "--verify requires this file to have a sha256Checksum, but Drive did not report one \
+         for it",
+    )?;
+    let actual = to_hex_string(&Sha256::digest(bytes));
+    anyhow::ensure!(
+        actual.eq_ignore_ascii_case(expected),
+        "sha256 checksum mismatch: expected {expected}, got {actual}"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -304,6 +376,11 @@ mod tests {
             modified_time: Some("2026-01-01T00:00:00.000Z".to_string()),
             parents: vec!["folder1".to_string()],
             web_view_link: Some("https://drive.google.com/file/d/f1/view".to_string()),
+            md5_checksum: Some("5d41402abc4b2a76b9719d911017c592".to_string()),
+            sha1_checksum: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()),
+            sha256_checksum: Some(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+            ),
             ..Default::default()
         };
         let mut buf = Vec::new();
@@ -316,6 +393,11 @@ mod tests {
         assert!(text.contains("Modified: 2026-01-01T00:00:00.000Z"));
         assert!(text.contains("Parents: folder1"));
         assert!(text.contains("WebViewLink: https://drive.google.com/file/d/f1/view"));
+        assert!(text.contains("Md5Checksum: 5d41402abc4b2a76b9719d911017c592"));
+        assert!(text.contains("Sha1Checksum: aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"));
+        assert!(text.contains(
+            "Sha256Checksum: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        ));
     }
 
     #[test]
@@ -454,6 +536,43 @@ mod tests {
         assert!(!is_texty("image/png"));
     }
 
+    // ── to_hex_string / verify_sha256_checksum ─────────────────────────
+
+    #[test]
+    fn to_hex_string_encodes_known_bytes_as_lowercase_hex() {
+        assert_eq!(to_hex_string(&[0x00, 0x0f, 0xab, 0xff]), "000fabff");
+    }
+
+    #[test]
+    fn to_hex_string_of_empty_input_is_empty() {
+        assert_eq!(to_hex_string(&[]), "");
+    }
+
+    #[test]
+    fn verify_sha256_checksum_succeeds_on_a_matching_digest() {
+        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        verify_sha256_checksum(b"hello", Some(expected)).unwrap();
+    }
+
+    #[test]
+    fn verify_sha256_checksum_is_case_insensitive() {
+        let expected = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";
+        verify_sha256_checksum(b"hello", Some(expected)).unwrap();
+    }
+
+    #[test]
+    fn verify_sha256_checksum_fails_clearly_on_mismatch() {
+        let err = verify_sha256_checksum(b"hello", Some("not-the-real-hash")).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verify_sha256_checksum_fails_clearly_when_absent() {
+        let err = verify_sha256_checksum(b"hello", None).unwrap_err();
+        assert!(err.to_string().contains("sha256Checksum"), "{err}");
+    }
+
     // ── run_read (metadata) ────────────────────────────────────────
 
     #[tokio::test]
@@ -470,9 +589,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", false, None, None, &OutputFormat::Table)
-            .await
-            .unwrap();
+        run_read(
+            &client,
+            "f1",
+            false,
+            None,
+            None,
+            false,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -489,7 +616,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", false, None, None, &OutputFormat::Json)
+        run_read(&client, "f1", false, None, None, false, &OutputFormat::Json)
             .await
             .unwrap();
     }
@@ -504,9 +631,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "missing", false, None, None, &OutputFormat::Table)
-            .await
-            .unwrap_err();
+        let err = run_read(
+            &client,
+            "missing",
+            false,
+            None,
+            None,
+            false,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
@@ -521,11 +656,23 @@ mod tests {
             false,
             None,
             Some("/tmp/out.txt"),
+            false,
             &OutputFormat::Table,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("--out-file requires --content"));
+    }
+
+    #[tokio::test]
+    async fn run_read_rejects_verify_without_content() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let err = run_read(&client, "f1", false, None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--verify requires --content"));
     }
 
     // ── run_read (content) ─────────────────────────────────────────
@@ -552,7 +699,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -572,7 +719,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         let message = err.to_string();
@@ -595,7 +742,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         let message = err.to_string();
@@ -624,7 +771,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -651,7 +798,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -680,7 +827,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -718,6 +865,7 @@ mod tests {
             true,
             Some("application/pdf"),
             Some(path.to_str().unwrap()),
+            false,
             &OutputFormat::Table,
         )
         .await
@@ -743,7 +891,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--export-mime-type"));
@@ -779,6 +927,7 @@ mod tests {
             true,
             None,
             Some(path.to_str().unwrap()),
+            false,
             &OutputFormat::Table,
         )
         .await
@@ -807,7 +956,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap();
     }
@@ -833,7 +982,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("refusing to print binary content"));
@@ -862,7 +1011,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not valid UTF-8"));
@@ -888,7 +1037,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
@@ -915,10 +1064,122 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "f1", true, None, None, &OutputFormat::Table)
+        let err = run_read(&client, "f1", true, None, None, false, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    // ── run_read (content, --verify) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn run_read_content_verify_succeeds_on_matching_checksum() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        run_read(&client, "f1", true, None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_content_verify_fails_clearly_on_mismatch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "not-the-real-hash",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let err = run_read(&client, "f1", true, None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_read_content_verify_fails_clearly_when_no_checksum_reported() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let err = run_read(&client, "f1", true, None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sha256Checksum"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_read_content_verify_rejects_google_native_file_before_exporting() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": GOOGLE_DOC,
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No mock for /drive/v3/files/f1/export — if --verify's Google-native
+        // rejection didn't run before the export call, this test would 404
+        // rather than surfacing the expected error.
+
+        let err = run_read(&client, "f1", true, None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--verify is not supported for Google-native files"),
+            "{err}"
+        );
     }
 
     // ── ReadCommand::execute glue ────────────────────────────────────
@@ -942,6 +1203,7 @@ mod tests {
             content: false,
             export_mime_type: None,
             out_file: None,
+            verify: false,
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
