@@ -20,3 +20,4 @@ pub mod rename;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
+pub mod visibility;
