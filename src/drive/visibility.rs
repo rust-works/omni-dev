@@ -75,6 +75,20 @@ pub enum Principal {
     Anyone,
 }
 
+impl std::fmt::Display for Principal {
+    /// A stable, log/report-friendly rendering — used by
+    /// `crate::drive::file_move`'s `VisibilityDiffReport` and the request
+    /// log's `added_principals`/`removed_principals` fields.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(email) => write!(f, "user:{email}"),
+            Self::Group(email) => write!(f, "group:{email}"),
+            Self::Domain(domain) => write!(f, "domain:{domain}"),
+            Self::Anyone => write!(f, "anyone"),
+        }
+    }
+}
+
 /// Builds the set of principals a permission list grants access to.
 ///
 /// Unrecognised `DrivePermission::permission_type` values are skipped
@@ -135,7 +149,7 @@ pub fn diff_visibility(
 /// A struct of bools, not a single-variant enum: a move can simultaneously
 /// fail more than one gate, and the audit log should say so precisely
 /// rather than reporting only the first match.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct BlockReasons {
     /// `diff.added` was non-empty and `allow_visibility_increase` wasn't set.
     pub visibility_increase: bool,
