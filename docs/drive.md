@@ -1,12 +1,21 @@
 # Drive Integration
 
-omni-dev exposes **read-only** access to the Google Drive v3 API through the
-`omni-dev drive` command tree — search, and read a file's metadata or
-content. Unlike [Gmail](gmail.md), which offers an opt-in `gmail.modify`
-scope for label mutation, Drive requests exactly one OAuth2 scope,
-`drive.readonly`, always: there is no upload/create/rename/move/trash/
-share/permission-mutation capability anywhere in this surface. A leaked
-Drive refresh token grants read access only.
+omni-dev exposes access to the Google Drive v3 API through the `omni-dev
+drive` command tree — search, read a file's metadata or content, find
+duplicates, rename a file, and move it between folders. `drive.readonly`
+(the default scope) is enough for search/read/dedupe; rename/move need the
+opt-in `drive.metadata` scope
+(`drive auth login --write`), the narrowest write scope Google offers — it
+covers `files.update` on `name`/`parents` only, with no file-content access
+at all. There is still no upload/create/trash/share/permission-mutation
+capability anywhere in this surface.
+
+**Move is security-gated.** Moving a file can change who can see it — Drive
+resolves a file's effective visibility from both direct permissions on the
+file and permissions inherited from its parent folder chain, and moving a
+file changes that chain. `drive move` refuses any move that would change
+visibility **by default**; three independent `--allow-*` flags opt in. See
+[Move](#move) and [ADR-0070](adrs/adr-0070.md) for the full design.
 
 The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_file_read`/
 `drive_account_list`, mirroring the CLI one-for-one like Gmail's `gmail_*`
@@ -27,9 +36,11 @@ walkthrough — this page is the topic-by-topic reference.
 5. [Search](#search)
 6. [Read](#read)
 7. [Duplicate detection](#duplicate-detection)
-8. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-9. [Troubleshooting](#troubleshooting)
-10. [See also](#see-also)
+8. [Rename](#rename)
+9. [Move](#move)
+10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+11. [Troubleshooting](#troubleshooting)
+12. [See also](#see-also)
 
 ## Prerequisites
 
@@ -78,7 +89,7 @@ omni-dev doesn't impose either shape.
 | `DRIVE_CLIENT_ID`      | OAuth2 client id from your own Google Cloud project (required).                                                              | _none_  |
 | `DRIVE_CLIENT_SECRET`  | OAuth2 client secret for the same client (required).                                                                         | _none_  |
 | `DRIVE_REFRESH_TOKEN`  | Written by `drive auth login`; not meant to be hand-set.                                                                     | _none_  |
-| `DRIVE_SCOPE`          | Written by `drive auth login`; records the granted scope (always `https://www.googleapis.com/auth/drive.readonly`) so `auth status` can report it without a network call. | _none_ |
+| `DRIVE_SCOPE`          | Written by `drive auth login`; records the granted scope (`drive.readonly`, or `drive.metadata` after `--write`) so `auth status` can report it without a network call. | _none_ |
 | `DRIVE_API_URL`        | Explicit API base URL; overrides the real `www.googleapis.com` host entirely. Use for a proxy or a forced egress gateway.    | _unset_ |
 
 Unlike Gmail, there is **no `drive auth import`** — no
@@ -105,9 +116,21 @@ Run `omni-dev drive auth status` to verify.
 This opens a browser to Google's consent screen via a loopback OAuth2
 authorization-code + PKCE flow (see [ADR-0063](adrs/adr-0063.md), inherited
 unchanged by [ADR-0069](adrs/adr-0069.md)); once you approve, the refresh
-token is written to `~/.omni-dev/settings.json`. There is **no `--modify`
-flag** — unlike `gmail auth login`, Drive always requests the single
-`drive.readonly` scope; there is nothing to opt into.
+token is written to `~/.omni-dev/settings.json`. By default this requests
+only `drive.readonly`. Pass `--write` to additionally request
+`drive.metadata` (needed for `drive rename`/`drive move`):
+
+```bash
+$ omni-dev drive auth login --write
+```
+
+`--write` requests `drive.metadata` *alongside* `drive.readonly`, never as a
+replacement — `drive.metadata` alone grants no file-content access, so
+`search`/`read` still need `drive.readonly` too. Google's consent screen
+lists both as separate permission tick-boxes; tick both when `--write` is
+passed. Re-run `drive auth login --write` at any time to upgrade an
+existing `drive.readonly`-only login — Google's `prompt=consent` re-issues a
+fresh refresh token with the broader grant.
 
 ### Verifying credentials
 
@@ -115,10 +138,11 @@ flag** — unlike `gmail auth login`, Drive always requests the single
 $ omni-dev drive auth status
 Checking Drive authentication...
 Authenticated as: user@example.com
-Granted scope: https://www.googleapis.com/auth/drive.readonly
+Granted scope: drive.readonly
 ```
 
-This calls `about.get`, a live network call.
+After a `--write` login, this instead reports `Granted scope: drive.readonly,
+drive.metadata`. This calls `about.get`, a live network call.
 
 Pass `--all` to report every configured named account (see
 [Multiple accounts](#multiple-accounts)) in one call instead of just the
@@ -130,12 +154,12 @@ $ omni-dev drive auth status --all
 == work ==
 Checking Drive authentication...
 Authenticated as: alice@work.com
-Granted scope: https://www.googleapis.com/auth/drive.readonly
+Granted scope: drive.readonly, drive.metadata
 
 == personal ==
 Checking Drive authentication...
 Authenticated as: alice@gmail.com
-Granted scope: https://www.googleapis.com/auth/drive.readonly
+Granted scope: drive.readonly
 ```
 
 `--all` degenerates to the single-account output above when no named
@@ -285,13 +309,14 @@ login failure.
 
 ## Output formats
 
-Every subcommand that renders a list or record (`search`, `read`,
-`account list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` /
-`jsonl`, default `table`) — the same convention as every other `omni-dev`
-domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
-status`/`account set-default` print a fixed human-readable status line
-instead and have no `-o` flag. `--out-file` exists only on `drive read
---content` — metadata always renders via `-o/--output`.
+Every subcommand that renders a list or record (`search`, `read`, `dedupe`,
+`rename`, `move`, `account list`) accepts `-o <format>` (`table` / `json` /
+`yaml` / `yamls` / `jsonl`, default `table`) — the same convention as every
+other `omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/
+`auth logout`/`auth status`/`account set-default` print a fixed
+human-readable status line instead and have no `-o` flag. `--out-file`
+exists only on `drive read --content` — metadata always renders via
+`-o/--output`.
 
 ## Search
 
@@ -406,6 +431,125 @@ Table output columns: `HASH | COUNT | FILES`, with `FILES` a comma-joined
 
 Grouping is currently fixed to `md5Checksum` — there's no `--by` flag to
 choose `sha1Checksum`/`sha256Checksum` instead.
+
+## Rename
+
+```bash
+$ omni-dev drive rename 1AbCdEfGhIjKlMnOpQrStUvWxYz "Q3 Report (final)"
+Renamed: Q3 Report -> Q3 Report (final) (1AbCdEfGhIjKlMnOpQrStUvWxYz)
+
+$ omni-dev drive rename 1AbCdEfGhIjKlMnOpQrStUvWxYz "Q3 Report (final)" --dry-run
+Would rename: Q3 Report -> Q3 Report (final) (1AbCdEfGhIjKlMnOpQrStUvWxYz)
+```
+
+Renaming only ever touches a file's `name` field — it never changes
+`parents`, so it can never change who can see the file (Drive resolves
+visibility from direct permissions plus permissions inherited from the
+parent folder chain; renaming doesn't touch either). There is nothing to
+gate, unlike [Move](#move): `drive rename` always proceeds, subject only to
+the ordinary API/auth failures below.
+
+Requires the `drive.metadata` scope (`drive auth login --write`). Without
+it, the rename fails with an actionable hint:
+
+```
+Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
+  Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed for rename/move
+```
+
+Every rename attempt — success or failure — is written to the
+[request log](log.md) as a `kind: "drivemutation"` record, tagged
+`service: "drive"`, carrying the file id, name, and outcome status. This is
+a hard invariant, not a best-effort convenience: logging happens inside the
+rename engine itself, not the CLI layer, so it holds for every current and
+future caller.
+
+## Move
+
+```bash
+$ omni-dev drive move 1AbCdEfGhIjKlMnOpQrStUvWxYz --to 1FolderIdGoesHere
+STATUS           NAME                           DETAIL
+moved            Q3 Report (final)
+
+$ omni-dev drive move 1AbCd... 1Efgh... --to 1FolderId --dry-run
+STATUS           NAME                           DETAIL
+would-move       Q3 Report (final)
+blocked          Confidential Salary Data       visibility increase (--allow-visibility-increase); adds user:external@partner.com
+```
+
+Moving a file can change **who can see it**: Drive resolves a file's
+effective visibility from direct permissions on the file *plus* permissions
+inherited from its parent folder chain, and moving a file changes that
+chain. `drive move` computes the exact visibility diff a move would cause
+and, by default, **refuses any move that would change visibility** — an
+increase (new principals gain access) or a decrease (existing principals
+lose access) either one. Three independent opt-in flags, none implying the
+others:
+
+- `--allow-visibility-increase` — proceed even if the move would grant new
+  principals access.
+- `--allow-visibility-decrease` — proceed even if the move would revoke
+  existing principals' access.
+- `--allow-drive-boundary-crossing` — proceed even if the move crosses a My
+  Drive / Shared Drive boundary (independent of the visibility diff — a
+  boundary crossing can block a move that changes nobody's *access*, only
+  which Drive the file lives in).
+
+**Bulk moves skip only the unsafe files, never fail the whole batch.**
+`drive move ID1 ID2 ID3... --to FOLDER` shares one destination across every
+file id given; a file whose move is blocked is reported as `blocked` and
+left where it is, while every other file in the same call still moves. Pass
+multiple file ids to move them all into the same folder in one call;
+different files to different destinations needs separate calls.
+
+A file already in the destination folder is reported `already-in-folder`
+and never touched (no `permissions.list` call is even made for it). A
+folder being moved gets a loud warning — its own visibility is evaluated,
+but v1 does not recurse into a moved folder's contents, so their visibility
+is not:
+
+```
+Warning: 'Old Projects' is a folder — its own visibility was evaluated, but its contents' visibility was not (folder moves don't recurse in v1).
+```
+
+**No interactive confirmation, `--dry-run` or not.** `--dry-run` plus the
+`--allow-*` flags are the entire gate — an interactive-by-default confirm
+would hang (or be silently force-skipped) over a future MCP caller, and
+every flag passed is already captured in the request log's `command_line`.
+`--dry-run` never calls the mutating `files.update` endpoint; the same
+`permissions.list` reads back the exact plan a real run would act on.
+
+**Exit code is always 0** as long as the command mechanically completed —
+individual `blocked`/`failed` outcomes live in the table/JSON output, not
+the exit code (the same convention `worktree push` uses). Check the output
+if scripting against this.
+
+Requires the `drive.metadata` scope (`drive auth login --write`), same as
+[Rename](#rename) — see its [troubleshooting
+entry](#insufficientpermissions-on-rename-or-move) for the actionable hint
+on a 403.
+
+Every move attempt — moved, blocked, already-in-folder, or failed — is
+written to the [request log](log.md) as a `kind: "drivemutation"` record.
+A `blocked` record carries the specific `added_principals`/
+`removed_principals` that triggered it, so a refusal is fully auditable
+even though no API call was made:
+
+```bash
+$ omni-dev log --query 'kind:drivemutation status:blocked'
+```
+
+**Known limitation — shadowed grants.** Drive's API doesn't expose whether
+a principal's access on a file is direct or inherited (that split is only
+populated for Shared Drive items, not My Drive files), so `drive move`
+derives it by subtraction. If a principal has *both* a direct grant on the
+file *and* inherited access via its current parent, the subtraction can't
+tell them apart — a move that only removes the parent-inherited grant is
+reported as revoking that principal's access, even though their direct
+grant means they actually keep it. This is a **safe failure direction**: it
+can only produce an unnecessary `--allow-visibility-decrease` requirement,
+never a missed visibility increase. See
+[ADR-0070](adrs/adr-0070.md) for the full algorithm.
 
 ## Rate limits and retry behaviour
 
@@ -549,6 +693,18 @@ The file's declared size exceeds the 500 MB `alt=media` download cap (see
 [Read](#read)). There's no override flag — very large files aren't a fit
 for this command today.
 
+### `insufficientPermissions` on rename (or move)
+
+```
+Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
+  Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed for rename/move
+```
+
+The active credentials only carry `drive.readonly` — there is no
+client-side check before the call, so this surfaces from Google's own 403.
+Re-run `omni-dev drive auth login --write` to upgrade the grant (see
+[Interactive setup](#interactive-setup)), then retry.
+
 ### No default export format for a Google-native file
 
 ```
@@ -565,8 +721,11 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
 - [Gmail Integration](gmail.md) — the sibling Google integration; shares
   the same named-account/OAuth2 storage pattern.
 - [ADR-0069](adrs/adr-0069.md) — the Drive-specific named-account store and
-  read-only OAuth2 client design, and why it deliberately duplicates
-  rather than shares code with Gmail's.
+  original read-only OAuth2 client design, and why it deliberately
+  duplicates rather than shares code with Gmail's.
+- [ADR-0070](adrs/adr-0070.md) — reverses ADR-0069 §2 to add rename/move:
+  the additive `drive.metadata` scope, the visibility-diff algorithm behind
+  `move`'s safety gate, and the three-flag opt-in model.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.

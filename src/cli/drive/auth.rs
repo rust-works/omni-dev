@@ -9,7 +9,7 @@ use crossterm::terminal::enable_raw_mode;
 
 use crate::drive::about_api::AboutApi;
 use crate::drive::account;
-use crate::drive::auth;
+use crate::drive::auth::{self, DriveScope};
 use crate::drive::client::DriveClient;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
@@ -46,34 +46,37 @@ impl AuthCommand {
     }
 }
 
-/// Runs the Drive OAuth2 login flow. No `--modify` — Drive requests a
-/// single fixed read-only scope
-/// ([`crate::drive::auth::SCOPE_READONLY`]); there is nothing to opt into.
+/// Runs the Drive OAuth2 login flow.
 #[derive(Parser)]
-pub struct LoginCommand;
+pub struct LoginCommand {
+    /// Request the `drive.metadata` scope (needed for `rename`/`move`) in
+    /// addition to `drive.readonly`. Without this flag, only read access is
+    /// granted.
+    #[arg(long)]
+    pub write: bool,
+}
 
 impl LoginCommand {
     /// Reads the user's Google Cloud OAuth2 client credentials from the
     /// environment or settings.json, prompting interactively when neither
     /// has them, then runs the login flow.
     pub async fn execute(self) -> Result<()> {
-        run_login(&SettingsEnv::load()).await
+        run_login(&SettingsEnv::load(), self.write).await
     }
 }
 
 /// [`LoginCommand::execute`] over an injected [`EnvSource`]. Production
 /// passes a [`SettingsEnv`] (process env, falling back to settings.json);
 /// tests pass a plain `MapEnv` representing the already-resolved value.
-async fn run_login(env: &(impl EnvSource + Sync)) -> Result<()> {
+async fn run_login(env: &(impl EnvSource + Sync), write: bool) -> Result<()> {
     let (client_id, client_secret) =
         resolve_login_credentials(env, prompt_client_id, prompt_client_secret)?;
+    let scope = resolve_scope(write);
 
     let settings = Settings::load().unwrap_or_default();
     let browser = auth::resolve_browser_config_for(&settings.drive, None)?;
 
-    // `login_for` takes NO scope arg (unlike Gmail's) — Drive always
-    // requests SCOPE_READONLY internally.
-    let status = auth::login_for(None, &client_id, &client_secret, &browser).await?;
+    let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
 
     println!("\nCredentials saved to ~/.omni-dev/settings.json");
     println!("  Granted scope: {}", status.scope.unwrap_or_default());
@@ -98,6 +101,15 @@ fn resolve_login_credentials(
         None => prompt_client_secret()?,
     };
     Ok((client_id, client_secret))
+}
+
+/// Maps `--write` to the scope requested at login.
+fn resolve_scope(write: bool) -> DriveScope {
+    if write {
+        DriveScope::Metadata
+    } else {
+        DriveScope::ReadOnly
+    }
 }
 
 /// Prompts for the OAuth2 client id. Unlike Gmail there is no `drive auth
@@ -226,9 +238,9 @@ impl StatusCommand {
             return run_auth_status_all().await;
         }
         let credentials = auth::load_credentials_for(None)?;
-        let scope = credentials.scope.clone();
+        let scope = credentials.scope;
         let client = DriveClient::from_credentials(&credentials)?;
-        run_auth_status(&client, &scope).await
+        run_auth_status(&client, scope).await
     }
 }
 
@@ -238,13 +250,13 @@ async fn run_auth_status_all() -> Result<()> {
     if accounts.is_empty() {
         // Zero-migration guarantee: degenerates to the single-account path.
         let credentials = auth::load_credentials_for(None)?;
-        let scope = credentials.scope.clone();
+        let scope = credentials.scope;
         let client = DriveClient::from_credentials(&credentials)?;
-        return run_auth_status(&client, &scope).await;
+        return run_auth_status(&client, scope).await;
     }
-    let client_for = |name: &str| -> Result<(DriveClient, String)> {
+    let client_for = |name: &str| -> Result<(DriveClient, DriveScope)> {
         let credentials = auth::load_credentials_for(Some(name))?;
-        let scope = credentials.scope.clone();
+        let scope = credentials.scope;
         let client = DriveClient::from_credentials(&credentials)?;
         Ok((client, scope))
     };
@@ -263,7 +275,7 @@ async fn run_auth_status_all_with<F>(
     client_for: &F,
 ) -> Result<()>
 where
-    F: Fn(&str) -> Result<(DriveClient, String)> + Sync,
+    F: Fn(&str) -> Result<(DriveClient, DriveScope)> + Sync,
 {
     let futs = accounts.iter().map(|summary| async move {
         (
@@ -284,13 +296,13 @@ where
 
 async fn report_one_account_status<F>(name: &str, client_for: &F) -> Result<String>
 where
-    F: Fn(&str) -> Result<(DriveClient, String)> + Sync,
+    F: Fn(&str) -> Result<(DriveClient, DriveScope)> + Sync,
 {
     let (client, scope) = client_for(name)?;
-    run_auth_status_for(&client, &scope, Some(name)).await
+    run_auth_status_for(&client, scope, Some(name)).await
 }
 
-async fn run_auth_status(client: &DriveClient, scope: &str) -> Result<()> {
+async fn run_auth_status(client: &DriveClient, scope: DriveScope) -> Result<()> {
     let body = run_auth_status_for(client, scope, None).await?;
     print!("{body}");
     Ok(())
@@ -303,7 +315,7 @@ async fn run_auth_status(client: &DriveClient, scope: &str) -> Result<()> {
 /// back out in a stable order instead of interleaving live `println!`s.
 async fn run_auth_status_for(
     client: &DriveClient,
-    scope: &str,
+    scope: DriveScope,
     account_name: Option<&str>,
 ) -> Result<String> {
     let mut out = String::new();
@@ -313,8 +325,14 @@ async fn run_auth_status_for(
     let email = about.user.email_address.unwrap_or_default();
 
     out.push_str(&format!("Authenticated as: {email}\n"));
-    // Plain string — no allows_modify() (Drive has no modify scope).
-    out.push_str(&format!("Granted scope: {scope}\n"));
+    out.push_str(&format!(
+        "Granted scope: {}\n",
+        if scope.allows_write() {
+            "drive.readonly, drive.metadata"
+        } else {
+            "drive.readonly"
+        }
+    ));
 
     if let (Some(name), false) = (account_name, email.is_empty()) {
         // Best-effort cache backfill: if two accounts in the same --all run
@@ -338,7 +356,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: auth::SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 
@@ -582,7 +600,7 @@ mod tests {
         let env = MapEnv::new()
             .with(auth::DRIVE_CLIENT_ID, "id")
             .with(auth::DRIVE_CLIENT_SECRET, "secret");
-        let err = run_login(&env).await.unwrap_err();
+        let err = run_login(&env, false).await.unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -602,7 +620,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_auth_status(&client, auth::SCOPE_READONLY)
+        run_auth_status(&client, DriveScope::ReadOnly)
             .await
             .unwrap();
     }
@@ -617,7 +635,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_auth_status(&client, auth::SCOPE_READONLY)
+        let err = run_auth_status(&client, DriveScope::ReadOnly)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
@@ -647,7 +665,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_auth_status_for(&client, auth::SCOPE_READONLY, Some("work"))
+        run_auth_status_for(&client, DriveScope::ReadOnly, Some("work"))
             .await
             .unwrap();
 
@@ -677,7 +695,7 @@ mod tests {
 
         // No account name: should not error, and there's no account entry
         // to backfill into (nothing to assert beyond a clean success).
-        run_auth_status_for(&client, auth::SCOPE_READONLY, None)
+        run_auth_status_for(&client, DriveScope::ReadOnly, None)
             .await
             .unwrap();
     }
@@ -737,16 +755,13 @@ mod tests {
             .await;
 
         let clients = std::sync::Mutex::new(std::collections::HashMap::from([
-            (
-                "work".to_string(),
-                (client_work, auth::SCOPE_READONLY.to_string()),
-            ),
+            ("work".to_string(), (client_work, DriveScope::ReadOnly)),
             (
                 "personal".to_string(),
-                (client_personal, auth::SCOPE_READONLY.to_string()),
+                (client_personal, DriveScope::ReadOnly),
             ),
         ]));
-        let client_for = |name: &str| -> Result<(DriveClient, String)> {
+        let client_for = |name: &str| -> Result<(DriveClient, DriveScope)> {
             clients
                 .lock()
                 .unwrap()
@@ -805,16 +820,10 @@ mod tests {
             .await;
 
         let clients = std::sync::Mutex::new(std::collections::HashMap::from([
-            (
-                "work".to_string(),
-                (client_work, auth::SCOPE_READONLY.to_string()),
-            ),
-            (
-                "broken".to_string(),
-                (client_broken, auth::SCOPE_READONLY.to_string()),
-            ),
+            ("work".to_string(), (client_work, DriveScope::ReadOnly)),
+            ("broken".to_string(), (client_broken, DriveScope::ReadOnly)),
         ]));
-        let client_for = |name: &str| -> Result<(DriveClient, String)> {
+        let client_for = |name: &str| -> Result<(DriveClient, DriveScope)> {
             clients
                 .lock()
                 .unwrap()

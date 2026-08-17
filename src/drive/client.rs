@@ -173,6 +173,24 @@ impl DriveClient {
         .await
     }
 
+    /// Sends an authenticated PATCH request with a JSON body and returns the
+    /// raw response. Drive's `files.update` (rename/move) is the only PATCH
+    /// endpoint this client calls.
+    pub async fn patch_json<T: serde::Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<Response> {
+        self.send_authorized(url, "PATCH", |client, token| {
+            client
+                .patch(url)
+                .bearer_auth(token)
+                .header("Content-Type", "application/json")
+                .json(body)
+        })
+        .await
+    }
+
     /// Sends a request built by `build`, retrying exactly once on HTTP 401.
     ///
     /// [`DriveSession::access_token`] already refreshes proactively when the
@@ -345,7 +363,7 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::SCOPE_READONLY;
+    use crate::drive::auth::DriveScope;
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -353,7 +371,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 
@@ -605,6 +623,34 @@ mod tests {
             .post_json(
                 &format!("{}/test", server.uri()),
                 &serde_json::json!({"k": "v"}),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn patch_json_sends_body_and_bearer_auth() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"name": "new-name"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .patch_json(
+                &format!("{}/test", server.uri()),
+                &serde_json::json!({"name": "new-name"}),
             )
             .await
             .unwrap();

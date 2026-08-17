@@ -5,7 +5,11 @@ pub(crate) mod auth;
 pub(crate) mod dedupe;
 pub(crate) mod format;
 pub(crate) mod helpers;
+/// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
+/// `crate::cli::atlassian::confluence::move_page`'s identical workaround.
+pub(crate) mod move_file;
 pub(crate) mod read;
+pub(crate) mod rename;
 pub(crate) mod search;
 
 use anyhow::Result;
@@ -14,7 +18,7 @@ use clap::{Parser, Subcommand};
 use crate::drive::account::DRIVE_ACCOUNT_ENV;
 use crate::drive::client::DriveClient;
 
-/// Drive: search and read Google Drive files via OAuth2 (read-only).
+/// Drive: search, read, rename, and move Google Drive files via OAuth2.
 #[derive(Parser)]
 pub struct DriveCommand {
     /// Selects a named Drive account configured in
@@ -48,6 +52,12 @@ pub enum DriveSubcommands {
     Read(read::ReadCommand),
     /// Finds Drive files sharing the same content hash.
     Dedupe(dedupe::DedupeCommand),
+    /// Renames a single Drive file. Requires the `drive.metadata` scope
+    /// (`drive auth login --write`).
+    Rename(rename::RenameCommand),
+    /// Moves one or more Drive files into a destination folder. Requires
+    /// the `drive.metadata` scope (`drive auth login --write`).
+    Move(move_file::MoveCommand),
 }
 
 impl DriveCommand {
@@ -91,6 +101,8 @@ impl DriveSubcommands {
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
+            Self::Rename(cmd) => cmd.execute(client).await,
+            Self::Move(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -100,7 +112,7 @@ impl DriveSubcommands {
 mod tests {
     use super::*;
     use crate::cli::drive::format::OutputFormat;
-    use crate::drive::auth::{DriveCredentials, SCOPE_READONLY};
+    use crate::drive::auth::{DriveCredentials, DriveScope};
     use crate::utils::secret::Secret;
 
     fn dead_credentials() -> DriveCredentials {
@@ -108,7 +120,7 @@ mod tests {
             client_id: "client".to_string(),
             client_secret: Secret::new("secret"),
             refresh_token: Secret::new("refresh"),
-            scope: SCOPE_READONLY.to_string(),
+            scope: DriveScope::ReadOnly,
         }
     }
 
@@ -278,6 +290,31 @@ mod tests {
         let cmd = DriveSubcommands::Dedupe(dedupe::DedupeCommand {
             query: "name contains 'x'".to_string(),
             limit: 10,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_rename() {
+        let cmd = DriveSubcommands::Rename(rename::RenameCommand {
+            file_id: "f1".to_string(),
+            new_name: "New Name".to_string(),
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_move() {
+        let cmd = DriveSubcommands::Move(move_file::MoveCommand {
+            file_ids: vec!["f1".to_string()],
+            to: "dest1".to_string(),
+            allow_visibility_increase: false,
+            allow_visibility_decrease: false,
+            allow_drive_boundary_crossing: false,
+            dry_run: false,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
