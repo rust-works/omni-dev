@@ -26,9 +26,10 @@ walkthrough — this page is the topic-by-topic reference.
 4. [Output formats](#output-formats)
 5. [Search](#search)
 6. [Read](#read)
-7. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-8. [Troubleshooting](#troubleshooting)
-9. [See also](#see-also)
+7. [Duplicate detection](#duplicate-detection)
+8. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+9. [Troubleshooting](#troubleshooting)
+10. [See also](#see-also)
 
 ## Prerequisites
 
@@ -372,6 +373,29 @@ API later, so a very old, untouched file may carry only `md5`). These
 fields aren't shown by `drive search`'s table renderer; use `-o
 json`/`-o yaml`/`-o jsonl` to see them there. `drive read`'s table output
 shows them directly (see above).
+
+## Duplicate detection
+
+```bash
+$ omni-dev drive dedupe "'1AbCdEfGhIjKlMnOpQrStUvWxYz' in parents"
+$ omni-dev drive dedupe "name contains 'invoice'" --limit 0 -o json
+```
+
+`drive dedupe` reuses the same bulk-search path as `drive search` —
+`files.list` already returns `md5Checksum` per hit, so finding duplicates
+needs no per-file follow-up call. It groups the query's results by
+`md5Checksum` (the broadest-coverage checksum field — see [Content
+hashes](#read) above), keeping only groups with 2 or more files; a file
+with no checksum (a folder or Google-native document) is skipped
+entirely. The query argument and `--limit` behave exactly like `drive
+search`'s.
+
+Table output columns: `HASH | COUNT | FILES`, with `FILES` a comma-joined
+`name (id)` list. An empty result prints `No duplicate files found.`. Pass
+`-o json`/`-o yaml`/`-o jsonl` for machine-readable output instead.
+
+Grouping is currently fixed to `md5Checksum` — there's no `--by` flag to
+choose `sha1Checksum`/`sha256Checksum` instead.
 
 ## Rate limits and retry behaviour
 

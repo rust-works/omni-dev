@@ -30,6 +30,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cli::drive::dedupe::group_duplicates;
 use crate::cli::drive::helpers::create_client_for;
 use crate::cli::drive::read::{is_texty, resolve_export_mime_type, GOOGLE_FOLDER, GOOGLE_SHORTCUT};
 use crate::drive::account;
@@ -72,6 +73,21 @@ pub struct DriveSearchParams {
     pub query: String,
     /// Maximum results. Defaults to 50 when omitted; `0` explicitly means
     /// fetch every match up to the hard cap (10000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for the `drive_dedupe` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriveDedupeParams {
+    /// Drive query, same syntax as `drive search`'s query argument (e.g.
+    /// `'<folder-id>' in parents` to dedupe within one folder). Required.
+    pub query: String,
+    /// Maximum results to scan. Defaults to 50 when omitted; `0` explicitly
+    /// means scan every match up to the hard cap (10000).
     #[serde(default)]
     pub limit: Option<usize>,
     #[doc = account_param_doc!()]
@@ -163,6 +179,27 @@ impl OmniDevServer {
         Ok(build_truncated_result(yaml))
     }
 
+    /// Tool: find Drive files sharing the same content hash.
+    #[tool(
+        description = "Find Drive files sharing the same content hash, within the results of a \
+                       Drive query (same syntax as `drive_search`'s `query`, e.g. `'<folder-id>' \
+                       in parents` to dedupe within one folder). Reuses the same bulk-search \
+                       path as `drive_search` — no per-file follow-up call. Groups by \
+                       md5Checksum (the broadest-coverage checksum field); files with no \
+                       checksum (folders, Google-native documents) are skipped, and groups of \
+                       one are omitted. `limit` defaults to 50 when omitted; pass `0` explicitly \
+                       to scan up to a hard cap (10000). \
+                       Read-only. Mirrors `omni-dev drive dedupe`. Output is YAML."
+    )]
+    pub async fn drive_dedupe(
+        &self,
+        Parameters(params): Parameters<DriveDedupeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let yaml = run_dedupe(&client, &params).await.map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
+    }
+
     /// Tool: read a single Drive file's metadata or content.
     #[tool(
         description = "Read a single Drive file by id. `format: \"metadata\"` (default) \
@@ -240,6 +277,14 @@ async fn run_search(client: &DriveClient, params: &DriveSearchParams) -> Result<
         .search_all(Some(&params.query), limit)
         .await?;
     yaml_result(&list.files)
+}
+
+async fn run_dedupe(client: &DriveClient, params: &DriveDedupeParams) -> Result<String> {
+    let limit = params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let list = FilesApi::new(client)
+        .search_all(Some(&params.query), limit)
+        .await?;
+    yaml_result(&group_duplicates(&list.files))
 }
 
 async fn run_file_read(client: &DriveClient, params: &DriveFileReadParams) -> Result<String> {
@@ -557,6 +602,66 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── run_dedupe ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_dedupe_groups_files_sharing_a_checksum() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "files": [
+                        {"id": "f1", "name": "a", "md5Checksum": "hash-a"},
+                        {"id": "f2", "name": "b", "md5Checksum": "hash-a"},
+                        {"id": "f3", "name": "c", "md5Checksum": "hash-b"},
+                    ],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_dedupe(
+            &client,
+            &DriveDedupeParams {
+                query: "name contains 'x'".to_string(),
+                limit: Some(10),
+                account: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("checksum: hash-a"));
+        assert!(yaml.contains("id: f1"));
+        assert!(yaml.contains("id: f2"));
+        assert!(!yaml.contains("hash-b"));
+    }
+
+    #[tokio::test]
+    async fn run_dedupe_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let err = run_dedupe(
+            &client,
+            &DriveDedupeParams {
+                query: "*".to_string(),
+                limit: None,
+                account: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("500"));
     }
 
     // ── run_file_read (metadata) ────────────────────────────────────
@@ -944,6 +1049,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("unknown Drive account 'bogus'"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_dedupe_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .drive_dedupe(Parameters(DriveDedupeParams {
+                query: "*".to_string(),
+                limit: None,
+                account: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
     }
 
     // ── run_account_list / drive_account_list ──────────────────────────

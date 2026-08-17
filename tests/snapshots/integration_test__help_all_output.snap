@@ -3732,6 +3732,7 @@ Commands:
   account  Manages named Drive accounts
   search   Searches Drive files
   read     Reads a single Drive file's metadata or content
+  dedupe   Finds Drive files sharing the same content hash
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3837,6 +3838,23 @@ Usage: status [OPTIONS]
 Options:
       --all   Reports status for every configured Drive account
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive dedupe - Finds Drive files sharing the same content hash
+
+Finds Drive files sharing the same content hash
+
+Usage: dedupe [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>  Drive search query, passed verbatim to `files.list`'s `q` parameter (e.g. `'<folder-id>' in parents` to dedupe within one folder)
+
+Options:
+      --limit <LIMIT>    Maximum results to scan. `0` means "scan every match" (capped at a hard ceiling to bound run time) [default: 50]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
