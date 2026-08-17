@@ -58,6 +58,13 @@ pub enum RecordKind {
     /// recovery-relevant metadata (path/branch/commit) in `context`.
     /// See `crate::cli::git` worktree subcommands.
     Worktree,
+    /// One per `drive rename`/`drive move` mutation attempt, including a
+    /// refused `Blocked` move — no `files.update` call happens for those,
+    /// but the refusal is itself the security-relevant event. Covers both
+    /// operations via `command`/`context`, mirroring how
+    /// [`RecordKind::Worktree`] covers multiple verbs rather than one kind
+    /// per verb. See `crate::drive::{rename,file_move}`.
+    DriveMutation,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]
     Unknown,
@@ -73,6 +80,7 @@ impl RecordKind {
             Self::Http => "http",
             Self::Gh => "gh",
             Self::Worktree => "worktree",
+            Self::DriveMutation => "drivemutation",
             Self::Unknown => "unknown",
         }
     }
@@ -847,6 +855,91 @@ fn build_worktree_record(outcome: WorktreeOutcome, ctx: RequestLogContext) -> Lo
     rec
 }
 
+/// The outcome of one `drive rename`/`drive move` attempt.
+#[derive(Debug, Clone)]
+pub struct DriveMutationOutcome {
+    /// `"rename"` or `"move"`; becomes the record's `command`.
+    pub operation: &'static str,
+    /// The Drive file id acted on.
+    pub file_id: String,
+    /// The file's name at the time of the attempt.
+    pub file_name: String,
+    /// The domain outcome (e.g. `"moved"`, `"blocked"`, `"already-in-folder"`,
+    /// `"failed"` — kebab-case, matching `MoveResult`'s
+    /// `#[serde(tag = "status", rename_all = "kebab-case")]`).
+    pub status: String,
+    /// Principals gaining access, when the visibility diff detected an
+    /// increase. Empty for `rename` (which never changes visibility) and
+    /// for a `move` with no visibility change.
+    pub added_principals: Vec<String>,
+    /// Principals losing access — the decrease-side counterpart of
+    /// `added_principals`.
+    pub removed_principals: Vec<String>,
+    /// Whether the file moved across a My Drive / Shared Drive boundary.
+    pub crosses_drive_boundary: bool,
+    /// The API/validation error, when the attempt failed.
+    pub error: Option<String>,
+    /// Wall time of the attempt.
+    pub duration: Duration,
+}
+
+/// Appends one `kind: "drivemutation"` record from the active context.
+///
+/// Best effort and exit-code-safe: it goes through [`record`], which
+/// swallows every error, so a logging failure can never change the
+/// underlying rename/move result.
+///
+/// Deliberately called from *inside* `src/drive/rename.rs`/
+/// `src/drive/file_move.rs` themselves rather than the CLI layer — unlike
+/// [`record_worktree`], which is safe to call from `src/cli/git/worktree.rs`
+/// only because `git worktree` has no MCP surface at all. Drive move/rename
+/// may grow an MCP caller later, and "every move/rename must be logged" is a
+/// hard invariant that needs to hold for every current and future caller.
+/// This is also additive to (not redundant with) the automatic per-request
+/// `kind: "http"` records `crate::drive::client::DriveClient` already writes
+/// for every call it makes: a `Blocked` outcome makes *no* `files.update`
+/// call at all, so without this record the single most security-relevant
+/// event — "we refused this because visibility would change, here's exactly
+/// why" — would never appear in the log.
+pub fn record_drive_mutation(outcome: DriveMutationOutcome) {
+    record(&build_drive_mutation_record(outcome, current_context()));
+}
+
+/// Builds the `kind: "drivemutation"` record for `outcome` under `ctx`. Split
+/// out from [`record_drive_mutation`] so the record shape is unit-testable
+/// without touching the filesystem or environment.
+fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogContext) -> LogRecord {
+    let mut rec = LogRecord::new(RecordKind::DriveMutation, ctx.invocation_id);
+    rec.source = Some(ctx.source);
+    rec.mcp_tool = ctx.mcp_tool;
+    rec.service = Some("drive".to_string());
+    rec.command = vec!["drive".to_string(), outcome.operation.to_string()];
+    rec.error = outcome.error;
+    rec.duration_ms = Some(outcome.duration.as_millis() as u64);
+
+    let mut context = BTreeMap::new();
+    context.insert("file_id".to_string(), outcome.file_id);
+    context.insert("file_name".to_string(), outcome.file_name);
+    context.insert("status".to_string(), outcome.status);
+    if !outcome.added_principals.is_empty() {
+        context.insert(
+            "added_principals".to_string(),
+            outcome.added_principals.join(","),
+        );
+    }
+    if !outcome.removed_principals.is_empty() {
+        context.insert(
+            "removed_principals".to_string(),
+            outcome.removed_principals.join(","),
+        );
+    }
+    if outcome.crosses_drive_boundary {
+        context.insert("crosses_drive_boundary".to_string(), "true".to_string());
+    }
+    rec.context = context;
+    rec
+}
+
 /// Optional, non-secret extras for an HTTP record. Bodies/headers are gated and
 /// redacted centrally in [`record_http_with`], so callers may pass them freely.
 #[derive(Debug, Clone, Default)]
@@ -1476,6 +1569,108 @@ mod tests {
         let back: LogRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back.kind, RecordKind::Worktree);
         assert_eq!(back.command, argv(&["git", "worktree", "add"]));
+        assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn build_drive_mutation_record_stamps_kind_service_command_and_context() {
+        let ctx = RequestLogContext {
+            invocation_id: "inv-3".to_string(),
+            source: Source::Mcp,
+            mcp_tool: Some("drive_file_move".to_string()),
+        };
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "move",
+                file_id: "f1".to_string(),
+                file_name: "report.pdf".to_string(),
+                status: "blocked".to_string(),
+                added_principals: vec!["alice@example.com".to_string()],
+                removed_principals: vec![],
+                crosses_drive_boundary: true,
+                error: None,
+                duration: Duration::from_millis(17),
+            },
+            ctx,
+        );
+        assert_eq!(rec.kind, RecordKind::DriveMutation);
+        assert_eq!(rec.invocation_id, "inv-3");
+        assert_eq!(rec.source, Some(Source::Mcp));
+        assert_eq!(rec.mcp_tool.as_deref(), Some("drive_file_move"));
+        assert_eq!(rec.service.as_deref(), Some("drive"));
+        assert_eq!(rec.command, vec!["drive".to_string(), "move".to_string()]);
+        assert_eq!(rec.duration_ms, Some(17));
+        assert_eq!(rec.context.get("file_id").map(String::as_str), Some("f1"));
+        assert_eq!(
+            rec.context.get("file_name").map(String::as_str),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            rec.context.get("status").map(String::as_str),
+            Some("blocked")
+        );
+        assert_eq!(
+            rec.context.get("added_principals").map(String::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(rec.context.get("removed_principals"), None);
+        assert_eq!(
+            rec.context
+                .get("crosses_drive_boundary")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn build_drive_mutation_record_omits_empty_principal_lists_and_false_boundary() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "rename",
+                file_id: "f2".to_string(),
+                file_name: "old.txt".to_string(),
+                status: "moved".to_string(),
+                added_principals: vec![],
+                removed_principals: vec![],
+                crosses_drive_boundary: false,
+                error: None,
+                duration: Duration::from_millis(5),
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.context.get("added_principals"), None);
+        assert_eq!(rec.context.get("removed_principals"), None);
+        assert_eq!(rec.context.get("crosses_drive_boundary"), None);
+    }
+
+    #[test]
+    fn record_kind_drive_mutation_serializes_as_drivemutation_and_round_trips() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "rename",
+                file_id: "f1".to_string(),
+                file_name: "a.txt".to_string(),
+                status: "failed".to_string(),
+                added_principals: vec![],
+                removed_principals: vec![],
+                crosses_drive_boundary: false,
+                error: Some("boom".to_string()),
+                duration: Duration::from_millis(1),
+            },
+            RequestLogContext::default(),
+        );
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(
+            line.contains("\"kind\":\"drivemutation\""),
+            "line was: {line}"
+        );
+        assert_eq!(RecordKind::DriveMutation.as_str(), "drivemutation");
+        let back: LogRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.kind, RecordKind::DriveMutation);
+        assert_eq!(
+            back.command,
+            vec!["drive".to_string(), "rename".to_string()]
+        );
         assert_eq!(back.error.as_deref(), Some("boom"));
     }
 
