@@ -267,6 +267,7 @@ mod tests {
             content: false,
             export_mime_type: None,
             out_file: None,
+            verify: false,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
