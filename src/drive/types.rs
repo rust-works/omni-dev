@@ -5,7 +5,10 @@
 //! Drive's own wire format: a **decimal string**, not a JSON number —
 //! present only for binary files with actual byte content; absent for
 //! folders and Google-native documents (Docs/Sheets/Slides/...), which have
-//! no fixed byte size.
+//! no fixed byte size. The content-hash fields (`md5Checksum`/
+//! `sha1Checksum`/`sha256Checksum`) share that same binary-content-only
+//! availability but, unlike `size`, are plain lowercase hex strings with no
+//! wire-format quirk of their own.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -52,6 +55,33 @@ pub struct DriveFile {
     /// Google-native documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// MD5 checksum of the file's content, as a lowercase hex string.
+    /// Absent for folders and Google-native documents. Has the broadest
+    /// historical coverage of the three checksum fields — sha1/sha256 were
+    /// added to the Drive API later, so a very old, untouched file may lack
+    /// them while still carrying this one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "md5Checksum"
+    )]
+    pub md5_checksum: Option<String>,
+    /// SHA-1 checksum of the file's content, as a lowercase hex string.
+    /// Same availability caveats as [`Self::md5_checksum`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sha1Checksum"
+    )]
+    pub sha1_checksum: Option<String>,
+    /// SHA-256 checksum of the file's content, as a lowercase hex string.
+    /// Same availability caveats as [`Self::md5_checksum`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sha256Checksum"
+    )]
+    pub sha256_checksum: Option<String>,
     /// Last modification time (RFC 3339).
     #[serde(
         default,
@@ -152,6 +182,9 @@ mod tests {
                     "name": "report.pdf",
                     "mimeType": "application/pdf",
                     "size": "12345",
+                    "md5Checksum": "5d41402abc4b2a76b9719d911017c592",
+                    "sha1Checksum": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+                    "sha256Checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
                     "modifiedTime": "2026-01-01T00:00:00.000Z",
                     "parents": ["folder1"],
                     "webViewLink": "https://drive.google.com/file/d/f1/view",
@@ -168,11 +201,32 @@ mod tests {
         assert_eq!(file.id, "f1");
         assert_eq!(file.size.as_deref(), Some("12345"));
         assert_eq!(
+            file.md5_checksum.as_deref(),
+            Some("5d41402abc4b2a76b9719d911017c592")
+        );
+        assert_eq!(
+            file.sha1_checksum.as_deref(),
+            Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d")
+        );
+        assert_eq!(
+            file.sha256_checksum.as_deref(),
+            Some("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+        );
+        assert_eq!(
             file.owners[0].email_address.as_deref(),
             Some("alice@example.com")
         );
         assert_eq!(file.drive_id.as_deref(), Some("shared1"));
         assert_eq!(response.next_page_token.as_deref(), Some("page2"));
+    }
+
+    #[test]
+    fn checksums_are_none_when_absent() {
+        let json = serde_json::json!({"id": "f1", "name": "n"});
+        let file: DriveFile = serde_json::from_value(json).unwrap();
+        assert!(file.md5_checksum.is_none());
+        assert!(file.sha1_checksum.is_none());
+        assert!(file.sha256_checksum.is_none());
     }
 
     #[test]

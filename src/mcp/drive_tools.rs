@@ -145,11 +145,13 @@ impl OmniDevServer {
     #[tool(
         description = "Search Drive files with a Drive query (same syntax as `drive search`'s \
                        query argument, e.g. `name contains 'report' and mimeType = \
-                       'application/pdf'`). Returns id/name/mimeType/size/modifiedTime/parents/\
-                       webViewLink/owners per hit — `files.list` returns full metadata in one \
-                       call, so there's no separate hydration step. Always searches shared \
-                       drives too. `limit` defaults to 50 when omitted; pass `0` explicitly to \
-                       auto-paginate up to a hard cap (10000). \
+                       'application/pdf'`). Returns id/name/mimeType/size/md5Checksum/\
+                       sha1Checksum/sha256Checksum/modifiedTime/parents/webViewLink/owners per \
+                       hit — `files.list` returns full metadata in one call, so there's no \
+                       separate hydration step. Checksum fields are present only for \
+                       binary-content files (absent for folders and Google-native docs). \
+                       Always searches shared drives too. `limit` defaults to 50 when omitted; \
+                       pass `0` explicitly to auto-paginate up to a hard cap (10000). \
                        Read-only. Mirrors `omni-dev drive search`. Output is YAML."
     )]
     pub async fn drive_search(
@@ -164,8 +166,9 @@ impl OmniDevServer {
     /// Tool: read a single Drive file's metadata or content.
     #[tool(
         description = "Read a single Drive file by id. `format: \"metadata\"` (default) \
-                       returns only metadata; `format: \"content\"` additionally fetches the \
-                       file's actual content — exported for Google-native files \
+                       returns only metadata (including md5Checksum/sha1Checksum/\
+                       sha256Checksum when available); `format: \"content\"` additionally \
+                       fetches the file's actual content — exported for Google-native files \
                        (Docs/Sheets/Slides/...; see `export_mime_type`), downloaded as-is \
                        otherwise. Folders and shortcuts are rejected with an actionable error \
                        in content mode. Text content is returned inline; binary content is \
