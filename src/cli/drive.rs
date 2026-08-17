@@ -5,6 +5,9 @@ pub(crate) mod auth;
 pub(crate) mod dedupe;
 pub(crate) mod format;
 pub(crate) mod helpers;
+/// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
+/// `crate::cli::atlassian::confluence::move_page`'s identical workaround.
+pub(crate) mod move_file;
 pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
@@ -52,6 +55,9 @@ pub enum DriveSubcommands {
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
+    /// Moves one or more Drive files into a destination folder. Requires
+    /// the `drive.metadata` scope (`drive auth login --write`).
+    Move(move_file::MoveCommand),
 }
 
 impl DriveCommand {
@@ -96,6 +102,7 @@ impl DriveSubcommands {
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
+            Self::Move(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -293,6 +300,20 @@ mod tests {
         let cmd = DriveSubcommands::Rename(rename::RenameCommand {
             file_id: "f1".to_string(),
             new_name: "New Name".to_string(),
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_move() {
+        let cmd = DriveSubcommands::Move(move_file::MoveCommand {
+            file_ids: vec!["f1".to_string()],
+            to: "dest1".to_string(),
+            allow_visibility_increase: false,
+            allow_visibility_decrease: false,
+            allow_drive_boundary_crossing: false,
             dry_run: false,
             output: OutputFormat::Table,
         });

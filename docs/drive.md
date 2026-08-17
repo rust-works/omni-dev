@@ -1,16 +1,20 @@
 # Drive Integration
 
 omni-dev exposes access to the Google Drive v3 API through the `omni-dev
-drive` command tree — search, read a file's metadata or content, and rename
-it. `drive.readonly` (the default scope) is enough for search/read; renaming
-needs the opt-in `drive.metadata` scope (`drive auth login --write`), the
-narrowest write scope Google offers — it covers `files.update` on
-`name`/`parents` only, with no file-content access at all. There is still no
-upload/create/trash/share/permission-mutation capability anywhere in this
-surface. Move (which can change a file's visibility, since Drive resolves
-access from both direct permissions and inherited parent-folder permissions)
-is a security-gated capability documented separately once it ships — see
-[ADR-0070](adrs/adr-0070.md).
+drive` command tree — search, read a file's metadata or content, rename it,
+and move it between folders. `drive.readonly` (the default scope) is enough
+for search/read; rename/move need the opt-in `drive.metadata` scope
+(`drive auth login --write`), the narrowest write scope Google offers — it
+covers `files.update` on `name`/`parents` only, with no file-content access
+at all. There is still no upload/create/trash/share/permission-mutation
+capability anywhere in this surface.
+
+**Move is security-gated.** Moving a file can change who can see it — Drive
+resolves a file's effective visibility from both direct permissions on the
+file and permissions inherited from its parent folder chain, and moving a
+file changes that chain. `drive move` refuses any move that would change
+visibility **by default**; three independent `--allow-*` flags opt in. See
+[Move](#move) and [ADR-0070](adrs/adr-0070.md) for the full design.
 
 The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_file_read`/
 `drive_account_list`, mirroring the CLI one-for-one like Gmail's `gmail_*`
@@ -32,9 +36,10 @@ walkthrough — this page is the topic-by-topic reference.
 6. [Read](#read)
 7. [Duplicate detection](#duplicate-detection)
 8. [Rename](#rename)
-9. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-10. [Troubleshooting](#troubleshooting)
-11. [See also](#see-also)
+9. [Move](#move)
+10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+11. [Troubleshooting](#troubleshooting)
+12. [See also](#see-also)
 
 ## Prerequisites
 
@@ -304,12 +309,12 @@ login failure.
 ## Output formats
 
 Every subcommand that renders a list or record (`search`, `read`, `rename`,
-`account list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` /
-`jsonl`, default `table`) — the same convention as every other `omni-dev`
-domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
-status`/`account set-default` print a fixed human-readable status line
-instead and have no `-o` flag. `--out-file` exists only on `drive read
---content` — metadata always renders via `-o/--output`.
+`move`, `account list`) accepts `-o <format>` (`table` / `json` / `yaml` /
+`yamls` / `jsonl`, default `table`) — the same convention as every other
+`omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth
+logout`/`auth status`/`account set-default` print a fixed human-readable
+status line instead and have no `-o` flag. `--out-file` exists only on
+`drive read --content` — metadata always renders via `-o/--output`.
 
 ## Search
 
@@ -439,9 +444,8 @@ Renaming only ever touches a file's `name` field — it never changes
 `parents`, so it can never change who can see the file (Drive resolves
 visibility from direct permissions plus permissions inherited from the
 parent folder chain; renaming doesn't touch either). There is nothing to
-gate, unlike `move` (documented separately once it ships — see
-[ADR-0070](adrs/adr-0070.md)): `drive rename` always proceeds, subject only
-to the ordinary API/auth failures below.
+gate, unlike [Move](#move): `drive rename` always proceeds, subject only to
+the ordinary API/auth failures below.
 
 Requires the `drive.metadata` scope (`drive auth login --write`). Without
 it, the rename fails with an actionable hint:
@@ -457,6 +461,93 @@ Every rename attempt — success or failure — is written to the
 a hard invariant, not a best-effort convenience: logging happens inside the
 rename engine itself, not the CLI layer, so it holds for every current and
 future caller.
+
+## Move
+
+```bash
+$ omni-dev drive move 1AbCdEfGhIjKlMnOpQrStUvWxYz --to 1FolderIdGoesHere
+STATUS           NAME                           DETAIL
+moved            Q3 Report (final)
+
+$ omni-dev drive move 1AbCd... 1Efgh... --to 1FolderId --dry-run
+STATUS           NAME                           DETAIL
+would-move       Q3 Report (final)
+blocked          Confidential Salary Data       visibility increase (--allow-visibility-increase); adds user:external@partner.com
+```
+
+Moving a file can change **who can see it**: Drive resolves a file's
+effective visibility from direct permissions on the file *plus* permissions
+inherited from its parent folder chain, and moving a file changes that
+chain. `drive move` computes the exact visibility diff a move would cause
+and, by default, **refuses any move that would change visibility** — an
+increase (new principals gain access) or a decrease (existing principals
+lose access) either one. Three independent opt-in flags, none implying the
+others:
+
+- `--allow-visibility-increase` — proceed even if the move would grant new
+  principals access.
+- `--allow-visibility-decrease` — proceed even if the move would revoke
+  existing principals' access.
+- `--allow-drive-boundary-crossing` — proceed even if the move crosses a My
+  Drive / Shared Drive boundary (independent of the visibility diff — a
+  boundary crossing can block a move that changes nobody's *access*, only
+  which Drive the file lives in).
+
+**Bulk moves skip only the unsafe files, never fail the whole batch.**
+`drive move ID1 ID2 ID3... --to FOLDER` shares one destination across every
+file id given; a file whose move is blocked is reported as `blocked` and
+left where it is, while every other file in the same call still moves. Pass
+multiple file ids to move them all into the same folder in one call;
+different files to different destinations needs separate calls.
+
+A file already in the destination folder is reported `already-in-folder`
+and never touched (no `permissions.list` call is even made for it). A
+folder being moved gets a loud warning — its own visibility is evaluated,
+but v1 does not recurse into a moved folder's contents, so their visibility
+is not:
+
+```
+Warning: 'Old Projects' is a folder — its own visibility was evaluated, but its contents' visibility was not (folder moves don't recurse in v1).
+```
+
+**No interactive confirmation, `--dry-run` or not.** `--dry-run` plus the
+`--allow-*` flags are the entire gate — an interactive-by-default confirm
+would hang (or be silently force-skipped) over a future MCP caller, and
+every flag passed is already captured in the request log's `command_line`.
+`--dry-run` never calls the mutating `files.update` endpoint; the same
+`permissions.list` reads back the exact plan a real run would act on.
+
+**Exit code is always 0** as long as the command mechanically completed —
+individual `blocked`/`failed` outcomes live in the table/JSON output, not
+the exit code (the same convention `worktree push` uses). Check the output
+if scripting against this.
+
+Requires the `drive.metadata` scope (`drive auth login --write`), same as
+[Rename](#rename) — see its [troubleshooting
+entry](#insufficientpermissions-on-rename-or-move) for the actionable hint
+on a 403.
+
+Every move attempt — moved, blocked, already-in-folder, or failed — is
+written to the [request log](log.md) as a `kind: "drivemutation"` record.
+A `blocked` record carries the specific `added_principals`/
+`removed_principals` that triggered it, so a refusal is fully auditable
+even though no API call was made:
+
+```bash
+$ omni-dev log --query 'kind:drivemutation status:blocked'
+```
+
+**Known limitation — shadowed grants.** Drive's API doesn't expose whether
+a principal's access on a file is direct or inherited (that split is only
+populated for Shared Drive items, not My Drive files), so `drive move`
+derives it by subtraction. If a principal has *both* a direct grant on the
+file *and* inherited access via its current parent, the subtraction can't
+tell them apart — a move that only removes the parent-inherited grant is
+reported as revoking that principal's access, even though their direct
+grant means they actually keep it. This is a **safe failure direction**: it
+can only produce an unnecessary `--allow-visibility-decrease` requirement,
+never a missed visibility increase. See
+[ADR-0070](adrs/adr-0070.md) for the full algorithm.
 
 ## Rate limits and retry behaviour
 

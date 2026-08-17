@@ -3734,6 +3734,7 @@ Commands:
   read     Reads a single Drive file's metadata or content
   dedupe   Finds Drive files sharing the same content hash
   rename   Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
+  move     Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3857,6 +3858,27 @@ Options:
       --limit <LIMIT>    Maximum results to scan. `0` means "scan every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive move - Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
+
+Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
+
+Usage: move [OPTIONS] --to <FOLDER_ID> <FILE_IDS>...
+
+Arguments:
+  <FILE_IDS>...  Drive file ids to move
+
+Options:
+      --to <FOLDER_ID>                 Destination folder id. One shared destination per invocation — different files to different destinations needs separate calls
+      --allow-visibility-increase      Allows a move that would grant new principals access to a file
+      --allow-visibility-decrease      Allows a move that would revoke existing principals' access to a file
+      --allow-drive-boundary-crossing  Allows a move across a My Drive / Shared Drive boundary
+      --dry-run                        Reports what would happen without moving anything
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================
