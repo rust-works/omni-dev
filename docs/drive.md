@@ -326,6 +326,7 @@ no flag to control this because there's no reason to turn it off.
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content --out-file report.pdf
+$ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content --verify --out-file report.pdf
 $ omni-dev drive read <google-doc-id> --content
 $ omni-dev drive read <google-sheet-id> --content --export-mime-type text/csv
 ```
@@ -373,6 +374,15 @@ API later, so a very old, untouched file may carry only `md5`). These
 fields aren't shown by `drive search`'s table renderer; use `-o
 json`/`-o yaml`/`-o jsonl` to see them there. `drive read`'s table output
 shows them directly (see above).
+
+**Verifying downloaded content:** pass `--content --verify` to locally
+recompute the SHA-256 checksum of the downloaded bytes and check it
+against Drive's reported `sha256Checksum`, printing a one-line
+confirmation on success. Fails clearly on a mismatch or on a file with no
+`sha256Checksum` reported. Only supported for regular (non-Google-native)
+files — Drive never returns a checksum for exported content, so
+`--verify` on a Google-native file errors immediately rather than
+exporting first.
 
 ## Duplicate detection
 

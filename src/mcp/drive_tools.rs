@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::drive::dedupe::group_duplicates;
 use crate::cli::drive::helpers::create_client_for;
-use crate::cli::drive::read::{is_texty, resolve_export_mime_type, GOOGLE_FOLDER, GOOGLE_SHORTCUT};
+use crate::cli::drive::read::{
+    is_texty, resolve_export_mime_type, verify_sha256_checksum, GOOGLE_FOLDER, GOOGLE_SHORTCUT,
+};
 use crate::drive::account;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
@@ -121,6 +123,14 @@ pub struct DriveFileReadParams {
     /// the response size limit.
     #[serde(default)]
     pub output_file: Option<String>,
+    /// Only valid with `format: "content"`. When true, locally recomputes
+    /// the SHA-256 checksum of the fetched bytes and checks it against
+    /// Drive's reported `sha256Checksum`. Only supported for non-Google-
+    /// native files — Drive never returns a checksum for exported content,
+    /// so this errors immediately on a Google-native file. Fails clearly on
+    /// a mismatch or a missing checksum.
+    #[serde(default)]
+    pub verify: Option<bool>,
     #[doc = account_param_doc!()]
     #[serde(default)]
     pub account: Option<String>,
@@ -211,7 +221,10 @@ impl OmniDevServer {
                        in content mode. Text content is returned inline; binary content is \
                        refused inline and requires `output_file`. When `output_file` is set, \
                        writes the content to that path and returns a short YAML summary \
-                       instead of the inline body. \
+                       instead of the inline body. Set `verify: true` (only with `format: \
+                       \"content\"`, only for non-Google-native files) to locally recompute the \
+                       SHA-256 checksum of the fetched bytes and check it against Drive's \
+                       reported sha256Checksum, failing clearly on a mismatch. \
                        Read-only. Mirrors `omni-dev drive read`. Output is YAML."
     )]
     pub async fn drive_file_read(
@@ -296,6 +309,10 @@ async fn run_file_read(client: &DriveClient, params: &DriveFileReadParams) -> Re
                 params.output_file.is_none(),
                 "output_file requires format: \"content\"; metadata is always returned inline"
             );
+            anyhow::ensure!(
+                !params.verify.unwrap_or(false),
+                "verify requires format: \"content\"; metadata is always returned inline"
+            );
             let meta = api.get_metadata(&params.file_id).await?;
             yaml_result(&meta)
         }
@@ -323,6 +340,13 @@ async fn run_file_read_content(api: &FilesApi<'_>, params: &DriveFileReadParams)
             meta.name
         );
     }
+    let verify = params.verify.unwrap_or(false);
+    if verify && meta.is_google_native() {
+        anyhow::bail!(
+            "verify is not supported for Google-native files: Drive does not return a checksum \
+             for exported content"
+        );
+    }
 
     let (bytes, content_mime_type) = if meta.is_google_native() {
         let export_mime = resolve_export_mime_type(&meta, params.export_mime_type.as_deref())?;
@@ -332,6 +356,10 @@ async fn run_file_read_content(api: &FilesApi<'_>, params: &DriveFileReadParams)
         let bytes = api.download(&params.file_id).await?;
         (bytes, meta.mime_type.clone())
     };
+
+    if verify {
+        verify_sha256_checksum(&bytes, meta.sha256_checksum.as_deref())?;
+    }
 
     match params.output_file.as_deref() {
         Some(path) => write_bytes_to_file_yaml(path, &bytes, &content_mime_type),
@@ -677,6 +705,7 @@ mod tests {
             format: format.map(str::to_string),
             export_mime_type: export_mime_type.map(str::to_string),
             output_file: output_file.map(str::to_string),
+            verify: None,
             account: None,
         }
     }
@@ -973,6 +1002,102 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    // ── run_file_read (content, verify) ─────────────────────────────
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_succeeds_on_matching_checksum() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        run_file_read(&client, &params).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_fails_clearly_on_mismatch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "not-the-real-hash",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_rejects_google_native_file_before_exporting() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/vnd.google-apps.document",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No mock for /drive/v3/files/f1/export — if the Google-native
+        // rejection didn't run before the export call, this test would 404
+        // rather than surfacing the expected error.
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("verify is not supported for Google-native files"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_file_read_metadata_rejects_verify() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let mut params = read_params("f1", None, None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(err.to_string().contains("verify requires format"), "{err}");
     }
 
     // ── Tool handler bodies (smoke + auth-status full path) ───────────
