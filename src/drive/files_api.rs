@@ -39,13 +39,14 @@ const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
 /// `fields` value for `files.list` — enough for `drive search`'s
 /// table/JSON output with zero follow-up calls per hit.
 const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,\
-    modifiedTime,parents,webViewLink,owners(displayName,emailAddress),driveId)";
+    md5Checksum,sha1Checksum,sha256Checksum,modifiedTime,parents,webViewLink,\
+    owners(displayName,emailAddress),driveId)";
 
 /// `fields` value for `files.get` — additionally includes `exportLinks` so
 /// `drive read`'s content-export error path can list which MIME types a
 /// Google-native file actually supports exporting to.
-const GET_FIELDS: &str = "id,name,mimeType,size,modifiedTime,parents,webViewLink,\
-    owners(displayName,emailAddress),driveId,exportLinks";
+const GET_FIELDS: &str = "id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,\
+    modifiedTime,parents,webViewLink,owners(displayName,emailAddress),driveId,exportLinks";
 
 /// Files API façade.
 #[derive(Debug)]
@@ -306,6 +307,11 @@ mod tests {
             name: "n".to_string(),
             mime_type: "application/pdf".to_string(),
             size: Some("1".to_string()),
+            md5_checksum: Some("5d41402abc4b2a76b9719d911017c592".to_string()),
+            sha1_checksum: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()),
+            sha256_checksum: Some(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+            ),
             modified_time: Some("2026-01-01T00:00:00Z".to_string()),
             parents: vec!["p1".to_string()],
             web_view_link: Some("https://example.com/view".to_string()),

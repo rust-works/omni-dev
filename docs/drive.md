@@ -309,9 +309,10 @@ combined with `and`/`or`. `--limit 0` fetches every match up to a 10,000
 hard cap, auto-paginating underneath (1,000 results per page).
 
 Unlike `gmail search`, there is **no `--enrich`/concurrency split**:
-`files.list` returns full metadata (id/name/mimeType/modifiedTime/size/...)
-per hit in one call via the `fields` parameter, so there's no separate
-hydration step to opt into. Every search also sends
+`files.list` returns full metadata (id/name/mimeType/modifiedTime/size/
+md5Checksum/sha1Checksum/sha256Checksum/...) per hit in one call via the
+`fields` parameter, so there's no separate hydration step to opt into.
+Every search also sends
 `supportsAllDrives=true` and `includeItemsFromAllDrives=true`
 unconditionally — results aren't silently scoped to My Drive only; there's
 no flag to control this because there's no reason to turn it off.
@@ -329,9 +330,9 @@ $ omni-dev drive read <google-sheet-id> --content --export-mime-type text/csv
 ```
 
 Without `--content`, `drive read` returns metadata only:
-`Id`/`Name`/`MimeType`/`Size`/`Modified`/`Parents`/`WebViewLink` (optional
-fields shown only if present). Pass `--content` to fetch the file's actual
-bytes instead:
+`Id`/`Name`/`MimeType`/`Size`/`Modified`/`Parents`/`WebViewLink`/
+`Md5Checksum`/`Sha1Checksum`/`Sha256Checksum` (optional fields shown only
+if present). Pass `--content` to fetch the file's actual bytes instead:
 
 - **Regular files** (PDFs, images, plain text, ...) are downloaded as-is
   via `alt=media`.
@@ -362,6 +363,15 @@ too large to export). Raw `alt=media` downloads are capped client-side at
 whose length exceeds that is refused before any bytes are buffered into
 memory. A missing `Content-Length` (e.g. chunked encoding) passes through
 unchecked.
+
+**Content hashes:** `md5Checksum`/`sha1Checksum`/`sha256Checksum` are
+present only for binary-content files — absent for folders and
+Google-native documents, which have no fixed byte content to hash. `md5`
+has the broadest historical coverage (sha1/sha256 were added to the Drive
+API later, so a very old, untouched file may carry only `md5`). These
+fields aren't shown by `drive search`'s table renderer; use `-o
+json`/`-o yaml`/`-o jsonl` to see them there. `drive read`'s table output
+shows them directly (see above).
 
 ## Rate limits and retry behaviour
 

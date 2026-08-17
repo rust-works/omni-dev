@@ -135,6 +135,18 @@ fn render_metadata_table(file: &DriveFile, out: &mut dyn std::io::Write) -> Resu
         writeln!(out, "WebViewLink: {}", sanitize_for_terminal(link))
             .context("Failed to write read row")?;
     }
+    if let Some(md5) = &file.md5_checksum {
+        writeln!(out, "Md5Checksum: {}", sanitize_for_terminal(md5))
+            .context("Failed to write read row")?;
+    }
+    if let Some(sha1) = &file.sha1_checksum {
+        writeln!(out, "Sha1Checksum: {}", sanitize_for_terminal(sha1))
+            .context("Failed to write read row")?;
+    }
+    if let Some(sha256) = &file.sha256_checksum {
+        writeln!(out, "Sha256Checksum: {}", sanitize_for_terminal(sha256))
+            .context("Failed to write read row")?;
+    }
     Ok(())
 }
 
@@ -304,6 +316,11 @@ mod tests {
             modified_time: Some("2026-01-01T00:00:00.000Z".to_string()),
             parents: vec!["folder1".to_string()],
             web_view_link: Some("https://drive.google.com/file/d/f1/view".to_string()),
+            md5_checksum: Some("5d41402abc4b2a76b9719d911017c592".to_string()),
+            sha1_checksum: Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()),
+            sha256_checksum: Some(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+            ),
             ..Default::default()
         };
         let mut buf = Vec::new();
@@ -316,6 +333,11 @@ mod tests {
         assert!(text.contains("Modified: 2026-01-01T00:00:00.000Z"));
         assert!(text.contains("Parents: folder1"));
         assert!(text.contains("WebViewLink: https://drive.google.com/file/d/f1/view"));
+        assert!(text.contains("Md5Checksum: 5d41402abc4b2a76b9719d911017c592"));
+        assert!(text.contains("Sha1Checksum: aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"));
+        assert!(text.contains(
+            "Sha256Checksum: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        ));
     }
 
     #[test]
