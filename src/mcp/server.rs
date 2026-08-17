@@ -398,6 +398,7 @@ mod tests {
             "drive_search",
             "drive_file_read",
             "drive_account_list",
+            "drive_dedupe",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

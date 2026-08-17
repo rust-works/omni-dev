@@ -26,9 +26,10 @@ walkthrough — this page is the topic-by-topic reference.
 4. [Output formats](#output-formats)
 5. [Search](#search)
 6. [Read](#read)
-7. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-8. [Troubleshooting](#troubleshooting)
-9. [See also](#see-also)
+7. [Duplicate detection](#duplicate-detection)
+8. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+9. [Troubleshooting](#troubleshooting)
+10. [See also](#see-also)
 
 ## Prerequisites
 
@@ -309,9 +310,10 @@ combined with `and`/`or`. `--limit 0` fetches every match up to a 10,000
 hard cap, auto-paginating underneath (1,000 results per page).
 
 Unlike `gmail search`, there is **no `--enrich`/concurrency split**:
-`files.list` returns full metadata (id/name/mimeType/modifiedTime/size/...)
-per hit in one call via the `fields` parameter, so there's no separate
-hydration step to opt into. Every search also sends
+`files.list` returns full metadata (id/name/mimeType/modifiedTime/size/
+md5Checksum/sha1Checksum/sha256Checksum/...) per hit in one call via the
+`fields` parameter, so there's no separate hydration step to opt into.
+Every search also sends
 `supportsAllDrives=true` and `includeItemsFromAllDrives=true`
 unconditionally — results aren't silently scoped to My Drive only; there's
 no flag to control this because there's no reason to turn it off.
@@ -324,14 +326,15 @@ no flag to control this because there's no reason to turn it off.
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content
 $ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content --out-file report.pdf
+$ omni-dev drive read 1AbCdEfGhIjKlMnOpQrStUvWxYz --content --verify --out-file report.pdf
 $ omni-dev drive read <google-doc-id> --content
 $ omni-dev drive read <google-sheet-id> --content --export-mime-type text/csv
 ```
 
 Without `--content`, `drive read` returns metadata only:
-`Id`/`Name`/`MimeType`/`Size`/`Modified`/`Parents`/`WebViewLink` (optional
-fields shown only if present). Pass `--content` to fetch the file's actual
-bytes instead:
+`Id`/`Name`/`MimeType`/`Size`/`Modified`/`Parents`/`WebViewLink`/
+`Md5Checksum`/`Sha1Checksum`/`Sha256Checksum` (optional fields shown only
+if present). Pass `--content` to fetch the file's actual bytes instead:
 
 - **Regular files** (PDFs, images, plain text, ...) are downloaded as-is
   via `alt=media`.
@@ -362,6 +365,47 @@ too large to export). Raw `alt=media` downloads are capped client-side at
 whose length exceeds that is refused before any bytes are buffered into
 memory. A missing `Content-Length` (e.g. chunked encoding) passes through
 unchecked.
+
+**Content hashes:** `md5Checksum`/`sha1Checksum`/`sha256Checksum` are
+present only for binary-content files — absent for folders and
+Google-native documents, which have no fixed byte content to hash. `md5`
+has the broadest historical coverage (sha1/sha256 were added to the Drive
+API later, so a very old, untouched file may carry only `md5`). These
+fields aren't shown by `drive search`'s table renderer; use `-o
+json`/`-o yaml`/`-o jsonl` to see them there. `drive read`'s table output
+shows them directly (see above).
+
+**Verifying downloaded content:** pass `--content --verify` to locally
+recompute the SHA-256 checksum of the downloaded bytes and check it
+against Drive's reported `sha256Checksum`, printing a one-line
+confirmation on success. Fails clearly on a mismatch or on a file with no
+`sha256Checksum` reported. Only supported for regular (non-Google-native)
+files — Drive never returns a checksum for exported content, so
+`--verify` on a Google-native file errors immediately rather than
+exporting first.
+
+## Duplicate detection
+
+```bash
+$ omni-dev drive dedupe "'1AbCdEfGhIjKlMnOpQrStUvWxYz' in parents"
+$ omni-dev drive dedupe "name contains 'invoice'" --limit 0 -o json
+```
+
+`drive dedupe` reuses the same bulk-search path as `drive search` —
+`files.list` already returns `md5Checksum` per hit, so finding duplicates
+needs no per-file follow-up call. It groups the query's results by
+`md5Checksum` (the broadest-coverage checksum field — see [Content
+hashes](#read) above), keeping only groups with 2 or more files; a file
+with no checksum (a folder or Google-native document) is skipped
+entirely. The query argument and `--limit` behave exactly like `drive
+search`'s.
+
+Table output columns: `HASH | COUNT | FILES`, with `FILES` a comma-joined
+`name (id)` list. An empty result prints `No duplicate files found.`. Pass
+`-o json`/`-o yaml`/`-o jsonl` for machine-readable output instead.
+
+Grouping is currently fixed to `md5Checksum` — there's no `--by` flag to
+choose `sha1Checksum`/`sha256Checksum` instead.
 
 ## Rate limits and retry behaviour
 

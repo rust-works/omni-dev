@@ -2,6 +2,7 @@
 
 pub(crate) mod account;
 pub(crate) mod auth;
+pub(crate) mod dedupe;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod read;
@@ -45,6 +46,8 @@ pub enum DriveSubcommands {
     Search(search::SearchCommand),
     /// Reads a single Drive file's metadata or content.
     Read(read::ReadCommand),
+    /// Finds Drive files sharing the same content hash.
+    Dedupe(dedupe::DedupeCommand),
 }
 
 impl DriveCommand {
@@ -87,6 +90,7 @@ impl DriveSubcommands {
             Self::Account(_) => unreachable!("Account is dispatched before client resolution"),
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
+            Self::Dedupe(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -263,6 +267,17 @@ mod tests {
             content: false,
             export_mime_type: None,
             out_file: None,
+            verify: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_dedupe() {
+        let cmd = DriveSubcommands::Dedupe(dedupe::DedupeCommand {
+            query: "name contains 'x'".to_string(),
+            limit: 10,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());

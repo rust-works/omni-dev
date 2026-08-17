@@ -30,8 +30,11 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cli::drive::dedupe::group_duplicates;
 use crate::cli::drive::helpers::create_client_for;
-use crate::cli::drive::read::{is_texty, resolve_export_mime_type, GOOGLE_FOLDER, GOOGLE_SHORTCUT};
+use crate::cli::drive::read::{
+    is_texty, resolve_export_mime_type, verify_sha256_checksum, GOOGLE_FOLDER, GOOGLE_SHORTCUT,
+};
 use crate::drive::account;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
@@ -79,6 +82,21 @@ pub struct DriveSearchParams {
     pub account: Option<String>,
 }
 
+/// Parameters for the `drive_dedupe` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriveDedupeParams {
+    /// Drive query, same syntax as `drive search`'s query argument (e.g.
+    /// `'<folder-id>' in parents` to dedupe within one folder). Required.
+    pub query: String,
+    /// Maximum results to scan. Defaults to 50 when omitted; `0` explicitly
+    /// means scan every match up to the hard cap (10000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
 /// Parameters for the `drive_file_read` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DriveFileReadParams {
@@ -105,6 +123,14 @@ pub struct DriveFileReadParams {
     /// the response size limit.
     #[serde(default)]
     pub output_file: Option<String>,
+    /// Only valid with `format: "content"`. When true, locally recomputes
+    /// the SHA-256 checksum of the fetched bytes and checks it against
+    /// Drive's reported `sha256Checksum`. Only supported for non-Google-
+    /// native files — Drive never returns a checksum for exported content,
+    /// so this errors immediately on a Google-native file. Fails clearly on
+    /// a mismatch or a missing checksum.
+    #[serde(default)]
+    pub verify: Option<bool>,
     #[doc = account_param_doc!()]
     #[serde(default)]
     pub account: Option<String>,
@@ -145,11 +171,13 @@ impl OmniDevServer {
     #[tool(
         description = "Search Drive files with a Drive query (same syntax as `drive search`'s \
                        query argument, e.g. `name contains 'report' and mimeType = \
-                       'application/pdf'`). Returns id/name/mimeType/size/modifiedTime/parents/\
-                       webViewLink/owners per hit — `files.list` returns full metadata in one \
-                       call, so there's no separate hydration step. Always searches shared \
-                       drives too. `limit` defaults to 50 when omitted; pass `0` explicitly to \
-                       auto-paginate up to a hard cap (10000). \
+                       'application/pdf'`). Returns id/name/mimeType/size/md5Checksum/\
+                       sha1Checksum/sha256Checksum/modifiedTime/parents/webViewLink/owners per \
+                       hit — `files.list` returns full metadata in one call, so there's no \
+                       separate hydration step. Checksum fields are present only for \
+                       binary-content files (absent for folders and Google-native docs). \
+                       Always searches shared drives too. `limit` defaults to 50 when omitted; \
+                       pass `0` explicitly to auto-paginate up to a hard cap (10000). \
                        Read-only. Mirrors `omni-dev drive search`. Output is YAML."
     )]
     pub async fn drive_search(
@@ -161,17 +189,42 @@ impl OmniDevServer {
         Ok(build_truncated_result(yaml))
     }
 
+    /// Tool: find Drive files sharing the same content hash.
+    #[tool(
+        description = "Find Drive files sharing the same content hash, within the results of a \
+                       Drive query (same syntax as `drive_search`'s `query`, e.g. `'<folder-id>' \
+                       in parents` to dedupe within one folder). Reuses the same bulk-search \
+                       path as `drive_search` — no per-file follow-up call. Groups by \
+                       md5Checksum (the broadest-coverage checksum field); files with no \
+                       checksum (folders, Google-native documents) are skipped, and groups of \
+                       one are omitted. `limit` defaults to 50 when omitted; pass `0` explicitly \
+                       to scan up to a hard cap (10000). \
+                       Read-only. Mirrors `omni-dev drive dedupe`. Output is YAML."
+    )]
+    pub async fn drive_dedupe(
+        &self,
+        Parameters(params): Parameters<DriveDedupeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let yaml = run_dedupe(&client, &params).await.map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
+    }
+
     /// Tool: read a single Drive file's metadata or content.
     #[tool(
         description = "Read a single Drive file by id. `format: \"metadata\"` (default) \
-                       returns only metadata; `format: \"content\"` additionally fetches the \
-                       file's actual content — exported for Google-native files \
+                       returns only metadata (including md5Checksum/sha1Checksum/\
+                       sha256Checksum when available); `format: \"content\"` additionally \
+                       fetches the file's actual content — exported for Google-native files \
                        (Docs/Sheets/Slides/...; see `export_mime_type`), downloaded as-is \
                        otherwise. Folders and shortcuts are rejected with an actionable error \
                        in content mode. Text content is returned inline; binary content is \
                        refused inline and requires `output_file`. When `output_file` is set, \
                        writes the content to that path and returns a short YAML summary \
-                       instead of the inline body. \
+                       instead of the inline body. Set `verify: true` (only with `format: \
+                       \"content\"`, only for non-Google-native files) to locally recompute the \
+                       SHA-256 checksum of the fetched bytes and check it against Drive's \
+                       reported sha256Checksum, failing clearly on a mismatch. \
                        Read-only. Mirrors `omni-dev drive read`. Output is YAML."
     )]
     pub async fn drive_file_read(
@@ -239,6 +292,14 @@ async fn run_search(client: &DriveClient, params: &DriveSearchParams) -> Result<
     yaml_result(&list.files)
 }
 
+async fn run_dedupe(client: &DriveClient, params: &DriveDedupeParams) -> Result<String> {
+    let limit = params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let list = FilesApi::new(client)
+        .search_all(Some(&params.query), limit)
+        .await?;
+    yaml_result(&group_duplicates(&list.files))
+}
+
 async fn run_file_read(client: &DriveClient, params: &DriveFileReadParams) -> Result<String> {
     let format = parse_read_format(params.format.as_deref())?;
     let api = FilesApi::new(client);
@@ -247,6 +308,10 @@ async fn run_file_read(client: &DriveClient, params: &DriveFileReadParams) -> Re
             anyhow::ensure!(
                 params.output_file.is_none(),
                 "output_file requires format: \"content\"; metadata is always returned inline"
+            );
+            anyhow::ensure!(
+                !params.verify.unwrap_or(false),
+                "verify requires format: \"content\"; metadata is always returned inline"
             );
             let meta = api.get_metadata(&params.file_id).await?;
             yaml_result(&meta)
@@ -275,6 +340,13 @@ async fn run_file_read_content(api: &FilesApi<'_>, params: &DriveFileReadParams)
             meta.name
         );
     }
+    let verify = params.verify.unwrap_or(false);
+    if verify && meta.is_google_native() {
+        anyhow::bail!(
+            "verify is not supported for Google-native files: Drive does not return a checksum \
+             for exported content"
+        );
+    }
 
     let (bytes, content_mime_type) = if meta.is_google_native() {
         let export_mime = resolve_export_mime_type(&meta, params.export_mime_type.as_deref())?;
@@ -284,6 +356,10 @@ async fn run_file_read_content(api: &FilesApi<'_>, params: &DriveFileReadParams)
         let bytes = api.download(&params.file_id).await?;
         (bytes, meta.mime_type.clone())
     };
+
+    if verify {
+        verify_sha256_checksum(&bytes, meta.sha256_checksum.as_deref())?;
+    }
 
     match params.output_file.as_deref() {
         Some(path) => write_bytes_to_file_yaml(path, &bytes, &content_mime_type),
@@ -556,6 +632,66 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
+    // ── run_dedupe ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_dedupe_groups_files_sharing_a_checksum() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "files": [
+                        {"id": "f1", "name": "a", "md5Checksum": "hash-a"},
+                        {"id": "f2", "name": "b", "md5Checksum": "hash-a"},
+                        {"id": "f3", "name": "c", "md5Checksum": "hash-b"},
+                    ],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_dedupe(
+            &client,
+            &DriveDedupeParams {
+                query: "name contains 'x'".to_string(),
+                limit: Some(10),
+                account: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("checksum: hash-a"));
+        assert!(yaml.contains("id: f1"));
+        assert!(yaml.contains("id: f2"));
+        assert!(!yaml.contains("hash-b"));
+    }
+
+    #[tokio::test]
+    async fn run_dedupe_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let err = run_dedupe(
+            &client,
+            &DriveDedupeParams {
+                query: "*".to_string(),
+                limit: None,
+                account: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
     // ── run_file_read (metadata) ────────────────────────────────────
 
     fn read_params(
@@ -569,6 +705,7 @@ mod tests {
             format: format.map(str::to_string),
             export_mime_type: export_mime_type.map(str::to_string),
             output_file: output_file.map(str::to_string),
+            verify: None,
             account: None,
         }
     }
@@ -867,6 +1004,102 @@ mod tests {
         assert!(err.to_string().contains("404"));
     }
 
+    // ── run_file_read (content, verify) ─────────────────────────────
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_succeeds_on_matching_checksum() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        run_file_read(&client, &params).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_fails_clearly_on_mismatch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "text/plain",
+                    "sha256Checksum": "not-the-real-hash",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_file_read_content_verify_rejects_google_native_file_before_exporting() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/vnd.google-apps.document",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No mock for /drive/v3/files/f1/export — if the Google-native
+        // rejection didn't run before the export call, this test would 404
+        // rather than surfacing the expected error.
+
+        let mut params = read_params("f1", Some("content"), None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("verify is not supported for Google-native files"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_file_read_metadata_rejects_verify() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let mut params = read_params("f1", None, None, None);
+        params.verify = Some(true);
+        let err = run_file_read(&client, &params).await.unwrap_err();
+        assert!(err.to_string().contains("verify requires format"), "{err}");
+    }
+
     // ── Tool handler bodies (smoke + auth-status full path) ───────────
 
     #[tokio::test(flavor = "current_thread")]
@@ -941,6 +1174,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("unknown Drive account 'bogus'"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_dedupe_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .drive_dedupe(Parameters(DriveDedupeParams {
+                query: "*".to_string(),
+                limit: None,
+                account: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
     }
 
     // ── run_account_list / drive_account_list ──────────────────────────
