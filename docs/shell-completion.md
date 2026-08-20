@@ -16,7 +16,7 @@ via `omni-dev help-all`.
 omni-dev completions bash | head
 ```
 
-If you see a `_omni-dev()` function definition, the binary is working. The
+If you see a `_omni__dev()` function definition, the binary is working. The
 remaining sections cover how to install the script so your shell actually
 loads it.
 
