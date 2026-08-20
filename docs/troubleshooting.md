@@ -162,6 +162,57 @@ Error: Claude API key not found
    - Check rate limits in Anthropic Console
    - Consider upgrading account tier
 
+### Gateway rejects `output_config`
+
+**Symptom**: an AI call fails with an HTTP 400 naming the structured-output
+field, when `ANTHROPIC_BEDROCK_BASE_URL` points at an internal gateway rather
+than at Bedrock directly:
+
+```console
+Error: Claude API request failed (HTTP 400):
+{"message":"output_config.format: Extra inputs are not permitted"}
+```
+
+**Cause**: omni-dev asks models flagged `supports_structured_output` in the
+[model registry](ai-backends.md#model-registry) for a schema-constrained
+response via the Messages API `output_config.format` field. That is a
+per-*model* capability; a proxy in front of the API is a per-*endpoint*
+concern the registry cannot see, and a gateway that validates request bodies
+strictly rejects the field it does not know. The rejection comes from the
+gateway, not from Bedrock — structured outputs are GA on Bedrock itself.
+
+**Expected behaviour**: omni-dev recognises this rejection, warns, and retries
+the call without the field, disabling structured output for the remainder of
+the run — the command completes normally. If you see the error itself rather
+than the warning, you are on a release older than the fix.
+
+**Solutions**:
+
+1. **Skip the rejected request entirely** (applies to every backend and model):
+
+   ```bash
+   export OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true
+   ```
+
+   Like every other omni-dev variable this can also live in an `env` bundle or
+   profile in `~/.omni-dev/settings.json`, or in a CI job's `env:` block.
+
+2. **Scope it to one model** — set the registry flag `false` for the model
+   routed through the gateway, in `~/.omni-dev/models.yaml`:
+
+   ```yaml
+   version: "1"
+   models:
+     - provider: "claude"
+       model: "global.anthropic.claude-sonnet-5"
+       api_identifier: "global.anthropic.claude-sonnet-5"
+       supports_structured_output: false
+   ```
+
+3. **Have the gateway pass the field through** — the only option that keeps
+   schema-constrained responses, and the right fix where you control the
+   gateway: this is a configuration gap, not a platform limitation.
+
 ## Configuration Issues
 
 ### Error: Scopes not detected
