@@ -192,6 +192,15 @@ pub(crate) mod shim {
     //! `claude-cli` backend does the equivalent at its own spawn boundary with
     //! [`spawn_with_etxtbsy_retry`](crate::claude::ai::claude_cli).)
     //!
+    //! [`retry_on_etxtbsy_async`] is the same retry for a test that drives a
+    //! production `async fn` end-to-end (e.g. a `WorktreesService` op that
+    //! `spawn_blocking`s the shim exec internally) rather than calling the
+    //! sync `Command`-spawning function directly — a plain `shim_lock` guard
+    //! bounds concurrent shim subprocesses but does **not** retry the exec
+    //! race, so a test that only takes the lock can still flake. See #1348 for
+    //! the sync case and the `merge_queue_with_*` tests in
+    //! `daemon::services::worktrees` for the async one.
+    //!
     //! Separately, [`shim_lock`] serialises tests that spawn a subprocess from a
     //! freshly-written shim. This is **not** the `ETXTBSY` fix (the retry above
     //! is) — the offending `fork()` comes from unrelated tests that never take
@@ -249,6 +258,34 @@ pub(crate) mod shim {
         // Budget exhausted: return the final attempt's result, ETXTBSY or not,
         // so the caller fails loudly rather than looping forever.
         f()
+    }
+
+    /// Async counterpart to [`retry_on_etxtbsy`], for a test that awaits a
+    /// production `async fn` that shells out to a freshly-written shim
+    /// (rather than calling the sync spawn function directly, which
+    /// [`retry_on_etxtbsy`] already covers). Same retry budget and backoff,
+    /// but sleeps via `tokio::time::sleep` so it can run inside a
+    /// `#[tokio::test]` without blocking the runtime thread.
+    pub(crate) async fn retry_on_etxtbsy_async<T, F, Fut>(mut f: F) -> anyhow::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        use std::time::Duration;
+        const MAX_ATTEMPTS: u32 = 8;
+        let mut backoff = Duration::from_millis(5);
+        for _ in 1..MAX_ATTEMPTS {
+            match f().await {
+                Err(e) if is_etxtbsy(&e) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+                other => return other,
+            }
+        }
+        // Budget exhausted: return the final attempt's result, ETXTBSY or not,
+        // so the caller fails loudly rather than looping forever.
+        f().await
     }
 
     /// Whether any error in `err`'s chain is an [`std::io::Error`] carrying
@@ -345,6 +382,50 @@ pub(crate) mod shim {
                 calls += 1;
                 Err(etxtbsy_error())
             });
+            assert!(is_etxtbsy(&result.unwrap_err()));
+            assert_eq!(calls, 8, "should try MAX_ATTEMPTS times, then give up");
+        }
+
+        #[tokio::test]
+        async fn retry_on_etxtbsy_async_succeeds_after_transient_failures() {
+            let mut calls = 0;
+            let out = retry_on_etxtbsy_async(|| {
+                calls += 1;
+                let calls = calls;
+                async move {
+                    if calls <= 3 {
+                        Err(etxtbsy_error())
+                    } else {
+                        Ok(calls)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(out, 4, "should succeed on the 4th attempt");
+            assert_eq!(calls, 4);
+        }
+
+        #[tokio::test]
+        async fn retry_on_etxtbsy_async_returns_a_non_etxtbsy_error_without_retrying() {
+            let mut calls = 0;
+            let result: anyhow::Result<()> = retry_on_etxtbsy_async(|| {
+                calls += 1;
+                async { Err(anyhow::anyhow!("a real failure")) }
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "a non-ETXTBSY error must not be retried");
+        }
+
+        #[tokio::test]
+        async fn retry_on_etxtbsy_async_gives_up_after_the_budget_and_returns_the_last_error() {
+            let mut calls = 0;
+            let result: anyhow::Result<()> = retry_on_etxtbsy_async(|| {
+                calls += 1;
+                async { Err(etxtbsy_error()) }
+            })
+            .await;
             assert!(is_etxtbsy(&result.unwrap_err()));
             assert_eq!(calls, 8, "should try MAX_ATTEMPTS times, then give up");
         }
