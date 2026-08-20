@@ -110,6 +110,35 @@ impl ClaudeError {
             _ => true,
         }
     }
+
+    /// Returns `true` when the endpoint rejected the structured-output field
+    /// `output_config` itself, rather than anything about the request's
+    /// content.
+    ///
+    /// Anthropic's Messages API takes `output_config.format` on models the
+    /// registry flags via `supports_structured_output`, but a gateway named by
+    /// `ANTHROPIC_BEDROCK_BASE_URL` may not pass the field through, and answers
+    /// a strict-schema rejection — `{"message": "output_config.format: Extra
+    /// inputs are not permitted"}` — rather than a model or content error
+    /// (issue #1561). That is a property of the *endpoint*, which the
+    /// per-model registry gate cannot know, so callers use this to drop to the
+    /// YAML response path instead of failing the run.
+    ///
+    /// The field-name match is the load-bearing half, keeping this narrow
+    /// enough that no ordinary `400` (bad model, oversized prompt, malformed
+    /// body) can trip it. `422` is accepted alongside `400` because
+    /// pydantic-style gateways conventionally use it for exactly this
+    /// unrecognised-field rejection.
+    #[must_use]
+    pub fn is_structured_output_rejection(&self) -> bool {
+        match self {
+            Self::ApiHttpError {
+                status: 400 | 422,
+                body,
+            } => body.to_ascii_lowercase().contains("output_config"),
+            _ => false,
+        }
+    }
 }
 
 /// Reports whether an AI error could plausibly succeed on a retry.
@@ -124,6 +153,20 @@ pub fn is_transient_ai_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ClaudeError>()
         .map_or(true, ClaudeError::is_transient)
+}
+
+/// Reports whether an AI error is an endpoint rejecting the `output_config`
+/// structured-output field — see
+/// [`ClaudeError::is_structured_output_rejection`].
+///
+/// Errors that are not a [`ClaudeError`] cannot be classified, so they are
+/// reported as `false`: only a positively-identified rejection may make a
+/// caller degrade to the YAML path.
+#[must_use]
+pub fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ClaudeError>()
+        .is_some_and(ClaudeError::is_structured_output_rejection)
 }
 
 // Note: anyhow already has a blanket impl for thiserror::Error types
@@ -173,5 +216,56 @@ mod tests {
         let rendered = http(404).to_string();
         assert!(rendered.contains("404"), "{rendered}");
         assert!(rendered.contains("body"), "{rendered}");
+    }
+
+    fn http_body(status: u16, body: &str) -> ClaudeError {
+        ClaudeError::ApiHttpError {
+            status,
+            body: String::from(body),
+        }
+    }
+
+    /// The reported gateway rejection (#1561) — and its `422` variant — are
+    /// recognised, in whatever case the endpoint spells the field.
+    #[test]
+    fn output_config_rejections_are_recognised() {
+        for status in [400, 422] {
+            assert!(
+                http_body(
+                    status,
+                    r#"{"message":"output_config.format: Extra inputs are not permitted"}"#
+                )
+                .is_structured_output_rejection(),
+                "HTTP {status} naming output_config should be recognised"
+            );
+        }
+        assert!(http_body(400, "OUTPUT_CONFIG is not supported").is_structured_output_rejection());
+    }
+
+    /// The predicate must stay narrow: an ordinary `4xx`, and a `5xx` that
+    /// happens to echo the field name, are not endpoint rejections of it.
+    #[test]
+    fn other_failures_are_not_output_config_rejections() {
+        assert!(!http_body(400, "max_tokens: must be positive").is_structured_output_rejection());
+        assert!(!http_body(404, "output_config").is_structured_output_rejection());
+        assert!(!http_body(500, "output_config exploded").is_structured_output_rejection());
+        assert!(
+            !ClaudeError::ApiRequestFailed(String::from("output_config"))
+                .is_structured_output_rejection()
+        );
+    }
+
+    /// An error that is not a [`ClaudeError`] cannot be classified, so the
+    /// `anyhow` helper reports `false` rather than degrading on a guess.
+    #[test]
+    fn anyhow_helper_classifies_only_claude_errors() {
+        let rejection: anyhow::Error = http_body(400, "output_config.format: nope").into();
+        assert!(is_structured_output_rejection(&rejection));
+
+        let other: anyhow::Error = http_body(400, "bad request").into();
+        assert!(!is_structured_output_rejection(&other));
+
+        let foreign = anyhow::anyhow!("output_config");
+        assert!(!is_structured_output_rejection(&foreign));
     }
 }

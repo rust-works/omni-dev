@@ -57,10 +57,16 @@ struct BedrockRequest {
 }
 
 /// Bedrock API content.
+///
+/// `text` is absent on non-text blocks (e.g. extended-thinking blocks emitted
+/// alongside the answer); `#[serde(default)]` keeps those blocks
+/// deserializable instead of failing the whole response, since the caller
+/// only reads `text` after filtering on `content_type == "text"`.
 #[derive(Deserialize, Debug)]
 struct Content {
     #[serde(rename = "type")]
     content_type: String,
+    #[serde(default)]
     text: String,
 }
 
@@ -261,11 +267,13 @@ impl BedrockAiClient {
             "Received Bedrock API response"
         );
 
-        // Extract text content from response
+        // Extract text content from response. Not necessarily the first
+        // block: extended-thinking models emit a leading `thinking` block
+        // ahead of the `text` answer.
         let result = bedrock_response
             .content
-            .first()
-            .filter(|c| c.content_type == "text")
+            .iter()
+            .find(|c| c.content_type == "text")
             .map(|c| c.text.clone())
             .ok_or_else(|| {
                 ClaudeError::InvalidResponseFormat("No text content in response".to_string()).into()
@@ -341,6 +349,37 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"id":"msg_1","type":"message","role":"assistant","model":"m",
                     "content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = BedrockAiClient::new(
+            "claude-3-opus-20240229".to_string(),
+            "test_token".to_string(),
+            server.uri(),
+            None,
+        )
+        .unwrap();
+
+        let out = client.send_request("system", "user").await.unwrap();
+        assert_eq!(out, "hi there");
+    }
+
+    #[tokio::test]
+    async fn send_request_skips_leading_thinking_block() {
+        // Extended-thinking models emit a `thinking` block (no `text` field)
+        // ahead of the `text` answer; the response must still deserialize and
+        // the `text` block must still be found rather than just the first one.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":"msg_1","type":"message","role":"assistant","model":"m",
+                    "content":[{"type":"thinking","thinking":"","signature":"sig"},
+                               {"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#,
             ))
             .expect(1)
             .mount(&server)
