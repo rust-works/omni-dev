@@ -388,10 +388,17 @@ with the scope definitions in `.omni-dev/scopes.yaml`:
 3. **Single source of truth** — `scopes.yaml` is the canonical definition. The scope list in
    `commit-guidelines.md` exists only so the AI prompt has inline context; it must never
    diverge from the YAML file.
+4. **Tree coverage** — every tracked file under `src/`, `editors/` and `.github/` must be
+   matched by some scope's `file_patterns` (or listed in the `allow:` list for files that
+   legitimately belong to no subsystem). When a new subsystem or module facade lands,
+   `scopes.yaml` must gain a pattern for it in the same change.
 
-All three clauses are enforced by
-[`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs), so a
-divergence fails the build rather than silently degrading the prompt.
+Clauses 1–3 are enforced by
+[`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs); clause
+4 is enforced by `omni-dev config scopes lint`, exercised end-to-end by the
+`binary_config_scopes_lint_*` tests in
+[`tests/integration_test.rs`](../tests/integration_test.rs). Together they make a divergence
+fail the build rather than silently degrading the prompt.
 
 ### Motivation
 
