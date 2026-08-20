@@ -794,6 +794,23 @@ mod tests {
     }
 
     #[test]
+    fn suggest_scope_fix_inserts_missing_scope_preserves_body() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let rules = CommitRules {
+            require_scope: true,
+            ..CommitRules::default()
+        };
+        let message = "chore: bump deps\n\nSome body text.";
+        let issues = lint_message(message, &rules, &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(
+            suggestion.message,
+            "chore(cargo): bump deps\n\nSome body text."
+        );
+    }
+
+    #[test]
     fn suggest_scope_fix_preserves_body() {
         let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
         let message = "chore(deps): bump deps\n\nSome body text.";
