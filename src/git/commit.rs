@@ -1227,6 +1227,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_scope_specific_pattern_beats_lib_catch_all() {
+        // Pins the specificity behaviour issue #1468 depends on: a file
+        // covered by a dedicated scope pattern must resolve there, not fall
+        // through to the Rust ecosystem `lib` scope's `src/**` catch-all.
+        let scope_defs = vec![
+            make_scope_def("lib", &["src/lib.rs", "src/**"]),
+            make_scope_def("worktrees", &["src/worktrees.rs"]),
+        ];
+        assert_eq!(
+            resolve_scope(&["src/worktrees.rs"], &scope_defs),
+            Some("worktrees".to_string())
+        );
+    }
+
+    #[test]
     fn refine_scope_no_matching_files() {
         let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
         let mut analysis = CommitAnalysis {
