@@ -55,12 +55,44 @@ pub struct LintCommand {
     /// commit range (for a `commit-msg` git hook call site).
     #[arg(long)]
     pub stdin: bool,
+
+    /// Populates a deterministic corrected-scope suggestion for each commit
+    /// with an `unknown-scope`/`missing-scope` issue, resolved from the
+    /// commit's changed files against `.omni-dev/scopes.yaml` + ecosystem
+    /// defaults — no AI, no network. Report-only; use `--fix` to apply.
+    /// Requires a commit range (incompatible with `--stdin`, which has no
+    /// changed-files list to resolve a scope from).
+    #[arg(long)]
+    pub suggest: bool,
+
+    /// Applies `--suggest`'s deterministic scope corrections directly to
+    /// the repository, via the same `AmendmentHandler` path `git commit
+    /// message amend` uses. No AI, no confirmation prompt — only ever
+    /// touches a commit with a resolvable `unknown-scope`/`missing-scope`
+    /// issue. Implies `--suggest`. Requires a commit range (incompatible
+    /// with `--stdin`).
+    #[arg(long)]
+    pub fix: bool,
+
+    /// Permits `--fix` to amend commits already present in a detected
+    /// remote main branch (rewrites published history). Mirrors `git
+    /// commit message amend --allow-pushed` / `twiddle --allow-pushed`.
+    /// Ignored without `--fix`.
+    #[arg(long)]
+    pub allow_pushed: bool,
 }
 
 impl LintCommand {
     /// Executes the lint command, validating commit messages against
     /// deterministic rules.
     pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+        if self.stdin && (self.suggest || self.fix) {
+            anyhow::bail!(
+                "--suggest/--fix require a commit range (not --stdin) — a bare message has no \
+                 changed-files list to resolve a scope from"
+            );
+        }
+
         let repo_root = match repo {
             Some(p) => p.to_path_buf(),
             None => std::env::current_dir().context("Failed to determine current directory")?,
@@ -85,18 +117,67 @@ impl LintCommand {
             lint_report_for_message(&message, &rules, &valid_scopes)
         } else {
             let range = self.resolve_range(repo_root)?;
-            lint_report_for_range(repo_root, &range, &rules, &valid_scopes)?
+            lint_report_for_range(
+                repo_root,
+                &range,
+                &rules,
+                &valid_scopes,
+                self.suggest || self.fix,
+            )?
         };
 
         self.output_report(&report, output_format)?;
 
+        if self.fix {
+            self.apply_fixes(repo_root, &report)?;
+        }
+
         // Unlike `check`, an empty range is a clean exit (0), not an error —
-        // a deterministic gate with nothing to lint isn't a failure.
+        // a deterministic gate with nothing to lint isn't a failure. Note
+        // this reads the pre-`--fix` report (mirroring `check --twiddle`'s
+        // identical ordering): `--fix`'s own success/failure is reported
+        // separately by `apply_fixes` above.
         let exit_code = report.exit_code(self.strict);
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
 
+        Ok(())
+    }
+
+    /// Applies every commit's deterministic scope-fix suggestion (populated
+    /// by `--suggest`/`--fix` on `report`) directly via the same
+    /// `AmendmentHandler` path `git commit message amend` uses. No prompt —
+    /// safe for CI/hook use, since only a resolvable
+    /// `unknown-scope`/`missing-scope` issue is ever touched.
+    fn apply_fixes(&self, repo_root: &Path, report: &CheckReport) -> Result<()> {
+        use crate::data::amendments::{Amendment, AmendmentFile};
+        use crate::git::AmendmentHandler;
+
+        let amendments: Vec<Amendment> = report
+            .commits
+            .iter()
+            .filter_map(|c| {
+                let suggestion = c.suggestion.as_ref()?;
+                Some(Amendment::new(c.hash.clone(), suggestion.message.clone()))
+            })
+            .collect();
+
+        if amendments.is_empty() {
+            println!("✨ No deterministic scope fixes to apply");
+            return Ok(());
+        }
+
+        let count = amendments.len();
+        let amendment_file = AmendmentFile { amendments };
+        let handler = AmendmentHandler::new(repo_root)
+            .context("Failed to initialize amendment handler")?
+            .with_allow_pushed(self.allow_pushed);
+        handler
+            .apply_amendment_file(&amendment_file)
+            .context("Failed to apply deterministic scope fixes")?;
+
+        println!("✅ Fixed {count} commit message(s)");
         Ok(())
     }
 
@@ -199,6 +280,16 @@ impl LintCommand {
                 );
             }
 
+            if !self.quiet {
+                if let Some(suggestion) = &result.suggestion {
+                    println!();
+                    print!(
+                        "{}",
+                        super::formatting::format_suggestion_text(suggestion, self.verbose)
+                    );
+                }
+            }
+
             println!();
         }
 
@@ -250,11 +341,18 @@ fn lint_report_for_message(
 /// Merge commits are already excluded by
 /// [`crate::git::GitRepository::get_commits_in_range`] — no additional
 /// filtering needed here. An empty range yields an empty (clean) report.
+///
+/// When `compute_suggestions` is set, each commit with an
+/// `unknown-scope`/`missing-scope` issue gets a deterministic
+/// [`crate::git::suggest_scope_fix`] suggestion, using its already-computed
+/// `file_changes` (populated by `get_commits_in_range`, otherwise unused by
+/// lint).
 fn lint_report_for_range(
     repo_root: &Path,
     range: &str,
     rules: &crate::data::context::CommitRules,
     valid_scopes: &[crate::data::context::ScopeDefinition],
+    compute_suggestions: bool,
 ) -> Result<CheckReport> {
     let repo = crate::git::GitRepository::open_at(repo_root)
         .context("Failed to open git repository at the given path")?;
@@ -265,6 +363,23 @@ fn lint_report_for_range(
         .map(|commit| {
             let issues = crate::git::lint_message(&commit.original_message, rules, valid_scopes);
             let passes = crate::git::lint_passes(&issues);
+            let suggestion = if compute_suggestions {
+                let files: Vec<&str> = commit
+                    .analysis
+                    .file_changes
+                    .file_list
+                    .iter()
+                    .map(|f| f.file.as_str())
+                    .collect();
+                crate::git::suggest_scope_fix(
+                    &commit.original_message,
+                    &files,
+                    valid_scopes,
+                    &issues,
+                )
+            } else {
+                None
+            };
             CommitCheckResult {
                 hash: commit.hash.clone(),
                 message: commit
@@ -274,7 +389,7 @@ fn lint_report_for_range(
                     .unwrap_or("")
                     .to_string(),
                 issues,
-                suggestion: None,
+                suggestion,
                 passes,
                 summary: None,
             }
@@ -321,13 +436,27 @@ pub enum LintInput {
 ///
 /// `repo_path` selects the repository (`None` defaults to the current
 /// working directory); `context_dir` overrides the `.omni-dev/` resolution
-/// chain for both `scopes.yaml` and `commit-rules.yaml`.
+/// chain for both `scopes.yaml` and `commit-rules.yaml`. `suggest` populates
+/// a deterministic scope-fix suggestion per commit (see
+/// [`crate::git::suggest_scope_fix`]) — report-only, mirroring the CLI's
+/// `--suggest`; it is an error to combine with [`LintInput::Message`], which
+/// has no changed-files list to resolve a scope from. There is no `fix`
+/// equivalent here: applying amendments stays exclusive to the CLI's
+/// `--fix` and the `git_amend_commits` MCP tool.
 pub async fn run_lint(
     input: LintInput,
     repo_path: Option<&Path>,
     context_dir: Option<&Path>,
     strict: bool,
+    suggest: bool,
 ) -> Result<LintOutcome> {
+    if suggest && matches!(input, LintInput::Message(_)) {
+        anyhow::bail!(
+            "suggest requires a commit range — a literal message has no changed-files list to \
+             resolve a scope from"
+        );
+    }
+
     let repo_root = match repo_path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().context("Failed to determine current directory")?,
@@ -348,7 +477,7 @@ pub async fn run_lint(
                     .context("Failed to open git repository at the given path")?;
                 super::default_commit_range(&repo)?
             };
-            lint_report_for_range(repo_root, &range, &rules, &valid_scopes)?
+            lint_report_for_range(repo_root, &range, &rules, &valid_scopes, suggest)?
         }
     };
 
@@ -444,12 +573,48 @@ mod tests {
         sh(&["merge", "side", "--no-ff", "-m", "Merge branch 'side'"]);
     }
 
+    /// Writes `path` and commits it for real (not `--allow-empty`), so the
+    /// commit has a genuine `file_changes` list for `--suggest`/`--fix` to
+    /// resolve a scope from.
+    fn commit_file(dir: &Path, path: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(path), contents).unwrap();
+        let add = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["add", path])
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add {path} failed");
+        commit(dir, message);
+    }
+
+    /// Returns HEAD's commit id, in its own function (rather than an inline
+    /// block) so `git2::Reference`/`Commit`'s borrow of `repo` doesn't get
+    /// tangled up with the enclosing test's other locals.
+    fn head_oid(repo_path: &Path) -> git2::Oid {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        commit.id()
+    }
+
+    /// Writes a `cargo` scope (matching `Cargo.toml`/`Cargo.lock`) to
+    /// `context_dir/scopes.yaml` — the Dependabot-style fixture from #1564.
+    fn write_cargo_scope(context_dir: &Path) {
+        std::fs::create_dir_all(context_dir).unwrap();
+        std::fs::write(
+            context_dir.join("scopes.yaml"),
+            "scopes:\n  - name: cargo\n    description: Cargo files\n    examples: []\n    file_patterns:\n      - Cargo.toml\n      - Cargo.lock\n",
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn run_lint_message_flags_known_issues() {
         let outcome = run_lint(
             LintInput::Message("feature(bogus): Bad Message.".to_string()),
             None,
             None,
+            false,
             false,
         )
         .await
@@ -466,6 +631,7 @@ mod tests {
             LintInput::Message("feat(cli): add thing".to_string()),
             None,
             None,
+            false,
             false,
         )
         .await
@@ -484,6 +650,7 @@ mod tests {
             Some(temp_dir.path()),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -500,6 +667,7 @@ mod tests {
             LintInput::Range(Some("HEAD..HEAD".to_string())),
             Some(temp_dir.path()),
             None,
+            false,
             false,
         )
         .await
@@ -521,6 +689,7 @@ mod tests {
             Some(temp_dir.path()),
             None,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -539,6 +708,7 @@ mod tests {
             Some(temp_dir.path()),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -546,6 +716,7 @@ mod tests {
             LintInput::Message("feature(bogus): Bad Message.".to_string()),
             None,
             None,
+            false,
             false,
         )
         .await
@@ -569,6 +740,9 @@ mod tests {
             verbose: false,
             show_passing: true,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -589,6 +763,9 @@ mod tests {
             verbose: false,
             show_passing: true,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -611,6 +788,9 @@ mod tests {
             verbose: false,
             show_passing: true,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -624,9 +804,15 @@ mod tests {
     #[tokio::test]
     async fn run_lint_range_none_uses_default_commit_range() {
         let temp_dir = init_test_repo();
-        let outcome = run_lint(LintInput::Range(None), Some(temp_dir.path()), None, false)
-            .await
-            .unwrap();
+        let outcome = run_lint(
+            LintInput::Range(None),
+            Some(temp_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.total_commits, 0);
     }
 
@@ -649,6 +835,9 @@ mod tests {
             verbose: true,
             show_passing: false,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -681,6 +870,9 @@ mod tests {
             verbose: true,
             show_passing: false,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -707,6 +899,9 @@ mod tests {
             verbose: true,
             show_passing: false,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -740,6 +935,9 @@ mod tests {
             verbose: false,
             show_passing: false,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
@@ -768,9 +966,220 @@ mod tests {
             verbose: false,
             show_passing: true,
             stdin: false,
+            suggest: false,
+            fix: false,
+            allow_pushed: false,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
         assert!(result.is_ok(), "expected clean exit, got: {result:?}");
+    }
+
+    // ── --suggest / --fix (#1564) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_lint_range_with_suggest_resolves_dependabot_style_scope() {
+        let temp_dir = init_test_repo();
+        let context_dir = temp_dir.path().join(".omni-dev");
+        write_cargo_scope(&context_dir);
+        commit_file(
+            temp_dir.path(),
+            "Cargo.toml",
+            "[package]\n",
+            "chore(deps): bump foo",
+        );
+
+        let outcome = run_lint(
+            LintInput::Range(Some("HEAD~1..HEAD".to_string())),
+            Some(temp_dir.path()),
+            Some(&context_dir),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.has_errors, "unknown-scope should still be flagged");
+        assert!(
+            outcome.report_yaml.contains("chore(cargo): bump foo"),
+            "expected a deterministic suggestion in report_yaml: {}",
+            outcome.report_yaml
+        );
+    }
+
+    #[tokio::test]
+    async fn run_lint_range_without_suggest_leaves_suggestion_none() {
+        let temp_dir = init_test_repo();
+        let context_dir = temp_dir.path().join(".omni-dev");
+        write_cargo_scope(&context_dir);
+        commit_file(
+            temp_dir.path(),
+            "Cargo.toml",
+            "[package]\n",
+            "chore(deps): bump foo",
+        );
+
+        let outcome = run_lint(
+            LintInput::Range(Some("HEAD~1..HEAD".to_string())),
+            Some(temp_dir.path()),
+            Some(&context_dir),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !outcome.report_yaml.contains("suggestion:"),
+            "no suggestion should be present without --suggest: {}",
+            outcome.report_yaml
+        );
+    }
+
+    #[tokio::test]
+    async fn run_lint_message_with_suggest_errors() {
+        let err = run_lint(
+            LintInput::Message("feat(cli): add thing".to_string()),
+            None,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase()
+                .contains("suggest requires a commit range"),
+            "expected a clear validation error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_execute_stdin_with_suggest_errors() {
+        let cmd = LintCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Text,
+            strict: false,
+            quiet: false,
+            verbose: false,
+            show_passing: false,
+            stdin: true,
+            suggest: true,
+            fix: false,
+            allow_pushed: false,
+        };
+        let err = cmd.execute(None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--suggest/--fix require a commit range"),
+            "expected a clear validation error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_execute_stdin_with_fix_errors() {
+        let cmd = LintCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Text,
+            strict: false,
+            quiet: false,
+            verbose: false,
+            show_passing: false,
+            stdin: true,
+            suggest: false,
+            fix: true,
+            allow_pushed: false,
+        };
+        let err = cmd.execute(None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--suggest/--fix require a commit range"));
+    }
+
+    /// Exercises `apply_fixes` directly rather than the full `execute()`
+    /// path — the fixture commit has an `unknown-scope` error, and
+    /// `execute()`'s exit-code handling would call `std::process::exit` and
+    /// abort this whole test binary (see the `show_passing` test above for
+    /// the same caveat).
+    #[test]
+    fn apply_fixes_amends_commit_via_amendment_handler() {
+        let temp_dir = init_test_repo();
+        // The context dir must live OUTSIDE the repo working tree — inside
+        // it, an untracked `.omni-dev/scopes.yaml` would make
+        // `AmendmentHandler`'s working-directory-clean safety check refuse
+        // to amend anything.
+        let context_tmp =
+            tempfile::tempdir_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp"))
+                .unwrap();
+        let context_dir = context_tmp.path().join(".omni-dev");
+        write_cargo_scope(&context_dir);
+        commit_file(
+            temp_dir.path(),
+            "Cargo.toml",
+            "[package]\n",
+            "chore(deps): bump foo",
+        );
+
+        let ctx_dir =
+            crate::claude::context::resolve_context_dir_at(Some(&context_dir), temp_dir.path());
+        let valid_scopes = crate::claude::context::load_project_scopes(&ctx_dir, temp_dir.path());
+        let rules = crate::claude::context::load_commit_rules(&ctx_dir);
+        let report =
+            lint_report_for_range(temp_dir.path(), "HEAD~1..HEAD", &rules, &valid_scopes, true)
+                .unwrap();
+
+        let cmd = LintCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Json,
+            strict: false,
+            quiet: true,
+            verbose: false,
+            show_passing: true,
+            stdin: false,
+            suggest: false,
+            fix: true,
+            allow_pushed: false,
+        };
+        cmd.apply_fixes(temp_dir.path(), &report).unwrap();
+
+        let repo = git2::Repository::open(temp_dir.path()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let msg = head.message().unwrap().to_string();
+        assert!(
+            msg.starts_with("chore(cargo): bump foo"),
+            "expected the amended message at HEAD, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn apply_fixes_with_no_suggestions_is_a_clean_noop() {
+        let temp_dir = init_test_repo();
+        let head_before = head_oid(temp_dir.path());
+
+        let report = CheckReport::new(vec![]);
+        let cmd = LintCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Json,
+            strict: false,
+            quiet: true,
+            verbose: false,
+            show_passing: true,
+            stdin: false,
+            suggest: false,
+            fix: true,
+            allow_pushed: false,
+        };
+        cmd.apply_fixes(temp_dir.path(), &report).unwrap();
+
+        let head_after = head_oid(temp_dir.path());
+        assert_eq!(head_before, head_after, "HEAD must be unchanged");
     }
 }

@@ -97,6 +97,15 @@ pub struct GitLintCommitsParams {
     /// Defaults to `false` (only errors fail).
     #[serde(default)]
     pub strict: bool,
+    /// When true, populates a deterministic corrected-scope suggestion
+    /// (no AI, no network) for each commit with an
+    /// `unknown-scope`/`missing-scope` issue, resolved from its changed
+    /// files against `scopes.yaml` + ecosystem defaults. Report-only —
+    /// mutation stays exclusive to `git_amend_commits`. Errors if combined
+    /// with `message` (a literal message has no changed-files list).
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub suggest: bool,
 }
 
 /// Parameters for the `git_twiddle_commits` tool.
@@ -274,10 +283,13 @@ impl OmniDevServer {
                        truthfulness — those need a model and stay in `git_check_commits`. Set \
                        `message` to lint a single literal message directly (bypassing git \
                        entirely), or `range` to lint every non-merge commit in a range (defaults \
-                       to commits ahead of the base branch). Mirrors \
-                       `omni-dev git commit message lint`. Returns a YAML payload with the full \
-                       CheckReport, a pass/fail summary, and the exit code the CLI would use \
-                       (honouring `strict`)."
+                       to commits ahead of the base branch). Set `suggest = true` to also populate \
+                       a deterministic corrected-scope suggestion (no AI) for each \
+                       `unknown-scope`/`missing-scope` issue — report-only; apply one via \
+                       `git_amend_commits`, or use the CLI's `lint --fix` to apply directly. \
+                       Mirrors `omni-dev git commit message lint --suggest`. Returns a YAML \
+                       payload with the full CheckReport, a pass/fail summary, and the exit code \
+                       the CLI would use (honouring `strict`)."
     )]
     pub async fn git_lint_commits(
         &self,
@@ -293,6 +305,7 @@ impl OmniDevServer {
             params.repo_path.as_deref().map(std::path::Path::new),
             params.context_dir.as_deref().map(std::path::Path::new),
             params.strict,
+            params.suggest,
         )
         .await
         .map_err(tool_error)?;
@@ -767,6 +780,7 @@ mod tests {
             context_dir: None,
             repo_path: Some("/no/such/path/for/mcp/test".to_string()),
             strict: false,
+            suggest: false,
         };
         let err = server
             .git_lint_commits(Parameters(params))
@@ -787,6 +801,7 @@ mod tests {
             context_dir: None,
             repo_path: None,
             strict: false,
+            suggest: false,
         };
         let result = server
             .git_lint_commits(Parameters(params))
@@ -799,6 +814,27 @@ mod tests {
             .clone();
         assert!(text.contains("exit_code: 1"));
         assert!(text.contains("has_errors: true"));
+    }
+
+    #[tokio::test]
+    async fn git_lint_commits_handler_suggest_with_message_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitLintCommitsParams {
+            range: None,
+            message: Some("feat(cli): add thing".to_string()),
+            context_dir: None,
+            repo_path: None,
+            strict: false,
+            suggest: true,
+        };
+        let err = server
+            .git_lint_commits(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
     }
 
     #[tokio::test]
