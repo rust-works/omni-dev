@@ -713,6 +713,39 @@ mod tests {
         assert_eq!(files.total_files, 2);
     }
 
+    /// A line with a status but no tab-separated filename (malformed
+    /// `git diff --name-status` output) has no file to record — skipped
+    /// rather than panicking or fabricating a path.
+    #[test]
+    fn parse_name_status_line_without_tab_is_skipped() {
+        let files = parse_name_status("A\ta.rs\nA\nM\tb.rs\n");
+        assert_eq!(files.total_files, 2);
+        assert_eq!(files.file_list[0].file, "a.rs");
+        assert_eq!(files.file_list[1].file, "b.rs");
+    }
+
+    /// `read_staged_files` surfaces a non-zero `git diff --cached
+    /// --name-status` exit as an error rather than silently returning an
+    /// empty file list. Unlike every other fixture in this module, this one
+    /// deliberately does NOT use `tempdir_in(CARGO_MANIFEST_DIR/tmp)` — that
+    /// convention nests the fixture inside omni-dev's own working tree, so
+    /// `git`'s upward repository discovery would find omni-dev's real
+    /// `.git` and the command would succeed trivially. This needs a
+    /// directory outside any git repository, so it uses the system temp
+    /// dir instead.
+    #[test]
+    fn read_staged_files_errors_when_git_command_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let err = read_staged_files(temp_dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase()
+                .contains("git diff --cached --name-status failed"),
+            "expected a git-failure error, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn run_staged_no_ai_prints_deterministic_skeleton_and_does_not_commit() {
         let temp_dir = init_repo_with_staged_cargo_toml();
