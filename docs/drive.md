@@ -17,11 +17,11 @@ file changes that chain. `drive move` refuses any move that would change
 visibility **by default**; three independent `--allow-*` flags opt in. See
 [Move](#move) and [ADR-0070](adrs/adr-0070.md) for the full design.
 
-The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_file_read`/
-`drive_account_list`, mirroring the CLI one-for-one like Gmail's `gmail_*`
-tools) is **not yet available** — it's tracked separately by
-[issue #1525](https://github.com/rust-works/omni-dev/issues/1525). This
-page will link it once it ships.
+The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_dedupe`/
+`drive_file_read`/`drive_account_list`, mirroring the CLI one-for-one like
+Gmail's `gmail_*` tools) is read-only, like the rest of the MCP surface —
+`rename`/`move` have no MCP equivalent. See
+[docs/mcp.md](mcp.md#drive-5-tools) for the full tool reference.
 
 New to this integration? Follow the
 [Drive Quickstart](drive-quickstart.md) for a linear, zero-to-first-search
@@ -216,8 +216,8 @@ $ omni-dev drive auth login --account personal
 `--account` need not already exist — `auth login` is how an account comes
 into existence. Every other Drive command (`search`, `read`, `auth
 status`, `auth logout`) also accepts `--account NAME` to target a specific
-account, and (once [issue #1525](https://github.com/rust-works/omni-dev/issues/1525)
-ships) the MCP tools will accept the equivalent `account` parameter.
+account, and every `drive_*` MCP tool accepts the equivalent `account`
+parameter.
 
 ### Managing accounts
 
