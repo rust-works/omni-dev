@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use crate::claude::error::is_structured_output_rejection as ai_error_is_schema_rejection;
 use crate::claude::error::is_transient_ai_error as ai_error_is_transient;
 use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
@@ -35,10 +36,12 @@ pub struct ClaudeClient {
     ai_client: Box<dyn AiClient>,
     /// Whether structured JSON-schema output is off for this client.
     ///
-    /// Set from the [`STRUCTURED_OUTPUT_DISABLE_ENV`] off-switch, which
-    /// expresses the per-*endpoint* limitation the per-model registry gate
-    /// cannot (issue #1561). Held as an atomic so it can additionally be
-    /// latched at runtime, and read from `&self` dispatch paths.
+    /// Starts from the [`STRUCTURED_OUTPUT_DISABLE_ENV`] off-switch, and is
+    /// latched on by [`send_with_optional_schema`](Self::send_with_optional_schema)
+    /// the first time an endpoint rejects `output_config` (issue #1561). One
+    /// latch per client covers a whole run: `check` shares a single
+    /// `ClaudeClient` across its concurrent batch futures, so the rejection is
+    /// discovered at most once however many commits are in flight.
     ///
     /// [`STRUCTURED_OUTPUT_DISABLE_ENV`]: crate::claude::backend::STRUCTURED_OUTPUT_DISABLE_ENV
     schema_disabled: std::sync::atomic::AtomicBool,
@@ -67,7 +70,8 @@ impl ClaudeClient {
         self
     }
 
-    /// Whether structured output is currently off for this client.
+    /// Whether structured output is currently off for this client — either
+    /// switched off up front or latched off by a rejection.
     fn schema_disabled(&self) -> bool {
         self.schema_disabled
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -152,6 +156,15 @@ impl ClaudeClient {
     /// [`AiClientCapabilities::supports_response_schema`](crate::claude::ai::AiClientCapabilities::supports_response_schema)
     /// `= false`, in which case [`schema_if_supported`](Self::schema_if_supported)
     /// at the call site returns `None` and we take the second branch.
+    ///
+    /// An endpoint that rejects the `output_config` field itself — a gateway
+    /// named by `ANTHROPIC_BEDROCK_BASE_URL` that does not pass it through
+    /// (issue #1561) — is retried once on the schema-less path and latches
+    /// structured output off for the rest of the run. This is a deliberate,
+    /// narrow exception to the rule that a permanent 4xx must fail loudly
+    /// (#1333): the retry is a *different* request, not the same one re-issued,
+    /// the trigger is a positively-identified rejection of the field by name
+    /// (`ai_error_is_schema_rejection`), and it warns.
     async fn send_with_optional_schema(
         &self,
         system_prompt: &str,
@@ -166,9 +179,34 @@ impl ClaudeClient {
         };
 
         let opts = RequestOptions::default().with_response_schema(s.clone());
-        self.ai_client
+        match self
+            .ai_client
             .send_request_with_options(system_prompt, user_prompt, opts)
             .await
+        {
+            Ok(content) => Ok(content),
+            Err(e) if ai_error_is_schema_rejection(&e) => {
+                self.schema_disabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    error = %e,
+                    "The AI endpoint rejected the structured-output field `output_config`; \
+                     retrying on the YAML response path and disabling it for the rest of this \
+                     run. A gateway in front of Bedrock/Anthropic that does not pass \
+                     `output_config` through is the usual cause. Set \
+                     OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true, or \
+                     `supports_structured_output: false` for this model in \
+                     ~/.omni-dev/models.yaml, to skip the rejected request entirely."
+                );
+                self.ai_client
+                    .send_request(Self::yaml_system_prompt(system_prompt), user_prompt)
+                    .await
+                    .with_context(|| {
+                        format!("YAML fallback after the endpoint rejected `output_config` ({e})")
+                    })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Validates that the prompt fits within the model's token budget.
@@ -2008,6 +2046,13 @@ mod tests {
         response: String,
         recorded_options: Arc<Mutex<Vec<RequestOptions>>>,
         recorded_plain: Arc<Mutex<Vec<(String, String)>>>,
+        /// When set, every `send_request_with_options` call fails with this
+        /// error — how the #1561 tests stand in for an endpoint that rejects
+        /// `output_config` while still answering plain requests.
+        options_error: Option<ClaudeError>,
+        /// When set, every `send_request` call fails with this error, for the
+        /// case where the YAML fallback fails too.
+        plain_error: Option<ClaudeError>,
     }
     impl SchemaRecordingMockAiClient {
         fn new(supports_response_schema: bool) -> Self {
@@ -2022,7 +2067,19 @@ mod tests {
                 response,
                 recorded_options: Arc::new(Mutex::new(Vec::new())),
                 recorded_plain: Arc::new(Mutex::new(Vec::new())),
+                options_error: None,
+                plain_error: None,
             }
+        }
+
+        fn failing_options(mut self, error: ClaudeError) -> Self {
+            self.options_error = Some(error);
+            self
+        }
+
+        fn failing_plain(mut self, error: ClaudeError) -> Self {
+            self.plain_error = Some(error);
+            self
         }
     }
 
@@ -2036,9 +2093,16 @@ mod tests {
             let sys = system_prompt.to_string();
             let usr = user_prompt.to_string();
             let response = self.response.clone();
+            let error = self
+                .plain_error
+                .as_ref()
+                .map(|e| ClaudeError::ApiRequestFailed(e.to_string()));
             Box::pin(async move {
                 plain.lock().unwrap().push((sys, usr));
-                Ok(response)
+                match error {
+                    Some(e) => Err(e.into()),
+                    None => Ok(response),
+                }
             })
         }
 
@@ -2054,9 +2118,19 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             let recorded = self.recorded_options.clone();
             let response = self.response.clone();
+            let error = self.options_error.as_ref().map(|e| match e {
+                ClaudeError::ApiHttpError { status, body } => ClaudeError::ApiHttpError {
+                    status: *status,
+                    body: body.clone(),
+                },
+                other => ClaudeError::ApiRequestFailed(other.to_string()),
+            });
             Box::pin(async move {
                 recorded.lock().unwrap().push(options);
-                Ok(response)
+                match error {
+                    Some(e) => Err(e.into()),
+                    None => Ok(response),
+                }
             })
         }
 
@@ -2123,10 +2197,122 @@ mod tests {
         assert!(plain_log.lock().unwrap().is_empty());
     }
 
-    // ── #1561: the structured-output off-switch ──────────────────────
+    // ── #1561: endpoint rejects `output_config` ──────────────────────
+
+    /// The rejection an `output_config`-stripping gateway returns, verbatim
+    /// from issue #1561.
+    fn output_config_rejection() -> ClaudeError {
+        ClaudeError::ApiHttpError {
+            status: 400,
+            body: String::from(
+                r#"{"message":"output_config.format: Extra inputs are not permitted"}"#,
+            ),
+        }
+    }
 
     fn schema_fixture() -> serde_json::Value {
         serde_json::json!({"type": "object", "additionalProperties": false})
+    }
+
+    /// A rejected `output_config` retries once on the plain path, and the
+    /// retry's system prompt has the JSON-schema override stripped — the model
+    /// must not be told to satisfy a schema the request no longer carries.
+    #[tokio::test]
+    async fn output_config_rejection_falls_back_to_yaml_path() {
+        let inner = SchemaRecordingMockAiClient::with_response(true, "answer: ok".to_string())
+            .failing_options(output_config_rejection());
+        let plain_log = inner.recorded_plain.clone();
+        let opts_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = schema_fixture();
+        let system_prompt = client.adjusted_system_prompt("base system prompt".to_string());
+        assert!(system_prompt.ends_with(prompts::JSON_SCHEMA_RESPONSE_OVERRIDE));
+
+        let out = client
+            .send_with_optional_schema(&system_prompt, "usr", client.schema_if_supported(&schema))
+            .await
+            .expect("the YAML fallback should carry the call");
+
+        assert_eq!(out, "answer: ok");
+        assert_eq!(opts_log.lock().unwrap().len(), 1);
+        let plain = plain_log.lock().unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].0, "base system prompt");
+        assert!(
+            !plain[0].0.contains("STRUCTURED OUTPUT OVERRIDE"),
+            "fallback prompt still carries the JSON override: {}",
+            plain[0].0
+        );
+    }
+
+    /// The rejection latches structured output off, so a second call skips the
+    /// schema path entirely rather than paying the rejected round-trip again.
+    #[tokio::test]
+    async fn output_config_rejection_latches_off_for_later_calls() {
+        let inner = SchemaRecordingMockAiClient::with_response(true, "answer: ok".to_string())
+            .failing_options(output_config_rejection());
+        let plain_log = inner.recorded_plain.clone();
+        let opts_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = schema_fixture();
+        for _ in 0..3 {
+            client
+                .send_with_optional_schema("sys", "usr", client.schema_if_supported(&schema))
+                .await
+                .expect("every call should succeed on the YAML path");
+        }
+
+        assert_eq!(
+            opts_log.lock().unwrap().len(),
+            1,
+            "the rejected shape should be attempted at most once per client"
+        );
+        assert_eq!(plain_log.lock().unwrap().len(), 3);
+        assert!(client.schema_if_supported(&schema).is_none());
+    }
+
+    /// Any other permanent failure still propagates — the fallback must not
+    /// widen into a blanket retry of 4xx responses (#1333).
+    #[tokio::test]
+    async fn unrelated_client_error_does_not_fall_back() {
+        let inner =
+            SchemaRecordingMockAiClient::new(true).failing_options(ClaudeError::ApiHttpError {
+                status: 400,
+                body: String::from("max_tokens: must be positive"),
+            });
+        let plain_log = inner.recorded_plain.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = schema_fixture();
+        let err = client
+            .send_with_optional_schema("sys", "usr", client.schema_if_supported(&schema))
+            .await
+            .expect_err("an unrelated 400 must not be papered over");
+
+        assert!(err.to_string().contains("max_tokens"), "{err}");
+        assert!(plain_log.lock().unwrap().is_empty());
+        assert!(client.schema_if_supported(&schema).is_some());
+    }
+
+    /// When the fallback fails too, both failures survive in the error chain.
+    #[tokio::test]
+    async fn failing_fallback_reports_both_errors() {
+        let inner = SchemaRecordingMockAiClient::new(true)
+            .failing_options(output_config_rejection())
+            .failing_plain(ClaudeError::NetworkError(String::from("connection reset")));
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = schema_fixture();
+        let err = client
+            .send_with_optional_schema("sys", "usr", client.schema_if_supported(&schema))
+            .await
+            .expect_err("a failing fallback must surface");
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("output_config"), "{chain}");
+        assert!(chain.contains("connection reset"), "{chain}");
     }
 
     /// The strip is exact and idempotent: it removes the override when present
@@ -2144,6 +2330,65 @@ mod tests {
             ClaudeClient::yaml_system_prompt(ClaudeClient::yaml_system_prompt(&adjusted)),
             base
         );
+    }
+
+    /// End-to-end reproduction of issue #1561 against a real
+    /// [`BedrockAiClient`]: a gateway that answers any body carrying
+    /// `output_config` with the reported `400` and passes everything else
+    /// through. The call must succeed, having re-issued exactly one
+    /// `output_config`-free request.
+    #[tokio::test]
+    async fn bedrock_gateway_rejecting_output_config_still_completes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        fn body_has_output_config(request: &Request) -> bool {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .is_ok_and(|body| body.get("output_config").is_some())
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_has_output_config)
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"output_config.format: Extra inputs are not permitted"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(|request: &Request| !body_has_output_config(request))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":"m","type":"message","role":"assistant","model":"m",
+                    "content":[{"type":"text","text":"answer: ok"}],"stop_reason":"end_turn"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ai_client = BedrockAiClient::new(
+            "claude-sonnet-4-6".to_string(),
+            "token".to_string(),
+            server.uri(),
+            None,
+        )
+        .expect("bedrock client should build");
+        let client = ClaudeClient::new(Box::new(ai_client));
+
+        let schema = schema_fixture();
+        let system_prompt = client.adjusted_system_prompt("base system prompt".to_string());
+        let out = client
+            .send_with_optional_schema(&system_prompt, "usr", client.schema_if_supported(&schema))
+            .await
+            .expect("the gateway rejection should be survivable");
+
+        assert_eq!(out, "answer: ok");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "expected one rejected then one retried");
+        let retried: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+        assert!(retried.get("output_config").is_none());
+        assert_eq!(retried["system"], "base system prompt");
     }
 
     /// The env off-switch reaches the client, so an endpoint known to reject
