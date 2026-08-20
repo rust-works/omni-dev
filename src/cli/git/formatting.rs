@@ -3,7 +3,7 @@
 //! This module contains pure functions extracted from `check`, `twiddle`, and
 //! `create_pr` command modules to eliminate duplication and enable unit testing.
 
-use crate::data::check::{CommitIssue, IssueSeverity};
+use crate::data::check::{CommitIssue, CommitSuggestion, IssueSeverity};
 use crate::data::context::{FileContext, ProjectSignificance};
 
 /// Truncates a commit hash to [`SHORT_HASH_LEN`](crate::git::SHORT_HASH_LEN) characters.
@@ -52,6 +52,23 @@ pub(crate) fn resolve_short_hash<'a>(short: &str, candidates: &'a [String]) -> O
             None
         }
     })
+}
+
+/// Formats a commit suggestion as indented text.
+pub(crate) fn format_suggestion_text(suggestion: &CommitSuggestion, verbose: bool) -> String {
+    let mut output = String::new();
+    output.push_str("   Suggested message:\n");
+    for line in suggestion.message.lines() {
+        output.push_str(&format!("      {line}\n"));
+    }
+    if verbose {
+        output.push('\n');
+        output.push_str("   Why this is better:\n");
+        for line in suggestion.explanation.lines() {
+            output.push_str(&format!("   {line}\n"));
+        }
+    }
+    output
 }
 
 /// Formats a file analysis summary with file count and critical file count.
