@@ -61,7 +61,7 @@ impl StagedCommand {
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
-        let _ = run_staged(
+        let outcome = run_staged(
             self.print_only,
             self.no_ai,
             None,
@@ -70,6 +70,11 @@ impl StagedCommand {
             repo,
         )
         .await?;
+
+        if !outcome.applied {
+            println!("{}", outcome.message);
+        }
+
         Ok(())
     }
 }
@@ -123,16 +128,17 @@ pub async fn run_staged(
 /// Deterministic (no-AI) core of [`run_staged`]'s `no_ai` path.
 ///
 /// Reads the staged file list via `git diff --cached --name-status`, resolves
-/// a `type(scope): ` skeleton via [`suggest_staged_skeleton`], prints it, and
-/// always returns `applied: false` — a bare skeleton has no description, so
-/// it is never committed, regardless of `--print-only`.
+/// a `type(scope): ` skeleton via [`suggest_staged_skeleton`], and always
+/// returns `applied: false` — a bare skeleton has no description, so it is
+/// never committed, regardless of `--print-only`. Never writes to stdout —
+/// the CLI-only caller (`StagedCommand::execute`) does that; the MCP handler
+/// reads `message` from the returned `StagedOutcome` instead (#1567).
 fn run_staged_no_ai(
     repo_root: &std::path::Path,
     valid_scopes: &[ScopeDefinition],
 ) -> Result<StagedOutcome> {
     let files = read_staged_files(repo_root)?;
     let message = suggest_staged_skeleton(&files, valid_scopes);
-    println!("{message}");
     Ok(StagedOutcome {
         message,
         applied: false,
@@ -164,7 +170,6 @@ pub(crate) async fn run_staged_with_client(
     }
 
     if print_only {
-        println!("{message}");
         return Ok(StagedOutcome {
             message,
             applied: false,
