@@ -58,6 +58,7 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `ci` - CI/CD pipelines and GitHub Actions workflows
 - `claude` - Claude AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
+- `coverage` - Coverage report parsing, diffing and rendering
 - `daemon` - Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray
 - `data` - Data structures and serialization
 - `datadog` - Datadog monitoring integration and REST API client
@@ -72,13 +73,22 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `scopes` - Commit scope definitions and configuration
 - `sessions` - Claude Code sessions tracker: cross-window live session state on the daemon
 - `snowflake` - Snowflake query service: authenticate-once SSO sessions on the daemon
+- `transcript` - Transcript fetching and formatting: source retrieval and subtitle conversion
 - `vscode` - VS Code companion extension for the worktrees service
 - `website` - Project promo site sources under website/
 - `workflows` - GitHub Actions workflow files
+- `worktrees` - Worktrees registry: cross-window repo/worktree tracking and window management on the daemon
 
 In addition to the scopes above, this project is a Rust crate, so the
 ecosystem default scopes `cargo`, `core`, `lib` and `test` are also
 accepted.
+
+Shared infrastructure with no subsystem owner — `src/lib.rs`, `src/utils.rs` /
+`src/utils/**`, `src/test_support.rs`, `src/bin/**`, `src/templates/**`, and
+loose `src/*.rs` helpers with no natural home (e.g. `build_info.rs`,
+`github_metrics.rs`) — uses the ecosystem `lib` scope rather than a dedicated
+one. `omni-dev config scopes lint` encodes the same files as the `allow:`
+list in `scopes.yaml`.
 
 For multi-scope commits, the scopes are correct when each listed scope
 matches at least one modified file. Do not flag scopes as incorrect
