@@ -314,6 +314,28 @@ requests structured output via `output_config.format` on models the registry
 flags as supporting it (regional / provider prefixes normalise to the same
 entry). Unflagged models fall back to the YAML response path.
 
+If `ANTHROPIC_BEDROCK_BASE_URL` points at a **gateway** rather than at Bedrock
+itself, that gateway may reject `output_config` as an unrecognised field even
+though Bedrock accepts it:
+
+```console
+Error: Claude API request failed (HTTP 400):
+{"message":"output_config.format: Extra inputs are not permitted"}
+```
+
+omni-dev recognises this specific rejection, warns, and retries the call on the
+YAML response path, disabling structured output for the rest of the run — so
+the run completes. To skip that one rejected round-trip entirely, switch
+structured output off up front:
+
+```bash
+export OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true
+```
+
+The variable applies to every backend and every model. To scope it to a single
+model instead, set `supports_structured_output: false` on that model's registry
+entry — see [Model Registry](#model-registry).
+
 **Verification.**
 
 ```bash
@@ -606,6 +628,13 @@ request `output_config.format` for that model — set it `true` in a user or
 project `models.yaml` entry to opt a newer model into the schema path, or
 leave it unset to keep a model on the YAML response path.
 
+Set it explicitly to `false` when the *model* supports structured output but
+the **endpoint** you reach it through does not — a gateway named by
+`ANTHROPIC_BEDROCK_BASE_URL` that rejects `output_config` as an unknown
+field. `OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true` is the same switch for every
+model at once; use the flag when only some of the models you route are behind
+such a gateway.
+
 **Model validation at preflight** — on the **Claude API** and **Bedrock**
 backends, an unknown model is rejected before any network call:
 
@@ -670,6 +699,7 @@ errors. The most common cases:
 | Connection refused on `localhost:11434`         | Ollama             | Start `ollama serve` or set `OLLAMA_BASE_URL`.                      |
 | `401 Unauthorized` from OpenAI                  | OpenAI             | Check `OPENAI_API_KEY` / `OPENAI_AUTH_TOKEN`.                       |
 | `AccessDeniedException` on a model ID           | Bedrock            | Region doesn't have the model, or your IAM policy blocks it — see [Discovering available models](#discovering-available-models). |
+| `output_config.format` rejected (400)           | Bedrock            | A gateway is stripping structured output (the `Extra inputs are not permitted` 400). Handled automatically (warn + YAML retry); silence it with `OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true` — see [troubleshooting.md](troubleshooting.md#gateway-rejects-output_config). |
 
 Enable verbose logging when reporting issues:
 
