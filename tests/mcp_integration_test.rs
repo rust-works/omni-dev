@@ -1604,6 +1604,231 @@ async fn mcp_binary_stdout_is_pure_json_rpc() -> Result<()> {
     Ok(())
 }
 
+/// Creates a repo with a baseline commit, then stages a new file so
+/// `git diff --cached` is non-empty. Mirrors the same-named private helper
+/// in `src/cli/git/staged.rs`'s unit tests, duplicated here because
+/// integration tests compile against the library as an external crate and
+/// can't reach a `#[cfg(test)]`-only item across that boundary.
+fn staged_change_repo() -> Result<TempDir> {
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let temp_dir = tempfile::tempdir_in(&tmp_root)?;
+    let repo = Repository::init(temp_dir.path())?;
+    {
+        let mut cfg = repo.config()?;
+        cfg.set_str("user.name", "Test")?;
+        cfg.set_str("user.email", "test@example.com")?;
+        cfg.set_str("commit.gpgsign", "false")?;
+    }
+
+    let signature = Signature::now("Test", "test@example.com")?;
+    fs::write(temp_dir.path().join("README"), "baseline\n")?;
+    let mut idx = repo.index()?;
+    idx.add_path(std::path::Path::new("README"))?;
+    idx.write()?;
+    let tree_id = idx.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "chore: baseline",
+        &tree,
+        &[],
+    )?;
+
+    fs::write(temp_dir.path().join("new.rs"), "fn marker_xyz() {}\n")?;
+    let mut idx = repo.index()?;
+    idx.add_path(std::path::Path::new("new.rs"))?;
+    idx.write()?;
+
+    Ok(temp_dir)
+}
+
+/// Spawns the real `omni-dev-mcp` binary with `extra_env` layered on top of
+/// the inherited environment, drives `initialize` -> `notifications/initialized`
+/// -> a `tools/call` for `tool`/`args` (request id `2`), and asserts every
+/// stdout line parses as JSON-RPC along the way — the STYLE-0018 / STYLE-0001
+/// regression guard, extended (#1567) to actually exercise a tool call rather
+/// than stopping at `tools/list`. Returns the parsed `id: 2` response frame.
+async fn call_tool_via_binary_and_assert_stdout_pure(
+    extra_env: &[(&str, String)],
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_omni-dev-mcp");
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()?;
+
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "stdout-test", "version": "0.0.0"}
+        }
+    });
+    let initialized_notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": args }
+    });
+
+    stdin
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await?;
+    stdin
+        .write_all(format!("{initialized_notification}\n").as_bytes())
+        .await?;
+    stdin.write_all(format!("{call}\n").as_bytes()).await?;
+    stdin.flush().await?;
+
+    // Collect frames until we see the tools/call response (id=2).
+    let mut response = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reader.read_line(&mut line),
+        )
+        .await??;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("stdout line is not JSON-RPC: {e}: {trimmed:?}"));
+        assert_eq!(
+            parsed.get("jsonrpc").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "frame missing jsonrpc version: {parsed}",
+        );
+        let seen_id = parsed.get("id").and_then(serde_json::Value::as_i64);
+        if seen_id == Some(2) {
+            response = Some(parsed);
+            break;
+        }
+    }
+
+    drop(stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+
+    Ok(response.expect("no tools/call response observed on stdout"))
+}
+
+fn assert_tool_call_succeeded(response: &serde_json::Value) {
+    assert!(
+        response.get("error").is_none(),
+        "unexpected JSON-RPC error: {response}"
+    );
+    let is_tool_error = response
+        .pointer("/result/isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(!is_tool_error, "tool returned an error result: {response}");
+}
+
+/// Regression test for #1567: `run_staged_no_ai` (added in #1564) used to
+/// `println!` its skeleton message directly, corrupting the MCP stdout wire.
+/// Drives the real binary end-to-end so the leak is only observable at the
+/// real-process level (the in-process `spawn_server` duplex transport never
+/// touches actual stdout). Fails on unpatched code because the leaked line
+/// breaks JSON parsing inside `call_tool_via_binary_and_assert_stdout_pure`.
+#[tokio::test]
+async fn mcp_binary_git_staged_commit_no_ai_stdout_is_pure_json_rpc() -> Result<()> {
+    let temp_dir = staged_change_repo()?;
+
+    let response = call_tool_via_binary_and_assert_stdout_pure(
+        &[],
+        "git_staged_commit",
+        serde_json::json!({
+            "no_ai": true,
+            "repo_path": temp_dir.path().to_string_lossy(),
+        }),
+    )
+    .await?;
+
+    assert_tool_call_succeeded(&response);
+    Ok(())
+}
+
+/// Regression test for #1567: `run_staged_with_client`'s `print_only` branch
+/// used to `println!` the AI-drafted message directly — this leak predates
+/// #1564. It requires the AI backend to actually run, so it stubs an
+/// Ollama-compatible endpoint with wiremock (same response shape as
+/// `src/claude/ai/openai.rs`'s `mock_chat_completion_ok`) and forces backend
+/// selection via `OMNI_DEV_AI_BACKEND=ollama`, which wins outright over any
+/// ambient credentials in the environment (`resolve_backend` in
+/// `src/claude/backend.rs`).
+#[tokio::test]
+async fn mcp_binary_git_staged_commit_print_only_stdout_is_pure_json_rpc() -> Result<()> {
+    let temp_dir = staged_change_repo()?;
+
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": { "role": "assistant", "content": "chore(cargo): test commit\n" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "model": "test-model"
+            })),
+        )
+        .mount(&mock)
+        .await;
+
+    let extra_env: Vec<(&str, String)> = vec![
+        ("OMNI_DEV_AI_BACKEND", "ollama".to_string()),
+        ("OLLAMA_BASE_URL", mock.uri()),
+        ("OLLAMA_MODEL", "test-model".to_string()),
+    ];
+
+    let response = call_tool_via_binary_and_assert_stdout_pure(
+        &extra_env,
+        "git_staged_commit",
+        serde_json::json!({
+            "print_only": true,
+            "repo_path": temp_dir.path().to_string_lossy(),
+        }),
+    )
+    .await?;
+
+    assert_tool_call_succeeded(&response);
+    Ok(())
+}
+
 #[tokio::test]
 async fn git_check_commits_without_credentials_returns_tool_error() -> Result<()> {
     call_tool_expect_error(
