@@ -1,10 +1,10 @@
 [package]
 name = "omni-dev"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2021"
 authors = ["John Ky <newhoggy@gmail.com>"]
 license = "BSD-3-Clause"
-description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog."
+description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, Datadog, Gmail, and Drive."
 repository = "https://github.com/rust-works/omni-dev"
 homepage = "https://github.com/rust-works/omni-dev"
 documentation = "https://docs.rs/omni-dev"

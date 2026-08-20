@@ -249,6 +249,28 @@ valid names.
 | `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
 | `gmail_account_list` | List configured Gmail accounts — name, cached email, scope, default. Never a secret |
 
+### Drive (5 tools)
+
+Read-only access (search, dedupe, file metadata/content) via OAuth2, mirroring
+the Gmail tool surface one-for-one. Authentication uses `DRIVE_CLIENT_ID` +
+`DRIVE_CLIENT_SECRET` + a refresh token stored by `omni-dev drive auth login`.
+`rename`/`move` (the CLI's write operations, gated behind the opt-in
+`drive.metadata` scope) have no MCP equivalent. See [Drive Guide](drive.md)
+and [ADR-0069](adrs/adr-0069.md).
+
+Every tool below (except `drive_account_list`) takes an optional `account`
+parameter selecting a named Drive account configured via `drive account`
+(see [Drive Guide — Multiple accounts](drive.md#multiple-accounts)); call
+`drive_account_list` first to discover valid names.
+
+| Tool | Purpose |
+|------|---------|
+| `drive_auth_status` | Credential-presence flags and granted scope only — never calls the Drive API |
+| `drive_search` | Search files (Drive query syntax); returns full metadata per hit, including checksums when present |
+| `drive_dedupe` | Find files sharing the same content hash within a query's results, grouped by `md5Checksum` |
+| `drive_file_read` | Read a file's metadata (default) or content (`format: "content"`); `output_file` writes binary content to disk; `verify: true` checks the fetched SHA-256 against Drive's reported checksum |
+| `drive_account_list` | List configured Drive accounts — name, cached email, scope, default. Never a secret |
+
 ### AI / Config (5 tools)
 
 | Tool | Purpose |
