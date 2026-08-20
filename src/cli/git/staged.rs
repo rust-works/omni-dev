@@ -4,19 +4,24 @@
 //!
 //! Default behaviour mirrors `git commit -m <message>` so user-installed
 //! `pre-commit` / `commit-msg` hooks fire normally. Pass `--print-only` to
-//! print the generated message to stdout without committing.
+//! print the generated message to stdout without committing, or `--no-ai`
+//! for a deterministic (no AI, no network) `type(scope): ` skeleton instead
+//! of a full AI-drafted message — always print-only, regardless of
+//! `--print-only`.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::process::{Command, Stdio};
 
 use crate::data::context::ScopeDefinition;
+use crate::git::commit::FileChanges;
 
 /// `omni-dev git commit message staged` CLI command.
 ///
 /// Model/beta-header selection uses the global `--model`/`--beta-header`
 /// flags (propagated as `OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER`) and the
-/// per-backend env chain; there are no subcommand-local flags.
+/// per-backend env chain; the only subcommand-local flags are `--print-only`,
+/// `--context-dir`, and `--no-ai`.
 #[derive(Parser)]
 pub struct StagedCommand {
     /// Print the generated message to stdout instead of committing.
@@ -26,6 +31,18 @@ pub struct StagedCommand {
     /// Override the context directory used to load project scopes.
     #[arg(long, value_name = "DIR")]
     pub context_dir: Option<std::path::PathBuf>,
+
+    /// Skip the AI backend entirely and print a deterministic `type(scope): `
+    /// skeleton derived from the staged diff's changed files — no AI, no
+    /// network, no credentials required. The scope is resolved the same way
+    /// `lint --suggest`/`--fix` do (`resolve_scope` against
+    /// `.omni-dev/scopes.yaml` + ecosystem defaults); the type is a
+    /// best-effort heuristic, not validated against an enumerable list.
+    /// Always prints and never commits, regardless of `--print-only` — a
+    /// bare skeleton has no description, so it's never a complete message
+    /// to commit.
+    #[arg(long)]
+    pub no_ai: bool,
 }
 
 /// Outcome of a staged-commit run.
@@ -46,6 +63,7 @@ impl StagedCommand {
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
         let _ = run_staged(
             self.print_only,
+            self.no_ai,
             None,
             None,
             self.context_dir.as_deref(),
@@ -62,8 +80,13 @@ impl StagedCommand {
 /// it the same way: resolve the repo root (the injected path, or the CWD as the
 /// default), run AI preflight, build the client, and delegate to the
 /// test-injectable inner [`run_staged_with_client`].
+///
+/// `no_ai` skips AI entirely (no credential preflight, no client, no network
+/// call) and returns a deterministic `type(scope): ` skeleton instead — see
+/// [`run_staged_no_ai`].
 pub async fn run_staged(
     print_only: bool,
+    no_ai: bool,
     model: Option<String>,
     beta_header: Option<(String, String)>,
     context_dir: Option<&std::path::Path>,
@@ -82,15 +105,38 @@ pub async fn run_staged(
         anyhow::bail!("no staged changes — stage files with `git add` before running this command");
     }
 
-    crate::utils::check_ai_command_prerequisites(model.as_deref(), repo_root)?;
-    let claude_client = crate::claude::create_default_claude_client(model, beta_header).await?;
-
     let resolved_context_dir =
         crate::claude::context::resolve_context_dir_at(context_dir, repo_root);
     let valid_scopes =
         crate::claude::context::load_project_scopes(&resolved_context_dir, repo_root);
 
+    if no_ai {
+        return run_staged_no_ai(repo_root, &valid_scopes);
+    }
+
+    crate::utils::check_ai_command_prerequisites(model.as_deref(), repo_root)?;
+    let claude_client = crate::claude::create_default_claude_client(model, beta_header).await?;
+
     run_staged_with_client(print_only, &valid_scopes, &claude_client, repo_root).await
+}
+
+/// Deterministic (no-AI) core of [`run_staged`]'s `no_ai` path.
+///
+/// Reads the staged file list via `git diff --cached --name-status`, resolves
+/// a `type(scope): ` skeleton via [`suggest_staged_skeleton`], prints it, and
+/// always returns `applied: false` — a bare skeleton has no description, so
+/// it is never committed, regardless of `--print-only`.
+fn run_staged_no_ai(
+    repo_root: &std::path::Path,
+    valid_scopes: &[ScopeDefinition],
+) -> Result<StagedOutcome> {
+    let files = read_staged_files(repo_root)?;
+    let message = suggest_staged_skeleton(&files, valid_scopes);
+    println!("{message}");
+    Ok(StagedOutcome {
+        message,
+        applied: false,
+    })
 }
 
 /// Test-injectable core of [`run_staged`].
@@ -171,6 +217,80 @@ fn read_staged_diff(repo_root: &std::path::Path) -> Result<String> {
         anyhow::bail!("git diff --cached failed: {stderr}");
     }
     String::from_utf8(output.stdout).context("git diff --cached produced non-UTF-8 output")
+}
+
+/// Parses `git diff --cached --name-status` output into [`FileChanges`].
+///
+/// Each line is `status\tpath` (`A`/`M`/`D`/...), or `status\told\tnew` for a
+/// rename/copy (`R100`/`C100`/...) — the *last* tab-separated field is always
+/// the file's current path. Pure and unit-testable without a git subprocess;
+/// [`read_staged_files`] is the thin subprocess wrapper around it.
+fn parse_name_status(text: &str) -> FileChanges {
+    let mut file_list = Vec::new();
+    let mut files_added = 0;
+    let mut files_deleted = 0;
+
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next() else {
+            continue;
+        };
+        let Some(file) = fields.next_back() else {
+            continue;
+        };
+        let status_char = status.chars().next().unwrap_or('?');
+        match status_char {
+            'A' => files_added += 1,
+            'D' => files_deleted += 1,
+            _ => {}
+        }
+        file_list.push(crate::git::commit::FileChange {
+            status: status_char.to_string(),
+            file: file.to_string(),
+        });
+    }
+
+    FileChanges {
+        total_files: file_list.len(),
+        files_added,
+        files_deleted,
+        file_list,
+    }
+}
+
+/// Reads the staged file list via `git diff --cached --name-status`.
+fn read_staged_files(repo_root: &std::path::Path) -> Result<FileChanges> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["diff", "--cached", "--name-status"])
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("Failed to execute git diff --cached --name-status")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff --cached --name-status failed: {stderr}");
+    }
+    let text = String::from_utf8(output.stdout)
+        .context("git diff --cached --name-status produced non-UTF-8 output")?;
+    Ok(parse_name_status(&text))
+}
+
+/// Builds a deterministic `type(scope): ` (or `type: ` when no scope
+/// resolves) skeleton from `files` — a prefix only, never a synthesized
+/// description. The type comes from
+/// [`crate::git::commit::detect_commit_type_from_message`] with an empty
+/// message (there's no message yet to seed from, so it falls straight
+/// through to the file-pattern heuristics); the scope from
+/// [`crate::git::resolve_scope`], the same deterministic resolution
+/// `lint --suggest`/`--fix` use.
+fn suggest_staged_skeleton(files: &FileChanges, valid_scopes: &[ScopeDefinition]) -> String {
+    let commit_type = crate::git::commit::detect_commit_type_from_message("", files);
+    let file_refs: Vec<&str> = files.file_list.iter().map(|f| f.file.as_str()).collect();
+    match crate::git::resolve_scope(&file_refs, valid_scopes) {
+        Some(scope) => format!("{commit_type}({scope}): "),
+        None => format!("{commit_type}: "),
+    }
 }
 
 /// Commits staged changes via `git commit -m <msg>` as a subprocess.
@@ -280,7 +400,7 @@ mod tests {
         // `has_staged_changes` is anchored to the injected repo (`.current_dir`),
         // so this empty repo bails regardless of whether the process CWD has
         // staged changes.
-        let err = run_staged(true, None, None, None, Some(temp_dir.path()))
+        let err = run_staged(true, false, None, None, None, Some(temp_dir.path()))
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -464,6 +584,7 @@ mod tests {
         let cmd = StagedCommand {
             print_only: true,
             context_dir: None,
+            no_ai: false,
         };
         let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
         let msg = format!("{err:#}");
@@ -495,6 +616,176 @@ mod tests {
         assert!(
             user.contains("marker_xyz"),
             "staged diff from the injected repo must reach the prompt: {user}"
+        );
+    }
+
+    // ── --no-ai (#1564) ──────────────────────────────────────────────
+
+    /// Creates a repo with a baseline commit, then stages a new `Cargo.toml`
+    /// so a `cargo`-scoped skeleton can be resolved.
+    fn init_repo_with_staged_cargo_toml() -> tempfile::TempDir {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            cfg.set_str("commit.gpgsign", "false").unwrap();
+        }
+        let signature = Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(temp_dir.path().join("README"), "baseline\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README")).unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "chore: baseline",
+            &tree,
+            &[],
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("Cargo.toml")).unwrap();
+        idx.write().unwrap();
+
+        temp_dir
+    }
+
+    /// Writes a `cargo` scope (matching `Cargo.toml`/`Cargo.lock`) to
+    /// `context_dir/scopes.yaml`.
+    fn write_cargo_scope(context_dir: &std::path::Path) {
+        std::fs::create_dir_all(context_dir).unwrap();
+        std::fs::write(
+            context_dir.join("scopes.yaml"),
+            "scopes:\n  - name: cargo\n    description: Cargo files\n    examples: []\n    file_patterns:\n      - Cargo.toml\n      - Cargo.lock\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_name_status_added_file() {
+        let files = parse_name_status("A\tCargo.toml\n");
+        assert_eq!(files.total_files, 1);
+        assert_eq!(files.files_added, 1);
+        assert_eq!(files.files_deleted, 0);
+        assert_eq!(files.file_list[0].status, "A");
+        assert_eq!(files.file_list[0].file, "Cargo.toml");
+    }
+
+    #[test]
+    fn parse_name_status_modified_file() {
+        let files = parse_name_status("M\tsrc/main.rs\n");
+        assert_eq!(files.files_added, 0);
+        assert_eq!(files.files_deleted, 0);
+        assert_eq!(files.file_list[0].status, "M");
+    }
+
+    #[test]
+    fn parse_name_status_deleted_file() {
+        let files = parse_name_status("D\told.rs\n");
+        assert_eq!(files.files_deleted, 1);
+        assert_eq!(files.file_list[0].status, "D");
+    }
+
+    #[test]
+    fn parse_name_status_rename_uses_new_path_as_file() {
+        let files = parse_name_status("R100\told.rs\tnew.rs\n");
+        assert_eq!(files.file_list.len(), 1);
+        assert_eq!(files.file_list[0].status, "R");
+        assert_eq!(files.file_list[0].file, "new.rs");
+    }
+
+    #[test]
+    fn parse_name_status_blank_lines_ignored() {
+        let files = parse_name_status("A\ta.rs\n\nM\tb.rs\n");
+        assert_eq!(files.total_files, 2);
+    }
+
+    #[tokio::test]
+    async fn run_staged_no_ai_prints_deterministic_skeleton_and_does_not_commit() {
+        let temp_dir = init_repo_with_staged_cargo_toml();
+        let context_dir = temp_dir.path().join(".omni-dev");
+        write_cargo_scope(&context_dir);
+        let head_before = head_oid(temp_dir.path());
+
+        let outcome = run_staged(
+            false,
+            true,
+            None,
+            None,
+            Some(&context_dir),
+            Some(temp_dir.path()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.applied, "--no-ai must never commit");
+        assert_eq!(outcome.message, "feat(cargo): ");
+
+        let head_after = head_oid(temp_dir.path());
+        assert_eq!(head_before, head_after, "HEAD must be unchanged");
+    }
+
+    #[test]
+    fn run_staged_no_ai_no_matching_scope_omits_parens() {
+        // Exercises `suggest_staged_skeleton` directly with an empty
+        // `valid_scopes` slice, rather than through `run_staged`'s full
+        // `load_project_scopes` config-loading chain — that chain falls back
+        // to the *user's real* XDG/`$HOME/.omni-dev/scopes.yaml` when no
+        // project-level file exists (by design, for global scope config),
+        // which would make this "nothing resolves" case depend on whatever
+        // happens to be configured on the machine running the test.
+        let files = crate::git::commit::FileChanges {
+            total_files: 1,
+            files_added: 1,
+            files_deleted: 0,
+            file_list: vec![crate::git::commit::FileChange {
+                status: "A".to_string(),
+                file: "new.rs".to_string(),
+            }],
+        };
+        assert_eq!(suggest_staged_skeleton(&files, &[]), "feat: ");
+    }
+
+    #[tokio::test]
+    async fn run_staged_no_ai_errors_when_nothing_staged() {
+        let temp_dir = init_empty_repo();
+        let err = run_staged(false, true, None, None, None, Some(temp_dir.path()))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.to_lowercase().contains("no staged changes"));
+    }
+
+    #[tokio::test]
+    async fn staged_command_execute_no_ai_dispatches_and_never_commits() {
+        let temp_dir = init_repo_with_staged_cargo_toml();
+        let head_before = head_oid(temp_dir.path());
+
+        let cmd = StagedCommand {
+            print_only: false,
+            context_dir: Some(temp_dir.path().join(".omni-dev")),
+            no_ai: true,
+        };
+        let result = cmd.execute(Some(temp_dir.path())).await;
+        assert!(result.is_ok(), "expected clean exit, got: {result:?}");
+
+        let head_after = head_oid(temp_dir.path());
+        assert_eq!(
+            head_before, head_after,
+            "HEAD must be unchanged (no_ai never commits, even with print_only: false)"
         );
     }
 }

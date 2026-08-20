@@ -266,61 +266,7 @@ impl CommitAnalysis {
 
     /// Detects conventional commit type based on files and existing message.
     fn detect_commit_type(commit: &Commit, file_changes: &FileChanges) -> String {
-        Self::detect_commit_type_from_message(commit.message().unwrap_or(""), file_changes)
-    }
-
-    /// Pure type inference from a commit `message` and its `file_changes`.
-    ///
-    /// Separated from [`Self::detect_commit_type`] so the branch logic can be exercised
-    /// deterministically by unit tests; the `&Commit`-taking wrapper requires a
-    /// live repository whose state varies run-to-run (which makes coverage of
-    /// these branches flicker — see the conventional-type tests below).
-    fn detect_commit_type_from_message(message: &str, file_changes: &FileChanges) -> String {
-        // Check if message already has conventional commit format
-        if let Some(existing_type) = Self::extract_conventional_type(message) {
-            return existing_type;
-        }
-
-        // Analyze file patterns
-        let files: Vec<&str> = file_changes
-            .file_list
-            .iter()
-            .map(|f| f.file.as_str())
-            .collect();
-
-        // Check for specific patterns
-        if files
-            .iter()
-            .any(|f| f.contains("test") || f.contains("spec"))
-        {
-            "test".to_string()
-        } else if files
-            .iter()
-            .any(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"))
-        {
-            "docs".to_string()
-        } else if files
-            .iter()
-            .any(|f| f.contains("Cargo.toml") || f.contains("package.json") || f.contains("config"))
-        {
-            if file_changes.files_added > 0 {
-                "feat".to_string()
-            } else {
-                "chore".to_string()
-            }
-        } else if file_changes.files_added > 0
-            && files
-                .iter()
-                .any(|f| f.ends_with(".rs") || f.ends_with(".js") || f.ends_with(".py"))
-        {
-            "feat".to_string()
-        } else if message.to_lowercase().contains("fix") || message.to_lowercase().contains("bug") {
-            "fix".to_string()
-        } else if file_changes.files_deleted > file_changes.files_added {
-            "refactor".to_string()
-        } else {
-            "chore".to_string()
-        }
+        detect_commit_type_from_message(commit.message().unwrap_or(""), file_changes)
     }
 
     /// Extracts conventional commit type from an existing message.
@@ -608,6 +554,70 @@ impl CommitAnalysis {
         }
 
         Ok((diff_path.to_string_lossy().to_string(), file_diffs))
+    }
+}
+
+/// Pure type inference from a commit `message` and its `file_changes`.
+///
+/// Separated from [`CommitAnalysis::detect_commit_type`] so the branch logic
+/// can be exercised deterministically by unit tests; the `&Commit`-taking
+/// wrapper requires a live repository whose state varies run-to-run (which
+/// makes coverage of these branches flicker — see the conventional-type
+/// tests below).
+///
+/// A free function (not an associated one), matching [`resolve_scope`]/
+/// [`refine_message_scope`]'s shape — `pub(crate)`, following the precedent
+/// set for [`scope_matches_files`] under #1475, so callers outside this
+/// module (e.g. `staged.rs`'s `--no-ai`, #1564) can reuse it deterministically
+/// without going through a live [`CommitAnalysis`]. An empty `message` (as
+/// `staged.rs` passes, since there's no message yet to seed from) simply
+/// skips the "already conventional" branch and falls straight through to the
+/// file-pattern heuristics below.
+pub(crate) fn detect_commit_type_from_message(message: &str, file_changes: &FileChanges) -> String {
+    // Check if message already has conventional commit format
+    if let Some(existing_type) = CommitAnalysis::extract_conventional_type(message) {
+        return existing_type;
+    }
+
+    // Analyze file patterns
+    let files: Vec<&str> = file_changes
+        .file_list
+        .iter()
+        .map(|f| f.file.as_str())
+        .collect();
+
+    // Check for specific patterns
+    if files
+        .iter()
+        .any(|f| f.contains("test") || f.contains("spec"))
+    {
+        "test".to_string()
+    } else if files
+        .iter()
+        .any(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"))
+    {
+        "docs".to_string()
+    } else if files
+        .iter()
+        .any(|f| f.contains("Cargo.toml") || f.contains("package.json") || f.contains("config"))
+    {
+        if file_changes.files_added > 0 {
+            "feat".to_string()
+        } else {
+            "chore".to_string()
+        }
+    } else if file_changes.files_added > 0
+        && files
+            .iter()
+            .any(|f| f.ends_with(".rs") || f.ends_with(".js") || f.ends_with(".py"))
+    {
+        "feat".to_string()
+    } else if message.to_lowercase().contains("fix") || message.to_lowercase().contains("bug") {
+        "fix".to_string()
+    } else if file_changes.files_deleted > file_changes.files_added {
+        "refactor".to_string()
+    } else {
+        "chore".to_string()
     }
 }
 
@@ -2062,7 +2072,7 @@ diff_file: "/tmp/test.diff"
     // longer depends on whatever commit the live-repo dispatch tests analyze.
 
     fn infer_type(message: &str, files: &[(&str, &str)]) -> String {
-        CommitAnalysis::detect_commit_type_from_message(message, &make_file_changes(files))
+        detect_commit_type_from_message(message, &make_file_changes(files))
     }
 
     #[test]

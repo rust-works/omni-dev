@@ -369,6 +369,13 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_git_commit_message_staged_no_ai() {
+        let cli =
+            Cli::try_parse_from(["omni-dev", "git", "commit", "message", "staged", "--no-ai"]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
     fn cli_parses_git_commit_message_staged_print_only() {
         let cli = Cli::try_parse_from([
             "omni-dev",
