@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::data::check::{CommitIssue, IssueSeverity};
+use crate::data::check::{CommitIssue, CommitSuggestion, IssueSeverity};
 use crate::data::context::{CommitRules, ScopeDefinition};
 
 /// Matches `type(scope)!: description`, `type(scope): description`,
@@ -265,6 +265,69 @@ pub fn lint_message(
 #[must_use]
 pub fn passes(issues: &[CommitIssue]) -> bool {
     !issues.iter().any(|i| i.severity == IssueSeverity::Error)
+}
+
+/// Deterministically suggests a corrected message for an `unknown-scope` or
+/// `missing-scope` issue.
+///
+/// Resolves a scope from `files` against `valid_scopes` via
+/// [`crate::git::commit::resolve_scope`] — no AI, no network. Returns `None`
+/// when there's nothing to suggest: neither issue is present, the subject
+/// doesn't parse, `resolve_scope` can't resolve anything from `files`, or
+/// the resolved scope doesn't actually change the message.
+///
+/// An existing-but-wrong scope (`unknown-scope`) is *replaced* via
+/// [`crate::git::commit::refine_message_scope`]. A missing scope
+/// (`missing-scope`, only reachable when `rules.require_scope` is set) is
+/// *inserted* between the type (and any breaking-change `!`) and the colon —
+/// `refine_message_scope` is deliberately not reused for this case, since its
+/// contract is "replace an existing scope," never "add one."
+pub fn suggest_scope_fix(
+    message: &str,
+    files: &[&str],
+    valid_scopes: &[ScopeDefinition],
+    issues: &[CommitIssue],
+) -> Option<CommitSuggestion> {
+    if !issues
+        .iter()
+        .any(|i| i.rule == "unknown-scope" || i.rule == "missing-scope")
+    {
+        return None;
+    }
+
+    let first_line = message.lines().next().unwrap_or("");
+    let parsed = parse_subject(first_line)?;
+
+    let corrected = if parsed.scope.is_some() {
+        let refined = crate::git::commit::refine_message_scope(message, files, valid_scopes);
+        if refined == message {
+            return None;
+        }
+        refined
+    } else {
+        let resolved = crate::git::commit::resolve_scope(files, valid_scopes)?;
+        // Canonical placement: the breaking-change `!` goes after the scope
+        // parens, matching `SUBJECT_RE`'s documented form (see the module
+        // doc comment on `refine_message_scope`'s sibling regex in this
+        // file) — not before them, which is only accepted leniently on
+        // input.
+        let bang = if parsed.breaking { "!" } else { "" };
+        let new_first_line = format!(
+            "{}({resolved}){bang}: {}",
+            parsed.commit_type, parsed.description
+        );
+        match message.split_once('\n') {
+            Some((_, rest)) => format!("{new_first_line}\n{rest}"),
+            None => new_first_line,
+        }
+    };
+
+    Some(CommitSuggestion {
+        message: corrected,
+        explanation: "Deterministically resolved from the commit's changed files against the \
+                       project's scope definitions (no AI)."
+            .to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -676,5 +739,112 @@ mod tests {
         let valid = scopes(&["cli", "claude"]);
         let issues = lint_message("feat(cli,claude)!: add thing", &rules, &valid);
         assert!(passes(&issues));
+    }
+
+    // ── suggest_scope_fix ────────────────────────────────────────────
+
+    fn scope_with_patterns(name: &str, patterns: &[&str]) -> ScopeDefinition {
+        ScopeDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            examples: vec![],
+            file_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn suggest_scope_fix_replaces_unknown_scope() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml", "Cargo.lock"])];
+        let message = "chore(deps): bump the rust-minor-patch group";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(
+            suggestion.message,
+            "chore(cargo): bump the rust-minor-patch group"
+        );
+    }
+
+    #[test]
+    fn suggest_scope_fix_inserts_missing_scope() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let rules = CommitRules {
+            require_scope: true,
+            ..CommitRules::default()
+        };
+        let message = "chore: bump deps";
+        let issues = lint_message(message, &rules, &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(suggestion.message, "chore(cargo): bump deps");
+    }
+
+    #[test]
+    fn suggest_scope_fix_inserts_missing_scope_preserves_breaking_bang() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let rules = CommitRules {
+            require_scope: true,
+            ..CommitRules::default()
+        };
+        let message = "chore!: bump deps";
+        let issues = lint_message(message, &rules, &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(suggestion.message, "chore(cargo)!: bump deps");
+    }
+
+    #[test]
+    fn suggest_scope_fix_preserves_body() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let message = "chore(deps): bump deps\n\nSome body text.";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(
+            suggestion.message,
+            "chore(cargo): bump deps\n\nSome body text."
+        );
+    }
+
+    #[test]
+    fn suggest_scope_fix_no_issue_no_suggestion() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let message = "chore(cargo): bump deps";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        assert!(issues.is_empty());
+        assert!(suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).is_none());
+    }
+
+    #[test]
+    fn suggest_scope_fix_no_matching_scope_defs_no_suggestion() {
+        let valid = vec![scope_with_patterns("docs", &["docs/**"])];
+        let message = "chore(deps): bump deps";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        assert!(suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).is_none());
+    }
+
+    #[test]
+    fn suggest_scope_fix_format_broken_subject_no_suggestion() {
+        let valid = vec![scope_with_patterns("cargo", &["Cargo.toml"])];
+        let message = "not a conventional commit subject";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        assert_eq!(issue_rules("format", &issues).len(), 1);
+        assert!(suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).is_none());
+    }
+
+    #[test]
+    fn suggest_scope_fix_tied_scopes_join_with_valid_comma_spacing() {
+        let valid = vec![
+            scope_with_patterns("cargo", &["Cargo.toml"]),
+            scope_with_patterns("lib", &["Cargo.toml"]),
+        ];
+        let message = "chore(deps): bump deps";
+        let issues = lint_message(message, &CommitRules::default(), &valid);
+        let suggestion =
+            suggest_scope_fix(message, &["Cargo.toml"], &valid, &issues).expect("should suggest");
+        assert_eq!(suggestion.message, "chore(cargo, lib): bump deps");
+        // The joined scope must itself pass the comma-format rule.
+        let rechecked = lint_message(&suggestion.message, &CommitRules::default(), &valid);
+        assert!(issue_rules("scope-comma-format", &rechecked).is_empty());
     }
 }
