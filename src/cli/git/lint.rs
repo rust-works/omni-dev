@@ -508,6 +508,17 @@ mod tests {
         let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
         for args in [
             vec!["init"],
+            // Persistent *local* config (not just the `-c` overrides on each
+            // call below) — `AmendmentHandler`'s own `git commit --amend`/
+            // `git rebase` subprocesses (exercised by the `apply_fixes_*`
+            // tests) run without those overrides, so they need a real
+            // identity in `.git/config` rather than depending on the
+            // process's ambient global git config, which isn't set on CI
+            // runners (mirrors `twiddle.rs`'s `init_test_repo_with_commit`,
+            // issue #950).
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
             vec!["checkout", "-b", "main"],
             vec!["commit", "--allow-empty", "-m", "feat(cli): first commit"],
         ] {
