@@ -1193,4 +1193,45 @@ mod tests {
         let head_after = head_oid(temp_dir.path());
         assert_eq!(head_before, head_after, "HEAD must be unchanged");
     }
+
+    /// Drives `output_text_report` directly (bypassing `execute()`, which
+    /// would `std::process::exit` on this issue's Error severity — see the
+    /// `apply_fixes_amends_commit_via_amendment_handler` caveat above) to
+    /// cover the suggestion-printing block reached when a commit has a
+    /// suggestion and `--quiet` is off.
+    #[test]
+    fn output_text_report_prints_suggestion_when_present_and_not_quiet() {
+        let cmd = LintCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Text,
+            strict: false,
+            quiet: false,
+            verbose: true,
+            show_passing: true,
+            stdin: false,
+            suggest: true,
+            fix: false,
+            allow_pushed: false,
+        };
+        let report = CheckReport::new(vec![CommitCheckResult {
+            hash: "abcdef1234567890".to_string(),
+            message: "chore(deps): bump foo".to_string(),
+            issues: vec![crate::data::check::CommitIssue {
+                severity: crate::data::check::IssueSeverity::Error,
+                section: "Scopes".to_string(),
+                rule: "unknown-scope".to_string(),
+                explanation: "Scope(s) not in the valid scopes list: deps".to_string(),
+            }],
+            suggestion: Some(crate::data::check::CommitSuggestion {
+                message: "chore(cargo): bump foo".to_string(),
+                explanation: "Deterministically resolved from the commit's changed files."
+                    .to_string(),
+            }),
+            passes: false,
+            summary: None,
+        }]);
+        assert!(cmd.output_text_report(&report).is_ok());
+    }
 }

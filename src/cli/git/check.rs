@@ -1317,7 +1317,8 @@ fn format_commit_line(icon: &str, short_hash: &str, message: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::check::{
-        CheckSummary, CommitIssue, CommitSuggestion, IssueSeverity, OutputFormat,
+        CheckReport, CheckSummary, CommitCheckResult, CommitIssue, CommitSuggestion, IssueSeverity,
+        OutputFormat,
     };
 
     // --- should_display_commit ---
@@ -1425,6 +1426,49 @@ mod tests {
         assert!(result.contains("fix: resolve crash"));
         assert!(result.contains("Why this is better:"));
         assert!(result.contains("clear description of fix"));
+    }
+
+    // --- output_text_report ---
+
+    /// Drives `output_text_report` directly (bypassing `execute()`, which
+    /// requires a real AI client and can `std::process::exit` on errors) to
+    /// cover the suggestion-printing block reached when a commit has a
+    /// suggestion and `--quiet` is off.
+    #[test]
+    fn output_text_report_prints_suggestion_when_present_and_not_quiet() {
+        let cmd = CheckCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Text,
+            format: None,
+            strict: false,
+            quiet: false,
+            verbose: true,
+            show_passing: true,
+            concurrency: 4,
+            batch_size: None,
+            no_coherence: false,
+            no_suggestions: false,
+            twiddle: false,
+        };
+        let report = CheckReport::new(vec![CommitCheckResult {
+            hash: "abcdef1234567890".to_string(),
+            message: "feat(cli): add thing".to_string(),
+            issues: vec![CommitIssue {
+                severity: IssueSeverity::Warning,
+                section: "Subject".to_string(),
+                rule: "some-rule".to_string(),
+                explanation: "needs work".to_string(),
+            }],
+            suggestion: Some(CommitSuggestion {
+                message: "feat(cli): add thing better".to_string(),
+                explanation: "clearer wording".to_string(),
+            }),
+            passes: false,
+            summary: None,
+        }]);
+        assert!(cmd.output_text_report(&report).is_ok());
     }
 
     // --- format_summary_text ---
