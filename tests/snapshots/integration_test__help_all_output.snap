@@ -4121,6 +4121,9 @@ Options:
       --verbose                    Shows the resolved rules/scopes configuration sources
       --show-passing               Includes passing commits in output (hidden by default)
       --stdin                      Reads a single commit message from standard input instead of a commit range (for a `commit-msg` git hook call site)
+      --suggest                    Populates a deterministic corrected-scope suggestion for each commit with an `unknown-scope`/`missing-scope` issue, resolved from the commit's changed files against `.omni-dev/scopes.yaml` + ecosystem defaults — no AI, no network. Report-only; use `--fix` to apply. Requires a commit range (incompatible with `--stdin`, which has no changed-files list to resolve a scope from)
+      --fix                        Applies `--suggest`'s deterministic scope corrections directly to the repository, via the same `AmendmentHandler` path `git commit message amend` uses. No AI, no confirmation prompt — only ever touches a commit with a resolvable `unknown-scope`/`missing-scope` issue. Implies `--suggest`. Requires a commit range (incompatible with `--stdin`)
+      --allow-pushed               Permits `--fix` to amend commits already present in a detected remote main branch (rewrites published history). Mirrors `git commit message amend --allow-pushed` / `twiddle --allow-pushed`. Ignored without `--fix`
   -h, --help                       Print help (see more with '--help')
 
 
@@ -4135,6 +4138,7 @@ Usage: staged [OPTIONS]
 Options:
       --print-only         Print the generated message to stdout instead of committing
       --context-dir <DIR>  Override the context directory used to load project scopes
+      --no-ai              Skip the AI backend entirely and print a deterministic `type(scope): ` skeleton derived from the staged diff's changed files — no AI, no network, no credentials required. The scope is resolved the same way `lint --suggest`/`--fix` do (`resolve_scope` against `.omni-dev/scopes.yaml` + ecosystem defaults); the type is a best-effort heuristic, not validated against an enumerable list. Always prints and never commits, regardless of `--print-only` — a bare skeleton has no description, so it's never a complete message to commit
   -h, --help               Print help
 
 

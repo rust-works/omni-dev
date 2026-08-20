@@ -97,6 +97,15 @@ pub struct GitLintCommitsParams {
     /// Defaults to `false` (only errors fail).
     #[serde(default)]
     pub strict: bool,
+    /// When true, populates a deterministic corrected-scope suggestion
+    /// (no AI, no network) for each commit with an
+    /// `unknown-scope`/`missing-scope` issue, resolved from its changed
+    /// files against `scopes.yaml` + ecosystem defaults. Report-only —
+    /// mutation stays exclusive to `git_amend_commits`. Errors if combined
+    /// with `message` (a literal message has no changed-files list).
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub suggest: bool,
 }
 
 /// Parameters for the `git_twiddle_commits` tool.
@@ -126,10 +135,18 @@ pub struct GitTwiddleCommitsParams {
 pub struct GitStagedCommitParams {
     /// When true, the generated commit message is returned without being
     /// committed to the repository. Defaults to `false` (commit applied).
+    /// Ignored (always treated as effectively true) when `no_ai` is set.
     #[serde(default)]
     pub print_only: bool,
+    /// When true, skips the AI backend entirely and returns a deterministic
+    /// `type(scope): ` skeleton derived from the staged diff's changed
+    /// files — no AI, no network, no credentials required. Never commits.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub no_ai: bool,
     /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
-    /// from settings, then the built-in default, when omitted.
+    /// from settings, then the built-in default, when omitted. Ignored when
+    /// `no_ai` is set.
     #[serde(default)]
     pub model: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.
@@ -274,10 +291,13 @@ impl OmniDevServer {
                        truthfulness — those need a model and stay in `git_check_commits`. Set \
                        `message` to lint a single literal message directly (bypassing git \
                        entirely), or `range` to lint every non-merge commit in a range (defaults \
-                       to commits ahead of the base branch). Mirrors \
-                       `omni-dev git commit message lint`. Returns a YAML payload with the full \
-                       CheckReport, a pass/fail summary, and the exit code the CLI would use \
-                       (honouring `strict`)."
+                       to commits ahead of the base branch). Set `suggest = true` to also populate \
+                       a deterministic corrected-scope suggestion (no AI) for each \
+                       `unknown-scope`/`missing-scope` issue — report-only; apply one via \
+                       `git_amend_commits`, or use the CLI's `lint --fix` to apply directly. \
+                       Mirrors `omni-dev git commit message lint --suggest`. Returns a YAML \
+                       payload with the full CheckReport, a pass/fail summary, and the exit code \
+                       the CLI would use (honouring `strict`)."
     )]
     pub async fn git_lint_commits(
         &self,
@@ -293,6 +313,7 @@ impl OmniDevServer {
             params.repo_path.as_deref().map(std::path::Path::new),
             params.context_dir.as_deref().map(std::path::Path::new),
             params.strict,
+            params.suggest,
         )
         .await
         .map_err(tool_error)?;
@@ -373,13 +394,16 @@ impl OmniDevServer {
         description = "Generate a Conventional Commits message from the currently staged diff \
                        and (by default) commit it via `git commit -m`. Mirrors \
                        `omni-dev git commit message staged`. Set `print_only = true` to return \
-                       the generated message without committing."
+                       the generated message without committing, or `no_ai = true` to skip the \
+                       AI backend entirely and return a deterministic `type(scope): ` skeleton \
+                       instead (no AI, no network, no credentials required; never commits)."
     )]
     pub async fn git_staged_commit(
         &self,
         Parameters(params): Parameters<GitStagedCommitParams>,
     ) -> Result<CallToolResult, McpError> {
         let print_only = params.print_only;
+        let no_ai = params.no_ai;
         let model = params.model.clone();
         params
             .repo_path
@@ -389,7 +413,7 @@ impl OmniDevServer {
         let repo_path: Option<PathBuf> = params.repo_path.as_deref().map(PathBuf::from);
 
         let outcome =
-            crate::cli::git::run_staged(print_only, model, None, None, repo_path.as_deref())
+            crate::cli::git::run_staged(print_only, no_ai, model, None, None, repo_path.as_deref())
                 .await
                 .map_err(tool_error)?;
 
@@ -767,6 +791,7 @@ mod tests {
             context_dir: None,
             repo_path: Some("/no/such/path/for/mcp/test".to_string()),
             strict: false,
+            suggest: false,
         };
         let err = server
             .git_lint_commits(Parameters(params))
@@ -787,6 +812,7 @@ mod tests {
             context_dir: None,
             repo_path: None,
             strict: false,
+            suggest: false,
         };
         let result = server
             .git_lint_commits(Parameters(params))
@@ -799,6 +825,27 @@ mod tests {
             .clone();
         assert!(text.contains("exit_code: 1"));
         assert!(text.contains("has_errors: true"));
+    }
+
+    #[tokio::test]
+    async fn git_lint_commits_handler_suggest_with_message_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitLintCommitsParams {
+            range: None,
+            message: Some("feat(cli): add thing".to_string()),
+            context_dir: None,
+            repo_path: None,
+            strict: false,
+            suggest: true,
+        };
+        let err = server
+            .git_lint_commits(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
     }
 
     #[tokio::test]
@@ -828,6 +875,26 @@ mod tests {
         let server = OmniDevServer::new();
         let params = GitStagedCommitParams {
             print_only: true,
+            no_ai: false,
+            model: None,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+        };
+        let err = server
+            .git_staged_commit(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_staged_commit_handler_no_ai_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitStagedCommitParams {
+            print_only: false,
+            no_ai: true,
             model: None,
             repo_path: Some("/no/such/path/for/mcp/test".to_string()),
         };
