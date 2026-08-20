@@ -33,12 +33,44 @@ const AMENDMENT_PARSE_MAX_RETRIES: u32 = 2;
 pub struct ClaudeClient {
     /// AI client implementation.
     ai_client: Box<dyn AiClient>,
+    /// Whether structured JSON-schema output is off for this client.
+    ///
+    /// Set from the [`STRUCTURED_OUTPUT_DISABLE_ENV`] off-switch, which
+    /// expresses the per-*endpoint* limitation the per-model registry gate
+    /// cannot (issue #1561). Held as an atomic so it can additionally be
+    /// latched at runtime, and read from `&self` dispatch paths.
+    ///
+    /// [`STRUCTURED_OUTPUT_DISABLE_ENV`]: crate::claude::backend::STRUCTURED_OUTPUT_DISABLE_ENV
+    schema_disabled: std::sync::atomic::AtomicBool,
 }
 
 impl ClaudeClient {
     /// Creates a new Claude client with the provided AI client implementation.
     pub fn new(ai_client: Box<dyn AiClient>) -> Self {
-        Self { ai_client }
+        Self {
+            ai_client,
+            schema_disabled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Returns `self` with structured JSON-schema output switched off when
+    /// `disabled`, whatever the backend advertises.
+    ///
+    /// Applied by [`create_default_claude_client_with`] from the
+    /// [`STRUCTURED_OUTPUT_DISABLE_ENV`](crate::claude::backend::STRUCTURED_OUTPUT_DISABLE_ENV)
+    /// off-switch, so an endpoint known to reject `output_config` never gets
+    /// sent it (issue #1561).
+    #[must_use]
+    pub fn with_structured_output_disabled(self, disabled: bool) -> Self {
+        self.schema_disabled
+            .store(disabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Whether structured output is currently off for this client.
+    fn schema_disabled(&self) -> bool {
+        self.schema_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns metadata about the AI client.
@@ -83,11 +115,31 @@ impl ClaudeClient {
         &self,
         schema: &'a serde_json::Value,
     ) -> Option<&'a serde_json::Value> {
-        if self.ai_client.capabilities().supports_response_schema {
+        if self.ai_client.capabilities().supports_response_schema && !self.schema_disabled() {
             Some(schema)
         } else {
             None
         }
+    }
+
+    /// Strips the JSON-schema system-prompt suffix, recovering the YAML
+    /// prompt byte-for-byte.
+    ///
+    /// [`adjusted_system_prompt`](Self::adjusted_system_prompt) appends
+    /// [`prompts::JSON_SCHEMA_RESPONSE_OVERRIDE`] at the very end for
+    /// schema-capable backends, and that suffix tells the model to disregard
+    /// the YAML instructions and match "the JSON Schema provided to the
+    /// runtime" — a schema a request without `output_config` no longer
+    /// carries. Any dispatch that ends up not attaching the schema must
+    /// therefore strip it, or the model is asked to satisfy a schema it was
+    /// never shown.
+    ///
+    /// A no-op when the suffix is absent, so it is safe to apply
+    /// unconditionally on the schema-less path.
+    fn yaml_system_prompt(system_prompt: &str) -> &str {
+        system_prompt
+            .strip_suffix(prompts::JSON_SCHEMA_RESPONSE_OVERRIDE)
+            .unwrap_or(system_prompt)
     }
 
     /// Dispatches a structured AI call with optional schema enforcement.
@@ -106,19 +158,17 @@ impl ClaudeClient {
         user_prompt: &str,
         schema: Option<&serde_json::Value>,
     ) -> Result<String> {
-        match schema {
-            Some(s) => {
-                let opts = RequestOptions::default().with_response_schema(s.clone());
-                self.ai_client
-                    .send_request_with_options(system_prompt, user_prompt, opts)
-                    .await
-            }
-            None => {
-                self.ai_client
-                    .send_request(system_prompt, user_prompt)
-                    .await
-            }
-        }
+        let Some(s) = schema else {
+            return self
+                .ai_client
+                .send_request(Self::yaml_system_prompt(system_prompt), user_prompt)
+                .await;
+        };
+
+        let opts = RequestOptions::default().with_response_schema(s.clone());
+        self.ai_client
+            .send_request_with_options(system_prompt, user_prompt, opts)
+            .await
     }
 
     /// Validates that the prompt fits within the model's token budget.
@@ -1808,9 +1858,12 @@ pub(crate) async fn create_default_claude_client_with(
     let beta_header = backend::resolve_beta_header(beta_header, env)?;
     let registry = crate::claude::model_config::get_model_registry();
     let model = backend::resolve_model(ai_backend, model.as_deref(), env, registry);
-    debug!(backend = ?ai_backend, model = %model, "Resolved AI backend");
+    // Resolved once, applied once below: the off-switch is a property of the
+    // endpoint, not of any one backend, so every arm honours it (#1561).
+    let schema_disabled = backend::resolve_structured_output_disabled(env);
+    debug!(backend = ?ai_backend, model = %model, schema_disabled, "Resolved AI backend");
 
-    match ai_backend {
+    let ai_client: Box<dyn AiClient> = match ai_backend {
         AiBackend::ClaudeCli => {
             // The `claude -p` subprocess negotiates betas itself, so the
             // beta header is deliberately not forwarded (and, uniquely, not
@@ -1823,8 +1876,7 @@ pub(crate) async fn create_default_claude_client_with(
                 );
             }
             debug!(model = %model, "Creating claude -p subprocess client");
-            let ai_client = ClaudeCliAiClient::new(model);
-            Ok(ClaudeClient::new(Box::new(ai_client)))
+            Box::new(ClaudeCliAiClient::new(model))
         }
         AiBackend::Ollama => {
             warn_beta_header_ignored(AiBackend::Ollama, beta_header.as_ref());
@@ -1846,7 +1898,7 @@ pub(crate) async fn create_default_claude_client_with(
                     );
                 }
             }
-            Ok(ClaudeClient::new(Box::new(ai_client)))
+            Box::new(ai_client)
         }
         AiBackend::OpenAi => {
             debug!("Creating OpenAI client");
@@ -1862,7 +1914,7 @@ pub(crate) async fn create_default_claude_client_with(
 
             let ai_client = OpenAiAiClient::new_openai(model, api_key, None)?;
             debug!("OpenAI client created successfully");
-            Ok(ClaudeClient::new(Box::new(ai_client)))
+            Box::new(ai_client)
         }
         AiBackend::Bedrock => {
             validate_beta_header(&model, &beta_header)?;
@@ -1874,8 +1926,12 @@ pub(crate) async fn create_default_claude_client_with(
                 .var("ANTHROPIC_BEDROCK_BASE_URL")
                 .ok_or(ClaudeError::ApiKeyNotFound)?;
 
-            let ai_client = BedrockAiClient::new(model, auth_token, base_url, beta_header)?;
-            Ok(ClaudeClient::new(Box::new(ai_client)))
+            Box::new(BedrockAiClient::new(
+                model,
+                auth_token,
+                base_url,
+                beta_header,
+            )?)
         }
         AiBackend::Default => {
             debug!("Creating direct Claude API client");
@@ -1890,9 +1946,11 @@ pub(crate) async fn create_default_claude_client_with(
 
             let ai_client = ClaudeAiClient::new(model, api_key, beta_header)?;
             debug!("Claude client created successfully");
-            Ok(ClaudeClient::new(Box::new(ai_client)))
+            Box::new(ai_client)
         }
-    }
+    };
+
+    Ok(ClaudeClient::new(ai_client).with_structured_output_disabled(schema_disabled))
 }
 
 #[cfg(test)]
@@ -2063,6 +2121,62 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].response_schema.as_ref(), Some(&schema));
         assert!(plain_log.lock().unwrap().is_empty());
+    }
+
+    // ── #1561: the structured-output off-switch ──────────────────────
+
+    fn schema_fixture() -> serde_json::Value {
+        serde_json::json!({"type": "object", "additionalProperties": false})
+    }
+
+    /// The strip is exact and idempotent: it removes the override when present
+    /// and leaves an unadorned YAML prompt untouched.
+    #[test]
+    fn yaml_system_prompt_strips_only_the_json_override() {
+        let base = "base system prompt";
+        let adjusted = prompts::apply_response_format_to_system_prompt(
+            base.to_string(),
+            ResponseFormat::JsonSchema,
+        );
+        assert_eq!(ClaudeClient::yaml_system_prompt(&adjusted), base);
+        assert_eq!(ClaudeClient::yaml_system_prompt(base), base);
+        assert_eq!(
+            ClaudeClient::yaml_system_prompt(ClaudeClient::yaml_system_prompt(&adjusted)),
+            base
+        );
+    }
+
+    /// The env off-switch reaches the client, so an endpoint known to reject
+    /// the field never gets sent it — not even once.
+    #[tokio::test]
+    async fn structured_output_disable_env_switches_the_schema_path_off() {
+        let base = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_AUTH_TOKEN", "token")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://example.com")
+            .with("OMNI_DEV_MODEL", "claude-sonnet-4-6");
+
+        let schema = schema_fixture();
+
+        let enabled = create_default_claude_client_with(&base, None, None)
+            .await
+            .expect("bedrock client should build");
+        assert!(
+            enabled.schema_if_supported(&schema).is_some(),
+            "a flagged model should use the schema path by default"
+        );
+
+        let disabled = create_default_claude_client_with(
+            &base.clone().with(
+                crate::claude::backend::STRUCTURED_OUTPUT_DISABLE_ENV,
+                "true",
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("bedrock client should build");
+        assert!(disabled.schema_if_supported(&schema).is_none());
     }
 
     /// `adjusted_system_prompt` only appends the JSON-schema override

@@ -61,6 +61,10 @@ pub const USE_OPENAI_ENV: &str = "USE_OPENAI";
 pub const USE_OLLAMA_ENV: &str = "USE_OLLAMA";
 /// Legacy backend-selection flag for AWS Bedrock (`true` to select).
 pub const USE_BEDROCK_ENV: &str = "CLAUDE_CODE_USE_BEDROCK";
+/// Env var switching structured JSON-schema output off for the whole
+/// invocation, whatever the model registry says. See
+/// [`resolve_structured_output_disabled`].
+pub const STRUCTURED_OUTPUT_DISABLE_ENV: &str = "OMNI_DEV_STRUCTURED_OUTPUT_DISABLE";
 
 /// Hard fallback when the registry has no default for the `claude` provider.
 ///
@@ -167,6 +171,31 @@ pub fn resolve_backend(env: &impl EnvSource) -> Result<AiBackend> {
     } else {
         Ok(AiBackend::Default)
     }
+}
+
+/// Resolves whether structured JSON-schema output is switched off for this
+/// invocation, from [`STRUCTURED_OUTPUT_DISABLE_ENV`].
+///
+/// The `output_config.format` request field is otherwise gated per *model*
+/// (`ModelRegistry::supports_structured_output`), which cannot express "this
+/// *endpoint* won't accept the field" — the case a gateway named by
+/// `ANTHROPIC_BEDROCK_BASE_URL` creates when it rejects `output_config`
+/// outright (issue #1561). This is the endpoint-level off-switch: it applies
+/// to every backend
+/// and every model, so a run against such a gateway never sends the field at
+/// all rather than paying one rejected round-trip to discover it.
+///
+/// Truthy values are `1`, `true`, and `yes` (trimmed, case-insensitive);
+/// anything else — including an unset or empty var — leaves structured output
+/// enabled. Read through the injected [`EnvSource`] like every other variable
+/// here, so it can equally be supplied from a `settings.json` `env` bundle or
+/// profile.
+#[must_use]
+pub fn resolve_structured_output_disabled(env: &impl EnvSource) -> bool {
+    env.var(STRUCTURED_OUTPUT_DISABLE_ENV).is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes"
+    })
 }
 
 /// Resolves the model id for `backend`, stopping at the first non-empty
@@ -320,6 +349,29 @@ mod tests {
                 .with(USE_OLLAMA_ENV, "true");
             assert_eq!(resolve_backend(&env).unwrap(), expected, "value {value}");
         }
+    }
+
+    /// The structured-output off-switch accepts the same truthy vocabulary as
+    /// the request log's flags, and is off unless positively set (#1561).
+    #[test]
+    fn resolve_structured_output_disabled_reads_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", " true "] {
+            let env = MapEnv::new().with(STRUCTURED_OUTPUT_DISABLE_ENV, value);
+            assert!(
+                resolve_structured_output_disabled(&env),
+                "value {value:?} should disable structured output"
+            );
+        }
+
+        for value in ["", "0", "false", "no", "maybe"] {
+            let env = MapEnv::new().with(STRUCTURED_OUTPUT_DISABLE_ENV, value);
+            assert!(
+                !resolve_structured_output_disabled(&env),
+                "value {value:?} should leave structured output enabled"
+            );
+        }
+
+        assert!(!resolve_structured_output_disabled(&MapEnv::new()));
     }
 
     #[test]
