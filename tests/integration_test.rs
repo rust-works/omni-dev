@@ -312,12 +312,14 @@ fn binary_config_models_show_succeeds() {
     assert!(stdout.contains("claude"));
 }
 
-// NOTE: these two tests encode this repo's *current, still-broken* scopes
-// state (issue #1468: src/transcript/**, src/coverage/**, src/worktrees.rs
-// have no covering scope). Once #1468 lands, invert (don't delete) the first
-// test to assert a clean run.
+// NOTE: prior to issue #1468, the first test below encoded this repo's
+// *then-broken* scopes state (src/transcript/**, src/coverage/**,
+// src/worktrees.rs had no covering scope, and the "resources" scope's
+// `src/resources/**` pattern was dead). #1468 fixed scopes.yaml, so it now
+// asserts a clean run instead — inverted rather than deleted, so a future
+// regression is still caught here.
 #[test]
-fn binary_config_scopes_lint_reports_known_gaps_today() {
+fn binary_config_scopes_lint_reports_a_clean_run() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
             "--repo",
@@ -330,37 +332,68 @@ fn binary_config_scopes_lint_reports_known_gaps_today() {
         ])
         .output()
         .expect("failed to run binary");
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit against today's scopes.yaml"
-    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON report");
-    let unscoped = report["unscoped_files"]
+    assert!(
+        output.status.success(),
+        "expected a clean `config scopes lint` run against today's scopes.yaml, got: {report}"
+    );
+    assert!(report["dead_patterns"]
         .as_array()
-        .expect("unscoped_files array");
-    let paths: Vec<&str> = unscoped.iter().filter_map(|v| v.as_str()).collect();
-    assert!(paths.iter().any(|p| p.starts_with("src/transcript")));
-    assert!(paths.iter().any(|p| p.starts_with("src/coverage")));
-    assert!(paths.contains(&"src/worktrees.rs"));
+        .expect("dead_patterns array")
+        .is_empty());
+    assert!(report["unscoped_files"]
+        .as_array()
+        .expect("unscoped_files array")
+        .is_empty());
 }
 
 #[test]
 fn binary_config_scopes_lint_project_only_matters() {
-    // The regression #1475 exists to prevent, demonstrated end-to-end: the
-    // ecosystem `lib` = `src/**` catch-all would make every currently
-    // unscoped src/ file (the gaps above) resolve to `lib` and vacuously
-    // pass — proving --project-only (the default) is what actually catches
-    // drift. Checked via the `unscoped_files` field specifically, not the
-    // overall exit code: this repo also has an unrelated, pre-existing dead
-    // pattern (scope "resources"' `src/resources/**`, since only
-    // `src/resources.rs` exists) that keeps the `--no-project-only` run
-    // non-zero regardless — fixing scopes.yaml drift is out of scope for
-    // #1475 (that's #1468's job), so the exit code alone can't isolate this.
+    // The regression #1475 exists to prevent, demonstrated end-to-end
+    // against a synthetic repo — not this crate's own scopes.yaml, which
+    // #1468 keeps clean under both modes, so it can no longer demonstrate
+    // the contrast: the ecosystem `lib` = `src/**` catch-all makes the
+    // "every file is scoped" check vacuously true, since every file also
+    // matches `lib`'s `src/**` — proving --project-only (the default) is
+    // what actually catches drift. Checked via the `unscoped_files` field
+    // specifically, not the overall exit code, since a project-only run
+    // failing and a project+ecosystem run passing is the interesting
+    // contrast, not either exit code alone.
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+    let p = temp_dir.path();
+
+    assert!(std::process::Command::new("git")
+        .current_dir(p)
+        .args(["init"])
+        .status()
+        .unwrap()
+        .success());
+    // Cargo.toml selects the Rust ecosystem defaults, whose `lib` scope
+    // (`["src/lib.rs", "src/**"]`) is the catch-all this test is about.
+    std::fs::write(p.join("Cargo.toml"), "[package]").unwrap();
+    std::fs::create_dir_all(p.join("src/newmod")).unwrap();
+    std::fs::write(p.join("src/newmod/helper.rs"), "// unscoped by design").unwrap();
+    let context_dir = p.join(".omni-dev");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(
+        context_dir.join("scopes.yaml"),
+        "scopes:\n  - name: cli\n    description: CLI\n    examples: []\n    file_patterns: [\"src/cli/**\"]\n",
+    )
+    .unwrap();
+    assert!(std::process::Command::new("git")
+        .current_dir(p)
+        .args(["add", "."])
+        .status()
+        .unwrap()
+        .success());
+
     let default_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
             "--repo",
-            env!("CARGO_MANIFEST_DIR"),
+            p.to_str().unwrap(),
             "config",
             "scopes",
             "lint",
@@ -380,7 +413,7 @@ fn binary_config_scopes_lint_project_only_matters() {
     let no_project_only_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
             "--repo",
-            env!("CARGO_MANIFEST_DIR"),
+            p.to_str().unwrap(),
             "config",
             "scopes",
             "lint",
