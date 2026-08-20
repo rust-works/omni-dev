@@ -508,7 +508,7 @@ fn binary_completions_bash_succeeds() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("complete -F _omni-dev"),
+        stdout.contains("complete -F _omni__dev"),
         "missing bash completion marker; stdout: {stdout}"
     );
 }
