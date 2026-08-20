@@ -6,27 +6,27 @@ scopes:
   - name: "claude"
     description: "Claude AI client implementation and integration"
     examples: ["claude: add contextual prompting", "claude: fix API error handling"]
-    file_patterns: ["src/claude/**", "src/data/context.rs"]
+    file_patterns: ["src/claude.rs", "src/claude/**", "src/data/context.rs"]
   - name: "atlassian"
     description: "Atlassian JIRA/Confluence integration and API client"
     examples: ["atlassian: add post_json to AtlassianClient", "atlassian: implement jira search"]
-    file_patterns: ["src/atlassian/**", "src/cli/atlassian/**"]
+    file_patterns: ["src/atlassian.rs", "src/atlassian/**", "src/cli/atlassian/**"]
   - name: "datadog"
     description: "Datadog monitoring integration and REST API client"
     examples: ["datadog: add get_parsed to DatadogClient", "datadog: implement monitor search"]
-    file_patterns: ["src/datadog/**", "src/cli/datadog.rs", "src/cli/datadog/**"]
+    file_patterns: ["src/datadog.rs", "src/datadog/**", "src/cli/datadog.rs", "src/cli/datadog/**"]
   - name: "cli"
     description: "Command-line interface and argument parsing"
     examples: ["cli: add twiddle contextual options", "cli: improve help text"]
-    file_patterns: ["src/cli/**", "src/main.rs"]
+    file_patterns: ["src/cli.rs", "src/cli/**", "src/main.rs"]
   - name: "browser"
     description: "Browser bridge: drive authenticated requests through a browser tab"
     examples: ["browser: add WebSocket bridge", "browser: support binary response bodies"]
-    file_patterns: ["src/browser/**", "src/cli/browser/**", "src/cli/browser.rs"]
+    file_patterns: ["src/browser.rs", "src/browser/**", "src/cli/browser/**", "src/cli/browser.rs"]
   - name: "snowflake"
     description: "Snowflake query service: authenticate-once SSO sessions on the daemon"
     examples: ["snowflake: add account-agnostic session engine", "snowflake: map arbitrary rows to JSON"]
-    file_patterns: ["src/snowflake/**", "src/cli/snowflake.rs", "src/daemon/services/snowflake.rs"]
+    file_patterns: ["src/snowflake.rs", "src/snowflake/**", "src/cli/snowflake.rs", "src/daemon/services/snowflake.rs"]
   - name: "sessions"
     description: "Claude Code sessions tracker: cross-window live session state on the daemon"
     examples: ["sessions: add cross-window session registry", "sessions: map hook events to state"]
@@ -34,19 +34,19 @@ scopes:
   - name: "daemon"
     description: "Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray"
     examples: ["daemon: add service registry", "daemon: update tray menu items in place"]
-    file_patterns: ["src/daemon/**", "src/cli/daemon.rs", "src/cli/daemon/**"]
+    file_patterns: ["src/daemon.rs", "src/daemon/**", "src/cli/daemon.rs", "src/cli/daemon/**"]
   - name: "git"
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
-    file_patterns: ["src/git/**"]
+    file_patterns: ["src/git.rs", "src/git/**"]
   - name: "drive"
     description: "Google Drive integration: typed API client, OAuth2 auth, and CLI/MCP surfaces"
     examples: ["drive: add OAuth2 PKCE login flow", "drive: implement file search"]
-    file_patterns: ["src/drive/**", "src/cli/drive.rs", "src/cli/drive/**"]
+    file_patterns: ["src/drive.rs", "src/drive/**", "src/cli/drive.rs", "src/cli/drive/**"]
   - name: "gmail"
     description: "Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces"
     examples: ["gmail: add OAuth2 PKCE login flow", "gmail: implement message search"]
-    file_patterns: ["src/gmail/**", "src/cli/gmail.rs", "src/cli/gmail/**"]
+    file_patterns: ["src/gmail.rs", "src/gmail/**", "src/cli/gmail.rs", "src/cli/gmail/**"]
   - name: "mcp"
     description: "MCP server implementation and tool handlers"
     examples: ["mcp: add git_view_commits tool", "mcp: wire up stdio transport"]
@@ -58,11 +58,23 @@ scopes:
   - name: "resources"
     description: "Embedded reference content registry shared by CLI and MCP"
     examples: ["resources: add jfm spec entry", "resources: extract specs into shared registry"]
-    file_patterns: ["src/resources.rs", "src/resources/**"]
+    file_patterns: ["src/resources.rs"]
   - name: "data"
     description: "Data structures and serialization"
     examples: ["data: add context structures", "data: improve YAML output"]
-    file_patterns: ["src/data/**"]
+    file_patterns: ["src/data.rs", "src/data/**"]
+  - name: "coverage"
+    description: "Coverage report parsing, diffing and rendering"
+    examples: ["coverage: add lcov parser", "coverage: render diff summary table"]
+    file_patterns: ["src/coverage.rs", "src/coverage/**", "src/cli/coverage.rs", "src/cli/coverage/**"]
+  - name: "transcript"
+    description: "Transcript fetching and formatting: source retrieval and subtitle conversion"
+    examples: ["transcript: add youtube transcript source", "transcript: support vtt output format"]
+    file_patterns: ["src/transcript.rs", "src/transcript/**", "src/cli/transcript.rs", "src/cli/transcript/**"]
+  - name: "worktrees"
+    description: "Worktrees registry: cross-window repo/worktree tracking and window management on the daemon"
+    examples: ["worktrees: add close-worktree op", "worktrees: fix ahead/behind lazy fetch"]
+    file_patterns: ["src/worktrees.rs"]
   - name: "docs"
     description: "Documentation and planning"
     examples: ["docs: update twiddle plan", "docs: add context intelligence spec"]
@@ -92,8 +104,13 @@ scopes:
 # generic/shared utilities and top-level entry points that don't belong to
 # any single subsystem. Checked by `omni-dev config scopes lint` (#1475).
 allow:
+  - "src/utils.rs"
   - "src/utils/**"
   - "src/lib.rs"
   - "src/test_support.rs"
   - "src/bin/**"
   - "src/templates/**"
+  - "src/build_info.rs"
+  - "src/github_metrics.rs"
+  - "src/github_rate_limit.rs"
+  - "src/pr_status.rs"
