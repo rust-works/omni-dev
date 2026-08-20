@@ -135,10 +135,18 @@ pub struct GitTwiddleCommitsParams {
 pub struct GitStagedCommitParams {
     /// When true, the generated commit message is returned without being
     /// committed to the repository. Defaults to `false` (commit applied).
+    /// Ignored (always treated as effectively true) when `no_ai` is set.
     #[serde(default)]
     pub print_only: bool,
+    /// When true, skips the AI backend entirely and returns a deterministic
+    /// `type(scope): ` skeleton derived from the staged diff's changed
+    /// files — no AI, no network, no credentials required. Never commits.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub no_ai: bool,
     /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
-    /// from settings, then the built-in default, when omitted.
+    /// from settings, then the built-in default, when omitted. Ignored when
+    /// `no_ai` is set.
     #[serde(default)]
     pub model: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.
@@ -386,13 +394,16 @@ impl OmniDevServer {
         description = "Generate a Conventional Commits message from the currently staged diff \
                        and (by default) commit it via `git commit -m`. Mirrors \
                        `omni-dev git commit message staged`. Set `print_only = true` to return \
-                       the generated message without committing."
+                       the generated message without committing, or `no_ai = true` to skip the \
+                       AI backend entirely and return a deterministic `type(scope): ` skeleton \
+                       instead (no AI, no network, no credentials required; never commits)."
     )]
     pub async fn git_staged_commit(
         &self,
         Parameters(params): Parameters<GitStagedCommitParams>,
     ) -> Result<CallToolResult, McpError> {
         let print_only = params.print_only;
+        let no_ai = params.no_ai;
         let model = params.model.clone();
         params
             .repo_path
@@ -402,7 +413,7 @@ impl OmniDevServer {
         let repo_path: Option<PathBuf> = params.repo_path.as_deref().map(PathBuf::from);
 
         let outcome =
-            crate::cli::git::run_staged(print_only, model, None, None, repo_path.as_deref())
+            crate::cli::git::run_staged(print_only, no_ai, model, None, None, repo_path.as_deref())
                 .await
                 .map_err(tool_error)?;
 
@@ -864,6 +875,26 @@ mod tests {
         let server = OmniDevServer::new();
         let params = GitStagedCommitParams {
             print_only: true,
+            no_ai: false,
+            model: None,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+        };
+        let err = server
+            .git_staged_commit(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_staged_commit_handler_no_ai_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitStagedCommitParams {
+            print_only: false,
+            no_ai: true,
             model: None,
             repo_path: Some("/no/such/path/for/mcp/test".to_string()),
         };
