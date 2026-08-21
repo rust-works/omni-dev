@@ -6,10 +6,11 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi};
 use crate::gmail::raw_message::decode_raw_message;
+use crate::gmail::render::render_markdown;
 use crate::gmail::types::Message;
 
 /// How much of the message to fetch.
@@ -46,6 +47,50 @@ impl ReadDetail {
     }
 }
 
+/// Output format for `gmail read`, extending the shared [`OutputFormat`]
+/// with `Markdown` — a human-readable rendering of the message headers
+/// (RFC 2047-decoded) and body via
+/// [`render_markdown`](crate::gmail::render::render_markdown), the same
+/// function `gmail render` uses for archived `.eml` files (#1513). Kept
+/// local to `read` rather than added to the shared `OutputFormat` used
+/// crate-wide: every other CLI surface's `-o` renders arbitrary
+/// `Serialize` data generically, and a `Markdown` variant only makes sense
+/// for a MIME message.
+#[derive(Clone, Debug, Default, ValueEnum)]
+pub enum ReadOutputFormat {
+    /// Human-readable table (id/thread-id/labels/snippet). Default.
+    #[default]
+    Table,
+    /// JSON.
+    Json,
+    /// YAML (single document).
+    Yaml,
+    /// YAML stream (`---`-separated multi-document).
+    Yamls,
+    /// JSON Lines.
+    Jsonl,
+    /// Human-readable Markdown rendering of the full message (headers +
+    /// body). Always fetches the complete raw MIME message regardless of
+    /// `--detail`, since rendering needs the full message structure.
+    Markdown,
+}
+
+impl ReadOutputFormat {
+    /// Converts to the shared [`OutputFormat`] for the non-`Markdown`
+    /// variants. Never called for `Markdown`, which `run_read` handles
+    /// before this conversion is needed.
+    fn as_shared(&self) -> OutputFormat {
+        match self {
+            Self::Table => OutputFormat::Table,
+            Self::Json => OutputFormat::Json,
+            Self::Yaml => OutputFormat::Yaml,
+            Self::Yamls => OutputFormat::Yamls,
+            Self::Jsonl => OutputFormat::Jsonl,
+            Self::Markdown => unreachable!("Markdown is handled before this point in run_read"),
+        }
+    }
+}
+
 /// Reads a single Gmail message.
 ///
 /// (mirrors the `gmail_message_read` MCP tool)
@@ -63,8 +108,17 @@ pub struct ReadCommand {
     pub detail: ReadDetail,
 
     /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    #[arg(short = 'o', long, value_enum, default_value_t = ReadOutputFormat::Table)]
+    pub output: ReadOutputFormat,
+
+    /// Collapses `>`-quoted reply history nested more than one level deep
+    /// into a one-line `*(N quoted lines omitted)*` marker (#1514). Only
+    /// affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it
+    /// is silently ignored elsewhere). Off by default: verbatim rendering
+    /// is fully information-preserving, and the full text is one re-render
+    /// away without this flag.
+    #[arg(long)]
+    pub fold_quotes: bool,
 }
 
 impl ReadCommand {
@@ -77,6 +131,7 @@ impl ReadCommand {
             self.detail,
             self.out_file.as_deref(),
             &self.output,
+            self.fold_quotes,
         )
         .await
     }
@@ -91,8 +146,28 @@ async fn run_read(
     message_id: &str,
     detail: ReadDetail,
     out_file: Option<&str>,
-    output: &OutputFormat,
+    output: &ReadOutputFormat,
+    fold_quotes: bool,
 ) -> Result<()> {
+    if matches!(output, ReadOutputFormat::Markdown) {
+        // Rendering needs the full raw MIME message regardless of
+        // `--detail`, so this fetches with `format=raw` directly rather
+        // than honouring `detail.as_message_format()`.
+        let message = MessagesApi::new(client)
+            .get(message_id, MessageFormat::Raw, &[])
+            .await?;
+        let bytes = decode_raw_message(&message)?;
+        let markdown = render_markdown(&bytes, fold_quotes);
+
+        if let Some(path) = out_file {
+            fs::write(path, &markdown).with_context(|| format!("Failed to write to {path}"))?;
+            println!("Saved to: {path}");
+            return Ok(());
+        }
+        print!("{markdown}");
+        return Ok(());
+    }
+
     let message = MessagesApi::new(client)
         .get(message_id, detail.as_message_format(), &[])
         .await?;
@@ -109,7 +184,7 @@ async fn run_read(
         return Ok(());
     }
 
-    if output_as(&message, output)? {
+    if output_as(&message, &output.as_shared())? {
         return Ok(());
     }
     let stdout = std::io::stdout();
@@ -142,16 +217,24 @@ fn render_plain_text(message: &Message) -> String {
 /// sense of "one command, one rendering," not a literal grid, matching the
 /// Datadog `monitor get` precedent for single-record views.
 fn render_read_table(message: &Message, out: &mut dyn Write) -> Result<()> {
-    writeln!(out, "Id: {}", message.id).context("Failed to write read row")?;
+    writeln!(out, "Id: {}", sanitize_for_terminal(&message.id))
+        .context("Failed to write read row")?;
     if let Some(thread_id) = &message.thread_id {
-        writeln!(out, "Thread-Id: {thread_id}").context("Failed to write read row")?;
-    }
-    if !message.label_ids.is_empty() {
-        writeln!(out, "Labels: {}", message.label_ids.join(", "))
+        writeln!(out, "Thread-Id: {}", sanitize_for_terminal(thread_id))
             .context("Failed to write read row")?;
     }
+    if !message.label_ids.is_empty() {
+        let labels = message
+            .label_ids
+            .iter()
+            .map(|l| sanitize_for_terminal(l))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "Labels: {labels}").context("Failed to write read row")?;
+    }
     if let Some(snippet) = &message.snippet {
-        writeln!(out, "Snippet: {snippet}").context("Failed to write read row")?;
+        writeln!(out, "Snippet: {}", sanitize_for_terminal(snippet))
+            .context("Failed to write read row")?;
     }
     Ok(())
 }
@@ -262,6 +345,25 @@ mod tests {
         assert_eq!(text, "Id: m1\n");
     }
 
+    #[test]
+    fn render_read_table_strips_control_bytes_from_server_strings() {
+        let message = Message {
+            id: "m1".to_string(),
+            thread_id: Some("t\x1b[31m1".to_string()),
+            label_ids: vec!["IN\rBOX".to_string()],
+            snippet: Some("evil\x07snippet\u{9b}2J".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_read_table(&message, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains(|c: char| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("Snippet: evilsnippet2J"), "{text:?}");
+    }
+
     // ── run_read ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -286,7 +388,8 @@ mod tests {
             "m1",
             ReadDetail::Full,
             Some(path.to_str().unwrap()),
-            &OutputFormat::Table,
+            &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -320,7 +423,8 @@ mod tests {
             "m1",
             ReadDetail::Raw,
             Some(path.to_str().unwrap()),
-            &OutputFormat::Table,
+            &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -350,12 +454,142 @@ mod tests {
             "m1",
             ReadDetail::Raw,
             Some(path.to_str().unwrap()),
-            &OutputFormat::Table,
+            &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("no `raw` field"));
         assert!(!path.exists());
+    }
+
+    // ── ReadOutputFormat::Markdown ──────────────────────────────────
+
+    #[tokio::test]
+    async fn run_read_markdown_writes_rendered_markdown_to_out_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let source = "Subject: Hi\r\nFrom: a@example.com\r\n\r\nBody text.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "raw": encoded,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("message.md");
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            Some(path.to_str().unwrap()),
+            &ReadOutputFormat::Markdown,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# Hi"));
+        assert!(content.contains("Body text."));
+    }
+
+    #[tokio::test]
+    async fn run_read_markdown_ignores_detail_and_always_fetches_raw() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let source = "Subject: Hi\r\n\r\nBody.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "raw": encoded,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // `--detail minimal` would normally request `format=minimal`; the
+        // mock above only matches `format=raw`, so a request for anything
+        // else 404s against wiremock's unmatched-request default and this
+        // would fail if `-o markdown` didn't override `detail`.
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Minimal,
+            None,
+            &ReadOutputFormat::Markdown,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_markdown_prints_to_stdout_without_out_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let source = "Subject: Hi\r\n\r\nBody.";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "raw": encoded,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Markdown,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_markdown_propagates_decode_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Markdown,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no `raw` field"));
     }
 
     #[tokio::test]
@@ -370,9 +604,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
-            .await
-            .unwrap();
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Table,
+            false,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -387,9 +628,88 @@ mod tests {
             .mount(&server)
             .await;
 
-        run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Json)
-            .await
-            .unwrap();
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Json,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_yaml_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Yaml,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_yamls_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Yamls,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_read_jsonl_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m1"})),
+            )
+            .mount(&server)
+            .await;
+
+        run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Jsonl,
+            false,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -402,9 +722,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run_read(&client, "m1", ReadDetail::Full, None, &OutputFormat::Table)
-            .await
-            .unwrap_err();
+        let err = run_read(
+            &client,
+            "m1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Table,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
@@ -427,7 +754,8 @@ mod tests {
             "m1",
             ReadDetail::Metadata,
             None,
-            &OutputFormat::Table,
+            &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -452,7 +780,8 @@ mod tests {
             "m1",
             ReadDetail::Minimal,
             None,
-            &OutputFormat::Table,
+            &ReadOutputFormat::Table,
+            false,
         )
         .await
         .unwrap();
@@ -478,7 +807,8 @@ mod tests {
             message_id: "m42".to_string(),
             out_file: None,
             detail: ReadDetail::Full,
-            output: OutputFormat::Json,
+            output: ReadOutputFormat::Json,
+            fold_quotes: false,
         };
         cmd.execute(&client).await.unwrap();
     }

@@ -5,7 +5,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::account::{self, AccountSummary};
 use crate::utils::settings::Settings;
 
@@ -53,23 +53,32 @@ fn render_account_table(accounts: &[AccountSummary], out: &mut dyn Write) -> Res
         return Ok(());
     }
 
+    // Sanitize before computing column widths, so a stripped control byte
+    // can't leave a column one character too wide for what's actually
+    // written (#1537). `name` is operator-chosen (the `--account` label);
+    // `email_address`/`scope` are cached values read back from the OAuth
+    // provider — sanitized uniformly rather than singled out by source.
+    let names: Vec<String> = accounts
+        .iter()
+        .map(|a| sanitize_for_terminal(&a.name))
+        .collect();
     let name_width = "NAME"
         .len()
-        .max(accounts.iter().map(|a| a.name.len()).max().unwrap_or(0));
-    let email_strings: Vec<&str> = accounts
+        .max(names.iter().map(String::len).max().unwrap_or(0));
+    let email_strings: Vec<String> = accounts
         .iter()
-        .map(|a| a.email_address.as_deref().unwrap_or("-"))
+        .map(|a| sanitize_for_terminal(a.email_address.as_deref().unwrap_or("-")))
         .collect();
     let email_width = "EMAIL"
         .len()
-        .max(email_strings.iter().map(|s| s.len()).max().unwrap_or(0));
-    let scope_strings: Vec<&str> = accounts
+        .max(email_strings.iter().map(String::len).max().unwrap_or(0));
+    let scope_strings: Vec<String> = accounts
         .iter()
-        .map(|a| a.scope.as_deref().unwrap_or("-"))
+        .map(|a| sanitize_for_terminal(a.scope.as_deref().unwrap_or("-")))
         .collect();
     let scope_width = "SCOPE"
         .len()
-        .max(scope_strings.iter().map(|s| s.len()).max().unwrap_or(0));
+        .max(scope_strings.iter().map(String::len).max().unwrap_or(0));
 
     writeln!(
         out,
@@ -81,7 +90,7 @@ fn render_account_table(accounts: &[AccountSummary], out: &mut dyn Write) -> Res
         writeln!(
             out,
             "{:<name_width$}  {:<email_width$}  {:<scope_width$}  {}",
-            account.name,
+            names[i],
             email_strings[i],
             scope_strings[i],
             if account.is_default { "*" } else { "" },
@@ -135,6 +144,37 @@ mod tests {
             .find(|l| l.contains("personal@example.com"))
             .unwrap();
         assert!(!personal_line.trim_end().ends_with('*'));
+    }
+
+    #[test]
+    fn render_table_strips_control_bytes_and_keeps_columns_aligned() {
+        let accounts = [
+            AccountSummary {
+                name: "wo\rrk".to_string(),
+                email_address: Some("evil\x1b[31m@example.com".to_string()),
+                scope: Some("read\x07only".to_string()),
+                is_default: true,
+            },
+            sample("personal", false),
+        ];
+        let mut buf = Vec::new();
+        render_account_table(&accounts, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+        assert!(out.contains("evil[31m@example.com"), "{out:?}");
+        // NAME/EMAIL/SCOPE stay aligned across rows (the trailing DEFAULT
+        // marker is deliberately unpadded, so compare up to SCOPE instead
+        // of whole-line length).
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[1].find("readonly"),
+            lines[2].find("readonly"),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! Datadog's v2 logs search — [`MessagesApi::search`] issues a single page,
 //! [`MessagesApi::search_all`] auto-paginates up to a caller-supplied limit
 //! (or [`HARD_CAP`] when the limit is `0`), and
-//! [`MessagesApi::search_all_unbounded`] auto-paginates with no cap at all
+//! [`MessagesApi::search_all_unbounded_streaming`] auto-paginates with no cap at all
 //! for `gmail sync`'s full-listing pass (#1467). Gmail's list endpoint is
 //! GET-with-query-params (not POST-with-body like Datadog's logs search),
 //! so URL construction follows the free `build_*_url` pattern from
@@ -143,6 +143,17 @@ fn header_value(payload: Option<&serde_json::Value>, name: &str) -> Option<Strin
         .map(str::to_string)
 }
 
+/// One page's worth of listing progress, reported by
+/// [`MessagesApi::search_all_unbounded_streaming`] as each page arrives.
+///
+/// Domain-agnostic — this module has no dependency on `gmail sync`'s
+/// progress-event/indicatif rendering layer (`src/cli/gmail/sync/progress.rs`,
+/// #1502); the caller maps this into whatever it needs.
+pub(crate) struct ListingProgress {
+    pub(crate) page_no: usize,
+    pub(crate) ids_so_far: usize,
+}
+
 /// Messages API façade.
 #[derive(Debug)]
 pub struct MessagesApi<'a> {
@@ -184,21 +195,22 @@ impl<'a> MessagesApi<'a> {
     ///
     /// `limit == 0` means "fetch every match up to [`HARD_CAP`]". This cap
     /// is a deliberate safety limit for this interactive surface — see
-    /// [`Self::search_all_unbounded`] for the one caller that must not have
-    /// it.
+    /// [`Self::search_all_unbounded_streaming`] for the one caller that must
+    /// not have it.
     pub async fn search_all(
         &self,
         query: Option<&str>,
         label_ids: &[&str],
         limit: usize,
     ) -> Result<MessageListResponse> {
-        self.paginate(query, label_ids, Some(effective_cap(limit)), None)
-            .await
+        self.paginate(query, label_ids, effective_cap(limit)).await
     }
 
     /// Searches messages, auto-paginating with **no cap** — every page is
     /// fetched until Gmail stops returning a `nextPageToken`, however large
-    /// the mailbox.
+    /// the mailbox — streaming each page's message ids onto `ids_tx` as soon
+    /// as the page arrives, instead of accumulating the whole listing before
+    /// returning.
     ///
     /// Deliberately not exposed to [`Self::search_all`]'s interactive
     /// callers (`gmail search`/`gmail thread`), which rely on [`HARD_CAP`]
@@ -214,40 +226,72 @@ impl<'a> MessagesApi<'a> {
     /// against the caller's quota budget, proactively rather than relying
     /// on reactive 429/403 retry — the same principle `messages.get`
     /// fetches already follow in `src/cli/gmail/sync/engine.rs`.
-    pub(crate) async fn search_all_unbounded(
+    ///
+    /// Streaming (rather than returning a [`MessageListResponse`] like
+    /// [`Self::search_all`]) is what lets `gmail sync`'s fetch fan-out start
+    /// on early-listed messages while later pages are still being fetched
+    /// (#1502). `ids_tx` is owned, not borrowed — dropping it on return is
+    /// the "no more ids" signal to the receiver, no sentinel needed. If the
+    /// receiver end has been dropped (the consumer stopped listening),
+    /// `ids_tx.send` starts failing and this method stops pulling further
+    /// pages rather than paying for list requests nobody wants. `on_page` is
+    /// a plain sync closure — this module stays free of any dependency on
+    /// the CLI/progress-rendering layer.
+    pub(crate) async fn search_all_unbounded_streaming(
         &self,
         query: Option<&str>,
         label_ids: &[&str],
         limiter: &TokenBucket,
-    ) -> Result<MessageListResponse> {
-        self.paginate(query, label_ids, None, Some(limiter)).await
+        ids_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        mut on_page: impl FnMut(ListingProgress),
+    ) -> Result<()> {
+        let mut page_token: Option<String> = None;
+        let mut page_no = 0usize;
+        let mut ids_so_far = 0usize;
+        loop {
+            limiter.acquire(MESSAGES_LIST_COST_UNITS).await;
+            let page = self
+                .search(query, label_ids, MAX_PAGE_LIMIT, page_token.as_deref())
+                .await?;
+            page_no += 1;
+            ids_so_far += page.messages.len();
+            for message in &page.messages {
+                if ids_tx.send(message.id.clone()).is_err() {
+                    return Ok(());
+                }
+            }
+            on_page(ListingProgress {
+                page_no,
+                ids_so_far,
+            });
+            let Some(next) = page.next_page_token else {
+                break;
+            };
+            page_token = Some(next);
+        }
+        Ok(())
     }
 
-    /// Shared pagination loop backing [`Self::search_all`] and
-    /// [`Self::search_all_unbounded`].
+    /// Pagination loop backing [`Self::search_all`]. (No longer shared with
+    /// the full-listing path — [`Self::search_all_unbounded_streaming`] has
+    /// its own loop, since it streams ids per page rather than accumulating
+    /// a [`MessageListResponse`] to return at the end, and paces itself
+    /// against a [`TokenBucket`] directly rather than through here.)
     ///
-    /// `cap: None` means no ceiling at all — termination is cursor-only,
-    /// never a short page: a `q`-filtered list can return zero messages on a
-    /// page alongside a valid `nextPageToken` (a scan that hasn't found a
-    /// match on this page yet), so only an absent token stops the loop.
+    /// `search_all`'s only caller always has a cap (`0` already means "up to
+    /// [`HARD_CAP`]" by the time it reaches here, via [`effective_cap`]), so
+    /// unlike the pre-#1502 version of this loop, `cap` isn't optional.
     async fn paginate(
         &self,
         query: Option<&str>,
         label_ids: &[&str],
-        cap: Option<usize>,
-        limiter: Option<&TokenBucket>,
+        cap: usize,
     ) -> Result<MessageListResponse> {
         let mut acc: Option<MessageListResponse> = None;
         let mut page_token: Option<String> = None;
         loop {
             let collected = acc.as_ref().map_or(0, |r| r.messages.len());
-            let page_size = match cap {
-                Some(cap) => (cap - collected).min(MAX_PAGE_LIMIT),
-                None => MAX_PAGE_LIMIT,
-            };
-            if let Some(limiter) = limiter {
-                limiter.acquire(MESSAGES_LIST_COST_UNITS).await;
-            }
+            let page_size = (cap - collected).min(MAX_PAGE_LIMIT);
             let page = self
                 .search(query, label_ids, page_size, page_token.as_deref())
                 .await?;
@@ -261,16 +305,13 @@ impl<'a> MessagesApi<'a> {
                 None => acc = Some(page),
             }
             let collected = acc.as_ref().map_or(0, |r| r.messages.len());
-            let cap_reached = cap.is_some_and(|cap| collected >= cap);
-            if cap_reached || next_token.is_none() {
+            if collected >= cap || next_token.is_none() {
                 break;
             }
             page_token = next_token;
         }
         let mut result = acc.unwrap_or_default();
-        if let Some(cap) = cap {
-            result.messages.truncate(cap);
-        }
+        result.messages.truncate(cap);
         Ok(result)
     }
 
@@ -478,8 +519,8 @@ mod tests {
 
     /// A `messages.list` responder that serves `full_pages` full pages (each
     /// with a fresh `nextPageToken`) followed by one terminating page with no
-    /// token — used to prove [`MessagesApi::search_all_unbounded`] keeps
-    /// paginating past whatever [`HARD_CAP`] would have stopped
+    /// token — used to prove [`MessagesApi::search_all_unbounded_streaming`]
+    /// keeps paginating past whatever [`HARD_CAP`] would have stopped
     /// [`MessagesApi::search_all`] at.
     struct SequentialPages {
         full_pages: usize,
@@ -839,10 +880,20 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
-    // ── search_all_unbounded ─────────────────────────────────────────
+    // ── search_all_unbounded_streaming ────────────────────────────────
+
+    /// Drains `rx` to completion into a `Vec`, for tests that don't care
+    /// about interleaving with the listing future itself.
+    async fn drain_ids(mut rx: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Some(id) = rx.recv().await {
+            ids.push(id);
+        }
+        ids
+    }
 
     #[tokio::test]
-    async fn search_all_unbounded_does_not_truncate_past_hard_cap() {
+    async fn search_all_unbounded_streaming_does_not_truncate_past_hard_cap() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         // One more full page than `search_all` would allow before hitting
@@ -859,17 +910,29 @@ mod tests {
             .await;
 
         let limiter = TokenBucket::new(1_000_000, 1_000_000);
-        let result = MessagesApi::new(&client)
-            .search_all_unbounded(None, &[], &limiter)
-            .await
-            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut pages_seen = 0usize;
+        let mut last_ids_so_far = 0usize;
+        let api = MessagesApi::new(&client);
+        let (listing_result, ids) = tokio::join!(
+            api.search_all_unbounded_streaming(None, &[], &limiter, tx, |p| {
+                pages_seen += 1;
+                assert_eq!(p.page_no, pages_seen);
+                last_ids_so_far = p.ids_so_far;
+            }),
+            drain_ids(rx),
+        );
+        listing_result.unwrap();
 
-        assert_eq!(result.messages.len(), full_pages * MAX_PAGE_LIMIT);
-        assert!(result.messages.len() > HARD_CAP);
+        assert_eq!(ids.len(), full_pages * MAX_PAGE_LIMIT);
+        assert!(ids.len() > HARD_CAP);
+        assert_eq!(last_ids_so_far, ids.len());
+        // `full_pages` full pages plus one empty terminating page.
+        assert_eq!(pages_seen, full_pages + 1);
     }
 
     #[tokio::test]
-    async fn search_all_unbounded_draws_the_limiter_once_per_page() {
+    async fn search_all_unbounded_streaming_draws_the_limiter_once_per_page() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let full_pages = 4;
@@ -892,10 +955,13 @@ mod tests {
         // `MESSAGES_LIST_COST_UNITS`; `TokenBucket` pacing itself is already
         // covered by `rate_limit.rs`'s own tests.
         let limiter = TokenBucket::new(1_000_000, 0);
-        MessagesApi::new(&client)
-            .search_all_unbounded(None, &[], &limiter)
-            .await
-            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let api = MessagesApi::new(&client);
+        let (listing_result, _ids) = tokio::join!(
+            api.search_all_unbounded_streaming(None, &[], &limiter, tx, |_| {}),
+            drain_ids(rx),
+        );
+        listing_result.unwrap();
 
         let page_requests = 5;
         let expected_spent = f64::from(page_requests * MESSAGES_LIST_COST_UNITS);
@@ -906,6 +972,33 @@ mod tests {
             limiter.available().await as i64,
             (1_000_000.0 - expected_spent) as i64
         );
+    }
+
+    #[tokio::test]
+    async fn search_all_unbounded_streaming_stops_pulling_pages_once_the_receiver_drops() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(SequentialPages {
+                // Enough pages that "never stops" would keep this test
+                // running/mounting far past a reasonable page count.
+                full_pages: 1_000,
+                calls: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let limiter = TokenBucket::new(1_000_000, 1_000_000);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+
+        // With no receiver, the very first `ids_tx.send` fails and the
+        // method returns `Ok(())` immediately rather than paging forever.
+        MessagesApi::new(&client)
+            .search_all_unbounded_streaming(None, &[], &limiter, tx, |_| {})
+            .await
+            .unwrap();
     }
 
     // ── get ───────────────────────────────────────────────────────────

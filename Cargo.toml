@@ -1,10 +1,10 @@
 [package]
 name = "omni-dev"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2021"
 authors = ["John Ky <newhoggy@gmail.com>"]
 license = "BSD-3-Clause"
-description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog."
+description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, Datadog, Gmail, and Drive."
 repository = "https://github.com/rust-works/omni-dev"
 homepage = "https://github.com/rust-works/omni-dev"
 documentation = "https://docs.rs/omni-dev"
@@ -78,6 +78,15 @@ percent-encoding = "2.3"
 # `gmail sync --extract-attachments` (real boundary parsing + CTE decoding,
 # which raw_message.rs's cheap heuristic scanner deliberately avoids).
 mail-parser = "0.11"
+# Live stderr progress bars for `gmail sync`'s full-mailbox pass
+# (`src/cli/gmail/sync/progress.rs`, #1502) — the only consumer; no-ops
+# automatically when stderr isn't a terminal.
+indicatif = "0.18"
+# HTML-to-Markdown conversion (html5ever under the hood), used only by
+# src/gmail/render.rs to back `gmail render`/`gmail read -o markdown`'s
+# text/html body fallback (#1513) when a message has no text/plain part —
+# mail-parser resolves MIME structure but does no HTML rendering itself.
+htmd = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }

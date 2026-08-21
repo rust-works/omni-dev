@@ -6,17 +6,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::enable_raw_mode;
 
 use crate::cli::gmail::helpers;
 use crate::gmail::account;
-use crate::gmail::auth::{self, BrowserConfig, GmailScope};
+use crate::gmail::auth::{self, GmailScope};
 use crate::gmail::client::GmailClient;
 use crate::gmail::import;
 use crate::gmail::profile_api::ProfileApi;
 use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
 use crate::utils::settings::{active_profile_from, profile_suffix, Settings, SettingsEnv};
+use crate::utils::terminal::RawModeGuard;
 
 /// Manages Gmail OAuth2 credentials.
 #[derive(Parser)]
@@ -107,22 +108,16 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
     // Snapshot whether this call could be the first empty→non-empty
     // transition (issue #1500) *before* logging in — `login_for` mutates
     // settings.json on success, so the check must run first.
+    let settings = Settings::load().unwrap_or_default();
     let might_shadow_legacy = {
-        let settings = Settings::load().unwrap_or_default();
         let legacy = auth::status();
         let had_legacy =
             legacy.has_client_id || legacy.has_client_secret || legacy.has_refresh_token;
         account::is_first_legacy_to_named_transition(&settings.gmail, had_legacy)
     };
+    let browser = auth::resolve_browser_config_for(&settings.gmail, None)?;
 
-    let status = auth::login_for(
-        None,
-        &client_id,
-        &client_secret,
-        scope,
-        &BrowserConfig::default(),
-    )
-    .await?;
+    let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
 
     if might_shadow_legacy {
         let settings = Settings::load().unwrap_or_default();
@@ -171,17 +166,6 @@ fn prompt_client_id() -> Result<String> {
         .read_line(&mut input)
         .context("Failed to read user input")?;
     Ok(input.trim().to_string())
-}
-
-/// Guard that disables raw mode on drop — mirrors `cli::ai::chat`'s
-/// `RawModeGuard`, duplicated locally rather than shared since it's a
-/// five-line `Drop` impl and this keeps the change scoped to Gmail.
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
 }
 
 /// Prompts for the OAuth2 client secret on stdin without echoing it —
@@ -325,58 +309,103 @@ async fn run_auth_status_all() -> Result<()> {
         let client = GmailClient::from_credentials(&credentials)?;
         return run_auth_status(&client, scope).await;
     }
-    for summary in &accounts {
-        println!("\n== {} ==", summary.name);
-        if let Err(err) = report_one_account_status(&summary.name).await {
-            println!("  error: {err}");
+    let client_for = |name: &str| -> Result<(GmailClient, GmailScope)> {
+        let credentials = auth::load_credentials_for(Some(name))?;
+        let scope = credentials.scope;
+        let client = GmailClient::from_credentials(&credentials)?;
+        Ok((client, scope))
+    };
+    run_auth_status_all_with(&accounts, &client_for).await
+}
+
+/// Runs every account's status check concurrently and prints the results
+/// back out in `accounts`' original order — `join_all`'s output preserves
+/// input order regardless of completion order, so no extra bookkeeping is
+/// needed to undo the concurrency once the results are in hand.
+///
+/// `client_for` is a seam: production builds a client from stored
+/// credentials, tests point it at a `wiremock` server per account name.
+async fn run_auth_status_all_with<F>(
+    accounts: &[account::AccountSummary],
+    client_for: &F,
+) -> Result<()>
+where
+    F: Fn(&str) -> Result<(GmailClient, GmailScope)> + Sync,
+{
+    let futs = accounts.iter().map(|summary| async move {
+        (
+            summary.name.clone(),
+            report_one_account_status(&summary.name, client_for).await,
+        )
+    });
+    let results = futures::future::join_all(futs).await;
+    for (name, result) in results {
+        println!("\n== {name} ==");
+        match result {
+            Ok(body) => print!("{body}"),
+            Err(err) => println!("  error: {err}"),
         }
     }
     Ok(())
 }
 
 /// Loads `name`'s credentials, builds a client, and reports its status —
-/// the per-account body of [`run_auth_status_all`]'s loop.
-async fn report_one_account_status(name: &str) -> Result<()> {
-    let credentials = auth::load_credentials_for(Some(name))?;
-    let scope = credentials.scope;
-    let client = GmailClient::from_credentials(&credentials)?;
+/// the per-account body of [`run_auth_status_all_with`]'s concurrent set.
+async fn report_one_account_status<F>(name: &str, client_for: &F) -> Result<String>
+where
+    F: Fn(&str) -> Result<(GmailClient, GmailScope)> + Sync,
+{
+    let (client, scope) = client_for(name)?;
     run_auth_status_for(&client, scope, Some(name)).await
 }
 
 /// Calls `users.getProfile` and reports whether the stored refresh token is
 /// still accepted.
 async fn run_auth_status(client: &GmailClient, scope: GmailScope) -> Result<()> {
-    run_auth_status_for(client, scope, None).await
+    let body = run_auth_status_for(client, scope, None).await?;
+    print!("{body}");
+    Ok(())
 }
 
 /// [`run_auth_status`], additionally backfilling `account_name`'s cached
 /// `email_address` in settings.json on success when given (`gmail auth
 /// status --all`, issue #1500) — the single-account path (`account_name:
-/// None`) never touches settings.json.
+/// None`) never touches settings.json. Returns the formatted report rather
+/// than printing it, so callers running several accounts concurrently
+/// (`run_auth_status_all_with`) can print them back out in a stable order
+/// instead of interleaving live `println!`s.
 async fn run_auth_status_for(
     client: &GmailClient,
     scope: GmailScope,
     account_name: Option<&str>,
-) -> Result<()> {
-    println!("Checking Gmail authentication...");
+) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("Checking Gmail authentication...\n");
 
     let profile = ProfileApi::new(client).get().await?;
 
-    println!("Authenticated as: {}", profile.email_address);
-    println!("Messages in mailbox: {}", profile.messages_total);
-    println!(
-        "Granted scope: {}",
+    out.push_str(&format!("Authenticated as: {}\n", profile.email_address));
+    out.push_str(&format!(
+        "Messages in mailbox: {}\n",
+        profile.messages_total
+    ));
+    out.push_str(&format!(
+        "Granted scope: {}\n",
         if scope.allows_modify() {
             "gmail.readonly, gmail.modify"
         } else {
             "gmail.readonly"
         }
-    );
+    ));
 
     if let Some(name) = account_name {
+        // Best-effort cache backfill: if two accounts in the same --all run
+        // both need a fresh email, concurrent read-modify-write to
+        // settings.json can drop one (no file lock). Self-heals on the next
+        // status check, which always re-fetches the email live.
         auth::record_account_email(name, &profile.email_address)?;
     }
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -628,6 +657,40 @@ mod tests {
         assert!(err.to_string().contains("Aborted"));
     }
 
+    // ── run_login ─────────────────────────────────────────────────
+    //
+    // The OAuth2 exchange itself (`login_for`, reached only after browser
+    // resolution succeeds) needs a real loopback callback and is covered at
+    // the `gmail::auth::login_to` layer instead — see the "AuthCommand::execute
+    // dispatch" note above for why `run_login`'s happy path stays untested
+    // here. This covers the settings-load/browser-resolution prelude that
+    // runs before that exchange, by making browser resolution itself fail
+    // fast (a malformed `browser_command`) so the flow never reaches the
+    // network.
+
+    #[tokio::test]
+    async fn run_login_surfaces_a_malformed_browser_command_before_the_oauth_exchange() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[(
+                "browser_command",
+                serde_json::Value::String("chrome \"--flag".to_string()),
+            )],
+        )
+        .unwrap();
+
+        let env = MapEnv::new()
+            .with(GMAIL_CLIENT_ID, "id")
+            .with(GMAIL_CLIENT_SECRET, "secret");
+
+        let err = run_login(&env, false).await.unwrap_err();
+        assert!(err.to_string().contains("browser_command"));
+    }
+
     // ── run_logout / LogoutCommand::execute ─────────────────────────
 
     #[test]
@@ -767,5 +830,164 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("403"));
         assert!(msg.contains("Forbidden"));
+    }
+
+    // ── run_auth_status_all_with ─────────────────────────────────────
+
+    fn account_summary(name: &str) -> account::AccountSummary {
+        account::AccountSummary {
+            name: name.to_string(),
+            email_address: None,
+            scope: None,
+            is_default: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_all_with_backfills_each_account_despite_uneven_latency() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        for name in ["work", "personal"] {
+            Settings::upsert_gmail_account(
+                &settings_path,
+                name,
+                &[("client_id", serde_json::Value::String("id".to_string()))],
+            )
+            .unwrap();
+        }
+
+        // "work" is listed first but resolves last, proving the recorded
+        // results line back up with their own account rather than whichever
+        // completed first.
+        let server_work = wiremock::MockServer::start().await;
+        mount_token_endpoint(&server_work).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "emailAddress": "work@example.com",
+                        "messagesTotal": 100,
+                        "threadsTotal": 50,
+                        "historyId": "1000",
+                    }))
+                    .set_delay(std::time::Duration::from_millis(50)),
+            )
+            .mount(&server_work)
+            .await;
+        let client_work = mock_client(&server_work.uri());
+
+        let server_personal = wiremock::MockServer::start().await;
+        mount_token_endpoint(&server_personal).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "emailAddress": "personal@example.com",
+                    "messagesTotal": 5,
+                    "threadsTotal": 2,
+                    "historyId": "2000",
+                })),
+            )
+            .mount(&server_personal)
+            .await;
+        let client_personal = mock_client(&server_personal.uri());
+
+        let clients = std::sync::Mutex::new(std::collections::HashMap::from([
+            ("work".to_string(), (client_work, GmailScope::ReadOnly)),
+            (
+                "personal".to_string(),
+                (client_personal, GmailScope::ReadOnly),
+            ),
+        ]));
+        let client_for = |name: &str| -> Result<(GmailClient, GmailScope)> {
+            clients
+                .lock()
+                .unwrap()
+                .remove(name)
+                .ok_or_else(|| anyhow::anyhow!("no test client for {name}"))
+        };
+
+        let accounts = vec![account_summary("work"), account_summary("personal")];
+        run_auth_status_all_with(&accounts, &client_for)
+            .await
+            .unwrap();
+
+        let settings = Settings::load().unwrap();
+        assert_eq!(
+            settings.gmail.accounts["work"].email_address.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(
+            settings.gmail.accounts["personal"].email_address.as_deref(),
+            Some("personal@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_all_with_reports_error_for_one_account() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        for name in ["work", "broken"] {
+            Settings::upsert_gmail_account(
+                &settings_path,
+                name,
+                &[("client_id", serde_json::Value::String("id".to_string()))],
+            )
+            .unwrap();
+        }
+
+        let server_work = wiremock::MockServer::start().await;
+        mount_token_endpoint(&server_work).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "emailAddress": "work@example.com",
+                    "messagesTotal": 100,
+                    "threadsTotal": 50,
+                    "historyId": "1000",
+                })),
+            )
+            .mount(&server_work)
+            .await;
+        let client_work = mock_client(&server_work.uri());
+
+        let server_broken = wiremock::MockServer::start().await;
+        mount_token_endpoint(&server_broken).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server_broken)
+            .await;
+        let client_broken = mock_client(&server_broken.uri());
+
+        let clients = std::sync::Mutex::new(std::collections::HashMap::from([
+            ("work".to_string(), (client_work, GmailScope::ReadOnly)),
+            ("broken".to_string(), (client_broken, GmailScope::ReadOnly)),
+        ]));
+        let client_for = |name: &str| -> Result<(GmailClient, GmailScope)> {
+            clients
+                .lock()
+                .unwrap()
+                .remove(name)
+                .ok_or_else(|| anyhow::anyhow!("no test client for {name}"))
+        };
+
+        let accounts = vec![account_summary("work"), account_summary("broken")];
+        // Errors are per-account and non-fatal: the overall call still
+        // succeeds even though one account's status check failed.
+        run_auth_status_all_with(&accounts, &client_for)
+            .await
+            .unwrap();
+
+        let settings = Settings::load().unwrap();
+        assert_eq!(
+            settings.gmail.accounts["work"].email_address.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(settings.gmail.accounts["broken"].email_address, None);
     }
 }

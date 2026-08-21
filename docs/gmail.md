@@ -22,9 +22,12 @@ walkthrough — this page is the topic-by-topic reference.
 7. [Threads](#threads)
 8. [Labels](#labels)
 9. [Sync](#sync)
-10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-11. [Troubleshooting](#troubleshooting)
-12. [See also](#see-also)
+10. [Sync all accounts](#sync-all-accounts)
+11. [Extract attachments](#extract-attachments)
+12. [Render](#render)
+13. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+14. [Troubleshooting](#troubleshooting)
+15. [See also](#see-also)
 
 ## Prerequisites
 
@@ -157,8 +160,10 @@ Granted scope: gmail.readonly
 
 `--all` degenerates to the single-account output above when no named
 accounts are configured. Each successful check also backfills that
-account's cached `email_address` in `settings.json` (display-only; never
-used for authentication).
+account's cached `email_address` in `settings.json` if it isn't already
+set (never used for authentication itself — only for the browser-profile
+targeting below) — an explicit value, whether you set it by hand or a
+previous check backfilled it, is never overwritten.
 
 ### Removing credentials
 
@@ -269,14 +274,73 @@ When a command runs, the account it uses is resolved in this order:
    pre-multi-account resolution (process env → the active `--profile`'s
    `env` map → the base `env` map) — the zero-migration path.
 
+### Browser profile targeting
+
+With several named accounts, `gmail auth login` opening whatever profile
+your default browser happens to be on means you have to switch Google
+identities by hand on the consent screen — easy to get wrong, and it can
+land the refresh token on the wrong mailbox entirely. Two escape hatches,
+both configured per account in `settings.json`'s `gmail.accounts.<name>`
+and both opt-in — neither changes behaviour for an account that sets
+neither:
+
+**Manual — `browser_command`.** An explicit launch command, with `{url}`
+substituted for the authorization URL (or appended, if no `{url}`
+placeholder is present). Takes precedence over automatic resolution below.
+Works for any browser, not just Chrome:
+
+```json
+"gmail": {
+  "accounts": {
+    "jky.greens": {
+      "browser_command": "open -na \"Google Chrome\" --args --profile-directory=\"Profile 7\" {url}"
+    }
+  }
+}
+```
+
+**Automatic — `chrome_profile_from_email`.** Set this `true` alongside
+`email_address` (see [Verifying credentials](#verifying-credentials) above
+— set it by hand, or let `gmail auth status --all` backfill it after a
+first login) and `gmail auth login` looks up which local Chrome profile is
+signed into that address, launching the authorization URL targeting it
+instead of the OS default browser:
+
+```json
+"gmail": {
+  "accounts": {
+    "jky.greens": {
+      "email_address": "jky.greens@example.com",
+      "chrome_profile_from_email": true
+    }
+  }
+}
+```
+
+Chrome-only for now (no Chromium/Brave/Edge support yet — use
+`browser_command` for those). Resolution reads Chrome's own `Local State`
+file and never guesses: zero matching profiles or more than one profile
+signed into the same address both fall back to the OS default browser
+rather than picking one, same as Chrome not being installed or the file
+being unreadable — resolution failure is always a fallback, never a login
+failure. See [ADR-0067](adrs/adr-0067.md) for the full design rationale.
+
 ## Output formats
 
-Every leaf subcommand accepts `-o <format>` (`table` / `json` / `yaml` /
-`yamls` / `jsonl`, default `table`) — the same convention as every other
-`omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `--out-file` exists
-only on `gmail read`, the one command with a naturally file-shaped payload
-(a message body/attachment source worth writing to disk); no other Gmail
-leaf has a use for it.
+Every subcommand that renders a list or record (`search`, `read`, `thread`,
+`label list`, `sync`, `sync-all`, `extract-attachments`, `render`, `account
+list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` / `jsonl`,
+default `table`) — the same convention as every other `omni-dev` domain
+(see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
+status`, `label add`/`label remove`, and `account set-default`/`account
+import-legacy` print a fixed human-readable status line instead and have no
+`-o` flag. `--out-file` exists only on `gmail read`, the one command with a
+naturally file-shaped payload (a message body/attachment source worth
+writing to disk); no other Gmail leaf has a use for it.
+
+`gmail read` additionally accepts `-o markdown` — a human-readable
+Markdown rendering of the message rather than a machine-readable format;
+see [Messages](#messages) and [Render](#render).
 
 ## Search
 
@@ -312,6 +376,8 @@ $ omni-dev gmail read <message-id>
 $ omni-dev gmail read <message-id> --detail minimal
 $ omni-dev gmail read <message-id> --detail metadata
 $ omni-dev gmail read <message-id> --detail raw --out-file message.eml
+$ omni-dev gmail read <message-id> -o markdown
+$ omni-dev gmail read <message-id> -o markdown --out-file message.md
 ```
 
 `--detail` controls how much of the message is fetched — named `--detail`,
@@ -326,6 +392,28 @@ instead of stdout for `minimal`/`metadata`/`full`; for `raw` it decodes the
 base64url payload first and writes the literal RFC 2822 bytes, so
 `--detail raw --out-file message.eml` produces a genuine `.eml` rather than
 still-encoded text.
+
+**`-o markdown`** renders the message as human-readable Markdown: a header
+block (Subject/From/To/Cc/Date/Message-Id/In-Reply-To/References, RFC
+2047-decoded — unlike the raw wire encoding [Sync](#sync)'s manifest
+fields keep), the body (`text/plain` preferred, `text/html` converted to
+Markdown otherwise), and an attachment filename list. It always fetches the
+complete raw MIME message regardless of `--detail` (rendering needs the
+full structure), so `--detail` is ignored when combined with `-o markdown`.
+The same rendering function backs [`gmail render`](#render) for already-
+archived `.eml` files — `-o markdown` is the live-fetch equivalent, useful
+when you want readable text for one message without archiving the whole
+mailbox first.
+
+**`--fold-quotes`** (only relevant with `-o markdown`; ignored otherwise,
+the reverse of `--detail`'s asymmetry) collapses `>`-quoted reply history
+nested more than one level deep into a one-line `*(N quoted lines
+omitted)*` marker, so a thread with 10-20+ levels of quoting doesn't drown
+its new content in repeated older quotes. The immediately-preceding
+reply's quote (depth 1) always stays visible for context; only deeper
+nesting folds. Off by default — verbatim rendering is fully
+information-preserving, and the full text is one re-render away without
+the flag.
 
 ### MCP equivalent(s)
 
@@ -394,6 +482,22 @@ depends on message sizes and network too — a measured run against a
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
 
+On a terminal, a backfill/`--full`/reconciliation run shows two live
+progress indicators on stderr — a listing spinner (pages fetched, ids
+discovered so far) and a fetch bar (messages fetched so far out of the
+currently-known total, plus a running error count) — updated as the
+mailbox is listed and fetched *concurrently*, rather than only printing a
+report once the entire run finishes. Total wall-clock time is unchanged
+(still bounded by the same per-second quota above); what changes is that
+fetching now begins as soon as the first listing page arrives, instead of
+waiting for the whole mailbox to be listed first. Pass `--quiet` to
+suppress the bars; they're also disabled automatically when stderr isn't a
+terminal or when `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` is selected.
+Whenever the bars ran (or `--quiet` was passed), the final text report
+skips the per-action listing too (see **Report summary** below), since
+bars already showed every fetch/delete live and repeating them as text
+would just be a second, redundant dump.
+
 **Archive layout:**
 
 ```
@@ -415,22 +519,35 @@ regenerated from the `.eml` files; it is the sole record of each message's
 Gmail-side metadata (labels, thread, watermark).
 
 **Backfill vs. incremental:** the first run (or `--full`) lists the whole
-mailbox and fetches whatever's missing on disk — presence-on-disk is the
-real idempotence mechanism, so an interrupted backfill simply picks up
-where it left off on the next run, no cursor required. The manifest itself
-is checkpointed to disk every 200 fetched messages during a large backfill
-(not only once at the end), so a crash loses at most that many messages'
-worth of already-completed work, not the whole run. Subsequent runs use
-`history.list` from the stored watermark, applying
-`messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved` events.
-Google does not guarantee history availability past roughly **one week**;
-a `startHistoryId` older than that gets a 404, which `sync` treats as a
-signal to fall back to the same full-listing pass as a backfill (not a
+mailbox and fetches whatever's missing on disk — listing and fetching are
+pipelined, so the fetch fan-out for early-listed messages starts
+immediately rather than waiting for the whole mailbox to be listed first.
+Presence-on-disk is the real idempotence mechanism, so an interrupted
+backfill simply picks up where it left off on the next run, no cursor
+required. The manifest itself is checkpointed to disk every 200 fetched
+messages during a large backfill (not only once at the end), so a crash
+loses at most that many messages' worth of already-completed work, not the
+whole run. Subsequent runs use `history.list` from the stored watermark,
+applying `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
+events. Google does not guarantee history availability past roughly **one
+week**; a `startHistoryId` older than that gets a 404, which `sync` treats
+as a signal to fall back to the same full-listing pass as a backfill (not a
 silent gap, and not a blind re-download of everything) — the `historyId`
 watermark is purely an optimisation over that fallback, never a
-correctness requirement. A run that hits a per-item error never advances
-the watermark, so the next run safely re-examines the same range (already
--archived messages are skipped for free).
+correctness requirement. (An incremental run's own `history.list` pass is
+not pipelined — it's typically a single page already, so there's little to
+overlap; only the full-listing path above gains concurrent
+listing+fetching.) A run that hits a per-item error never advances the
+watermark, so the next run safely re-examines the same range (already
+-archived messages are skipped for free). One exception: a message that
+vanishes from the server in the window between being listed and being
+fetched (`messages.get` returns a 404 with reason `notFound`) is not an
+error — it's recorded as a `Vanished` action instead, since Gmail's
+`history.list` and `messages.get` aren't perfectly consistent and retrying
+that particular id can never succeed. Withholding the watermark for it
+would only wedge the account, re-discovering and re-failing on the same
+stale history event on every run for up to a week; see the Troubleshooting
+section below.
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
 backfill/`--full`/reconciliation pass, but `history.list` has no query
@@ -445,7 +562,10 @@ raw message bytes (no second network request), and are stored as their raw
 wire encoding — non-ASCII subjects encoded per RFC 2047
 (`=?UTF-8?B?...?=`) are **not** decoded to human-readable text in this
 release. `in_reply_to`/`references` are what let a conversation be
-reconstructed from the manifest alone, without re-parsing every `.eml`.
+reconstructed from the manifest alone, without re-parsing every `.eml`. To
+read an individual archived message with its headers properly decoded, use
+[`gmail render`](#render) against its `.eml` file (or `gmail read -o
+markdown` for a live, not-yet-archived message) rather than the manifest.
 
 **Attachments:** `attachment_count` and `attachment_filenames` record how
 many MIME parts are marked `Content-Disposition: attachment` and whichever
@@ -470,18 +590,26 @@ MIME simply yields no attachment files — it never fails the `.eml` fetch
 itself. Because `sync` only ever fetches messages missing on disk
 (presence-on-disk is the archive's idempotence mechanism — see above),
 turning this flag on does **not** retroactively extract attachments for
-messages already archived by an earlier run, even under `--full`; delete
-the affected `.eml` files (or the whole archive) and re-run `--full
---extract-attachments` to force re-extraction.
+messages already archived by an earlier run, even under `--full`; run
+[`gmail extract-attachments`](#extract-attachments) with `--archive-dir`
+pointed at the same directory instead — it extracts from the `.eml` files
+already on disk, no re-fetch required.
 
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
-`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally alongside the
-per-action listing, e.g. `5,794 fetched, 30 deleted, 0 errors` in text
-output, or an explicit `summary` field (`fetched`/`would_fetch`/
-`labels_updated`/`deleted`/`undeleted`/`would_delete`/`would_undelete`/
-`errors` counts) alongside `actions`/`errors` in the structured formats —
-useful since a large sync's per-action listing can run into the thousands
-of lines.
+`-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally, e.g.
+`5,794 fetched, 30 deleted, 0 errors` in text output, or an explicit
+`summary` field (`fetched`/`would_fetch`/`labels_updated`/`deleted`/
+`undeleted`/`would_delete`/`would_undelete`/`errors` counts) in the
+structured formats. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` always
+include the full per-action listing alongside `summary` too — the
+authoritative, complete record. Text output includes the per-action
+listing only when nothing else already showed it: if the live progress
+bars ran, or `--quiet` was passed, text output shows just `Note`s, errors,
+and the summary — a large sync's per-action listing can run into the
+thousands of lines, and printing it again once bars already rendered it
+live would just be a second, redundant dump. A non-interactive `stderr`
+(no bars possible) still gets the full per-action listing in text, since
+it's the only record of what happened in that case.
 
 **`--dry-run`** reports every action sync would take without writing any
 file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
@@ -489,6 +617,209 @@ file — not `state.json`, not `manifest.jsonl`, not a single `.eml`.
 No MCP equivalent — a bulk, potentially long-running filesystem operation
 is a poor fit for a synchronous MCP tool call (the same reasoning that kept
 label mutation CLI-only above).
+
+## Sync all accounts
+
+```bash
+$ omni-dev gmail sync-all
+$ omni-dev gmail sync-all --concurrency 10
+$ omni-dev gmail sync-all --full --dry-run
+$ omni-dev gmail sync-all -o json
+```
+
+Runs [`sync`](#sync) for every account listed in `.omni-dev/gmail-sync.yaml`,
+concurrently, replacing a wrapper script that loops `gmail sync --account
+...` over each mailbox one at a time. Each account keeps its own archive
+and its own [rate limit](#rate-limits-and-retry-behaviour) budget — nothing
+about a single account's sync changes, only that several now run at once.
+See [ADR-0068](adrs/adr-0068.md) for the full design rationale.
+
+**Config file:** `.omni-dev/gmail-sync.yaml`, discovered the same way as
+every other `.omni-dev/` file (see
+[docs/omni-dev-directory.md](omni-dev-directory.md#gmail-syncyaml)) — walk-up
+from the current directory, a `local/` override, `--context-dir`/
+`OMNI_DEV_CONFIG_DIR`:
+
+```yaml
+concurrency: 20
+accounts:
+  - account: jky.greens
+    output_dir: emails/jky.greens/
+  - account: newhoggy
+    output_dir: emails/newhoggy/
+    query: "-in:spam"
+    extract_attachments: true
+```
+
+`account` must name an account already configured under
+[Multiple accounts](#multiple-accounts) — `gmail-sync.yaml` says only
+*which* accounts to sync and *where*, never a second credential store.
+`output_dir` resolves relative to the project root (the parent of the
+discovered `.omni-dev/`) unless absolute. Unlike every other `.omni-dev/`
+config file, a missing, empty, or malformed `gmail-sync.yaml`, or one
+naming an account `gmail account list` doesn't know about, is a hard error
+before any network call is made — see
+[docs/omni-dev-directory.md's Validation behaviour](omni-dev-directory.md#gmail-syncyaml-1).
+
+**`--account` is incompatible with `sync-all`:** the global `--account`/
+`OMNI_DEV_GMAIL_ACCOUNT` selector picks one mailbox; `sync-all` always
+targets the whole `gmail-sync.yaml` list, so passing both is a hard error
+rather than a silent no-op or an ignored flag.
+
+**Concurrency:** two independent caps compose. Each account's own fetch
+fan-out is still bounded by the same local concurrency `gmail sync` itself
+uses — unaffected by this command. A second, *shared* cap —
+`sync-all --concurrency` if given, else `gmail-sync.yaml`'s top-level
+`concurrency`, else the same default as `gmail sync --concurrency` — bounds
+how many fetch requests are in flight *across every account combined* at
+once, so one account can never claim the whole shared budget for itself.
+Each account still paces its own requests against its own Gmail quota
+independently (see [Rate limits](#rate-limits-and-retry-behaviour) below) —
+the shared cap is a purely local resource limit, unrelated to quota
+compliance.
+
+**Progress and output:** on the same interactive-terminal condition a single
+`gmail sync` uses (`-o table`, not `--quiet`, a `stderr` that's actually a
+tty), every account gets its own listing spinner + fetch bar, all registered
+on one shared `MultiProgress` — a single shared renderer, rather than each
+account's bars fighting another's over the same terminal, is what lets them
+all advance concurrently and stay legible. Independent of the bars, a
+one-line summary still prints per account as soon as that account finishes
+(not only once every account is done), e.g. `jky.greens: 42 fetched, 0
+errors`, followed by a trailing `combined: ...` total once every account has
+finished — that line prints through the bars (via `suspend`) rather than
+racing their redraw. `--quiet` suppresses both the live bars and the
+per-account summary lines; the combined total and any per-message error
+lines always print regardless. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl`
+instead emit one structured record per account (`account`, `actions`,
+`errors`, `summary`, and — only for an account whose task failed before
+producing a report at all, e.g. bad credentials or a rejected output
+directory — `account_error`) plus a `combined_summary`, once every account
+has finished — the same `summary` shape [Sync](#sync)'s own **Report
+summary** describes.
+
+**Exit code:** non-zero if *any* configured account either failed outright
+(bad credentials, a rejected output directory, …) or reported one or more
+per-message errors — one account's failure is never silently swallowed
+because the others succeeded. Every other account still runs to completion
+regardless of an earlier one's failure.
+
+No MCP equivalent — same reasoning as `sync` itself, doubled: a bulk,
+potentially long-running filesystem operation across several mailboxes at
+once is an even poorer fit for a synchronous MCP tool call.
+
+## Extract attachments
+
+```bash
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive --dry-run
+$ omni-dev gmail extract-attachments --archive-dir ~/mail-archive -o json
+```
+
+Retroactively extracts attachments for messages [`sync`](#sync)/[`sync-all`](#sync-all-accounts)
+already archived, without contacting Gmail at all — the fix for
+[`--extract-attachments`](#sync)'s "no retroactive backfill" limitation
+(see [ADR-0065](adrs/adr-0065.md)). Purely local and fast: it reads the
+manifest and `.eml` files already under `--archive-dir` and never resolves
+a client, so no credentials, `--account`, or network access are needed —
+unlike every other `gmail` subcommand. Named `--archive-dir` rather than
+`sync`'s `--output-dir` since this command's primary interaction with the
+directory is reading an existing archive, not producing one — it happens
+to also write new `attachments/` subdirectories into it, but that's
+incidental to what the flag names.
+
+For each message in the manifest, it trusts `attachment_count > 0` (the
+same cheap heuristic scan `sync` always runs, regardless of whether
+`--extract-attachments` was ever passed — see [Sync](#sync)'s Attachments
+paragraph) as a fast-path filter, skipping the rest without opening their
+`.eml`. A candidate whose `messages/<year>/<month>/<day>/<id>/attachments/`
+directory already exists is skipped too — the same presence-on-disk
+idempotence `sync` itself relies on, which is what makes this command safe
+to re-run at any time to pick up whatever an earlier run missed (including
+a partial/interrupted one). Everything else is read from disk, parsed with
+the same real MIME parser `sync --extract-attachments` uses, and written
+out identically. A message whose real parse finds nothing — the rare
+heuristic/parser disagreement ADR-0065 documents — is silently skipped,
+not an error; a missing or unreadable `.eml` is recorded as a per-message
+error and the run continues with the rest of the archive.
+
+**`--dry-run`** parses every candidate `.eml` (so its reported counts are
+accurate, not just an echo of the heuristic) and reports what it would
+extract without writing any file.
+
+**Report summary:** mirrors [Sync](#sync)'s — a trailing `N extracted, N
+would extract, N errors` tally in text output, or a `summary` field in the
+structured formats, with the full per-action listing always included in
+`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`.
+
+No MCP equivalent — a bulk filesystem operation is as poor a fit here as
+it is for `sync` itself.
+
+## Render
+
+```bash
+$ omni-dev gmail render message.eml
+$ omni-dev gmail render messages/2026/01/*/*/*.eml
+$ omni-dev gmail render message.eml --out-dir rendered/
+$ omni-dev gmail render *.eml -o json
+$ omni-dev gmail render message.eml --fold-quotes
+$ omni-dev gmail render --archive-dir archive/ --all --out-dir rendered/
+```
+
+Renders one or more `.eml` files as human-readable Markdown: a header
+block (Subject/From/To/Cc/Date/Message-Id/In-Reply-To/References, RFC
+2047-decoded), the body (`text/plain` preferred, `text/html` converted to
+Markdown otherwise), and an attachment filename list (listed, never
+embedded — this is a readable rendering, not an export). Purely local and
+fast, like [Extract attachments](#extract-attachments): it never resolves
+a client, so no credentials, `--account`, or network access are needed.
+
+By default `render` takes bare file paths, with no dependency on the
+mailbox having been synced by this tool at all — this works equally well
+piped a glob from a `gmail sync` archive
+(`messages/<year>/<month>/<day>/*.eml`) or any other `.eml` file, from
+anywhere. The same rendering function backs `gmail read -o markdown`; see
+[Messages](#messages).
+
+**`--archive-dir PATH --all`** is the alternative for rendering an entire
+synced archive: it reads `PATH`'s `manifest.jsonl` and renders every
+non-deleted message, in place of gathering paths yourself. `--all` is
+required alongside `--archive-dir` (rather than `--archive-dir` alone
+implying it), reserving room for a future non-`--all` selector; the two
+are mutually exclusive with positional `PATH` arguments. Paired with
+`--out-dir`, a message whose `.md` file already exists there is silently
+skipped, mirroring [`extract-attachments`](#extract-attachments)'s own
+presence-on-disk idempotence for `attachments/` dirs — so re-running
+against a growing archive only renders what's new.
+
+By default (no `--out-dir`), each input's rendered Markdown is printed
+directly to stdout — with more than one input, successive renderings are
+separated by a `---` thematic break — so `omni-dev gmail render *.eml >
+combined.md` produces clean, redirectable Markdown as long as every input
+renders successfully. **`--out-dir DIR`** instead writes one `.md` file
+per input into `DIR` (named after the input's stem, e.g. `abc123.eml` ->
+`abc123.md`; `DIR` is created if missing), printing a `Saved to:` line per
+file instead.
+
+A per-file read/parse/write failure (a missing path, a permission error)
+is recorded against that file rather than aborting the run — the rest of
+the batch still renders — but the command still exits non-zero if any
+file failed. An unparseable message degrades to a short placeholder rather
+than failing outright, the same posture
+[`extract-attachments`](#extract-attachments) takes for a message whose
+real MIME parse disagrees with the cheap heuristic.
+
+`-o json`/`-o yaml`/`-o yamls`/`-o jsonl` emit one structured record per
+input (`path`, and either `markdown` or `saved_to`, plus `error` for a
+failed file) instead of the Table view above.
+
+**`--fold-quotes`** collapses deeply-nested `>`-quoted reply history in
+each rendered body — see [Messages](#messages)'s `-o markdown` section for
+the full description; the behavior is identical since both call the same
+rendering function.
+
+No MCP equivalent — same reasoning as
+[Extract attachments](#extract-attachments).
 
 ## Rate limits and retry behaviour
 
@@ -579,6 +910,10 @@ to open (e.g. over SSH, or in a headless environment), the authorization
 URL is printed to the terminal for you to open manually — no CLI flag is
 needed to force this fallback; it's the same code path.
 
+If it opens the *wrong* browser profile (mixing up which named account
+lands on which Google identity), see [Browser profile
+targeting](#browser-profile-targeting) above.
+
 ### No Gmail scope was granted
 
 ```
@@ -616,10 +951,66 @@ this persists the refresh token (plus client id/secret) to
 `~/.omni-dev/settings.json`, read by every invocation regardless of how
 the process started.
 
+### `operation timed out` fetching a message during `sync`
+
+```
+Error: <id> failed: Failed to parse messages.get response: error decoding response body for url (...): request or response body error: operation timed out
+```
+
+`messages.get?format=raw` returns the whole message (headers, body, and
+every attachment, base64-encoded) in one response. The Gmail client (like
+the Atlassian and Datadog clients) sets two independent timeouts, not one:
+a 10-second connect timeout (DNS + TCP + TLS handshake) and a 120-second
+**read** timeout that covers each individual read of the response body and
+resets on every successful one — it's a stall detector, not a fixed total
+deadline, so a download that's slow-but-still-progressing keeps extending
+it rather than getting cut off partway through. A handful of large
+messages (tens of MB — attachment-heavy mail) downloading concurrently
+under `--concurrency` divide the available bandwidth, so each read can
+individually stall long enough to trip the read timeout even though
+nothing is actually stuck. This is more likely the more of `--concurrency`
+is spent on large messages at once, not a sign of a broken connection.
+
+`sync` is safe to just re-run: a run with errors never advances the
+watermark, and presence-on-disk means already-archived messages are
+skipped, so a re-run only retries what failed. Two ways to make it
+succeed:
+
+- Lower `--concurrency` (even down to `1`) so each large download gets
+  more of the available bandwidth to itself.
+- Raise the read timeout instead via `OMNI_DEV_HTTP_READ_TIMEOUT_SECS`
+  (whole seconds; a missing, non-numeric, or non-positive value falls back
+  to the 120-second default) — shared by the Gmail, Atlassian, and Datadog
+  REST clients, e.g.
+  `OMNI_DEV_HTTP_READ_TIMEOUT_SECS=300 omni-dev gmail sync ...`. The
+  connect timeout has its own override, `OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS`
+  (default 10s), for the unrelated case of a slow-to-establish connection.
+
+### `Vanished <id>` in a `sync` report
+
+```
+Vanished m1a2b3c4 (message no longer existed on the server; skipped, not an error)
+```
+
+This is expected and benign, not something to fix by re-running: Gmail's
+`history.list` and `messages.get` aren't perfectly consistent, so a message
+can be permanently deleted from the server in the window between being
+listed and being fetched — auto-filtered mail, a sent message recalled
+immediately, and similar routine churn. Unlike every other per-item
+failure, this can never succeed on retry, so it is not counted as an error
+(`report.errors` stays empty), does not withhold the watermark, and does
+not fail `sync`'s or `sync-all`'s exit code — only a message vanishing for
+any *other* reason (a 404 with a different `reason`, or any non-404
+failure) still surfaces as an ordinary error and still withholds the
+watermark. See [ADR-0064](adrs/adr-0064.md)'s 2026-08-06 amendment for
+#1509.
+
 ## See also
 
 - [Gmail Quickstart](gmail-quickstart.md) — a linear, zero-to-synced-archive
   walkthrough for first-time setup.
+- [Drive Integration](drive.md) — the sibling Google integration; shares
+  the same named-account/OAuth2 storage pattern.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
 - [MCP Reference — Gmail](mcp.md#gmail-6-tools) — parameter-only listing of
@@ -630,4 +1021,7 @@ the process started.
 - [ADR-0066](adrs/adr-0066.md) — the named-account store behind
   [Multiple accounts](#multiple-accounts), and why it's orthogonal to
   `--profile`.
+- [ADR-0068](adrs/adr-0068.md) — the `gmail-sync.yaml` config file and
+  shared-semaphore concurrency model behind
+  [Sync all accounts](#sync-all-accounts).
 - [Gmail API documentation](https://developers.google.com/workspace/gmail/api/reference/rest) — upstream reference.

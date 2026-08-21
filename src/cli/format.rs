@@ -59,6 +59,37 @@ pub trait JsonlSerialize {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()>;
 }
 
+/// Strips control characters (C0, DEL, C1) from a server- or
+/// writer-supplied string before it reaches the terminal.
+///
+/// Every CSI escape sequence starts with ESC (a C0 control character), so
+/// this neutralizes embedded ANSI escape sequences at the source without
+/// needing sequence-aware parsing; it also strips embedded newlines that
+/// could otherwise be used to spoof extra output rows. The one place a
+/// newline legitimately appears in rendered output is the record separator
+/// the renderer itself writes between rows — never a value coming from a
+/// sanitized field (#1137).
+///
+/// Also strips the bidirectional-control code points (LRE/RLE/PDF/LRO/RLO,
+/// LRI/RLI/FSI/PDI, LRM/RLM) — a Trojan-Source-style spoofing vector
+/// (CVE-2021-42574) distinct from escape injection, since a terminal that
+/// honors them can visually reorder rendered text (e.g. a filename crafted
+/// so `evil.exe` displays as `exe.live`). These are the only code points
+/// pulled from Unicode category `Cf`; the rest of `Cf` (e.g. ZWJ in emoji
+/// sequences, joiners in Arabic/Indic text) is left alone since stripping
+/// it would mangle otherwise-valid international text (#1552).
+pub fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .collect()
+}
+
+/// True for the Unicode bidirectional-control code points: LRE/RLE/PDF/LRO/RLO
+/// (U+202A–U+202E), LRI/RLI/FSI/PDI (U+2066–U+2069), and LRM/RLM (U+200E/U+200F).
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+}
+
 /// Writes each item in an iterator as a single compact JSON line.
 pub fn write_items_jsonl<'a, I, T>(items: I, out: &mut dyn Write) -> Result<()>
 where
@@ -150,6 +181,49 @@ pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat)
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ── sanitize_for_terminal ──────────────────────────────────────
+
+    #[test]
+    fn sanitize_for_terminal_leaves_clean_string_unchanged() {
+        assert_eq!(sanitize_for_terminal("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_ansi_escape_sequence() {
+        assert_eq!(sanitize_for_terminal("evil\x1b[31mrepo"), "evil[31mrepo");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_c0_c1_and_del_control_bytes() {
+        let input = "a\rb\x07c\u{7f}d\u{9b}e";
+        assert_eq!(sanitize_for_terminal(input), "abcde");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_embedded_newlines() {
+        assert_eq!(sanitize_for_terminal("line1\nline2"), "line1line2");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_bidi_override_characters() {
+        let input = "evil\u{202E}exe.live";
+        assert_eq!(sanitize_for_terminal(input), "evilexe.live");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_all_bidi_control_code_points() {
+        let input = "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{200E}k\u{200F}l";
+        assert_eq!(sanitize_for_terminal(input), "abcdefghijkl");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_leaves_other_format_characters_unchanged() {
+        // Zero-width joiner (used in emoji ZWJ sequences) is `Cf` but not a
+        // bidi control, so it must survive.
+        let input = "\u{1F468}\u{200D}\u{1F469}";
+        assert_eq!(sanitize_for_terminal(input), input);
+    }
 
     #[test]
     fn output_default_is_table() {

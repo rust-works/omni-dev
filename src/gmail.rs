@@ -11,6 +11,7 @@
 pub mod account;
 pub mod attachments;
 pub mod auth;
+mod chrome_profile;
 pub mod client;
 pub mod error;
 pub mod history_api;
@@ -19,6 +20,7 @@ pub mod labels_api;
 pub mod messages_api;
 pub mod profile_api;
 pub mod raw_message;
+pub mod render;
 pub mod threads_api;
 pub mod types;
 

@@ -23,11 +23,12 @@
 //! - **1 `blank-line-after-subject`** — the issue's own headline example (a
 //!   clean 61-char subject, non-blank line 2 folds the whole first
 //!   paragraph into `%s`).
-//! - **3 `unknown-scope`** — `settings`, `coverage`, `deps` (a dependabot
-//!   commit): scopes used at commit time that are no longer (or never
-//!   were) in the *current* `.omni-dev/scopes.yaml`. This is `scopes.yaml`
-//!   drift, not a lint bug — explicitly out of scope for #1474 (`scopes.yaml`
-//!   repair is #1468).
+//! - **2 `unknown-scope`** — `settings`, `deps` (a dependabot commit):
+//!   scopes used at commit time that are no longer (or never were) in the
+//!   *current* `.omni-dev/scopes.yaml`. This is `scopes.yaml` drift, not a
+//!   lint bug — explicitly out of scope for #1474 (`scopes.yaml` repair is
+//!   #1468). A third entry, `92bfe968` (scope `coverage`), moved to
+//!   [`PASSING_SUBJECTS`] once #1468 added `coverage` as a real scope.
 //! - **1 `format`** — an external contributor's one-off PR ("Add MCP
 //!   Toplist rank badge") that never followed conventional commit format.
 //!
@@ -412,6 +413,8 @@ const PASSING_SUBJECTS: &[(&str, &str)] = &[
     ("5ada3dbc", "docs(cli): cross-reference MCP tools from subcommand help"),
     ("b65660c7", "docs(mcp): audit tool and parameter descriptions for AI-agent clarity"),
     ("ec6fa1cc", "docs(docs): add STYLE-0029 MCP description checklist"),
+    // Moved from FAILING_FIXTURES: `coverage` became a real scope in #1468.
+    ("92bfe968", "refactor(atlassian,cli,coverage): migrate remaining mod.rs files"),
 ];
 
 /// Real commit subjects from the pinned corpus range with a known,
@@ -440,7 +443,6 @@ const FAILING_FIXTURES: &[(&str, &str, &str)] = &[
     ("26bfb45d", "chore(deps): bump the rust-minor-patch group with 2 updates", "unknown-scope"),
     ("46915a16", "feat(mcp,git,data,atlassian): expose newer-subsystem tools and add jira_search filters", "subject-length"),
     ("ce9d282e", "feat(cli)!: unify machine-readable output selection on `-o`/`--output`; reserve `--out-file` for file destinations", "subject-length"),
-    ("92bfe968", "refactor(atlassian,cli,coverage): migrate remaining mod.rs files", "unknown-scope"),
     ("718bda44", "feat(request-log): close log coverage gaps — transcript HTTP recording, AI backend service tags, numeric query fields, and absolute time bounds", "subject-length"),
     ("ef47479b", "refactor(claude, atlassian, request-log): consolidate HTTP 429 retry logic into shared driver", "subject-length"),
     ("80b2df17", "feat(claude, cli): make --model, --beta-header global; extend --ai-backend to openai, ollama, bedrock", "subject-length"),
@@ -548,9 +550,9 @@ fn blank_line_fixture_flags_exactly_its_known_rule() {
 /// truncation of the fixture arrays above.
 #[test]
 fn corpus_size_matches_the_pinned_range() {
-    assert_eq!(PASSING_SUBJECTS.len(), 366);
-    assert_eq!(FAILING_FIXTURES.len(), 32);
-    // 366 passing + 32 failing + 1 blank-line special case = 399, the full
+    assert_eq!(PASSING_SUBJECTS.len(), 367);
+    assert_eq!(FAILING_FIXTURES.len(), 31);
+    // 367 passing + 31 failing + 1 blank-line special case = 399, the full
     // non-merge commit count of the pinned a28f9598..466cf0fc range.
     assert_eq!(PASSING_SUBJECTS.len() + FAILING_FIXTURES.len() + 1, 399);
 }

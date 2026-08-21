@@ -19,7 +19,9 @@ pub use commit::{
     CommitInfoForAI, FileDiffRef,
 };
 pub use diff_split::{split_by_file, split_file_by_hunk, FileDiff, HunkDiff};
-pub use lint::{lint_message, parse_subject, passes as lint_passes, ParsedSubject};
+pub use lint::{
+    lint_message, parse_subject, passes as lint_passes, suggest_scope_fix, ParsedSubject,
+};
 pub use main_branches::{branches_containing, detect_main_branch_tips, MainBranchTip};
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;

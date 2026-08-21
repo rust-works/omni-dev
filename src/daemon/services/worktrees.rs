@@ -5123,7 +5123,9 @@ fn prune_orphaned_admin(path: &Path, candidate_main_repos: &[PathBuf]) -> Result
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::shim::{retry_on_etxtbsy, shim_lock, write_exec_script};
+    use crate::test_support::shim::{
+        retry_on_etxtbsy, retry_on_etxtbsy_async, shim_lock, write_exec_script,
+    };
     use std::sync::MutexGuard;
 
     fn register_payload(key: &str, repo: Option<&str>, folder: &str) -> Value {
@@ -9905,16 +9907,16 @@ mod tests {
         let ghdir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(ghdir.path(), &merge_resolve_reply(&head, "SUCCESS", &pr));
         let svc = WorktreesService::new();
-        let reply = svc
-            .merge_queue_with(
-                MergeQueueRequest {
-                    paths: vec![dir.path().to_path_buf()],
-                    requester_key: None,
-                    check: true,
-                    confirmed: false,
-                },
-                bin,
-            )
+        let req = MergeQueueRequest {
+            paths: vec![dir.path().to_path_buf()],
+            requester_key: None,
+            check: true,
+            confirmed: false,
+        };
+        // `merge_queue_with` shells the freshly-written `fake-gh` shim via
+        // `spawn_blocking` — a test-only ETXTBSY exec race the `shim_lock`
+        // guard alone does not retry (see test_support::shim's module docs).
+        let reply = retry_on_etxtbsy_async(|| svc.merge_queue_with(req.clone(), bin.clone()))
             .await
             .unwrap();
         let eligible = reply.get("eligible").and_then(Value::as_array).unwrap();
@@ -9948,16 +9950,17 @@ mod tests {
             ),
         );
         let svc = WorktreesService::new();
-        let reply = svc
-            .merge_queue_with(
-                MergeQueueRequest {
-                    paths: vec![dir.path().to_path_buf()],
-                    requester_key: Some("w1".into()),
-                    check: false,
-                    confirmed: true,
-                },
-                bin,
-            )
+        let req = MergeQueueRequest {
+            paths: vec![dir.path().to_path_buf()],
+            requester_key: Some("w1".into()),
+            check: false,
+            confirmed: true,
+        };
+        // `merge_queue_with` shells the freshly-written `fake-gh` shim (twice,
+        // for the resolve then the enqueue) via `spawn_blocking` — a test-only
+        // ETXTBSY exec race the `shim_lock` guard alone does not retry (see
+        // test_support::shim's module docs).
+        let reply = retry_on_etxtbsy_async(|| svc.merge_queue_with(req.clone(), bin.clone()))
             .await
             .unwrap();
         drop(guard);

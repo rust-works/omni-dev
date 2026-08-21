@@ -49,6 +49,7 @@ impl OmniDevServer {
             + Self::config_tool_router()
             + Self::datadog_tool_router()
             + Self::gmail_tool_router()
+            + Self::drive_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
             + Self::coverage_tool_router()
@@ -384,6 +385,20 @@ mod tests {
             "gmail_thread_read",
             "gmail_label_list",
             "gmail_account_list",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_all_drive_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "drive_auth_status",
+            "drive_search",
+            "drive_file_read",
+            "drive_account_list",
+            "drive_dedupe",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

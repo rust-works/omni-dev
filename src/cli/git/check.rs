@@ -656,7 +656,10 @@ impl CheckCommand {
             if !self.quiet {
                 if let Some(suggestion) = &result.suggestion {
                     println!();
-                    print!("{}", format_suggestion_text(suggestion, self.verbose));
+                    print!(
+                        "{}",
+                        super::formatting::format_suggestion_text(suggestion, self.verbose)
+                    );
                 }
             }
 
@@ -1289,26 +1292,6 @@ fn should_offer_twiddle(
     twiddle_flag && has_errors && format == crate::data::check::OutputFormat::Text
 }
 
-/// Formats a commit suggestion as indented text.
-fn format_suggestion_text(
-    suggestion: &crate::data::check::CommitSuggestion,
-    verbose: bool,
-) -> String {
-    let mut output = String::new();
-    output.push_str("   Suggested message:\n");
-    for line in suggestion.message.lines() {
-        output.push_str(&format!("      {line}\n"));
-    }
-    if verbose {
-        output.push('\n');
-        output.push_str("   Why this is better:\n");
-        for line in suggestion.explanation.lines() {
-            output.push_str(&format!("   {line}\n"));
-        }
-    }
-    output
-}
-
 /// Formats the summary section of a check report.
 fn format_summary_text(summary: &crate::data::check::CheckSummary) -> String {
     format!(
@@ -1334,7 +1317,8 @@ fn format_commit_line(icon: &str, short_hash: &str, message: &str) -> String {
 mod tests {
     use super::*;
     use crate::data::check::{
-        CheckSummary, CommitIssue, CommitSuggestion, IssueSeverity, OutputFormat,
+        CheckReport, CheckSummary, CommitCheckResult, CommitIssue, CommitSuggestion, IssueSeverity,
+        OutputFormat,
     };
 
     // --- should_display_commit ---
@@ -1417,7 +1401,7 @@ mod tests {
         assert!(!should_offer_twiddle(true, true, OutputFormat::Json));
     }
 
-    // --- format_suggestion_text ---
+    // --- format_suggestion_text (moved to `super::formatting`, #1564) ---
 
     #[test]
     fn suggestion_text_basic() {
@@ -1425,7 +1409,7 @@ mod tests {
             message: "feat(cli): add new flag".to_string(),
             explanation: "uses conventional format".to_string(),
         };
-        let result = format_suggestion_text(&suggestion, false);
+        let result = super::super::formatting::format_suggestion_text(&suggestion, false);
         assert!(result.contains("Suggested message:"));
         assert!(result.contains("feat(cli): add new flag"));
         assert!(!result.contains("Why this is better"));
@@ -1437,11 +1421,54 @@ mod tests {
             message: "fix: resolve crash".to_string(),
             explanation: "clear description of fix".to_string(),
         };
-        let result = format_suggestion_text(&suggestion, true);
+        let result = super::super::formatting::format_suggestion_text(&suggestion, true);
         assert!(result.contains("Suggested message:"));
         assert!(result.contains("fix: resolve crash"));
         assert!(result.contains("Why this is better:"));
         assert!(result.contains("clear description of fix"));
+    }
+
+    // --- output_text_report ---
+
+    /// Drives `output_text_report` directly (bypassing `execute()`, which
+    /// requires a real AI client and can `std::process::exit` on errors) to
+    /// cover the suggestion-printing block reached when a commit has a
+    /// suggestion and `--quiet` is off.
+    #[test]
+    fn output_text_report_prints_suggestion_when_present_and_not_quiet() {
+        let cmd = CheckCommand {
+            commit_range: None,
+            context_dir: None,
+            guidelines: None,
+            output: OutputFormat::Text,
+            format: None,
+            strict: false,
+            quiet: false,
+            verbose: true,
+            show_passing: true,
+            concurrency: 4,
+            batch_size: None,
+            no_coherence: false,
+            no_suggestions: false,
+            twiddle: false,
+        };
+        let report = CheckReport::new(vec![CommitCheckResult {
+            hash: "abcdef1234567890".to_string(),
+            message: "feat(cli): add thing".to_string(),
+            issues: vec![CommitIssue {
+                severity: IssueSeverity::Warning,
+                section: "Subject".to_string(),
+                rule: "some-rule".to_string(),
+                explanation: "needs work".to_string(),
+            }],
+            suggestion: Some(CommitSuggestion {
+                message: "feat(cli): add thing better".to_string(),
+                explanation: "clearer wording".to_string(),
+            }),
+            passes: false,
+            summary: None,
+        }]);
+        assert!(cmd.output_text_report(&report).is_ok());
     }
 
     // --- format_summary_text ---

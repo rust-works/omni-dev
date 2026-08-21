@@ -53,6 +53,34 @@ impl<T: EnvSource + ?Sized> EnvSource for &T {
     }
 }
 
+/// RAII guard that sets a process env var for the duration of a scope,
+/// restoring (or removing) whatever was there before when the guard drops —
+/// so a caller that mutates process env can be invoked more than once per
+/// process without leaking state between calls (#1538).
+pub(crate) struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl ScopedEnvVar {
+    /// Sets `key` to `value`, snapshotting the previous value (if any) to
+    /// restore on drop.
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

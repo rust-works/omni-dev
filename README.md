@@ -322,6 +322,55 @@ CLI-only (a long-running bulk filesystem operation, a poor fit for a
 synchronous MCP call). For the full guide, see
 [docs/gmail.md](docs/gmail.md).
 
+### 📁 Drive Integration
+
+Authenticate against your own Google Drive account via OAuth2 (loopback
+authorization-code + PKCE, the same flow as Gmail), then search files, read
+their metadata or content, find duplicates, and rename/move files. The
+default scope, `drive.readonly`, is enough for search/read/dedupe;
+rename/move need the opt-in `drive.metadata` scope (`drive auth login
+--write`), the narrowest write scope Google offers — there is still no
+upload/create/trash/share/permission-mutation capability anywhere in this
+surface. `drive move` is security-gated: it refuses any move that would
+change a file's visibility by default (see [ADR-0070](docs/adrs/adr-0070.md)).
+New to this integration? Start with the
+[Drive Quickstart](docs/drive-quickstart.md) for a zero-to-first-search
+walkthrough; see the [Drive integration guide](docs/drive.md) for
+prerequisites (you bring your own Google Cloud OAuth2 client, independent
+of Gmail's), authentication setup, rate-limit behaviour, and
+troubleshooting.
+
+```bash
+# One-time: create your own Google Cloud OAuth2 client (see docs/drive.md),
+# then authenticate (opens a browser)
+export DRIVE_CLIENT_ID=...
+export DRIVE_CLIENT_SECRET=...
+omni-dev drive auth login
+
+# Verify the credentials by calling about.get
+omni-dev drive auth status
+
+# Search and read file metadata/content
+omni-dev drive search "name contains 'report'"
+omni-dev drive read <file-id>
+omni-dev drive read <file-id> --content --out-file report.pdf
+
+# Rename/move need the opt-in drive.metadata scope
+omni-dev drive auth login --write
+omni-dev drive rename <file-id> "New Name.pdf"
+omni-dev drive move <file-id> --to <folder-id>
+```
+
+An OAuth2 client left in Google's "Testing" publishing status issues
+refresh tokens that expire after 7 days — see
+[docs/drive.md](docs/drive.md#prerequisites) for how to avoid re-running
+`auth login` weekly.
+
+Five read-only MCP tools (`drive_*`) mirror the CLI's `auth status`,
+`search`, `dedupe`, `read`, and `account list` — see
+[docs/mcp.md](docs/mcp.md#drive-5-tools). `rename`/`move` have no MCP
+equivalent. For the full guide, see [docs/drive.md](docs/drive.md).
+
 ### 🎙️ Transcript Fetching
 
 Pull captions and transcripts from external media platforms. YouTube is the

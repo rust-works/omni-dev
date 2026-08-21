@@ -100,6 +100,30 @@ fn oneline(rec: &LogRecord) -> String {
                 .map_or_else(String::new, |ms| format!(" {ms}ms"));
             format!("{time}  wt    {source:<14} {command}{path}{branch}{exit}{dur}")
         }
+        RecordKind::DriveMutation => {
+            let source = source_str(rec.source);
+            let command = if rec.command.is_empty() {
+                "-".to_string()
+            } else {
+                rec.command.join(" ")
+            };
+            let file_name = rec
+                .context
+                .get("file_name")
+                .map_or_else(String::new, |n| format!(" {n}"));
+            let status = rec
+                .context
+                .get("status")
+                .map_or_else(String::new, |s| format!(" status={s}"));
+            let err = rec
+                .error
+                .as_deref()
+                .map_or_else(String::new, |e| format!("  error={e}"));
+            let dur = rec
+                .duration_ms
+                .map_or_else(String::new, |ms| format!(" {ms}ms"));
+            format!("{time}  drv   {source:<14} {command}{file_name}{status}{err}{dur}")
+        }
         RecordKind::Invocation | RecordKind::Unknown => {
             let source = source_str(rec.source);
             let command = if rec.command.is_empty() {
@@ -270,6 +294,37 @@ mod tests {
         let line = render(&mv, "", Format::Oneline);
         assert!(line.contains("/tmp/new-home"), "line was: {line}");
         assert!(line.contains(" -"), "line was: {line}");
+    }
+
+    #[test]
+    fn oneline_drive_mutation_shows_file_status_error_and_duration() {
+        let mut rec = LogRecord {
+            kind: RecordKind::DriveMutation,
+            timestamp: "2026-06-22T12:34:56.789Z".to_string(),
+            command: vec!["drive".to_string(), "move".to_string()],
+            source: Some(Source::Cli),
+            duration_ms: Some(17),
+            ..LogRecord::default()
+        };
+        rec.context
+            .insert("file_name".to_string(), "report.pdf".to_string());
+        rec.context
+            .insert("status".to_string(), "blocked".to_string());
+        let line = render(&rec, "", Format::Oneline);
+        assert!(line.contains("drv"), "line was: {line}");
+        assert!(line.contains("drive move"), "line was: {line}");
+        assert!(line.contains("report.pdf"), "line was: {line}");
+        assert!(line.contains("status=blocked"), "line was: {line}");
+        assert!(line.contains("17ms"), "line was: {line}");
+
+        // An empty command renders the "-" placeholder, same as other kinds.
+        let bare = LogRecord {
+            kind: RecordKind::DriveMutation,
+            ..LogRecord::default()
+        };
+        let bare_line = render(&bare, "", Format::Oneline);
+        assert!(bare_line.contains("drv"), "line was: {bare_line}");
+        assert!(bare_line.contains(" -"), "line was: {bare_line}");
     }
 
     #[test]

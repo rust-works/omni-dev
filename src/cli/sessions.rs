@@ -29,7 +29,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::cli::format::TableOrJson;
+use crate::cli::format::{sanitize_for_terminal, TableOrJson};
 use crate::daemon::client::DaemonClient;
 use crate::daemon::paths;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
@@ -817,10 +817,10 @@ fn source_label(session: &Value) -> &'static str {
 }
 
 /// Strips control characters from an untrusted registry string so a crafted
-/// payload cannot inject terminal escape sequences into the rendered table (the
-/// worktrees `sanitize` precedent, #1137). The `--json` path stays verbatim.
+/// payload cannot inject terminal escape sequences into the rendered table
+/// (#1137). The `--json` path stays verbatim.
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    sanitize_for_terminal(s)
 }
 
 /// Seconds elapsed since an RFC 3339 timestamp (0 if absent/unparseable).

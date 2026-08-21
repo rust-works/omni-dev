@@ -45,10 +45,22 @@ impl ImportLegacyCommand {
             &Settings::get_settings_path()?,
             &self.name,
             &[
-                ("client_id", legacy.client_id.as_str()),
-                ("client_secret", legacy.client_secret.expose_secret()),
-                ("refresh_token", legacy.refresh_token.expose_secret()),
-                ("scope", legacy.scope.as_str()),
+                (
+                    "client_id",
+                    serde_json::Value::String(legacy.client_id.clone()),
+                ),
+                (
+                    "client_secret",
+                    serde_json::Value::String(legacy.client_secret.expose_secret().to_string()),
+                ),
+                (
+                    "refresh_token",
+                    serde_json::Value::String(legacy.refresh_token.expose_secret().to_string()),
+                ),
+                (
+                    "scope",
+                    serde_json::Value::String(legacy.scope.as_str().to_string()),
+                ),
             ],
         )?;
 

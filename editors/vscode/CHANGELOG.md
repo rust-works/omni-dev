@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-21
+
 ### Added
 - **A passive "behind origin/main" indicator on worktree rows** ([#1457](https://github.com/rust-works/omni-dev/issues/1457)): the `↑ahead ↓behind` sync counts only ever reflected a branch's divergence from **its own upstream**, never from the repository's remote default branch — so a feature branch fully in sync with its own upstream could sit dozens of commits behind `origin/main` with no visible signal. The only place that number was computed was inside **Rebase on main**'s confirm modal, reachable only by actually invoking a rebase. A new `⇊N` glyph (with its own tooltip line naming the count and the **Rebase on main** action) now surfaces it at rest, fetched lazily on repo-expand alongside the existing sync counts — no extra round trip, and no `git fetch`.
   - Omitted whenever the branch's own upstream **is** already the repository's resolved default branch (the common checked-out-`main`/`master` case), so it never duplicates the existing `↓` count — and, unlike `ahead`/`behind`, a worktree with **no upstream at all** can still show `⇊N`.

@@ -67,6 +67,18 @@ pub(crate) struct ManifestRecord {
     pub(crate) deleted_at: Option<DateTime<Utc>>,
 }
 
+impl ManifestRecord {
+    /// Parses [`Self::internal_date`] into a UTC timestamp — mirrors
+    /// [`crate::gmail::types::Message::internal_date_utc`] exactly, since a
+    /// manifest record's `internal_date` is that same Gmail
+    /// epoch-millisecond string, just persisted to disk rather than held on
+    /// a freshly-fetched `Message`.
+    pub(crate) fn internal_date_utc(&self) -> Option<DateTime<Utc>> {
+        let ms: i64 = self.internal_date.as_deref()?.parse().ok()?;
+        DateTime::from_timestamp_millis(ms)
+    }
+}
+
 /// The whole manifest, keyed by message id (a `BTreeMap` for deterministic,
 /// greppable output order).
 ///
@@ -164,6 +176,15 @@ impl Manifest {
             .values()
             .filter(|r| r.deleted_at.is_none())
             .map(|r| r.id.as_str())
+    }
+
+    /// Every record not currently soft-deleted, with full data — the
+    /// `ManifestRecord`-yielding counterpart of [`Self::ids_not_deleted`],
+    /// for callers (e.g. `gmail extract-attachments`) that need
+    /// `attachment_count`/`path`/`internal_date` rather than just an id to
+    /// look up.
+    pub(crate) fn records_not_deleted(&self) -> impl Iterator<Item = &ManifestRecord> {
+        self.0.values().filter(|r| r.deleted_at.is_none())
     }
 
     /// Atomically rewrites `manifest.jsonl` in full (temp file in the same
@@ -347,6 +368,41 @@ mod tests {
 
         let remaining: Vec<&str> = manifest.ids_not_deleted().collect();
         assert_eq!(remaining, vec!["m2"]);
+    }
+
+    #[test]
+    fn records_not_deleted_excludes_soft_deleted_records() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        manifest.upsert(sample_record("m2"));
+        manifest.mark_deleted("m1", Utc::now());
+
+        let remaining: Vec<&str> = manifest
+            .records_not_deleted()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["m2"]);
+    }
+
+    // ── internal_date_utc ────────────────────────────────────────────
+
+    #[test]
+    fn internal_date_utc_parses_valid_epoch_ms() {
+        let record = sample_record("m1");
+        assert_eq!(
+            record.internal_date_utc(),
+            DateTime::from_timestamp_millis(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn internal_date_utc_is_none_for_missing_or_invalid() {
+        let mut record = sample_record("m1");
+        record.internal_date = None;
+        assert_eq!(record.internal_date_utc(), None);
+
+        record.internal_date = Some("not a number".to_string());
+        assert_eq!(record.internal_date_utc(), None);
     }
 
     #[test]
