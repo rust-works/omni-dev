@@ -273,6 +273,19 @@ Coverage is the VS Code extension's Claude tabs. Terminal Claude
 wrapped — `claude-wrap` detects a terminal and gets out of the way entirely — so
 those sessions keep Feeds 1–3 and their limits.
 
+**Terminal-tab titles carry the model, colour-coded** (issue #1445). VS Code's
+terminal API only lets the *creating* extension set a tab's icon/colour, and only
+at creation time, so there is no way to recolour an already-open tab — the wrapper
+instead rewrites Claude's own OSC title sequence in flight, prepending a
+colour-circle emoji and family name: 🟠 Fable, 🟡 Opus, 🟢 Sonnet, 🔵 Haiku, or
+⚪ Claude for anything else. Claude asserts its title once, at startup, before its
+model can possibly be known yet, so the tab briefly shows the undecorated title
+and then corrects itself a moment later — no need to interact with the session
+first. It updates live again if the model changes mid-session (`/model`). Set
+`OMNI_DEV_CLAUDE_WRAP_NO_TITLE_REWRITE=1` to disable this and forward Claude's
+title unchanged, if it ever misrenders in a given terminal or font. See the
+[ADR-0057](adrs/adr-0057.md) amendment for how this stays fail-open.
+
 ## Tray
 
 The macOS menu bar gains a **"Claude Sessions"** submenu: one line per session
