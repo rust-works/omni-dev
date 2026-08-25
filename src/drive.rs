@@ -23,3 +23,4 @@ pub mod rename;
 pub(crate) mod test_support;
 pub mod types;
 pub mod visibility;
+pub mod write_gate;
