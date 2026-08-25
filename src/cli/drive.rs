@@ -13,6 +13,7 @@ pub(crate) mod permissions;
 pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
+pub(crate) mod upload;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -58,6 +59,10 @@ pub enum DriveSubcommands {
     /// rules (issue #1574). Requires the `drive.file` or `drive` scope
     /// (`drive auth login --write-file`/`--write-full`).
     Create(create::CreateCommand),
+    /// Uploads local content as a new file, gated by the folder
+    /// write-permission rules (issue #1574). Requires the `drive.file` or
+    /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    Upload(upload::UploadCommand),
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
@@ -119,6 +124,7 @@ impl DriveSubcommands {
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
             Self::Create(cmd) => cmd.execute(client).await,
+            Self::Upload(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
         }
@@ -371,6 +377,27 @@ mod tests {
             name: "New File".to_string(),
             parent: "parent-1".to_string(),
             folder: false,
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_upload() {
+        // Same env-isolation and exit-0-regardless-of-outcome reasoning as
+        // dispatch_routes_create.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let content_dir = tempfile::tempdir().unwrap();
+        let local_path = content_dir.path().join("upload-me.txt");
+        std::fs::write(&local_path, b"content").unwrap();
+
+        let cmd = DriveSubcommands::Upload(upload::UploadCommand {
+            local_path,
+            parent: "parent-1".to_string(),
+            name: None,
             mime_type: None,
             dry_run: false,
             output: OutputFormat::Table,
