@@ -179,7 +179,7 @@ impl MessageCommand {
             MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(repo),
             MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute(repo).await,
             MessageSubcommands::Check(check_cmd) => check_cmd.execute(repo).await,
-            MessageSubcommands::Lint(lint_cmd) => lint_cmd.execute(repo).await,
+            MessageSubcommands::Lint(lint_cmd) => lint_cmd.execute(repo),
             MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute(repo).await,
         }
     }

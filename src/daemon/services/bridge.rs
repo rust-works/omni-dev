@@ -40,14 +40,14 @@ pub struct BridgeService {
 impl BridgeService {
     /// Resolves the session token, persists it to a `0600` file, starts the
     /// bridge planes, and returns the service.
-    pub async fn start(
+    pub fn start(
         config: BridgeConfig,
         token_file: Option<&Path>,
         token_path: PathBuf,
     ) -> Result<Self> {
         let token = auth::resolve_token(token_file)?;
         write_token(&token_path, &token)?;
-        let server = BridgeServer::start(config.clone(), token.clone()).await?;
+        let server = BridgeServer::start(config.clone(), token.clone())?;
         Ok(Self {
             inner: StdMutex::new(Some(server)),
             config,
@@ -79,7 +79,7 @@ impl BridgeService {
         if let Some(server) = old {
             server.shutdown().await;
         }
-        let server = BridgeServer::start(self.config.clone(), (*self.token).clone()).await?;
+        let server = BridgeServer::start(self.config.clone(), (*self.token).clone())?;
         *self.lock() = Some(server);
         Ok(())
     }
@@ -324,16 +324,14 @@ mod tests {
     use super::*;
 
     /// A bridge service on random ports with its token written to a temp dir.
-    async fn temp_service(dir: &Path) -> BridgeService {
+    fn temp_service(dir: &Path) -> BridgeService {
         let config = BridgeConfig {
             ws_port: 0,
             control_port: 0,
             ..BridgeConfig::default()
         };
         let token_path = dir.join("bridge.token");
-        BridgeService::start(config, None, token_path)
-            .await
-            .unwrap()
+        BridgeService::start(config, None, token_path).unwrap()
     }
 
     #[cfg(unix)]
@@ -355,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn start_writes_token_and_reports_status() {
         let dir = tempfile::tempdir().unwrap();
-        let svc = temp_service(dir.path()).await;
+        let svc = temp_service(dir.path());
 
         // Token file exists and is owner-only.
         let token_path = dir.path().join("bridge.token");
@@ -412,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn menu_lists_status_line_and_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let svc = temp_service(dir.path()).await;
+        let svc = temp_service(dir.path());
         let menu = svc.menu();
         assert_eq!(menu.title, "Browser Bridge");
         assert!(matches!(menu.items.first(), Some(MenuItem::Label(_))));
@@ -472,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn restart_keeps_service_serving() {
         let dir = tempfile::tempdir().unwrap();
-        let svc = temp_service(dir.path()).await;
+        let svc = temp_service(dir.path());
         svc.handle("restart", Value::Null).await.unwrap();
         // Still healthy after a restart.
         assert!(svc.status().await.healthy);
