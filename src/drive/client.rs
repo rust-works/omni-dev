@@ -175,7 +175,7 @@ impl DriveClient {
 
     /// Sends an authenticated PATCH request with a JSON body and returns the
     /// raw response. Drive's `files.update` (rename/move) is the only PATCH
-    /// endpoint this client calls.
+    /// endpoint this client calls with a JSON body.
     pub async fn patch_json<T: serde::Serialize + Sync + ?Sized>(
         &self,
         url: &str,
@@ -187,6 +187,47 @@ impl DriveClient {
                 .bearer_auth(token)
                 .header("Content-Type", "application/json")
                 .json(body)
+        })
+        .await
+    }
+
+    /// Sends an authenticated POST request with a raw byte body and returns
+    /// the raw response — for Drive's multipart-upload endpoint, whose
+    /// `multipart/related` body [`crate::drive::files_api::FilesApi::upload`]
+    /// hand-assembles (Drive's upload endpoint rejects the
+    /// `multipart/form-data` `reqwest::multipart::Form` would produce).
+    ///
+    /// `body` is cloned per send attempt (`send_authorized`'s `build`
+    /// closure is `Fn`, not `FnOnce` — it may run twice, once on a 401
+    /// retry — and [`reqwest::RequestBuilder::body`] takes ownership).
+    pub async fn post_bytes(&self, url: &str, body: &[u8], content_type: &str) -> Result<Response> {
+        self.send_authorized(url, "POST", |client, token| {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("Content-Type", content_type)
+                .body(body.to_vec())
+        })
+        .await
+    }
+
+    /// Sends an authenticated PATCH request with a raw byte body and
+    /// returns the raw response —
+    /// [`crate::drive::files_api::FilesApi::edit_content`]'s simple
+    /// media-only content replacement (`uploadType=media`, no multipart
+    /// envelope needed since there's no accompanying metadata change).
+    pub async fn patch_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> Result<Response> {
+        self.send_authorized(url, "PATCH", |client, token| {
+            client
+                .patch(url)
+                .bearer_auth(token)
+                .header("Content-Type", content_type)
+                .body(body.to_vec())
         })
         .await
     }
@@ -363,7 +404,7 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::DriveScope;
+    use crate::drive::auth::DriveGrantedScopes;
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -371,7 +412,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         }
     }
 

@@ -14,12 +14,17 @@ pub mod account;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
+pub mod content_edit;
+pub mod create;
 pub mod error;
 pub mod file_move;
 pub mod files_api;
+pub mod folder_ancestry;
 pub mod permissions_api;
 pub mod rename;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
+pub mod upload;
 pub mod visibility;
+pub mod write_gate;

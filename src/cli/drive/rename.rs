@@ -112,7 +112,7 @@ fn print_outcome(outcome: &RenameOutcome, output: &OutputFormat) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -120,7 +120,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::Metadata,
+            scope: DriveGrantedScopes::METADATA,
         }
     }
 

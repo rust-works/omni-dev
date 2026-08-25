@@ -226,11 +226,12 @@ pub struct DriveAccountSettings {
     /// equivalent settings field, for the same reason): this is a
     /// status-reporting cache of whatever was actually granted, not the
     /// value driving a live login decision — that's
-    /// [`crate::drive::auth::DriveScope`], read from this field via
-    /// [`crate::drive::auth::DriveScope::from_granted`]
+    /// [`crate::drive::auth::DriveGrantedScopes`], read from this field via
+    /// [`crate::drive::auth::DriveGrantedScopes::from_granted`]
     /// ([ADR-0070](../../docs/adrs/adr-0070.md), reversing
     /// [ADR-0069](../../docs/adrs/adr-0069.md) §2's "no `DriveScope` enum,
-    /// read-only by design").
+    /// read-only by design"; further generalized from a 2-variant enum to a
+    /// capability set by issue #1574).
     #[serde(default)]
     pub scope: Option<String>,
     /// Google account address for this account. Populated opportunistically
@@ -262,6 +263,31 @@ pub struct DriveAccountSettings {
     /// [ADR-0067](../../docs/adrs/adr-0067.md).)
     #[serde(default)]
     pub browser_command: Option<String>,
+
+    /// Folder-scoped write-permission rules gating `drive create`/`upload`/
+    /// `edit` for this account (issue #1574).
+    ///
+    /// Per-account, not a top-level `DriveSettings` field: a folder id is
+    /// only meaningful inside the one Drive it was minted in, exactly like
+    /// `client_id`/`refresh_token`/`scope` above are already per-account —
+    /// see [`crate::drive::write_gate`]'s module doc for the gate itself.
+    /// Absent or empty means every write is refused for this account
+    /// everywhere; there is deliberately no separate enabled/disabled
+    /// toggle (falls out of
+    /// [`crate::drive::write_gate::DriveOperation`]'s default policy
+    /// alone).
+    #[serde(default)]
+    pub write_permissions: WritePermissionsSettings,
+}
+
+/// The `write_permissions` block on one [`DriveAccountSettings`] — see its
+/// doc comment for why this is per-account.
+#[derive(Debug, Default, Deserialize)]
+pub struct WritePermissionsSettings {
+    /// The configured rules, evaluated by
+    /// [`crate::drive::write_gate::resolve`].
+    #[serde(default)]
+    pub rules: Vec<crate::drive::write_gate::FolderPermissionRule>,
 }
 
 /// The `drive` section of `settings.json` — named Google Drive accounts,
@@ -1944,6 +1970,111 @@ mod tests {
             settings.drive.accounts["work"].chrome_profile_from_email,
             "the bool field must deserialize back to `true`, not the string \"true\""
         );
+    }
+
+    // ── write_permissions (issue #1574) ─────────────────────────────────
+
+    #[test]
+    fn write_permissions_field_round_trips_through_settings_load() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "drive": {
+                    "accounts": {
+                        "work": {
+                            "write_permissions": {
+                                "rules": [
+                                    {
+                                        "folder_id": "folder-1",
+                                        "recursive": true,
+                                        "allow": ["create", "upload"],
+                                        "deny": ["edit"]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from_path(&path).unwrap();
+        let rules = &settings.drive.accounts["work"].write_permissions.rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].folder_id, "folder-1");
+        assert!(rules[0].recursive);
+        assert!(rules[0]
+            .allow
+            .contains(&crate::drive::write_gate::DriveOperation::Create));
+        assert!(rules[0]
+            .allow
+            .contains(&crate::drive::write_gate::DriveOperation::Upload));
+        assert!(rules[0]
+            .deny
+            .contains(&crate::drive::write_gate::DriveOperation::Edit));
+    }
+
+    #[test]
+    fn write_permissions_absent_defaults_to_empty_rules() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"drive": {"accounts": {"work": {"client_id": "id"}}}}"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from_path(&path).unwrap();
+        assert!(settings.drive.accounts["work"]
+            .write_permissions
+            .rules
+            .is_empty());
+    }
+
+    /// Mirrors the crate-wide unknown-field-preserving convention every
+    /// other settings block already guarantees: a future field inside
+    /// `write_permissions` that this version of `omni-dev` doesn't know
+    /// about must survive an unrelated read-modify-write cycle untouched,
+    /// since writes go through the untyped `serde_json::Value` merge path
+    /// ([`read_or_default_settings`]/[`ensure_object_at`]), never a
+    /// round-trip through the typed struct.
+    #[test]
+    fn write_permissions_unknown_future_field_is_preserved_through_read_modify_write() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "drive": {
+                    "accounts": {
+                        "work": {
+                            "write_permissions": {
+                                "rules": [],
+                                "future_field": "not yet modeled"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(
+            val["drive"]["accounts"]["work"]["write_permissions"]["future_field"],
+            "not yet modeled"
+        );
+        assert_eq!(val["drive"]["accounts"]["work"]["client_id"], "id");
     }
 
     #[test]

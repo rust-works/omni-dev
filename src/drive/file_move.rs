@@ -19,16 +19,9 @@ use serde::Serialize;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::permissions_api::PermissionsApi;
-use crate::drive::types::DrivePermission;
+use crate::drive::types::{DrivePermission, GOOGLE_FOLDER_MIME_TYPE};
 use crate::drive::visibility::{self, BlockReasons, MoveGateFlags, VisibilityDiff};
 use crate::request_log::{self, DriveMutationOutcome};
-
-/// MIME type marking a Drive folder. Deliberately a private, local copy of
-/// `crate::cli::drive::read::GOOGLE_FOLDER` rather than a shared import:
-/// this is an engine module, and depending on a CLI-layer module for a
-/// stable, well-known Drive constant would invert the usual CLI-depends-on-
-/// engine direction.
-const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
 /// Per-batch move options.
 #[derive(Debug, Clone)]
@@ -398,6 +391,11 @@ fn record_attempt(outcome: &MoveOutcome, duration: Duration) {
         added_principals,
         removed_principals,
         crosses_drive_boundary: outcome.crosses_drive_boundary,
+        // Move is gated by the visibility diff, not the folder
+        // write-permission gate.
+        resolved_folder_id: None,
+        decided_by_folder_id: None,
+        decided_by_depth: None,
         error,
         duration,
     });
@@ -407,7 +405,7 @@ fn record_attempt(outcome: &MoveOutcome, duration: Duration) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -415,7 +413,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::Metadata,
+            scope: DriveGrantedScopes::METADATA,
         }
     }
 

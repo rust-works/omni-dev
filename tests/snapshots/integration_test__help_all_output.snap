@@ -3728,14 +3728,18 @@ Drive: search and read Google Drive files via OAuth2 (read-only)
 Usage: drive [OPTIONS] <COMMAND>
 
 Commands:
-  auth     Manages Drive OAuth2 credentials
-  account  Manages named Drive accounts
-  search   Searches Drive files
-  read     Reads a single Drive file's metadata or content
-  dedupe   Finds Drive files sharing the same content hash
-  rename   Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
-  move     Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
-  help     Print this message or the help of the given subcommand(s)
+  auth         Manages Drive OAuth2 credentials
+  account      Manages named Drive accounts
+  search       Searches Drive files
+  read         Reads a single Drive file's metadata or content
+  dedupe       Finds Drive files sharing the same content hash
+  create       Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  upload       Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  edit         Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+  rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
+  move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
+  permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
       --account <NAME>  Selects a named Drive account configured in `~/.omni-dev/settings.json` (AWS-CLI style, mirrors the top-level `--profile`) for this invocation
@@ -3814,8 +3818,10 @@ Runs the Drive OAuth2 login flow (opens a browser)
 Usage: login [OPTIONS]
 
 Options:
-      --write  Request the `drive.metadata` scope (needed for `rename`/`move`) in addition to `drive.readonly`. Without this flag, only read access is granted
-  -h, --help   Print help
+      --write       Request the `drive.metadata` scope (needed for `rename`/`move`) in addition to `drive.readonly`. Without any `--write*` flag, only read access is granted
+      --write-file  Request the `drive.file` scope (needed for `create`/`upload`, and `edit` of files `omni-dev` itself created) in addition to `drive.readonly`. Independent of and combinable with `--write` and `--write-full` — Google just grants the union (issue #1574)
+      --write-full  Request the unrestricted `drive` scope (needed for `edit` of any pre-existing file's content) in addition to `drive.readonly`. The largest privilege grant this integration has ever requested — combine with `--write`/`--write-file` freely (issue #1574)
+  -h, --help        Print help
 
 
 ================================================================================
@@ -3845,6 +3851,24 @@ Options:
 
 ================================================================================
 
+omni-dev drive create - Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Usage: create [OPTIONS] --name <NAME> --parent <FOLDER_ID>
+
+Options:
+      --name <NAME>         The new file/folder's display name
+      --parent <FOLDER_ID>  The folder id to create it in
+      --folder              Create a folder instead of a plain file. Conflicts with `--mime-type`
+      --mime-type <TYPE>    MIME type for a plain file. Defaults to `application/octet-stream` when omitted. Conflicts with `--folder`
+      --dry-run             Reports the gate verdict without calling `files.create`
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive dedupe - Finds Drive files sharing the same content hash
 
 Finds Drive files sharing the same content hash
@@ -3858,6 +3882,25 @@ Options:
       --limit <LIMIT>    Maximum results to scan. `0` means "scan every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive edit - Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+
+Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+
+Usage: edit [OPTIONS] --content <LOCAL_PATH|-> <FILE_ID>
+
+Arguments:
+  <FILE_ID>  Drive file id (from `drive search`, or the `id` segment of a Drive URL)
+
+Options:
+      --content <LOCAL_PATH|->  New content: a local file path, or `-` to read from stdin
+      --mime-type <TYPE>        MIME type for the content. Defaults to `application/octet-stream`
+      --dry-run                 Reports the gate verdict without calling `files.update`
+  -o, --output <OUTPUT>         Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                    Print help (see more with '--help')
 
 
 ================================================================================
@@ -3879,6 +3922,71 @@ Options:
       --dry-run                        Reports what would happen without moving anything
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive permissions - Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+
+Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+
+Usage: permissions <COMMAND>
+
+Commands:
+  show           Prints the active account's configured write-permission rules
+  lookup-folder  Searches Drive for candidate folders and prints their ids/paths
+  check          Evaluates the configured rules against a real target
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive permissions check - Evaluates the configured rules against a real target
+
+Evaluates the configured rules against a real target
+
+Usage: check [OPTIONS] --operation <OPERATION> <ID>
+
+Arguments:
+  <ID>  The folder or file id to evaluate
+
+Options:
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit]
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive permissions lookup-folder - Searches Drive for candidate folders and prints their ids/paths
+
+Searches Drive for candidate folders and prints their ids/paths
+
+Usage: lookup-folder [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>  Folder name (or fragment) to search for
+
+Options:
+      --limit <LIMIT>    Maximum candidates to resolve full paths for [default: 20]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive permissions show - Prints the active account's configured write-permission rules
+
+Prints the active account's configured write-permission rules
+
+Usage: show [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -3934,6 +4042,26 @@ Options:
       --limit <LIMIT>    Maximum results to return. `0` means "fetch every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive upload - Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Usage: upload [OPTIONS] --parent <FOLDER_ID> <LOCAL_PATH>
+
+Arguments:
+  <LOCAL_PATH>  Local file to upload
+
+Options:
+      --parent <FOLDER_ID>  The folder id to upload it into
+      --name <NAME>         The new file's display name. Defaults to `local_path`'s file name
+      --mime-type <TYPE>    MIME type for the content. Defaults to `application/octet-stream`
+      --dry-run             Reports the gate verdict without calling `files.create`
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================
