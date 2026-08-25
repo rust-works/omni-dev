@@ -2,13 +2,15 @@
 
 omni-dev exposes access to the Google Drive v3 API through the `omni-dev
 drive` command tree — search, read a file's metadata or content, find
-duplicates, rename a file, and move it between folders. `drive.readonly`
-(the default scope) is enough for search/read/dedupe; rename/move need the
-opt-in `drive.metadata` scope
+duplicates, rename a file, move it between folders, and create/upload/edit
+file content. `drive.readonly` (the default scope) is enough for
+search/read/dedupe; rename/move need the opt-in `drive.metadata` scope
 (`drive auth login --write`), the narrowest write scope Google offers — it
 covers `files.update` on `name`/`parents` only, with no file-content access
-at all. There is still no upload/create/trash/share/permission-mutation
-capability anywhere in this surface.
+at all. Content mutation needs a broader grant still: `--write-file`
+(`drive.file`, app-created files only) or `--write-full` (the unrestricted
+`drive` scope, needed to edit any pre-existing file). There is still no
+trash/share/permission-mutation capability anywhere in this surface.
 
 **Move is security-gated.** Moving a file can change who can see it — Drive
 resolves a file's effective visibility from both direct permissions on the
@@ -17,10 +19,20 @@ file changes that chain. `drive move` refuses any move that would change
 visibility **by default**; three independent `--allow-*` flags opt in. See
 [Move](#move) and [ADR-0070](adrs/adr-0070.md) for the full design.
 
+**Create/upload/edit are gated by a second, independent, local
+permission system.** Google's OAuth scopes are all-or-nothing across your
+*entire* Drive — there's no way to grant "write access to just this
+folder." `write_permissions` rules in `settings.json` are omni-dev's own
+policy layer filling that gap: read defaults open, every write defaults
+**refused everywhere** until a rule explicitly grants it for that folder.
+Both the OAuth scope and the local gate must allow an operation — neither
+alone is sufficient. See [Write permissions](#write-permissions) and
+[ADR-0071](adrs/adr-0071.md) for the full design.
+
 The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_dedupe`/
 `drive_file_read`/`drive_account_list`, mirroring the CLI one-for-one like
 Gmail's `gmail_*` tools) is read-only, like the rest of the MCP surface —
-`rename`/`move` have no MCP equivalent. See
+`rename`/`move`/`create`/`upload`/`edit` have no MCP equivalent. See
 [docs/mcp.md](mcp.md#drive-5-tools) for the full tool reference.
 
 New to this integration? Follow the
@@ -38,9 +50,13 @@ walkthrough — this page is the topic-by-topic reference.
 7. [Duplicate detection](#duplicate-detection)
 8. [Rename](#rename)
 9. [Move](#move)
-10. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-11. [Troubleshooting](#troubleshooting)
-12. [See also](#see-also)
+10. [Write permissions](#write-permissions)
+11. [Create](#create)
+12. [Upload](#upload)
+13. [Edit](#edit)
+14. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+15. [Troubleshooting](#troubleshooting)
+16. [See also](#see-also)
 
 ## Prerequisites
 
@@ -84,13 +100,13 @@ omni-dev doesn't impose either shape.
 
 ### Environment variables
 
-| Variable              | Purpose                                                                                                                    | Default |
-|------------------------|------------------------------------------------------------------------------------------------------------------------------|---------|
-| `DRIVE_CLIENT_ID`      | OAuth2 client id from your own Google Cloud project (required).                                                              | _none_  |
-| `DRIVE_CLIENT_SECRET`  | OAuth2 client secret for the same client (required).                                                                         | _none_  |
-| `DRIVE_REFRESH_TOKEN`  | Written by `drive auth login`; not meant to be hand-set.                                                                     | _none_  |
-| `DRIVE_SCOPE`          | Written by `drive auth login`; records the granted scope (`drive.readonly`, or `drive.metadata` after `--write`) so `auth status` can report it without a network call. | _none_ |
-| `DRIVE_API_URL`        | Explicit API base URL; overrides the real `www.googleapis.com` host entirely. Use for a proxy or a forced egress gateway.    | _unset_ |
+| Variable              | Purpose                                                                                                                                                                                                                                               | Default |
+|-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `DRIVE_CLIENT_ID`     | OAuth2 client id from your own Google Cloud project (required).                                                                                                                                                                                       | _none_  |
+| `DRIVE_CLIENT_SECRET` | OAuth2 client secret for the same client (required).                                                                                                                                                                                                  | _none_  |
+| `DRIVE_REFRESH_TOKEN` | Written by `drive auth login`; not meant to be hand-set.                                                                                                                                                                                              | _none_  |
+| `DRIVE_SCOPE`         | Written by `drive auth login`; records the granted scope(s) — any combination of `drive.readonly`, `drive.metadata` (`--write`), `drive.file` (`--write-file`), and `drive` (`--write-full`) — so `auth status` can report it without a network call. | _none_  |
+| `DRIVE_API_URL`       | Explicit API base URL; overrides the real `www.googleapis.com` host entirely. Use for a proxy or a forced egress gateway.                                                                                                                             | _unset_ |
 
 Unlike Gmail, there is **no `drive auth import`** — no
 `client_secret.json`-import path exists for Drive. `DRIVE_CLIENT_ID`/
@@ -117,20 +133,34 @@ This opens a browser to Google's consent screen via a loopback OAuth2
 authorization-code + PKCE flow (see [ADR-0063](adrs/adr-0063.md), inherited
 unchanged by [ADR-0069](adrs/adr-0069.md)); once you approve, the refresh
 token is written to `~/.omni-dev/settings.json`. By default this requests
-only `drive.readonly`. Pass `--write` to additionally request
-`drive.metadata` (needed for `drive rename`/`drive move`):
+only `drive.readonly`. Three independent flags request more, combinable
+freely in one call:
+
+| Flag           | Scope requested        | Needed for                                                                                           |
+|----------------|------------------------|------------------------------------------------------------------------------------------------------|
+| `--write`      | `drive.metadata`       | `drive rename`/`drive move`                                                                          |
+| `--write-file` | `drive.file`           | `drive create`/`drive upload`, and `drive edit` on files `omni-dev` itself created                   |
+| `--write-full` | `drive` (unrestricted) | `drive edit` on any pre-existing file — the largest privilege grant this integration ever requests   |
 
 ```bash
-$ omni-dev drive auth login --write
+$ omni-dev drive auth login --write --write-file --write-full
 ```
 
-`--write` requests `drive.metadata` *alongside* `drive.readonly`, never as a
-replacement — `drive.metadata` alone grants no file-content access, so
-`search`/`read` still need `drive.readonly` too. Google's consent screen
-lists both as separate permission tick-boxes; tick both when `--write` is
-passed. Re-run `drive auth login --write` at any time to upgrade an
-existing `drive.readonly`-only login — Google's `prompt=consent` re-issues a
-fresh refresh token with the broader grant.
+Every flag requests its scope *alongside* `drive.readonly`, never as a
+replacement — none of `drive.metadata`/`drive.file`/`drive` alone grants
+read access, so `search`/`read` still need `drive.readonly` too. Google's
+consent screen lists each as a separate permission tick-box; tick all that
+apply to the flags you passed. Re-run `drive auth login` with more flags at
+any time to upgrade an existing login — Google's `prompt=consent` re-issues
+a fresh refresh token with the broader grant.
+
+`--write-file` alone cannot edit a file that already existed in your Drive
+before `omni-dev` touched it — Google restricts `drive.file` to files this
+app itself created via that scope. `drive edit` on any pre-existing file
+needs `--write-full`, the only scope that can. Requesting `--write-full` is
+a significant privilege escalation (unrestricted read/write over your
+*entire* Drive) — the [Write permissions](#write-permissions) gate below is
+what bounds it to specific folders in practice.
 
 ### Verifying credentials
 
@@ -141,8 +171,10 @@ Authenticated as: user@example.com
 Granted scope: drive.readonly
 ```
 
-After a `--write` login, this instead reports `Granted scope: drive.readonly,
-drive.metadata`. This calls `about.get`, a live network call.
+After a `--write --write-file` login, this instead reports `Granted scope:
+drive.readonly, drive.metadata, drive.file` — every granted scope, listed
+in the order shown in the [Interactive setup](#interactive-setup) table
+above. This calls `about.get`, a live network call.
 
 Pass `--all` to report every configured named account (see
 [Multiple accounts](#multiple-accounts)) in one call instead of just the
@@ -551,6 +583,238 @@ can only produce an unnecessary `--allow-visibility-decrease` requirement,
 never a missed visibility increase. See
 [ADR-0070](adrs/adr-0070.md) for the full algorithm.
 
+## Write permissions
+
+`drive create`/`drive upload`/`drive edit` (below) need a much broader OAuth
+grant than rename/move — `--write-file`/`--write-full` — but Google's
+scopes are all-or-nothing across your whole Drive. There's no way to tell
+Google "only let this credential write inside folder X." So `omni-dev` adds
+its own, independent, local policy layer on top: a folder-scoped
+allow/deny rule list in `settings.json`, evaluated **before** any mutating
+API call is attempted, regardless of what the OAuth scope would technically
+permit.
+
+**Default policy** — what applies when no configured rule names an
+operation anywhere in a target's ancestor chain:
+
+| Operation | Default |
+|-----------|---------|
+| `read`    | allow   |
+| `create`  | deny    |
+| `upload`  | deny    |
+| `edit`    | deny    |
+
+There is no "enabled: true" flag — an absent or empty rule list already
+means "deny every create/upload/edit everywhere," via this table alone,
+which *is* the disabled state.
+
+Rules live per Drive account, since a folder id only means something inside
+the one Drive it came from:
+
+```jsonc
+{
+  "drive": {
+    "accounts": {
+      "work": {
+        "write_permissions": {
+          "rules": [
+            { "folder_id": "1AbC...AiWorkspace",  "recursive": true,  "allow": ["create", "upload", "edit"] },
+            { "folder_id": "1XyZ...DropZone",     "recursive": false, "allow": ["create"] },
+            { "folder_id": "1Sen...Confidential",  "recursive": true,  "deny": ["read"] }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+- `folder_id` — Drive's own canonical folder id, not a path (Drive names
+  aren't unique, and files can have multiple parents). Find one with
+  [`drive permissions lookup-folder`](#drive-permissions-lookup-folder)
+  below.
+- `recursive` — when `true`, the rule also matches every descendant of
+  `folder_id`, not just the folder itself.
+- `allow`/`deny` — any of `read`, `create`, `upload`, `edit`. A `deny`
+  entry is schema-ready today for a future `search`/`read`/`dedupe`
+  enforcement fast-follow (not wired up yet — see
+  [ADR-0071](adrs/adr-0071.md) §11); `create`/`upload`/`edit` are enforced
+  now.
+
+**Resolution**: for a target's ancestor chain (the folder itself at depth
+0, then its parent, grandparent, …), the closest matching rule wins; if
+rules at the same depth disagree, `deny` wins. No matching rule anywhere
+falls through to the default policy table above. `drive create`/`drive
+upload` resolve the chain from `--parent`; `drive edit` resolves it from
+the target file's *current* parent(s) — unioned across every current
+parent for a legacy multi-parent file, with `deny` winning if any parent
+disagrees.
+
+### Diagnostics
+
+Three read-only subcommands, none of which can ever mutate anything —
+useful for authoring and debugging rules before relying on them.
+
+#### `drive permissions show`
+
+```bash
+$ omni-dev drive permissions show
+FOLDER_ID              RECURSIVE  ALLOW                DENY
+1AbC...AiWorkspace      true       create,edit,upload   -
+1XyZ...DropZone         false      create               -
+```
+
+Reads only `settings.json` — no network call. With no rules configured, it
+explains that every write is refused everywhere and points at the
+`write_permissions.rules` key above.
+
+#### `drive permissions lookup-folder`
+
+```bash
+$ omni-dev drive permissions lookup-folder "Workspace"
+ID                    NAME       PATH
+1AbC...AiWorkspace     Workspace  My Drive/Team/Workspace
+```
+
+Searches by name and resolves each hit's full root-to-leaf path (via the
+same ancestor-chain walk the gate itself uses), so you can tell apart
+same-named folders in different locations before pasting an id into
+config.
+
+#### `drive permissions check`
+
+```bash
+$ omni-dev drive permissions check 1AbC...AiWorkspace --operation create
+target:     1AbC...AiWorkspace
+operation:  create
+verdict:    allow
+decided by: rule on folder 1AbC...AiWorkspace (depth 0)
+```
+
+Evaluates the real configured rules against a real target and operation —
+the exact `resolve_ancestor_chain`/`write_gate::resolve` functions
+`create`/`upload`/`edit` themselves call, so this diagnostic can never
+drift from actual enforcement. Accepts either a folder id (checked
+directly) or a file id (checked from its current parent(s), matching
+`edit`'s own semantics).
+
+## Create
+
+```bash
+$ omni-dev drive create --name "Notes.txt" --parent 1AbC...AiWorkspace
+Created: Notes.txt (1NewFileIdHere) in 1AbC...AiWorkspace
+
+$ omni-dev drive create --name "Notes.txt" --parent 1AbC...AiWorkspace --dry-run
+Would create: Notes.txt in 1AbC...AiWorkspace
+
+$ omni-dev drive create --name "Reports" --parent 1AbC...AiWorkspace --folder
+Created: Reports (1NewFolderIdHere) in 1AbC...AiWorkspace
+```
+
+Creates a new file (metadata only — no content; see [Upload](#upload) to
+push local content in) or, with `--folder`, a new folder. `--mime-type`
+sets the content type for a plain file (default
+`application/octet-stream`); it conflicts with `--folder`, which always
+creates `application/vnd.google-apps.folder`.
+
+Gated by [Write permissions](#write-permissions) against `--parent` —
+refused before any `files.create` call if no rule allows `create` there.
+`--dry-run` classifies against the exact same gate a real run would,
+without ever calling `files.create`:
+
+```bash
+$ omni-dev drive create --name "x" --parent 1Sen...Confidential --dry-run
+Blocked: x in 1Sen...Confidential
+  refused by default policy (no matching rule)
+```
+
+Requires the `drive.file` or `drive` scope (`drive auth login --write-file`
+or `--write-full`); without either, the call fails with an actionable hint
+naming both flags. Every real attempt — created, blocked, or failed — is
+written to the [request log](log.md#what-gets-recorded) as a `kind:
+"drivemutation"` record, even when the gate refused before any API call
+was made; `--dry-run` previews are never logged.
+
+## Upload
+
+```bash
+$ omni-dev drive upload ./report.pdf --parent 1AbC...AiWorkspace
+Uploaded: report.pdf (1NewFileIdHere) in 1AbC...AiWorkspace
+
+$ omni-dev drive upload ./report.pdf --parent 1AbC...AiWorkspace --name "Q3 Report.pdf" --dry-run
+Would upload: Q3 Report.pdf in 1AbC...AiWorkspace
+```
+
+Uploads local content as a new file — everything [Create](#create) does,
+plus reading a local file's bytes. `--name` defaults to the local file's
+own name; `--mime-type` defaults to `application/octet-stream`.
+
+**5 MB size cap.** Drive's simple (non-resumable) upload endpoint —
+the only one this command uses — caps request bodies at 5 MB. The local
+file is stat'd and refused *before* it's ever read into memory if it's too
+large, so this fires identically whether or not `--dry-run` is set:
+
+```bash
+$ omni-dev drive upload ./huge-video.mp4 --parent 1AbC...AiWorkspace
+Error: refusing to upload 83886080 bytes (limit: 5242880 bytes); Drive's simple upload endpoint caps requests at 5 MB — larger content needs resumable upload, not supported by `drive upload`/`drive edit` yet
+```
+
+Larger content needs Drive's chunked resumable-upload protocol, not
+supported by this command in v1 (an explicit, documented boundary — see
+[ADR-0071](adrs/adr-0071.md) §10 — not a silent gap).
+
+Same gate, scope requirement, and logging behavior as [Create](#create).
+
+## Edit
+
+```bash
+$ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf
+Edited: 1ExistingFileId
+
+$ cat ./new-report.pdf | omni-dev drive edit 1ExistingFileId --content -
+Edited: 1ExistingFileId
+
+$ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf --dry-run
+Would edit: 1ExistingFileId
+```
+
+Replaces an existing file's raw content. `--content` accepts a local path,
+or `-` to read from stdin (bounded at the same 5 MB cap — an
+unbounded pipe is never buffered past the limit before being refused).
+
+**Gated differently from create/upload.** Since there's no `--parent` to
+check, the gate evaluates the target's *current* parent folder(s) instead
+— unioned across every parent for a legacy multi-parent file, with `deny`
+winning if any parent disagrees (see [Write
+permissions](#write-permissions) above). An orphan file with no parent
+falls straight to the default policy (refused).
+
+**Google-native documents are refused outright, before the gate even
+runs:**
+
+```bash
+$ omni-dev drive edit 1SomeGoogleDocId --content ./file.txt
+Refused: 1SomeGoogleDocId is a Google-native document (Docs/Sheets/Slides/...) — no raw content to replace
+```
+
+A Docs/Sheets/Slides file has no fixed byte content a raw media `PATCH` can
+replace — editing one is a Docs-API/Sheets-API problem, out of scope here
+(the same deferral [ADR-0069](adrs/adr-0069.md) already made for Docs
+export).
+
+**Scope depends on the file's origin.** `--write-file` (`drive.file`) is
+enough only if `omni-dev` itself created the target via `drive
+create`/`drive upload`; any other pre-existing file needs the unrestricted
+`--write-full`. A 403 names both flags, since the client has no cheap way
+to tell which a given file id needs:
+
+```
+Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
+  Run `omni-dev drive auth login --write-file` if this file was created by omni-dev, or `--write-full` to edit any pre-existing file's content, then retry
+```
+
+Same request-log behavior as [Create](#create)/[Upload](#upload).
+
 ## Rate limits and retry behaviour
 
 Drive signals quota exhaustion two ways: a plain **HTTP 429**, and **HTTP
@@ -705,6 +969,33 @@ client-side check before the call, so this surfaces from Google's own 403.
 Re-run `omni-dev drive auth login --write` to upgrade the grant (see
 [Interactive setup](#interactive-setup)), then retry.
 
+### `insufficientPermissions` on create/upload/edit
+
+```
+Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
+  Run `omni-dev drive auth login --write-file` (or `--write-full`) to grant the scope needed to create files/folders and upload content
+```
+
+Same shape as the rename/move hint above, but for `create`/`upload` (needs
+`--write-file` or `--write-full`) or `edit` (needs `--write-file` if
+`omni-dev` created the file, `--write-full` for any pre-existing one — see
+[Edit](#edit)). Re-run `drive auth login` with the named flag(s), then
+retry.
+
+### `Blocked` — refused by the folder write-permission gate
+
+```bash
+$ omni-dev drive create --name "x" --parent 1Sen...Confidential
+Blocked: x in 1Sen...Confidential
+  refused by default policy (no matching rule)
+```
+
+This is not an error — the command exits 0, same as a `Blocked` move (see
+[Move](#move)). No `files.create`/`files.update` call was ever made. Run
+`drive permissions check <folder-id> --operation <op>` to see exactly which
+rule (if any) decided the refusal, and [Write
+permissions](#write-permissions) to add a rule that allows it.
+
 ### No default export format for a Google-native file
 
 ```
@@ -726,6 +1017,10 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
 - [ADR-0070](adrs/adr-0070.md) — reverses ADR-0069 §2 to add rename/move:
   the additive `drive.metadata` scope, the visibility-diff algorithm behind
   `move`'s safety gate, and the three-flag opt-in model.
+- [ADR-0071](adrs/adr-0071.md) — extends ADR-0069/ADR-0070 to add
+  `create`/`upload`/`edit`: the `--write-file`/`--write-full` scope tiers,
+  the folder-scoped [write-permission gate](#write-permissions) and its
+  resolution algorithm, and why both layers are independently required.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.
