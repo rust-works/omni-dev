@@ -147,6 +147,8 @@ test("classifyModel matches each family by case-insensitive substring (#1448)", 
   assert.equal(classifyModel("claude-SONNET-4-6"), "s");
   assert.equal(classifyModel("claude-opus-4-8"), "o");
   assert.equal(classifyModel("claude-fable-5"), "f");
+  assert.equal(classifyModel("anthropic.kimi-k3"), "k");
+  assert.equal(classifyModel("anthropic.glm-5.2"), "g");
 });
 
 test("classifyModel survives a Bedrock/regional-prefixed id", () => {
@@ -205,9 +207,10 @@ test("unionModelFamilies is empty for a repo with no sessions anywhere", () => {
   assert.deepEqual(unionModelFamilies(["/w/repo", "/w/repo-two"], {}), new Set());
 });
 
-test("formatModelMarker renders in fixed h/s/o/f/* order regardless of insertion order", () => {
+test("formatModelMarker renders in fixed h/s/o/f/k/g/* order regardless of insertion order", () => {
   assert.equal(formatModelMarker(new Set<Family>(["o", "h"])), "[ho]");
   assert.equal(formatModelMarker(new Set<Family>(["*", "f", "s"])), "[sf*]");
+  assert.equal(formatModelMarker(new Set<Family>(["g", "k", "f"])), "[fkg]");
 });
 
 test("formatModelMarker is empty (not '[]') for an empty or absent set", () => {

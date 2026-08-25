@@ -95,14 +95,15 @@ function bucketFor(state: SessionState): keyof SessionTally | undefined {
 }
 
 /**
- * One letter of the `[hsof*]` model-family marker (#1448), in the fixed order
- * the marker always renders them: h(aiku), s(onnet), o(pus), f(able), then
- * *(anything else, including a model the daemon never learned).
+ * One letter of the `[hsofkg*]` model-family marker (#1448), in the fixed order
+ * the marker always renders them: h(aiku), s(onnet), o(pus), f(able),
+ * k(imi), g(lm), then *(anything else, including a model the daemon never
+ * learned).
  */
-export type Family = "h" | "s" | "o" | "f" | "*";
+export type Family = "h" | "s" | "o" | "f" | "k" | "g" | "*";
 
 /** {@link Family} letters in the marker's fixed rendering order. */
-const FAMILY_ORDER: readonly Family[] = ["h", "s", "o", "f", "*"];
+const FAMILY_ORDER: readonly Family[] = ["h", "s", "o", "f", "k", "g", "*"];
 
 /** Substring needles, checked in {@link FAMILY_ORDER} order. */
 const FAMILY_NEEDLES: readonly { family: Family; needle: string }[] = [
@@ -110,6 +111,8 @@ const FAMILY_NEEDLES: readonly { family: Family; needle: string }[] = [
   { family: "s", needle: "sonnet" },
   { family: "o", needle: "opus" },
   { family: "f", needle: "fable" },
+  { family: "k", needle: "kimi" },
+  { family: "g", needle: "glm" },
 ];
 
 /**
@@ -248,7 +251,7 @@ export function sessionGlyphs(tally: SessionTally | undefined): string {
 }
 
 /**
- * The `[hsof*]`-style model-family marker text (#1448): fixed letter order,
+ * The `[hsofkg*]`-style model-family marker text (#1448): fixed letter order,
  * only letters actually present, empty for an empty/absent set — not `"[]"` —
  * so a worktree/repo with no sessions contributes nothing to the row
  * description.

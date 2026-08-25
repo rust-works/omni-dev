@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Kimi and GLM model-family letters** in the Claude model-family marker ([#1448](https://github.com/rust-works/omni-dev/issues/1448)): the trailing `[hsof*]` marker now also recognises **k**imi and **g**lm model ids (e.g. `anthropic.kimi-k3`, `anthropic.glm-5.2`), rendering them as `k` and `g` in the fixed `h`/`s`/`o`/`f`/`k`/`g`/`*` order. Previously such ids fell through to the catch-all `*`, so concurrent Kimi/GLM sessions were indistinguishable from any other unknown model.
+
 ## [0.9.0] - 2026-08-21
 
 ### Added

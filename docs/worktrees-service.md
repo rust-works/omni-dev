@@ -523,8 +523,8 @@ file decoration, not description text), which also tints that row's branch label
   repo-root/worktree-path identity — and not by node object identity.
 - **Claude model-family marker** (#1448): when the [sessions service](sessions-service.md)
   attributes one or more Claude sessions to a worktree, its row description gets a
-  trailing `[hsof*]`-style marker — **h**aiku, **s**onnet, **o**pus, **f**able, `*`
-  for anything else — naming which model families are running there, in that fixed
+  trailing `[hsofkg*]`-style marker — **h**aiku, **s**onnet, **o**pus, **f**able,
+  **k**imi, **g**lm, `*` for anything else — naming which model families are running there, in that fixed
   order, with only the letters actually in use. A repository row shows the union of
   its worktrees' markers, so `[so]` there means Sonnet is running in one worktree and
   Opus in another, not necessarily both in the same one. Idle counts the same as
