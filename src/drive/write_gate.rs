@@ -60,6 +60,20 @@ pub enum DriveOperation {
     Edit,
 }
 
+impl std::fmt::Display for DriveOperation {
+    /// Lowercase, matching the `#[serde(rename_all = "lowercase")]` wire
+    /// form — used by `drive permissions show`/`check`'s rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Read => "read",
+            Self::Create => "create",
+            Self::Upload => "upload",
+            Self::Edit => "edit",
+        };
+        write!(f, "{s}")
+    }
+}
+
 impl DriveOperation {
     /// The verdict when no configured rule names this operation anywhere in
     /// a target's ancestor chain. `Read` stays open by default (unchanged
@@ -81,7 +95,7 @@ impl DriveOperation {
 /// legacy parents), so identity is the id, exactly as the browser
 /// bridge's `OriginAllowlist` matches exact origin strings rather than
 /// URL patterns.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FolderPermissionRule {
     /// The Drive folder id this rule matches.
     pub folder_id: String,
@@ -181,6 +195,36 @@ pub fn resolve(chain: &[String], op: DriveOperation, rules: &[FolderPermissionRu
             decided_by: None,
         },
     }
+}
+
+/// Combines per-parent [`Decision`]s into one, for a target with more than
+/// one current parent (a legacy multi-parent file — Drive no longer
+/// permits creating new ones).
+///
+/// Deny wins across parents, the same fail-closed direction every other
+/// tie-break in this module takes. Callers with a single parent (the
+/// common case) can call [`resolve`] directly instead; an *orphan* target
+/// (zero parents) should call `resolve(&[], op, rules)` directly too,
+/// rather than calling this with zero decisions — a target's chain
+/// degenerates to "only the default policy applies," not to a policy
+/// about *no* chain, so `first` requires at least one decision by
+/// construction.
+///
+/// Shared by `drive edit` (whose target's chain starts at its *current*
+/// parents, unioned) and `drive permissions check` (whose target may
+/// itself be a file).
+#[must_use]
+pub fn combine_across_parents(
+    first: Decision,
+    rest: impl IntoIterator<Item = Decision>,
+) -> Decision {
+    rest.into_iter().fold(first, |acc, next| {
+        if acc.verdict == Verdict::Deny {
+            acc
+        } else {
+            next
+        }
+    })
 }
 
 #[cfg(test)]
@@ -314,6 +358,14 @@ mod tests {
     }
 
     #[test]
+    fn display_matches_the_serde_lowercase_wire_form() {
+        assert_eq!(DriveOperation::Read.to_string(), "read");
+        assert_eq!(DriveOperation::Create.to_string(), "create");
+        assert_eq!(DriveOperation::Upload.to_string(), "upload");
+        assert_eq!(DriveOperation::Edit.to_string(), "edit");
+    }
+
+    #[test]
     fn operations_on_one_rule_are_independent() {
         let rules = [rule("target", false, &[DriveOperation::Create], &[])];
         let create = resolve(&chain(&["target"]), DriveOperation::Create, &rules);
@@ -344,5 +396,41 @@ mod tests {
             Verdict::Deny,
             "no rule named upload; falls to default policy"
         );
+    }
+
+    // ── combine_across_parents ────────────────────────────────────────
+
+    fn decision(verdict: Verdict) -> Decision {
+        Decision {
+            verdict,
+            decided_by: None,
+        }
+    }
+
+    #[test]
+    fn combine_across_parents_single_decision_returns_it_unchanged() {
+        let combined = combine_across_parents(decision(Verdict::Allow), []);
+        assert_eq!(combined.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn combine_across_parents_deny_beats_allow_deny_first() {
+        let combined = combine_across_parents(decision(Verdict::Deny), [decision(Verdict::Allow)]);
+        assert_eq!(combined.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn combine_across_parents_deny_beats_allow_allow_first() {
+        let combined = combine_across_parents(decision(Verdict::Allow), [decision(Verdict::Deny)]);
+        assert_eq!(combined.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn combine_across_parents_all_allow_returns_allow() {
+        let combined = combine_across_parents(
+            decision(Verdict::Allow),
+            [decision(Verdict::Allow), decision(Verdict::Allow)],
+        );
+        assert_eq!(combined.verdict, Verdict::Allow);
     }
 }

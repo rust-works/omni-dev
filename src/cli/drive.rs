@@ -8,6 +8,7 @@ pub(crate) mod helpers;
 /// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
 /// `crate::cli::atlassian::confluence::move_page`'s identical workaround.
 pub(crate) mod move_file;
+pub(crate) mod permissions;
 pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
@@ -58,6 +59,9 @@ pub enum DriveSubcommands {
     /// Moves one or more Drive files into a destination folder. Requires
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
+    /// Inspects the folder-scoped write-permission rules gating `drive
+    /// create`/`upload`/`edit` (issue #1574).
+    Permissions(permissions::PermissionsCommand),
 }
 
 impl DriveCommand {
@@ -82,6 +86,11 @@ impl DriveCommand {
         match self.command {
             DriveSubcommands::Auth(cmd) => cmd.execute().await,
             DriveSubcommands::Account(cmd) => cmd.execute(),
+            // Permissions' three leaves have mixed client needs (`show` is
+            // config-only, `lookup-folder`/`check` both call the Drive
+            // API) — like Auth, it resolves its own client lazily per leaf
+            // rather than sharing the single eager resolution below.
+            DriveSubcommands::Permissions(cmd) => cmd.execute().await,
             command => {
                 let client = helpers::create_client()?;
                 command.dispatch(&client).await
@@ -91,13 +100,16 @@ impl DriveCommand {
 }
 
 impl DriveSubcommands {
-    /// Routes a non-`Auth`/`Account` subcommand against the shared client.
-    /// The `Auth`/`Account` arms are unreachable: both are handled before
-    /// client resolution in [`DriveCommand::execute`].
+    /// Routes a non-`Auth`/`Account`/`Permissions` subcommand against the
+    /// shared client. Those three arms are unreachable: all are handled
+    /// before client resolution in [`DriveCommand::execute`].
     async fn dispatch(self, client: &DriveClient) -> Result<()> {
         match self {
             Self::Auth(_) => unreachable!("Auth is dispatched before client resolution"),
             Self::Account(_) => unreachable!("Account is dispatched before client resolution"),
+            Self::Permissions(_) => {
+                unreachable!("Permissions is dispatched before client resolution")
+            }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
@@ -260,6 +272,45 @@ mod tests {
             }),
         };
         cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_routes_permissions_show_without_client_resolution() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Permissions(permissions::PermissionsCommand {
+                command: permissions::PermissionsSubcommands::Show(
+                    permissions::show::ShowCommand {
+                        output: OutputFormat::Table,
+                    },
+                ),
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_routes_permissions_check_and_surfaces_missing_credentials() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Permissions(permissions::PermissionsCommand {
+                command: permissions::PermissionsSubcommands::Check(
+                    permissions::check::CheckCommand {
+                        id: "f1".to_string(),
+                        operation: permissions::check::OperationArg::Read,
+                        output: OutputFormat::Table,
+                    },
+                ),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
     }
 
     #[tokio::test]
