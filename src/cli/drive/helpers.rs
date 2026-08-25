@@ -34,7 +34,7 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     #[test]
@@ -43,7 +43,7 @@ mod tests {
             client_id: "client".to_string(),
             client_secret: Secret::new("secret"),
             refresh_token: Secret::new("refresh"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         let client = create_client_from(creds).unwrap();
         assert_eq!(client.base_url(), "https://www.googleapis.com");

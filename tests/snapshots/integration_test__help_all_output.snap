@@ -3814,8 +3814,10 @@ Runs the Drive OAuth2 login flow (opens a browser)
 Usage: login [OPTIONS]
 
 Options:
-      --write  Request the `drive.metadata` scope (needed for `rename`/`move`) in addition to `drive.readonly`. Without this flag, only read access is granted
-  -h, --help   Print help
+      --write       Request the `drive.metadata` scope (needed for `rename`/`move`) in addition to `drive.readonly`. Without any `--write*` flag, only read access is granted
+      --write-file  Request the `drive.file` scope (needed for `create`/`upload`, and `edit` of files `omni-dev` itself created) in addition to `drive.readonly`. Independent of and combinable with `--write` and `--write-full` — Google just grants the union (issue #1574)
+      --write-full  Request the unrestricted `drive` scope (needed for `edit` of any pre-existing file's content) in addition to `drive.readonly`. The largest privilege grant this integration has ever requested — combine with `--write`/`--write-file` freely (issue #1574)
+  -h, --help        Print help
 
 
 ================================================================================
