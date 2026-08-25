@@ -10,8 +10,7 @@ use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry::{self, AncestorChain};
-
-const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
 
 /// Default cap on how many search hits to resolve a full path for — each
 /// candidate costs its own ancestor-chain walk on top of the search call

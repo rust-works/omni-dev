@@ -10,14 +10,9 @@ use crate::cli::drive::format::{
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
+use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
 use crate::drive::write_gate::{self, Decision, DriveOperation, FolderPermissionRule, Verdict};
 use crate::utils::settings::Settings;
-
-/// Local copy of `application/vnd.google-apps.folder` — see
-/// `crate::drive::file_move`'s identical constant for why this stays a
-/// private, per-module copy rather than a shared import (promoted to a
-/// single shared constant alongside issue #1574's mutating verbs).
-const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
 /// `--operation`'s value set — a thin CLI-layer copy of
 /// [`DriveOperation`], kept separate so the pure engine module has no
