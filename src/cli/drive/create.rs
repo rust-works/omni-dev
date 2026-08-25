@@ -4,12 +4,11 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
-use crate::drive::account::ResolvedAccount;
+use crate::cli::drive::helpers::active_account_rules;
 use crate::drive::client::DriveClient;
 use crate::drive::create::{self, CreateOptions, CreateOutcome, CreateResult};
 use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
 use crate::drive::write_gate::FolderPermissionRule;
-use crate::utils::settings::Settings;
 
 /// MIME type used when creating a plain file with neither `--folder` nor
 /// `--mime-type` given — Drive's own fallback for a `files.create` call
@@ -66,24 +65,6 @@ impl CreateCommand {
         let rules = active_account_rules()?;
         run_create(client, &opts, &rules, &self.output).await
     }
-}
-
-/// Reads the active account's `write_permissions.rules` from
-/// `~/.omni-dev/settings.json`. An [`ResolvedAccount::Unconfigured`]
-/// account has no `write_permissions` block to read, so it resolves to an
-/// empty rule set — every write is refused, per the gate's default policy.
-fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
-    let settings = Settings::load().unwrap_or_default();
-    let resolved = crate::drive::auth::resolve(&settings.drive, None)?;
-    Ok(match &resolved {
-        ResolvedAccount::Named(name) => settings
-            .drive
-            .accounts
-            .get(name)
-            .map(|a| a.write_permissions.rules.clone())
-            .unwrap_or_default(),
-        ResolvedAccount::Unconfigured => Vec::new(),
-    })
 }
 
 /// Runs `create` and emits the outcome in the requested format.

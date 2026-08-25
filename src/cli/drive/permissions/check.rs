@@ -7,12 +7,12 @@ use serde::Serialize;
 use crate::cli::drive::format::{
     output_as, sanitize_for_terminal, write_scalar_jsonl, JsonlSerialize, OutputFormat,
 };
+use crate::cli::drive::helpers::active_account_rules;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
 use crate::drive::write_gate::{Decision, DriveOperation, FolderPermissionRule, Verdict};
-use crate::utils::settings::Settings;
 
 /// `--operation`'s value set — a thin CLI-layer copy of
 /// [`DriveOperation`], kept separate so the pure engine module has no
@@ -60,17 +60,7 @@ impl CheckCommand {
     /// Runs the command against the shared client resolved by
     /// `PermissionsCommand::execute`.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let settings = Settings::load().unwrap_or_default();
-        let resolved = crate::drive::auth::resolve(&settings.drive, None)?;
-        let rules: Vec<FolderPermissionRule> = match &resolved {
-            crate::drive::account::ResolvedAccount::Named(name) => settings
-                .drive
-                .accounts
-                .get(name)
-                .map(|a| a.write_permissions.rules.clone())
-                .unwrap_or_default(),
-            crate::drive::account::ResolvedAccount::Unconfigured => Vec::new(),
-        };
+        let rules = active_account_rules()?;
         run_check(
             client,
             &self.id,
