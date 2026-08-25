@@ -14,6 +14,7 @@ pub mod account;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
+pub mod content_edit;
 pub mod create;
 pub mod error;
 pub mod file_move;

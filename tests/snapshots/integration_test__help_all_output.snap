@@ -3735,6 +3735,7 @@ Commands:
   dedupe       Finds Drive files sharing the same content hash
   create       Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   upload       Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  edit         Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
   permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
@@ -3881,6 +3882,25 @@ Options:
       --limit <LIMIT>    Maximum results to scan. `0` means "scan every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive edit - Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+
+Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+
+Usage: edit [OPTIONS] --content <LOCAL_PATH|-> <FILE_ID>
+
+Arguments:
+  <FILE_ID>  Drive file id (from `drive search`, or the `id` segment of a Drive URL)
+
+Options:
+      --content <LOCAL_PATH|->  New content: a local file path, or `-` to read from stdin
+      --mime-type <TYPE>        MIME type for the content. Defaults to `application/octet-stream`
+      --dry-run                 Reports the gate verdict without calling `files.update`
+  -o, --output <OUTPUT>         Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                    Print help (see more with '--help')
 
 
 ================================================================================

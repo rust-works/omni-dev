@@ -78,8 +78,9 @@ impl UploadCommand {
 /// Stats `path` and refuses it *before* reading if it exceeds
 /// [`MAX_UPLOAD_BYTES`] — avoids ever buffering an oversized file, and
 /// fires identically whether or not `--dry-run` is set, since this runs
-/// before `UploadOptions` is even constructed.
-fn read_local_content(path: &std::path::Path) -> Result<Vec<u8>> {
+/// before `UploadOptions` is even constructed. Reused by
+/// `crate::cli::drive::edit` for its `--content <LOCAL_PATH>` case.
+pub(crate) fn read_local_content(path: &std::path::Path) -> Result<Vec<u8>> {
     let len = std::fs::metadata(path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
         .len();

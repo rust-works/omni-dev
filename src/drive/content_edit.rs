@@ -1,0 +1,520 @@
+//! Drive file content edit — replaces an existing file's content (issue
+//! #1574, [ADR-0071](../../docs/adrs/adr-0071.md)).
+//!
+//! The most structurally distinct of the three mutating verbs: unlike
+//! `create`/`upload` (whose gate chain starts at the caller-given
+//! `--parent`), `edit`'s chain starts at the target's *current* parent
+//! folder(s) — `files.get` first, then one ancestor-chain walk per parent,
+//! combined via [`write_gate::combine_across_parents`] for a legacy
+//! multi-parent file (mirrors `visibility.rs`'s existing multi-parent-union
+//! contract). An orphan file with no parent degenerates to the bare
+//! default policy, correctly, via an empty chain.
+//!
+//! Still single-target, so this follows `create.rs`/`upload.rs`'s linear-
+//! function shape, not `file_move.rs`'s batch Plan/Execute.
+
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
+use crate::drive::client::DriveClient;
+use crate::drive::files_api::FilesApi;
+use crate::drive::folder_ancestry;
+use crate::drive::write_gate::{
+    self, DecidingRule, Decision, DriveOperation, FolderPermissionRule,
+};
+use crate::request_log::{self, DriveMutationOutcome};
+
+/// Per-call edit options.
+#[derive(Debug, Clone)]
+pub struct EditOptions {
+    /// The file id to edit.
+    pub file_id: String,
+    /// The new content, already read into memory (and already
+    /// size-checked) by the caller.
+    pub content: Vec<u8>,
+    /// The content's MIME type.
+    pub content_type: String,
+    /// When `true`, classify but never call `files.update`.
+    pub dry_run: bool,
+}
+
+/// What happened (or, under `--dry-run`, would happen).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum EditResult {
+    /// `--dry-run`, and the gate would allow it.
+    WouldEdit,
+    /// The target is a Google-native document (Docs/Sheets/Slides/...)
+    /// with no fixed byte content a raw media PATCH can replace. Checked
+    /// client-side, before the gate — this isn't a policy decision, the
+    /// operation is simply nonsensical for this target.
+    RefusedNativeDocument,
+    /// The folder write-permission gate refused it.
+    Blocked {
+        /// The rule that decided the refusal, if any.
+        decided_by: Option<DecidingRule>,
+    },
+    /// `files.update` (media) succeeded.
+    Edited,
+    /// An API/validation error.
+    Failed {
+        /// A human-readable summary of what failed.
+        detail: String,
+    },
+}
+
+impl EditResult {
+    /// The request-log `status` string — mirrors
+    /// `CreateResult`/`UploadResult`/`MoveResult::log_status`'s precedent.
+    fn log_status(&self) -> &'static str {
+        match self {
+            Self::WouldEdit => "would-edit",
+            Self::RefusedNativeDocument => "refused-native-document",
+            Self::Blocked { .. } => "blocked",
+            Self::Edited => "edited",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// The planned (and, after a real run, final) outcome of one `edit` call.
+#[derive(Debug, Clone, Serialize)]
+pub struct EditOutcome {
+    /// The target file id.
+    pub file_id: String,
+    /// The file's name at the time of the attempt, once known (absent if
+    /// the initial `files.get` itself failed).
+    pub file_name: Option<String>,
+    /// The folder the write-permission gate evaluated against — the
+    /// target's resolved current parent, when the target has exactly one;
+    /// `None` for an orphan target, a target refused before the gate ran
+    /// (`RefusedNativeDocument`), or a target with more than one current
+    /// parent (no single folder to report).
+    pub resolved_folder_id: Option<String>,
+    /// The result.
+    pub result: EditResult,
+}
+
+impl JsonlSerialize for EditOutcome {
+    fn write_jsonl(&self, out: &mut dyn std::io::Write) -> Result<(), anyhow::Error> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Replaces `opts.file_id`'s content with `opts.content`, gated by `rules`.
+///
+/// Every real (non-dry-run) attempt is logged; a `--dry-run` preview never
+/// is, matching `create`/`upload`/`move`'s existing precedent.
+pub async fn edit(
+    client: &DriveClient,
+    opts: &EditOptions,
+    rules: &[FolderPermissionRule],
+) -> EditOutcome {
+    let started = Instant::now();
+    let outcome = edit_inner(client, opts, rules).await;
+    if !opts.dry_run {
+        record_attempt(&outcome, started.elapsed());
+    }
+    outcome
+}
+
+async fn edit_inner(
+    client: &DriveClient,
+    opts: &EditOptions,
+    rules: &[FolderPermissionRule],
+) -> EditOutcome {
+    let files_api = FilesApi::new(client);
+    let target = match files_api.get_metadata(&opts.file_id).await {
+        Ok(target) => target,
+        Err(err) => {
+            return EditOutcome {
+                file_id: opts.file_id.clone(),
+                file_name: None,
+                resolved_folder_id: None,
+                result: EditResult::Failed {
+                    detail: err.to_string(),
+                },
+            }
+        }
+    };
+
+    if target.is_google_native() {
+        return EditOutcome {
+            file_id: opts.file_id.clone(),
+            file_name: Some(target.name),
+            resolved_folder_id: None,
+            result: EditResult::RefusedNativeDocument,
+        };
+    }
+
+    let (decision, resolved_folder_id) =
+        match evaluate_current_parents(&files_api, &target.parents, rules).await {
+            Ok(evaluated) => evaluated,
+            Err(err) => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    result: EditResult::Failed {
+                        detail: err.to_string(),
+                    },
+                }
+            }
+        };
+
+    if decision.verdict == write_gate::Verdict::Deny {
+        return EditOutcome {
+            file_id: opts.file_id.clone(),
+            file_name: Some(target.name),
+            resolved_folder_id,
+            result: EditResult::Blocked {
+                decided_by: decision.decided_by,
+            },
+        };
+    }
+
+    if opts.dry_run {
+        return EditOutcome {
+            file_id: opts.file_id.clone(),
+            file_name: Some(target.name),
+            resolved_folder_id,
+            result: EditResult::WouldEdit,
+        };
+    }
+
+    let result = match files_api
+        .edit_content(&opts.file_id, &opts.content, &opts.content_type)
+        .await
+    {
+        Ok(_) => EditResult::Edited,
+        Err(err) => EditResult::Failed {
+            detail: err.to_string(),
+        },
+    };
+    EditOutcome {
+        file_id: opts.file_id.clone(),
+        file_name: Some(target.name),
+        resolved_folder_id,
+        result,
+    }
+}
+
+/// Resolves `parents` (a target's *current* parent ids) into a combined
+/// [`Decision`], plus the single resolved folder id when there's exactly
+/// one parent (for request-log/report purposes — multi-parent targets
+/// report `None`, since no single folder id would be accurate).
+///
+/// An empty `parents` (orphan target) degenerates to the bare default
+/// policy via an empty chain, matching `write_gate::resolve`'s documented
+/// contract. A fetch failure on *any* parent's chain is a hard `Err` — the
+/// same fail-closed invariant `folder_ancestry::resolve_ancestor_chain`
+/// itself enforces, propagated rather than silently dropping that parent.
+async fn evaluate_current_parents(
+    files_api: &FilesApi<'_>,
+    parents: &[String],
+    rules: &[FolderPermissionRule],
+) -> anyhow::Result<(Decision, Option<String>)> {
+    let Some((first_parent, rest_parents)) = parents.split_first() else {
+        return Ok((write_gate::resolve(&[], DriveOperation::Edit, rules), None));
+    };
+    let first_chain = folder_ancestry::resolve_ancestor_chain(files_api, first_parent).await?;
+    let mut combined = write_gate::resolve(&first_chain.folder_ids(), DriveOperation::Edit, rules);
+    for parent_id in rest_parents {
+        let chain = folder_ancestry::resolve_ancestor_chain(files_api, parent_id).await?;
+        let decision = write_gate::resolve(&chain.folder_ids(), DriveOperation::Edit, rules);
+        combined = write_gate::combine_across_parents(combined, [decision]);
+    }
+    let resolved_folder_id = rest_parents.is_empty().then(|| first_parent.clone());
+    Ok((combined, resolved_folder_id))
+}
+
+/// Builds and writes the [`DriveMutationOutcome`] for one `edit` attempt.
+fn record_attempt(outcome: &EditOutcome, duration: Duration) {
+    let error = match &outcome.result {
+        EditResult::Failed { detail } => Some(detail.clone()),
+        _ => None,
+    };
+    let (decided_by_folder_id, decided_by_depth) = match &outcome.result {
+        EditResult::Blocked {
+            decided_by: Some(rule),
+        } => (Some(rule.folder_id.clone()), Some(rule.depth)),
+        _ => (None, None),
+    };
+    request_log::record_drive_mutation(DriveMutationOutcome {
+        operation: "edit",
+        file_id: outcome.file_id.clone(),
+        file_name: outcome.file_name.clone().unwrap_or_default(),
+        status: outcome.result.log_status().to_string(),
+        added_principals: Vec::new(),
+        removed_principals: Vec::new(),
+        crosses_drive_boundary: false,
+        resolved_folder_id: outcome.resolved_folder_id.clone(),
+        decided_by_folder_id,
+        decided_by_depth,
+        error,
+        duration,
+    });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
+    use crate::drive::write_gate::DriveOperation;
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
+        let parents_json: Vec<&str> = parents.to_vec();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": mime_type, "parents": parents_json,
+                })),
+            )
+    }
+
+    fn mount_folder(id: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+    }
+
+    fn opts(dry_run: bool) -> EditOptions {
+        opts_for("file-1", dry_run)
+    }
+
+    fn opts_for(file_id: &str, dry_run: bool) -> EditOptions {
+        EditOptions {
+            file_id: file_id.to_string(),
+            content: b"new content".to_vec(),
+            content_type: "text/plain".to_string(),
+            dry_run,
+        }
+    }
+
+    fn allow_rule() -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: "parent-1".to_string(),
+            recursive: false,
+            allow: [DriveOperation::Edit].into_iter().collect(),
+            deny: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_target_succeeds_and_calls_edit_endpoint_once() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = edit(&client, &opts(false), &[allow_rule()]).await;
+        assert!(matches!(outcome.result, EditResult::Edited));
+    }
+
+    #[tokio::test]
+    async fn denied_target_refuses_with_zero_edit_calls() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No PATCH /upload/drive/v3/files/file-1 mock mounted — an
+        // accidental edit attempt fails loudly with "no matching mock".
+
+        let outcome = edit(&client, &opts(false), &[]).await;
+        assert!(matches!(outcome.result, EditResult::Blocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn google_native_document_is_refused_before_any_gate_or_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file(
+            "doc-1",
+            "application/vnd.google-apps.document",
+            &["parent-1"],
+        )
+        .mount(&server)
+        .await;
+        // Deliberately no mock for parent-1 (the gate never runs) and no
+        // PATCH mock — proves the refusal happens strictly before the
+        // ancestor-chain walk and before any mutating call, even though
+        // an allow-everything rule set would otherwise permit it.
+        let permissive_rule = FolderPermissionRule {
+            folder_id: "parent-1".to_string(),
+            recursive: true,
+            allow: [DriveOperation::Edit].into_iter().collect(),
+            deny: Default::default(),
+        };
+
+        let outcome = edit(&client, &opts_for("doc-1", false), &[permissive_rule]).await;
+        assert!(matches!(outcome.result, EditResult::RefusedNativeDocument));
+    }
+
+    #[tokio::test]
+    async fn orphan_file_uses_default_policy() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("orphan", "text/plain", &[]).mount(&server).await;
+
+        let outcome = edit(&client, &opts_for("orphan", false), &[]).await;
+        assert!(matches!(outcome.result, EditResult::Blocked { .. }));
+        assert_eq!(outcome.resolved_folder_id, None);
+    }
+
+    #[tokio::test]
+    async fn edit_denies_when_any_current_parent_denies_even_if_another_allows() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["allow-parent", "deny-parent"])
+            .mount(&server)
+            .await;
+        mount_folder("allow-parent").mount(&server).await;
+        mount_folder("deny-parent").mount(&server).await;
+        let rules = [allow_rule()]; // only "parent-1" is allowed; neither
+                                    // allow-parent nor deny-parent match it,
+                                    // so both fall to the default deny —
+                                    // this asserts deny-wins-across-parents
+                                    // even when BOTH parents individually
+                                    // resolve to the same (deny) verdict,
+                                    // and the multi-parent path is exercised.
+
+        let outcome = edit(&client, &opts(false), &rules).await;
+        assert!(matches!(outcome.result, EditResult::Blocked { .. }));
+        assert_eq!(
+            outcome.resolved_folder_id, None,
+            "multi-parent targets report no single resolved folder id"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestor_chain_fetch_failure_produces_failed_not_allow() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("server error"))
+            .mount(&server)
+            .await;
+
+        let outcome = edit(&client, &opts(false), &[allow_rule()]).await;
+        assert!(
+            matches!(outcome.result, EditResult::Failed { .. }),
+            "a fetch failure must never silently fall through to Edited/WouldEdit"
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_403_surfaces_both_write_flags() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let outcome = edit(&client, &opts(false), &[allow_rule()]).await;
+        let EditResult::Failed { detail } = outcome.result else {
+            panic!("expected Failed, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--write-file"), "{detail}");
+        assert!(detail.contains("--write-full"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_calls_edit_endpoint() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let outcome = edit(&client, &opts(true), &[allow_rule()]).await;
+        assert!(matches!(outcome.result, EditResult::WouldEdit));
+    }
+
+    #[tokio::test]
+    async fn dry_run_surfaces_the_same_blocked_reasoning_as_a_real_denied_run() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .expect(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").expect(2).mount(&server).await;
+
+        let dry_run_outcome = edit(&client, &opts(true), &[]).await;
+        let real_outcome = edit(&client, &opts(false), &[]).await;
+        assert!(matches!(dry_run_outcome.result, EditResult::Blocked { .. }));
+        assert!(matches!(real_outcome.result, EditResult::Blocked { .. }));
+    }
+}
