@@ -311,8 +311,8 @@ mod tests {
         FolderPermissionRule {
             folder_id: "parent-1".to_string(),
             recursive: false,
-            allow: [DriveOperation::Edit].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Edit).collect(),
+            deny: std::collections::HashSet::default(),
         }
     }
 
@@ -372,8 +372,8 @@ mod tests {
         let permissive_rule = FolderPermissionRule {
             folder_id: "parent-1".to_string(),
             recursive: true,
-            allow: [DriveOperation::Edit].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Edit).collect(),
+            deny: std::collections::HashSet::default(),
         };
 
         let outcome = edit(&client, &opts_for("doc-1", false), &[permissive_rule]).await;
