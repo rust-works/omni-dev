@@ -276,7 +276,7 @@ impl BridgeServer {
     /// Binds both planes (fail-closed), spawns the accept loops, and returns
     /// immediately. `token` is the already-resolved session token (never
     /// sourced from argv).
-    pub async fn start(mut config: BridgeConfig, token: String) -> Result<Self> {
+    pub fn start(mut config: BridgeConfig, token: String) -> Result<Self> {
         let control_listener =
             bind_loopback_reuse(SocketAddr::from((Ipv4Addr::LOCALHOST, config.control_port)))
                 .with_context(|| {
@@ -417,7 +417,7 @@ impl BridgeServer {
 ///
 /// `token` is the already-resolved session token (never sourced from argv).
 pub async fn run(config: BridgeConfig, token: String) -> Result<()> {
-    let server = BridgeServer::start(config, token).await?;
+    let server = BridgeServer::start(config, token)?;
     print_startup(server.state.config.as_ref(), &server.state.token);
     server.wait().await
 }
@@ -1910,9 +1910,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_server_start_status_shutdown() {
-        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
-            .await
-            .unwrap();
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string()).unwrap();
         // Ports were resolved from the OS (port 0 → a real bound port).
         assert_ne!(server.control_port(), 0);
         assert_ne!(server.ws_port(), 0);
@@ -1927,9 +1925,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_unknown_tab_is_error() {
-        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
-            .await
-            .unwrap();
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string()).unwrap();
         let err = server.disconnect_tab(999).unwrap_err();
         assert!(err.to_string().contains("no connected tab"));
         server.shutdown().await;
@@ -1944,9 +1940,7 @@ mod tests {
             control_port: taken,
             ..ephemeral_config()
         };
-        assert!(BridgeServer::start(config, "tok".to_string())
-            .await
-            .is_err());
+        assert!(BridgeServer::start(config, "tok".to_string()).is_err());
     }
 
     #[tokio::test]
@@ -1956,9 +1950,7 @@ mod tests {
         // listener address in TIME_WAIT; without SO_REUSEADDR the rebind fails
         // with EADDRINUSE and the bridge is wedged not-running. With it, the
         // rebind succeeds.
-        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
-            .await
-            .unwrap();
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string()).unwrap();
         let control_port = server.control_port();
         let ws_port = server.ws_port();
 
@@ -1984,7 +1976,6 @@ mod tests {
             ..ephemeral_config()
         };
         let server2 = BridgeServer::start(config, "tok".to_string())
-            .await
             .expect("rebinding just-released fixed ports must succeed with SO_REUSEADDR");
         server2.shutdown().await;
     }

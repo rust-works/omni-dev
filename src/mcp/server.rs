@@ -67,6 +67,11 @@ impl OmniDevServer {
     }
 }
 
+// `ServerHandler`'s methods are `async fn` in the trait (rmcp, an external
+// crate), so an impl can't drop `async` even where a given method never
+// awaits — that also covers the `#[tool_handler]` macro's own generated
+// method, which this lint can't see into.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OmniDevServer {
     /// Routes an MCP tool call, scoping a task-local request-log context

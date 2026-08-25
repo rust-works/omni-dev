@@ -132,8 +132,7 @@ pub async fn build_default_registry(
 ) -> Result<ServiceRegistry> {
     let mut registry = ServiceRegistry::new();
     if services.includes(DaemonServiceKind::Bridge) {
-        let bridge =
-            BridgeService::start(bridge_config, bridge_token_file, bridge_token_path).await?;
+        let bridge = BridgeService::start(bridge_config, bridge_token_file, bridge_token_path)?;
         registry.register(Arc::new(bridge));
     }
     if services.includes(DaemonServiceKind::Snowflake) {

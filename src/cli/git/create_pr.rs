@@ -192,7 +192,7 @@ impl CreatePrCommand {
         } = generated;
 
         // 8. Show detailed context information (like twiddle command)
-        self.show_context_information(&repo_view).await?;
+        self.show_context_information(&repo_view)?;
         debug!(
             generated_title = %pr_content.title,
             generated_description_length = pr_content.description.len(),
@@ -499,10 +499,7 @@ impl CreatePrCommand {
     }
 
     /// Shows detailed context information (similar to twiddle command).
-    async fn show_context_information(
-        &self,
-        _repo_view: &crate::data::RepositoryView,
-    ) -> Result<()> {
+    fn show_context_information(&self, _repo_view: &crate::data::RepositoryView) -> Result<()> {
         // Note: commit range info and context summary are now shown earlier
         // This method is kept for potential future detailed information
         // that should be shown after AI generation
@@ -563,7 +560,7 @@ impl CreatePrCommand {
     }
 
     /// Collects contextual information for enhanced PR generation (adapted from twiddle).
-    async fn collect_context(
+    fn collect_context(
         &self,
         repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
@@ -746,7 +743,7 @@ impl CreatePrCommand {
 
         // Collect project context for PR guidelines
         debug!("Collecting context for PR generation");
-        let context = self.collect_context(repo_root, repo_view).await?;
+        let context = self.collect_context(repo_root, repo_view)?;
         debug!("Context collection completed");
 
         // Generate AI-powered PR content with context
@@ -1531,7 +1528,7 @@ pub async fn run_create_pr(
     };
 
     let repo_view = cmd.generate_repository_view(&repo_root)?;
-    let context = cmd.collect_context(&repo_root, &repo_view).await?;
+    let context = cmd.collect_context(&repo_root, &repo_view)?;
     let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_create_pr_with_client(&cmd, &repo_view, &context, &claude_client).await
 }

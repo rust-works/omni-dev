@@ -25,9 +25,9 @@ impl CoverageCommand {
     ///
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
-    pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+    pub fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
         match self.command {
-            CoverageSubcommands::Diff(cmd) => cmd.execute(repo).await,
+            CoverageSubcommands::Diff(cmd) => cmd.execute(repo),
         }
     }
 }
@@ -39,8 +39,8 @@ mod tests {
 
     /// The `coverage` command dispatches to `diff`; a missing report makes the
     /// leaf command error, which exercises the dispatch path end-to-end.
-    #[tokio::test]
-    async fn dispatches_to_diff() {
+    #[test]
+    fn dispatches_to_diff() {
         let cmd = CoverageCommand {
             command: CoverageSubcommands::Diff(diff::DiffCommand {
                 report: std::path::PathBuf::from("/nonexistent/report.lcov"),
@@ -65,6 +65,6 @@ mod tests {
             }),
         };
         // Reaches the leaf command and fails on the missing report file.
-        assert!(cmd.execute(None).await.is_err());
+        assert!(cmd.execute(None).is_err());
     }
 }
