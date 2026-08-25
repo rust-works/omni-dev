@@ -261,8 +261,8 @@ mod tests {
         FolderPermissionRule {
             folder_id: "parent-1".to_string(),
             recursive: false,
-            allow: [DriveOperation::Upload].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Upload).collect(),
+            deny: std::collections::HashSet::default(),
         }
     }
 

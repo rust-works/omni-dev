@@ -207,7 +207,7 @@ mod tests {
             folder_id: folder_id.to_string(),
             recursive,
             allow: allow.iter().copied().collect(),
-            deny: Default::default(),
+            deny: std::collections::HashSet::default(),
         }
     }
 

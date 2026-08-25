@@ -267,7 +267,7 @@ mod tests {
     }
 
     fn chain(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+        ids.iter().copied().map(ToString::to_string).collect()
     }
 
     #[test]

@@ -118,7 +118,7 @@ mod tests {
             allow: [DriveOperation::Create, DriveOperation::Upload]
                 .into_iter()
                 .collect(),
-            deny: [DriveOperation::Edit].into_iter().collect(),
+            deny: std::iter::once(DriveOperation::Edit).collect(),
         }
     }
 
@@ -152,8 +152,8 @@ mod tests {
         let rules = [FolderPermissionRule {
             folder_id: "folder-1".to_string(),
             recursive: false,
-            allow: Default::default(),
-            deny: Default::default(),
+            allow: std::collections::HashSet::default(),
+            deny: std::collections::HashSet::default(),
         }];
         let mut buf = Vec::new();
         render_rules_table(&rules, &mut buf).unwrap();
@@ -166,8 +166,8 @@ mod tests {
         let rules = [FolderPermissionRule {
             folder_id: "fo\rlder\x1b[31m".to_string(),
             recursive: false,
-            allow: Default::default(),
-            deny: Default::default(),
+            allow: std::collections::HashSet::default(),
+            deny: std::collections::HashSet::default(),
         }];
         let mut buf = Vec::new();
         render_rules_table(&rules, &mut buf).unwrap();

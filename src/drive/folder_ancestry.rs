@@ -333,8 +333,8 @@ mod tests {
         let rules = [FolderPermissionRule {
             folder_id: "child".to_string(),
             recursive: false,
-            allow: [DriveOperation::Create].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Create).collect(),
+            deny: std::collections::HashSet::default(),
         }];
 
         let decision = resolve_decision(&files_api, "child", DriveOperation::Create, &rules)
@@ -394,8 +394,8 @@ mod tests {
         let rules = [FolderPermissionRule {
             folder_id: "child".to_string(),
             recursive: false,
-            allow: [DriveOperation::Read].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Read).collect(),
+            deny: std::collections::HashSet::default(),
         }];
 
         let decision = resolve_decision_from(&files_api, start, DriveOperation::Read, &rules)
@@ -429,8 +429,8 @@ mod tests {
         let rules = [FolderPermissionRule {
             folder_id: "parent-1".to_string(),
             recursive: false,
-            allow: [DriveOperation::Edit].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Edit).collect(),
+            deny: std::collections::HashSet::default(),
         }];
 
         let (decision, resolved_folder_id) = resolve_decision_for_parents(
@@ -456,14 +456,14 @@ mod tests {
             FolderPermissionRule {
                 folder_id: "allow-parent".to_string(),
                 recursive: false,
-                allow: [DriveOperation::Edit].into_iter().collect(),
-                deny: Default::default(),
+                allow: std::iter::once(DriveOperation::Edit).collect(),
+                deny: std::collections::HashSet::default(),
             },
             FolderPermissionRule {
                 folder_id: "deny-parent".to_string(),
                 recursive: false,
-                allow: Default::default(),
-                deny: [DriveOperation::Edit].into_iter().collect(),
+                allow: std::collections::HashSet::default(),
+                deny: std::iter::once(DriveOperation::Edit).collect(),
             },
         ];
 

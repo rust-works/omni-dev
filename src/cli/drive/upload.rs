@@ -75,7 +75,8 @@ impl UploadCommand {
 }
 
 /// Stats `path` and refuses it *before* reading if it exceeds
-/// [`MAX_UPLOAD_BYTES`] — avoids ever buffering an oversized file, and
+/// [`MAX_UPLOAD_BYTES`](crate::drive::files_api::MAX_UPLOAD_BYTES) —
+/// avoids ever buffering an oversized file, and
 /// fires identically whether or not `--dry-run` is set, since this runs
 /// before `UploadOptions` is even constructed. Reused by
 /// `crate::cli::drive::edit` for its `--content <LOCAL_PATH>` case.
@@ -193,8 +194,8 @@ mod tests {
         FolderPermissionRule {
             folder_id: "parent-1".to_string(),
             recursive: false,
-            allow: [DriveOperation::Upload].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::Upload).collect(),
+            deny: std::collections::HashSet::default(),
         }
     }
 
