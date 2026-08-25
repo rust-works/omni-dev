@@ -7,13 +7,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
+use crate::cli::drive::helpers::active_account_rules;
 use crate::cli::drive::upload::read_local_content;
-use crate::drive::account::ResolvedAccount;
 use crate::drive::client::DriveClient;
 use crate::drive::content_edit::{self, EditOptions, EditOutcome, EditResult};
 use crate::drive::files_api::{check_upload_size, MAX_UPLOAD_BYTES};
 use crate::drive::write_gate::FolderPermissionRule;
-use crate::utils::settings::Settings;
 
 /// MIME type used when `--mime-type` is omitted — Drive's own fallback for
 /// unspecified content.
@@ -93,22 +92,6 @@ fn read_stdin_content() -> Result<Vec<u8>> {
         .context("Failed to read stdin")?;
     check_upload_size(buf.len() as u64)?;
     Ok(buf)
-}
-
-/// Reads the active account's `write_permissions.rules` — see
-/// `crate::cli::drive::create`'s identical helper.
-fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
-    let settings = Settings::load().unwrap_or_default();
-    let resolved = crate::drive::auth::resolve(&settings.drive, None)?;
-    Ok(match &resolved {
-        ResolvedAccount::Named(name) => settings
-            .drive
-            .accounts
-            .get(name)
-            .map(|a| a.write_permissions.rules.clone())
-            .unwrap_or_default(),
-        ResolvedAccount::Unconfigured => Vec::new(),
-    })
 }
 
 /// Runs `edit` and emits the outcome in the requested format.

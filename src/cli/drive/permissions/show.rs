@@ -6,9 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
-use crate::drive::account::ResolvedAccount;
+use crate::cli::drive::helpers::active_account_rules;
 use crate::drive::write_gate::FolderPermissionRule;
-use crate::utils::settings::Settings;
 
 /// Prints the active account's configured write-permission rules.
 #[derive(Parser)]
@@ -23,21 +22,11 @@ impl ShowCommand {
     /// only — no network call, mirroring `drive account list`. Unlike that
     /// command, rules are per-account data (see
     /// `crate::drive::write_gate`'s module doc), so this resolves the
-    /// active account first and shows nothing for
-    /// [`ResolvedAccount::Unconfigured`] — there is no account whose
-    /// `write_permissions` block could apply.
+    /// active account first and shows nothing for an unconfigured account
+    /// — there is no account whose `write_permissions` block could apply.
     pub fn execute(self) -> Result<()> {
-        let settings = Settings::load().unwrap_or_default();
-        let resolved = crate::drive::auth::resolve(&settings.drive, None)?;
-        let rules: &[FolderPermissionRule] = match &resolved {
-            ResolvedAccount::Named(name) => settings
-                .drive
-                .accounts
-                .get(name)
-                .map_or(&[], |account| account.write_permissions.rules.as_slice()),
-            ResolvedAccount::Unconfigured => &[],
-        };
-        run_show(rules, &self.output)
+        let rules = active_account_rules()?;
+        run_show(&rules, &self.output)
     }
 }
 
