@@ -7,6 +7,8 @@
 //! sibling concept has nothing to mirror here).
 
 use anyhow::{Context, Result};
+use base64::Engine;
+use rand::Rng;
 use url::Url;
 
 use crate::drive::client::DriveClient;
@@ -36,6 +38,15 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 50;
 /// `files.get?alt=media` has none — an unbounded read of a very large file
 /// risks exhausting process memory.
 const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Refuses to buffer local content larger than this for
+/// [`FilesApi::upload`]/[`FilesApi::edit_content`] — Google's documented
+/// cap on `uploadType=multipart`/`uploadType=media` simple-upload request
+/// bodies. Content above this needs a resumable upload session (chunked,
+/// with its own restart/retry bookkeeping), explicitly out of scope for
+/// v1 — refused outright rather than silently degrading, the same
+/// documented-boundary posture ADR-0070 §8 took for shallow folder moves.
+pub(crate) const MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024;
 
 /// `fields` value for `files.list` — enough for `drive search`'s
 /// table/JSON output with zero follow-up calls per hit.
@@ -226,6 +237,45 @@ impl<'a> FilesApi<'a> {
             .map_err(|err| append_write_scope_hint(err, WriteCapability::CreateOrUpload))
     }
 
+    /// Uploads `content` as a new file (`files.create` with
+    /// `uploadType=multipart`, Drive's simple upload endpoint — no
+    /// resumable-session support). Requires the `drive.file` or `drive`
+    /// scope (`drive auth login --write-file`/`--write-full`).
+    ///
+    /// Refuses content over [`MAX_UPLOAD_BYTES`] before ever building the
+    /// request body.
+    pub async fn upload(
+        &self,
+        name: &str,
+        parent_folder_id: &str,
+        content: &[u8],
+        content_type: &str,
+    ) -> Result<DriveFile> {
+        check_upload_size(content.len() as u64)?;
+        let boundary = generate_multipart_boundary();
+        let metadata = serde_json::json!({
+            "name": name,
+            "parents": [parent_folder_id],
+        });
+        let body = build_multipart_related_body(&metadata, content, content_type, &boundary);
+        let url = build_file_upload_url(self.client.base_url())?;
+        let response = self
+            .client
+            .post_bytes(
+                url.as_str(),
+                &body,
+                &format!("multipart/related; boundary={boundary}"),
+            )
+            .await?;
+        self.client
+            .parse_response(
+                response,
+                "Failed to parse files.create (multipart) response",
+            )
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::CreateOrUpload))
+    }
+
     /// Shared GET-then-check-status-then-collect-bytes body for
     /// [`Self::export`]/[`Self::download`] — both go through
     /// [`DriveClient::get_bytes`], not `get_json`/`get_parsed`.
@@ -255,6 +305,21 @@ fn check_download_size(content_length: Option<u64>) -> Result<()> {
              this file is too large for `drive read --content`"
         );
     }
+    Ok(())
+}
+
+/// Refuses to upload content larger than [`MAX_UPLOAD_BYTES`]. Unlike
+/// [`check_download_size`] (which checks a caller-*reported*
+/// `Content-Length` that might be absent), a caller-supplied local
+/// buffer's length is always known up front, so this takes a plain `u64`,
+/// no `Option`.
+pub(crate) fn check_upload_size(len: u64) -> Result<()> {
+    anyhow::ensure!(
+        len <= MAX_UPLOAD_BYTES,
+        "refusing to upload {len} bytes (limit: {MAX_UPLOAD_BYTES} bytes); Drive's simple \
+         upload endpoint caps requests at 5 MB — larger content needs resumable upload, not \
+         supported by `drive upload`/`drive edit` yet"
+    );
     Ok(())
 }
 
@@ -305,6 +370,60 @@ fn build_file_create_url(base_url: &str) -> Result<Url> {
         pairs.append_pair("supportsAllDrives", "true");
     }
     Ok(url)
+}
+
+/// `files.create` URL for [`FilesApi::upload`], on Drive's separate
+/// `/upload/` path prefix (`uploadType=multipart`, Google's simple-upload
+/// endpoint — no resumable-session support here).
+fn build_file_upload_url(base_url: &str) -> Result<Url> {
+    let mut url = DriveClient::api_url(base_url, "/upload/drive/v3/files")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("uploadType", "multipart");
+        pairs.append_pair("fields", GET_FIELDS);
+        pairs.append_pair("supportsAllDrives", "true");
+    }
+    Ok(url)
+}
+
+/// A fresh, random `multipart/related` boundary — unlikely to collide with
+/// arbitrary binary content, unlike a fixed string would risk.
+fn generate_multipart_boundary() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    format!(
+        "omnidev-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
+/// Hand-assembles a `multipart/related` (RFC 2387) body for Drive's simple
+/// multipart upload endpoint.
+///
+/// Drive's upload endpoint requires exactly this format — two parts, a
+/// JSON metadata part followed by the raw content part — and rejects the
+/// `multipart/form-data` `reqwest::multipart::Form` would produce, so this
+/// can't just call into `reqwest`'s own multipart support. Pure and
+/// unit-tested at the byte level, since Drive is strict about this shape
+/// (exact `\r\n` placement, no trailing content after the closing
+/// boundary).
+fn build_multipart_related_body(
+    metadata: &serde_json::Value,
+    content: &[u8],
+    content_type: &str,
+    boundary: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(content.len() + 256);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+    body.extend_from_slice(metadata.to_string().as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(content);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--").as_bytes());
+    body
 }
 
 fn build_export_url(base_url: &str, file_id: &str, mime_type: &str) -> Result<Url> {
@@ -1132,6 +1251,97 @@ mod tests {
         assert!(err.to_string().contains("--write-full"), "{err}");
     }
 
+    // ── upload ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upload_sends_multipart_related_content_type_and_returns_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files"))
+            .and(wiremock::matchers::query_param("uploadType", "multipart"))
+            .and(wiremock::matchers::header_regex(
+                "content-type",
+                "^multipart/related; boundary=omnidev-",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "new-upload-1", "name": "photo.jpg",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client)
+            .upload("photo.jpg", "parent-1", b"JPEGDATA", "image/jpeg")
+            .await
+            .unwrap();
+        assert_eq!(file.id, "new-upload-1");
+    }
+
+    #[tokio::test]
+    async fn upload_refuses_oversized_content_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // Deliberately no mock mounted — an oversized upload must be
+        // refused before ever building/sending the request.
+        let oversized = vec![0u8; (MAX_UPLOAD_BYTES + 1) as usize];
+
+        let err = FilesApi::new(&client)
+            .upload(
+                "big.bin",
+                "parent-1",
+                &oversized,
+                "application/octet-stream",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to upload"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn upload_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .upload("f.txt", "parent-1", b"content", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn upload_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .upload("f.txt", "parent-1", b"content", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--write-file"), "{err}");
+        assert!(err.to_string().contains("--write-full"), "{err}");
+    }
+
     #[test]
     fn append_write_scope_hint_leaves_other_errors_unchanged() {
         let err = anyhow::anyhow!("some other failure");
@@ -1184,6 +1394,85 @@ mod tests {
     #[test]
     fn check_download_size_allows_a_missing_length() {
         assert!(check_download_size(None).is_ok());
+    }
+
+    // ── check_upload_size ───────────────────────────────────────────
+
+    #[test]
+    fn check_upload_size_rejects_a_length_over_the_cap() {
+        let err = check_upload_size(MAX_UPLOAD_BYTES + 1).unwrap_err();
+        assert!(err.to_string().contains("refusing to upload"), "{err}");
+    }
+
+    #[test]
+    fn check_upload_size_allows_a_length_at_the_cap() {
+        assert!(check_upload_size(MAX_UPLOAD_BYTES).is_ok());
+    }
+
+    // ── build_multipart_related_body ────────────────────────────────
+
+    #[test]
+    fn multipart_body_has_two_parts_separated_by_the_boundary() {
+        let metadata = serde_json::json!({"name": "photo.jpg", "parents": ["p1"]});
+        let body = build_multipart_related_body(&metadata, b"JPEGDATA", "image/jpeg", "BOUNDARY");
+        let body_str = String::from_utf8(body).unwrap();
+        assert_eq!(
+            body_str,
+            "--BOUNDARY\r\n\
+             Content-Type: application/json; charset=UTF-8\r\n\r\n\
+             {\"name\":\"photo.jpg\",\"parents\":[\"p1\"]}\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: image/jpeg\r\n\r\n\
+             JPEGDATA\r\n\
+             --BOUNDARY--"
+        );
+    }
+
+    #[test]
+    fn multipart_body_preserves_binary_content_byte_for_byte() {
+        let metadata = serde_json::json!({"name": "bin"});
+        let binary_content: Vec<u8> = vec![0x00, 0xFF, 0x0D, 0x0A, 0x2D, 0x2D, 0x01];
+        let body = build_multipart_related_body(
+            &metadata,
+            &binary_content,
+            "application/octet-stream",
+            "B",
+        );
+        // The exact byte sequence must appear intact, unmangled by any
+        // text-mode transformation.
+        let needle_pos = body
+            .windows(binary_content.len())
+            .position(|w| w == binary_content.as_slice());
+        assert!(
+            needle_pos.is_some(),
+            "binary content not found intact in body"
+        );
+    }
+
+    #[test]
+    fn multipart_body_ends_with_the_closing_boundary_no_trailing_bytes() {
+        let metadata = serde_json::json!({});
+        let body = build_multipart_related_body(&metadata, b"x", "text/plain", "B");
+        assert!(body.ends_with(b"--B--"));
+    }
+
+    #[test]
+    fn generate_multipart_boundary_produces_distinct_values() {
+        let a = generate_multipart_boundary();
+        let b = generate_multipart_boundary();
+        assert_ne!(a, b);
+        assert!(a.starts_with("omnidev-"));
+    }
+
+    // ── build_file_upload_url ───────────────────────────────────────
+
+    #[test]
+    fn build_file_upload_url_includes_upload_type_fields_and_supports_all_drives() {
+        let url = build_file_upload_url("https://www.googleapis.com").unwrap();
+        assert!(url.path().ends_with("/upload/drive/v3/files"));
+        assert!(url.as_str().contains("uploadType=multipart"));
+        assert!(url.as_str().contains("fields="));
+        assert!(url.as_str().contains("supportsAllDrives=true"));
     }
 
     // ── effective_cap ────────────────────────────────────────────────

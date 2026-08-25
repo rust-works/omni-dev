@@ -24,5 +24,6 @@ pub mod rename;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
+pub mod upload;
 pub mod visibility;
 pub mod write_gate;
