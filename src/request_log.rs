@@ -877,6 +877,18 @@ pub struct DriveMutationOutcome {
     pub removed_principals: Vec<String>,
     /// Whether the file moved across a My Drive / Shared Drive boundary.
     pub crosses_drive_boundary: bool,
+    /// The folder the write-permission gate evaluated against (issue
+    /// #1574) — the `--parent` for `create`/`upload`, the target's current
+    /// parent for `edit`. `None` for `rename`/`move` (never gated) and for
+    /// a `content_edit` outcome that short-circuited before the gate (a
+    /// Google-native-document refusal).
+    pub resolved_folder_id: Option<String>,
+    /// The folder id of the configured rule that decided the write-gate
+    /// verdict, when one did (as opposed to the bare default policy).
+    /// Paired with `decided_by_depth`.
+    pub decided_by_folder_id: Option<String>,
+    /// How many levels above `resolved_folder_id` that rule's folder sits.
+    pub decided_by_depth: Option<usize>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -935,6 +947,15 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if outcome.crosses_drive_boundary {
         context.insert("crosses_drive_boundary".to_string(), "true".to_string());
+    }
+    if let Some(resolved_folder_id) = outcome.resolved_folder_id {
+        context.insert("resolved_folder_id".to_string(), resolved_folder_id);
+    }
+    if let Some(decided_by_folder_id) = outcome.decided_by_folder_id {
+        context.insert("decided_by_folder_id".to_string(), decided_by_folder_id);
+    }
+    if let Some(decided_by_depth) = outcome.decided_by_depth {
+        context.insert("decided_by_depth".to_string(), decided_by_depth.to_string());
     }
     rec.context = context;
     rec
@@ -1588,6 +1609,9 @@ mod tests {
                 added_principals: vec!["alice@example.com".to_string()],
                 removed_principals: vec![],
                 crosses_drive_boundary: true,
+                resolved_folder_id: Some("dest1".to_string()),
+                decided_by_folder_id: Some("dest1".to_string()),
+                decided_by_depth: Some(0),
                 error: None,
                 duration: Duration::from_millis(17),
             },
@@ -1620,6 +1644,18 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+        assert_eq!(
+            rec.context.get("resolved_folder_id").map(String::as_str),
+            Some("dest1")
+        );
+        assert_eq!(
+            rec.context.get("decided_by_folder_id").map(String::as_str),
+            Some("dest1")
+        );
+        assert_eq!(
+            rec.context.get("decided_by_depth").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]
@@ -1633,6 +1669,9 @@ mod tests {
                 added_principals: vec![],
                 removed_principals: vec![],
                 crosses_drive_boundary: false,
+                resolved_folder_id: None,
+                decided_by_folder_id: None,
+                decided_by_depth: None,
                 error: None,
                 duration: Duration::from_millis(5),
             },
@@ -1641,6 +1680,9 @@ mod tests {
         assert_eq!(rec.context.get("added_principals"), None);
         assert_eq!(rec.context.get("removed_principals"), None);
         assert_eq!(rec.context.get("crosses_drive_boundary"), None);
+        assert_eq!(rec.context.get("resolved_folder_id"), None);
+        assert_eq!(rec.context.get("decided_by_folder_id"), None);
+        assert_eq!(rec.context.get("decided_by_depth"), None);
     }
 
     #[test]
@@ -1654,6 +1696,9 @@ mod tests {
                 added_principals: vec![],
                 removed_principals: vec![],
                 crosses_drive_boundary: false,
+                resolved_folder_id: None,
+                decided_by_folder_id: None,
+                decided_by_depth: None,
                 error: Some("boom".to_string()),
                 duration: Duration::from_millis(1),
             },
@@ -1672,6 +1717,39 @@ mod tests {
             vec!["drive".to_string(), "rename".to_string()]
         );
         assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+
+    /// Confirms the existing `kind: "drivemutation"` record — reused, not a
+    /// new `RecordKind` — round-trips identically for the new `create`
+    /// operation issue #1574 adds (ADR-0071 §8).
+    #[test]
+    fn build_drive_mutation_record_round_trips_for_create_operation() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "create",
+                file_id: "f1".to_string(),
+                file_name: "New File".to_string(),
+                status: "created".to_string(),
+                added_principals: vec![],
+                removed_principals: vec![],
+                crosses_drive_boundary: false,
+                resolved_folder_id: Some("parent1".to_string()),
+                decided_by_folder_id: None,
+                decided_by_depth: None,
+                error: None,
+                duration: Duration::from_millis(1),
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.command, vec!["drive".to_string(), "create".to_string()]);
+        assert_eq!(
+            rec.context.get("resolved_folder_id").map(String::as_str),
+            Some("parent1")
+        );
+        assert_eq!(rec.context.get("decided_by_folder_id"), None);
+        let line = serde_json::to_string(&rec).unwrap();
+        let back: LogRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.kind, RecordKind::DriveMutation);
     }
 
     #[test]

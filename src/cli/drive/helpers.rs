@@ -2,8 +2,11 @@
 
 use anyhow::Result;
 
+use crate::drive::account::ResolvedAccount;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
+use crate::drive::write_gate::FolderPermissionRule;
+use crate::utils::settings::Settings;
 
 /// Creates an authenticated Drive API client from environment/settings-resolved credentials.
 pub fn create_client() -> Result<DriveClient> {
@@ -30,11 +33,34 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
     DriveClient::from_credentials(&credentials)
 }
 
+/// Reads the active account's `write_permissions.rules` from
+/// `~/.omni-dev/settings.json` (issue #1574). An
+/// [`ResolvedAccount::Unconfigured`] account has no `write_permissions`
+/// block to read, so it resolves to an empty rule set — every write is
+/// refused, per the gate's default policy.
+///
+/// Shared by `drive create`/`upload`/`edit`/`permissions show`/
+/// `permissions check` — previously each of the five reimplemented this
+/// identically.
+pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
+    let settings = Settings::load().unwrap_or_default();
+    let resolved = auth::resolve(&settings.drive, None)?;
+    Ok(match &resolved {
+        ResolvedAccount::Named(name) => settings
+            .drive
+            .accounts
+            .get(name)
+            .map(|a| a.write_permissions.rules.clone())
+            .unwrap_or_default(),
+        ResolvedAccount::Unconfigured => Vec::new(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     #[test]
@@ -43,7 +69,7 @@ mod tests {
             client_id: "client".to_string(),
             client_secret: Secret::new("secret"),
             refresh_token: Secret::new("refresh"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         let client = create_client_from(creds).unwrap();
         assert_eq!(client.base_url(), "https://www.googleapis.com");
@@ -85,5 +111,44 @@ mod tests {
 
         let err = create_client_for(Some("bogus")).unwrap_err();
         assert!(err.to_string().contains("unknown Drive account 'bogus'"));
+    }
+
+    // ── active_account_rules ────────────────────────────────────────────
+
+    #[test]
+    fn active_account_rules_unconfigured_account_is_empty() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        assert!(active_account_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_account_rules_reads_the_sole_configured_accounts_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[(
+                "write_permissions",
+                serde_json::json!({
+                    "rules": [{
+                        "folder_id": "folder-1",
+                        "recursive": true,
+                        "allow": ["create"],
+                    }],
+                }),
+            )],
+        )
+        .unwrap();
+
+        let rules = active_account_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].folder_id, "folder-1");
+        assert!(rules[0]
+            .allow
+            .contains(&crate::drive::write_gate::DriveOperation::Create));
     }
 }

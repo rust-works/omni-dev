@@ -429,7 +429,7 @@ mod tests {
     use rmcp::handler::server::wrapper::Parameters;
 
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope, SCOPE_READONLY};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes, SCOPE_READONLY};
     use crate::drive::test_support::EnvGuard;
     use crate::utils::secret::Secret;
 
@@ -438,7 +438,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         }
     }
 

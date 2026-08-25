@@ -33,16 +33,22 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `commit` (HEAD *before* removal), `had_uncommitted`, and `used_force`; for
   `prune`: a JSON `pruned` list of `{path, branch, commit}`. See
   [Recovering a removed worktree](#recovering-a-removed-worktree).
-- **`kind: "drivemutation"`** — one per `omni-dev drive rename`/`drive move`
-  attempt, written from *inside* the mutation itself so it covers every
-  current and future caller (CLI today, MCP later), not just the CLI.
-  Includes a refused `Blocked` move — no `files.update` call happens for
-  those, but the refusal is itself the security-relevant event. Tagged
-  `service: "drive"`, with `command` set to `["drive", "<operation>"]` and
-  the outcome detail in the free-form `context` map: `file_id`, `file_name`,
-  `status`, and — only when a visibility change was detected —
-  `added_principals`/`removed_principals` (comma-separated) and
-  `crosses_drive_boundary`. See [docs/drive.md](drive.md).
+- **`kind: "drivemutation"`** — one per `omni-dev drive rename`/`drive
+  move`/`drive create`/`drive upload`/`drive edit` attempt, written from
+  *inside* the mutation itself so it covers every current and future caller
+  (CLI today, MCP later), not just the CLI. Includes a refused move
+  (`Blocked`, ADR-0070) or create/upload/edit (`Blocked` by the folder
+  write-permission gate, ADR-0071, issue #1574) — no mutating API call
+  happens for those, but the refusal is itself the security-relevant event.
+  Tagged `service: "drive"`, with `command` set to `["drive",
+  "<operation>"]` and the outcome detail in the free-form `context` map:
+  `file_id`, `file_name`, `status`, and — only when present —
+  `added_principals`/`removed_principals` (comma-separated,
+  `move`-only) and `crosses_drive_boundary` (`move`-only), plus
+  `resolved_folder_id`/`decided_by_folder_id`/`decided_by_depth`
+  (`create`/`upload`/`edit`-only — the folder the write-permission gate
+  evaluated against, and which configured rule, if any, decided the
+  verdict). See [docs/drive.md](drive.md#write-permissions).
 
 Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and

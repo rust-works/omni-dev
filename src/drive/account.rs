@@ -234,6 +234,7 @@ mod tests {
             email_address: email.map(str::to_string),
             chrome_profile_from_email: false,
             browser_command: None,
+            write_permissions: crate::utils::settings::WritePermissionsSettings::default(),
         }
     }
 
@@ -256,6 +257,8 @@ mod tests {
                             email_address: acc.email_address.clone(),
                             chrome_profile_from_email: acc.chrome_profile_from_email,
                             browser_command: acc.browser_command.clone(),
+                            write_permissions:
+                                crate::utils::settings::WritePermissionsSettings::default(),
                         },
                     )
                 })

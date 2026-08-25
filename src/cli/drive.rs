@@ -2,15 +2,19 @@
 
 pub(crate) mod account;
 pub(crate) mod auth;
+pub(crate) mod create;
 pub(crate) mod dedupe;
+pub(crate) mod edit;
 pub(crate) mod format;
 pub(crate) mod helpers;
 /// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
 /// `crate::cli::atlassian::confluence::move_page`'s identical workaround.
 pub(crate) mod move_file;
+pub(crate) mod permissions;
 pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
+pub(crate) mod upload;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -52,12 +56,29 @@ pub enum DriveSubcommands {
     Read(read::ReadCommand),
     /// Finds Drive files sharing the same content hash.
     Dedupe(dedupe::DedupeCommand),
+    /// Creates a new file or folder, gated by the folder write-permission
+    /// rules (issue #1574). Requires the `drive.file` or `drive` scope
+    /// (`drive auth login --write-file`/`--write-full`).
+    Create(create::CreateCommand),
+    /// Uploads local content as a new file, gated by the folder
+    /// write-permission rules (issue #1574). Requires the `drive.file` or
+    /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    Upload(upload::UploadCommand),
+    /// Replaces an existing file's content, gated by the folder
+    /// write-permission rules (issue #1574). Requires the `drive.file`
+    /// scope if `omni-dev` created the file, or the unrestricted `drive`
+    /// scope for any pre-existing file (`drive auth login --write-file`
+    /// or `--write-full`).
+    Edit(edit::EditCommand),
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
     /// Moves one or more Drive files into a destination folder. Requires
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
+    /// Inspects the folder-scoped write-permission rules gating `drive
+    /// create`/`upload`/`edit` (issue #1574).
+    Permissions(permissions::PermissionsCommand),
 }
 
 impl DriveCommand {
@@ -82,6 +103,11 @@ impl DriveCommand {
         match self.command {
             DriveSubcommands::Auth(cmd) => cmd.execute().await,
             DriveSubcommands::Account(cmd) => cmd.execute(),
+            // Permissions' three leaves have mixed client needs (`show` is
+            // config-only, `lookup-folder`/`check` both call the Drive
+            // API) — like Auth, it resolves its own client lazily per leaf
+            // rather than sharing the single eager resolution below.
+            DriveSubcommands::Permissions(cmd) => cmd.execute().await,
             command => {
                 let client = helpers::create_client()?;
                 command.dispatch(&client).await
@@ -91,16 +117,22 @@ impl DriveCommand {
 }
 
 impl DriveSubcommands {
-    /// Routes a non-`Auth`/`Account` subcommand against the shared client.
-    /// The `Auth`/`Account` arms are unreachable: both are handled before
-    /// client resolution in [`DriveCommand::execute`].
+    /// Routes a non-`Auth`/`Account`/`Permissions` subcommand against the
+    /// shared client. Those three arms are unreachable: all are handled
+    /// before client resolution in [`DriveCommand::execute`].
     async fn dispatch(self, client: &DriveClient) -> Result<()> {
         match self {
             Self::Auth(_) => unreachable!("Auth is dispatched before client resolution"),
             Self::Account(_) => unreachable!("Account is dispatched before client resolution"),
+            Self::Permissions(_) => {
+                unreachable!("Permissions is dispatched before client resolution")
+            }
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
+            Self::Create(cmd) => cmd.execute(client).await,
+            Self::Upload(cmd) => cmd.execute(client).await,
+            Self::Edit(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
         }
@@ -112,7 +144,7 @@ impl DriveSubcommands {
 mod tests {
     use super::*;
     use crate::cli::drive::format::OutputFormat;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     fn dead_credentials() -> DriveCredentials {
@@ -120,7 +152,7 @@ mod tests {
             client_id: "client".to_string(),
             client_secret: Secret::new("secret"),
             refresh_token: Secret::new("refresh"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         }
     }
 
@@ -263,6 +295,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_routes_permissions_show_without_client_resolution() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Permissions(permissions::PermissionsCommand {
+                command: permissions::PermissionsSubcommands::Show(
+                    permissions::show::ShowCommand {
+                        output: OutputFormat::Table,
+                    },
+                ),
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_routes_permissions_check_and_surfaces_missing_credentials() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Permissions(permissions::PermissionsCommand {
+                command: permissions::PermissionsSubcommands::Check(
+                    permissions::check::CheckCommand {
+                        id: "f1".to_string(),
+                        operation: permissions::check::OperationArg::Read,
+                        output: OutputFormat::Table,
+                    },
+                ),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),
@@ -293,6 +364,73 @@ mod tests {
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_create() {
+        // Unlike rename/move (whose engine fns return `Result` and
+        // propagate a network error via `?`), `create`'s engine fn always
+        // returns an `Ok`-shaped `CreateOutcome` — a fetch failure against
+        // the dead client becomes an embedded `Failed{detail}`, matching
+        // the exit-0-regardless-of-outcome convention (ADR-0071 §12), not
+        // a dispatch-level error. Needs env isolation (unlike the other
+        // dispatch_routes_* tests): `create`'s CLI layer resolves the
+        // active account's write_permissions.rules via `Settings::load()`,
+        // so without a clean $HOME it reads whatever real
+        // ~/.omni-dev/settings.json this process has.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Create(create::CreateCommand {
+            name: "New File".to_string(),
+            parent: "parent-1".to_string(),
+            folder: false,
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_upload() {
+        // Same env-isolation and exit-0-regardless-of-outcome reasoning as
+        // dispatch_routes_create.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let content_dir = tempfile::tempdir().unwrap();
+        let local_path = content_dir.path().join("upload-me.txt");
+        std::fs::write(&local_path, b"content").unwrap();
+
+        let cmd = DriveSubcommands::Upload(upload::UploadCommand {
+            local_path,
+            parent: "parent-1".to_string(),
+            name: None,
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_edit() {
+        // Same env-isolation and exit-0-regardless-of-outcome reasoning as
+        // dispatch_routes_create/dispatch_routes_upload.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let content_dir = tempfile::tempdir().unwrap();
+        let content_path = content_dir.path().join("new-content.txt");
+        std::fs::write(&content_path, b"content").unwrap();
+
+        let cmd = DriveSubcommands::Edit(edit::EditCommand {
+            file_id: "f1".to_string(),
+            content: content_path.to_str().unwrap().to_string(),
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
     #[tokio::test]

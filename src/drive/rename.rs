@@ -89,6 +89,10 @@ fn record_attempt(
         added_principals: Vec::new(),
         removed_principals: Vec::new(),
         crosses_drive_boundary: false,
+        // Rename is never gated by the folder write-permission gate.
+        resolved_folder_id: None,
+        decided_by_folder_id: None,
+        decided_by_depth: None,
         error,
         duration,
     });
@@ -98,7 +102,7 @@ fn record_attempt(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveScope};
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
     fn test_credentials() -> DriveCredentials {
@@ -106,7 +110,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::Metadata,
+            scope: DriveGrantedScopes::METADATA,
         }
     }
 
