@@ -213,7 +213,16 @@ impl<'a> FilesApi<'a> {
     /// Creates a new file or folder (`files.create`, metadata-only — no
     /// content). Requires the `drive.file` or `drive` scope (`drive auth
     /// login --write-file`/`--write-full`).
-    pub async fn create(
+    ///
+    /// Restricted to `crate::drive`: every mutating call here must run
+    /// through `write_gate::resolve` first (issue #1574's folder-permission
+    /// gate), and that gate is only ever invoked by the engine modules
+    /// (`crate::drive::{create,upload,content_edit}`), never this façade
+    /// itself. This visibility is the actual enforcement of "no bypass by
+    /// construction" — a caller outside `crate::drive` (a new CLI command, a
+    /// future MCP tool) cannot even compile a direct call to this method; it
+    /// has to go through the gated engine function instead.
+    pub(in crate::drive) async fn create(
         &self,
         name: &str,
         parent_folder_id: &str,
@@ -244,7 +253,10 @@ impl<'a> FilesApi<'a> {
     ///
     /// Refuses content over [`MAX_UPLOAD_BYTES`] before ever building the
     /// request body.
-    pub async fn upload(
+    ///
+    /// Restricted to `crate::drive` — see [`Self::create`]'s doc comment
+    /// for why.
+    pub(in crate::drive) async fn upload(
         &self,
         name: &str,
         parent_folder_id: &str,
@@ -252,6 +264,7 @@ impl<'a> FilesApi<'a> {
         content_type: &str,
     ) -> Result<DriveFile> {
         check_upload_size(content.len() as u64)?;
+        check_content_type(content_type)?;
         let boundary = generate_multipart_boundary();
         let metadata = serde_json::json!({
             "name": name,
@@ -283,13 +296,17 @@ impl<'a> FilesApi<'a> {
     /// scope for any pre-existing file.
     ///
     /// Refuses content over [`MAX_UPLOAD_BYTES`] before ever sending it.
-    pub async fn edit_content(
+    ///
+    /// Restricted to `crate::drive` — see [`Self::create`]'s doc comment
+    /// for why.
+    pub(in crate::drive) async fn edit_content(
         &self,
         file_id: &str,
         content: &[u8],
         content_type: &str,
     ) -> Result<DriveFile> {
         check_upload_size(content.len() as u64)?;
+        check_content_type(content_type)?;
         let url = build_file_edit_content_url(self.client.base_url(), file_id)?;
         let response = self
             .client
@@ -344,6 +361,25 @@ pub(crate) fn check_upload_size(len: u64) -> Result<()> {
         "refusing to upload {len} bytes (limit: {MAX_UPLOAD_BYTES} bytes); Drive's simple \
          upload endpoint caps requests at 5 MB — larger content needs resumable upload, not \
          supported by `drive upload`/`drive edit` yet"
+    );
+    Ok(())
+}
+
+/// Refuses a `Content-Type` value containing a CR or LF byte.
+///
+/// [`FilesApi::upload`] splices `content_type` directly into a
+/// hand-assembled `multipart/related` body header line
+/// ([`build_multipart_related_body`]), which bypasses the CRLF rejection
+/// `reqwest`'s own `header()` already applies to a real HTTP header value
+/// (the mechanism protecting [`FilesApi::edit_content`]'s plain
+/// `Content-Type` header) — an unchecked value here could inject an extra
+/// multipart boundary/part into the request Google receives. Applied to
+/// both mutating call sites for a consistent, clearly-worded refusal
+/// rather than relying on two different enforcement mechanisms.
+fn check_content_type(content_type: &str) -> Result<()> {
+    anyhow::ensure!(
+        !content_type.contains(['\r', '\n']),
+        "refusing content type {content_type:?}: must not contain a CR or LF byte"
     );
     Ok(())
 }
@@ -1344,6 +1380,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_refuses_content_type_containing_crlf_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // Deliberately no mock mounted — a CRLF in content_type must be
+        // refused before ever building the multipart body, where it would
+        // otherwise splice raw bytes into Drive's request.
+        let err = FilesApi::new(&client)
+            .upload(
+                "f.txt",
+                "parent-1",
+                b"content",
+                "text/plain\r\n--boundary\r\nX-Injected: yes",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing content type"), "{err}");
+    }
+
+    #[tokio::test]
     async fn upload_propagates_api_errors() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1423,6 +1478,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("refusing to upload"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn edit_content_refuses_content_type_containing_crlf_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // Deliberately no mock mounted.
+
+        let err = FilesApi::new(&client)
+            .edit_content("f1", b"content", "text/plain\r\nX-Injected: yes")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing content type"), "{err}");
     }
 
     #[tokio::test]
