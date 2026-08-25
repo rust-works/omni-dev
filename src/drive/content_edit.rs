@@ -213,12 +213,11 @@ fn record_attempt(outcome: &EditOutcome, duration: Duration) {
         EditResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = match &outcome.result {
-        EditResult::Blocked {
-            decided_by: Some(rule),
-        } => (Some(rule.folder_id.clone()), Some(rule.depth)),
-        _ => (None, None),
+    let decided_by = match &outcome.result {
+        EditResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: "edit",
         file_id: outcome.file_id.clone(),

@@ -179,12 +179,11 @@ fn record_attempt(outcome: &UploadOutcome, duration: Duration) {
         UploadResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = match &outcome.result {
-        UploadResult::Blocked {
-            decided_by: Some(rule),
-        } => (Some(rule.folder_id.clone()), Some(rule.depth)),
-        _ => (None, None),
+    let decided_by = match &outcome.result {
+        UploadResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: "upload",
         file_id: match &outcome.result {

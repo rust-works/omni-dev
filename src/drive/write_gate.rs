@@ -227,6 +227,26 @@ pub fn combine_across_parents(
     })
 }
 
+/// Splits an optional [`DecidingRule`] into the `(folder_id, depth)` pair
+/// `crate::request_log::DriveMutationOutcome::decided_by_folder_id`/
+/// `decided_by_depth` expect.
+///
+/// Shared by `create`/`upload`/`edit`'s otherwise near-identical
+/// `record_attempt` functions — each still builds its own
+/// `DriveMutationOutcome` (the verb-specific fields genuinely differ), but
+/// this was the one piece of extraction logic that was byte-for-byte the
+/// same in all three. Kept here (rather than in `crate::request_log`,
+/// which stays decoupled from any one integration's internal types) and
+/// pure, matching this module's zero-I/O contract — it does not itself
+/// call `crate::request_log::record_drive_mutation`.
+#[must_use]
+pub fn decided_by_log_fields(decided_by: Option<&DecidingRule>) -> (Option<String>, Option<usize>) {
+    match decided_by {
+        Some(rule) => (Some(rule.folder_id.clone()), Some(rule.depth)),
+        None => (None, None),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -423,6 +443,25 @@ mod tests {
     fn combine_across_parents_deny_beats_allow_allow_first() {
         let combined = combine_across_parents(decision(Verdict::Allow), [decision(Verdict::Deny)]);
         assert_eq!(combined.verdict, Verdict::Deny);
+    }
+
+    // ── decided_by_log_fields ────────────────────────────────────────
+
+    #[test]
+    fn decided_by_log_fields_none_yields_none_pair() {
+        assert_eq!(decided_by_log_fields(None), (None, None));
+    }
+
+    #[test]
+    fn decided_by_log_fields_some_extracts_folder_id_and_depth() {
+        let rule = DecidingRule {
+            folder_id: "folder-1".to_string(),
+            depth: 2,
+        };
+        assert_eq!(
+            decided_by_log_fields(Some(&rule)),
+            (Some("folder-1".to_string()), Some(2))
+        );
     }
 
     #[test]

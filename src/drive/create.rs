@@ -177,12 +177,11 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         CreateResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = match &outcome.result {
-        CreateResult::Blocked {
-            decided_by: Some(rule),
-        } => (Some(rule.folder_id.clone()), Some(rule.depth)),
-        _ => (None, None),
+    let decided_by = match &outcome.result {
+        CreateResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: "create",
         file_id: match &outcome.result {
