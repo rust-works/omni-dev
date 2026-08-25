@@ -346,7 +346,7 @@ impl Cli {
             Commands::Sessions(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::ClaudeWrap(cmd) => cmd.execute().await,
-            Commands::Coverage(cmd) => cmd.execute(repo).await,
+            Commands::Coverage(cmd) => cmd.execute(repo),
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(repo),
