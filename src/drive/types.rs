@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 
+/// MIME type marking a Drive folder.
+///
+/// A shared constant (issue #1574) — previously duplicated privately in
+/// `file_move.rs` (whose own doc comment explained the duplication was to
+/// avoid an engine→CLI dependency on `crate::cli::drive::read::GOOGLE_FOLDER`,
+/// not to avoid sharing between engine modules) and in the new
+/// `permissions/check.rs`/`permissions/lookup_folder.rs`. `read.rs`'s own
+/// `GOOGLE_FOLDER` constant is untouched — this is a distinct, engine-layer
+/// copy, not a rename of that one.
+pub(crate) const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+
 /// An owner of a Drive file, as embedded in `files.list`/`files.get`'s
 /// `owners[]` field (requested via the `fields` param's
 /// `owners(displayName,emailAddress)` sub-selector — see `files_api.rs`).

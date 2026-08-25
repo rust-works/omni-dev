@@ -170,7 +170,7 @@ impl<'a> FilesApi<'a> {
         self.client
             .parse_response(response, "Failed to parse files.update response")
             .await
-            .map_err(append_write_scope_hint)
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
     }
 
     /// Moves a file between folders (`files.update` with `addParents`/
@@ -196,7 +196,34 @@ impl<'a> FilesApi<'a> {
         self.client
             .parse_response(response, "Failed to parse files.update response")
             .await
-            .map_err(append_write_scope_hint)
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
+    }
+
+    /// Creates a new file or folder (`files.create`, metadata-only — no
+    /// content). Requires the `drive.file` or `drive` scope (`drive auth
+    /// login --write-file`/`--write-full`).
+    pub async fn create(
+        &self,
+        name: &str,
+        parent_folder_id: &str,
+        mime_type: &str,
+    ) -> Result<DriveFile> {
+        let url = build_file_create_url(self.client.base_url())?;
+        let response = self
+            .client
+            .post_json(
+                url.as_str(),
+                &serde_json::json!({
+                    "name": name,
+                    "mimeType": mime_type,
+                    "parents": [parent_folder_id],
+                }),
+            )
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.create response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::CreateOrUpload))
     }
 
     /// Shared GET-then-check-status-then-collect-bytes body for
@@ -268,6 +295,18 @@ fn build_file_get_url(base_url: &str, file_id: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// `files.create` URL for [`FilesApi::create`] — metadata-only, `fields`
+/// selects the same response shape `files.get` returns.
+fn build_file_create_url(base_url: &str) -> Result<Url> {
+    let mut url = DriveClient::api_url(base_url, "/drive/v3/files")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("fields", GET_FIELDS);
+        pairs.append_pair("supportsAllDrives", "true");
+    }
+    Ok(url)
+}
+
 fn build_export_url(base_url: &str, file_id: &str, mime_type: &str) -> Result<Url> {
     // `supportsAllDrives` is not a documented `files.export` parameter
     // (unlike `files.get`/`files.list`) — deliberately omitted rather than
@@ -312,13 +351,27 @@ fn build_file_update_url(
     Ok(url)
 }
 
-/// Appends an actionable hint to a `files.update` failure caused by an
-/// insufficient OAuth scope — the default `drive.readonly` scope cannot
-/// call `files.update` at all; only `--write`'s `drive.metadata` scope can.
-/// No client-side scope pre-check exists (mirrors Gmail's label-mutation
-/// commands): the PATCH is always attempted, and Google's 403 is made
-/// actionable here instead.
-fn append_write_scope_hint(err: anyhow::Error) -> anyhow::Error {
+/// Which write capability a mutating call needed — parameterizes
+/// [`append_write_scope_hint`] so one function serves every mutating verb's
+/// 403 instead of hardcoding a single hint (issue #1574 generalization of
+/// [ADR-0070](../../docs/adrs/adr-0070.md) §2's rename/move-only hint).
+pub(crate) enum WriteCapability {
+    /// `files.update` on `name`/`parents` (rename/move) — `drive.metadata`.
+    Metadata,
+    /// Creating a new file/folder, or uploading new content — `drive.file`
+    /// or `drive`.
+    CreateOrUpload,
+    // `EditContent` (edit's own capability, naming both --write-file and
+    // --write-full since the client can't cheaply tell which a given file
+    // id needs) is added alongside `drive edit` itself, not here — adding
+    // it now would be dead code until content_edit.rs exists.
+}
+
+/// Appends an actionable hint to a mutating-call failure caused by an
+/// insufficient OAuth scope. No client-side scope pre-check exists (mirrors
+/// Gmail's label-mutation commands): the mutating call is always attempted,
+/// and Google's 403 is made actionable here instead.
+fn append_write_scope_hint(err: anyhow::Error, capability: WriteCapability) -> anyhow::Error {
     let is_insufficient_permissions = matches!(
         err.downcast_ref::<DriveError>(),
         Some(DriveError::ApiRequestFailed {
@@ -326,13 +379,20 @@ fn append_write_scope_hint(err: anyhow::Error) -> anyhow::Error {
             ..
         }) if reason == "insufficientPermissions"
     );
-    if is_insufficient_permissions {
-        return err.context(
-            "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
-             for rename/move",
-        );
+    if !is_insufficient_permissions {
+        return err;
     }
-    err
+    let hint = match capability {
+        WriteCapability::Metadata => {
+            "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
+             for rename/move"
+        }
+        WriteCapability::CreateOrUpload => {
+            "Run `omni-dev drive auth login --write-file` (or `--write-full`) to grant the \
+             scope needed to create files/folders and upload content"
+        }
+    };
+    err.context(hint)
 }
 
 /// Clamps a caller-supplied limit to [`HARD_CAP`], treating `0` as "fetch
@@ -503,6 +563,14 @@ mod tests {
     fn build_file_get_url_includes_fields_and_supports_all_drives() {
         let url = build_file_get_url("https://www.googleapis.com", "f1").unwrap();
         assert!(url.as_str().contains("/drive/v3/files/f1"));
+        assert!(url.as_str().contains("fields="));
+        assert!(url.as_str().contains("supportsAllDrives=true"));
+    }
+
+    #[test]
+    fn build_file_create_url_includes_fields_and_supports_all_drives() {
+        let url = build_file_create_url("https://www.googleapis.com").unwrap();
+        assert!(url.path().ends_with("/drive/v3/files"));
         assert!(url.as_str().contains("fields="));
         assert!(url.as_str().contains("supportsAllDrives=true"));
     }
@@ -991,11 +1059,113 @@ mod tests {
         );
     }
 
+    // ── create ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_sends_name_mime_type_and_parents() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .and(wiremock::matchers::query_param("fields", GET_FIELDS))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "name": "New File",
+                "mimeType": "text/plain",
+                "parents": ["parent-1"],
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "New File", "mimeType": "text/plain",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client)
+            .create("New File", "parent-1", "text/plain")
+            .await
+            .unwrap();
+        assert_eq!(file.id, "f1");
+        assert_eq!(file.name, "New File");
+    }
+
+    #[tokio::test]
+    async fn create_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .create("New File", "parent-1", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn create_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .create("New File", "parent-1", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--write-file"), "{err}");
+        assert!(err.to_string().contains("--write-full"), "{err}");
+    }
+
     #[test]
     fn append_write_scope_hint_leaves_other_errors_unchanged() {
         let err = anyhow::anyhow!("some other failure");
-        let msg = append_write_scope_hint(err).to_string();
+        let msg = append_write_scope_hint(err, WriteCapability::Metadata).to_string();
         assert_eq!(msg, "some other failure");
+    }
+
+    fn insufficient_permissions_error() -> anyhow::Error {
+        DriveError::ApiRequestFailed {
+            status: 403,
+            body: String::new(),
+            reason: Some("insufficientPermissions".to_string()),
+        }
+        .into()
+    }
+
+    #[test]
+    fn append_write_scope_hint_metadata_names_write_flag() {
+        let msg =
+            append_write_scope_hint(insufficient_permissions_error(), WriteCapability::Metadata)
+                .to_string();
+        assert!(msg.contains("--write"), "{msg}");
+        assert!(msg.contains("rename/move"), "{msg}");
+    }
+
+    #[test]
+    fn append_write_scope_hint_create_or_upload_names_write_file_flag() {
+        let msg = append_write_scope_hint(
+            insufficient_permissions_error(),
+            WriteCapability::CreateOrUpload,
+        )
+        .to_string();
+        assert!(msg.contains("--write-file"), "{msg}");
+        assert!(msg.contains("--write-full"), "{msg}");
     }
 
     // ── check_download_size ─────────────────────────────────────────

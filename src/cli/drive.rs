@@ -2,6 +2,7 @@
 
 pub(crate) mod account;
 pub(crate) mod auth;
+pub(crate) mod create;
 pub(crate) mod dedupe;
 pub(crate) mod format;
 pub(crate) mod helpers;
@@ -53,6 +54,10 @@ pub enum DriveSubcommands {
     Read(read::ReadCommand),
     /// Finds Drive files sharing the same content hash.
     Dedupe(dedupe::DedupeCommand),
+    /// Creates a new file or folder, gated by the folder write-permission
+    /// rules (issue #1574). Requires the `drive.file` or `drive` scope
+    /// (`drive auth login --write-file`/`--write-full`).
+    Create(create::CreateCommand),
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
@@ -113,6 +118,7 @@ impl DriveSubcommands {
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
+            Self::Create(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
         }
@@ -344,6 +350,32 @@ mod tests {
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_create() {
+        // Unlike rename/move (whose engine fns return `Result` and
+        // propagate a network error via `?`), `create`'s engine fn always
+        // returns an `Ok`-shaped `CreateOutcome` — a fetch failure against
+        // the dead client becomes an embedded `Failed{detail}`, matching
+        // the exit-0-regardless-of-outcome convention (ADR-0071 §12), not
+        // a dispatch-level error. Needs env isolation (unlike the other
+        // dispatch_routes_* tests): `create`'s CLI layer resolves the
+        // active account's write_permissions.rules via `Settings::load()`,
+        // so without a clean $HOME it reads whatever real
+        // ~/.omni-dev/settings.json this process has.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Create(create::CreateCommand {
+            name: "New File".to_string(),
+            parent: "parent-1".to_string(),
+            folder: false,
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
     #[tokio::test]

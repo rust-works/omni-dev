@@ -89,6 +89,10 @@ fn record_attempt(
         added_principals: Vec::new(),
         removed_principals: Vec::new(),
         crosses_drive_boundary: false,
+        // Rename is never gated by the folder write-permission gate.
+        resolved_folder_id: None,
+        decided_by_folder_id: None,
+        decided_by_depth: None,
         error,
         duration,
     });
