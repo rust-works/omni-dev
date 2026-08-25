@@ -4,6 +4,7 @@ pub(crate) mod account;
 pub(crate) mod auth;
 pub(crate) mod create;
 pub(crate) mod dedupe;
+pub(crate) mod edit;
 pub(crate) mod format;
 pub(crate) mod helpers;
 /// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
@@ -63,6 +64,12 @@ pub enum DriveSubcommands {
     /// write-permission rules (issue #1574). Requires the `drive.file` or
     /// `drive` scope (`drive auth login --write-file`/`--write-full`).
     Upload(upload::UploadCommand),
+    /// Replaces an existing file's content, gated by the folder
+    /// write-permission rules (issue #1574). Requires the `drive.file`
+    /// scope if `omni-dev` created the file, or the unrestricted `drive`
+    /// scope for any pre-existing file (`drive auth login --write-file`
+    /// or `--write-full`).
+    Edit(edit::EditCommand),
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
@@ -125,6 +132,7 @@ impl DriveSubcommands {
             Self::Dedupe(cmd) => cmd.execute(client).await,
             Self::Create(cmd) => cmd.execute(client).await,
             Self::Upload(cmd) => cmd.execute(client).await,
+            Self::Edit(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
         }
@@ -398,6 +406,26 @@ mod tests {
             local_path,
             parent: "parent-1".to_string(),
             name: None,
+            mime_type: None,
+            dry_run: false,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_edit() {
+        // Same env-isolation and exit-0-regardless-of-outcome reasoning as
+        // dispatch_routes_create/dispatch_routes_upload.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let content_dir = tempfile::tempdir().unwrap();
+        let content_path = content_dir.path().join("new-content.txt");
+        std::fs::write(&content_path, b"content").unwrap();
+
+        let cmd = DriveSubcommands::Edit(edit::EditCommand {
+            file_id: "f1".to_string(),
+            content: content_path.to_str().unwrap().to_string(),
             mime_type: None,
             dry_run: false,
             output: OutputFormat::Table,

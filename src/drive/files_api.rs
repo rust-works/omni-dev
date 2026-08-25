@@ -276,6 +276,31 @@ impl<'a> FilesApi<'a> {
             .map_err(|err| append_write_scope_hint(err, WriteCapability::CreateOrUpload))
     }
 
+    /// Replaces an existing file's content (`files.update` with
+    /// `uploadType=media` — content-only, no multipart envelope since
+    /// there's no accompanying metadata change). Requires the `drive.file`
+    /// scope if `omni-dev` created `file_id`, or the unrestricted `drive`
+    /// scope for any pre-existing file.
+    ///
+    /// Refuses content over [`MAX_UPLOAD_BYTES`] before ever sending it.
+    pub async fn edit_content(
+        &self,
+        file_id: &str,
+        content: &[u8],
+        content_type: &str,
+    ) -> Result<DriveFile> {
+        check_upload_size(content.len() as u64)?;
+        let url = build_file_edit_content_url(self.client.base_url(), file_id)?;
+        let response = self
+            .client
+            .patch_bytes(url.as_str(), content, content_type)
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.update (media) response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
+
     /// Shared GET-then-check-status-then-collect-bytes body for
     /// [`Self::export`]/[`Self::download`] — both go through
     /// [`DriveClient::get_bytes`], not `get_json`/`get_parsed`.
@@ -386,6 +411,19 @@ fn build_file_upload_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// `files.update` URL for [`FilesApi::edit_content`], on Drive's `/upload/`
+/// path prefix (`uploadType=media` — content-only, no multipart envelope).
+fn build_file_edit_content_url(base_url: &str, file_id: &str) -> Result<Url> {
+    let mut url = DriveClient::api_url(base_url, &format!("/upload/drive/v3/files/{file_id}"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("uploadType", "media");
+        pairs.append_pair("fields", GET_FIELDS);
+        pairs.append_pair("supportsAllDrives", "true");
+    }
+    Ok(url)
+}
+
 /// A fresh, random `multipart/related` boundary — unlikely to collide with
 /// arbitrary binary content, unlike a fixed string would risk.
 fn generate_multipart_boundary() -> String {
@@ -480,10 +518,11 @@ pub(crate) enum WriteCapability {
     /// Creating a new file/folder, or uploading new content — `drive.file`
     /// or `drive`.
     CreateOrUpload,
-    // `EditContent` (edit's own capability, naming both --write-file and
-    // --write-full since the client can't cheaply tell which a given file
-    // id needs) is added alongside `drive edit` itself, not here — adding
-    // it now would be dead code until content_edit.rs exists.
+    /// Editing an existing file's content — `drive.file` if `omni-dev`
+    /// created it, `drive` (unrestricted) for any pre-existing file. The
+    /// client has no cheap way to know which a given file id is, so the
+    /// hint names both.
+    EditContent,
 }
 
 /// Appends an actionable hint to a mutating-call failure caused by an
@@ -509,6 +548,10 @@ fn append_write_scope_hint(err: anyhow::Error, capability: WriteCapability) -> a
         WriteCapability::CreateOrUpload => {
             "Run `omni-dev drive auth login --write-file` (or `--write-full`) to grant the \
              scope needed to create files/folders and upload content"
+        }
+        WriteCapability::EditContent => {
+            "Run `omni-dev drive auth login --write-file` if this file was created by \
+             omni-dev, or `--write-full` to edit any pre-existing file's content, then retry"
         }
     };
     err.context(hint)
@@ -1342,6 +1385,97 @@ mod tests {
         assert!(err.to_string().contains("--write-full"), "{err}");
     }
 
+    // ── edit_content ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn edit_content_sends_media_upload_type_and_returns_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("uploadType", "media"))
+            .and(wiremock::matchers::header("content-type", "text/plain"))
+            .and(wiremock::matchers::body_bytes(b"new content".to_vec()))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "existing.txt",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client)
+            .edit_content("f1", b"new content", "text/plain")
+            .await
+            .unwrap();
+        assert_eq!(file.id, "f1");
+    }
+
+    #[tokio::test]
+    async fn edit_content_refuses_oversized_content_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let oversized = vec![0u8; (MAX_UPLOAD_BYTES + 1) as usize];
+
+        let err = FilesApi::new(&client)
+            .edit_content("f1", &oversized, "application/octet-stream")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to upload"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn edit_content_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .edit_content("f1", b"content", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn edit_content_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client)
+            .edit_content("f1", b"content", "text/plain")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--write-file"), "{err}");
+        assert!(err.to_string().contains("--write-full"), "{err}");
+    }
+
+    #[test]
+    fn build_file_edit_content_url_includes_upload_type_fields_and_supports_all_drives() {
+        let url = build_file_edit_content_url("https://www.googleapis.com", "f1").unwrap();
+        assert!(url.path().ends_with("/upload/drive/v3/files/f1"));
+        assert!(url.as_str().contains("uploadType=media"));
+        assert!(url.as_str().contains("fields="));
+        assert!(url.as_str().contains("supportsAllDrives=true"));
+    }
+
     #[test]
     fn append_write_scope_hint_leaves_other_errors_unchanged() {
         let err = anyhow::anyhow!("some other failure");
@@ -1372,6 +1506,17 @@ mod tests {
         let msg = append_write_scope_hint(
             insufficient_permissions_error(),
             WriteCapability::CreateOrUpload,
+        )
+        .to_string();
+        assert!(msg.contains("--write-file"), "{msg}");
+        assert!(msg.contains("--write-full"), "{msg}");
+    }
+
+    #[test]
+    fn append_write_scope_hint_edit_content_names_both_flags() {
+        let msg = append_write_scope_hint(
+            insufficient_permissions_error(),
+            WriteCapability::EditContent,
         )
         .to_string();
         assert!(msg.contains("--write-file"), "{msg}");
