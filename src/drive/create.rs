@@ -118,21 +118,25 @@ async fn create_inner(
     rules: &[FolderPermissionRule],
 ) -> CreateOutcome {
     let files_api = FilesApi::new(client);
-    let chain =
-        match folder_ancestry::resolve_ancestor_chain(&files_api, &opts.parent_folder_id).await {
-            Ok(chain) => chain,
-            Err(err) => {
-                return CreateOutcome {
-                    name: opts.name.clone(),
-                    parent_folder_id: opts.parent_folder_id.clone(),
-                    result: CreateResult::Failed {
-                        detail: err.to_string(),
-                    },
-                }
+    let decision = match folder_ancestry::resolve_decision(
+        &files_api,
+        &opts.parent_folder_id,
+        DriveOperation::Create,
+        rules,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(err) => {
+            return CreateOutcome {
+                name: opts.name.clone(),
+                parent_folder_id: opts.parent_folder_id.clone(),
+                result: CreateResult::Failed {
+                    detail: err.to_string(),
+                },
             }
-        };
-
-    let decision = write_gate::resolve(&chain.folder_ids(), DriveOperation::Create, rules);
+        }
+    };
     if decision.verdict == write_gate::Verdict::Deny {
         return CreateOutcome {
             name: opts.name.clone(),

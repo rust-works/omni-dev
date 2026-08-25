@@ -4,11 +4,13 @@
 //! The most structurally distinct of the three mutating verbs: unlike
 //! `create`/`upload` (whose gate chain starts at the caller-given
 //! `--parent`), `edit`'s chain starts at the target's *current* parent
-//! folder(s) — `files.get` first, then one ancestor-chain walk per parent,
-//! combined via [`write_gate::combine_across_parents`] for a legacy
-//! multi-parent file (mirrors `visibility.rs`'s existing multi-parent-union
-//! contract). An orphan file with no parent degenerates to the bare
-//! default policy, correctly, via an empty chain.
+//! folder(s) — `files.get` first, then
+//! [`folder_ancestry::resolve_decision_for_parents`] resolves and combines
+//! a decision per parent for a legacy multi-parent file (mirrors
+//! `visibility.rs`'s existing multi-parent-union contract; shared with
+//! `drive permissions check`'s identical file-target case). An orphan file
+//! with no parent degenerates to the bare default policy, correctly, via
+//! an empty chain.
 //!
 //! Still single-target, so this follows `create.rs`/`upload.rs`'s linear-
 //! function shape, not `file_move.rs`'s batch Plan/Execute.
@@ -21,9 +23,7 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
-use crate::drive::write_gate::{
-    self, DecidingRule, Decision, DriveOperation, FolderPermissionRule,
-};
+use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
 /// Per-call edit options.
@@ -149,20 +149,26 @@ async fn edit_inner(
         };
     }
 
-    let (decision, resolved_folder_id) =
-        match evaluate_current_parents(&files_api, &target.parents, rules).await {
-            Ok(evaluated) => evaluated,
-            Err(err) => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id: None,
-                    result: EditResult::Failed {
-                        detail: err.to_string(),
-                    },
-                }
+    let (decision, resolved_folder_id) = match folder_ancestry::resolve_decision_for_parents(
+        &files_api,
+        &target.parents,
+        DriveOperation::Edit,
+        rules,
+    )
+    .await
+    {
+        Ok(evaluated) => evaluated,
+        Err(err) => {
+            return EditOutcome {
+                file_id: opts.file_id.clone(),
+                file_name: Some(target.name),
+                resolved_folder_id: None,
+                result: EditResult::Failed {
+                    detail: err.to_string(),
+                },
             }
-        };
+        }
+    };
 
     if decision.verdict == write_gate::Verdict::Deny {
         return EditOutcome {
@@ -199,35 +205,6 @@ async fn edit_inner(
         resolved_folder_id,
         result,
     }
-}
-
-/// Resolves `parents` (a target's *current* parent ids) into a combined
-/// [`Decision`], plus the single resolved folder id when there's exactly
-/// one parent (for request-log/report purposes — multi-parent targets
-/// report `None`, since no single folder id would be accurate).
-///
-/// An empty `parents` (orphan target) degenerates to the bare default
-/// policy via an empty chain, matching `write_gate::resolve`'s documented
-/// contract. A fetch failure on *any* parent's chain is a hard `Err` — the
-/// same fail-closed invariant `folder_ancestry::resolve_ancestor_chain`
-/// itself enforces, propagated rather than silently dropping that parent.
-async fn evaluate_current_parents(
-    files_api: &FilesApi<'_>,
-    parents: &[String],
-    rules: &[FolderPermissionRule],
-) -> anyhow::Result<(Decision, Option<String>)> {
-    let Some((first_parent, rest_parents)) = parents.split_first() else {
-        return Ok((write_gate::resolve(&[], DriveOperation::Edit, rules), None));
-    };
-    let first_chain = folder_ancestry::resolve_ancestor_chain(files_api, first_parent).await?;
-    let mut combined = write_gate::resolve(&first_chain.folder_ids(), DriveOperation::Edit, rules);
-    for parent_id in rest_parents {
-        let chain = folder_ancestry::resolve_ancestor_chain(files_api, parent_id).await?;
-        let decision = write_gate::resolve(&chain.folder_ids(), DriveOperation::Edit, rules);
-        combined = write_gate::combine_across_parents(combined, [decision]);
-    }
-    let resolved_folder_id = rest_parents.is_empty().then(|| first_parent.clone());
-    Ok((combined, resolved_folder_id))
 }
 
 /// Builds and writes the [`DriveMutationOutcome`] for one `edit` attempt.

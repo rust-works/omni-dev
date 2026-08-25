@@ -11,7 +11,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
-use crate::drive::write_gate::{self, Decision, DriveOperation, FolderPermissionRule, Verdict};
+use crate::drive::write_gate::{Decision, DriveOperation, FolderPermissionRule, Verdict};
 use crate::utils::settings::Settings;
 
 /// `--operation`'s value set — a thin CLI-layer copy of
@@ -38,10 +38,10 @@ impl From<OperationArg> for DriveOperation {
 }
 
 /// Evaluates the configured write-permission rules against a real target
-/// and prints the verdict — the same [`folder_ancestry::resolve_ancestor_chain`]
-/// and [`write_gate::resolve`] the real `create`/`upload`/`edit` engine
-/// modules call, so this diagnostic can never drift from actual
-/// enforcement.
+/// and prints the verdict — the same [`folder_ancestry::resolve_decision`]/
+/// [`folder_ancestry::resolve_decision_for_parents`] the real
+/// `create`/`upload`/`edit` engine modules call, so this diagnostic can
+/// never drift from actual enforcement.
 #[derive(Parser)]
 pub struct CheckCommand {
     /// The folder or file id to evaluate.
@@ -136,11 +136,13 @@ async fn run_check(
 
 /// Fetches `target_id` and evaluates `op` against it: a folder target's
 /// chain starts at itself (mirrors `create`/`upload`'s `--parent`
-/// semantics); a file target's chain starts at its *current* parent(s),
-/// unioned across every legacy multi-parent via
-/// [`write_gate::combine_across_parents`] (mirrors `drive edit`'s
-/// semantics) — an orphan file with no parent degenerates to the bare
-/// default policy.
+/// semantics, reusing the already-fetched metadata via
+/// [`folder_ancestry::resolve_decision_from`] rather than re-fetching it);
+/// a file target's chain starts at its *current* parent(s), unioned across
+/// every legacy multi-parent via
+/// [`folder_ancestry::resolve_decision_for_parents`] (mirrors `drive
+/// edit`'s semantics) — an orphan file with no parent degenerates to the
+/// bare default policy.
 async fn evaluate_target(
     files_api: &FilesApi<'_>,
     target_id: &str,
@@ -149,22 +151,12 @@ async fn evaluate_target(
 ) -> Result<Decision> {
     let target = files_api.get_metadata(target_id).await?;
     if target.mime_type == GOOGLE_FOLDER_MIME_TYPE {
-        let chain = folder_ancestry::resolve_ancestor_chain(files_api, target_id).await?;
-        return Ok(write_gate::resolve(&chain.folder_ids(), op, rules));
+        return folder_ancestry::resolve_decision_from(files_api, target, op, rules).await;
     }
-    let Some((first_parent, rest_parents)) = target.parents.split_first() else {
-        // Orphan file, no current parent: degenerates to the bare default
-        // policy, same as an empty chain would.
-        return Ok(write_gate::resolve(&[], op, rules));
-    };
-    let first_chain = folder_ancestry::resolve_ancestor_chain(files_api, first_parent).await?;
-    let mut combined = write_gate::resolve(&first_chain.folder_ids(), op, rules);
-    for parent_id in rest_parents {
-        let chain = folder_ancestry::resolve_ancestor_chain(files_api, parent_id).await?;
-        let decision = write_gate::resolve(&chain.folder_ids(), op, rules);
-        combined = write_gate::combine_across_parents(combined, [decision]);
-    }
-    Ok(combined)
+    let (decision, _resolved_folder_id) =
+        folder_ancestry::resolve_decision_for_parents(files_api, &target.parents, op, rules)
+            .await?;
+    Ok(decision)
 }
 
 /// Prints a `CheckReport` in the plain-text (non-`output_as`) form.
@@ -240,6 +232,10 @@ mod tests {
                     "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
                 })),
             )
+            // Exactly once: evaluate_target must reuse the metadata it
+            // already fetched to decide the target is a folder, not
+            // re-fetch it as the ancestor walk's own first call.
+            .expect(1)
             .mount(&server)
             .await;
         let files_api = FilesApi::new(&client);
