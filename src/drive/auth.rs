@@ -70,6 +70,21 @@ pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/drive.readonly
 /// Drive's narrowest write scope: `files.update` on `name`/`parents` only
 /// (rename/move), no file-content access. Opt-in via `--write`.
 pub const SCOPE_METADATA: &str = "https://www.googleapis.com/auth/drive.metadata";
+/// Per-file write scope, restricted by Google to files this app created.
+///
+/// Restricted by Google to files this app itself created (via this scope)
+/// or that the user explicitly picked through a Drive file picker (not
+/// applicable to a headless CLI). Sufficient for `drive create`/`drive
+/// upload`, and for `drive edit` on those same, app-created files. Opt-in
+/// via `--write-file` (issue #1574).
+pub const SCOPE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
+/// The unrestricted "full" Drive scope.
+///
+/// The only scope that can edit a file's content that already existed
+/// before `omni-dev` touched it. The largest privilege grant this
+/// integration has ever requested. Opt-in via `--write-full` (issue
+/// #1574).
+pub const SCOPE_FULL: &str = "https://www.googleapis.com/auth/drive";
 
 /// How long to wait for the browser sign-in callback before giving up.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,66 +98,113 @@ const REFRESH_SKEW: TimeDelta = TimeDelta::seconds(60);
 /// misbehaving or malicious token endpoint can't crash the process (#1531).
 const MAX_EXPIRES_IN_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 
-/// The Drive OAuth2 scope granted at login.
+/// The Drive OAuth2 scope(s) granted at login.
 ///
-/// Unlike Gmail's readonly/modify split, `Metadata` is requested
-/// *additively* over `ReadOnly`, never as a replacement: `drive.metadata`
-/// alone grants no file-content access, so read commands (`search`, `read`,
-/// export/download) still need `drive.readonly` too. The authorization
-/// request for `Metadata` therefore asks for both scopes together — see
-/// [`build_authorization_url`].
+/// A capability *set*, not a tier: `--write`/`--write-file`/`--write-full`
+/// are independent, combinable opt-ins (Google just grants the union), so
+/// a caller can hold any subset of the four scope strings, not one of two
+/// mutually exclusive levels (issue #1574, generalizing
+/// [ADR-0070](../../../docs/adrs/adr-0070.md) §1's additive-scope
+/// principle from two variants to four independent flags). `readonly` is
+/// always requested alongside every other flag — none of `metadata`/
+/// `file`/`full` alone grants read access the way Gmail's readonly/modify
+/// split would imply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DriveScope {
-    /// List/read/export/download files and metadata. Default; never
-    /// requests any mutation.
-    #[default]
-    ReadOnly,
-    /// Everything [`ReadOnly`](Self::ReadOnly) grants, plus `drive.metadata`
-    /// (`files.update` on `name`/`parents` — rename/move).
-    Metadata,
+pub struct DriveGrantedScopes {
+    /// `drive.readonly` — list/read/export/download.
+    pub readonly: bool,
+    /// `drive.metadata` — `files.update` on `name`/`parents` only
+    /// (rename/move).
+    pub metadata: bool,
+    /// `drive.file` — create/upload, plus edit of app-created files.
+    pub file: bool,
+    /// `drive` (unrestricted) — edit of any pre-existing file's content.
+    pub full: bool,
 }
 
-impl DriveScope {
-    /// Returns the wire scope string Google expects for status-reporting /
-    /// storage purposes. For [`Metadata`](Self::Metadata) this is just
-    /// [`SCOPE_METADATA`] — the *additive* `drive.readonly` request shape
-    /// lives in [`build_authorization_url`] alone, since Google's granted-
-    /// scope response and [`from_granted`](Self::from_granted) already
-    /// round-trip correctly off the single [`SCOPE_METADATA`] token.
+impl DriveGrantedScopes {
+    /// The scope set requested before issue #1574: readonly only.
+    pub const READONLY: Self = Self {
+        readonly: true,
+        metadata: false,
+        file: false,
+        full: false,
+    };
+    /// The scope set requested by `--write` before issue #1574: readonly +
+    /// metadata.
+    pub const METADATA: Self = Self {
+        readonly: true,
+        metadata: true,
+        file: false,
+        full: false,
+    };
+
+    /// Returns the canonical, order-stable, space-separated wire string —
+    /// used both for `DRIVE_SCOPE`/`drive.accounts.<name>.scope` storage
+    /// and directly as [`build_authorization_url`]'s requested `scope=`
+    /// value, since `readonly` is now just one of four independent bits
+    /// rather than a request shape [`build_authorization_url`] has to
+    /// derive separately.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => SCOPE_READONLY,
-            Self::Metadata => SCOPE_METADATA,
-        }
+    pub fn as_str(self) -> String {
+        [
+            self.readonly.then_some(SCOPE_READONLY),
+            self.metadata.then_some(SCOPE_METADATA),
+            self.file.then_some(SCOPE_FILE),
+            self.full.then_some(SCOPE_FULL),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
     }
 
-    /// Parses Google's space-separated granted-scope response, treating the
-    /// presence of the metadata scope anywhere in it as
-    /// [`Metadata`](Self::Metadata) and the readonly scope (with no
-    /// metadata) as [`ReadOnly`](Self::ReadOnly).
+    /// Parses Google's space-separated granted-scope response. Every
+    /// recognized token independently sets its own flag (order-independent,
+    /// unlike a first-match branch).
     ///
-    /// Returns `None` when neither Drive scope is present — e.g. the user
-    /// left the Drive permission unticked on Google's consent screen — so
-    /// callers can reject the grant instead of silently defaulting to
-    /// [`ReadOnly`](Self::ReadOnly).
+    /// Returns `None` when none of the four Drive scope strings are
+    /// present — e.g. the user left the Drive permission unticked on
+    /// Google's consent screen — so callers can reject the grant instead
+    /// of silently defaulting to an all-false set.
     #[must_use]
     pub fn from_granted(granted: &str) -> Option<Self> {
         let tokens: Vec<&str> = granted.split_whitespace().collect();
-        if tokens.contains(&SCOPE_METADATA) {
-            Some(Self::Metadata)
-        } else if tokens.contains(&SCOPE_READONLY) {
-            Some(Self::ReadOnly)
-        } else {
-            None
-        }
+        let scopes = Self {
+            readonly: tokens.contains(&SCOPE_READONLY),
+            metadata: tokens.contains(&SCOPE_METADATA),
+            file: tokens.contains(&SCOPE_FILE),
+            full: tokens.contains(&SCOPE_FULL),
+        };
+        (scopes != Self::default()).then_some(scopes)
     }
 
-    /// Whether this scope allows mutating calls (`files.update` on
-    /// `name`/`parents` — rename/move).
+    /// Whether this scope set allows `files.update` on `name`/`parents`
+    /// (rename/move).
+    #[must_use]
+    pub fn allows_rename_move(self) -> bool {
+        self.metadata
+    }
+
+    /// Whether this scope set allows creating a new file/folder or
+    /// uploading new content.
+    #[must_use]
+    pub fn allows_create_or_upload(self) -> bool {
+        self.file || self.full
+    }
+
+    /// Whether this scope set allows editing a file `omni-dev` did *not*
+    /// itself create — only the unrestricted `drive` scope can; `drive.file`
+    /// alone cannot.
+    #[must_use]
+    pub fn allows_edit_arbitrary_content(self) -> bool {
+        self.full
+    }
+
+    /// Whether this scope set allows any mutating call at all.
     #[must_use]
     pub fn allows_write(self) -> bool {
-        matches!(self, Self::Metadata)
+        self.metadata || self.file || self.full
     }
 }
 
@@ -156,8 +218,8 @@ pub struct DriveCredentials {
     pub client_secret: Secret,
     /// The stored refresh token (redacted in `Debug` output).
     pub refresh_token: Secret,
-    /// The scope granted at the login that produced this refresh token.
-    pub scope: DriveScope,
+    /// The scope(s) granted at the login that produced this refresh token.
+    pub scope: DriveGrantedScopes,
 }
 
 /// Secret-free presence/scope report, safe to serialise (e.g. over MCP).
@@ -327,7 +389,7 @@ fn load_named_credentials(drive: &DriveSettings, name: &str) -> Result<DriveCred
     let scope = account
         .scope
         .as_deref()
-        .and_then(DriveScope::from_granted)
+        .and_then(DriveGrantedScopes::from_granted)
         .unwrap_or_default();
 
     Ok(DriveCredentials {
@@ -356,13 +418,16 @@ pub(crate) fn load_credentials_with(
         .var(DRIVE_REFRESH_TOKEN)
         .ok_or(DriveError::CredentialsNotFound)?;
     // Unlike login (which rejects an unparseable grant outright), a stored
-    // scope that no longer parses degrades to ReadOnly rather than erroring:
-    // it was already validated when written, and failing closed here is
-    // safe (a stale Metadata silently becoming ReadOnly still fails at the
-    // API, not open).
+    // scope that no longer parses degrades to an all-false scope set rather
+    // than erroring: it was already validated when written, and failing
+    // closed here is safe — scope is never used to gate a real API call
+    // client-side (no pre-flight check anywhere, see
+    // `files_api::append_write_scope_hint`), only status display, so an
+    // all-false fallback just means status reporting says "no recognized
+    // scope" instead of overclaiming one.
     let scope = env
         .var(DRIVE_SCOPE)
-        .and_then(|s| DriveScope::from_granted(&s))
+        .and_then(|s| DriveGrantedScopes::from_granted(&s))
         .unwrap_or_default();
 
     Ok(DriveCredentials {
@@ -475,6 +540,7 @@ pub(crate) fn save_credentials_to(
     profile: Option<&str>,
     credentials: &DriveCredentials,
 ) -> Result<()> {
+    let scope_str = credentials.scope.as_str();
     Settings::upsert_env_vars_in(
         settings_path,
         profile,
@@ -488,7 +554,7 @@ pub(crate) fn save_credentials_to(
                 DRIVE_REFRESH_TOKEN,
                 credentials.refresh_token.expose_secret(),
             ),
-            (DRIVE_SCOPE, credentials.scope.as_str()),
+            (DRIVE_SCOPE, scope_str.as_str()),
         ],
     )
 }
@@ -512,7 +578,7 @@ fn named_account_vars(credentials: &DriveCredentials) -> [(&str, serde_json::Val
         ),
         (
             "scope",
-            serde_json::Value::String(credentials.scope.as_str().to_string()),
+            serde_json::Value::String(credentials.scope.as_str()),
         ),
     ]
 }
@@ -687,18 +753,17 @@ fn code_challenge(code_verifier: &str) -> String {
 fn build_authorization_url(
     client_id: &str,
     redirect_uri: &str,
-    scope: DriveScope,
+    scope: DriveGrantedScopes,
     state: &str,
     code_challenge: &str,
 ) -> Result<Url> {
     let mut url =
         Url::parse(AUTHORIZATION_ENDPOINT).context("Invalid Drive authorization endpoint")?;
-    // Metadata is requested *additively* over ReadOnly — see DriveScope's
-    // doc comment for why a single `scope.as_str()` isn't enough here.
-    let requested_scope = match scope {
-        DriveScope::ReadOnly => SCOPE_READONLY.to_string(),
-        DriveScope::Metadata => format!("{SCOPE_READONLY} {SCOPE_METADATA}"),
-    };
+    // `scope.as_str()` is now the requested-scope string directly — the
+    // caller is responsible for setting `readonly: true` alongside
+    // whichever write flags it wants, so there's no separate match to
+    // derive an "additive over readonly" request shape here any more.
+    let requested_scope = scope.as_str();
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
@@ -1006,7 +1071,7 @@ impl DriveSession {
 pub async fn login(
     client_id: &str,
     client_secret: &Secret,
-    scope: DriveScope,
+    scope: DriveGrantedScopes,
     browser: &BrowserConfig,
 ) -> Result<DriveAuthStatus> {
     login_to(
@@ -1028,7 +1093,7 @@ pub(crate) async fn login_to(
     profile: Option<&str>,
     client_id: &str,
     client_secret: &Secret,
-    scope: DriveScope,
+    scope: DriveGrantedScopes,
     browser: &BrowserConfig,
     token_endpoint: &str,
 ) -> Result<DriveAuthStatus> {
@@ -1049,7 +1114,7 @@ pub(crate) async fn login_for(
     explicit: Option<&str>,
     client_id: &str,
     client_secret: &Secret,
-    scope: DriveScope,
+    scope: DriveGrantedScopes,
     browser: &BrowserConfig,
 ) -> Result<DriveAuthStatus> {
     let settings = Settings::load().unwrap_or_default();
@@ -1086,7 +1151,7 @@ pub(crate) async fn login_for(
 async fn run_login_flow(
     client_id: &str,
     client_secret: &Secret,
-    scope: DriveScope,
+    scope: DriveGrantedScopes,
     browser: &BrowserConfig,
     token_endpoint: &str,
 ) -> Result<DriveCredentials> {
@@ -1137,7 +1202,7 @@ async fn run_login_flow(
         .refresh_token
         .ok_or(DriveError::MalformedTokenResponse("refresh_token"))?;
     let granted_raw = tokens.scope.unwrap_or_default();
-    let granted_scope = DriveScope::from_granted(&granted_raw).ok_or_else(|| {
+    let granted_scope = DriveGrantedScopes::from_granted(&granted_raw).ok_or_else(|| {
         let received = if granted_raw.trim().is_empty() {
             "none".to_string()
         } else {
@@ -1164,7 +1229,7 @@ fn status_from_credentials(credentials: &DriveCredentials) -> DriveAuthStatus {
         has_client_id: true,
         has_client_secret: true,
         has_refresh_token: true,
-        scope: Some(credentials.scope.as_str().to_string()),
+        scope: Some(credentials.scope.as_str()),
     }
 }
 
@@ -1178,6 +1243,96 @@ mod tests {
     use super::*;
 
     // ── Pure helpers ─────────────────────────────────────────────────
+
+    // ── DriveGrantedScopes ───────────────────────────────────────────
+
+    #[test]
+    fn from_granted_sets_each_flag_independently_order_agnostic() {
+        let scope =
+            DriveGrantedScopes::from_granted(&format!("{SCOPE_FULL} {SCOPE_READONLY}")).unwrap();
+        assert!(scope.readonly);
+        assert!(!scope.metadata);
+        assert!(!scope.file);
+        assert!(scope.full);
+    }
+
+    #[test]
+    fn from_granted_recognizes_all_four_scopes_together() {
+        let granted = format!("{SCOPE_READONLY} {SCOPE_METADATA} {SCOPE_FILE} {SCOPE_FULL}");
+        let scope = DriveGrantedScopes::from_granted(&granted).unwrap();
+        assert!(scope.readonly);
+        assert!(scope.metadata);
+        assert!(scope.file);
+        assert!(scope.full);
+    }
+
+    #[test]
+    fn from_granted_returns_none_when_no_drive_scope_present() {
+        assert_eq!(
+            DriveGrantedScopes::from_granted("openid email profile"),
+            None
+        );
+        assert_eq!(DriveGrantedScopes::from_granted(""), None);
+    }
+
+    #[test]
+    fn as_str_round_trips_through_from_granted() {
+        let scope = DriveGrantedScopes {
+            readonly: true,
+            metadata: false,
+            file: true,
+            full: false,
+        };
+        let round_tripped = DriveGrantedScopes::from_granted(&scope.as_str()).unwrap();
+        assert_eq!(scope, round_tripped);
+    }
+
+    #[test]
+    fn as_str_orders_scopes_readonly_metadata_file_full() {
+        let scope = DriveGrantedScopes {
+            readonly: true,
+            metadata: true,
+            file: true,
+            full: true,
+        };
+        assert_eq!(
+            scope.as_str(),
+            format!("{SCOPE_READONLY} {SCOPE_METADATA} {SCOPE_FILE} {SCOPE_FULL}")
+        );
+    }
+
+    #[test]
+    fn allows_predicates_reflect_the_capability_each_names() {
+        assert!(!DriveGrantedScopes::READONLY.allows_write());
+        assert!(!DriveGrantedScopes::READONLY.allows_rename_move());
+        assert!(!DriveGrantedScopes::READONLY.allows_create_or_upload());
+        assert!(!DriveGrantedScopes::READONLY.allows_edit_arbitrary_content());
+
+        assert!(DriveGrantedScopes::METADATA.allows_write());
+        assert!(DriveGrantedScopes::METADATA.allows_rename_move());
+        assert!(!DriveGrantedScopes::METADATA.allows_create_or_upload());
+
+        let file_only = DriveGrantedScopes {
+            readonly: true,
+            metadata: false,
+            file: true,
+            full: false,
+        };
+        assert!(file_only.allows_create_or_upload());
+        assert!(
+            !file_only.allows_edit_arbitrary_content(),
+            "drive.file alone cannot edit an arbitrary pre-existing file"
+        );
+
+        let full_only = DriveGrantedScopes {
+            readonly: true,
+            metadata: false,
+            file: false,
+            full: true,
+        };
+        assert!(full_only.allows_create_or_upload());
+        assert!(full_only.allows_edit_arbitrary_content());
+    }
 
     #[test]
     fn code_challenge_matches_rfc_7636_test_vector() {
@@ -1211,7 +1366,7 @@ mod tests {
         let url = build_authorization_url(
             "client-123",
             "http://127.0.0.1:5555",
-            DriveScope::ReadOnly,
+            DriveGrantedScopes::READONLY,
             "state-abc",
             "challenge-xyz",
         )
@@ -1233,7 +1388,7 @@ mod tests {
         let url = build_authorization_url(
             "client-123",
             "http://127.0.0.1:5555",
-            DriveScope::Metadata,
+            DriveGrantedScopes::METADATA,
             "state-abc",
             "challenge-xyz",
         )
@@ -1318,7 +1473,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: Secret::new("secret-1"),
             refresh_token: Secret::new("refresh-1"),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         assert_eq!(
             named_account_vars(&credentials),
@@ -1727,7 +1882,7 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    DriveScope::ReadOnly,
+                    DriveGrantedScopes::READONLY,
                     &browser,
                     "http://127.0.0.1:1/token", // never reached — fails before exchange
                 )
@@ -1947,7 +2102,7 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    DriveScope::ReadOnly,
+                    DriveGrantedScopes::READONLY,
                     &browser,
                     &token_endpoint,
                 )
@@ -2028,7 +2183,7 @@ mod tests {
                     None,
                     "client-id",
                     &Secret::new("client-secret"),
-                    DriveScope::ReadOnly,
+                    DriveGrantedScopes::READONLY,
                     &browser,
                     &token_endpoint,
                 )
@@ -2111,7 +2266,7 @@ mod tests {
                 None,
                 "client-id",
                 &Secret::new("client-secret"),
-                DriveScope::ReadOnly,
+                DriveGrantedScopes::READONLY,
                 &browser,
             )
             .await;
@@ -2150,7 +2305,7 @@ mod tests {
                 Some("work"),
                 "client-id",
                 &Secret::new("client-secret"),
-                DriveScope::ReadOnly,
+                DriveGrantedScopes::READONLY,
                 &browser,
             )
             .await;
@@ -2262,7 +2417,7 @@ mod tests {
             client_id: "client-1".to_string(),
             client_secret: "secret-1".into(),
             refresh_token: "refresh-1".into(),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         }
     }
 
@@ -2484,7 +2639,7 @@ mod tests {
             client_id: "client-visible".to_string(),
             client_secret: "sekret-client-secret".into(),
             refresh_token: "sekret-refresh-token".into(),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         let debug = format!("{creds:?}");
         assert!(debug.contains("DriveCredentials"));
@@ -2561,7 +2716,11 @@ mod tests {
             .with(DRIVE_REFRESH_TOKEN, "r");
         let creds = load_credentials_with(&env).unwrap();
         assert_eq!(creds.client_id, "c");
-        assert_eq!(creds.scope, DriveScope::ReadOnly);
+        // No DRIVE_SCOPE set: degrades to an all-false scope set (not the
+        // old ReadOnly default) — scope is never used to gate a real API
+        // call client-side, only status display, so this is a safe,
+        // strictly more conservative fallback (issue #1574).
+        assert_eq!(creds.scope, DriveGrantedScopes::default());
     }
 
     /// Save + remove round-trip against injected settings-file paths — no
@@ -2580,7 +2739,7 @@ mod tests {
                 client_id: "client-1".to_string(),
                 client_secret: "secret-1".into(),
                 refresh_token: "refresh-1".into(),
-                scope: DriveScope::ReadOnly,
+                scope: DriveGrantedScopes::READONLY,
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -2619,7 +2778,7 @@ mod tests {
                 client_id: "client-2".to_string(),
                 client_secret: "secret-2".into(),
                 refresh_token: "refresh-2".into(),
-                scope: DriveScope::ReadOnly,
+                scope: DriveGrantedScopes::READONLY,
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -2691,7 +2850,7 @@ mod tests {
             client_id: "client-p".to_string(),
             client_secret: "secret-p".into(),
             refresh_token: "refresh-p".into(),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
 
@@ -2728,7 +2887,7 @@ mod tests {
             client_id: "wrapper-client".to_string(),
             client_secret: "wrapper-secret".into(),
             refresh_token: "wrapper-refresh".into(),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
         save_credentials(&creds).unwrap();
 
@@ -2782,7 +2941,7 @@ mod tests {
         assert_eq!(creds.client_id, "work-id");
         assert_eq!(creds.client_secret.expose_secret(), "work-secret");
         assert_eq!(creds.refresh_token.expose_secret(), "work-refresh");
-        assert_eq!(creds.scope, DriveScope::ReadOnly);
+        assert_eq!(creds.scope, DriveGrantedScopes::READONLY);
     }
 
     #[test]
@@ -2965,7 +3124,7 @@ mod tests {
             client_id: "id".to_string(),
             client_secret: "secret".into(),
             refresh_token: "refresh".into(),
-            scope: DriveScope::ReadOnly,
+            scope: DriveGrantedScopes::READONLY,
         };
 
         let dir_direct = guard.clear_credentials();

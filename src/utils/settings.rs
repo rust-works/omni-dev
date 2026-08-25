@@ -226,11 +226,12 @@ pub struct DriveAccountSettings {
     /// equivalent settings field, for the same reason): this is a
     /// status-reporting cache of whatever was actually granted, not the
     /// value driving a live login decision — that's
-    /// [`crate::drive::auth::DriveScope`], read from this field via
-    /// [`crate::drive::auth::DriveScope::from_granted`]
+    /// [`crate::drive::auth::DriveGrantedScopes`], read from this field via
+    /// [`crate::drive::auth::DriveGrantedScopes::from_granted`]
     /// ([ADR-0070](../../docs/adrs/adr-0070.md), reversing
     /// [ADR-0069](../../docs/adrs/adr-0069.md) §2's "no `DriveScope` enum,
-    /// read-only by design").
+    /// read-only by design"; further generalized from a 2-variant enum to a
+    /// capability set by issue #1574).
     #[serde(default)]
     pub scope: Option<String>,
     /// Google account address for this account. Populated opportunistically
