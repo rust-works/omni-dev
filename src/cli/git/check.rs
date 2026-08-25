@@ -108,7 +108,7 @@ impl CheckCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let mut repo_view = self.generate_repository_view(repo_root).await?;
+        let mut repo_view = self.generate_repository_view(repo_root)?;
 
         // 2. Check for empty commit range (exit code 3)
         if repo_view.commits.is_empty() {
@@ -121,7 +121,7 @@ impl CheckCommand {
         }
 
         // 3. Load commit guidelines and scopes
-        let guidelines = self.load_guidelines(repo_root).await?;
+        let guidelines = self.load_guidelines(repo_root)?;
         let valid_scopes = self.load_scopes(repo_root);
 
         // Refine detected scopes using file_patterns from scope definitions
@@ -179,14 +179,12 @@ impl CheckCommand {
             use std::io::IsTerminal;
             let amendments = self.build_amendments_from_suggestions(&report, &repo_view);
             if !amendments.is_empty()
-                && self
-                    .prompt_and_apply_suggestions(
-                        repo_root,
-                        amendments,
-                        std::io::stdin().is_terminal(),
-                        &mut std::io::BufReader::new(std::io::stdin()),
-                    )
-                    .await?
+                && self.prompt_and_apply_suggestions(
+                    repo_root,
+                    amendments,
+                    std::io::stdin().is_terminal(),
+                    &mut std::io::BufReader::new(std::io::stdin()),
+                )?
             {
                 // Amendments applied — exit successfully
                 return Ok(());
@@ -203,7 +201,7 @@ impl CheckCommand {
     }
 
     /// Generates the repository view (reuses logic from TwiddleCommand).
-    async fn generate_repository_view(
+    fn generate_repository_view(
         &self,
         repo_root: &std::path::Path,
     ) -> Result<crate::data::RepositoryView> {
@@ -284,7 +282,7 @@ impl CheckCommand {
     }
 
     /// Loads commit guidelines from file or context directory.
-    async fn load_guidelines(&self, repo_root: &std::path::Path) -> Result<Option<String>> {
+    fn load_guidelines(&self, repo_root: &std::path::Path) -> Result<Option<String>> {
         // If explicit guidelines path is provided, use it
         if let Some(guidelines_path) = &self.guidelines {
             let content = std::fs::read_to_string(guidelines_path).with_context(|| {
@@ -736,7 +734,7 @@ impl CheckCommand {
     ///
     /// `is_terminal` and `reader` are injected so tests can drive the function
     /// without blocking on real stdin.
-    async fn prompt_and_apply_suggestions(
+    fn prompt_and_apply_suggestions(
         &self,
         repo_root: &std::path::Path,
         amendments: Vec<crate::data::amendments::Amendment>,
@@ -1880,8 +1878,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn prompt_and_apply_suggestions_non_terminal_returns_false() {
+    #[test]
+    fn prompt_and_apply_suggestions_non_terminal_returns_false() {
         // is_terminal=false → non-interactive warning, returns Ok(false) immediately.
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
@@ -1892,13 +1890,12 @@ mod tests {
                 false,
                 &mut reader,
             )
-            .await
             .unwrap();
         assert!(!result, "non-terminal should return false");
     }
 
-    #[tokio::test]
-    async fn prompt_and_apply_suggestions_eof_returns_false() {
+    #[test]
+    fn prompt_and_apply_suggestions_eof_returns_false() {
         // is_terminal=true, EOF reader → read_line returns 0, returns Ok(false).
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
@@ -1909,13 +1906,12 @@ mod tests {
                 true,
                 &mut reader,
             )
-            .await
             .unwrap();
         assert!(!result, "EOF should return false");
     }
 
-    #[tokio::test]
-    async fn prompt_and_apply_suggestions_quit_returns_false() {
+    #[test]
+    fn prompt_and_apply_suggestions_quit_returns_false() {
         // is_terminal=true, "q\n" → user quits, returns Ok(false).
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"q\n" as &[u8]);
@@ -1926,13 +1922,12 @@ mod tests {
                 true,
                 &mut reader,
             )
-            .await
             .unwrap();
         assert!(!result, "quit should return false");
     }
 
-    #[tokio::test]
-    async fn prompt_and_apply_suggestions_invalid_then_quit_returns_false() {
+    #[test]
+    fn prompt_and_apply_suggestions_invalid_then_quit_returns_false() {
         // is_terminal=true, invalid input then "q\n" → prints error, then user quits.
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"x\nq\n" as &[u8]);
@@ -1943,7 +1938,6 @@ mod tests {
                 true,
                 &mut reader,
             )
-            .await
             .unwrap();
         assert!(!result, "invalid then quit should return false");
     }

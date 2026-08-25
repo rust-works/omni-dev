@@ -155,7 +155,7 @@ impl TwiddleCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let mut full_repo_view = self.generate_repository_view(repo_root).await?;
+        let mut full_repo_view = self.generate_repository_view(repo_root)?;
 
         // 2. Use parallel map-reduce for multiple commits
         if full_repo_view.commits.len() > 1 {
@@ -166,7 +166,7 @@ impl TwiddleCommand {
 
         // 3. Collect contextual information (Phase 3)
         let context = if use_contextual {
-            Some(self.collect_context(repo_root, &full_repo_view).await?)
+            Some(self.collect_context(repo_root, &full_repo_view)?)
         } else {
             None
         };
@@ -250,8 +250,7 @@ impl TwiddleCommand {
             }
 
             // 8. Apply amendments (re-read from file to capture any user edits)
-            self.apply_amendments_from_file(repo_root, &amendments_file)
-                .await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)?;
             println!("✅ Commit messages improved successfully!");
 
             // 9. Run post-twiddle check if --check flag is set
@@ -300,7 +299,7 @@ impl TwiddleCommand {
 
         // Collect context once (shared across all commits)
         let context = if use_contextual {
-            Some(self.collect_context(repo_root, &full_repo_view).await?)
+            Some(self.collect_context(repo_root, &full_repo_view)?)
         } else {
             None
         };
@@ -582,8 +581,7 @@ impl TwiddleCommand {
                 }
             }
 
-            self.apply_amendments_from_file(repo_root, &amendments_file)
-                .await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)?;
             println!("✅ Commit messages improved successfully!");
 
             if self.check {
@@ -597,7 +595,7 @@ impl TwiddleCommand {
     }
 
     /// Generates the repository view (reuses ViewCommand logic).
-    async fn generate_repository_view(
+    fn generate_repository_view(
         &self,
         repo_root: &std::path::Path,
     ) -> Result<crate::data::RepositoryView> {
@@ -799,7 +797,7 @@ impl TwiddleCommand {
     }
 
     /// Applies amendments from a file path (re-reads from disk to capture user edits).
-    async fn apply_amendments_from_file(
+    fn apply_amendments_from_file(
         &self,
         repo_root: &std::path::Path,
         amendments_file: &std::path::Path,
@@ -819,7 +817,7 @@ impl TwiddleCommand {
     }
 
     /// Collects contextual information for enhanced commit message generation.
-    async fn collect_context(
+    fn collect_context(
         &self,
         repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
@@ -1048,7 +1046,7 @@ impl TwiddleCommand {
         println!("📋 Generating amendments YAML without AI processing...");
 
         // Generate repository view to get all commits
-        let repo_view = self.generate_repository_view(repo_root).await?;
+        let repo_view = self.generate_repository_view(repo_root)?;
 
         // Create amendments with original commit messages (no AI improvements)
         let amendments: Vec<Amendment> = repo_view
@@ -1094,8 +1092,7 @@ impl TwiddleCommand {
             }
 
             // Apply amendments (re-read from file to capture any user edits)
-            self.apply_amendments_from_file(repo_root, &amendments_file)
-                .await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)?;
             println!("✅ Commit messages applied successfully!");
 
             // Run post-twiddle check if --check flag is set
@@ -1129,7 +1126,7 @@ impl TwiddleCommand {
             }
 
             // Generate fresh repository view to get updated commit messages
-            let mut repo_view = self.generate_repository_view(repo_root).await?;
+            let mut repo_view = self.generate_repository_view(repo_root)?;
 
             if repo_view.commits.is_empty() {
                 println!("⚠️  No commits to check");
@@ -1214,8 +1211,7 @@ impl TwiddleCommand {
             amendment_file
                 .save_to_file(temp_file.path())
                 .context("Failed to save retry amendments")?;
-            self.apply_amendments_from_file(repo_root, temp_file.path())
-                .await?;
+            self.apply_amendments_from_file(repo_root, temp_file.path())?;
         }
 
         Ok(())

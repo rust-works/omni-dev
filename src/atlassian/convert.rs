@@ -1648,7 +1648,7 @@ fn escape_emoji_shortcodes(text: &str) -> String {
             if after < text.len() {
                 let name_end = text[after..]
                     .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '+' && c != '-')
-                    .map_or(text[after..].len(), |pos| pos);
+                    .unwrap_or(text[after..].len());
                 if name_end > 0
                     && after + name_end < text.len()
                     && text.as_bytes()[after + name_end] == b':'

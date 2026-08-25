@@ -205,7 +205,7 @@ impl DiffCommand {
     ///
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
-    pub async fn execute(mut self, repo: Option<&Path>) -> Result<()> {
+    pub fn execute(mut self, repo: Option<&Path>) -> Result<()> {
         if let Some(format) = self.format.take() {
             eprintln!("warning: --format is deprecated; use -o/--output instead");
             self.output = format;
@@ -914,30 +914,30 @@ mod tests {
         assert!(opts.collapse_ranges);
     }
 
-    #[tokio::test]
-    async fn execute_succeeds_and_gate_bails() {
+    #[test]
+    fn execute_succeeds_and_gate_bails() {
         let (_dir, repo, base) = repo_with_added_file();
         let report = write_head_lcov(&repo);
         // Passing gate: execute prints and returns Ok.
         let mut cmd = command(report.clone(), &base);
         cmd.fail_under_patch = Some(10.0);
-        assert!(cmd.execute(Some(&repo)).await.is_ok());
+        assert!(cmd.execute(Some(&repo)).is_ok());
 
         // Failing gate: execute returns Err.
         let mut cmd = command(report, &base);
         cmd.fail_under_patch = Some(99.0);
-        assert!(cmd.execute(Some(&repo)).await.is_err());
+        assert!(cmd.execute(Some(&repo)).is_err());
     }
 
-    #[tokio::test]
-    async fn execute_folds_deprecated_format_flag() {
+    #[test]
+    fn execute_folds_deprecated_format_flag() {
         let (_dir, repo, base) = repo_with_added_file();
         let report = write_head_lcov(&repo);
         // The deprecated `--format` is folded into `output` with a warning
         // before `run` reads it.
         let mut cmd = command(report, &base);
         cmd.format = Some(OutputFormatArg::Yaml);
-        assert!(cmd.execute(Some(&repo)).await.is_ok());
+        assert!(cmd.execute(Some(&repo)).is_ok());
     }
 
     /// The injected repo root drives BOTH the git repository and relative

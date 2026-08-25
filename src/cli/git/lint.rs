@@ -85,7 +85,7 @@ pub struct LintCommand {
 impl LintCommand {
     /// Executes the lint command, validating commit messages against
     /// deterministic rules.
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
         if self.stdin && (self.suggest || self.fix) {
             anyhow::bail!(
                 "--suggest/--fix require a commit range (not --stdin) — a bare message has no \
@@ -755,8 +755,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -778,8 +777,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -803,8 +801,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok(), "expected clean exit, got: {result:?}");
     }
 
@@ -850,8 +847,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -885,8 +881,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -914,8 +909,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok());
     }
 
@@ -950,8 +944,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok(), "expected clean exit, got: {result:?}");
     }
 
@@ -981,8 +974,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute(Some(temp_dir.path())));
+        let result = cmd.execute(Some(temp_dir.path()));
         assert!(result.is_ok(), "expected clean exit, got: {result:?}");
     }
 
@@ -1066,8 +1058,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cli_execute_stdin_with_suggest_errors() {
+    #[test]
+    fn cli_execute_stdin_with_suggest_errors() {
         let cmd = LintCommand {
             commit_range: None,
             context_dir: None,
@@ -1082,7 +1074,7 @@ mod tests {
             fix: false,
             allow_pushed: false,
         };
-        let err = cmd.execute(None).await.unwrap_err();
+        let err = cmd.execute(None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("--suggest/--fix require a commit range"),
@@ -1090,8 +1082,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cli_execute_stdin_with_fix_errors() {
+    #[test]
+    fn cli_execute_stdin_with_fix_errors() {
         let cmd = LintCommand {
             commit_range: None,
             context_dir: None,
@@ -1106,7 +1098,7 @@ mod tests {
             fix: true,
             allow_pushed: false,
         };
-        let err = cmd.execute(None).await.unwrap_err();
+        let err = cmd.execute(None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("--suggest/--fix require a commit range"));
     }

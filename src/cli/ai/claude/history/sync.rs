@@ -439,7 +439,7 @@ fn plan_session(session: &Session, target_path: &Path, format: FileFormat) -> Re
     match fs::metadata(target_path) {
         Ok(meta) => {
             let same_size = meta.len() == session.size;
-            let same_mtime = meta.modified().ok().is_some_and(|t| t == session.mtime);
+            let same_mtime = meta.modified().is_ok_and(|t| t == session.mtime);
             // Markdown is a derived artefact whose on-disk length differs from
             // the source jsonl, so size cannot participate in the key. The
             // source jsonl is append-only, making mtime alone a sufficient
