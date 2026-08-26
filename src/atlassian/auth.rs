@@ -769,6 +769,53 @@ mod tests {
         }
     }
 
+    /// A corrupted settings file makes the underlying
+    /// `Settings::upsert_env_vars_in` read fail; `save_credentials_to` must
+    /// propagate that error rather than silently proceeding (Basic branch).
+    #[test]
+    fn save_credentials_to_basic_propagates_corrupted_settings_error() {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, "{ not valid json").unwrap();
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://org.atlassian.net".to_string(),
+            auth: AtlassianAuth::Basic {
+                email: "user@test.com".to_string(),
+                api_token: "token".into(),
+            },
+        };
+        let err = save_credentials_to(&settings_path, None, &creds).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse"), "{err}");
+    }
+
+    /// Same as above for the Bearer branch (issue #1578).
+    #[test]
+    fn save_credentials_to_bearer_propagates_corrupted_settings_error() {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, "{ not valid json").unwrap();
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://jira.example.com".to_string(),
+            auth: AtlassianAuth::Bearer {
+                token: "my-pat".into(),
+            },
+        };
+        let err = save_credentials_to(&settings_path, None, &creds).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse"), "{err}");
+    }
+
     /// A profile-targeted save lands under `profiles.<name>.env` — where the
     /// profile-aware read side will find it — and leaves the base `env`
     /// untouched (issue #1116).
