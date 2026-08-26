@@ -214,6 +214,9 @@ Read, write, and manage JIRA issues and Confluence pages from the command line:
 # Authenticate with Atlassian Cloud
 omni-dev atlassian auth login
 
+# Or, for Jira/Confluence Server & Data Center (Personal Access Token)
+omni-dev atlassian auth login --pat
+
 # Check authentication status
 omni-dev atlassian auth status
 
@@ -979,9 +982,10 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
     `CLAUDE_CODE_MODEL`, `ANTHROPIC_MODEL` for Claude-family backends;
     `OPENAI_MODEL`; `OLLAMA_MODEL`) or `~/.omni-dev/settings.json`
   - Supports standard identifiers and Bedrock-style formats
-- **Atlassian Credentials** (for JIRA/Confluence features): Instance URL, email, and
-  [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
-  - Configure with: `omni-dev atlassian auth login`
+- **Atlassian Credentials** (for JIRA/Confluence features): Instance URL, plus either
+  email + [API token](https://id.atlassian.com/manage-profile/security/api-tokens) (Cloud)
+  or a Personal Access Token (Server/Data Center)
+  - Configure with: `omni-dev atlassian auth login` (or `--pat` for Server/Data Center)
 - **Datadog Credentials** (for Datadog features): API key, application key, and site
   - Configure with: `omni-dev datadog auth login`
 - **Git**: Any modern version

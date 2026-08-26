@@ -297,8 +297,9 @@ Recognised keys written by built-in flows:
 | Key | Written by | Read by |
 |---|---|---|
 | `ATLASSIAN_INSTANCE_URL` | `omni-dev atlassian auth login` ([`src/atlassian/auth.rs:152`](../src/atlassian/auth.rs#L152)) | [`load_credentials`](../src/atlassian/auth.rs#L40) |
-| `ATLASSIAN_EMAIL` | same | same |
-| `ATLASSIAN_API_TOKEN` | same | same |
+| `ATLASSIAN_EMAIL` | same (Cloud Basic auth) | same |
+| `ATLASSIAN_API_TOKEN` | same (Cloud Basic auth) | same |
+| `ATLASSIAN_PAT` | `omni-dev atlassian auth login --pat` (Server/Data Center Bearer auth; issue #1578) | same |
 | `DATADOG_API_KEY` | `omni-dev datadog auth login` ([`src/datadog/auth.rs:195`](../src/datadog/auth.rs#L195)) | [`load_credentials`](../src/datadog/auth.rs#L85) |
 | `DATADOG_APP_KEY` | same | same |
 | `DATADOG_SITE` | same | same |

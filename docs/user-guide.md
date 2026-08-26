@@ -618,9 +618,10 @@ omni-dev atlassian auth status
 omni-dev atlassian auth logout
 ```
 
-`auth logout` removes the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
-`ATLASSIAN_API_TOKEN` keys from the active profile's `env` map (the base `env`
-map when no profile is selected), leaving all other settings intact.
+`auth logout` removes the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`,
+`ATLASSIAN_API_TOKEN`, and `ATLASSIAN_PAT` keys from the active profile's
+`env` map (the base `env` map when no profile is selected), leaving all other
+settings intact.
 
 Credentials are stored in `~/.omni-dev/settings.json`. You can also use
 environment variables:
@@ -633,6 +634,26 @@ export ATLASSIAN_API_TOKEN=your-token
 
 Environment variables take precedence over the settings file.
 
+##### Server / Data Center (Personal Access Token)
+
+Jira/Confluence **Server and Data Center** (8.14+) authenticate with a
+Personal Access Token instead of an email + API token pair, sent as
+`Authorization: Bearer <token>`. Use `--pat` to configure one:
+
+```bash
+# Interactive PAT setup (prompts for instance URL and token only)
+omni-dev atlassian auth login --pat
+
+# Same env-var override, using ATLASSIAN_PAT instead of email/token
+export ATLASSIAN_INSTANCE_URL=https://jira.example.com
+export ATLASSIAN_PAT=your-personal-access-token
+```
+
+`ATLASSIAN_PAT` takes precedence over `ATLASSIAN_EMAIL`/`ATLASSIAN_API_TOKEN`
+when both are set. Logging in with one mode clears the other mode's keys from
+settings.json, so switching between Cloud and Server/Data Center never leaves
+stale credentials behind.
+
 To keep multiple Atlassian tenants (e.g. `work` and `personal`) on one machine
 and pick one per command, store each tenant's variables in a named **profile**
 and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
@@ -641,7 +662,7 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 To override just the **instance URL** for a single invocation — for example to
 target a specific tenant without switching profiles — pass the global
 `--instance <URL>` flag (or set `OMNI_DEV_ATLASSIAN_INSTANCE`). It applies to
-every JIRA and Confluence command (email and API token still come from the
+every JIRA and Confluence command (auth credentials still come from the
 environment/settings) and, being global, works before or after the subcommand:
 
 ```bash

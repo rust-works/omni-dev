@@ -668,6 +668,19 @@ API tokens are issued at <https://id.atlassian.com/manage-profile/security/api-t
 Note: Atlassian API tokens are scoped to the email account and the instance
 URL — copy them carefully and avoid trailing whitespace.
 
+**Jira/Confluence Server or Data Center** (not Cloud) uses a Personal Access
+Token instead — there's no email involved:
+
+```bash
+omni-dev atlassian auth login --pat
+# or
+export ATLASSIAN_INSTANCE_URL=https://jira.example.com
+export ATLASSIAN_PAT=...
+```
+
+If both `ATLASSIAN_PAT` and `ATLASSIAN_EMAIL`/`ATLASSIAN_API_TOKEN` are set,
+`ATLASSIAN_PAT` wins.
+
 ### Error: `404 Not Found` on a known JIRA key or Confluence page
 
 Almost always one of:

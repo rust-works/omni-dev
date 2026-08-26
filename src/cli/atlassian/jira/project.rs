@@ -598,7 +598,7 @@ mod tests {
     // canonical `EnvGuard`, so the env-reading dispatch + `?` propagation run.
 
     use crate::atlassian::auth::test_util::EnvGuard;
-    use crate::atlassian::auth::AtlassianCredentials;
+    use crate::atlassian::auth::{AtlassianAuth, AtlassianCredentials};
     use crate::cli::atlassian::helpers::create_client_from;
 
     /// Credentials pointed at a mock server. The mock matches method + path
@@ -606,8 +606,10 @@ mod tests {
     fn mock_credentials(instance_url: &str) -> AtlassianCredentials {
         AtlassianCredentials {
             instance_url: instance_url.to_string(),
-            email: "test@example.com".to_string(),
-            api_token: "test-token".into(),
+            auth: AtlassianAuth::Basic {
+                email: "test@example.com".to_string(),
+                api_token: "test-token".into(),
+            },
         }
     }
 

@@ -45,10 +45,13 @@ impl OmniDevServer {
     #[tool(
         description = "Report which Atlassian credential scopes have credentials configured. \
                        Returns boolean presence flags only — NEVER includes the email, API \
-                       token, or any other secret. The instance URL (non-secret) is returned \
-                       verbatim. Checks local configuration only; it does NOT call the Atlassian \
-                       API to validate the credentials (unlike `omni-dev atlassian auth status`, \
-                       which signs in and prints the authenticated user). Takes no arguments. \
+                       token, Personal Access Token, or any other secret. The instance URL \
+                       (non-secret) is returned verbatim. Covers both auth modes: Cloud (email + \
+                       API token) and Server/Data Center (a Bearer Personal Access Token, via \
+                       `has_pat`); `configured` reports whether either mode is fully set up. \
+                       Checks local configuration only; it does NOT call the Atlassian API to \
+                       validate the credentials (unlike `omni-dev atlassian auth status`, which \
+                       signs in and prints the authenticated user). Takes no arguments. \
                        Read-only. Output is YAML."
     )]
     pub async fn atlassian_auth_status(

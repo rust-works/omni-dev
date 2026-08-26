@@ -75,7 +75,7 @@ mod tests {
     fn atlassian_subcommands_auth_variant() {
         let cmd = AtlassianCommand {
             command: AtlassianSubcommands::Auth(auth::AuthCommand {
-                command: auth::AuthSubcommands::Login(auth::LoginCommand),
+                command: auth::AuthSubcommands::Login(auth::LoginCommand { pat: false }),
             }),
         };
         assert!(matches!(cmd.command, AtlassianSubcommands::Auth(_)));

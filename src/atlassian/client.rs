@@ -93,21 +93,24 @@ fn jira_write_error(status: u16, body: String) -> anyhow::Error {
     AtlassianError::ApiRequestFailed { status, body }.into()
 }
 
-/// Shared HTTP client for Atlassian Cloud REST APIs.
+/// Shared HTTP client for Atlassian Cloud and Server/Data Center REST APIs.
 ///
 /// Backs every JIRA, Confluence, and Agile helper exposed by this crate.
 /// Construct directly via [`AtlassianClient::new`] (instance URL + email + API
-/// token) or, more commonly, via [`AtlassianClient::from_credentials`] which
-/// accepts an [`AtlassianCredentials`](crate::atlassian::auth::AtlassianCredentials)
-/// resolved from the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
-/// `ATLASSIAN_API_TOKEN` environment variables (falling back to
-/// `~/.omni-dev/settings.json`) by
+/// token, Cloud Basic auth) or [`AtlassianClient::new_bearer`] (instance URL +
+/// Personal Access Token, Server/Data Center Bearer auth) or, more commonly,
+/// via [`AtlassianClient::from_credentials`] which accepts an
+/// [`AtlassianCredentials`](crate::atlassian::auth::AtlassianCredentials)
+/// resolved from the `ATLASSIAN_INSTANCE_URL` plus either
+/// `ATLASSIAN_EMAIL`/`ATLASSIAN_API_TOKEN` or `ATLASSIAN_PAT` environment
+/// variables (falling back to `~/.omni-dev/settings.json`) by
 /// [`load_credentials`](crate::atlassian::auth::load_credentials).
 ///
-/// Authenticates every request with HTTP Basic auth: a precomputed
-/// `Authorization: Basic <base64(email:api_token)>` header is attached to all
-/// outbound calls. Requests time out after 30s and automatically retry up to
-/// three times on HTTP 429, honoring any `Retry-After` header.
+/// Authenticates every request with a precomputed `Authorization` header
+/// attached to all outbound calls: `Basic <base64(email:api_token)>` for
+/// Cloud, `Bearer <token>` for Server/Data Center PATs (issue #1578).
+/// Requests time out after 30s and automatically retry up to three times on
+/// HTTP 429, honoring any `Retry-After` header.
 pub struct AtlassianClient {
     client: Client,
     instance_url: String,
@@ -228,13 +231,46 @@ mod tests {
 
     #[test]
     fn from_credentials() {
+        use crate::atlassian::auth::AtlassianAuth;
         let creds = crate::atlassian::auth::AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
-            email: "user@test.com".to_string(),
-            api_token: "token123".into(),
+            auth: AtlassianAuth::Basic {
+                email: "user@test.com".to_string(),
+                api_token: "token123".into(),
+            },
         };
         let client = AtlassianClient::from_credentials(&creds).unwrap();
         assert_eq!(client.instance_url(), "https://org.atlassian.net");
+        let expected_encoded =
+            base64::engine::general_purpose::STANDARD.encode("user@test.com:token123");
+        assert_eq!(client.auth_header, format!("Basic {expected_encoded}"));
+    }
+
+    #[test]
+    fn new_bearer_client_sets_bearer_auth() {
+        let client = AtlassianClient::new_bearer("https://jira.example.com", "my-pat").unwrap();
+        assert_eq!(client.instance_url(), "https://jira.example.com");
+        assert_eq!(client.auth_header, "Bearer my-pat");
+    }
+
+    #[test]
+    fn new_bearer_client_strips_trailing_slash() {
+        let client = AtlassianClient::new_bearer("https://jira.example.com/", "my-pat").unwrap();
+        assert_eq!(client.instance_url(), "https://jira.example.com");
+    }
+
+    #[test]
+    fn from_credentials_bearer() {
+        use crate::atlassian::auth::AtlassianAuth;
+        let creds = crate::atlassian::auth::AtlassianCredentials {
+            instance_url: "https://jira.example.com".to_string(),
+            auth: AtlassianAuth::Bearer {
+                token: "my-pat".into(),
+            },
+        };
+        let client = AtlassianClient::from_credentials(&creds).unwrap();
+        assert_eq!(client.instance_url(), "https://jira.example.com");
+        assert_eq!(client.auth_header, "Bearer my-pat");
     }
 
     #[test]
@@ -6497,7 +6533,7 @@ mod tests {
 }
 
 impl AtlassianClient {
-    /// Creates a new Atlassian API client.
+    /// Creates a new Atlassian API client using Cloud Basic auth.
     ///
     /// Constructs the Basic Auth header from the email and API token.
     pub fn new(instance_url: &str, email: &str, api_token: &str) -> Result<Self> {
@@ -6518,13 +6554,39 @@ impl AtlassianClient {
         })
     }
 
-    /// Creates a client from stored credentials.
+    /// Creates a new Atlassian API client using Server/Data Center Bearer
+    /// auth (a Personal Access Token; issue #1578).
+    ///
+    /// Constructs the `Authorization: Bearer <token>` header.
+    pub fn new_bearer(instance_url: &str, token: &str) -> Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(connect_timeout())
+            .read_timeout(read_timeout())
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        let auth_header = format!("Bearer {token}");
+
+        Ok(Self {
+            client,
+            instance_url: instance_url.trim_end_matches('/').to_string(),
+            auth_header,
+        })
+    }
+
+    /// Creates a client from stored credentials, using Basic or Bearer auth
+    /// depending on [`AtlassianCredentials::auth`](crate::atlassian::auth::AtlassianCredentials::auth).
     pub fn from_credentials(creds: &crate::atlassian::auth::AtlassianCredentials) -> Result<Self> {
-        Self::new(
-            &creds.instance_url,
-            &creds.email,
-            creds.api_token.expose_secret(),
-        )
+        use crate::atlassian::auth::AtlassianAuth;
+
+        match &creds.auth {
+            AtlassianAuth::Basic { email, api_token } => {
+                Self::new(&creds.instance_url, email, api_token.expose_secret())
+            }
+            AtlassianAuth::Bearer { token } => {
+                Self::new_bearer(&creds.instance_url, token.expose_secret())
+            }
+        }
     }
 
     /// Returns the instance URL.

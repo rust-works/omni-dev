@@ -1,8 +1,10 @@
 //! Atlassian credential management.
 //!
-//! Loads and saves Atlassian Cloud API credentials from/to the
-//! `~/.omni-dev/settings.json` file — the active profile's `env` map when a
-//! profile is selected, the base `env` map otherwise (issue #1116).
+//! Loads and saves Atlassian credentials from/to the `~/.omni-dev/settings.json`
+//! file — the active profile's `env` map when a profile is selected, the base
+//! `env` map otherwise (issue #1116). Supports two auth modes: Cloud Basic
+//! auth (email + API token) and Server/Data Center Bearer auth (a Personal
+//! Access Token, no email) — see [`AtlassianAuth`] (issue #1578).
 
 use anyhow::Result;
 use serde::Serialize;
@@ -21,6 +23,13 @@ pub const ATLASSIAN_EMAIL: &str = "ATLASSIAN_EMAIL";
 /// Environment variable / settings key for the Atlassian API token.
 pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 
+/// Environment variable / settings key for a Server/Data Center Personal
+/// Access Token (Bearer auth, no email — issue #1578).
+///
+/// Takes precedence over [`ATLASSIAN_EMAIL`]/[`ATLASSIAN_API_TOKEN`] when
+/// set; see [`load_credentials_with_instance`].
+pub const ATLASSIAN_PAT: &str = "ATLASSIAN_PAT";
+
 /// Environment variable that overrides the Atlassian instance URL.
 ///
 /// Applies to **every** JIRA/Confluence command. Set by the global `--instance`
@@ -29,17 +38,32 @@ pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 /// (e.g. via [`load_credentials_with_instance`]) still wins over it.
 pub const ATLASSIAN_INSTANCE_OVERRIDE_ENV: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
 
-/// Atlassian Cloud credentials.
+/// Atlassian auth mode: Cloud Basic auth (email + API token) or Server/Data
+/// Center Bearer auth (a Personal Access Token, no email — issue #1578).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtlassianAuth {
+    /// Cloud auth: `Authorization: Basic base64(email:api_token)`.
+    Basic {
+        /// User email address.
+        email: String,
+        /// API token (secret; redacted in `Debug` output).
+        api_token: Secret,
+    },
+    /// Server/Data Center auth: `Authorization: Bearer <token>`.
+    Bearer {
+        /// Personal Access Token (secret; redacted in `Debug` output).
+        token: Secret,
+    },
+}
+
+/// Atlassian credentials: an instance URL plus an [`AtlassianAuth`] mode.
 #[derive(Debug, Clone)]
 pub struct AtlassianCredentials {
     /// Instance base URL (e.g., `"https://myorg.atlassian.net"`).
     pub instance_url: String,
 
-    /// User email address.
-    pub email: String,
-
-    /// API token (secret; redacted in `Debug` output).
-    pub api_token: Secret,
+    /// Auth mode (Cloud Basic or Server/Data Center Bearer).
+    pub auth: AtlassianAuth,
 }
 
 /// Loads Atlassian credentials from environment variables or settings.json.
@@ -62,8 +86,14 @@ pub fn load_credentials() -> Result<AtlassianCredentials> {
 /// trailing-slash normalization) and the `ATLASSIAN_INSTANCE_URL` env /
 /// settings lookup is skipped — so a caller-supplied instance (e.g.
 /// `jira create --instance`) works even when no instance is configured in the
-/// environment. `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN` are still required.
-/// When `None`, behaves exactly like [`load_credentials`].
+/// environment. When `None`, behaves exactly like [`load_credentials`].
+///
+/// Auth mode resolution: if [`ATLASSIAN_PAT`] is present, it is used
+/// (`AtlassianAuth::Bearer`) — this wins outright even if `ATLASSIAN_EMAIL`/
+/// `ATLASSIAN_API_TOKEN` are also set, mirroring the "explicit env wins"
+/// precedent elsewhere in the crate (e.g. `OMNI_DEV_AI_BACKEND`). Otherwise
+/// both `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN` are required
+/// (`AtlassianAuth::Basic`), exactly as before issue #1578.
 pub fn load_credentials_with_instance(
     instance_override: Option<&str>,
 ) -> Result<AtlassianCredentials> {
@@ -75,21 +105,27 @@ pub fn load_credentials_with_instance(
             .get_env_var(ATLASSIAN_INSTANCE_URL)
             .ok_or(AtlassianError::CredentialsNotFound)?,
     };
-    let email = settings
-        .get_env_var(ATLASSIAN_EMAIL)
-        .ok_or(AtlassianError::CredentialsNotFound)?;
-    let api_token = settings
-        .get_env_var(ATLASSIAN_API_TOKEN)
-        .ok_or(AtlassianError::CredentialsNotFound)?;
-
     // Normalize: strip trailing slash from instance URL
     let instance_url = instance_url.trim_end_matches('/').to_string();
 
-    Ok(AtlassianCredentials {
-        instance_url,
-        email,
-        api_token: api_token.into(),
-    })
+    let auth = if let Some(token) = settings.get_env_var(ATLASSIAN_PAT) {
+        AtlassianAuth::Bearer {
+            token: token.into(),
+        }
+    } else {
+        let email = settings
+            .get_env_var(ATLASSIAN_EMAIL)
+            .ok_or(AtlassianError::CredentialsNotFound)?;
+        let api_token = settings
+            .get_env_var(ATLASSIAN_API_TOKEN)
+            .ok_or(AtlassianError::CredentialsNotFound)?;
+        AtlassianAuth::Basic {
+            email,
+            api_token: api_token.into(),
+        }
+    };
+
+    Ok(AtlassianCredentials { instance_url, auth })
 }
 
 /// Summary of a single Atlassian credential scope.
@@ -105,6 +141,14 @@ pub struct AtlassianScopeStatus {
     pub has_email: bool,
     /// Whether [`ATLASSIAN_API_TOKEN`] is present. Token value is never exposed.
     pub has_token: bool,
+    /// Whether [`ATLASSIAN_PAT`] is present (Bearer auth, Server/Data Center).
+    /// Token value is never exposed.
+    pub has_pat: bool,
+    /// Whether this scope has a complete, usable auth mode configured:
+    /// `has_pat`, or `has_email && has_token`. A `false` value with some
+    /// flags `true` means a partial/incomplete configuration (e.g. only
+    /// `has_email` set) rather than a deliberate alternate mode.
+    pub configured: bool,
     /// Value of [`ATLASSIAN_INSTANCE_URL`] when set. The URL is considered
     /// non-secret; returning it helps the assistant surface which instance
     /// a scope targets without exposing credentials.
@@ -135,12 +179,16 @@ pub fn status() -> AuthStatus {
         .map(|v| v.trim_end_matches('/').to_string());
     let has_email = settings.get_env_var(ATLASSIAN_EMAIL).is_some();
     let has_token = settings.get_env_var(ATLASSIAN_API_TOKEN).is_some();
+    let has_pat = settings.get_env_var(ATLASSIAN_PAT).is_some();
+    let configured = has_pat || (has_email && has_token);
 
     AuthStatus {
         scopes: vec![AtlassianScopeStatus {
             name: "default".to_string(),
             has_email,
             has_token,
+            has_pat,
+            configured,
             instance_url,
         }],
     }
@@ -162,6 +210,10 @@ pub fn save_credentials(credentials: &AtlassianCredentials) -> Result<()> {
 /// [`save_credentials`], writing to an explicit settings-file path and env
 /// map (`profiles.<name>.env` when `profile` is `Some`, base `env` otherwise).
 ///
+/// Also removes the *other* auth mode's keys, so switching mode (e.g.
+/// re-running `login` with `--pat` after a Basic login) never leaves stale,
+/// ambiguous credentials behind (issue #1578).
+///
 /// Tests inject a tempdir path and an explicit profile instead of mutating
 /// `HOME` / `OMNI_DEV_PROFILE` (issue #1030).
 pub(crate) fn save_credentials_to(
@@ -169,15 +221,36 @@ pub(crate) fn save_credentials_to(
     profile: Option<&str>,
     credentials: &AtlassianCredentials,
 ) -> Result<()> {
-    Settings::upsert_env_vars_in(
-        settings_path,
-        profile,
-        &[
-            (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
-            (ATLASSIAN_EMAIL, credentials.email.as_str()),
-            (ATLASSIAN_API_TOKEN, credentials.api_token.expose_secret()),
-        ],
-    )
+    match &credentials.auth {
+        AtlassianAuth::Basic { email, api_token } => {
+            Settings::upsert_env_vars_in(
+                settings_path,
+                profile,
+                &[
+                    (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
+                    (ATLASSIAN_EMAIL, email.as_str()),
+                    (ATLASSIAN_API_TOKEN, api_token.expose_secret()),
+                ],
+            )?;
+            Settings::remove_env_vars_in(settings_path, profile, &[ATLASSIAN_PAT])?;
+        }
+        AtlassianAuth::Bearer { token } => {
+            Settings::upsert_env_vars_in(
+                settings_path,
+                profile,
+                &[
+                    (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
+                    (ATLASSIAN_PAT, token.expose_secret()),
+                ],
+            )?;
+            Settings::remove_env_vars_in(
+                settings_path,
+                profile,
+                &[ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes Atlassian credential keys from `~/.omni-dev/settings.json` — from
@@ -207,7 +280,12 @@ pub(crate) fn remove_credentials_at(
     Settings::remove_env_vars_in(
         settings_path,
         profile,
-        &[ATLASSIAN_INSTANCE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN],
+        &[
+            ATLASSIAN_INSTANCE_URL,
+            ATLASSIAN_EMAIL,
+            ATLASSIAN_API_TOKEN,
+            ATLASSIAN_PAT,
+        ],
     )
 }
 
@@ -221,7 +299,7 @@ pub(crate) fn remove_credentials_at(
 pub(crate) mod test_util {
     use super::{
         ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_OVERRIDE_ENV,
-        ATLASSIAN_INSTANCE_URL,
+        ATLASSIAN_INSTANCE_URL, ATLASSIAN_PAT,
     };
     use crate::utils::settings::PROFILE_ENV_VAR;
 
@@ -258,6 +336,7 @@ pub(crate) mod test_util {
                 ATLASSIAN_INSTANCE_OVERRIDE_ENV,
                 ATLASSIAN_EMAIL,
                 ATLASSIAN_API_TOKEN,
+                ATLASSIAN_PAT,
             ];
             let snapshot = keys
                 .into_iter()
@@ -286,13 +365,14 @@ pub(crate) mod test_util {
             std::env::remove_var(ATLASSIAN_INSTANCE_OVERRIDE_ENV);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
+            std::env::remove_var(ATLASSIAN_PAT);
             dir
         }
 
-        /// Sets the three Atlassian credential env vars to point at a wiremock
-        /// (or any HTTP) endpoint. The matching `HOME` is replaced with a
-        /// fresh tempdir so any `~/.omni-dev/settings.json` on the developer's
-        /// machine does not bleed in.
+        /// Sets the three Basic-auth Atlassian credential env vars to point at
+        /// a wiremock (or any HTTP) endpoint. The matching `HOME` is replaced
+        /// with a fresh tempdir so any `~/.omni-dev/settings.json` on the
+        /// developer's machine does not bleed in.
         pub(crate) fn set_credentials(&self, instance_url: &str) -> tempfile::TempDir {
             let dir = {
                 std::fs::create_dir_all("tmp").ok();
@@ -302,6 +382,24 @@ pub(crate) mod test_util {
             std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
             std::env::set_var(ATLASSIAN_EMAIL, "test@example.com");
             std::env::set_var(ATLASSIAN_API_TOKEN, "test-token");
+            std::env::remove_var(ATLASSIAN_PAT);
+            dir
+        }
+
+        /// Sets `ATLASSIAN_PAT` (Bearer auth) to point at a wiremock (or any
+        /// HTTP) endpoint, clearing the Basic-auth env vars so the two modes
+        /// never conflict. The matching `HOME` is replaced with a fresh
+        /// tempdir, as in [`Self::set_credentials`].
+        pub(crate) fn set_bearer_credentials(&self, instance_url: &str) -> tempfile::TempDir {
+            let dir = {
+                std::fs::create_dir_all("tmp").ok();
+                tempfile::TempDir::new_in("tmp").unwrap()
+            };
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
+            std::env::set_var(ATLASSIAN_PAT, "test-pat");
+            std::env::remove_var(ATLASSIAN_EMAIL);
+            std::env::remove_var(ATLASSIAN_API_TOKEN);
             dir
         }
     }
@@ -378,13 +476,14 @@ mod tests {
     fn credentials_struct_clone_and_debug() {
         let creds = AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
-            email: "user@test.com".to_string(),
-            api_token: "super-sekret-api-token-value".into(),
+            auth: AtlassianAuth::Basic {
+                email: "user@test.com".to_string(),
+                api_token: "super-sekret-api-token-value".into(),
+            },
         };
         let cloned = creds.clone();
         assert_eq!(cloned.instance_url, creds.instance_url);
-        assert_eq!(cloned.email, creds.email);
-        assert_eq!(cloned.api_token, creds.api_token);
+        assert_eq!(cloned.auth, creds.auth);
         // Debug must never print the token value (#1131).
         let debug = format!("{creds:?}");
         assert!(debug.contains("AtlassianCredentials"));
@@ -393,6 +492,22 @@ mod tests {
             "leaked token: {debug}"
         );
         assert!(debug.contains("api_token: <redacted>"));
+    }
+
+    #[test]
+    fn credentials_struct_bearer_debug_redacts_token() {
+        let creds = AtlassianCredentials {
+            instance_url: "https://jira.example.com".to_string(),
+            auth: AtlassianAuth::Bearer {
+                token: "super-sekret-pat-value".into(),
+            },
+        };
+        let debug = format!("{creds:?}");
+        assert!(
+            !debug.contains("super-sekret-pat-value"),
+            "leaked token: {debug}"
+        );
+        assert!(debug.contains("token: <redacted>"));
     }
 
     use super::test_util::EnvGuard;
@@ -407,6 +522,7 @@ mod tests {
         std::env::remove_var(ATLASSIAN_INSTANCE_URL);
         std::env::remove_var(ATLASSIAN_EMAIL);
         std::env::remove_var(ATLASSIAN_API_TOKEN);
+        std::env::remove_var(ATLASSIAN_PAT);
         dir
     }
 
@@ -421,6 +537,8 @@ mod tests {
         assert_eq!(scope.name, "default");
         assert!(!scope.has_email);
         assert!(!scope.has_token);
+        assert!(!scope.has_pat);
+        assert!(!scope.configured);
         assert_eq!(scope.instance_url, None);
     }
 
@@ -445,6 +563,8 @@ mod tests {
         let scope = &status.scopes[0];
         assert!(scope.has_email);
         assert!(scope.has_token);
+        assert!(!scope.has_pat);
+        assert!(scope.configured);
         assert_eq!(
             scope.instance_url.as_deref(),
             Some("https://status.atlassian.net")
@@ -453,6 +573,54 @@ mod tests {
         let yaml = serde_yaml::to_string(&status).unwrap();
         assert!(!yaml.contains("sekret-do-not-leak"), "leaked token: {yaml}");
         assert!(!yaml.contains("person@example.com"), "leaked email: {yaml}");
+    }
+
+    #[test]
+    fn status_reports_pat_as_configured_without_email_or_token() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        fs::write(
+            omni_dir.join("settings.json"),
+            r#"{"env":{
+                "ATLASSIAN_INSTANCE_URL":"https://server.example.com/",
+                "ATLASSIAN_PAT":"sekret-pat-do-not-leak"
+            }}"#,
+        )
+        .unwrap();
+
+        let status = status();
+        let scope = &status.scopes[0];
+        assert!(!scope.has_email);
+        assert!(!scope.has_token);
+        assert!(scope.has_pat);
+        assert!(scope.configured);
+
+        let yaml = serde_yaml::to_string(&status).unwrap();
+        assert!(
+            !yaml.contains("sekret-pat-do-not-leak"),
+            "leaked token: {yaml}"
+        );
+    }
+
+    #[test]
+    fn status_reports_incomplete_basic_config_as_unconfigured() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        fs::write(
+            omni_dir.join("settings.json"),
+            r#"{"env":{"ATLASSIAN_EMAIL":"person@example.com"}}"#,
+        )
+        .unwrap();
+
+        let scope = &status().scopes[0];
+        assert!(scope.has_email);
+        assert!(!scope.has_token);
+        assert!(!scope.has_pat);
+        assert!(!scope.configured);
     }
 
     #[test]
@@ -482,8 +650,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://wrapper.atlassian.net".to_string(),
-            email: "wrapper@example.com".to_string(),
-            api_token: "wrapper-token".into(),
+            auth: AtlassianAuth::Basic {
+                email: "wrapper@example.com".to_string(),
+                api_token: "wrapper-token".into(),
+            },
         };
         save_credentials(&creds).unwrap();
 
@@ -503,8 +673,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://wrapper.atlassian.net".to_string(),
-            email: "wrapper@example.com".to_string(),
-            api_token: "wrapper-token".into(),
+            auth: AtlassianAuth::Basic {
+                email: "wrapper@example.com".to_string(),
+                api_token: "wrapper-token".into(),
+            },
         };
         save_credentials(&creds).unwrap();
 
@@ -536,8 +708,10 @@ mod tests {
 
             let creds = AtlassianCredentials {
                 instance_url: "https://save.atlassian.net".to_string(),
-                email: "save@example.com".to_string(),
-                api_token: "save-token".into(),
+                auth: AtlassianAuth::Basic {
+                    email: "save@example.com".to_string(),
+                    api_token: "save-token".into(),
+                },
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -577,8 +751,10 @@ mod tests {
 
             let creds = AtlassianCredentials {
                 instance_url: "https://org.atlassian.net".to_string(),
-                email: "user@test.com".to_string(),
-                api_token: "token".into(),
+                auth: AtlassianAuth::Basic {
+                    email: "user@test.com".to_string(),
+                    api_token: "token".into(),
+                },
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -609,8 +785,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://work.atlassian.net".to_string(),
-            email: "work@example.com".to_string(),
-            api_token: "work-token".into(),
+            auth: AtlassianAuth::Basic {
+                email: "work@example.com".to_string(),
+                api_token: "work-token".into(),
+            },
         };
         save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
 
@@ -641,8 +819,13 @@ mod tests {
         let creds =
             load_credentials_with_instance(Some("https://override.atlassian.net/")).unwrap();
         assert_eq!(creds.instance_url, "https://override.atlassian.net");
-        assert_eq!(creds.email, "person@example.com");
-        assert_eq!(creds.api_token.expose_secret(), "token");
+        assert_eq!(
+            creds.auth,
+            AtlassianAuth::Basic {
+                email: "person@example.com".to_string(),
+                api_token: "token".into(),
+            }
+        );
     }
 
     #[test]
@@ -678,6 +861,42 @@ mod tests {
         );
         let creds = load_credentials().unwrap();
         assert_eq!(creds.instance_url, "https://flag.atlassian.net");
-        assert_eq!(creds.email, "person@example.com");
+        assert!(matches!(creds.auth, AtlassianAuth::Basic { .. }));
+    }
+
+    #[test]
+    fn load_credentials_with_instance_uses_bearer_when_pat_present() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_PAT, "my-pat");
+
+        let creds = load_credentials_with_instance(Some("https://server.example.com/")).unwrap();
+        assert_eq!(creds.instance_url, "https://server.example.com");
+        assert_eq!(
+            creds.auth,
+            AtlassianAuth::Bearer {
+                token: "my-pat".into()
+            }
+        );
+    }
+
+    #[test]
+    fn load_credentials_with_instance_pat_takes_precedence_over_basic() {
+        // Explicit ATLASSIAN_PAT wins outright even when Basic-auth env vars
+        // are also set (issue #1578) — mirrors the "explicit env wins"
+        // precedent used for OMNI_DEV_AI_BACKEND.
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_EMAIL, "person@example.com");
+        std::env::set_var(ATLASSIAN_API_TOKEN, "token");
+        std::env::set_var(ATLASSIAN_PAT, "my-pat");
+
+        let creds = load_credentials_with_instance(Some("https://server.example.com")).unwrap();
+        assert_eq!(
+            creds.auth,
+            AtlassianAuth::Bearer {
+                token: "my-pat".into()
+            }
+        );
     }
 }

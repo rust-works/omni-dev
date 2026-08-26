@@ -91,6 +91,10 @@ Declares the env vars the server understands. `required: []` is intentional — 
       "description": "Atlassian instance base URL (e.g. https://your-org.atlassian.net)",
       "type": "string"
     },
+    "ATLASSIAN_PAT": {
+      "description": "Personal Access Token for Jira/Confluence Server & Data Center (Bearer auth, no email — takes precedence over ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN when set)",
+      "type": "string"
+    },
     "AWS_ACCESS_KEY_ID": {
       "description": "AWS access key ID for the Bedrock backend (used by the AWS SDK)",
       "type": "string"

@@ -129,10 +129,22 @@ per invocation — the same model as the AWS CLI's `--profile`. Profiles live in
         "ATLASSIAN_EMAIL": "me@personal.com",
         "ATLASSIAN_API_TOKEN": "..."
       }
+    },
+    "self-hosted": {
+      "env": {
+        "ATLASSIAN_INSTANCE_URL": "https://jira.example.com",
+        "ATLASSIAN_PAT": "..."
+      }
     }
   }
 }
 ```
+
+Each Atlassian scope picks its own auth mode independently — `work` and
+`personal` above use Cloud Basic auth (email + API token), `self-hosted` uses
+a Server/Data Center Bearer PAT instead (`ATLASSIAN_PAT`, issue #1578). When
+both `ATLASSIAN_PAT` and `ATLASSIAN_EMAIL`/`ATLASSIAN_API_TOKEN` are set in
+the same scope, `ATLASSIAN_PAT` takes precedence.
 
 Select a profile two ways (the flag wins over the env var, mirroring
 `--profile` / `AWS_PROFILE`):

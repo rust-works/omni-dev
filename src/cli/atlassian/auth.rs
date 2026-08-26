@@ -5,12 +5,13 @@ use std::io::{self, Write};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::auth::{self, AtlassianCredentials};
+use crate::atlassian::auth::{self, AtlassianAuth, AtlassianCredentials};
 use crate::atlassian::client::AtlassianClient;
 use crate::utils::env::SystemEnv;
 use crate::utils::settings::{active_profile_from, profile_suffix, Settings};
 
-/// Manages Atlassian Cloud credentials.
+/// Manages Atlassian credentials (Cloud Basic auth or Server/Data Center
+/// Bearer PAT).
 #[derive(Parser)]
 pub struct AuthCommand {
     /// The auth subcommand to execute.
@@ -21,9 +22,10 @@ pub struct AuthCommand {
 /// Auth subcommands.
 #[derive(Subcommand)]
 pub enum AuthSubcommands {
-    /// Configures Atlassian Cloud credentials interactively.
+    /// Configures Atlassian credentials interactively (Cloud email + API
+    /// token, or `--pat` for Server/Data Center).
     Login(LoginCommand),
-    /// Removes Atlassian Cloud credentials from settings.json.
+    /// Removes Atlassian credentials from settings.json.
     Logout(LogoutCommand),
     /// Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool).
     Status(StatusCommand),
@@ -40,18 +42,32 @@ impl AuthCommand {
     }
 }
 
-/// Configures Atlassian Cloud credentials.
+/// Configures Atlassian credentials.
 #[derive(Parser)]
-pub struct LoginCommand;
+pub struct LoginCommand {
+    /// Use a Bearer Personal Access Token (Jira/Confluence Server & Data
+    /// Center) instead of email + API token (Cloud).
+    #[arg(long)]
+    pub pat: bool,
+}
 
 impl LoginCommand {
     /// Prompts the user for credentials and saves them.
     pub fn execute(self) -> Result<()> {
-        println!("Configure Atlassian Cloud credentials\n");
-        let instance_url = prompt("Instance URL (e.g., https://myorg.atlassian.net): ")?;
-        let email = prompt("Email: ")?;
-        let api_token = prompt("API token: ")?;
-        run_login(&instance_url, &email, &api_token)
+        if self.pat {
+            println!(
+                "Configure Atlassian Server/Data Center credentials (Personal Access Token)\n"
+            );
+            let instance_url = prompt("Instance URL (e.g., https://jira.example.com): ")?;
+            let token = prompt("Personal Access Token: ")?;
+            run_login_bearer(&instance_url, &token)
+        } else {
+            println!("Configure Atlassian Cloud credentials\n");
+            let instance_url = prompt("Instance URL (e.g., https://myorg.atlassian.net): ")?;
+            let email = prompt("Email: ")?;
+            let api_token = prompt("API token: ")?;
+            run_login(&instance_url, &email, &api_token)
+        }
     }
 }
 
@@ -93,8 +109,10 @@ fn run_login_to(
 
     let credentials = AtlassianCredentials {
         instance_url: instance_url.to_string(),
-        email: email.to_string(),
-        api_token: api_token.into(),
+        auth: AtlassianAuth::Basic {
+            email: email.to_string(),
+            api_token: api_token.into(),
+        },
     };
 
     auth::save_credentials_to(settings_path, profile, &credentials)?;
@@ -104,6 +122,54 @@ fn run_login_to(
     );
     println!("  Instance: {instance_url}");
     println!("  Email: {email}");
+    println!("\nRun `omni-dev atlassian auth status` to verify.");
+
+    Ok(())
+}
+
+/// [`run_login`] equivalent for Server/Data Center Bearer auth (a Personal
+/// Access Token, no email — issue #1578).
+///
+/// Extracted from [`LoginCommand::execute`] so the input-validation branches
+/// are reachable from tests without mocking stdin.
+fn run_login_bearer(instance_url: &str, token: &str) -> Result<()> {
+    run_login_bearer_to(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+        instance_url,
+        token,
+    )
+}
+
+/// [`run_login_bearer`], persisting to an explicit settings-file path and
+/// profile so tests inject both instead of mutating `HOME` /
+/// `OMNI_DEV_PROFILE` (issue #1030).
+fn run_login_bearer_to(
+    settings_path: &std::path::Path,
+    profile: Option<&str>,
+    instance_url: &str,
+    token: &str,
+) -> Result<()> {
+    if instance_url.is_empty() {
+        anyhow::bail!("Instance URL is required");
+    }
+    if token.is_empty() {
+        anyhow::bail!("Personal Access Token is required");
+    }
+
+    let credentials = AtlassianCredentials {
+        instance_url: instance_url.to_string(),
+        auth: AtlassianAuth::Bearer {
+            token: token.into(),
+        },
+    };
+
+    auth::save_credentials_to(settings_path, profile, &credentials)?;
+    println!(
+        "\nCredentials saved to ~/.omni-dev/settings.json{}",
+        profile_suffix(profile)
+    );
+    println!("  Instance: {instance_url}");
     println!("\nRun `omni-dev atlassian auth status` to verify.");
 
     Ok(())
@@ -190,7 +256,7 @@ mod tests {
     #[test]
     fn auth_command_login_dispatch() {
         let cmd = AuthCommand {
-            command: AuthSubcommands::Login(LoginCommand),
+            command: AuthSubcommands::Login(LoginCommand { pat: false }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Login(_)));
     }
@@ -281,6 +347,79 @@ mod tests {
             "me@work.com"
         );
         assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
+    }
+
+    // ── run_login_bearer ───────────────────────────────────────────
+
+    #[test]
+    fn run_login_bearer_rejects_empty_instance_url() {
+        let err = run_login_bearer("", "my-pat").unwrap_err();
+        assert!(err.to_string().contains("Instance URL"));
+    }
+
+    #[test]
+    fn run_login_bearer_rejects_empty_token() {
+        let err = run_login_bearer("https://jira.example.com", "").unwrap_err();
+        assert!(err.to_string().contains("Personal Access Token"));
+    }
+
+    #[test]
+    fn run_login_bearer_to_persists_pat_only() {
+        let (_dir, settings_path) = temp_settings();
+
+        run_login_bearer_to(&settings_path, None, "https://jira.example.com", "my-pat").unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["env"]["ATLASSIAN_INSTANCE_URL"],
+            "https://jira.example.com"
+        );
+        assert_eq!(val["env"]["ATLASSIAN_PAT"], "my-pat");
+        assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
+        assert!(val["env"].get("ATLASSIAN_API_TOKEN").is_none());
+    }
+
+    #[test]
+    fn run_login_bearer_to_clears_stale_basic_credentials() {
+        let (dir, settings_path) = temp_settings();
+        std::fs::create_dir_all(dir.path().join(".omni-dev")).unwrap();
+        run_login_to(
+            &settings_path,
+            None,
+            "https://org.atlassian.net",
+            "me@test.com",
+            "tok",
+        )
+        .unwrap();
+
+        run_login_bearer_to(&settings_path, None, "https://jira.example.com", "my-pat").unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["ATLASSIAN_PAT"], "my-pat");
+        assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
+        assert!(val["env"].get("ATLASSIAN_API_TOKEN").is_none());
+    }
+
+    #[test]
+    fn run_login_to_clears_stale_pat() {
+        let (_dir, settings_path) = temp_settings();
+        run_login_bearer_to(&settings_path, None, "https://jira.example.com", "my-pat").unwrap();
+
+        run_login_to(
+            &settings_path,
+            None,
+            "https://org.atlassian.net",
+            "me@test.com",
+            "tok",
+        )
+        .unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "me@test.com");
+        assert!(val["env"].get("ATLASSIAN_PAT").is_none());
     }
 
     // ── run_logout ─────────────────────────────────────────────────
@@ -451,5 +590,55 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = run_auth_status(&client, &server.uri()).await.unwrap_err();
         assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_success_with_bearer_auth() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .and(wiremock::matchers::header("Authorization", "Bearer my-pat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new_bearer(&server.uri(), "my-pat").unwrap();
+        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+    }
+
+    /// End-to-end: `StatusCommand::execute` resolves credentials via
+    /// `auth::load_credentials()` (real `HOME`/env resolution, unlike the
+    /// other `run_auth_status` tests above which construct the client
+    /// directly), so this is the one test that exercises `ATLASSIAN_PAT`
+    /// through the full production path (issue #1578).
+    #[tokio::test]
+    async fn status_command_execute_authenticates_via_pat() {
+        use crate::atlassian::auth::test_util::EnvGuard;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer test-pat",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_bearer_credentials(&server.uri());
+
+        assert!(StatusCommand.execute().await.is_ok());
     }
 }
