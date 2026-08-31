@@ -65,7 +65,7 @@ sha2 = "0.11"
 # snowflake-connector-rs).
 aws-lc-rs = "1.16"
 ureq = "3"
-quick-xml = "0.41"
+quick-xml = "0.42"
 # Already in the tree transitively via reqwest; a direct dep lets
 # src/utils/http.rs name `http::Response::builder()` to reconstruct a
 # reqwest::Response from buffered parts (the retry_if 403/429 retry driver).
