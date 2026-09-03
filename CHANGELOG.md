@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`coverage diff` no longer misattributes huge line ranges as new on refactor-shaped diffs** ([#1580](https://github.com/rust-works/omni-dev/issues/1580)): `DiffModel::between` (`src/coverage/diff.rs`) built its `git2::DiffOptions` with only `context_lines(3)` set, leaving libgit2's default Myers algorithm active — which misaligns on files with long runs of near-duplicate lines (e.g. hand-expanded match arms), spuriously reporting nearly an entire file as "new" when a diff really just deletes one repetitive block. Adding `.patience(true)` and `.indent_heuristic(true)` fixes it; `patience` is libgit2's analogue of git's `--diff-algorithm=histogram`, confirmed correct against the real reproduction commit.
+
 ## [0.41.0] - 2026-08-20
 
 ### Added
