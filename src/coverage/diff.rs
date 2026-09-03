@@ -127,7 +127,7 @@ impl DiffModel {
             .with_context(|| format!("head ref `{head_ref}` is not a tree-ish"))?;
 
         let mut opts = DiffOptions::new();
-        opts.context_lines(3);
+        opts.context_lines(3).patience(true).indent_heuristic(true);
         let mut diff = repo
             .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))
             .context("failed to diff base against head")?;
