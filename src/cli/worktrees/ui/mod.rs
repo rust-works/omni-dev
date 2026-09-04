@@ -68,11 +68,26 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// Undoes every step of `enter()` that already succeeded before a later
+    /// step fails — `Drop` only runs for a fully-constructed `Self`, so a
+    /// partial failure here (e.g. `execute!` after raw mode is already on)
+    /// would otherwise leave the invoking shell in raw mode / the alternate
+    /// screen with no guard left to clean it up.
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => terminal,
+            Err(e) => {
+                let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+                let _ = disable_raw_mode();
+                return Err(e.into());
+            }
+        };
         Ok(Self { terminal })
     }
 }

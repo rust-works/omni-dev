@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::paths::{ensure_dir_0700, set_file_0600};
+
 /// Workbench colour ids the row-colour picker accepts, ported from the
 /// extension's `icons.ts::ROW_COLORS`. Rejected on write; tolerated on read
 /// (forward-compat with a colour a newer VS Code release might add).
@@ -116,7 +118,11 @@ impl RowColorStore {
     /// crash mid-write never leaves a truncated/corrupt store.
     fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
+            // 0700/0600, matching every other `~/.omni-dev/*`/`~/.claude`-style
+            // per-user config writer in the crate (e.g.
+            // `src/utils/settings.rs::write_settings`) rather than the
+            // process umask.
+            ensure_dir_0700(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let file = StoreFile {
@@ -127,6 +133,8 @@ impl RowColorStore {
         let tmp_path = self.path.with_extension("yaml.tmp");
         fs::write(&tmp_path, contents)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        set_file_0600(&tmp_path)
+            .with_context(|| format!("failed to set permissions on {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &self.path)
             .with_context(|| format!("failed to replace {}", self.path.display()))?;
         Ok(())

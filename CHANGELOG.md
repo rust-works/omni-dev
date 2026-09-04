@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`omni-dev worktrees ui` — a full-screen terminal UI for the worktrees tree (Phase 1: read-only view)** ([#1585](https://github.com/rust-works/omni-dev/issues/1585)): a `ratatui`-based app that supersedes `worktrees tree --follow` for interactive use, redrawing on every live `worktrees`/`sessions` push from the daemon rather than one static snapshot. It reuses the daemon's existing `subscribe` push protocol behind a new reconnect-with-full-jitter-backoff supervisor (`src/cli/worktrees/ui/supervisor.rs`) that falls back to one-shot polling against an older daemon that doesn't know the `subscribe` op, and joins the tree/sessions feeds with a local ahead/behind cache, row-colour store (`~/.omni-dev/worktrees-ui-row-colors.yaml`), and open-tab state into one merged view model (`src/cli/worktrees/ui/{hub,view_model}.rs`). Each row's colour follows the same severity ranking the tree view's `rowColorId` uses (red > yellow > green > muted from PR-check/session state), with an in-flight git operation or a user's own row-colour tag taking precedence over it. `q`/`Esc`/Ctrl-C quits and always restores the terminal. Actions, embedded terminals and tabs, and the rest of the tree view's VS Code-parity surface are later phases. See [docs/worktrees-service.md](docs/worktrees-service.md).
+
+### Changed
+- **MSRV raised from 1.80.0 to 1.88.0**: required by `ratatui` 0.30 (added for `worktrees ui` above, chosen because it resolves to the same `crossterm` 0.29 already pinned here — `ratatui` 0.29 would have pulled in a second, non-overlapping `crossterm` 0.28 instead). `clippy.toml`'s `msrv` is synced to match, which also surfaced newer idioms clippy previously held back (`Option::is_none_or`, `usize::midpoint`, `iter::repeat_n`, `&raw mut`) across a handful of unrelated files.
+
 ## [0.42.0] - 2026-09-04
 
 ### Added

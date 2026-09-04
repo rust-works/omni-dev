@@ -314,22 +314,30 @@ fn merge_worktree(
     open_tabs: &OpenTabs,
 ) -> WorktreeRow {
     let path = PathBuf::from(&wt.path);
-    let joined_sessions = sessions
-        .iter()
-        .filter(|s| s.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&path)))
-        .map(|s| SessionBadge {
-            session_id: s.session_id.clone(),
-            state: s.state,
-            source: match &s.source {
-                Source::Terminal => SessionSourceRow::Terminal,
-                Source::VsCode { window_key } => SessionSourceRow::VsCode {
-                    window_key: window_key.clone(),
+    // `Path::starts_with("")` is true for every path, so an empty `path` (a
+    // malformed/older daemon payload omitting the field) must never be used
+    // as a session-join prefix — otherwise every live session in the system
+    // would attach to this one row.
+    let joined_sessions = if path.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        sessions
+            .iter()
+            .filter(|s| s.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&path)))
+            .map(|s| SessionBadge {
+                session_id: s.session_id.clone(),
+                state: s.state,
+                source: match &s.source {
+                    Source::Terminal => SessionSourceRow::Terminal,
+                    Source::VsCode { window_key } => SessionSourceRow::VsCode {
+                        window_key: window_key.clone(),
+                    },
                 },
-            },
-            model: s.model.clone(),
-            last_seen: s.last_seen,
-        })
-        .collect();
+                model: s.model.clone(),
+                last_seen: s.last_seen,
+            })
+            .collect()
+    };
     WorktreeRow {
         branch: wt.branch.clone(),
         head_sha: wt.head_sha.clone(),
@@ -412,6 +420,26 @@ mod tests {
         // component-wise and gets it right.
         let wt = worktree_wire("/repo/wt-1");
         let sessions = vec![session("/repo/wt-10/src", None)];
+        let ahead_behind = AheadBehindCache::new(super::super::client::WorktreesClient::new(
+            "/tmp/nonexistent.sock",
+        ));
+        let row_colors = RowColorStore::default();
+        let open_tabs = OpenTabs::default();
+        let row = merge_worktree(&wt, &sessions, &ahead_behind, &row_colors, &open_tabs);
+        assert!(row.sessions.is_empty());
+    }
+
+    #[test]
+    fn merge_does_not_join_any_session_when_worktree_path_is_empty() {
+        // A malformed/older daemon payload omitting `path` deserializes it to
+        // "" (see wire.rs's `sanitized` deserializer default). Path::starts_with("")
+        // is true for every path, so without the empty-path guard this would
+        // attach every session in the system to this one row.
+        let wt = worktree_wire("");
+        let sessions = vec![
+            session("/repo/wt-1/src", None),
+            session("/other-repo/wt/src", None),
+        ];
         let ahead_behind = AheadBehindCache::new(super::super::client::WorktreesClient::new(
             "/tmp/nonexistent.sock",
         ));

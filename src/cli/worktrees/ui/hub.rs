@@ -135,12 +135,19 @@ impl Hub {
             tokio::select! {
                 changed = self.tree_rx.changed() => {
                     if changed.is_err() {
-                        return; // the supervisor task is gone
+                        // The supervisor task's sender was dropped — normal on
+                        // a deliberate cancel, but also the only symptom of an
+                        // unexpected panic inside it, so this must not go
+                        // silent: without a log line here, the UI just freezes
+                        // on its last snapshot with no visible cause.
+                        tracing::warn!("worktrees ui: tree feed supervisor task ended; hub stopping");
+                        return;
                     }
                     self.on_tree_changed();
                 }
                 changed = self.sessions_rx.changed() => {
                     if changed.is_err() {
+                        tracing::warn!("worktrees ui: sessions feed supervisor task ended; hub stopping");
                         return;
                     }
                 }

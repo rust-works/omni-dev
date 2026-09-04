@@ -110,11 +110,18 @@ pub struct PrBadgeWire {
     pub number: u64,
     #[serde(rename = "isDraft", default)]
     pub is_draft: bool,
-    /// No `#[serde(default)]`: `PrCheckState` has no `Default` impl, and the
-    /// daemon always includes this field whenever `pr` itself is present.
+    /// The daemon always includes this field whenever `pr` itself is
+    /// present, but a single missing/malformed `checks` must not fail
+    /// deserialization of the *entire* snapshot the way a required field
+    /// would — it degrades to "no checks reported" instead.
+    #[serde(default = "default_pr_check_state")]
     pub checks: PrCheckState,
     #[serde(default, deserialize_with = "sanitized")]
     pub url: String,
+}
+
+fn default_pr_check_state() -> PrCheckState {
+    PrCheckState::None
 }
 
 /// The `sessions` service's `list`/`subscribe` payload: `{ "sessions": [...] }`.
@@ -204,6 +211,17 @@ mod tests {
         assert_eq!(pr.number, 42);
         assert!(pr.is_draft);
         assert_eq!(pr.checks, PrCheckState::Pending);
+    }
+
+    #[test]
+    fn pr_badge_wire_defaults_missing_checks_instead_of_failing_to_parse() {
+        let pr: PrBadgeWire = serde_json::from_value(serde_json::json!({
+            "number": 42,
+            "isDraft": false,
+            "url": "https://github.com/o/r/pull/42",
+        }))
+        .unwrap();
+        assert_eq!(pr.checks, PrCheckState::None);
     }
 
     #[test]

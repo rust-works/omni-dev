@@ -110,10 +110,38 @@ fn worktree_line(wt: &WorktreeRow) -> Line<'static> {
 
     let color = match wt.emphasis() {
         RowEmphasis::Operation => Color::Yellow,
-        RowEmphasis::Open => Color::Green,
-        RowEmphasis::UserTag(_) | RowEmphasis::Default => Color::Reset,
+        RowEmphasis::UserTag(tag) => color_for_tag(&tag),
+        // Neither an in-flight operation nor a user tag overrides the row:
+        // fall through to the automatic PR-check/session severity colour
+        // (`tree.ts::rowColorId`'s red > yellow > green ranking), and only
+        // then to the plain "open" green / reset defaults.
+        RowEmphasis::Open | RowEmphasis::Default => match wt.badge_severity() {
+            Severity::Red => Color::Red,
+            Severity::Yellow => Color::Yellow,
+            Severity::Green => Color::Green,
+            Severity::Muted if wt.open => Color::Green,
+            Severity::Muted => Color::Reset,
+        },
     };
     Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+/// Maps a row-colour id — one of `row_colors::KNOWN_ROW_COLORS`, or an
+/// unrecognized future one the store tolerates on read — to a terminal
+/// colour. An unrecognized id falls back to the terminal's default
+/// foreground rather than erroring, consistent with that same tolerance.
+fn color_for_tag(tag: &str) -> Color {
+    match tag {
+        "charts.red" | "terminal.ansiRed" => Color::Red,
+        "charts.orange" => Color::Rgb(0xff, 0xa5, 0x00),
+        "charts.yellow" | "terminal.ansiYellow" => Color::Yellow,
+        "charts.green" | "terminal.ansiGreen" => Color::Green,
+        "charts.blue" | "terminal.ansiBlue" => Color::Blue,
+        "charts.purple" | "terminal.ansiMagenta" => Color::Magenta,
+        "terminal.ansiCyan" => Color::Cyan,
+        "charts.foreground" | "descriptionForeground" => Color::Gray,
+        _ => Color::Reset,
+    }
 }
 
 /// Summarizes a worktree's live Claude sessions as `"N session(s) (model,
@@ -153,5 +181,102 @@ fn feed_status_label(status: FeedStatus) -> String {
             )
         }
         FeedStatus::Polling => "polling (daemon predates live updates)".to_string(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::pr_status::PrCheckState;
+
+    use super::super::view_model::PrBadgeRow;
+    use super::*;
+
+    fn worktree_row() -> WorktreeRow {
+        WorktreeRow {
+            path: PathBuf::from("/repo/wt"),
+            branch: None,
+            head_sha: None,
+            upstream_sha: None,
+            is_main: false,
+            open: false,
+            window_key: None,
+            pr: None,
+            pr_none: false,
+            operation: None,
+            rebasing: false,
+            pushing: false,
+            ahead_behind: AheadBehindState::Unknown,
+            sessions: Vec::new(),
+            row_color: None,
+            here: false,
+        }
+    }
+
+    fn line_color(wt: &WorktreeRow) -> Color {
+        match worktree_line(wt).spans.first() {
+            Some(span) => span.style.fg.unwrap_or(Color::Reset),
+            None => Color::Reset,
+        }
+    }
+
+    #[test]
+    fn color_for_tag_maps_every_known_row_color() {
+        for tag in super::super::row_colors::KNOWN_ROW_COLORS {
+            // Must not silently fall back to Reset for a colour the store
+            // actually accepts on write.
+            assert_ne!(color_for_tag(tag), Color::Reset, "tag: {tag}");
+        }
+    }
+
+    #[test]
+    fn color_for_tag_falls_back_to_reset_for_an_unrecognized_id() {
+        assert_eq!(color_for_tag("not-a-real-color"), Color::Reset);
+    }
+
+    #[test]
+    fn a_user_row_tag_is_rendered_in_its_mapped_color() {
+        let mut wt = worktree_row();
+        wt.row_color = Some("charts.blue".to_string());
+        assert_eq!(line_color(&wt), Color::Blue);
+    }
+
+    #[test]
+    fn failing_pr_checks_color_the_row_red_even_with_no_operation_or_tag() {
+        let mut wt = worktree_row();
+        wt.pr = Some(PrBadgeRow {
+            number: 1,
+            is_draft: false,
+            checks: PrCheckState::Failure,
+            url: String::new(),
+        });
+        assert_eq!(line_color(&wt), Color::Red);
+    }
+
+    #[test]
+    fn an_in_flight_operation_still_wins_over_severity() {
+        let mut wt = worktree_row();
+        wt.rebasing = true;
+        wt.pr = Some(PrBadgeRow {
+            number: 1,
+            is_draft: false,
+            checks: PrCheckState::Failure,
+            url: String::new(),
+        });
+        assert_eq!(line_color(&wt), Color::Yellow);
+    }
+
+    #[test]
+    fn open_with_no_severity_or_tag_stays_green() {
+        let mut wt = worktree_row();
+        wt.open = true;
+        assert_eq!(line_color(&wt), Color::Green);
+    }
+
+    #[test]
+    fn default_row_with_no_signal_is_reset() {
+        assert_eq!(line_color(&worktree_row()), Color::Reset);
     }
 }

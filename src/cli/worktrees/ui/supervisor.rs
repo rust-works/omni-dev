@@ -83,38 +83,107 @@ async fn run_supervisor<T>(
         if cancel.is_cancelled() {
             return;
         }
-        if let Ok(mut sub) = client.subscribe(subscribe_envelope.clone()).await {
-            match sub.next().await {
-                Some(Ok(reply)) if !reply.ok => {
-                    // An old daemon that doesn't recognise `subscribe`: it
-                    // replies ok:false and holds the connection open. Drop it
-                    // (closing our end) and never retry `subscribe` again.
-                    drop(sub);
-                    return run_polling_fallback(client, poll_envelope, poll_interval, tx, cancel)
+        // Every await that touches the socket races the cancellation token,
+        // not just the outer loop and the backoff sleep — otherwise a daemon
+        // that accepts a connection but never replies (wedged, not merely
+        // down) would leave this task blocked forever and never observe a
+        // shutdown request.
+        let subscribe_result = tokio::select! {
+            result = client.subscribe(subscribe_envelope.clone()) => result,
+            () = cancel.cancelled() => return,
+        };
+        match subscribe_result {
+            Ok(mut sub) => {
+                let first = tokio::select! {
+                    frame = sub.next() => frame,
+                    () = cancel.cancelled() => return,
+                };
+                match first {
+                    Some(Ok(reply)) if !reply.ok => {
+                        // An old daemon that doesn't recognise `subscribe`: it
+                        // replies ok:false and holds the connection open. Drop it
+                        // (closing our end) and never retry `subscribe` again.
+                        tracing::info!(
+                            "worktrees ui: daemon does not support subscribe; falling back to polling"
+                        );
+                        drop(sub);
+                        return run_polling_fallback(
+                            client,
+                            poll_envelope,
+                            poll_interval,
+                            tx,
+                            cancel,
+                        )
                         .await;
-                }
-                Some(Ok(reply)) => {
-                    if let Ok(value) = serde_json::from_value(reply.payload) {
-                        attempt = 0;
-                        let _ = tx.send(FeedFrame::Live(value));
                     }
-                    loop {
-                        match sub.next().await {
-                            Some(Ok(reply)) if reply.ok => {
-                                if let Ok(value) = serde_json::from_value(reply.payload) {
-                                    let _ = tx.send(FeedFrame::Live(value));
+                    Some(Ok(reply)) => {
+                        match serde_json::from_value(reply.payload) {
+                            Ok(value) => {
+                                attempt = 0;
+                                let _ = tx.send(FeedFrame::Live(value));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "worktrees ui: failed to parse subscribe payload: {e:#}"
+                                );
+                            }
+                        }
+                        loop {
+                            let next = tokio::select! {
+                                frame = sub.next() => frame,
+                                () = cancel.cancelled() => return,
+                            };
+                            match next {
+                                Some(Ok(reply)) if reply.ok => {
+                                    match serde_json::from_value(reply.payload) {
+                                        Ok(value) => {
+                                            let _ = tx.send(FeedFrame::Live(value));
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            "worktrees ui: failed to parse pushed payload: {e:#}"
+                                        ),
+                                    }
+                                }
+                                // A non-ok frame here (rather than on first read)
+                                // would be unusual — treat it the same as a
+                                // transport error and just reconnect, since only
+                                // the *first* frame carries the "unsupported op"
+                                // meaning.
+                                Some(Ok(_)) => {
+                                    tracing::warn!(
+                                        "worktrees ui: daemon sent an unexpected ok:false frame after the initial subscribe; reconnecting"
+                                    );
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(
+                                        "worktrees ui: subscription stream error: {e:#}; reconnecting"
+                                    );
+                                    break;
+                                }
+                                None => {
+                                    tracing::info!(
+                                        "worktrees ui: daemon closed the subscription; reconnecting"
+                                    );
+                                    break;
                                 }
                             }
-                            // A non-ok frame here (rather than on first read)
-                            // would be unusual — treat it the same as a
-                            // transport error and just reconnect, since only
-                            // the *first* frame carries the "unsupported op"
-                            // meaning.
-                            _ => break,
                         }
                     }
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            "worktrees ui: failed to read the first subscribe frame: {e:#}"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            "worktrees ui: daemon closed the connection before sending a subscribe frame"
+                        );
+                    }
                 }
-                _ => {}
+            }
+            Err(e) => {
+                tracing::warn!("worktrees ui: failed to connect to the daemon: {e:#}");
             }
         }
 
@@ -145,12 +214,19 @@ async fn run_polling_fallback<T>(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Ok(reply) = client.request(poll_envelope.clone()).await {
-                    if reply.ok {
-                        if let Ok(value) = serde_json::from_value(reply.payload) {
+                match client.request(poll_envelope.clone()).await {
+                    Ok(reply) if reply.ok => match serde_json::from_value(reply.payload) {
+                        Ok(value) => {
                             let _ = tx.send(FeedFrame::Live(value));
                         }
-                    }
+                        Err(e) => tracing::warn!(
+                            "worktrees ui: failed to parse polled payload: {e:#}"
+                        ),
+                    },
+                    Ok(reply) => tracing::warn!(
+                        "worktrees ui: poll request rejected: {:?}", reply.error
+                    ),
+                    Err(e) => tracing::warn!("worktrees ui: poll request failed: {e:#}"),
                 }
             }
             () = cancel.cancelled() => return,
