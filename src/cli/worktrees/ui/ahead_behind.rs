@@ -64,9 +64,8 @@ impl AheadBehindCache {
     }
 
     /// Drops a cached entry so a later `set_visible` call re-fetches it.
-    /// Called by [`super::hub::Hub`] when a worktree's `head_sha`/
-    /// `upstream_sha` moves (a commit or a push) since its ahead/behind was
-    /// last computed.
+    /// Called by the hub actor when a worktree's `head_sha`/`upstream_sha`
+    /// moves (a commit or a push) since its ahead/behind was last computed.
     pub fn invalidate(&mut self, path: &Path) {
         self.entries.remove(path);
     }
