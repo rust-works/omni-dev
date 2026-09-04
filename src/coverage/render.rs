@@ -212,7 +212,7 @@ fn render_delta_table(diff: &CoverageDiff, out: &mut String) {
                 delta,
             }
         })
-        .filter(|r| r.delta.is_none() || r.delta.is_some_and(|d| d.abs() >= EPS))
+        .filter(|r| r.delta.is_none_or(|d| d.abs() >= EPS))
         .collect();
     // New files (no delta) sort to the top, then largest decreases first.
     rows.sort_by(|a, b| {

@@ -205,7 +205,11 @@ mod macos {
         // fills on success. On any non-success return the slot is left untouched,
         // so it is only read below when the status says it was written.
         let status = unsafe {
-            AXUIElementCopyAttributeValue(element, CFRetained::as_ptr(&name).as_ptr(), &mut value)
+            AXUIElementCopyAttributeValue(
+                element,
+                CFRetained::as_ptr(&name).as_ptr(),
+                &raw mut value,
+            )
         };
         if status == AX_SUCCESS {
             own(value)
@@ -342,7 +346,7 @@ mod macos {
                 // A window that reports no subrole at all is treated as standard:
                 // the flag exists to exclude things that positively identify as
                 // sheets or palettes, not to require an opt-in.
-                standard: subrole.map_or(true, |role| role == SUBROLE_STANDARD_WINDOW),
+                standard: subrole.is_none_or(|role| role == SUBROLE_STANDARD_WINDOW),
                 // CFEqual rather than pointer equality: AX may hand out distinct
                 // element objects that refer to the same window.
                 focused: focused.is_some_and(|f| CFEqual(Some(window), Some(f))),
