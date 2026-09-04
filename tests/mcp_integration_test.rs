@@ -223,10 +223,10 @@ async fn all_tools_advertise_descriptions_and_param_schemas() -> Result<()> {
     let mut problems = Vec::new();
     for tool in &tools.tools {
         let name = tool.name.as_ref();
-        if !tool
+        if tool
             .description
             .as_ref()
-            .is_some_and(|d| !d.trim().is_empty())
+            .is_none_or(|d| d.trim().is_empty())
         {
             problems.push(format!("{name}: missing tool description"));
         }

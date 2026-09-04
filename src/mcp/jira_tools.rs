@@ -286,8 +286,8 @@ pub(crate) async fn board_list_yaml(
     let boards: Vec<AgileBoard> = cached
         .boards
         .iter()
-        .filter(|b| project.map_or(true, |p| b.project_key.as_deref() == Some(p)))
-        .filter(|b| board_type.map_or(true, |t| b.board_type == t))
+        .filter(|b| project.is_none_or(|p| b.project_key.as_deref() == Some(p)))
+        .filter(|b| board_type.is_none_or(|t| b.board_type == t))
         .take(effective_limit)
         .cloned()
         .collect();
