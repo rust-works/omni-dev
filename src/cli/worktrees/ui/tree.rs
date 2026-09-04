@@ -11,7 +11,7 @@ use super::view_model::{RepoRow, WorktreesViewModel};
 
 /// One addressable row in the flattened tree — a repo header or one of its
 /// worktrees — used for cursor movement and to resolve a row back to an
-/// [`actions::Target`].
+/// [`Target`].
 #[derive(Debug, Clone)]
 pub enum RowRef {
     Repo { index: usize },
