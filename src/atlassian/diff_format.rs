@@ -668,7 +668,7 @@ fn trim_to_budget(
     let (mut lo, mut hi) = (0usize, sections.len());
     let mut best = 0usize;
     while lo <= hi {
-        let mid = (lo + hi) / 2;
+        let mid = usize::midpoint(lo, hi);
         let trial = build_compare_output(
             diff,
             ctx,

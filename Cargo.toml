@@ -11,7 +11,7 @@ documentation = "https://docs.rs/omni-dev"
 readme = "README.md"
 keywords = ["git", "ai", "claude", "mcp", "conventional-commits"]
 categories = ["development-tools", "command-line-utilities"]
-rust-version = "1.80.0"
+rust-version = "1.88.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping
 # assets that consumers of the library/binary do not need: the promo website,
 # social-preview images, scratch space, and the VS Code companion extension
@@ -47,7 +47,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dirs = "6.0.0"
 globset = "0.4"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "0.30", features = ["crossterm"] }
 url = "2.5.8"
 base64 = "0.23"
 futures = "0.3"

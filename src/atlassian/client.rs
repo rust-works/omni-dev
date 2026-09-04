@@ -8283,8 +8283,8 @@ impl AtlassianClient {
 
         let versions: Vec<JiraProjectVersion> = entries
             .into_iter()
-            .filter(|e| released.map_or(true, |r| e.released == r))
-            .filter(|e| archived.map_or(true, |a| e.archived == a))
+            .filter(|e| released.is_none_or(|r| e.released == r))
+            .filter(|e| archived.is_none_or(|a| e.archived == a))
             .map(|e| JiraProjectVersion {
                 id: e.id,
                 name: e.name,

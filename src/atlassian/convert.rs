@@ -384,7 +384,7 @@ impl<'a> MarkdownParser<'a> {
                     // directly in the container, and drop the spurious
                     // `state` attr that was injected by the checkbox
                     // marker.
-                    let is_empty = task.content.as_ref().map_or(true, Vec::is_empty);
+                    let is_empty = task.content.as_ref().is_none_or(Vec::is_empty);
                     if is_empty && nested.len() == 1 && nested[0].node_type == "taskList" {
                         if let Some(task_items) = nested.remove(0).content {
                             task.content = Some(task_items);
@@ -3195,7 +3195,7 @@ fn fmt_numeric_attr(v: &serde_json::Value) -> Option<String> {
 fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     match node.node_type.as_str() {
         "paragraph" => {
-            let is_empty = node.content.as_ref().map_or(true, Vec::is_empty);
+            let is_empty = node.content.as_ref().is_none_or(Vec::is_empty);
             // Build directive attr string for localId when using ::paragraph form
             let dir_attrs = {
                 let mut parts = Vec::new();
@@ -3680,7 +3680,7 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
     // For paragraphs, localId is included in the ::paragraph directive when the
     // paragraph uses directive form (empty or whitespace-only content).
     let para_used_directive = node.node_type == "paragraph" && {
-        let is_empty = node.content.as_ref().map_or(true, Vec::is_empty);
+        let is_empty = node.content.as_ref().is_none_or(Vec::is_empty);
         if is_empty {
             true
         } else {

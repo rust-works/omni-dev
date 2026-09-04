@@ -3340,7 +3340,7 @@ mod tests {
     // --- resolve_duplicate_amendments ---
 
     fn dup_hash(byte: char) -> String {
-        std::iter::repeat(byte).take(40).collect()
+        std::iter::repeat_n(byte, 40).collect()
     }
 
     fn dup_amendments(items: &[(&str, &str)]) -> AmendmentFile {

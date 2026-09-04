@@ -148,11 +148,9 @@ impl ClaudeError {
 /// abort a caller that would otherwise retry or degrade gracefully.
 #[must_use]
 pub fn is_transient_ai_error(error: &anyhow::Error) -> bool {
-    // `is_none_or` would read better but is stable only since 1.82; the
-    // project's MSRV is 1.80.
     error
         .downcast_ref::<ClaudeError>()
-        .map_or(true, ClaudeError::is_transient)
+        .is_none_or(ClaudeError::is_transient)
 }
 
 /// Reports whether an AI error is an endpoint rejecting the `output_config`

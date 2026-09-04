@@ -818,7 +818,7 @@ pub(crate) fn write_attachments_atomically(
 fn is_history_not_found(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<GmailError>() {
         Some(e @ GmailError::ApiRequestFailed { status: 404, .. }) => {
-            e.reason().map_or(true, |r| r == "notFound")
+            e.reason().is_none_or(|r| r == "notFound")
         }
         _ => false,
     }

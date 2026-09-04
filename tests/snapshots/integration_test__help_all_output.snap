@@ -5307,6 +5307,7 @@ Commands:
   register     Register a window's open worktree folders (companion feed op)
   heartbeat    Refresh a window's liveness and read any pending close/reload directive
   unregister   Remove a window's registration (companion feed op)
+  ui           Launch the full-screen terminal UI for the worktrees tree (#1585)
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -5519,6 +5520,19 @@ Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -f, --follow           Stream live snapshots: re-render on every change until interrupted (Ctrl-C). Uses the daemon's `subscribe` push op
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev worktrees ui - Launch the full-screen terminal UI for the worktrees tree (#1585)
+
+Launch the full-screen terminal UI for the worktrees tree (#1585)
+
+Usage: ui [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================

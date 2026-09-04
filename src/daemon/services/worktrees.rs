@@ -244,9 +244,7 @@ struct RefreshTask {
 /// is *when* a subprocess runs, which a test cannot pin down without either flaking
 /// or passing for the wrong reason.
 fn pr_should_fetch(grew: bool, since_last_fetch: Option<Duration>, backoff: Duration) -> bool {
-    // `map_or(true, ..)` rather than `is_none_or`: the latter is stable only
-    // since 1.82 and this crate's MSRV is 1.80.
-    grew || since_last_fetch.map_or(true, |elapsed| elapsed >= backoff)
+    grew || since_last_fetch.is_none_or(|elapsed| elapsed >= backoff)
 }
 
 /// Whether `next` holds a watch the poller has not already resolved for its

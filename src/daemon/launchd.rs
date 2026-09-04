@@ -280,7 +280,7 @@ pub(crate) fn launchd_listener(name: &str) -> Result<Option<UnixListener>> {
     // `launch_activate_socket` either writes a freshly `malloc`-ed array of `cnt`
     // ints into `*fds` and returns 0, or returns a non-zero errno and allocates
     // nothing. We never read past `cnt` and free the array exactly once below.
-    let rc = unsafe { launch_activate_socket(c_name.as_ptr(), &mut fds, &mut cnt) };
+    let rc = unsafe { launch_activate_socket(c_name.as_ptr(), &raw mut fds, &raw mut cnt) };
     if rc != 0 {
         // ENOENT/ESRCH ⇒ no activation socket under this name (not launchd-spawned,
         // or the name does not match the plist): fall back to a self-bound socket.

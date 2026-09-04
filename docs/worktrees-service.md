@@ -375,6 +375,28 @@ omni-dev worktrees show-closed false    # hide closed worktrees everywhere
 (Ctrl-C) — the terminal equivalent of the editor tree view. It honours `-o json`
 (one compact frame per line, an NDJSON stream).
 
+`worktrees ui` launches a full-screen terminal UI over the same live data
+(issue #1585) — a `ratatui` app that supersedes `worktrees tree --follow` for
+interactive use:
+
+```bash
+omni-dev worktrees ui
+
+# Against a non-default daemon socket.
+omni-dev worktrees ui --socket /path/to/daemon.sock
+```
+
+Phase 1 (this release) is a read-only, live-updating tree view: one row per
+repository/worktree, redrawn on every `worktrees`/`sessions` push, with a
+status bar reporting each feed's connection state (`live` / `reconnecting` /
+`polling (daemon predates live updates)`). It reuses the same `subscribe`
+reconnect-with-backoff-and-legacy-daemon-fallback contract `tree --follow`
+does, and the same row-severity ranking `worktrees tree`'s glyph table follows
+(the tree view's `rowColorId`: red > yellow > green > muted). `q`/`Esc`/Ctrl-C
+quits and always restores the terminal, even on an error path. Actions, an
+action-target selection model, embedded terminals and tabs, and the rest of
+the tree view's VS Code-parity surface land in later phases.
+
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests
 can drive the registry's full lifecycle without VS Code (#1361). Each takes a

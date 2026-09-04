@@ -9,6 +9,8 @@
 //! scripted/headless reporter or an integration test drive the registry the way
 //! the VS Code extension does from each window.
 
+mod ui;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -67,6 +69,8 @@ pub enum WorktreesSubcommands {
     Heartbeat(HeartbeatCommand),
     /// Remove a window's registration (companion feed op).
     Unregister(UnregisterCommand),
+    /// Launch the full-screen terminal UI for the worktrees tree (#1585).
+    Ui(ui::UiCommand),
 }
 
 impl WorktreesCommand {
@@ -92,6 +96,7 @@ impl WorktreesCommand {
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
             WorktreesSubcommands::Unregister(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Ui(cmd) => cmd.execute().await,
         }
     }
 }

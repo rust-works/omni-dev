@@ -704,7 +704,7 @@ fn remove_hooks(settings: &mut Value, command: &str) -> usize {
         groups.retain(|g| {
             g.get("hooks")
                 .and_then(Value::as_array)
-                .map_or(true, |h| !h.is_empty())
+                .is_none_or(|h| !h.is_empty())
         });
         if groups.is_empty() {
             empty_events.push(event.clone());
@@ -1023,7 +1023,7 @@ mod tests {
             let empty = settings["hooks"]
                 .get(event)
                 .and_then(Value::as_array)
-                .map_or(true, |g| g.iter().all(|g| !group_has_command(g, cmd)));
+                .is_none_or(|g| g.iter().all(|g| !group_has_command(g, cmd)));
             assert!(empty, "our hook survived under {event}");
         }
         // ...but the unrelated PreToolUse hook remains.
