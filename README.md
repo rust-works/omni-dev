@@ -326,13 +326,22 @@ synchronous MCP call). For the full guide, see
 
 Authenticate against your own Google Drive account via OAuth2 (loopback
 authorization-code + PKCE, the same flow as Gmail), then search files, read
-their metadata or content, find duplicates, and rename/move files. The
-default scope, `drive.readonly`, is enough for search/read/dedupe;
-rename/move need the opt-in `drive.metadata` scope (`drive auth login
---write`), the narrowest write scope Google offers — there is still no
-upload/create/trash/share/permission-mutation capability anywhere in this
-surface. `drive move` is security-gated: it refuses any move that would
-change a file's visibility by default (see [ADR-0070](docs/adrs/adr-0070.md)).
+their metadata or content, find duplicates, rename/move files, and create,
+upload, or replace file content. Every write is opt-in twice over. First by
+OAuth scope: the default `drive.readonly` covers search/read/dedupe;
+rename/move need `drive.metadata` (`drive auth login --write`), the narrowest
+write scope Google offers; create/upload need `drive.file`
+(`--write-file`); and editing a file omni-dev did not itself create needs the
+unrestricted `drive` scope (`--write-full`). Second by a **local**,
+folder-scoped gate: `create`/`upload`/`edit` resolve the target's ancestor
+folder chain against per-account rules in `settings.json` — closest ancestor
+wins, deny beats allow, and **a write with no matching rule is denied** — so
+an OAuth grant alone never authorizes a mutation (see
+[ADR-0071](docs/adrs/adr-0071.md)). Inspect that gate with `drive permissions
+show/lookup-folder/check` before granting anything. There is still no
+trash/share/permission-mutation capability anywhere in this surface. `drive
+move` is separately security-gated: it refuses any move that would change a
+file's visibility by default (see [ADR-0070](docs/adrs/adr-0070.md)).
 New to this integration? Start with the
 [Drive Quickstart](docs/drive-quickstart.md) for a zero-to-first-search
 walkthrough; see the [Drive integration guide](docs/drive.md) for
@@ -359,6 +368,15 @@ omni-dev drive read <file-id> --content --out-file report.pdf
 omni-dev drive auth login --write
 omni-dev drive rename <file-id> "New Name.pdf"
 omni-dev drive move <file-id> --to <folder-id>
+
+# Creating/uploading/editing content needs a content scope *and* a
+# folder rule in settings.json permitting the destination
+omni-dev drive auth login --write-file          # or --write-full to edit
+omni-dev drive permissions show                 # what is configured
+omni-dev drive permissions check <folder-id> --operation create  # what it decides
+omni-dev drive create --name notes.txt --parent <folder-id>
+omni-dev drive upload ./report.pdf --parent <folder-id>
+omni-dev drive edit <file-id> --content ./report.pdf   # or --content - for stdin
 ```
 
 An OAuth2 client left in Google's "Testing" publishing status issues
@@ -368,8 +386,9 @@ refresh tokens that expire after 7 days — see
 
 Five read-only MCP tools (`drive_*`) mirror the CLI's `auth status`,
 `search`, `dedupe`, `read`, and `account list` — see
-[docs/mcp.md](docs/mcp.md#drive-5-tools). `rename`/`move` have no MCP
-equivalent. For the full guide, see [docs/drive.md](docs/drive.md).
+[docs/mcp.md](docs/mcp.md#drive-5-tools). The mutating verbs —
+`rename`/`move`/`create`/`upload`/`edit` — have no MCP equivalent. For the
+full guide, see [docs/drive.md](docs/drive.md).
 
 ### 🎙️ Transcript Fetching
 
