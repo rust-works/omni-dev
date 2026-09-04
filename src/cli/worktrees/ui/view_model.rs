@@ -74,8 +74,10 @@ pub struct WorktreeRow {
     pub upstream_sha: Option<String>,
     pub is_main: bool,
     pub open: bool,
-    /// Not rendered by Phase 1; the daemon `open`/`focus` op target once the
-    /// tree pane's `focus`/`o` parity command lands (Phase 2).
+    /// Not rendered, and not read by Phase 2's `Focus` action either — that
+    /// action's daemon `open` op only needs `path` (matching the CLI's own
+    /// `FocusCommand`), so this stays unconsumed until a later phase's
+    /// "jump to the owning window" action needs it specifically.
     #[allow(dead_code)]
     pub window_key: Option<String>,
     pub pr: Option<PrBadgeRow>,
@@ -117,18 +119,15 @@ pub struct PrBadgeRow {
     pub number: u64,
     pub is_draft: bool,
     pub checks: PrCheckState,
-    /// The PR's web URL. Not rendered by Phase 1's plain tree pane; carried
-    /// through for the `openPullRequestInBrowser` parity command (#1585 §3,
-    /// Phase 2).
-    #[allow(dead_code)]
+    /// The PR's web URL — read by Phase 2's Copy Pull Request URL(s) action
+    /// (`actions::pull_request_lines`).
     pub url: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionBadge {
-    /// Not rendered by Phase 1; carried through as the action target once a
-    /// per-session action (e.g. "move Claude session here") lands (Phase 2).
-    #[allow(dead_code)]
+    /// Read by Phase 2's Move/Copy Claude Session Here action
+    /// (`actions::SessionSummary`) to build its session picker.
     pub session_id: String,
     pub state: SessionState,
     pub source: SessionSourceRow,
@@ -243,6 +242,19 @@ pub fn badge_severity(
     severity
 }
 
+/// The four inputs `merge_repo`/`merge_worktree` need at every level of the
+/// tree, bundled so they thread through as one reference instead of four
+/// unchanged parameters repeated at each nesting level. `merge` itself keeps
+/// its flat parameter list (below) — the hub genuinely owns these as
+/// separate fields, so bundling only pays off once you're past the one call
+/// site that actually has four separate variables to bundle.
+struct MergeContext<'a> {
+    sessions: &'a [SessionEntryWire],
+    ahead_behind: &'a AheadBehindCache,
+    row_colors: &'a RowColorStore,
+    open_tabs: &'a OpenTabs,
+}
+
 /// Merges the daemon's tree snapshot with joined sessions and local state
 /// into one [`WorktreesViewModel`]. `tree` is `None` before the first
 /// snapshot has arrived (the view starts empty, not stale).
@@ -265,10 +277,16 @@ pub fn merge(
             ..Default::default()
         };
     };
+    let ctx = MergeContext {
+        sessions,
+        ahead_behind,
+        row_colors,
+        open_tabs,
+    };
     let repos = tree
         .repos
         .iter()
-        .map(|repo| merge_repo(repo, sessions, ahead_behind, row_colors, open_tabs))
+        .map(|repo| merge_repo(repo, &ctx))
         .collect();
     WorktreesViewModel {
         repos,
@@ -279,13 +297,7 @@ pub fn merge(
     }
 }
 
-fn merge_repo(
-    repo: &TreeRepoWire,
-    sessions: &[SessionEntryWire],
-    ahead_behind: &AheadBehindCache,
-    row_colors: &RowColorStore,
-    open_tabs: &OpenTabs,
-) -> RepoRow {
+fn merge_repo(repo: &TreeRepoWire, ctx: &MergeContext<'_>) -> RepoRow {
     let root = PathBuf::from(&repo.root);
     RepoRow {
         main_repo: repo.main_repo.clone(),
@@ -293,7 +305,8 @@ fn merge_repo(
             owner: g.owner.clone(),
             name: g.name.clone(),
         }),
-        row_color: row_colors
+        row_color: ctx
+            .row_colors
             .get(&RowColorKey::Repo(root.clone()))
             .map(str::to_string),
         root,
@@ -301,18 +314,12 @@ fn merge_repo(
         worktrees: repo
             .worktrees
             .iter()
-            .map(|wt| merge_worktree(wt, sessions, ahead_behind, row_colors, open_tabs))
+            .map(|wt| merge_worktree(wt, ctx))
             .collect(),
     }
 }
 
-fn merge_worktree(
-    wt: &TreeWorktreeWire,
-    sessions: &[SessionEntryWire],
-    ahead_behind: &AheadBehindCache,
-    row_colors: &RowColorStore,
-    open_tabs: &OpenTabs,
-) -> WorktreeRow {
+fn merge_worktree(wt: &TreeWorktreeWire, ctx: &MergeContext<'_>) -> WorktreeRow {
     let path = PathBuf::from(&wt.path);
     // `Path::starts_with("")` is true for every path, so an empty `path` (a
     // malformed/older daemon payload omitting the field) must never be used
@@ -321,7 +328,7 @@ fn merge_worktree(
     let joined_sessions = if path.as_os_str().is_empty() {
         Vec::new()
     } else {
-        sessions
+        ctx.sessions
             .iter()
             .filter(|s| s.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&path)))
             .map(|s| SessionBadge {
@@ -355,12 +362,13 @@ fn merge_worktree(
         operation: wt.operation.clone(),
         rebasing: wt.rebasing,
         pushing: wt.pushing,
-        ahead_behind: ahead_behind.get(&path),
+        ahead_behind: ctx.ahead_behind.get(&path),
         sessions: joined_sessions,
-        row_color: row_colors
+        row_color: ctx
+            .row_colors
             .get(&RowColorKey::Worktree(path.clone()))
             .map(str::to_string),
-        here: open_tabs.contains(&path),
+        here: ctx.open_tabs.contains(&path),
         path,
     }
 }
@@ -409,7 +417,13 @@ mod tests {
         ));
         let row_colors = RowColorStore::default();
         let open_tabs = OpenTabs::default();
-        let row = merge_worktree(&wt, &sessions, &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &sessions,
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert_eq!(row.sessions.len(), 1);
     }
 
@@ -425,7 +439,13 @@ mod tests {
         ));
         let row_colors = RowColorStore::default();
         let open_tabs = OpenTabs::default();
-        let row = merge_worktree(&wt, &sessions, &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &sessions,
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert!(row.sessions.is_empty());
     }
 
@@ -445,7 +465,13 @@ mod tests {
         ));
         let row_colors = RowColorStore::default();
         let open_tabs = OpenTabs::default();
-        let row = merge_worktree(&wt, &sessions, &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &sessions,
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert!(row.sessions.is_empty());
     }
 
@@ -459,12 +485,24 @@ mod tests {
         let row_colors = RowColorStore::default();
         let mut open_tabs = OpenTabs::default();
         // ...but no TUI tab does, so `here` must be false.
-        let row = merge_worktree(&wt, &[], &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &[],
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert!(!row.here);
         assert!(row.open);
 
         open_tabs.set(PathBuf::from("/repo/wt-1"));
-        let row = merge_worktree(&wt, &[], &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &[],
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert!(row.here);
     }
 
@@ -483,7 +521,13 @@ mod tests {
             )
             .unwrap();
         let open_tabs = OpenTabs::default();
-        let row = merge_worktree(&wt, &[], &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &[],
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert_eq!(row.row_color.as_deref(), Some("charts.blue"));
     }
 
@@ -495,7 +539,13 @@ mod tests {
         ));
         let row_colors = RowColorStore::default();
         let open_tabs = OpenTabs::default();
-        let row = merge_worktree(&wt, &[], &ahead_behind, &row_colors, &open_tabs);
+        let ctx = MergeContext {
+            sessions: &[],
+            ahead_behind: &ahead_behind,
+            row_colors: &row_colors,
+            open_tabs: &open_tabs,
+        };
+        let row = merge_worktree(&wt, &ctx);
         assert_eq!(row.ahead_behind, AheadBehindState::Unknown);
     }
 

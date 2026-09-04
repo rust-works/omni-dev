@@ -8,25 +8,26 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use super::tree::TreeState;
 use super::view_model::{
     AheadBehindState, FeedStatus, GlyphCue, RowEmphasis, SessionBadge, SessionSourceRow, Severity,
     WorktreeRow, WorktreesViewModel,
 };
 
-pub fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel) {
+pub fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, tree: &TreeState) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
-    draw_tree(frame, chunks[0], view);
-    draw_status_bar(frame, chunks[1], view);
+    draw_tree(frame, chunks[0], view, tree);
+    draw_status_bar(frame, chunks[1], view, tree);
 }
 
-fn draw_tree(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel) {
+fn draw_tree(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel, tree: &TreeState) {
     let mut items: Vec<ListItem> = Vec::new();
     if view.repos.is_empty() {
         items.push(ListItem::new("No repositories open."));
@@ -43,16 +44,36 @@ fn draw_tree(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel) {
             header.push_str(&format!("  ({tag})"));
         }
         header.push_str(&format!("  {}", repo.root.display()));
-        items.push(ListItem::new(Line::from(Span::styled(
+        let header_line = Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
-        ))));
+        ));
+        items.push(gutter_item(header_line, tree.marked.contains(&repo.root)));
         for wt in &repo.worktrees {
-            items.push(ListItem::new(worktree_line(wt)));
+            items.push(gutter_item(
+                worktree_line(wt),
+                tree.marked.contains(&wt.path),
+            ));
         }
     }
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("WORKTREES"));
-    frame.render_widget(list, area);
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(tree.cursor.min(items.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("WORKTREES"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Prepends the multi-select gutter (`▌ ` when marked, two spaces
+/// otherwise — the mockup's marked-row marker, issue #1585 §2) to a row's
+/// existing styled line, preserving that line's own per-span styling.
+fn gutter_item(line: Line<'static>, marked: bool) -> ListItem<'static> {
+    let gutter = if marked { "▌ " } else { "  " };
+    let mut spans = vec![Span::raw(gutter)];
+    spans.extend(line.spans);
+    ListItem::new(Line::from(spans))
 }
 
 fn worktree_line(wt: &WorktreeRow) -> Line<'static> {
@@ -160,10 +181,16 @@ fn sessions_summary(sessions: &[SessionBadge]) -> String {
     format!("{} session(s) ({model}, {source})", sessions.len())
 }
 
-fn draw_status_bar(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel) {
+fn draw_status_bar(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel, tree: &TreeState) {
     let closed = if view.show_closed { "shown" } else { "hidden" };
+    let marked = if tree.marked.is_empty() {
+        String::new()
+    } else {
+        format!("{} marked   ", tree.marked.len())
+    };
     let status = format!(
-        "worktrees: {}  sessions: {}  closed worktrees {closed}   q quit",
+        "{marked}worktrees: {}  sessions: {}  closed worktrees {closed}   \
+         space mark  a actions  c/C colour  q quit",
         feed_status_label(view.worktrees_status),
         feed_status_label(view.sessions_status),
     );

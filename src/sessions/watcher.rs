@@ -82,7 +82,11 @@ impl Sighting {
 /// The transcripts root: `$OMNI_DEV_CLAUDE_PROJECTS_DIR` (test/escape override),
 /// else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`. `None` only
 /// when no home directory can be resolved and no override is set.
-fn projects_dir() -> Option<PathBuf> {
+///
+/// `pub(crate)` so `src/sessions/relocate.rs` (the worktrees UI's "move/copy
+/// Claude session here" action, issue #1585 Phase 2) can resolve the same
+/// root without a second copy of this precedence chain.
+pub(crate) fn projects_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(PROJECTS_DIR_ENV) {
         return Some(PathBuf::from(dir));
     }

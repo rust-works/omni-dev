@@ -172,6 +172,38 @@ pub struct AheadBehindEntryWire {
     pub main_behind: Option<usize>,
 }
 
+/// The `close` op's phase-1 safety report (`{ path, remove: true }`,
+/// unconfirmed) — mirrors the daemon's private `SafetyReport`
+/// (`src/daemon/services/worktrees.rs`). `removable && risks.is_empty()`
+/// means "proceed with no confirm"; any `risks` entry means "show one".
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SafetyReportWire {
+    #[serde(default)]
+    pub removable: bool,
+    #[serde(default)]
+    pub is_main: bool,
+    #[serde(default)]
+    pub open: bool,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub window_key: Option<String>,
+    #[serde(default)]
+    pub window_folder_count: usize,
+    #[serde(default)]
+    pub risks: Vec<CloseNoteWire>,
+    #[serde(default)]
+    pub info: Vec<CloseNoteWire>,
+}
+
+/// One risk/info note in a [`SafetyReportWire`]: a machine `kind` slug and a
+/// human-readable `detail` — mirrors the daemon's private `Note`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CloseNoteWire {
+    #[serde(default, deserialize_with = "sanitized")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub detail: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -187,6 +219,40 @@ mod tests {
         });
         let wt: TreeWorktreeWire = serde_json::from_value(json).unwrap();
         assert_eq!(wt.branch.as_deref(), Some("evil[31mrepo"));
+    }
+
+    #[test]
+    fn safety_report_wire_parses_fields_and_notes() {
+        let json = serde_json::json!({
+            "removable": true,
+            "is_main": false,
+            "open": true,
+            "window_key": "w1",
+            "window_folder_count": 2,
+            "risks": [{ "kind": "dirty", "detail": "uncommitted changes" }],
+            "info": [{ "kind": "unpushed", "detail": "2 unpushed commits" }],
+        });
+        let report: SafetyReportWire = serde_json::from_value(json).unwrap();
+        assert!(report.removable);
+        assert!(!report.is_main);
+        assert!(report.open);
+        assert_eq!(report.window_key.as_deref(), Some("w1"));
+        assert_eq!(report.window_folder_count, 2);
+        assert_eq!(report.risks.len(), 1);
+        assert_eq!(report.risks[0].kind, "dirty");
+        assert_eq!(report.info[0].detail, "2 unpushed commits");
+    }
+
+    #[test]
+    fn safety_report_wire_defaults_missing_fields() {
+        let report: SafetyReportWire =
+            serde_json::from_value(serde_json::json!({ "removable": false, "is_main": true }))
+                .unwrap();
+        assert!(!report.removable);
+        assert!(report.is_main);
+        assert!(!report.open);
+        assert!(report.window_key.is_none());
+        assert!(report.risks.is_empty());
     }
 
     #[test]
