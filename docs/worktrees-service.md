@@ -386,16 +386,31 @@ omni-dev worktrees ui
 omni-dev worktrees ui --socket /path/to/daemon.sock
 ```
 
-Phase 1 (this release) is a read-only, live-updating tree view: one row per
+Phase 1 was a read-only, live-updating tree view: one row per
 repository/worktree, redrawn on every `worktrees`/`sessions` push, with a
 status bar reporting each feed's connection state (`live` / `reconnecting` /
 `polling (daemon predates live updates)`). It reuses the same `subscribe`
 reconnect-with-backoff-and-legacy-daemon-fallback contract `tree --follow`
 does, and the same row-severity ranking `worktrees tree`'s glyph table follows
 (the tree view's `rowColorId`: red > yellow > green > muted). `q`/`Esc`/Ctrl-C
-quits and always restores the terminal, even on an error path. Actions, an
-action-target selection model, embedded terminals and tabs, and the rest of
-the tree view's VS Code-parity surface land in later phases.
+quits and always restores the terminal, even on an error path.
+
+Phase 2 (this release) adds row navigation/marking (`↑`/`↓`/`j`/`k`, `space`
+to mark), an action menu (`a`) filtered to the current selection and grouped
+in the tree view's own `0_open`/`1_pr`/`2_claude`/`3_copy`/`9_close` order, a
+row-colour picker (`c` to set, `C` to clear), and five daemon-free parity
+commands ported from the tree view: **Open GitHub Repository**, **Copy
+Directory**, **Copy Pull Request URL(s)** (built entirely from the already-live
+snapshot — no `gh` lookup, unlike the tree view), **Move/Copy Claude Session
+Here** (pure `~/.claude/projects/` filesystem manipulation; the cursor row is
+always the *source*, since a TUI has no "current window" to default a source
+to the way the tree view's version does — `src/sessions/relocate.rs`), and
+**Focus/Open Worktree** (wraps the daemon's `open` op, identical to `worktrees
+focus`). **Close Worktree**/**Close Window** are the two-phase check→confirm→
+execute flow, fanned out client-side across every marked target since
+`close`'s wire payload isn't batched. Embedded terminals, tabs/splits, mouse
+handling and the rest of the tree view's VS Code-parity surface land in later
+phases.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests

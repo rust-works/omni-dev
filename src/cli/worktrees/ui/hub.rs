@@ -35,21 +35,23 @@ struct WorktreeOids {
 
 /// Commands the rendering layer sends into the hub.
 ///
-/// Phase 1 has no scrollable/collapsible tree pane yet, so the hub treats
-/// every worktree in the latest snapshot as visible by default; later phases
-/// narrow that with `SetVisibleRows` once there is a real notion of "on
-/// screen". The row-colour and open-tab commands are unused until the action
-/// layer (Phase 2) and the embedded-terminal tab lifecycle (Phase 3) land,
-/// but the command surface is defined here now since it *is* the hub/render
-/// interface boundary — `apply` below already handles every variant.
+/// Phase 2's `Dispatcher` (`actions.rs`) constructs `SetRowColor`/
+/// `ClearRowColor` for the `c`/`C` keybindings. `ClearAllRowColors` has no
+/// keybinding yet (no "clear every colour" command in the action menu);
+/// `SetOpenTab`/`ClearOpenTab` await Phase 3's tab lifecycle, and
+/// `SetVisibleRows` awaits Phase 4's scrollable tree (until then the hub
+/// treats every worktree in the latest snapshot as visible by default).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // constructed by the render layer starting Phase 2/3
 pub enum HubCommand {
+    #[allow(dead_code)] // Phase 3 tab lifecycle
     SetOpenTab(PathBuf),
+    #[allow(dead_code)] // Phase 3 tab lifecycle
     ClearOpenTab(PathBuf),
     SetRowColor(RowColorKey, String),
     ClearRowColor(RowColorKey),
+    #[allow(dead_code)] // no "clear every colour" command yet
     ClearAllRowColors,
+    #[allow(dead_code)] // Phase 4 scrollable tree
     SetVisibleRows(Vec<PathBuf>),
 }
 
@@ -57,9 +59,7 @@ pub enum HubCommand {
 /// report state changes into the hub.
 pub struct ViewModelHandle {
     pub view: watch::Receiver<Arc<WorktreesViewModel>>,
-    /// Unused by Phase 1's read-only render loop; wired up starting Phase 2
-    /// (actions, row-colour edits) and Phase 3 (tab lifecycle).
-    #[allow(dead_code)]
+    /// Constructed and sent by `actions::Dispatcher` (Phase 2).
     pub commands: mpsc::UnboundedSender<HubCommand>,
 }
 

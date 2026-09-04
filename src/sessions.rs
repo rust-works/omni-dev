@@ -40,6 +40,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+pub mod relocate;
 pub mod stream;
 pub mod watcher;
 
