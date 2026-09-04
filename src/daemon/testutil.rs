@@ -68,3 +68,53 @@ pub(crate) fn fake_daemon_stream(replies: Vec<Value>) -> (TempDir, PathBuf, Join
     });
     (dir, sock, server)
 }
+
+/// Like [`fake_daemon_stream`], but holds the connection open after sending
+/// `replies` until `close` is dropped or fired, instead of closing
+/// immediately.
+///
+/// A caller driving a reconnect-supervisor (one that treats "connection
+/// closed" as "go reconnect") over a plain [`fake_daemon_stream`] cannot
+/// reliably observe a pushed frame as a *stable* value — the moment the
+/// one-shot fake closes, the supervisor immediately moves on to its next
+/// state (a reconnect attempt), and on a single-threaded runtime that whole
+/// disconnect-and-retry sequence can run to completion before a consumer
+/// polling e.g. a `tokio::sync::watch::Receiver` is ever scheduled, so it
+/// observes only the post-disconnect state, never the frame itself. Holding
+/// the connection open gives the test explicit control over when the
+/// disconnect happens, so it can assert on the stable, pre-disconnect state
+/// first.
+pub(crate) fn fake_daemon_stream_hold_open(
+    replies: Vec<Value>,
+) -> (
+    TempDir,
+    PathBuf,
+    tokio::sync::oneshot::Sender<()>,
+    JoinHandle<()>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
+    use tokio_util::codec::{Framed, LinesCodec};
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let sock = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (close_tx, close_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, LinesCodec::new());
+        let _req = framed.next().await.unwrap().unwrap();
+        for reply in replies {
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+        }
+        // Held open until the caller signals (or drops `close_tx`); a
+        // `RecvError` on drop is exactly the "close now" signal, same as an
+        // explicit send.
+        let _ = close_rx.await;
+    });
+    (dir, sock, close_tx, server)
+}
