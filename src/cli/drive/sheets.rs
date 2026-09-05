@@ -6,15 +6,18 @@
 //! permission diagnostics: a Sheet is a Drive file, and the permission gate
 //! is a Drive concept.
 
+pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
+pub(crate) mod values;
+pub(crate) mod write;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::drive::client::DriveClient;
 
-/// Reads the cells of a Google Sheet.
+/// Reads and writes the cells of a Google Sheet.
 #[derive(Parser)]
 pub struct SheetsCommand {
     /// The sheets subcommand to execute.
@@ -29,6 +32,19 @@ pub enum SheetsSubcommands {
     Info(info::InfoCommand),
     /// Reads cell values from one range, or from every sheet.
     Read(read::ReadCommand),
+    /// Overwrites the cells of a range, gated by the folder
+    /// write-permission rules (issue #1589). Requires the `drive.file` or
+    /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    Write(write::WriteCommand),
+    /// Appends rows after the last row of a range's table, gated by the
+    /// folder write-permission rules (issue #1589).
+    Append(write::AppendCommand),
+    /// Clears a range's values, leaving formatting intact. Gated by the
+    /// folder write-permission rules (issue #1589).
+    Clear(write::ClearCommand),
+    /// Creates a new Google Sheet, optionally seeded with values. Gated by
+    /// the folder write-permission rules' `create` operation (issue #1589).
+    Create(create::CreateCommand),
 }
 
 impl SheetsCommand {
@@ -42,6 +58,10 @@ impl SheetsCommand {
         match self.command {
             SheetsSubcommands::Info(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Read(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::Write(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::Append(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::Clear(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }
 }

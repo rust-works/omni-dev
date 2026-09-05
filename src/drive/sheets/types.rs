@@ -183,6 +183,73 @@ pub struct BatchGetValuesResponse {
     pub value_ranges: Vec<ValueRange>,
 }
 
+/// Response to `values.update`.
+///
+/// The counts are what the request log records as context, so
+/// `omni-dev log --query kind:drivemutation` can answer "what did that write
+/// actually touch" rather than only "a write happened".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateValuesResponse {
+    /// The range that was written, server-normalised.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedRange"
+    )]
+    pub updated_range: Option<String>,
+    /// Rows written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedRows"
+    )]
+    pub updated_rows: Option<i64>,
+    /// Columns written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedColumns"
+    )]
+    pub updated_columns: Option<i64>,
+    /// Cells written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedCells"
+    )]
+    pub updated_cells: Option<i64>,
+}
+
+/// Response to `values.append`.
+///
+/// Note the nesting: the counts live under `updates`, not at the top level,
+/// which is the one shape difference from `values.update`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppendValuesResponse {
+    /// The table range the append targeted, before the new rows.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "tableRange"
+    )]
+    pub table_range: Option<String>,
+    /// What was actually written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<UpdateValuesResponse>,
+}
+
+/// Response to `values.clear`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClearValuesResponse {
+    /// The range that was cleared, server-normalised.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clearedRange"
+    )]
+    pub cleared_range: Option<String>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -280,5 +347,43 @@ mod tests {
 
         let empty: BatchGetValuesResponse = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.value_ranges.is_empty());
+    }
+    #[test]
+    fn update_values_response_parses_the_counts() {
+        let json = serde_json::json!({
+            "spreadsheetId": "s", "updatedRange": "'Q1'!A1:B2",
+            "updatedRows": 2, "updatedColumns": 2, "updatedCells": 4,
+        });
+        let parsed: UpdateValuesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.updated_range.as_deref(), Some("'Q1'!A1:B2"));
+        assert_eq!(parsed.updated_cells, Some(4));
+    }
+
+    #[test]
+    fn append_values_response_nests_the_counts_under_updates() {
+        // The one shape difference from values.update — reading the counts
+        // from the top level here would silently log zeroes.
+        let json = serde_json::json!({
+            "tableRange": "'Q1'!A1:B3",
+            "updates": {"updatedRange": "'Q1'!A4:B4", "updatedRows": 1, "updatedCells": 2},
+        });
+        let parsed: AppendValuesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.table_range.as_deref(), Some("'Q1'!A1:B3"));
+        assert_eq!(parsed.updates.unwrap().updated_cells, Some(2));
+    }
+
+    #[test]
+    fn clear_values_response_parses_the_cleared_range() {
+        let json = serde_json::json!({"spreadsheetId": "s", "clearedRange": "'Q1'!A1:Z999"});
+        let parsed: ClearValuesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.cleared_range.as_deref(), Some("'Q1'!A1:Z999"));
+    }
+
+    #[test]
+    fn write_responses_tolerate_missing_counts() {
+        let parsed: UpdateValuesResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed.updated_cells, None);
+        let parsed: AppendValuesResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(parsed.updates.is_none());
     }
 }

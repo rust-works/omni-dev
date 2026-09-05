@@ -95,6 +95,7 @@ fn record_attempt(
         decided_by_depth: None,
         error,
         duration,
+        ..Default::default()
     });
 }
 

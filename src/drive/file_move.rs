@@ -398,6 +398,7 @@ fn record_attempt(outcome: &MoveOutcome, duration: Duration) {
         decided_by_depth: None,
         error,
         duration,
+        ..Default::default()
     });
 }
 

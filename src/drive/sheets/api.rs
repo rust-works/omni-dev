@@ -8,8 +8,12 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use crate::drive::api_client::GoogleApiClient;
+use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::types::{BatchGetValuesResponse, Spreadsheet, ValueRange};
+use crate::drive::sheets::types::{
+    AppendValuesResponse, BatchGetValuesResponse, ClearValuesResponse, Spreadsheet,
+    UpdateValuesResponse, ValueRange,
+};
 
 /// `fields` mask for `spreadsheets.get`.
 ///
@@ -57,6 +61,37 @@ impl ValueRenderOption {
             Self::Formatted => "FORMATTED_VALUE",
             Self::Unformatted => "UNFORMATTED_VALUE",
             Self::Formula => "FORMULA",
+        }
+    }
+}
+
+/// How the API should interpret the values being written.
+///
+/// Engine-layer, `clap`-free, like [`ValueRenderOption`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValueInputOption {
+    /// Parse each value the way typing it into the UI would: `=SUM(A1:A3)`
+    /// becomes a formula, `2026-09-06` becomes a date, `1,234` becomes a
+    /// number.
+    ///
+    /// The default because it is what a person means by "write this into the
+    /// sheet". It is also the one option whose *wrong* value silently
+    /// mangles data rather than erroring, which is why both spellings are
+    /// spelled out in `--help` and echoed by `--dry-run`.
+    #[default]
+    UserEntered,
+    /// Store every value verbatim as a string. A leading `=` stays literal
+    /// text rather than becoming a formula.
+    Raw,
+}
+
+impl ValueInputOption {
+    /// The wire value for the `valueInputOption` query parameter.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserEntered => "USER_ENTERED",
+            Self::Raw => "RAW",
         }
     }
 }
@@ -115,6 +150,73 @@ impl<'a> SheetsApi<'a> {
             .transport()
             .get_parsed(url.as_str(), "Failed to parse Sheets batchGet response")
             .await
+    }
+
+    /// Overwrites the cells of `range`.
+    ///
+    /// `pub(in crate::drive)` so the CLI cannot reach it without going
+    /// through the gated engine — the same no-bypass-by-construction fence
+    /// `FilesApi::create`/`upload`/`edit_content` sit behind.
+    pub(in crate::drive) async fn values_update(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+        values: &[Vec<String>],
+        input: ValueInputOption,
+    ) -> Result<UpdateValuesResponse> {
+        let url = build_values_update_url(self.client.base_url(), spreadsheet_id, range, input)?;
+        let body = serde_json::json!({ "range": range, "values": values });
+        let response = self
+            .client
+            .transport()
+            .put_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Sheets update response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
+
+    /// Appends rows after the last row of the table containing `range`.
+    pub(in crate::drive) async fn values_append(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+        values: &[Vec<String>],
+        input: ValueInputOption,
+    ) -> Result<AppendValuesResponse> {
+        let url = build_values_append_url(self.client.base_url(), spreadsheet_id, range, input)?;
+        let body = serde_json::json!({ "range": range, "values": values });
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Sheets append response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
+
+    /// Clears the values in `range`, leaving formatting intact.
+    pub(in crate::drive) async fn values_clear(
+        &self,
+        spreadsheet_id: &str,
+        range: &str,
+    ) -> Result<ClearValuesResponse> {
+        let url = build_values_clear_url(self.client.base_url(), spreadsheet_id, range)?;
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &serde_json::json!({}))
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Sheets clear response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
     }
 }
 
@@ -191,6 +293,52 @@ fn build_values_batch_get_url(
         }
         pairs.append_pair("valueRenderOption", render.as_str());
     }
+    Ok(url)
+}
+
+fn build_values_update_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+    range: &str,
+    input: ValueInputOption,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    push_path_segments(&mut url, &[spreadsheet_id, "values", range])?;
+    url.query_pairs_mut()
+        .append_pair("valueInputOption", input.as_str());
+    Ok(url)
+}
+
+fn build_values_append_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+    range: &str,
+    input: ValueInputOption,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    push_path_segments(
+        &mut url,
+        &[spreadsheet_id, "values", &format!("{range}:append")],
+    )?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("valueInputOption", input.as_str());
+        // Insert whole rows rather than overwriting whatever sits below the
+        // table; `OVERWRITE` is the API default and is the destructive one.
+        pairs.append_pair("insertDataOption", "INSERT_ROWS");
+    }
+    Ok(url)
+}
+
+fn build_values_clear_url(base_url: &str, spreadsheet_id: &str, range: &str) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    push_path_segments(
+        &mut url,
+        &[spreadsheet_id, "values", &format!("{range}:clear")],
+    )?;
     Ok(url)
 }
 

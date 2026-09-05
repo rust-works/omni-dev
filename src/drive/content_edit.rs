@@ -231,6 +231,7 @@ fn record_attempt(outcome: &EditOutcome, duration: Duration) {
         decided_by_depth,
         error,
         duration,
+        ..Default::default()
     });
 }
 

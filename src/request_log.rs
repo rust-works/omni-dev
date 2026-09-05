@@ -855,10 +855,16 @@ fn build_worktree_record(outcome: WorktreeOutcome, ctx: RequestLogContext) -> Lo
     rec
 }
 
-/// The outcome of one `drive rename`/`drive move` attempt.
-#[derive(Debug, Clone)]
+/// The outcome of one Drive mutation attempt.
+///
+/// `Default` so a caller names only the fields its verb actually has: this
+/// struct is shared by every mutating verb and most leave most of it empty.
+/// Note `duration` defaults to zero, which is never the right value — every
+/// construction site sets it explicitly.
+#[derive(Debug, Clone, Default)]
 pub struct DriveMutationOutcome {
-    /// `"rename"` or `"move"`; becomes the record's `command`.
+    /// The verb — `"rename"`, `"move"`, `"sheets-write"`, … ; becomes the
+    /// record's `command` as `["drive", <operation>]`.
     pub operation: &'static str,
     /// The Drive file id acted on.
     pub file_id: String,
@@ -889,6 +895,20 @@ pub struct DriveMutationOutcome {
     pub decided_by_folder_id: Option<String>,
     /// How many levels above `resolved_folder_id` that rule's folder sits.
     pub decided_by_depth: Option<usize>,
+    /// The A1 range a Sheets write targeted (issue #1589). `None` for every
+    /// non-Sheets verb.
+    pub range: Option<String>,
+    /// The server-normalised range the Sheets API reported writing or
+    /// clearing. Can differ from [`Self::range`]: the server resolves an
+    /// open-ended range against the sheet's actual extent.
+    pub updated_range: Option<String>,
+    /// Rows the Sheets API reported writing.
+    pub updated_rows: Option<i64>,
+    /// Columns the Sheets API reported writing.
+    pub updated_columns: Option<i64>,
+    /// Cells the Sheets API reported writing — the number that answers "how
+    /// much did that write actually touch".
+    pub updated_cells: Option<i64>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -956,6 +976,21 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(decided_by_depth) = outcome.decided_by_depth {
         context.insert("decided_by_depth".to_string(), decided_by_depth.to_string());
+    }
+    if let Some(range) = outcome.range {
+        context.insert("range".to_string(), range);
+    }
+    if let Some(updated_range) = outcome.updated_range {
+        context.insert("updated_range".to_string(), updated_range);
+    }
+    if let Some(rows) = outcome.updated_rows {
+        context.insert("updated_rows".to_string(), rows.to_string());
+    }
+    if let Some(cols) = outcome.updated_columns {
+        context.insert("updated_columns".to_string(), cols.to_string());
+    }
+    if let Some(cells) = outcome.updated_cells {
+        context.insert("updated_cells".to_string(), cells.to_string());
     }
     rec.context = context;
     rec
@@ -1614,6 +1649,7 @@ mod tests {
                 decided_by_depth: Some(0),
                 error: None,
                 duration: Duration::from_millis(17),
+                ..Default::default()
             },
             ctx,
         );
@@ -1674,6 +1710,7 @@ mod tests {
                 decided_by_depth: None,
                 error: None,
                 duration: Duration::from_millis(5),
+                ..Default::default()
             },
             RequestLogContext::default(),
         );
@@ -1701,6 +1738,7 @@ mod tests {
                 decided_by_depth: None,
                 error: Some("boom".to_string()),
                 duration: Duration::from_millis(1),
+                ..Default::default()
             },
             RequestLogContext::default(),
         );
@@ -1738,6 +1776,7 @@ mod tests {
                 decided_by_depth: None,
                 error: None,
                 duration: Duration::from_millis(1),
+                ..Default::default()
             },
             RequestLogContext::default(),
         );

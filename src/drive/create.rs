@@ -200,6 +200,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         decided_by_depth,
         error,
         duration,
+        ..Default::default()
     });
 }
 
