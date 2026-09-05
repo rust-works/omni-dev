@@ -162,6 +162,30 @@ impl CoverageReport {
     {
         self.files.retain(|path, _| keep(path));
     }
+
+    /// Drops every line for which `keep` returns `false`, then drops any file
+    /// left with no executable lines.
+    ///
+    /// The line-level twin of [`retain_paths`](Self::retain_paths), used to
+    /// apply `ignore` source markers. Like the path filter it runs *after*
+    /// [`strip_prefix`](Self::strip_prefix), so the predicate sees repo-relative
+    /// paths, and it is applied to head and baseline independently — each from
+    /// its own revision's source, since a region moves between revisions.
+    ///
+    /// Emptied files are removed rather than kept at zero lines: a
+    /// [`FileCoverage`] with no lines has `percent() == None`, which
+    /// `FileDelta::delta` reads as a fall to zero — so a fully-ignored file
+    /// would render as a *total loss of coverage*, the exact opposite of what
+    /// ignoring it means.
+    pub fn retain_lines<F>(&mut self, keep: F)
+    where
+        F: Fn(&str, u32) -> bool,
+    {
+        for (path, file) in &mut self.files {
+            file.lines.retain(|&line, _| keep(path, line));
+        }
+        self.files.retain(|_, file| file.total_lines() > 0);
+    }
 }
 
 /// Strips `prefix_slash` (a trailing-slash directory prefix) from `path`, then
@@ -283,6 +307,41 @@ mod tests {
         report.insert(f);
         report.strip_prefix(Path::new("/some/other/root"));
         assert!(report.files.contains_key("src/a.rs"));
+    }
+
+    #[test]
+    fn retain_lines_drops_only_the_named_lines() {
+        let mut report = CoverageReport::new();
+        let mut f = FileCoverage::new("src/a.rs");
+        f.record(1, 1);
+        f.record(2, 0);
+        f.record(3, 5);
+        report.insert(f);
+        report.retain_lines(|path, line| !(path == "src/a.rs" && line == 2));
+        assert_eq!(report.hits("src/a.rs", 1), Some(1));
+        assert_eq!(report.hits("src/a.rs", 2), None);
+        assert_eq!(report.hits("src/a.rs", 3), Some(5));
+        assert_eq!(report.total_lines(), 2);
+    }
+
+    /// A file whose every line is ignored must leave the report entirely. Kept
+    /// at zero lines its `percent()` is `None`, which `FileDelta::delta` reads
+    /// as a fall to zero — an ignored file would render as a total loss of
+    /// coverage.
+    #[test]
+    fn retain_lines_removes_files_left_empty() {
+        let mut report = CoverageReport::new();
+        for path in ["src/a.rs", "src/gated.rs"] {
+            let mut f = FileCoverage::new(path);
+            f.record(1, 1);
+            report.insert(f);
+        }
+        report.retain_lines(|path, _| path != "src/gated.rs");
+        assert!(report.files.contains_key("src/a.rs"));
+        assert!(
+            !report.files.contains_key("src/gated.rs"),
+            "a file with no lines left must be dropped, not kept at 0%"
+        );
     }
 
     #[test]
