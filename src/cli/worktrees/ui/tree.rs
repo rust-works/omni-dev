@@ -19,6 +19,15 @@ pub enum RowRef {
 }
 
 impl RowRef {
+    /// This row's path if it is a *worktree* row, ignoring repo headers —
+    /// what `SetVisibleRows` reports, since ahead/behind is per worktree.
+    pub fn worktree_path(&self, view: &WorktreesViewModel) -> Option<PathBuf> {
+        match self {
+            Self::Repo { .. } => None,
+            Self::Worktree { .. } => self.path(view).map(std::path::Path::to_path_buf),
+        }
+    }
+
     fn path<'a>(&self, view: &'a WorktreesViewModel) -> Option<&'a std::path::Path> {
         match self {
             Self::Repo { index } => view.repos.get(*index).map(|r| r.root.as_path()),

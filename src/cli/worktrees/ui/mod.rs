@@ -18,6 +18,7 @@ mod ahead_behind;
 mod app;
 mod client;
 mod clipboard;
+mod glyph;
 mod hub;
 mod keys;
 mod layout;
@@ -59,18 +60,29 @@ pub struct UiCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+
+    /// Draw row cues with ASCII characters instead of unicode. Also
+    /// settable with OMNI_DEV_UI_ASCII=1.
+    #[arg(long)]
+    pub ascii: bool,
 }
 
 impl UiCommand {
     pub async fn execute(self) -> Result<()> {
         let socket = server::resolve_socket(self.socket)?;
+        // Resolved once, at startup, and passed down — never re-read
+        // per frame, so the glyph set cannot change mid-session.
+        let glyphs = glyph::GlyphMode::resolve(
+            self.ascii,
+            std::env::var("OMNI_DEV_UI_ASCII").ok().as_deref(),
+        );
         let cancel = CancellationToken::new();
         let handle = hub::spawn(socket.clone(), cancel.clone());
         let commands = handle.commands.clone();
         let dispatcher = Dispatcher::new(WorktreesClient::new(socket), commands.clone());
 
         let mut guard = TerminalGuard::enter()?;
-        let result = app::run(&mut guard.terminal, handle, dispatcher, commands).await;
+        let result = app::run(&mut guard.terminal, handle, dispatcher, commands, glyphs).await;
         drop(guard); // always restores the terminal, even on an error path
         cancel.cancel();
         result

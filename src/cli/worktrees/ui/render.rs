@@ -11,11 +11,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use super::glyph::{self, Glyph, GlyphMode};
 use super::tree::TreeState;
 use super::view_model::{
     AheadBehindState, FeedStatus, GlyphCue, RowEmphasis, SessionBadge, SessionSourceRow, Severity,
     WorktreeRow, WorktreesViewModel,
 };
+use crate::pr_status::PrCheckState;
+use crate::sessions::SessionState;
 
 /// Draws the tree pane into `area`. The border is highlighted while the
 /// pane has keyboard focus (Phase 3 splits focus between the tree and a
@@ -27,11 +30,16 @@ pub fn draw_tree_pane(
     view: &WorktreesViewModel,
     tree: &mut TreeState,
     focused: bool,
+    glyphs: GlyphMode,
 ) {
     let mut items: Vec<ListItem> = Vec::new();
     if view.repos.is_empty() {
         items.push(ListItem::new("No repositories open."));
     }
+    // The branch column gets whatever the pane can spare after the fixed
+    // columns, within sane bounds — so a narrow pane elides rather than
+    // pushing the path and badges off the edge.
+    let branch_width = usize::from(area.width.saturating_sub(FIXED_COLUMNS)).clamp(8, 32);
     for repo in &view.repos {
         let mut header = repo.main_repo.clone();
         if let Some(gh) = &repo.github {
@@ -48,11 +56,16 @@ pub fn draw_tree_pane(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        items.push(gutter_item(header_line, tree.marked.contains(&repo.root)));
+        items.push(gutter_item(
+            header_line,
+            tree.marked.contains(&repo.root),
+            glyphs,
+        ));
         for wt in &repo.worktrees {
             items.push(gutter_item(
-                worktree_line(wt),
+                worktree_line(wt, glyphs, branch_width),
                 tree.marked.contains(&wt.path),
+                glyphs,
             ));
         }
     }
@@ -77,29 +90,43 @@ pub fn draw_tree_pane(
     tree.offset = state.offset();
 }
 
-/// Prepends the multi-select gutter (`▌ ` when marked, two spaces
-/// otherwise — the mockup's marked-row marker, issue #1585 §2) to a row's
-/// existing styled line, preserving that line's own per-span styling.
-fn gutter_item(line: Line<'static>, marked: bool) -> ListItem<'static> {
-    let gutter = if marked { "▌ " } else { "  " };
-    let mut spans = vec![Span::raw(gutter)];
+/// Prepends the multi-select gutter (one cell of marker plus a space) to a
+/// row's existing styled line, preserving that line's own per-span styling.
+fn gutter_item(line: Line<'static>, marked: bool, glyphs: GlyphMode) -> ListItem<'static> {
+    let marker = if marked {
+        Glyph::MarkedGutter
+    } else {
+        Glyph::UnmarkedGutter
+    };
+    let mut spans = vec![Span::raw(format!("{} ", marker.as_str(glyphs)))];
     spans.extend(line.spans);
     ListItem::new(Line::from(spans))
 }
 
-fn worktree_line(wt: &WorktreeRow) -> Line<'static> {
+/// Columns a row spends outside the branch name: the gutter, the two cue
+/// glyphs and their spacing, the badge column, and the divergence field.
+const FIXED_COLUMNS: u16 = 34;
+
+fn worktree_line(wt: &WorktreeRow, glyphs: GlyphMode, branch_width: usize) -> Line<'static> {
     let glyph = match wt.glyph_cue() {
-        GlyphCue::Here => '*',
-        GlyphCue::Pushing | GlyphCue::Rebasing => '~',
-        GlyphCue::Operation => '!',
-        GlyphCue::Open => 'o',
-        GlyphCue::Closed => '.',
-    };
-    let main_marker = if wt.is_main { '*' } else { ' ' };
-    let branch = wt
-        .branch
-        .clone()
-        .unwrap_or_else(|| "(detached)".to_string());
+        GlyphCue::Here => Glyph::Here,
+        GlyphCue::Pushing | GlyphCue::Rebasing => Glyph::InFlight,
+        GlyphCue::Operation => Glyph::Operation,
+        GlyphCue::Open => Glyph::Open,
+        GlyphCue::Closed => Glyph::Closed,
+    }
+    .as_str(glyphs);
+    let main_marker = if wt.is_main {
+        Glyph::MainMarker
+    } else {
+        Glyph::NotMain
+    }
+    .as_str(glyphs);
+    let branch = glyph::truncate_middle(
+        wt.branch.as_deref().unwrap_or("(detached)"),
+        branch_width,
+        glyphs,
+    );
 
     let mut fields = Vec::new();
     match wt.ahead_behind {
@@ -125,20 +152,20 @@ fn worktree_line(wt: &WorktreeRow) -> Line<'static> {
         fields.push(sessions_summary(&wt.sessions));
     }
 
-    let severity_marker = match wt.badge_severity() {
-        Severity::Red => " [!]",
-        Severity::Yellow => " [~]",
-        Severity::Green => " [ok]",
-        Severity::Muted => "",
-    };
-    let mut text = format!(" {main_marker}{glyph} {branch}");
+    // The badge column: PR checks then session state, one cell each, in
+    // fixed positions so the column reads down the pane. Unlike the VS Code
+    // companion — which negotiates two characters of `FileDecoration`
+    // between the two providers (#1406) — a TUI owns every cell, so the two
+    // dimensions simply get a cell each and never compete.
+    let badges = format!("{}{}", check_glyph(wt, glyphs), session_glyph(wt, glyphs));
+
+    let mut text = format!(" {main_marker}{glyph} {badges} {branch:<branch_width$}");
     if !fields.is_empty() {
         text.push_str("  ");
         text.push_str(&fields.join("  "));
     }
     text.push_str("  ");
     text.push_str(&wt.path.display().to_string());
-    text.push_str(severity_marker);
 
     let color = match wt.emphasis() {
         RowEmphasis::Operation => Color::Yellow,
@@ -156,6 +183,49 @@ fn worktree_line(wt: &WorktreeRow) -> Line<'static> {
         },
     };
     Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+/// The PR-check cell: one glyph, or a blank when the row has no PR.
+/// Pending is `…` rather than a bare dot because colour alone no longer
+/// separates it from a passing run (the tree view's own #1406 lesson).
+fn check_glyph(wt: &WorktreeRow, glyphs: GlyphMode) -> &'static str {
+    let Some(pr) = &wt.pr else {
+        return " ";
+    };
+    match pr.checks {
+        PrCheckState::Success => Glyph::ChecksPass,
+        PrCheckState::Failure => Glyph::ChecksFail,
+        PrCheckState::Pending => Glyph::ChecksPending,
+        PrCheckState::None => return " ",
+    }
+    .as_str(glyphs)
+}
+
+/// The Claude-session cell: the most demanding state on the row, since a
+/// row with one waiting session and three idle ones is a row that wants
+/// attention. Blank when the worktree has no sessions.
+fn session_glyph(wt: &WorktreeRow, glyphs: GlyphMode) -> &'static str {
+    let mut cue: Option<Glyph> = None;
+    for session in &wt.sessions {
+        let candidate = match session.state {
+            SessionState::WaitingForInput | SessionState::WaitingForPermission => {
+                Glyph::SessionWaiting
+            }
+            SessionState::Starting | SessionState::Working => Glyph::SessionWorking,
+            SessionState::Idle => Glyph::SessionIdle,
+            SessionState::Ended => continue,
+        };
+        // Waiting outranks working outranks idle.
+        let rank = |g: Glyph| match g {
+            Glyph::SessionWaiting => 3,
+            Glyph::SessionWorking => 2,
+            _ => 1,
+        };
+        if cue.is_none_or(|current| rank(candidate) > rank(current)) {
+            cue = Some(candidate);
+        }
+    }
+    cue.map_or(" ", |g| g.as_str(glyphs))
 }
 
 /// Maps a row-colour id — one of `row_colors::KNOWN_ROW_COLORS`, or an
@@ -261,7 +331,7 @@ mod tests {
     }
 
     fn line_color(wt: &WorktreeRow) -> Color {
-        match worktree_line(wt).spans.first() {
+        match worktree_line(wt, GlyphMode::Unicode, 24).spans.first() {
             Some(span) => span.style.fg.unwrap_or(Color::Reset),
             None => Color::Reset,
         }
@@ -383,14 +453,35 @@ mod tests {
         for focused in [true, false] {
             let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
             terminal
-                .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, focused))
+                .draw(|frame| {
+                    draw_tree_pane(
+                        frame,
+                        frame.area(),
+                        &view,
+                        &mut tree,
+                        focused,
+                        GlyphMode::Unicode,
+                    );
+                })
                 .unwrap();
             let text = buffer_text(&terminal);
             assert!(text.contains("WORKTREES"));
             assert!(text.contains("repo  (github: acme/repo)  [polling]  (charts.blue)"));
-            assert!(text.contains("feature/x  +2 -1 main-3  #42 draft"));
-            assert!(text.contains("▌"), "the marked row has a gutter");
-            assert!(text.contains("*. main  ..."), "main marker + loading state");
+            // Phase 4c pads the branch to a fixed column and inserts the
+            // two-cell badge column before it, so the fields follow the
+            // padding rather than the branch directly.
+            assert!(text.contains("feature/x"));
+            assert!(text.contains("+2 -1 main-3  #42 draft"));
+            assert!(
+                text.contains('\u{2502}'),
+                "the marked row has a gutter: {text}"
+            );
+            assert!(
+                text.contains('\u{2026}'),
+                "the pending-checks badge is the ellipsis glyph: {text}"
+            );
+            assert!(text.contains("main"), "the main worktree's branch");
+            assert!(text.contains("..."), "its loading divergence state");
         }
     }
 
@@ -403,7 +494,16 @@ mod tests {
         let view = WorktreesViewModel::default();
         let mut tree = TreeState::default();
         terminal
-            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
+            .draw(|frame| {
+                draw_tree_pane(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &mut tree,
+                    true,
+                    GlyphMode::Unicode,
+                );
+            })
             .unwrap();
         assert!(buffer_text(&terminal).contains("No repositories open."));
     }
@@ -422,7 +522,16 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
         terminal
-            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
+            .draw(|frame| {
+                draw_tree_pane(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &mut tree,
+                    true,
+                    GlyphMode::Unicode,
+                );
+            })
             .unwrap();
         assert_eq!(tree.offset, 2);
         assert!(buffer_text(&terminal).contains("feature/x"));
@@ -430,7 +539,16 @@ mod tests {
         // Moving the cursor back up scrolls the offset back with it.
         tree.cursor = 0;
         terminal
-            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
+            .draw(|frame| {
+                draw_tree_pane(
+                    frame,
+                    frame.area(),
+                    &view,
+                    &mut tree,
+                    true,
+                    GlyphMode::Unicode,
+                );
+            })
             .unwrap();
         assert_eq!(tree.offset, 0);
     }
@@ -471,6 +589,96 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("polling (daemon predates live updates)"));
         assert!(text.contains("worktrees: connecting"));
+    }
+
+    #[test]
+    fn the_badge_column_shows_checks_then_session_state() {
+        use crate::sessions::SessionState;
+
+        let mut wt = worktree_row();
+        // No PR and no sessions: both cells blank, so the column still
+        // occupies its two cells and the branch stays aligned.
+        assert_eq!(check_glyph(&wt, GlyphMode::Unicode), " ");
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), " ");
+
+        wt.pr = Some(PrBadgeRow {
+            number: 1,
+            is_draft: false,
+            checks: PrCheckState::Failure,
+            url: String::new(),
+        });
+        assert_eq!(check_glyph(&wt, GlyphMode::Unicode), "\u{2717}");
+        assert_eq!(check_glyph(&wt, GlyphMode::Ascii), "x");
+
+        let session = |state| SessionBadge {
+            session_id: "s".to_string(),
+            state,
+            source: SessionSourceRow::Terminal,
+            model: None,
+            last_seen: chrono::Utc::now(),
+        };
+        // The most demanding state on the row wins: one waiting session
+        // among idle ones still reads as waiting.
+        wt.sessions = vec![
+            session(SessionState::Idle),
+            session(SessionState::WaitingForPermission),
+            session(SessionState::Idle),
+        ];
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "!");
+        wt.sessions = vec![session(SessionState::Idle), session(SessionState::Working)];
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "\u{25cf}");
+        wt.sessions = vec![session(SessionState::Idle)];
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "\u{00b7}");
+        // An ended session is not a cue at all.
+        wt.sessions = vec![session(SessionState::Ended)];
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), " ");
+    }
+
+    #[test]
+    fn a_long_branch_is_elided_and_the_row_stays_column_aligned() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        let mut short = worktree_row();
+        short.branch = Some("main".to_string());
+        let mut long = worktree_row();
+        long.branch = Some("issue-1585-worktrees-ui-phase-4c-and-then-some".to_string());
+
+        // Both rows put the path at the same column, which is the whole
+        // point of padding the branch to a fixed width.
+        let width = 20;
+        let a = worktree_line(&short, GlyphMode::Unicode, width);
+        let b = worktree_line(&long, GlyphMode::Unicode, width);
+        let text_a: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text_b: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
+        let at_a = text_a.find("/repo/wt").expect("a path in the short row");
+        let at_b = text_b.find("/repo/wt").expect("a path in the long row");
+        assert_eq!(
+            text_a[..at_a].width(),
+            text_b[..at_b].width(),
+            "paths must start at the same column:\n{text_a}\n{text_b}"
+        );
+        assert!(text_b.contains('\u{2026}'), "the long branch is elided");
+    }
+
+    #[test]
+    fn ascii_mode_renders_no_non_ascii_anywhere_in_a_row() {
+        let mut wt = worktree_row();
+        wt.branch = Some("issue-1585-worktrees-ui-phase-4c-and-then-some".to_string());
+        wt.is_main = true;
+        wt.open = true;
+        wt.pr = Some(PrBadgeRow {
+            number: 7,
+            is_draft: true,
+            checks: PrCheckState::Pending,
+            url: String::new(),
+        });
+        let line = worktree_line(&wt, GlyphMode::Ascii, 16);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.is_ascii(), "ascii mode emitted non-ascii: {text:?}");
+        // And the gutter is ASCII too.
+        let item = gutter_item(line, true, GlyphMode::Ascii);
+        let rendered: String = format!("{item:?}");
+        assert!(!rendered.contains('\u{2502}'));
     }
 
     #[test]

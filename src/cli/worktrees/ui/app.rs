@@ -28,6 +28,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use super::actions::{self, ActionFlow, ActionKind, CheckReport, Dispatcher, Target};
+use super::glyph::GlyphMode;
 use super::hub::{HubCommand, ViewModelHandle};
 use super::keys::{self, ChromeKey, KeyRoute};
 use super::mouse::{self, DragOrigin, Hit, RegionMap, TreeClick, WheelRoute};
@@ -68,6 +69,13 @@ struct App {
     notice: Option<String>,
     pty_tx: mpsc::UnboundedSender<(TabId, TermEvent)>,
     commands: mpsc::UnboundedSender<HubCommand>,
+    /// Unicode or ASCII row cues, resolved once at startup.
+    glyphs: GlyphMode,
+    /// The scrollback-find or command-palette prompt, when one is open.
+    prompt: Option<Prompt>,
+    /// The worktree paths the tree pane last rendered, so the hub only
+    /// fetches ahead/behind for rows that are actually on screen.
+    reported_visible: Vec<PathBuf>,
     /// The hit-testable regions of the last drawn frame.
     regions: RegionMap,
     /// The terminal side's rect as of the last frame — what a splitter drag
@@ -76,6 +84,54 @@ struct App {
     /// The drag in progress, if any, and the region it is clamped to.
     drag: DragOrigin,
     clicks: mouse::ClickTracker,
+}
+
+/// A one-line text prompt: either the scrollback find (`alt-f`) or the
+/// command palette (`:`). Both are a typed string plus a status line, so
+/// they share one state and one renderer rather than two near-copies.
+struct Prompt {
+    kind: PromptKind,
+    input: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    /// Search the focused tab's scrollback.
+    Find,
+    /// Run a command by name.
+    Palette,
+}
+
+impl PromptKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Find => " find in scrollback ",
+            Self::Palette => " command ",
+        }
+    }
+}
+
+/// One entry in the command palette: the name typed to match it, and the
+/// action it runs. Built from the same [`ActionKind`] set the action menu
+/// uses, so the palette can never drift from the menu.
+fn palette_entries(targets: &[Target]) -> Vec<popup::MenuItem> {
+    actions::applicable_actions(targets)
+        .into_iter()
+        .map(|(action, label)| popup::MenuItem { action, label })
+        .collect()
+}
+
+/// Filters palette entries by a case-insensitive substring of their label.
+fn filter_palette(entries: Vec<popup::MenuItem>, query: &str) -> Vec<popup::MenuItem> {
+    if query.is_empty() {
+        return entries;
+    }
+    let needle = query.to_lowercase();
+    entries
+        .into_iter()
+        .filter(|item| item.label.to_lowercase().contains(&needle))
+        .collect()
 }
 
 /// The Move/Copy-Claude-Session-Here wizard's steps (issue #1585 Phase 2
@@ -117,6 +173,7 @@ pub async fn run(
     mut handle: ViewModelHandle,
     dispatcher: Dispatcher,
     commands: mpsc::UnboundedSender<HubCommand>,
+    glyphs: GlyphMode,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let (pty_tx, mut pty_rx) = mpsc::unbounded_channel();
@@ -131,6 +188,9 @@ pub async fn run(
         notice: None,
         pty_tx,
         commands,
+        glyphs,
+        prompt: None,
+        reported_visible: Vec::new(),
         regions: RegionMap::default(),
         terminal_area: None,
         drag: DragOrigin::None,
@@ -348,7 +408,9 @@ fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
         view,
         &mut app.tree,
         app.focus == Focus::Tree,
+        app.glyphs,
     );
+    report_visible_rows(app, view, areas.tree);
     // `arrange` both lays the stack out and resizes each visible group's
     // active tab to the grid it is about to be drawn into, so the emulator
     // is never read at a size it was not rendered at.
@@ -384,6 +446,27 @@ fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
     };
     render::draw_status_bar(frame, areas.status, view, &app.tree, &status_hint(app));
     draw_popups(frame, app);
+}
+
+/// Tells the hub which worktree rows are actually on screen, so ahead/behind
+/// is fetched for those and not for every row in the snapshot — the dominant
+/// per-worktree cost (#1306), and the reason `SetVisibleRows` exists.
+///
+/// Sent only when the set changes: the command triggers fetches, and firing
+/// it every frame would restart them ~60 times a second.
+fn report_visible_rows(app: &mut App, view: &WorktreesViewModel, tree_area: Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(tree_area);
+    let rows = TreeState::visible_rows(view);
+    let visible: Vec<PathBuf> = rows
+        .iter()
+        .skip(app.tree.offset)
+        .take(usize::from(inner.height))
+        .filter_map(|row| row.worktree_path(view))
+        .collect();
+    if visible != app.reported_visible {
+        app.reported_visible.clone_from(&visible);
+        let _ = app.commands.send(HubCommand::SetVisibleRows(visible));
+    }
 }
 
 fn status_hint(app: &App) -> String {
@@ -426,6 +509,16 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
             },
         };
         popup::draw_confirm_modal(frame, area, &modal);
+        return;
+    }
+    if let Some(prompt) = &app.prompt {
+        popup::draw_prompt(
+            frame,
+            area,
+            prompt.kind.title(),
+            &prompt.input,
+            &prompt.status,
+        );
         return;
     }
     if let Some(menu) = &app.menu {
@@ -492,6 +585,7 @@ fn relative_mtime(modified: std::time::SystemTime) -> String {
 fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> bool {
     if app.quit_confirm
         || app.menu.is_some()
+        || app.prompt.is_some()
         || app.relocate.is_some()
         || matches!(app.flow, ActionFlow::AwaitingConfirm { .. })
     {
@@ -774,6 +868,13 @@ async fn handle_key(
         return false;
     }
 
+    // An open prompt takes every remaining key: it is a text field, so a
+    // bare letter must type rather than trigger a tree command.
+    if app.prompt.is_some() {
+        handle_prompt_key(app, view, key).await;
+        return false;
+    }
+
     // A focused, live terminal takes everything else verbatim.
     if app.focus == Focus::Terminal {
         match app.panes.active_tab().filter(|t| t.is_alive()) {
@@ -908,9 +1009,82 @@ async fn handle_key(
                 .await;
             app.flow = ActionFlow::Done { outcome };
         }
+        // The command palette, the issue footer's `:` hint.
+        KeyCode::Char(':') => {
+            app.prompt = Some(Prompt {
+                kind: PromptKind::Palette,
+                input: String::new(),
+                status: String::new(),
+            });
+        }
         _ => {}
     }
     false
+}
+
+/// Handles one key while a prompt is open. `Esc` cancels, `Enter` runs,
+/// `Backspace` deletes, and any printable character types.
+async fn handle_prompt_key(app: &mut App, view: &WorktreesViewModel, key: KeyEvent) {
+    let Some(prompt) = app.prompt.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => app.prompt = None,
+        KeyCode::Backspace => {
+            prompt.input.pop();
+            prompt.status.clear();
+        }
+        KeyCode::Char(c) => {
+            prompt.input.push(c);
+            prompt.status.clear();
+        }
+        KeyCode::Enter => match prompt.kind {
+            PromptKind::Find => {
+                let needle = prompt.input.clone();
+                let found = app
+                    .panes
+                    .active_tab()
+                    .is_some_and(|tab| tab.find_in_scrollback(&needle));
+                // Stay open so `Enter` again steps to the next match back.
+                if let Some(prompt) = app.prompt.as_mut() {
+                    prompt.status = if found {
+                        String::new()
+                    } else {
+                        "no match".to_string()
+                    };
+                }
+            }
+            PromptKind::Palette => {
+                let query = prompt.input.clone();
+                app.prompt = None;
+                let targets = app.tree.targets(view);
+                let matches = filter_palette(palette_entries(&targets), &query);
+                match matches.first() {
+                    Some(item) => {
+                        let action = item.action;
+                        if matches!(
+                            action,
+                            ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere
+                        ) {
+                            let mode = if action == ActionKind::MoveClaudeSessionHere {
+                                RelocationMode::Move
+                            } else {
+                                RelocationMode::Copy
+                            };
+                            start_relocate_flow(app, view, mode);
+                        } else {
+                            // The palette opens the menu at the match rather
+                            // than running it outright, so a destructive
+                            // action still goes through its confirm.
+                            app.menu = Some(popup::ActionMenu::new(matches));
+                        }
+                    }
+                    None => app.notice = Some(format!("no command matching {query:?}")),
+                }
+            }
+        },
+        _ => {}
+    }
 }
 
 fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey) {
@@ -947,6 +1121,17 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
             }
         }
         ChromeKey::ResetLayout => app.panes.reset_weights(),
+        ChromeKey::Find => {
+            if app.panes.active_tab().is_some() {
+                app.prompt = Some(Prompt {
+                    kind: PromptKind::Find,
+                    input: String::new(),
+                    status: String::new(),
+                });
+            } else {
+                app.notice = Some("no terminal tab to search".to_string());
+            }
+        }
         ChromeKey::Copy => {
             let text = app
                 .panes
@@ -1293,6 +1478,9 @@ mod tests {
             relocate: None,
             focus: Focus::Tree,
             panes: panes::PaneLayout::default(),
+            glyphs: GlyphMode::Unicode,
+            prompt: None,
+            reported_visible: Vec::new(),
             quit_confirm: false,
             notice: None,
             pty_tx,
@@ -1668,7 +1856,21 @@ mod tests {
         handle_key(&mut app, &view, &dispatcher, alt('w')).await;
         assert!(app.panes.is_empty());
         assert_eq!(app.focus, Focus::Tree);
-        assert!(matches!(commands.try_recv(), Ok(HubCommand::ClearOpenTab(p)) if p == here));
+        assert!(
+            drained_clear_open_tab(&mut commands, &here),
+            "closing the last tab clears the here cue"
+        );
+    }
+
+    /// Drains the hub channel looking for `ClearOpenTab(path)`. Drawing also
+    /// posts `SetVisibleRows`, so the wanted command is not necessarily
+    /// first in the queue.
+    fn drained_clear_open_tab(
+        commands: &mut mpsc::UnboundedReceiver<HubCommand>,
+        path: &Path,
+    ) -> bool {
+        std::iter::from_fn(|| commands.try_recv().ok())
+            .any(|cmd| matches!(cmd, HubCommand::ClearOpenTab(p) if p == path))
     }
 
     #[cfg(unix)]
@@ -2183,12 +2385,15 @@ mod tests {
         handle_key(&mut app, &view, &dispatcher, alt('w')).await;
         assert!(app.panes.any_alive(), "one tab left");
         assert!(
-            commands.try_recv().is_err(),
+            !drained_clear_open_tab(&mut commands, &here),
             "the cue stays while a tab remains"
         );
         handle_key(&mut app, &view, &dispatcher, alt('w')).await;
         assert!(app.panes.is_empty());
-        assert!(matches!(commands.try_recv(), Ok(HubCommand::ClearOpenTab(p)) if p == here));
+        assert!(
+            drained_clear_open_tab(&mut commands, &here),
+            "the last close clears the cue"
+        );
         assert_eq!(app.focus, Focus::Tree);
     }
 
@@ -2318,6 +2523,169 @@ mod tests {
         assert_eq!(app.panes.groups[0].tabs.len(), before - 1);
 
         shutdown_all(&mut app);
+    }
+
+    #[tokio::test]
+    async fn the_command_palette_filters_by_label_and_opens_the_menu_at_the_match() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1;
+
+        // `:` opens the palette; letters type into it rather than running
+        // tree commands (`c` would otherwise open the colour picker).
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(':'))).await;
+        assert!(app.prompt.is_some());
+        for c in "copy dir".chars() {
+            handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(c))).await;
+        }
+        assert!(app.menu.is_none(), "typing did not trigger a tree command");
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        draw_into(&mut terminal, &view, &mut app);
+        assert!(buffer_text(&terminal).contains("copy dir"));
+
+        // Backspace deletes; Enter opens the menu at the filtered match so
+        // the action still goes through its normal confirm path.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Backspace)).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        assert!(app.prompt.is_none());
+        assert!(app.menu.is_some(), "the palette opened the action menu");
+        app.menu = None;
+
+        // A query matching nothing says so instead of doing something else.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(':'))).await;
+        for c in "zzzz".chars() {
+            handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(c))).await;
+        }
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        assert!(app.menu.is_none());
+        assert!(app.notice.as_deref().unwrap_or("").contains("no command"));
+
+        // Esc cancels without running anything.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(':'))).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn filter_palette_matches_case_insensitively_and_keeps_everything_when_empty() {
+        let items = vec![
+            popup::MenuItem {
+                action: ActionKind::CopyDirectory,
+                label: "Copy Directory",
+            },
+            popup::MenuItem {
+                action: ActionKind::Focus,
+                label: "Focus Worktree",
+            },
+        ];
+        assert_eq!(filter_palette(items.clone(), "").len(), 2);
+        assert_eq!(filter_palette(items.clone(), "copy").len(), 1);
+        assert_eq!(filter_palette(items.clone(), "COPY").len(), 1);
+        assert_eq!(filter_palette(items.clone(), "work").len(), 1);
+        assert!(filter_palette(items, "nothing").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_searches_the_scrollback_and_reports_a_miss() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy()]);
+
+        // Without a tab there is nothing to search, and it says so.
+        handle_key(&mut app, &view, &dispatcher, alt('f')).await;
+        assert!(app.prompt.is_none());
+        assert!(app.notice.as_deref().unwrap_or("").contains("no terminal"));
+
+        // Print enough lines to push the needle into scrollback.
+        let tab = scripted_tab(
+            &app,
+            "i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done; \
+             echo NEEDLE-HERE; i=0; while [ $i -lt 60 ]; do echo tail-$i; i=$((i+1)); done; \
+             sleep 3",
+            here,
+        );
+        install_tab(&mut app, tab);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        assert!(
+            wait_until(|| {
+                draw_into(&mut terminal, &view, &mut app);
+                buffer_text(&terminal).contains("tail-59")
+            })
+            .await,
+            "the child never finished printing"
+        );
+
+        handle_key(&mut app, &view, &dispatcher, alt('f')).await;
+        assert!(app.prompt.is_some());
+        for c in "needle".chars() {
+            handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(c))).await;
+        }
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        // A hit scrolls the display back and leaves no error status.
+        let prompt = app.prompt.as_ref().expect("the find prompt stays open");
+        assert_eq!(prompt.status, "", "case-insensitive match should be found");
+        draw_into(&mut terminal, &view, &mut app);
+        assert!(
+            buffer_text(&terminal).contains("NEEDLE-HERE"),
+            "the match was scrolled into view"
+        );
+
+        // A miss reports it rather than scrolling somewhere arbitrary.
+        for _ in 0..6 {
+            handle_key(&mut app, &view, &dispatcher, press(KeyCode::Backspace)).await;
+        }
+        for c in "nowhere".chars() {
+            handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(c))).await;
+        }
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        assert_eq!(app.prompt.as_ref().unwrap().status, "no match");
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
+        assert!(app.prompt.is_none());
+        shutdown_all(&mut app);
+    }
+
+    #[tokio::test]
+    async fn visible_rows_are_reported_once_per_change_not_once_per_frame() {
+        let (mut app, _dispatcher, mut commands) = test_app();
+        let view = view_with(&["/repo/a", "/repo/b"]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        draw_into(&mut terminal, &view, &mut app);
+        let first = commands.try_recv();
+        match first {
+            Ok(HubCommand::SetVisibleRows(rows)) => {
+                assert_eq!(rows.len(), 2, "both worktree rows are visible");
+                assert!(rows.iter().all(|p| p.starts_with("/repo/")));
+                assert!(
+                    !rows.contains(&PathBuf::from("/repo")),
+                    "the repo header is not a worktree row"
+                );
+            }
+            other => panic!("expected SetVisibleRows, got {other:?}"),
+        }
+        // Redrawing the same view must not re-send: the command triggers
+        // ahead/behind fetches, and repeating it every frame would restart
+        // them ~60 times a second.
+        for _ in 0..5 {
+            draw_into(&mut terminal, &view, &mut app);
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "an unchanged visible set was re-reported"
+        );
+
+        // A pane too short to show every row reports only what fits.
+        let mut small = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        draw_into(&mut small, &view, &mut app);
+        match commands.try_recv() {
+            Ok(HubCommand::SetVisibleRows(rows)) => assert!(
+                rows.len() < 2,
+                "a 4-row pane cannot show both worktrees: {rows:?}"
+            ),
+            other => panic!("expected a new SetVisibleRows, got {other:?}"),
+        }
     }
 
     #[test]

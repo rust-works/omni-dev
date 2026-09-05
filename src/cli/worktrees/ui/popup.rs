@@ -15,6 +15,7 @@ use super::actions::{ActionKind, ConfirmPrompt};
 /// display label. Grouping (the VS Code extension's own `0_open`/`1_pr`/
 /// `2_claude`/`3_copy`/`9_close` order) is expressed purely by the caller's
 /// item order; there is no separate group-header row in v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuItem {
     pub action: ActionKind,
     pub label: &'static str,
@@ -100,6 +101,39 @@ pub fn draw_list_popup(
         .collect();
     let list = List::new(list_items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(list, popup_area);
+}
+
+/// A one-line text prompt — the scrollback find (`alt-f`) and the command
+/// palette (`:`). `hint` names what the input does; `status` carries the
+/// last result ("no match", the filtered command count).
+pub fn draw_prompt(frame: &mut Frame<'_>, area: Rect, title: &str, input: &str, status: &str) {
+    let width = area.width.saturating_sub(8).clamp(20, 70);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + area.height / 3,
+        width,
+        height: 3,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title.to_string());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let line = if status.is_empty() {
+        Line::from(vec![
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().add_modifier(Modifier::REVERSED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().add_modifier(Modifier::REVERSED)),
+            Span::styled(format!("   {status}"), Style::default().fg(Color::DarkGray)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), inner);
 }
 
 pub fn draw_confirm_modal(frame: &mut Frame<'_>, area: Rect, modal: &ConfirmModal) {

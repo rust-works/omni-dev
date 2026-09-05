@@ -5532,6 +5532,7 @@ Usage: ui [OPTIONS]
 
 Options:
       --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+      --ascii          Draw row cues with ASCII characters instead of unicode. Also settable with OMNI_DEV_UI_ASCII=1
   -h, --help           Print help
 
 
