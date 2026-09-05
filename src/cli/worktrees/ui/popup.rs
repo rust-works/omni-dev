@@ -614,6 +614,17 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_are_inert_with_nothing_selectable() {
+        let mut menu =
+            ActionMenu::with_entries("t", vec![MenuEntry::Separator, MenuEntry::Separator]);
+        assert_eq!(menu.selected, 0, "no item to land on when opening");
+        menu.select_end(true);
+        assert_eq!(menu.selected, 0, "End finds nothing selectable either");
+        menu.select_end(false);
+        assert_eq!(menu.selected, 0, "nor Home");
+    }
+
+    #[test]
     fn draw_menu_reports_one_rect_per_visible_item_and_none_for_separators() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -669,6 +680,49 @@ mod tests {
         for (_, rect) in &region.items {
             assert!(rect.y > region.rect.y && rect.y < region.rect.bottom() - 1);
         }
+
+        // Moving the selection back above the current scroll window (Home,
+        // in effect) must scroll back up to follow it, not leave it hidden
+        // above the visible range.
+        let scrolled_down_to = menu.scroll;
+        menu.selected = 0;
+        terminal
+            .draw(|frame| {
+                draw_menu(frame, frame.area(), &mut menu);
+            })
+            .unwrap();
+        assert!(
+            menu.scroll < scrolled_down_to,
+            "scrolled back up to follow the selection"
+        );
+        assert_eq!(menu.scroll, 0);
+    }
+
+    #[test]
+    fn a_disabled_entry_renders_dimmed_rather_than_highlighted() {
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut menu = ActionMenu::with_entries(
+            "Actions",
+            vec![MenuEntry::Item(MenuItem {
+                command: MenuCommand::Action(ActionKind::CopyDirectory),
+                label: "b",
+                enabled: false,
+            })],
+        );
+        // Force the selection onto the disabled entry: disabled items still
+        // take the highlight (see `select_index`), so the dimmed style must
+        // win over the "selected" reversed style.
+        menu.selected = 0;
+        let mut region = None;
+        terminal
+            .draw(|frame| region = Some(draw_menu(frame, frame.area(), &mut menu)))
+            .unwrap();
+        let region = region.unwrap();
+        let (_, rect) = region.items[0];
+        let cell = &terminal.backend().buffer()[(rect.x, rect.y)];
+        assert_eq!(cell.fg, Color::DarkGray, "dimmed, not reversed");
+        assert!(!cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

@@ -1835,6 +1835,15 @@ mod tests {
         assert!(app.menu.is_some());
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Down)).await;
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('k'))).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::End)).await;
+        let end_selected = app.menu.as_ref().unwrap().selected;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Home)).await;
+        assert_eq!(
+            app.menu.as_ref().unwrap().selected,
+            0,
+            "Home lands on the first item"
+        );
+        assert_ne!(end_selected, 0, "End had landed elsewhere first");
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
         assert!(app.menu.is_none());
 
@@ -1966,6 +1975,10 @@ mod tests {
             sessions: vec![session.clone(), session.clone()],
             selected: 0,
         });
+        let mut picker_terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        picker_terminal
+            .draw(|frame| draw(frame, &view, &mut app))
+            .unwrap();
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Down)).await;
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Up)).await;
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
@@ -1973,6 +1986,9 @@ mod tests {
             app.relocate,
             Some(RelocateStep::PickDestination { .. })
         ));
+        picker_terminal
+            .draw(|frame| draw(frame, &view, &mut app))
+            .unwrap();
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('j'))).await;
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('n'))).await; // no-op here
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
@@ -2153,6 +2169,19 @@ mod tests {
         let none = KeyModifiers::NONE;
         let down = |row: u16, mods| mouse_at(MouseEventKind::Down(MouseButton::Left), 5, row, mods);
 
+        // A drag with no drag in progress (no preceding press, or one that
+        // did not start a drag) is inert.
+        assert_eq!(app.drag, DragOrigin::None);
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), 5, 3, none)
+            )
+            .await
+        );
+
         // The border is chrome; a click there does nothing.
         assert!(!handle_mouse(&mut app, &view, &dispatcher, down(0, none)).await);
         // A click on row 2 moves the cursor there.
@@ -2298,6 +2327,129 @@ mod tests {
         app.quit_confirm = true;
         assert!(!handle_mouse(&mut app, &view, &dispatcher, down(tree.y, none)).await);
         app.quit_confirm = false;
+    }
+
+    #[tokio::test]
+    async fn menu_mouse_hovers_arms_scrolls_and_invokes_under_the_pointer() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        let none = KeyModifiers::NONE;
+        let colors = row_colors::KNOWN_ROW_COLORS;
+        app.menu = Some(popup::ActionMenu::new(vec![
+            popup::MenuItem::action(ActionKind::SetRowColor(colors[0]), "a"),
+            popup::MenuItem::action(ActionKind::SetRowColor(colors[1]), "b"),
+        ]));
+        // A hand-built region, standing in for what `draw_menu` would have
+        // reported: two one-row items inside a small popup rect.
+        app.regions.popup = Some(mouse::PopupRegion {
+            rect: Rect::new(9, 4, 12, 4),
+            items: vec![(0, Rect::new(10, 5, 10, 1)), (1, Rect::new(10, 6, 10, 1))],
+        });
+        let at = |kind, row| mouse_at(kind, 10, row, none);
+
+        // Hovering a different item moves the highlight and asks for a
+        // redraw; hovering the one already selected does not.
+        assert!(handle_mouse(&mut app, &view, &dispatcher, at(MouseEventKind::Moved, 6)).await);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
+        assert!(!handle_mouse(&mut app, &view, &dispatcher, at(MouseEventKind::Moved, 6)).await);
+
+        // The release that opened the menu lands here too, unarmed — it must
+        // be ignored rather than invoking whatever is under it.
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Up(MouseButton::Right), 6)
+            )
+            .await
+        );
+        assert!(app.menu.is_some(), "an unarmed release does not dismiss");
+
+        // The wheel moves the selection without arming anything.
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::ScrollUp, 6)
+            )
+            .await
+        );
+        assert_eq!(app.menu.as_ref().unwrap().selected, 0);
+        assert!(!app.menu.as_ref().unwrap().armed);
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::ScrollDown, 6)
+            )
+            .await
+        );
+        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
+
+        // A press that starts inside the menu arms it and selects under the
+        // pointer; the matching release then invokes that item and closes
+        // the menu.
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Down(MouseButton::Right), 5)
+            )
+            .await
+        );
+        assert!(app.menu.as_ref().unwrap().armed);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 0);
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Up(MouseButton::Right), 5)
+            )
+            .await
+        );
+        assert!(app.menu.is_none(), "invoking a command closes the menu");
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::SetRowColor(..))
+        ));
+        assert!(matches!(app.flow, ActionFlow::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn menu_command_move_and_copy_claude_session_start_the_relocate_wizard() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+
+        // Both variants route through the same relocate wizard — with no
+        // Claude sessions for this row, it fails cleanly rather than hanging
+        // (mirrors `relocate_wizard_fails_cleanly_without_sessions_and_cancels`).
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Action(ActionKind::MoveClaudeSessionHere),
+        )
+        .await;
+        assert!(app.menu.is_none());
+        assert!(matches!(app.flow, ActionFlow::Failed { .. }));
+        app.flow = ActionFlow::Idle;
+
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Action(ActionKind::CopyClaudeSessionHere),
+        )
+        .await;
+        assert!(app.menu.is_none());
+        assert!(matches!(app.flow, ActionFlow::Failed { .. }));
     }
 
     #[cfg(unix)]
@@ -2919,6 +3071,7 @@ mod tests {
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
         assert!(app.prompt.is_none());
         assert!(app.menu.is_some(), "the palette opened the action menu");
+        draw_into(&mut terminal, &view, &mut app);
         app.menu = None;
 
         // A query matching nothing says so instead of doing something else.
