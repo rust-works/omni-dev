@@ -464,6 +464,34 @@ rather than being replaced the moment you open another. The tree's "you are
 here" marker counts tabs, so it stays lit while any tab on that worktree
 remains.
 
+Phase 4c filled in the tree pane itself. Every row cue now comes from one
+glyph table with a unicode and an ASCII form, and **every form is exactly one
+cell wide** — a two-cell glyph would misalign every column after it on that
+row alone, which is why the East-Asian *ambiguous-width* characters the
+mockups used are deliberately not in it. Pass `--ascii` (or set
+`OMNI_DEV_UI_ASCII=1`) to switch the whole table to ASCII on a terminal
+without a unicode font:
+
+```bash
+omni-dev worktrees ui --ascii
+```
+
+Each worktree row carries a two-cell badge column: PR-check state, then
+Claude-session state. This is the one place the TUI is plainly better than
+the VS Code tree view, which has to share two characters of decoration
+between those same two signals; here each gets its own cell and they never
+compete. Long branch names are elided in the middle and padded to a fixed
+column so paths line up down the pane.
+
+`alt-f` searches the focused tab's scrollback (case-insensitive, `Enter`
+again steps further back, `Esc` closes), and `:` opens a command palette over
+the same actions the `a` menu offers — filtering by name and then opening the
+menu at the match, so a destructive action still gets its confirmation.
+
+The tree also tells the daemon which rows are actually on screen, so the
+per-worktree ahead/behind lookup runs for the visible rows rather than every
+worktree in the snapshot.
+
 The rest of the tree view's VS Code-parity surface lands in later phases.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —

@@ -23,7 +23,7 @@ use std::process::ExitStatus;
 use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::event_loop::Msg;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Term, TermMode};
@@ -213,6 +213,48 @@ impl TerminalTab {
         if let Some(handle) = &self.handle {
             handle.term.lock().resize(size);
             let _ = handle.sender.send(Msg::Resize(size.window_size()));
+        }
+    }
+
+    /// Searches the scrollback for `needle`, case-insensitively, and
+    /// scrolls the display so the nearest match above the current viewport
+    /// is on screen. Returns whether a match was found.
+    ///
+    /// The search reads the emulator's grid line by line, so a soft-wrapped
+    /// match is found on the row it starts on. **The scanned text is never
+    /// logged or returned** — only the fact of a match and the scroll it
+    /// caused leave this method (issue #1585, Security).
+    pub fn find_in_scrollback(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        let Some(handle) = &self.handle else {
+            return false;
+        };
+        let needle = needle.to_lowercase();
+        let mut term = handle.term.lock();
+        let grid = term.grid();
+        let columns = grid.columns();
+        // With display offset `d` the viewport's top line is `Line(-d)`,
+        // and history runs back to `Line(-history)`.
+        let history = grid.total_lines() - grid.screen_lines();
+        let current = grid.display_offset();
+
+        // Walk back from just above the current viewport towards the oldest
+        // line, so repeated searches step further through history.
+        let found = ((current + 1)..=history).find(|offset| {
+            let line = Line(-i32::try_from(*offset).unwrap_or(i32::MAX));
+            let text: String = (0..columns).map(|col| grid[line][Column(col)].c).collect();
+            text.to_lowercase().contains(&needle)
+        });
+        match found {
+            Some(offset) => {
+                let delta =
+                    i32::try_from(offset).unwrap_or(i32::MAX) - i32::try_from(current).unwrap_or(0);
+                term.scroll_display(Scroll::Delta(delta));
+                true
+            }
+            None => false,
         }
     }
 
