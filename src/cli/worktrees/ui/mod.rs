@@ -7,9 +7,10 @@
 //! parity commands plus the two-phase close flow. Phase 3 (this code) hosts
 //! one embedded terminal tab on the right — a real PTY running the user's
 //! shell or `claude` (through `omni-dev claude-wrap`, so the session reports
-//! authoritative state) — driven by `alacritty_terminal`. Tabs/splits, the
-//! mouse/selection contract and the rest of the VS Code-parity surface stay
-//! in later phases — see the issue and
+//! authoritative state) — driven by `alacritty_terminal`. Phase 4 lands the
+//! mouse/selection contract (`mouse.rs`: per-region hit-testing, drags
+//! clamped to their origin, child-mouse-reporting handoff), then tabs/splits
+//! and the rest of the VS Code-parity surface — see the issue and
 //! `/Users/jky/.claude/plans/unified-snacking-dragonfly.md` for the full plan.
 
 mod actions;
@@ -20,6 +21,7 @@ mod clipboard;
 mod hub;
 mod keys;
 mod local_state;
+mod mouse;
 mod popup;
 mod render;
 mod row_colors;

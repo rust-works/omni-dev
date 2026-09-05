@@ -426,8 +426,26 @@ the emulator's own query replies are written back to the child, both of which
 a real interactive child (`vim`, `claude`) needs. The kitty keyboard protocol
 is deliberately not advertised this phase (legacy xterm key encoding, as
 Terminal.app would). PTY contents are never logged. `q` asks before quitting
-while a child is live. Tabs/splits, the mouse/selection contract and the rest
-of the tree view's VS Code-parity surface land in later phases.
+while a child is live.
+
+Phase 4a added **mouse support** ([ADR-0072](adrs/adr-0072.md) §6). In the
+tree pane a click moves the cursor, `^`-click toggles a mark, `⇧`-click marks
+the range from the cursor, a left-drag range-marks, a double-click opens a
+shell tab, and the wheel moves the cursor. In the terminal grid a left-drag
+selects text (a double-click selects the word under it, a triple-click the
+line), the wheel scrolls scrollback — or sends arrow keys to a full-screen
+child on the alternate screen, or forwards to a child that has asked for the
+mouse — and `alt-c` copies the selection and clears it. Two rules make the
+selection safe rather than incidental: a drag is clamped to the pane it
+began in, and only the terminal grid can be selected at all (the tree,
+borders and status bar have no selection model, so the chrome can never end
+up on the clipboard). A child that requested mouse reporting (`claude`,
+`vim`, `less`) receives the mouse instead of the TUI, with `⌥` held taking
+it back for selection; the host terminal's own **shift-drag** still bypasses
+the app entirely in terminals that honour that convention (iTerm2, kitty,
+WezTerm, Ghostty), which is the escape hatch for selecting across panes.
+Tabs/splits and the rest of the tree view's VS Code-parity surface land in
+later phases.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests
