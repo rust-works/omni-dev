@@ -11,7 +11,7 @@
 //!    and popups have no selection type, so no code path can produce a
 //!    selectable string from chrome.
 //! 2. **A drag is clamped to the region it started in** for its whole
-//!    lifetime ([`RegionMap::clamp_to_terminal`] / [`RegionMap::tree_row_clamped`]):
+//!    lifetime ([`RegionMap::clamp_to_grid`] / [`RegionMap::tree_row_clamped`]):
 //!    dragging past a boundary resolves against the last in-bounds cell.
 //! 3. **Copy comes from the emulator's grid** (`Term::selection_to_string`,
 //!    soft-wrap aware), never from the rendered frame.
@@ -49,31 +49,93 @@ pub enum Hit {
     /// Inside the tree pane: `row` is the flattened row index (the pane's
     /// scroll offset already applied). It may lie past the last row.
     Tree { row: usize },
-    /// Inside a terminal grid: 0-based grid coordinates.
-    Terminal { col: u16, line: u16 },
+    /// A group's tab strip. `tab` is the tab under the pointer, or `None`
+    /// for the empty space after the last one.
+    TabStrip { group: usize, tab: Option<usize> },
+    /// Inside a group's terminal grid: 0-based grid coordinates.
+    Terminal { group: usize, col: u16, line: u16 },
+    /// The boundary between group `index` and `index + 1` — a drag here
+    /// resizes the pair.
+    Splitter { index: usize },
     /// Borders, the status bar, gaps — inert.
     Chrome,
 }
 
+/// One rendered group's hit-testable parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupRegion {
+    /// The one-row tab strip above the group.
+    pub strip: Rect,
+    /// The grid inside the group's border.
+    pub grid: Rect,
+    /// Each tab's `[start, end)` columns on the strip, in tab order —
+    /// produced by the same code that renders them, so the two cannot
+    /// disagree about where a tab is.
+    pub tab_spans: Vec<(u16, u16)>,
+}
+
+impl GroupRegion {
+    fn tab_at(&self, col: u16) -> Option<usize> {
+        self.tab_spans
+            .iter()
+            .position(|(start, end)| col >= *start && col < *end)
+    }
+}
+
 /// The hit-testable regions of the last drawn frame — rebuilt by every
 /// `draw`, so a stale map can only ever be one frame old.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionMap {
     /// The tree pane's inner area (inside its border).
     pub tree: Rect,
     /// The tree's first visible row index.
     pub tree_offset: usize,
-    /// The terminal grid's area (inside the pane border), when a tab exists.
-    pub terminal: Option<Rect>,
+    /// One entry per *rendered* group, top to bottom. A group the layout
+    /// dropped for want of height simply is not here.
+    pub groups: Vec<GroupRegion>,
+    /// The screen row of each splitter, one per adjacent pair of groups.
+    pub splitters: Vec<u16>,
+    /// The horizontal extent splitters are draggable over — the terminal
+    /// side's columns.
+    pub splitter_cols: (u16, u16),
 }
 
 impl RegionMap {
     pub fn hit(&self, col: u16, row: u16) -> Hit {
-        if let Some(term) = self.terminal.filter(|r| contains(*r, col, row)) {
-            return Hit::Terminal {
-                col: col - term.x,
-                line: row - term.y,
-            };
+        // Tab strips win over the splitter. A group's strip sits directly
+        // under the boundary above it, inside the splitter's 3-row box; if
+        // the splitter took that row, every group below the first would
+        // have unclickable tabs. The splitter keeps the boundary row and
+        // the row above, which is still a 2-row target.
+        for (index, group) in self.groups.iter().enumerate() {
+            if contains(group.strip, col, row) {
+                return Hit::TabStrip {
+                    group: index,
+                    tab: group.tab_at(col),
+                };
+            }
+        }
+        // Splitters next: they sit on a group's border row, which is
+        // outside every grid, so this steals nothing selectable.
+        if col >= self.splitter_cols.0 && col < self.splitter_cols.1 {
+            if let Some((index, _)) = self
+                .splitters
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.abs_diff(row) <= SPLITTER_REACH)
+                .min_by_key(|(_, r)| r.abs_diff(row))
+            {
+                return Hit::Splitter { index };
+            }
+        }
+        for (index, group) in self.groups.iter().enumerate() {
+            if contains(group.grid, col, row) {
+                return Hit::Terminal {
+                    group: index,
+                    col: col - group.grid.x,
+                    line: row - group.grid.y,
+                };
+            }
         }
         if contains(self.tree, col, row) {
             return Hit::Tree {
@@ -83,12 +145,16 @@ impl RegionMap {
         Hit::Chrome
     }
 
-    /// Clamps a screen position into the terminal grid — the drag rule
-    /// (contract §2) for a drag that started in the grid.
-    pub fn clamp_to_terminal(&self, col: u16, row: u16) -> Option<(u16, u16)> {
-        let term = self.terminal.filter(|r| r.width > 0 && r.height > 0)?;
-        let col = col.clamp(term.x, term.x + term.width - 1) - term.x;
-        let line = row.clamp(term.y, term.y + term.height - 1) - term.y;
+    /// Clamps a screen position into group `index`'s grid — the drag rule
+    /// (contract §2) for a selection drag that started in that grid.
+    pub fn clamp_to_grid(&self, index: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let grid = self
+            .groups
+            .get(index)
+            .map(|g| g.grid)
+            .filter(|r| r.width > 0 && r.height > 0)?;
+        let col = col.clamp(grid.x, grid.x + grid.width - 1) - grid.x;
+        let line = row.clamp(grid.y, grid.y + grid.height - 1) - grid.y;
         Some((col, line))
     }
 
@@ -102,6 +168,11 @@ impl RegionMap {
         self.tree_offset + usize::from(row - self.tree.y)
     }
 }
+
+/// How far either side of its row a splitter answers to — half of
+/// [`super::layout::SPLITTER_HIT_HEIGHT`]'s 3-row box (a 1-row target is unusable
+/// with a mouse).
+const SPLITTER_REACH: u16 = super::layout::SPLITTER_HIT_HEIGHT / 2;
 
 fn contains(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
@@ -168,10 +239,13 @@ pub enum DragOrigin {
     None,
     /// A range-mark drag from tree row `anchor`.
     Tree { anchor: usize },
-    /// A selection drag in the terminal grid.
-    Terminal,
-    /// The child owns this drag: motion and release are forwarded to it.
-    Child,
+    /// A selection drag in group `group`'s terminal grid.
+    Terminal { group: usize },
+    /// A splitter drag resizing the pair either side of `index`.
+    Splitter { index: usize },
+    /// The child in group `group` owns this drag: motion and release are
+    /// forwarded to it.
+    Child { group: usize },
 }
 
 /// Contract §4: the focused child receives the mouse when it has requested
@@ -300,11 +374,26 @@ pub fn route_wheel(
 mod tests {
     use super::*;
 
+    /// A tree on the left and two stacked groups on the right, each with a
+    /// one-row strip above a grid, and a splitter between them.
     fn map() -> RegionMap {
         RegionMap {
             tree: Rect::new(1, 1, 30, 10),
             tree_offset: 5,
-            terminal: Some(Rect::new(41, 1, 40, 10)),
+            groups: vec![
+                GroupRegion {
+                    strip: Rect::new(40, 0, 41, 1),
+                    grid: Rect::new(41, 2, 39, 4),
+                    tab_spans: vec![(40, 49), (50, 60)],
+                },
+                GroupRegion {
+                    strip: Rect::new(40, 8, 41, 1),
+                    grid: Rect::new(41, 10, 39, 4),
+                    tab_spans: vec![(40, 49)],
+                },
+            ],
+            splitters: vec![7],
+            splitter_cols: (40, 81),
         }
     }
 
@@ -313,29 +402,112 @@ mod tests {
         let map = map();
         assert_eq!(map.hit(1, 1), Hit::Tree { row: 5 });
         assert_eq!(map.hit(30, 10), Hit::Tree { row: 14 });
-        assert_eq!(map.hit(41, 1), Hit::Terminal { col: 0, line: 0 });
-        assert_eq!(map.hit(80, 10), Hit::Terminal { col: 39, line: 9 });
+        assert_eq!(
+            map.hit(41, 2),
+            Hit::Terminal {
+                group: 0,
+                col: 0,
+                line: 0
+            }
+        );
+        assert_eq!(
+            map.hit(79, 13),
+            Hit::Terminal {
+                group: 1,
+                col: 38,
+                line: 3
+            }
+        );
         assert_eq!(map.hit(0, 0), Hit::Chrome, "the border");
         assert_eq!(map.hit(35, 5), Hit::Chrome, "the gap between panes");
         assert_eq!(map.hit(5, 11), Hit::Chrome, "below the tree");
-        let no_terminal = RegionMap {
-            terminal: None,
+        assert_eq!(map.hit(41, 1), Hit::Chrome, "the group's top border");
+        let no_groups = RegionMap {
+            groups: Vec::new(),
+            splitters: Vec::new(),
             ..map
         };
-        assert_eq!(no_terminal.hit(50, 5), Hit::Chrome);
+        assert_eq!(no_groups.hit(50, 5), Hit::Chrome);
+    }
+
+    #[test]
+    fn tab_strips_hit_test_to_a_tab_or_the_empty_space_after_them() {
+        let map = map();
+        assert_eq!(
+            map.hit(41, 0),
+            Hit::TabStrip {
+                group: 0,
+                tab: Some(0)
+            }
+        );
+        assert_eq!(
+            map.hit(55, 0),
+            Hit::TabStrip {
+                group: 0,
+                tab: Some(1)
+            }
+        );
+        assert_eq!(
+            map.hit(49, 0),
+            Hit::TabStrip {
+                group: 0,
+                tab: None
+            },
+            "the gap between two tabs"
+        );
+        assert_eq!(
+            map.hit(70, 0),
+            Hit::TabStrip {
+                group: 0,
+                tab: None
+            },
+            "past the last tab"
+        );
+        assert_eq!(
+            map.hit(42, 8),
+            Hit::TabStrip {
+                group: 1,
+                tab: Some(0)
+            },
+            "group 1's strip is clickable despite the splitter above it"
+        );
+    }
+
+    #[test]
+    fn the_splitter_answers_beside_its_row_but_never_steals_a_tab_strip() {
+        let map = map();
+        for row in [6, 7] {
+            assert_eq!(map.hit(60, row), Hit::Splitter { index: 0 }, "row {row}");
+        }
+        // Row 8 is inside the splitter's box *and* is group 1's strip. The
+        // strip wins, or no group below the first could be clicked.
+        assert_eq!(
+            map.hit(60, 8),
+            Hit::TabStrip {
+                group: 1,
+                tab: None
+            }
+        );
+        assert_ne!(map.hit(60, 5), Hit::Splitter { index: 0 });
+        assert_ne!(map.hit(60, 9), Hit::Splitter { index: 0 });
+        // Over the tree, the same rows are not a splitter.
+        assert_eq!(map.hit(5, 7), Hit::Tree { row: 11 });
     }
 
     #[test]
     fn drags_are_clamped_to_the_region_they_started_in() {
         let map = map();
-        assert_eq!(map.clamp_to_terminal(0, 0), Some((0, 0)));
-        assert_eq!(map.clamp_to_terminal(200, 200), Some((39, 9)));
-        assert_eq!(map.clamp_to_terminal(45, 5), Some((4, 4)));
+        assert_eq!(map.clamp_to_grid(0, 0, 0), Some((0, 0)));
+        assert_eq!(map.clamp_to_grid(0, 200, 200), Some((38, 3)));
+        assert_eq!(map.clamp_to_grid(0, 45, 4), Some((4, 2)));
+        // A drag in group 1 clamps to group 1, never into group 0.
+        assert_eq!(map.clamp_to_grid(1, 60, 0), Some((19, 0)));
+        assert_eq!(map.clamp_to_grid(9, 1, 1), None, "no such group");
         assert_eq!(map.tree_row_clamped(0), 5);
         assert_eq!(map.tree_row_clamped(200), 14);
         assert_eq!(map.tree_row_clamped(3), 7);
         let empty = RegionMap::default();
-        assert_eq!(empty.clamp_to_terminal(3, 3), None);
+        assert_eq!(empty.clamp_to_grid(0, 3, 3), None);
         assert_eq!(empty.tree_row_clamped(3), 0);
     }
 
