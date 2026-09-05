@@ -1,5 +1,6 @@
 //! `omni-dev coverage diff` — diff/patch coverage analysis.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,8 +9,10 @@ use git2::Repository;
 use regex::RegexSet;
 
 use crate::claude::context::{load_config_content, resolve_context_dir_at};
+use crate::coverage::analysis::{analyze_with_markers, Markers};
+use crate::coverage::markers::{self, FileMarkers};
 use crate::coverage::{
-    analyze, default_base_ref, parse, render, DiffModel, DiffScope, Format, OutputFormat,
+    default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, Format, OutputFormat,
     RenderOptions,
 };
 
@@ -167,6 +170,88 @@ pub struct DiffCommand {
     pub commit_url: Option<String>,
 }
 
+/// Which revision's source to scan for markers.
+#[derive(Debug, Clone, Copy)]
+enum Revision<'a> {
+    /// The head side. `Some(rev)` when `--head-ref` named one explicitly.
+    Head(Option<&'a str>),
+    /// The base side, always an explicit revision.
+    Base(&'a str),
+}
+
+/// Reads source files from one revision.
+///
+/// The head side prefers the **working tree** when `--head-ref` was not given:
+/// that is the source the report was measured from, and it lets a marker take
+/// effect while its author is still writing it, before any commit. An explicit
+/// `--head-ref` (or a repository with no working tree) reads that revision's
+/// tree instead, so the scan always matches the revision the report describes.
+enum RevisionSource<'repo> {
+    /// Files on disk, under this working directory.
+    Workdir(PathBuf),
+    /// Blobs from a revision's tree, with the repository they belong to.
+    Tree(&'repo Repository, git2::Tree<'repo>),
+}
+
+impl<'repo> RevisionSource<'repo> {
+    /// Resolves the source for `revision`.
+    fn open(repo: &'repo Repository, revision: Revision<'_>) -> Result<Self> {
+        let rev = match revision {
+            Revision::Head(None) => match repo.workdir() {
+                Some(workdir) => return Ok(Self::Workdir(workdir.to_path_buf())),
+                None => "HEAD",
+            },
+            Revision::Head(Some(rev)) | Revision::Base(rev) => rev,
+        };
+        let tree = repo
+            .revparse_single(rev)
+            .with_context(|| format!("could not resolve ref `{rev}` to scan for coverage markers"))?
+            .peel_to_tree()
+            .with_context(|| format!("ref `{rev}` is not a tree-ish"))?;
+        Ok(Self::Tree(repo, tree))
+    }
+
+    /// Reads `path`, or `None` when the revision has no readable text there.
+    fn read(&self, path: &str) -> Result<Option<String>> {
+        match self {
+            Self::Workdir(workdir) => match std::fs::read(workdir.join(path)) {
+                Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
+                // Generated code and out-of-tree paths appear in a report
+                // without existing in the checkout.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(anyhow::Error::new(e).context(format!(
+                    "could not read {} to scan for coverage markers",
+                    workdir.join(path).display()
+                ))),
+            },
+            Self::Tree(repo, tree) => {
+                let Ok(entry) = tree.get_path(Path::new(path)) else {
+                    return Ok(None);
+                };
+                let object = entry.to_object(repo).with_context(|| {
+                    format!("could not read `{path}` from the tree to scan for coverage markers")
+                })?;
+                let Some(blob) = object.as_blob() else {
+                    return Ok(None);
+                };
+                Ok(String::from_utf8(blob.content().to_vec()).ok())
+            }
+        }
+    }
+}
+
+/// Removes every `ignore`d line from `report`, and any file left empty.
+///
+/// This is what makes `ignore` the scoped twin of `ignore-filename-regex`:
+/// applied to each side from its own revision's source, before any delta is
+/// computed, so the lines simply do not exist for the rest of the pipeline.
+fn apply_ignored(report: &mut CoverageReport, markers: &BTreeMap<String, FileMarkers>) {
+    if markers.values().all(|m| m.ignored.is_empty()) {
+        return;
+    }
+    report.retain_lines(|path, line| markers.get(path).is_none_or(|m| !m.ignored.contains(&line)));
+}
+
 /// Persistent `coverage diff` settings read from `.omni-dev/coverage.yaml`.
 ///
 /// Forward-compatible: unknown top-level keys are ignored, so a newer schema
@@ -269,13 +354,35 @@ impl DiffCommand {
             None => None,
         };
 
+        // Source markers are read from each revision's *own* source, so no line
+        // number is ever stored and a region that moved between base and head
+        // needs no reconciliation. This runs after `strip_prefix` and the
+        // filename ignore-list, so a file excluded there is never even read —
+        // file-level exclusion wins, and markers inside it never raise errors.
+        let mut markers = Markers {
+            head: self.scan_markers(&repo, Revision::Head(self.head_ref.as_deref()), &head)?,
+            base: match &baseline {
+                Some(baseline) => self.scan_markers(&repo, Revision::Base(&base_ref), baseline)?,
+                None => BTreeMap::new(),
+            },
+        };
+        let mut head = head;
+        let mut baseline = baseline;
+        apply_ignored(&mut head, &markers.head);
+        if let Some(baseline) = baseline.as_mut() {
+            apply_ignored(baseline, &markers.base);
+        }
+        // An ignored file may have left the report entirely; its markers would
+        // then be reported as applied without having applied to anything.
+        markers.head.retain(|path, _| head.files.contains_key(path));
+
         let diff = DiffModel::between(&repo, &base_ref, self.head_ref.as_deref())?;
         let scope = if self.all_files {
             DiffScope::All
         } else {
             DiffScope::DiffOnly
         };
-        let result = analyze(&head, &diff, baseline.as_ref(), scope);
+        let result = analyze_with_markers(&head, &diff, baseline.as_ref(), scope, &markers);
 
         let opts = self.render_options();
         let rendered = render(&result, &opts, self.output.into())?;
@@ -325,6 +432,37 @@ impl DiffCommand {
             report.retain_paths(|path| !ignore.is_match(path));
         }
         Ok(report)
+    }
+
+    /// Scans one revision's source for coverage markers.
+    ///
+    /// Only paths present in `report` are read, so the cost is bounded by the
+    /// report rather than by the repository, and a file the coverage run never
+    /// mentioned is never opened.
+    ///
+    /// A path missing from the revision is **skipped silently**: generated code
+    /// and out-of-tree paths legitimately appear in a report without existing in
+    /// the tree. Any other read failure is a hard error — except a non-UTF-8
+    /// file, which is skipped, since it can only ever *fail to find* a marker
+    /// and so errs toward reporting more coverage movement, never less.
+    fn scan_markers(
+        &self,
+        repo: &Repository,
+        revision: Revision<'_>,
+        report: &CoverageReport,
+    ) -> Result<BTreeMap<String, FileMarkers>> {
+        let mut found = BTreeMap::new();
+        let source = RevisionSource::open(repo, revision)?;
+        for path in report.files.keys() {
+            let Some(text) = source.read(path)? else {
+                continue;
+            };
+            let regions = markers::scan(path, &text)?;
+            if !regions.is_empty() {
+                found.insert(path.clone(), FileMarkers::new(regions));
+            }
+        }
+        Ok(found)
     }
 
     /// Loads the repo-config ignore-list (`coverage.yaml`'s
@@ -555,6 +693,193 @@ mod tests {
             let outcome = cmd.run(Some(&repo)).unwrap();
             assert!(outcome.rendered.contains("patch_coverage"));
         }
+    }
+
+    /// Builds a marker line. The introducer is assembled at runtime so this
+    /// file's own fixtures are not themselves markers when omni-dev scans its
+    /// own source — see `crate::coverage::markers::INTRODUCER`.
+    fn marked(kind: &str, reason: &str) -> String {
+        format!(
+            "// {} {kind} reason=\"{reason}\"",
+            crate::coverage::markers::INTRODUCER
+        )
+    }
+
+    /// Builds a repo whose `src/gated.rs` carries a marked region sitting at
+    /// **different line numbers on each side** — the property the whole design
+    /// exists for. Base has the region at lines 1-4; head prepends two lines,
+    /// moving it to 3-6. `kind` of `None` builds the unmarked control.
+    ///
+    /// The gated lines are covered at base and uncovered at head: exactly the
+    /// cross-runner-CPU flip the markers exist to silence.
+    fn repo_with_moved_marker_region(
+        kind: Option<&str>,
+    ) -> (TempDir, PathBuf, String, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let repo = Repository::init(&path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+
+        let (open, close) = match kind {
+            Some(kind) => (
+                marked(kind, "CPU-gated dispatch"),
+                format!("// {} end", crate::coverage::markers::INTRODUCER),
+            ),
+            None => (
+                "// an ordinary comment".to_string(),
+                "// another".to_string(),
+            ),
+        };
+        let base_src =
+            format!("{open}\nfn gated() {{}}\nfn also_gated() {{}}\n{close}\nfn plain() {{}}\n");
+        // Two extra lines above shift the whole region down by two.
+        let head_src = format!(
+            "// a new comment\n// and another\n{open}\nfn gated() {{}}\nfn also_gated() {{}}\n{close}\nfn plain() {{}}\n"
+        );
+
+        let commit = |files: &[(&str, &str)], parent: Option<git2::Oid>| {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for (name, content) in files {
+                let file = path.join(name);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            let parent = parent.map(|id| repo.find_commit(id).unwrap());
+            let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+                .unwrap()
+        };
+
+        let base = commit(&[("src/gated.rs", &base_src)], None);
+        commit(&[("src/gated.rs", &head_src)], Some(base));
+
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        let gated = workdir.join("src/gated.rs");
+
+        // Base: the two gated lines (2, 3) covered, `plain` (5) covered.
+        let base_lcov = workdir.join("base.lcov");
+        fs::write(
+            &base_lcov,
+            format!(
+                "SF:{}\nDA:2,4\nDA:3,4\nDA:5,1\nend_of_record\n",
+                gated.display()
+            ),
+        )
+        .unwrap();
+        // Head: the same two gated lines (now 4, 5) uncovered — a different
+        // runner CPU — and `plain` (now 7) still covered.
+        let head_lcov = workdir.join("head.lcov");
+        fs::write(
+            &head_lcov,
+            format!(
+                "SF:{}\nDA:4,0\nDA:5,0\nDA:7,1\nend_of_record\n",
+                gated.display()
+            ),
+        )
+        .unwrap();
+
+        (dir, workdir, base.to_string(), head_lcov, base_lcov)
+    }
+
+    /// End-to-end: a `tolerate` region read from each revision's own source, at
+    /// different line numbers on each side, masks the flip everywhere — headline
+    /// and per-file row — while the reported percentage stays the real measured
+    /// value, and the region is reported once, not once per revision.
+    #[test]
+    fn tolerate_marker_masks_a_flip_across_a_moved_region() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("tolerate"));
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+
+        assert!(
+            rendered.contains("Total: **33.33%**"),
+            "the displayed percentage must be the real one: {rendered}"
+        );
+        assert!(
+            rendered.contains("\u{26aa} 0 pp vs `main`"),
+            "the masked flip must not move the headline: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\u{1f534}"),
+            "nothing should be painted red: {rendered}"
+        );
+        assert!(
+            rendered.contains("0 ignored region(s), 1 tolerated region(s)"),
+            "a region that merely moved is one region, not two: {rendered}"
+        );
+        assert!(
+            rendered.contains("| `src/gated.rs` | `tolerate` | 3-6 | both |"),
+            "the span reported is the one observed at head: {rendered}"
+        );
+        assert!(
+            rendered.contains("CPU-gated dispatch"),
+            "the reason must be shown: {rendered}"
+        );
+    }
+
+    /// The control that proves the test above measures the marker and not a
+    /// coincidence: the same flip, unmarked, still moves the report.
+    #[test]
+    fn the_same_flip_moves_the_report_without_a_marker() {
+        let (_dir, repo, base, head_lcov, base_lcov) = repo_with_moved_marker_region(None);
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            rendered.contains("\u{1f534}"),
+            "an unmarked flip must still be reported: {rendered}"
+        );
+        assert!(!rendered.contains("region(s)"), "{rendered}");
+    }
+
+    /// `ignore` removes the lines from both reports, so they leave the
+    /// denominator entirely rather than being scored against the baseline.
+    #[test]
+    fn ignore_marker_removes_lines_from_both_reports() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("ignore"));
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            rendered.contains("Total: **100%**"),
+            "only the covered `plain` line should remain in the denominator: {rendered}"
+        );
+        assert!(rendered.contains("1 ignored region(s)"), "{rendered}");
+    }
+
+    /// A malformed marker fails the run loudly, naming the file and line: a
+    /// marker whose author believes it is silencing noise must never be a silent
+    /// no-op.
+    #[test]
+    fn a_malformed_marker_is_a_hard_error() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("tolerate"));
+        // Strip the closing marker from the head worktree, leaving it open.
+        let gated = repo.join("src/gated.rs");
+        let source = fs::read_to_string(&gated).unwrap();
+        let end = format!("// {} end", crate::coverage::markers::INTRODUCER);
+        fs::write(&gated, source.replace(&end, "// not the end")).unwrap();
+
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let message = match cmd.run(Some(&repo)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unterminated region must fail the run"),
+        };
+        assert!(message.contains("src/gated.rs:3"), "{message}");
+        assert!(message.contains("unterminated"), "{message}");
     }
 
     #[test]

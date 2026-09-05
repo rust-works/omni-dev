@@ -19,11 +19,15 @@ pub mod diff;
 pub mod format;
 pub mod lcov;
 pub mod llvm_json;
+pub mod markers;
 pub mod model;
 pub mod render;
 
-pub use analysis::{analyze, CoverageDiff, DiffScope};
+pub use analysis::{
+    analyze, analyze_with_markers, AppliedMarker, CoverageDiff, DiffScope, MarkerSide, Markers,
+};
 pub use diff::{default_base_ref, DiffModel};
 pub use format::{parse, Format};
+pub use markers::{FileMarkers, MarkerKind, Region};
 pub use model::{CoverageReport, FileCoverage};
 pub use render::{render, OutputFormat, RenderOptions};

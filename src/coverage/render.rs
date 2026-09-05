@@ -186,7 +186,11 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
     if diff.has_baseline {
         match (diff.total_after, diff.total_before) {
             (after, Some(before)) => {
-                let d = after.unwrap_or(0.0) - before;
+                // The percentage displayed is always the real measured value;
+                // the movement is computed from the `tolerate`-masked one, so a
+                // silenced flip cannot move the arrow or the number beside it.
+                let effective = diff.total_after_effective.or(after);
+                let d = effective.unwrap_or(0.0) - before;
                 out.push_str(&format!(
                     "Total: **{}** {} {} pp vs `main`{}\n\n",
                     pct(after),
@@ -224,6 +228,8 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
              from `main`._\n\n",
         );
     }
+    // Also without a baseline: `ignore` still shapes the total and the patch.
+    render_markers(diff, &mut out);
 
     render_patch_section(diff, opts, &mut out);
 
@@ -247,7 +253,9 @@ fn render_delta_table(diff: &CoverageDiff, out: &mut String) {
         .file_deltas
         .iter()
         .map(|fd| {
-            let delta = fd.before.map(|before| fd.after.unwrap_or(0.0) - before);
+            // `delta()` reads the `tolerate`-masked coverage, so a silenced flip
+            // does not produce a row; `after` stays the real displayed value.
+            let delta = fd.delta();
             Row {
                 path: fd.path.clone(),
                 before: fd.before,
@@ -317,6 +325,46 @@ fn render_notable_unchanged(diff: &CoverageDiff, out: &mut String) {
             pct(fd.before),
             pct(fd.after),
             change
+        ));
+    }
+    out.push_str("\n</details>\n\n");
+}
+
+/// Renders the collapsed note listing every source-marker region that applied.
+///
+/// Silencing is never invisible: a reviewer can always see which regions were
+/// ignored or tolerated, where they are, and why their author silenced them.
+fn render_markers(diff: &CoverageDiff, out: &mut String) {
+    if diff.markers.is_empty() {
+        return;
+    }
+    let count =
+        |kind: crate::coverage::MarkerKind| diff.markers.iter().filter(|m| m.kind == kind).count();
+    out.push_str(&format!(
+        "<details><summary>🔇 {} ignored region(s), {} tolerated region(s)</summary>\n\n",
+        count(crate::coverage::MarkerKind::Ignore),
+        count(crate::coverage::MarkerKind::Tolerate)
+    ));
+    out.push_str(
+        "`ignore` removes the lines from both reports; `tolerate` keeps them in the reported \
+         percentage but scores them against the baseline, so a cross-run flip cannot move a \
+         delta. Regions are read from each revision's own source.\n\n",
+    );
+    out.push_str("| File | Kind | Lines | Rev | Reason |\n");
+    out.push_str("|------|------|-------|-----|--------|\n");
+    for marker in &diff.markers {
+        let lines = if marker.start == marker.end {
+            marker.start.to_string()
+        } else {
+            format!("{}-{}", marker.start, marker.end)
+        };
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} |\n",
+            marker.path,
+            marker.kind.as_str(),
+            lines,
+            marker.side.as_str(),
+            marker.reason
         ));
     }
     out.push_str("\n</details>\n\n");
@@ -434,6 +482,20 @@ struct CoverageDiffView {
     project_delta: Option<ProjectDeltaView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indirect_changes: Option<IndirectView>,
+    /// Source-marker regions that applied. Empty when no marker was found.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    markers: Vec<MarkerView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MarkerView {
+    path: String,
+    kind: String,
+    /// Which revision the region was observed on: `both`, `head`, or `base`.
+    side: String,
+    start: u32,
+    end: u32,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -457,7 +519,12 @@ struct FilePatchView {
 #[derive(Debug, Clone, Serialize)]
 struct ProjectDeltaView {
     total_before: Option<f64>,
+    /// The real, measured head coverage.
     total_after: Option<f64>,
+    /// Head coverage with `tolerate` masking applied — the value the reported
+    /// deltas are computed from. Present only when masking changed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_after_effective: Option<f64>,
     files: Vec<FileDeltaView>,
     /// Unchanged files (not touched by the diff) that nonetheless moved
     /// substantially — flagged as not attributable to the PR.
@@ -469,7 +536,13 @@ struct ProjectDeltaView {
 struct FileDeltaView {
     path: String,
     before: Option<f64>,
+    /// The real, measured head coverage.
     after: Option<f64>,
+    /// Head coverage with `tolerate` masking applied. Present only when masking
+    /// changed it, in which case `delta` is `after_effective - before` rather
+    /// than `after - before`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_effective: Option<f64>,
     delta: Option<f64>,
 }
 
@@ -518,11 +591,18 @@ impl CoverageDiffView {
                 path: fd.path.clone(),
                 before: fd.before.map(round2),
                 after: fd.after.map(round2),
+                after_effective: fd
+                    .is_masked()
+                    .then(|| fd.after_effective.map(round2))
+                    .flatten(),
                 delta: fd.delta().map(round2),
             };
             let project_delta = ProjectDeltaView {
                 total_before: diff.total_before.map(round2),
                 total_after: diff.total_after.map(round2),
+                total_after_effective: (diff.total_after_effective != diff.total_after)
+                    .then(|| diff.total_after_effective.map(round2))
+                    .flatten(),
                 files: diff.file_deltas.iter().map(file_delta_view).collect(),
                 notable_unchanged: diff.notable_unchanged.iter().map(file_delta_view).collect(),
             };
@@ -549,12 +629,26 @@ impl CoverageDiffView {
             (None, None)
         };
 
+        let markers = diff
+            .markers
+            .iter()
+            .map(|m| MarkerView {
+                path: m.path.clone(),
+                kind: m.kind.as_str().to_string(),
+                side: m.side.as_str().to_string(),
+                start: m.start,
+                end: m.end,
+                reason: m.reason.clone(),
+            })
+            .collect();
+
         Self {
             explanation: explanation(),
             patch_coverage,
             uncovered_new_lines,
             project_delta,
             indirect_changes,
+            markers,
         }
     }
 
@@ -567,6 +661,7 @@ impl CoverageDiffView {
             .indirect_changes
             .as_ref()
             .is_some_and(|i| !i.lines.is_empty());
+        let has_markers = !self.markers.is_empty();
         for field in &mut self.explanation.fields {
             field.present = match field.name.as_str() {
                 "patch_coverage.percent" | "patch_coverage.covered" | "patch_coverage.total" => {
@@ -576,6 +671,7 @@ impl CoverageDiffView {
                 "uncovered_new_lines[]" => has_uncovered,
                 "project_delta.total_after" | "project_delta.files[].path" => has_baseline,
                 "indirect_changes.lines[].path" => has_indirect,
+                "markers[].path" => has_markers,
                 _ => false,
             };
         }
@@ -627,6 +723,13 @@ fn explanation() -> FieldExplanation {
                 "indirect_changes.lines[].path",
                 "Lines whose coverage flipped without their content changing; needs a baseline.",
             ),
+            field(
+                "markers[].path",
+                "Source-marker regions that applied. `kind` is `ignore` (lines removed from both \
+                 reports) or `tolerate` (lines kept in the percentages, but their coverage flips \
+                 masked). Where a region was tolerated, `delta` is computed from \
+                 `after_effective`, not from the displayed `after`.",
+            ),
         ],
     }
 }
@@ -635,7 +738,9 @@ fn explanation() -> FieldExplanation {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::coverage::analysis::{FileDelta, FilePatch, IndirectChange, PatchCoverage};
+    use crate::coverage::analysis::{
+        AppliedMarker, FileDelta, FilePatch, IndirectChange, MarkerSide, PatchCoverage,
+    };
 
     #[test]
     fn fmt_num_trims_trailing_zeros() {
@@ -737,11 +842,11 @@ mod tests {
         let mut diff = sample_diff();
         diff.has_baseline = true;
         diff.total_before = Some(80.0);
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/big.rs".to_string(),
-            before: Some(90.0),
-            after: Some(89.998),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/big.rs".to_string(),
+            Some(90.0),
+            Some(89.998),
+        )];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(
             md.contains("| `src/big.rs` | 90% | 90% | \u{26aa} 0 pp |"),
@@ -798,13 +903,150 @@ mod tests {
         diff.has_baseline = true;
         diff.total_before = Some(85.0);
         diff.total_after = Some(80.0);
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/big.rs".to_string(),
-            before: Some(90.0),
-            after: Some(60.0),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/big.rs".to_string(),
+            Some(90.0),
+            Some(60.0),
+        )];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(!md.contains("not attributable to this diff"), "{md}");
+    }
+
+    fn tolerated_marker() -> AppliedMarker {
+        AppliedMarker {
+            path: "src/util/simd/x86.rs".to_string(),
+            kind: crate::coverage::MarkerKind::Tolerate,
+            side: MarkerSide::Both,
+            start: 41,
+            end: 52,
+            reason: "CPU-gated: the avx512f arm only runs on Zen 4+".to_string(),
+        }
+    }
+
+    /// #1593, the motivating case: the headline shows the *real* percentage but
+    /// takes its movement from the masked one, so the reported number stays
+    /// truthful while the silenced flip stops moving the needle.
+    #[test]
+    fn markdown_headline_uses_effective_coverage_for_the_delta_only() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(92.8012);
+        diff.total_after = Some(92.7924);
+        diff.total_after_effective = Some(92.8012);
+        diff.markers = vec![tolerated_marker()];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            md.contains("Total: **92.79%** \u{26aa} 0 pp vs `main`"),
+            "{md}"
+        );
+        assert!(
+            !md.contains("not attributable"),
+            "a masked move is not a move: {md}"
+        );
+    }
+
+    /// Silencing is never invisible.
+    #[test]
+    fn markdown_lists_every_applied_marker() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.markers = vec![
+            tolerated_marker(),
+            AppliedMarker {
+                path: "src/generated.rs".to_string(),
+                kind: crate::coverage::MarkerKind::Ignore,
+                side: MarkerSide::Head,
+                start: 7,
+                end: 7,
+                reason: "generated".to_string(),
+            },
+        ];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            md.contains("\u{1f507} 1 ignored region(s), 1 tolerated region(s)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| `src/util/simd/x86.rs` | `tolerate` | 41-52 | both |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| `src/generated.rs` | `ignore` | 7 | head |"),
+            "{md}"
+        );
+        assert!(md.contains("the avx512f arm only runs on Zen 4+"), "{md}");
+    }
+
+    /// `ignore` shapes the total and the patch even with no baseline, so its
+    /// note must appear there too.
+    #[test]
+    fn markdown_lists_markers_without_a_baseline() {
+        let mut diff = sample_diff();
+        diff.markers = vec![tolerated_marker()];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("1 tolerated region(s)"), "{md}");
+    }
+
+    #[test]
+    fn markdown_omits_the_note_when_no_marker_applied() {
+        let md = render(
+            &baseline_diff(),
+            &RenderOptions::default(),
+            OutputFormat::Markdown,
+        )
+        .unwrap();
+        assert!(!md.contains("region(s)"), "{md}");
+    }
+
+    /// The structured views must agree with the markdown: `delta` is the masked
+    /// value, and `after`/`total_after` stay real, with the effective value
+    /// alongside so a consumer can see why they differ.
+    #[test]
+    fn json_reports_markers_and_effective_coverage() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(92.8012);
+        diff.total_after = Some(92.7924);
+        diff.total_after_effective = Some(92.8012);
+        diff.file_deltas = vec![FileDelta {
+            path: "src/util/simd/x86.rs".to_string(),
+            before: Some(90.0),
+            after: Some(80.0),
+            after_effective: Some(90.0),
+        }];
+        diff.markers = vec![tolerated_marker()];
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["project_delta"]["total_after"], 92.79);
+        assert_eq!(value["project_delta"]["total_after_effective"], 92.8);
+        let file = &value["project_delta"]["files"][0];
+        assert_eq!(file["after"], 80.0);
+        assert_eq!(file["after_effective"], 90.0);
+        assert_eq!(
+            file["delta"], 0.0,
+            "delta is computed from the masked value"
+        );
+        assert_eq!(value["markers"][0]["kind"], "tolerate");
+        assert_eq!(value["markers"][0]["side"], "both");
+        assert_eq!(value["markers"][0]["start"], 41);
+    }
+
+    /// An unmasked run must not grow the effective fields — they exist only to
+    /// explain a discrepancy, so an absent one means "there was none".
+    #[test]
+    fn json_omits_effective_fields_when_nothing_was_masked() {
+        let mut diff = baseline_diff();
+        diff.total_after_effective = diff.total_after;
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["project_delta"]
+            .get("total_after_effective")
+            .is_none());
+        assert!(value["project_delta"]["files"][0]
+            .get("after_effective")
+            .is_none());
+        assert!(value.get("markers").is_none());
     }
 
     #[test]
@@ -854,34 +1096,15 @@ mod tests {
             total_after: Some(80.0),
             total_before: Some(80.0), // equal → ⚪ 0 pp
             file_deltas: vec![
-                FileDelta {
-                    path: "src/new.rs".to_string(),
-                    before: None,
-                    after: Some(50.0),
-                },
-                FileDelta {
-                    path: "src/down.rs".to_string(),
-                    before: Some(100.0),
-                    after: Some(70.0),
-                },
-                FileDelta {
-                    path: "src/up.rs".to_string(),
-                    before: Some(70.0),
-                    after: Some(90.0),
-                },
-                FileDelta {
-                    path: "src/tiny.rs".to_string(),
-                    before: Some(90.0),
-                    after: Some(90.02), // below EPS → filtered out
-                },
-                FileDelta {
-                    path: "src/gone.rs".to_string(),
-                    before: Some(50.0),
-                    after: None, // After renders as em dash
-                },
+                FileDelta::new("src/new.rs".to_string(), None, Some(50.0)),
+                FileDelta::new("src/down.rs".to_string(), Some(100.0), Some(70.0)),
+                FileDelta::new("src/up.rs".to_string(), Some(70.0), Some(90.0)),
+                // below EPS → filtered out
+                FileDelta::new("src/tiny.rs", Some(90.0), Some(90.02)),
+                // `After` renders as an em dash
+                FileDelta::new("src/gone.rs", Some(50.0), None),
             ],
-            notable_unchanged: Vec::new(),
-            indirect: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -977,17 +1200,9 @@ mod tests {
     fn markdown_renders_notable_unchanged_note() {
         let mut diff = baseline_diff();
         diff.notable_unchanged = vec![
-            FileDelta {
-                path: "src/other.rs".to_string(),
-                before: Some(80.0),
-                after: Some(60.0),
-            },
+            FileDelta::new("src/other.rs".to_string(), Some(80.0), Some(60.0)),
             // Absent from the baseline → delta() is None → renders as "🆕 new".
-            FileDelta {
-                path: "src/fresh.rs".to_string(),
-                before: None,
-                after: Some(55.0),
-            },
+            FileDelta::new("src/fresh.rs".to_string(), None, Some(55.0)),
         ];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(md.contains("unchanged file(s) also moved (not attributed to this PR)"));
@@ -999,11 +1214,11 @@ mod tests {
     #[test]
     fn json_includes_notable_unchanged() {
         let mut diff = baseline_diff();
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/other.rs".to_string(),
-            before: Some(80.0),
-            after: Some(60.0),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/other.rs".to_string(),
+            Some(80.0),
+            Some(60.0),
+        )];
         let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
