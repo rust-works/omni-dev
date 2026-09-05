@@ -444,8 +444,27 @@ up on the clipboard). A child that requested mouse reporting (`claude`,
 it back for selection; the host terminal's own **shift-drag** still bypasses
 the app entirely in terminals that honour that convention (iTerm2, kitty,
 WezTerm, Ghostty), which is the escape hatch for selecting across panes.
-Tabs/splits and the rest of the tree view's VS Code-parity surface land in
-later phases.
+Phase 4b turned the terminal side into a **stack of tab groups**. `alt-t`
+opens a tab in the focused group and `alt-s` splits a new group below it;
+`alt-[`/`alt-]` cycle tabs, `alt-1`…`alt-9` pick one, `alt-↑`/`alt-↓` move
+focus between groups, `alt-⇧↑`/`alt-⇧↓` move the active tab between them,
+and `alt-0` restores an equal split. Every group has a tab strip — click a
+tab to activate it, middle-click to close it, wheel to cycle — and the
+boundary between two groups drags to resize them, with a three-row grab area
+and a four-row floor on either side so a group can never be squeezed away.
+The stack is top-to-bottom only, deliberately: that is what the tree view's
+users asked for, and it avoids the focus-traversal and persistence
+complexity of arbitrary nesting.
+
+Two behaviours differ from Phase 3's single tab. Opening a worktree that
+already has a live tab focuses that tab instead of opening a duplicate,
+though `alt-s` always makes a new group. And a tab whose child has exited
+stays on screen showing its exit status until you close it with `alt-w`,
+rather than being replaced the moment you open another. The tree's "you are
+here" marker counts tabs, so it stays lit while any tab on that worktree
+remains.
+
+The rest of the tree view's VS Code-parity surface lands in later phases.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests

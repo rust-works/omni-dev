@@ -26,8 +26,26 @@ pub enum ChromeKey {
     NewShellTab,
     /// `alt-⇧t`: open a Claude tab in the cursor worktree.
     NewClaudeTab,
+    /// `alt-s`: open a shell tab in a new group below (a split).
+    SplitShellTab,
     /// `alt-w`: close the tab.
     CloseTab,
+    /// `alt-]`: next tab in the focused group.
+    NextTab,
+    /// `alt-[`: previous tab in the focused group.
+    PrevTab,
+    /// `alt-1`…`alt-9`: select that tab (0-based here).
+    SelectTab(usize),
+    /// `alt-↓`: focus the group below.
+    NextGroup,
+    /// `alt-↑`: focus the group above.
+    PrevGroup,
+    /// `alt-⇧↓`: move the active tab into the group below.
+    MoveTabDown,
+    /// `alt-⇧↑`: move the active tab into the group above.
+    MoveTabUp,
+    /// `alt-0`: reset every group to an equal share.
+    ResetLayout,
     /// `alt-c`: copy the terminal selection.
     Copy,
     /// `⇧PageUp`: scroll the terminal back a page.
@@ -71,8 +89,22 @@ pub fn chrome_key(key: &KeyEvent) -> Option<ChromeKey> {
         KeyCode::Char('T') if alt => Some(ChromeKey::NewClaudeTab),
         KeyCode::Char('t') if alt && shift => Some(ChromeKey::NewClaudeTab),
         KeyCode::Char('t') if alt => Some(ChromeKey::NewShellTab),
+        KeyCode::Char('s') if alt => Some(ChromeKey::SplitShellTab),
         KeyCode::Char('w') if alt => Some(ChromeKey::CloseTab),
         KeyCode::Char('c') if alt => Some(ChromeKey::Copy),
+        KeyCode::Char(']') if alt => Some(ChromeKey::NextTab),
+        KeyCode::Char('[') if alt => Some(ChromeKey::PrevTab),
+        KeyCode::Char('0') if alt => Some(ChromeKey::ResetLayout),
+        // `alt-1`…`alt-9` select a tab; reported 0-based.
+        KeyCode::Char(c @ '1'..='9') if alt => {
+            Some(ChromeKey::SelectTab(c as usize - '1' as usize))
+        }
+        // Shift decides move-a-tab vs. move-focus, matching the tab strip's
+        // own drag/reorder distinction.
+        KeyCode::Up if alt && shift => Some(ChromeKey::MoveTabUp),
+        KeyCode::Down if alt && shift => Some(ChromeKey::MoveTabDown),
+        KeyCode::Up if alt => Some(ChromeKey::PrevGroup),
+        KeyCode::Down if alt => Some(ChromeKey::NextGroup),
         KeyCode::PageUp if shift => Some(ChromeKey::ScrollPageUp),
         KeyCode::PageDown if shift => Some(ChromeKey::ScrollPageDown),
         _ => None,

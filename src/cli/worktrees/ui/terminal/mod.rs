@@ -370,11 +370,27 @@ impl TerminalTab {
         }
     }
 
-    fn pane_title(&self) -> String {
-        let name = self.opened_in.file_name().map_or_else(
+    /// The tab strip's short label: the kind and the worktree's basename,
+    /// with the child's own title preferred when it set one. Truncated so
+    /// one tab cannot crowd out the rest of the strip.
+    pub fn strip_label(&self) -> String {
+        let name = self.worktree_name();
+        let label = match &self.title {
+            Some(t) if !t.is_empty() => format!("{}·{t}", self.kind.label()),
+            _ => format!("{}·{name}", self.kind.label()),
+        };
+        truncate_middle(&label, 24)
+    }
+
+    fn worktree_name(&self) -> String {
+        self.opened_in.file_name().map_or_else(
             || self.opened_in.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
-        );
+        )
+    }
+
+    fn pane_title(&self) -> String {
+        let name = self.worktree_name();
         let mut title = match &self.title {
             Some(t) if !t.is_empty() => format!(" {} · {name} · {t} ", self.kind.label()),
             _ => format!(" {} · {name} ", self.kind.label()),
@@ -392,6 +408,24 @@ impl TerminalTab {
         }
         title
     }
+}
+
+/// Shortens `text` to `max` characters by eliding its middle with `…`,
+/// keeping both ends legible (a branch-shaped label's distinguishing part
+/// is as often at the end as the start). Counts `char`s, not bytes, so a
+/// multi-byte label is never split mid-character.
+fn truncate_middle(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max || max < 3 {
+        return text.to_string();
+    }
+    let keep = max - 1; // one cell for the ellipsis
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = text.chars().take(head).collect();
+    out.push('…');
+    out.extend(text.chars().skip(count - tail));
+    out
 }
 
 /// Resolves a viewport cell (clamped into the grid) to a grid point,
@@ -681,6 +715,37 @@ mod tests {
         );
         assert_eq!(tab.handle_event(TermEvent::Exit), TabEffect::Exited);
         pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Exited).await;
+        tab.shutdown();
+    }
+
+    #[test]
+    fn truncate_middle_elides_only_when_it_has_to_and_never_splits_a_char() {
+        assert_eq!(truncate_middle("short", 24), "short");
+        assert_eq!(truncate_middle("exactly-ten", 11), "exactly-ten");
+        let long = "shell·issue-1585-worktrees-ui-phase-4";
+        let out = truncate_middle(long, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.contains('…'));
+        assert!(out.starts_with("shell·"), "the head survives: {out}");
+        assert!(out.ends_with('4'), "the tail survives: {out}");
+        // Multi-byte throughout: still exactly `max` chars, still valid.
+        let cjk = "你好你好你好你好你好你好";
+        assert_eq!(truncate_middle(cjk, 5).chars().count(), 5);
+        // A max too small to elide into returns the text untouched.
+        assert_eq!(truncate_middle("abcdef", 2), "abcdef");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strip_label_names_the_kind_and_worktree_then_the_childs_title() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tab = sh_tab("printf '\\033]2;my-title\\a'; sleep 1", tx);
+        assert!(tab.strip_label().starts_with("shell·"));
+        pump(&mut tab, &mut rx, |_, t| {
+            t.title.as_deref() == Some("my-title")
+        })
+        .await;
+        assert_eq!(tab.strip_label(), "shell·my-title");
         tab.shutdown();
     }
 

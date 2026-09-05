@@ -31,6 +31,7 @@ use super::actions::{self, ActionFlow, ActionKind, CheckReport, Dispatcher, Targ
 use super::hub::{HubCommand, ViewModelHandle};
 use super::keys::{self, ChromeKey, KeyRoute};
 use super::mouse::{self, DragOrigin, Hit, RegionMap, TreeClick, WheelRoute};
+use super::panes;
 use super::terminal::{GridSize, TabEffect, TabId, TabKind, TerminalTab};
 use super::tree::TreeState;
 use super::view_model::WorktreesViewModel;
@@ -59,8 +60,8 @@ struct App {
     menu: Option<popup::ActionMenu>,
     relocate: Option<RelocateStep>,
     focus: Focus,
-    terminal: Option<TerminalTab>,
-    next_tab_id: TabId,
+    /// The terminal side: a vertical stack of tab groups (Phase 4b).
+    panes: panes::PaneLayout,
     /// `q` with a live child asks first; the answer lands here.
     quit_confirm: bool,
     /// A one-line message for the status bar, cleared on the next key.
@@ -69,6 +70,9 @@ struct App {
     commands: mpsc::UnboundedSender<HubCommand>,
     /// The hit-testable regions of the last drawn frame.
     regions: RegionMap,
+    /// The terminal side's rect as of the last frame — what a splitter drag
+    /// recomputes weights against.
+    terminal_area: Option<Rect>,
     /// The drag in progress, if any, and the region it is clamped to.
     drag: DragOrigin,
     clicks: mouse::ClickTracker,
@@ -122,13 +126,13 @@ pub async fn run(
         menu: None,
         relocate: None,
         focus: Focus::Tree,
-        terminal: None,
-        next_tab_id: 1,
+        panes: panes::PaneLayout::default(),
         quit_confirm: false,
         notice: None,
         pty_tx,
         commands,
         regions: RegionMap::default(),
+        terminal_area: None,
         drag: DragOrigin::None,
         clicks: mouse::ClickTracker::default(),
     };
@@ -172,7 +176,7 @@ pub async fn run(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         if app.focus == Focus::Terminal {
-                            if let Some(tab) = app.terminal.as_ref().filter(|t| t.is_alive()) {
+                            if let Some(tab) = app.panes.active_tab().filter(|t| t.is_alive()) {
                                 tab.write_input(keys::paste_bytes(&text, tab.mode()));
                             }
                         }
@@ -203,8 +207,10 @@ pub async fn run(
         }
     }
 
-    if let Some(tab) = app.terminal.as_mut() {
-        tab.shutdown();
+    for group in &mut app.panes.groups {
+        for tab in &mut group.tabs {
+            tab.shutdown();
+        }
     }
     Ok(())
 }
@@ -212,10 +218,10 @@ pub async fn run(
 impl App {
     /// Absorbs one emulator event; returns whether a redraw is needed.
     fn handle_pty_event(&mut self, tab_id: TabId, event: TermEvent) -> bool {
-        let Some(tab) = self.terminal.as_mut().filter(|t| t.id() == tab_id) else {
+        let Some(effect) = self.panes.handle_event(tab_id, event) else {
             return false; // an event from a tab that has already been closed
         };
-        match tab.handle_event(event) {
+        match effect {
             TabEffect::None => false,
             TabEffect::Redraw => true,
             TabEffect::CopyToClipboard(text) => {
@@ -225,16 +231,18 @@ impl App {
                 false
             }
             TabEffect::Exited => {
-                self.notice = Some("terminal exited — alt-w to close the pane".to_string());
+                self.notice = Some("terminal exited — alt-w to close the tab".to_string());
                 true
             }
         }
     }
 
     /// Forwards host focus in/out to a child that asked for it
-    /// (`TermMode::FOCUS_IN_OUT`), the way a real terminal would.
+    /// (`TermMode::FOCUS_IN_OUT`), the way a real terminal would. Only the
+    /// focused tab hears about it — a background tab never had focus to
+    /// gain or lose.
     fn forward_focus(&self, gained: bool) {
-        if let Some(tab) = self.terminal.as_ref().filter(|t| t.is_alive()) {
+        if let Some(tab) = self.panes.active_tab().filter(|t| t.is_alive()) {
             if tab.mode().contains(TermMode::FOCUS_IN_OUT) {
                 tab.write_input(if gained {
                     b"\x1b[I".to_vec()
@@ -245,28 +253,30 @@ impl App {
         }
     }
 
-    /// Opens a tab of `kind` in `worktree`, or focuses the existing tab if
-    /// it is that worktree's. Phase 3 hosts exactly one tab (no tab strip
-    /// yet), so a live tab for a *different* worktree has to be closed
-    /// first; an exited one is replaced.
-    fn open_tab(&mut self, kind: TabKind, worktree: PathBuf, size: GridSize) {
-        if let Some(existing) = &self.terminal {
-            if existing.is_alive() {
-                if existing.opened_in == worktree && existing.kind == kind {
-                    self.focus = Focus::Terminal;
-                } else {
-                    self.notice =
-                        Some("one tab this phase — alt-w closes the current one".to_string());
-                }
+    /// Opens a tab of `kind` in `worktree`, focusing an existing live one
+    /// for the same worktree and kind rather than opening a duplicate. With
+    /// `split`, the tab lands in a new group below the focused one.
+    fn open_tab(&mut self, kind: TabKind, worktree: PathBuf, size: GridSize, split: bool) {
+        // Reusing an existing tab is the *open* gesture's convenience. A
+        // split is an explicit "give me another pane", so it always makes
+        // one — including on a worktree that already has a tab.
+        if !split {
+            if let Some(addr) = self.panes.find_in_worktree(&worktree, kind) {
+                self.panes.focus(addr);
+                self.focus = Focus::Terminal;
                 return;
             }
-            self.close_tab();
         }
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        match TerminalTab::spawn(id, kind, worktree.clone(), size, self.pty_tx.clone()) {
-            Ok(tab) => {
-                self.terminal = Some(tab);
+        let tx = self.pty_tx.clone();
+        let target = worktree.clone();
+        let spawn = move |id| TerminalTab::spawn(id, kind, target, size, tx);
+        let opened = if split {
+            self.panes.split(spawn)
+        } else {
+            self.panes.open_tab(spawn)
+        };
+        match opened {
+            Ok(_) => {
                 self.focus = Focus::Terminal;
                 let _ = self.commands.send(HubCommand::SetOpenTab(worktree));
             }
@@ -274,12 +284,19 @@ impl App {
         }
     }
 
+    /// Closes the focused tab. The `here` cue is only cleared once the
+    /// *last* tab on that worktree has gone, since several tabs may share
+    /// one worktree.
     fn close_tab(&mut self) {
-        if let Some(mut tab) = self.terminal.take() {
-            tab.shutdown();
-            let _ = self.commands.send(HubCommand::ClearOpenTab(tab.opened_in));
+        let Some(worktree) = self.panes.close_active() else {
+            return;
+        };
+        if !self.panes.open_worktrees().contains(&worktree) {
+            let _ = self.commands.send(HubCommand::ClearOpenTab(worktree));
         }
-        self.focus = Focus::Tree;
+        if self.panes.is_empty() {
+            self.focus = Focus::Tree;
+        }
     }
 
     fn cursor_worktree(&self, view: &WorktreesViewModel) -> Option<PathBuf> {
@@ -324,7 +341,7 @@ fn layout(area: Rect, has_terminal: bool) -> Areas {
 }
 
 fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
-    let areas = layout(frame.area(), app.terminal.is_some());
+    let areas = layout(frame.area(), !app.panes.is_empty());
     render::draw_tree_pane(
         frame,
         areas.tree,
@@ -332,25 +349,38 @@ fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
         &mut app.tree,
         app.focus == Focus::Tree,
     );
-    let terminal_inner = match (areas.terminal, app.terminal.as_mut()) {
-        (Some(area), Some(tab)) => {
-            // Keep the emulator sized to the pane it is drawn in — a host
-            // resize or a layout change lands here before the grid is read.
-            let inner = Block::default().borders(Borders::ALL).inner(area);
-            tab.resize(GridSize {
-                cols: inner.width,
-                lines: inner.height,
-            });
-            tab.draw(frame, area, app.focus == Focus::Terminal);
-            Some(inner)
-        }
-        _ => None,
+    // `arrange` both lays the stack out and resizes each visible group's
+    // active tab to the grid it is about to be drawn into, so the emulator
+    // is never read at a size it was not rendered at.
+    app.terminal_area = areas.terminal;
+    let group_rects = match areas.terminal {
+        Some(area) => app.panes.arrange(area),
+        None => Vec::new(),
     };
-    // The region map mirrors exactly what was just drawn, offset included.
+    app.panes
+        .draw(frame, &group_rects, app.focus == Focus::Terminal);
+
+    // The region map mirrors exactly what was just drawn, offsets included.
+    let splitters = group_rects
+        .iter()
+        .take(group_rects.len().saturating_sub(1))
+        .map(|r| super::layout::boundary_row(r.body))
+        .collect();
     app.regions = RegionMap {
         tree: Block::default().borders(Borders::ALL).inner(areas.tree),
         tree_offset: app.tree.offset,
-        terminal: terminal_inner,
+        groups: group_rects
+            .iter()
+            .map(|r| mouse::GroupRegion {
+                strip: r.strip,
+                grid: r.grid,
+                tab_spans: r.tab_spans.clone(),
+            })
+            .collect(),
+        splitters,
+        splitter_cols: areas
+            .terminal
+            .map_or((0, 0), |a| (a.x, a.x.saturating_add(a.width))),
     };
     render::draw_status_bar(frame, areas.status, view, &app.tree, &status_hint(app));
     draw_popups(frame, app);
@@ -375,7 +405,7 @@ fn status_hint(app: &App) -> String {
         },
         (ActionFlow::Failed { error }, _) => format!("failed: {error}"),
         (_, Focus::Terminal) => {
-            "alt-e tree  alt-w close tab  alt-c copy  ⇧PgUp/⇧PgDn scrollback".to_string()
+            "alt-e tree  alt-t tab  alt-s split  alt-[/] cycle  alt-w close  alt-c copy".to_string()
         }
         (_, Focus::Tree) => {
             "↑↓ move  space mark  enter/alt-t shell tab  alt-⇧t claude tab  a actions  c/C colour  q quit".to_string()
@@ -475,8 +505,15 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                 Hit::Tree { row: tree_row } => {
                     tree_mouse_down(app, view, tree_row, button, mods, (col, row))
                 }
-                Hit::Terminal { col: gc, line } => {
-                    terminal_mouse_down(app, button, mods, (gc, line), (col, row))
+                Hit::Terminal {
+                    group,
+                    col: gc,
+                    line,
+                } => terminal_mouse_down(app, group, button, mods, (gc, line), (col, row)),
+                Hit::TabStrip { group, tab } => strip_mouse_down(app, group, tab, button),
+                Hit::Splitter { index } => {
+                    app.drag = DragOrigin::Splitter { index };
+                    false
                 }
                 Hit::Chrome => false,
             }
@@ -488,31 +525,32 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                 app.tree.mark_range(view, anchor, app.tree.cursor);
                 true
             }
-            DragOrigin::Terminal => {
-                let Some((gc, line)) = app.regions.clamp_to_terminal(col, row) else {
+            DragOrigin::Terminal { group } => {
+                let Some((gc, line)) = app.regions.clamp_to_grid(group, col, row) else {
                     return false;
                 };
-                if let Some(tab) = &app.terminal {
+                if let Some(tab) = app.panes.group_tab(group) {
                     tab.selection_update(gc, line);
                 }
                 true
             }
-            DragOrigin::Child => {
-                forward_to_child(app, MouseEventKind::Drag(button), mods, (col, row));
+            DragOrigin::Splitter { index } => drag_splitter(app, index, row),
+            DragOrigin::Child { group } => {
+                forward_to_child(app, group, MouseEventKind::Drag(button), mods, (col, row));
                 false
             }
             DragOrigin::None => false,
         },
         MouseEventKind::Up(button) => {
-            if std::mem::take(&mut app.drag) == DragOrigin::Child {
-                forward_to_child(app, MouseEventKind::Up(button), mods, (col, row));
+            if let DragOrigin::Child { group } = std::mem::take(&mut app.drag) {
+                forward_to_child(app, group, MouseEventKind::Up(button), mods, (col, row));
             }
             false
         }
         MouseEventKind::Moved => {
             // Only a child that asked for all-motion reporting cares.
-            if matches!(app.regions.hit(col, row), Hit::Terminal { .. }) {
-                forward_to_child(app, MouseEventKind::Moved, mods, (col, row));
+            if let Hit::Terminal { group, .. } = app.regions.hit(col, row) {
+                forward_to_child(app, group, MouseEventKind::Moved, mods, (col, row));
             }
             false
         }
@@ -524,8 +562,18 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                     app.tree.move_cursor(if up { -1 } else { 1 }, rows);
                     true
                 }
-                Hit::Terminal { col: gc, line } => {
-                    let Some(tab) = &app.terminal else {
+                // The wheel over a tab strip cycles that group's tabs.
+                Hit::TabStrip { group, .. } => {
+                    app.panes.focused = group;
+                    app.panes.cycle_tab(if up { -1 } else { 1 });
+                    true
+                }
+                Hit::Terminal {
+                    group,
+                    col: gc,
+                    line,
+                } => {
+                    let Some(tab) = app.panes.group_tab(group) else {
                         return false;
                     };
                     match mouse::route_wheel(up, mods, gc, line, tab.mode()) {
@@ -541,16 +589,59 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                         }
                     }
                 }
-                Hit::Chrome => false,
+                Hit::Splitter { .. } | Hit::Chrome => false,
             }
         }
         MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
-            if matches!(app.regions.hit(col, row), Hit::Terminal { .. }) {
-                forward_to_child(app, mouse.kind, mods, (col, row));
+            if let Hit::Terminal { group, .. } = app.regions.hit(col, row) {
+                forward_to_child(app, group, mouse.kind, mods, (col, row));
             }
             false
         }
     }
+}
+
+/// A button-down on a tab strip: left activates the tab (or focuses the
+/// group when the click is past the last one), middle closes it — the
+/// conventional tab-strip gestures.
+fn strip_mouse_down(app: &mut App, group: usize, tab: Option<usize>, button: MouseButton) -> bool {
+    app.focus = Focus::Terminal;
+    app.drag = DragOrigin::None;
+    app.panes.focused = group.min(app.panes.group_count().saturating_sub(1));
+    let Some(tab) = tab else {
+        return true;
+    };
+    match button {
+        MouseButton::Middle => {
+            let addr = panes::TabAddr { group, tab };
+            if let Some(worktree) = app.panes.close_tab(addr) {
+                if !app.panes.open_worktrees().contains(&worktree) {
+                    let _ = app.commands.send(HubCommand::ClearOpenTab(worktree));
+                }
+                if app.panes.is_empty() {
+                    app.focus = Focus::Tree;
+                }
+            }
+        }
+        MouseButton::Left | MouseButton::Right => {
+            app.panes.focus(panes::TabAddr { group, tab });
+        }
+    }
+    true
+}
+
+/// Drags splitter `index` to screen row `row`, resizing only the two groups
+/// either side of it.
+fn drag_splitter(app: &mut App, index: usize, row: u16) -> bool {
+    let Some(area) = app.terminal_area else {
+        return false;
+    };
+    let next = super::layout::drag_splitter(area, &app.panes.weights, index, row);
+    if next == app.panes.weights {
+        return false;
+    }
+    app.panes.weights = next;
+    true
 }
 
 /// A button-down on tree row `tree_row` (which may be past the last row).
@@ -584,7 +675,7 @@ fn tree_mouse_down(
         }
         TreeClick::Open => {
             app.tree.set_cursor(tree_row, rows);
-            open_tab_for_cursor(app, view, TabKind::Shell);
+            open_tab_for_cursor(app, view, TabKind::Shell, false);
         }
     }
     if button == MouseButton::Left {
@@ -593,12 +684,13 @@ fn tree_mouse_down(
     true
 }
 
-/// A button-down on the terminal grid at (`gc`, `line`): the child's if it
-/// asked for the mouse (contract §4), else the start of a selection —
+/// A button-down on group `group`'s grid at (`gc`, `line`): the child's if
+/// it asked for the mouse (contract §4), else the start of a selection —
 /// simple, word or line by click count. Middle/right buttons neither paste
 /// nor select: there is no clipboard→child path here by design.
 fn terminal_mouse_down(
     app: &mut App,
+    group: usize,
     button: MouseButton,
     mods: KeyModifiers,
     (gc, line): (u16, u16),
@@ -606,7 +698,10 @@ fn terminal_mouse_down(
 ) -> bool {
     app.focus = Focus::Terminal;
     app.drag = DragOrigin::None;
-    let Some(tab) = &app.terminal else {
+    // Clicking a group focuses it, so the next key goes where the eye is.
+    app.panes.focused = group.min(app.panes.group_count().saturating_sub(1));
+    let click = app.clicks.click(col, row, Instant::now());
+    let Some(tab) = app.panes.group_tab(group) else {
         return true;
     };
     let mode = tab.mode();
@@ -615,29 +710,35 @@ fn terminal_mouse_down(
         {
             tab.write_input(bytes);
         }
-        app.drag = DragOrigin::Child;
+        app.drag = DragOrigin::Child { group };
         return true;
     }
     if button == MouseButton::Left {
-        let ty = match app.clicks.click(col, row, Instant::now()) {
+        let ty = match click {
             1 => SelectionType::Simple,
             2 => SelectionType::Semantic,
             _ => SelectionType::Lines,
         };
         tab.selection_start(gc, line, ty);
-        app.drag = DragOrigin::Terminal;
+        app.drag = DragOrigin::Terminal { group };
     }
     true
 }
 
-/// Encodes `kind` at the screen position (clamped into the grid — a child
-/// drag stays in the grid like any other) for a live child that asked for
-/// the mouse, and writes it.
-fn forward_to_child(app: &App, kind: MouseEventKind, mods: KeyModifiers, (col, row): (u16, u16)) {
-    let Some(tab) = app.terminal.as_ref().filter(|t| t.is_alive()) else {
+/// Encodes `kind` at the screen position (clamped into group `group`'s grid
+/// — a child drag stays in the grid like any other) for a live child that
+/// asked for the mouse, and writes it.
+fn forward_to_child(
+    app: &App,
+    group: usize,
+    kind: MouseEventKind,
+    mods: KeyModifiers,
+    (col, row): (u16, u16),
+) {
+    let Some(tab) = app.panes.group_tab(group).filter(|t| t.is_alive()) else {
         return;
     };
-    let Some((gc, line)) = app.regions.clamp_to_terminal(col, row) else {
+    let Some((gc, line)) = app.regions.clamp_to_grid(group, col, row) else {
         return;
     };
     let mode = tab.mode();
@@ -675,7 +776,7 @@ async fn handle_key(
 
     // A focused, live terminal takes everything else verbatim.
     if app.focus == Focus::Terminal {
-        match app.terminal.as_ref().filter(|t| t.is_alive()) {
+        match app.panes.active_tab().filter(|t| t.is_alive()) {
             Some(tab) => {
                 if let KeyRoute::Passthrough(bytes) = keys::route(&key, tab.mode()) {
                     tab.write_input(bytes);
@@ -751,7 +852,7 @@ async fn handle_key(
     // the action menu / row-colour pickers / terminal tabs.
     match code {
         KeyCode::Char('q') => {
-            if app.terminal.as_ref().is_some_and(TerminalTab::is_alive) {
+            if app.panes.any_alive() {
                 app.quit_confirm = true;
             } else {
                 return true;
@@ -762,7 +863,7 @@ async fn handle_key(
         KeyCode::Esc => {
             if !app.tree.marked.is_empty() {
                 app.tree.clear_marks();
-            } else if app.terminal.as_ref().is_some_and(TerminalTab::is_alive) {
+            } else if app.panes.any_alive() {
                 app.quit_confirm = true;
             } else {
                 return true;
@@ -781,7 +882,7 @@ async fn handle_key(
                 app.tree.toggle_mark(path);
             }
         }
-        KeyCode::Enter => open_tab_for_cursor(app, view, TabKind::Shell),
+        KeyCode::Enter => open_tab_for_cursor(app, view, TabKind::Shell, false),
         KeyCode::Char('a') => {
             let targets = app.tree.targets(view);
             let items = actions::applicable_actions(&targets)
@@ -816,24 +917,45 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
     match chrome {
         ChromeKey::FocusTree => app.focus = Focus::Tree,
         ChromeKey::FocusTerminal => {
-            if app.terminal.is_some() {
-                app.focus = Focus::Terminal;
-            } else {
+            if app.panes.is_empty() {
                 app.notice = Some("no terminal tab — enter or alt-t opens one".to_string());
+            } else {
+                app.focus = Focus::Terminal;
             }
         }
-        ChromeKey::NewShellTab => open_tab_for_cursor(app, view, TabKind::Shell),
-        ChromeKey::NewClaudeTab => open_tab_for_cursor(app, view, TabKind::Claude),
+        ChromeKey::NewShellTab => open_tab_for_cursor(app, view, TabKind::Shell, false),
+        ChromeKey::NewClaudeTab => open_tab_for_cursor(app, view, TabKind::Claude, false),
+        ChromeKey::SplitShellTab => open_tab_for_cursor(app, view, TabKind::Shell, true),
         ChromeKey::CloseTab => app.close_tab(),
+        ChromeKey::NextTab => app.panes.cycle_tab(1),
+        ChromeKey::PrevTab => app.panes.cycle_tab(-1),
+        ChromeKey::SelectTab(index) => {
+            if !app.panes.select_tab(index) {
+                app.notice = Some(format!("no tab {}", index + 1));
+            }
+        }
+        ChromeKey::NextGroup => app.panes.cycle_group(1),
+        ChromeKey::PrevGroup => app.panes.cycle_group(-1),
+        ChromeKey::MoveTabDown => {
+            if !app.panes.move_tab_to_group(1) {
+                app.notice = Some("no group below to move this tab to".to_string());
+            }
+        }
+        ChromeKey::MoveTabUp => {
+            if !app.panes.move_tab_to_group(-1) {
+                app.notice = Some("no group above to move this tab to".to_string());
+            }
+        }
+        ChromeKey::ResetLayout => app.panes.reset_weights(),
         ChromeKey::Copy => {
             let text = app
-                .terminal
-                .as_ref()
+                .panes
+                .active_tab()
                 .and_then(TerminalTab::selection_to_string);
             app.notice = Some(match text {
                 Some(text) if clipboard::copy_text(&text).is_ok() => {
                     // Copying consumes the selection, as in tmux/screen.
-                    if let Some(tab) = &app.terminal {
+                    if let Some(tab) = app.panes.active_tab() {
                         tab.clear_selection();
                     }
                     "copied".to_string()
@@ -843,26 +965,35 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
             });
         }
         ChromeKey::ScrollPageUp => {
-            if let Some(tab) = &app.terminal {
+            if let Some(tab) = app.panes.active_tab() {
                 tab.scroll(Scroll::PageUp);
             }
         }
         ChromeKey::ScrollPageDown => {
-            if let Some(tab) = &app.terminal {
+            if let Some(tab) = app.panes.active_tab() {
                 tab.scroll(Scroll::PageDown);
             }
         }
     }
 }
 
-/// Opens (or focuses) a `kind` tab in the cursor worktree. The initial size
-/// is a placeholder — the first `draw` resizes the emulator to the real
-/// pane before its grid is ever read.
-fn open_tab_for_cursor(app: &mut App, view: &WorktreesViewModel, kind: TabKind) {
+/// Opens (or focuses) a `kind` tab in the cursor worktree, in a new group
+/// below when `split`. The initial size is a placeholder — the first `draw`
+/// resizes the emulator to the real pane before its grid is ever read.
+fn open_tab_for_cursor(app: &mut App, view: &WorktreesViewModel, kind: TabKind, split: bool) {
     let Some(worktree) = app.cursor_worktree(view) else {
         app.notice = Some("no row selected".to_string());
         return;
     };
+    // Refuse a split that could not be drawn rather than silently dropping
+    // the new group off the bottom of the pane.
+    if split {
+        let height = app.terminal_area.map_or(0, |a| a.height);
+        if height < panes::min_height_for(app.panes.group_count() + 1) {
+            app.notice = Some("not enough height to split — close a group first".to_string());
+            return;
+        }
+    }
     app.open_tab(
         kind,
         worktree,
@@ -870,6 +1001,7 @@ fn open_tab_for_cursor(app: &mut App, view: &WorktreesViewModel, kind: TabKind) 
             cols: 80,
             lines: 24,
         },
+        split,
     );
 }
 
@@ -1160,13 +1292,13 @@ mod tests {
             menu: None,
             relocate: None,
             focus: Focus::Tree,
-            terminal: None,
-            next_tab_id: 1,
+            panes: panes::PaneLayout::default(),
             quit_confirm: false,
             notice: None,
             pty_tx,
             commands,
             regions: RegionMap::default(),
+            terminal_area: None,
             drag: DragOrigin::None,
             clicks: mouse::ClickTracker::default(),
         };
@@ -1179,6 +1311,47 @@ mod tests {
 
     fn alt(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn alt_key(code: KeyCode, extra: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT | extra)
+    }
+
+    /// Installs an already-spawned tab as the app's only tab — the pane
+    /// stack's equivalent of Phase 3's `app.terminal = Some(tab)`.
+    #[cfg(unix)]
+    fn install_tab(app: &mut App, tab: TerminalTab) {
+        app.panes
+            .open_tab(move |_| Ok(tab))
+            .expect("installing a prebuilt tab cannot fail");
+    }
+
+    /// The first rendered group's grid rect.
+    fn grid_rect(app: &App) -> Rect {
+        app.regions
+            .groups
+            .first()
+            .map(|g| g.grid)
+            .expect("a terminal region")
+    }
+
+    /// The app's single active tab, for assertions.
+    fn only_tab(app: &App) -> &TerminalTab {
+        app.panes.active_tab().expect("a tab")
+    }
+
+    fn only_tab_mut(app: &mut App) -> Option<&mut TerminalTab> {
+        let focused = app.panes.focused;
+        app.panes.groups.get_mut(focused)?.active_tab_mut()
+    }
+
+    /// Shuts every tab down, so a test's children never outlive it.
+    fn shutdown_all(app: &mut App) {
+        for group in &mut app.panes.groups {
+            for tab in &mut group.tabs {
+                tab.shutdown();
+            }
+        }
     }
 
     fn mouse_at(kind: MouseEventKind, col: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
@@ -1433,7 +1606,7 @@ mod tests {
             extra_env: Vec::new(),
         };
         let tab = TerminalTab::from_request(TabKind::Shell, request, app.pty_tx.clone()).unwrap();
-        app.terminal = Some(tab);
+        install_tab(&mut app, tab);
         app.focus = Focus::Terminal;
 
         // Keys go to the child, Esc included; chords are still chrome.
@@ -1448,7 +1621,9 @@ mod tests {
         app.forward_focus(false);
         app.forward_focus(true);
 
-        // Opening the same worktree again just focuses; another is refused.
+        // Opening the same worktree again focuses the tab it already has
+        // rather than opening a duplicate (Phase 4b: a second worktree now
+        // opens a second tab instead of being refused).
         app.focus = Focus::Tree;
         app.open_tab(
             TabKind::Shell,
@@ -1457,17 +1632,10 @@ mod tests {
                 cols: 80,
                 lines: 24,
             },
+            false,
         );
         assert_eq!(app.focus, Focus::Terminal);
-        app.open_tab(
-            TabKind::Shell,
-            PathBuf::from("/repo/other"),
-            GridSize {
-                cols: 80,
-                lines: 24,
-            },
-        );
-        assert!(app.notice.as_deref().unwrap_or("").contains("one tab"));
+        assert_eq!(app.panes.groups[0].tabs.len(), 1, "no duplicate tab");
 
         // Drawing lays out both panes, resizes the emulator to the pane, and
         // shows the quit confirm when `q` is pressed with a live child.
@@ -1496,16 +1664,16 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("terminal exited"));
-        app.terminal.as_mut().unwrap().exit_status = None; // pretend it is still live
+        only_tab_mut(&mut app).unwrap().exit_status = None; // pretend it is still live
         handle_key(&mut app, &view, &dispatcher, alt('w')).await;
-        assert!(app.terminal.is_none());
+        assert!(app.panes.is_empty());
         assert_eq!(app.focus, Focus::Tree);
         assert!(matches!(commands.try_recv(), Ok(HubCommand::ClearOpenTab(p)) if p == here));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_tab_for_cursor_spawns_and_reports_here_then_replaces_an_exited_tab() {
+    async fn open_tab_for_cursor_spawns_and_reports_here_beside_an_exited_tab() {
         let (mut app, _dispatcher, mut commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path().to_path_buf();
@@ -1527,20 +1695,17 @@ mod tests {
         let mut tab =
             TerminalTab::from_request(TabKind::Shell, request, app.pty_tx.clone()).unwrap();
         tab.exit_status = Some(std::process::ExitStatus::default());
-        app.terminal = Some(tab);
+        install_tab(&mut app, tab);
 
         // A missing cursor row is a notice, not a spawn.
         let empty = WorktreesViewModel::default();
-        open_tab_for_cursor(&mut app, &empty, TabKind::Shell);
+        open_tab_for_cursor(&mut app, &empty, TabKind::Shell, false);
         assert_eq!(app.notice.as_deref(), Some("no row selected"));
 
-        // With a row: the exited tab is closed (ClearOpenTab) and the user's
-        // shell is spawned in its place (SetOpenTab).
-        open_tab_for_cursor(&mut app, &view, TabKind::Shell);
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(HubCommand::ClearOpenTab(_))
-        ));
+        // With a row: an exited tab is not reused (it keeps its grid and
+        // exit status on screen until closed), so the user's shell is
+        // spawned as a second tab beside it and reported open.
+        open_tab_for_cursor(&mut app, &view, TabKind::Shell, false);
         match commands.try_recv() {
             Ok(HubCommand::SetOpenTab(p)) => assert_eq!(p, here),
             other => {
@@ -1552,9 +1717,7 @@ mod tests {
                 );
             }
         }
-        if let Some(tab) = app.terminal.as_mut() {
-            tab.shutdown();
-        }
+        shutdown_all(&mut app);
     }
 
     #[tokio::test]
@@ -1694,10 +1857,10 @@ mod tests {
         // Either the login shell spawned (and took focus) or, on a minimal
         // image, the failure is reported — never silence.
         assert!(
-            app.terminal.is_some() || app.notice.is_some(),
+            !app.panes.is_empty() || app.notice.is_some(),
             "double-click neither opened a tab nor reported a failure"
         );
-        if app.terminal.is_some() {
+        if !app.panes.is_empty() {
             assert_eq!(app.focus, Focus::Terminal);
         }
         app.close_tab();
@@ -1709,25 +1872,20 @@ mod tests {
         let (mut app, _dispatcher, _commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let view = view_with(&[&dir.path().to_string_lossy()]);
-        app.terminal = Some(scripted_tab(
+        let tab = scripted_tab(
             &app,
             "printf 'hello world\\nsecond line\\n'; sleep 3",
             dir.path().to_path_buf(),
-        ));
+        );
+        install_tab(&mut app, tab);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         draw_into(&mut terminal, &view, &mut app);
-        let grid = app.regions.terminal.expect("a terminal region");
+        let grid = grid_rect(&app);
         assert!(
-            wait_until(|| app
-                .terminal
-                .as_ref()
-                .unwrap()
-                .selection_to_string()
-                .is_none()
-                && {
-                    draw_into(&mut terminal, &view, &mut app);
-                    buffer_text(&terminal).contains("second line")
-                })
+            wait_until(|| only_tab(&app).selection_to_string().is_none() && {
+                draw_into(&mut terminal, &view, &mut app);
+                buffer_text(&terminal).contains("second line")
+            })
             .await,
             "the child's output never rendered"
         );
@@ -1743,7 +1901,7 @@ mod tests {
             at(MouseEventKind::Down(MouseButton::Left), 0, 0)
         ));
         assert_eq!(app.focus, Focus::Terminal);
-        assert_eq!(app.drag, DragOrigin::Terminal);
+        assert_eq!(app.drag, DragOrigin::Terminal { group: 0 });
         assert!(handle_mouse(
             &mut app,
             &view,
@@ -1756,11 +1914,7 @@ mod tests {
         ));
         assert_eq!(app.drag, DragOrigin::None);
         assert_eq!(
-            app.terminal
-                .as_ref()
-                .unwrap()
-                .selection_to_string()
-                .as_deref(),
+            only_tab(&app).selection_to_string().as_deref(),
             Some("hello")
         );
         assert!(handle_mouse(
@@ -1778,12 +1932,7 @@ mod tests {
             &view,
             mouse_at(MouseEventKind::Drag(MouseButton::Left), 500, 500, none)
         ));
-        let clamped = app
-            .terminal
-            .as_ref()
-            .unwrap()
-            .selection_to_string()
-            .unwrap();
+        let clamped = only_tab(&app).selection_to_string().unwrap();
         assert!(clamped.starts_with("second line"), "got {clamped:?}");
         handle_mouse(
             &mut app,
@@ -1801,11 +1950,7 @@ mod tests {
         );
         handle_mouse(&mut app, &view, dbl);
         assert_eq!(
-            app.terminal
-                .as_ref()
-                .unwrap()
-                .selection_to_string()
-                .as_deref(),
+            only_tab(&app).selection_to_string().as_deref(),
             Some("world")
         );
         handle_mouse(
@@ -1815,7 +1960,7 @@ mod tests {
         );
         handle_mouse(&mut app, &view, dbl);
         // A line selection's text carries the line's own trailing newline.
-        let line = app.terminal.as_ref().unwrap().selection_to_string();
+        let line = only_tab(&app).selection_to_string();
         assert_eq!(line.as_deref().map(str::trim_end), Some("hello world"));
         handle_mouse(
             &mut app,
@@ -1826,12 +1971,7 @@ mod tests {
                                                    // alt-c copies (OSC 52 fallback in CI) and consumes the selection.
         handle_chrome_key(&mut app, &view, ChromeKey::Copy);
         assert_eq!(app.notice.as_deref(), Some("copied"));
-        assert!(app
-            .terminal
-            .as_ref()
-            .unwrap()
-            .selection_to_string()
-            .is_none());
+        assert!(only_tab(&app).selection_to_string().is_none());
 
         // The wheel scrolls the emulator's history (no child mouse mode, not
         // the alt screen); a middle click neither pastes nor selects.
@@ -1874,18 +2014,13 @@ mod tests {
         // TUI sends (exactly one SGR press) in a form the grid can show.
         let script = "stty -echo -icanon min 1 time 0; printf '\\033[?1000h\\033[?1006h'; \
                       dd bs=1 count=9 2>/dev/null | od -An -c; sleep 2";
-        app.terminal = Some(scripted_tab(&app, script, dir.path().to_path_buf()));
+        let tab = scripted_tab(&app, script, dir.path().to_path_buf());
+        install_tab(&mut app, tab);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         draw_into(&mut terminal, &view, &mut app);
-        let grid = app.regions.terminal.expect("a terminal region");
+        let grid = grid_rect(&app);
         assert!(
-            wait_until(|| app
-                .terminal
-                .as_ref()
-                .unwrap()
-                .mode()
-                .contains(TermMode::SGR_MOUSE))
-            .await,
+            wait_until(|| only_tab(&app).mode().contains(TermMode::SGR_MOUSE)).await,
             "the child never enabled mouse reporting"
         );
         let none = KeyModifiers::NONE;
@@ -1901,7 +2036,7 @@ mod tests {
                 KeyModifiers::ALT
             )
         ));
-        assert_eq!(app.drag, DragOrigin::Terminal);
+        assert_eq!(app.drag, DragOrigin::Terminal { group: 0 });
         handle_mouse(
             &mut app,
             &view,
@@ -1925,7 +2060,7 @@ mod tests {
                 none
             )
         ));
-        assert_eq!(app.drag, DragOrigin::Child);
+        assert_eq!(app.drag, DragOrigin::Child { group: 0 });
         assert!(!handle_mouse(
             &mut app,
             &view,
@@ -1964,6 +2099,225 @@ mod tests {
             mouse_at(MouseEventKind::ScrollUp, grid.x, grid.y, none)
         ));
         app.close_tab();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_chords_split_cycle_select_move_and_reset_the_stack() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy(), "/repo/other"]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        // Seed one tab, then draw so a terminal area exists for splits.
+        let tab = scripted_tab(&app, "sleep 5", here.clone());
+        install_tab(&mut app, tab);
+        draw_into(&mut terminal, &view, &mut app);
+        assert_eq!(app.panes.group_count(), 1);
+
+        // alt-s splits into a second group; alt-↑/↓ move focus between them.
+        app.tree.cursor = 1;
+        handle_key(&mut app, &view, &dispatcher, alt('s')).await;
+        assert_eq!(app.panes.group_count(), 2, "alt-s split the stack");
+        assert_eq!(app.panes.focused, 1);
+        draw_into(&mut terminal, &view, &mut app);
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            alt_key(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.panes.focused, 0);
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            alt_key(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.panes.focused, 1);
+
+        // alt-⇧↑ moves the tab into the group above, emptying its own.
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            alt_key(KeyCode::Up, KeyModifiers::SHIFT),
+        )
+        .await;
+        assert_eq!(app.panes.group_count(), 1);
+        assert_eq!(app.panes.groups[0].tabs.len(), 2);
+        // With one group there is nowhere to move to, and it says so.
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            alt_key(KeyCode::Down, KeyModifiers::SHIFT),
+        )
+        .await;
+        assert!(app.notice.as_deref().unwrap_or("").contains("no group"));
+
+        // alt-[ / alt-] cycle tabs, alt-1..9 select, out of range notices.
+        assert_eq!(app.panes.groups[0].active, 1);
+        handle_key(&mut app, &view, &dispatcher, alt(']')).await;
+        assert_eq!(app.panes.groups[0].active, 0, "wraps");
+        handle_key(&mut app, &view, &dispatcher, alt('[')).await;
+        assert_eq!(app.panes.groups[0].active, 1);
+        handle_key(&mut app, &view, &dispatcher, alt('1')).await;
+        assert_eq!(app.panes.groups[0].active, 0);
+        handle_key(&mut app, &view, &dispatcher, alt('9')).await;
+        assert!(app.notice.as_deref().unwrap_or("").contains("no tab 9"));
+
+        // alt-0 resets the weights.
+        app.panes.weights = vec![7];
+        handle_key(&mut app, &view, &dispatcher, alt('0')).await;
+        assert_eq!(app.panes.weights, vec![1]);
+
+        // Both tabs are on one worktree, so the cue only clears at the last
+        // close — the ref-counted `here` rule.
+        while let Ok(cmd) = commands.try_recv() {
+            drop(cmd); // discard the opens
+        }
+        handle_key(&mut app, &view, &dispatcher, alt('w')).await;
+        assert!(app.panes.any_alive(), "one tab left");
+        assert!(
+            commands.try_recv().is_err(),
+            "the cue stays while a tab remains"
+        );
+        handle_key(&mut app, &view, &dispatcher, alt('w')).await;
+        assert!(app.panes.is_empty());
+        assert!(matches!(commands.try_recv(), Ok(HubCommand::ClearOpenTab(p)) if p == here));
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_split_is_refused_when_the_pane_is_too_short_to_draw_it() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy()]);
+        let tab = scripted_tab(&app, "sleep 5", here);
+        install_tab(&mut app, tab);
+        // Six rows of terminal cannot hold two four-row groups.
+        let mut terminal = Terminal::new(TestBackend::new(100, 7)).unwrap();
+        draw_into(&mut terminal, &view, &mut app);
+        app.tree.cursor = 1;
+        handle_key(&mut app, &view, &dispatcher, alt('s')).await;
+        assert_eq!(app.panes.group_count(), 1, "the split was refused");
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("not enough height"));
+        app.close_tab();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_tab_strip_activates_closes_and_the_splitter_resizes() {
+        let (mut app, _dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy()]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        // Two tabs in one group, then a second group below.
+        for _ in 0..2 {
+            let tab = scripted_tab(&app, "sleep 5", here.clone());
+            install_tab(&mut app, tab);
+        }
+        let tab = scripted_tab(&app, "sleep 5", here);
+        app.panes.split(move |_| Ok(tab)).unwrap();
+        draw_into(&mut terminal, &view, &mut app);
+        assert_eq!(app.regions.groups.len(), 2);
+        assert_eq!(app.regions.splitters.len(), 1);
+
+        // Clicking tab 1 on the first strip activates it and focuses group 0.
+        let strip = app.regions.groups[0].strip;
+        let spans = app.regions.groups[0].tab_spans.clone();
+        assert_eq!(spans.len(), 2, "two tabs on the strip");
+        let none = KeyModifiers::NONE;
+        assert!(handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                spans[0].0,
+                strip.y,
+                none
+            )
+        ));
+        assert_eq!(app.panes.focused, 0);
+        assert_eq!(app.panes.groups[0].active, 0);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        // The wheel over a strip cycles that group's tabs.
+        assert!(handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(MouseEventKind::ScrollDown, spans[0].0, strip.y, none)
+        ));
+        assert_eq!(app.panes.groups[0].active, 1);
+
+        // Dragging the splitter up shrinks the first group; only the pair
+        // either side changes, and it never goes below the minimum.
+        let splitter = app.regions.splitters[0];
+        let before = app.panes.weights.clone();
+        // Pressing on a splitter changes nothing visible — it only arms the
+        // drag — so it asks for no redraw.
+        assert!(!handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 60, splitter, none)
+        ));
+        assert_eq!(app.drag, DragOrigin::Splitter { index: 0 });
+        assert!(handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                60,
+                splitter - 4,
+                none
+            )
+        ));
+        assert_ne!(app.panes.weights, before, "the drag moved the boundary");
+        draw_into(&mut terminal, &view, &mut app);
+        let rects = app.panes.arrange(app.terminal_area.unwrap());
+        assert!(rects.iter().all(|r| r.body.height >= 3));
+        handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                60,
+                splitter - 4,
+                none,
+            ),
+        );
+        assert_eq!(app.drag, DragOrigin::None);
+
+        // A middle click on a tab closes just that tab.
+        draw_into(&mut terminal, &view, &mut app);
+        let spans = app.regions.groups[0].tab_spans.clone();
+        let strip_y = app.regions.groups[0].strip.y;
+        let before = app.panes.groups[0].tabs.len();
+        assert!(handle_mouse(
+            &mut app,
+            &view,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Middle),
+                spans[0].0,
+                strip_y,
+                none
+            )
+        ));
+        assert_eq!(app.panes.groups[0].tabs.len(), before - 1);
+
+        shutdown_all(&mut app);
     }
 
     #[test]

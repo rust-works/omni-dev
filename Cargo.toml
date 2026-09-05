@@ -63,6 +63,12 @@ arboard = "3.6.1"
 # 1.88 MSRV declared above). Apache-2.0 — the crate's first Apache-2.0 core
 # dependency, noted at review.
 alacritty_terminal = "0.26"
+# Display-width maths for `omni-dev worktrees ui`'s tab strip and tree
+# columns (issue #1585 Phase 4): already in the tree transitively via
+# ratatui, promoted to a direct dependency now that our own code computes
+# cell widths — a tab strip's hit-test spans must agree with the widths
+# ratatui rendered at, so both sides call the same crate.
+unicode-width = "0.2"
 url = "2.5.8"
 base64 = "0.23"
 futures = "0.3"
