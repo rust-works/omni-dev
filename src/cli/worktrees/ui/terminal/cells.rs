@@ -156,6 +156,59 @@ mod tests {
     }
 
     #[test]
+    fn every_named_color_maps_and_defaults_map_to_reset() {
+        let colors = Colors::default();
+        let cases: &[(NamedColor, Color)] = &[
+            (NamedColor::Black, Color::Black),
+            (NamedColor::Green, Color::Green),
+            (NamedColor::Yellow, Color::Yellow),
+            (NamedColor::Blue, Color::Blue),
+            (NamedColor::Magenta, Color::Magenta),
+            (NamedColor::Cyan, Color::Cyan),
+            (NamedColor::White, Color::Gray),
+            (NamedColor::BrightBlack, Color::DarkGray),
+            (NamedColor::BrightRed, Color::LightRed),
+            (NamedColor::BrightGreen, Color::LightGreen),
+            (NamedColor::BrightYellow, Color::LightYellow),
+            (NamedColor::BrightMagenta, Color::LightMagenta),
+            (NamedColor::BrightCyan, Color::LightCyan),
+            (NamedColor::BrightWhite, Color::White),
+            (NamedColor::DimBlack, Color::Black),
+            (NamedColor::DimRed, Color::Red),
+            (NamedColor::DimYellow, Color::Yellow),
+            (NamedColor::DimBlue, Color::Blue),
+            (NamedColor::DimMagenta, Color::Magenta),
+            (NamedColor::DimCyan, Color::Cyan),
+            (NamedColor::DimWhite, Color::Gray),
+            (NamedColor::Foreground, Color::Reset),
+            (NamedColor::Background, Color::Reset),
+            (NamedColor::Cursor, Color::Reset),
+            (NamedColor::BrightForeground, Color::Reset),
+            (NamedColor::DimForeground, Color::Reset),
+        ];
+        for (named, expected) in cases {
+            assert_eq!(
+                to_ratatui(AnsiColor::Named(*named), &colors),
+                *expected,
+                "{named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dim_strikeout_and_hidden_flags_become_modifiers() {
+        let cell = Cell {
+            flags: Flags::DIM | Flags::STRIKEOUT | Flags::HIDDEN,
+            ..Default::default()
+        };
+        let style = cell_style(&cell, &Colors::default());
+        assert!(style.add_modifier.contains(Modifier::DIM));
+        assert!(style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(style.add_modifier.contains(Modifier::HIDDEN));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn attribute_flags_become_modifiers() {
         let cell = Cell {
             flags: Flags::BOLD | Flags::ITALIC | Flags::UNDERCURL | Flags::INVERSE,

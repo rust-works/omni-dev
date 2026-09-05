@@ -868,6 +868,417 @@ fn advance_relocate(app: &mut App, view: &WorktreesViewModel, dispatcher: &Dispa
 mod tests {
     use super::*;
 
+    use crossterm::event::KeyModifiers;
+    use ratatui::backend::TestBackend;
+
+    use super::super::client::WorktreesClient;
+    use super::super::view_model::{RepoRow, WorktreeRow};
+
+    fn view_with(paths: &[&str]) -> WorktreesViewModel {
+        let worktrees = paths
+            .iter()
+            .map(|p| WorktreeRow {
+                path: PathBuf::from(p),
+                branch: Some("main".to_string()),
+                head_sha: None,
+                upstream_sha: None,
+                is_main: false,
+                open: false,
+                window_key: None,
+                pr: None,
+                pr_none: false,
+                operation: None,
+                rebasing: false,
+                pushing: false,
+                ahead_behind: super::super::view_model::AheadBehindState::Unknown,
+                sessions: Vec::new(),
+                row_color: None,
+                here: false,
+            })
+            .collect();
+        WorktreesViewModel {
+            repos: vec![RepoRow {
+                main_repo: "repo".to_string(),
+                github: None,
+                root: PathBuf::from("/repo"),
+                polling_enabled: false,
+                row_color: None,
+                worktrees,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// An app wired to a nonexistent daemon socket (no action here reaches
+    /// it) with the hub-command receiver returned for assertions.
+    fn test_app() -> (App, Dispatcher, mpsc::UnboundedReceiver<HubCommand>) {
+        let (commands, commands_rx) = mpsc::unbounded_channel();
+        let (pty_tx, _pty_rx) = mpsc::unbounded_channel();
+        let dispatcher = Dispatcher::new(
+            WorktreesClient::new("/tmp/nonexistent-omni-dev-app-test.sock"),
+            commands.clone(),
+        );
+        let app = App {
+            tree: TreeState::default(),
+            flow: ActionFlow::Idle,
+            menu: None,
+            relocate: None,
+            focus: Focus::Tree,
+            terminal: None,
+            next_tab_id: 1,
+            quit_confirm: false,
+            notice: None,
+            pty_tx,
+            commands,
+        };
+        (app, dispatcher, commands_rx)
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tree_keys_move_mark_open_menus_and_quit() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let view = view_with(&["/repo/a", "/repo/b"]);
+
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('j'))).await);
+        assert_eq!(app.tree.cursor, 1);
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('k'))).await);
+        assert_eq!(app.tree.cursor, 0);
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Down)).await);
+
+        // Space marks the cursor row; Esc clears marks before it quits.
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char(' '))).await);
+        assert_eq!(app.tree.marked.len(), 1);
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await);
+        assert!(app.tree.marked.is_empty());
+        assert!(handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await);
+        assert!(handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('q'))).await);
+
+        // The action menu opens on `a`, navigates, and closes on Esc.
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('a'))).await);
+        assert!(app.menu.is_some());
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Down)).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('k'))).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
+        assert!(app.menu.is_none());
+
+        // The colour picker dispatches a local SetRowColor through the hub.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('c'))).await;
+        assert!(app.menu.is_some());
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        assert!(matches!(app.flow, ActionFlow::Done { .. }));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::SetRowColor(..))
+        ));
+        assert!(status_hint(&app).starts_with("Set colour"));
+        // Any key dismisses the outcome.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('x'))).await;
+        assert_eq!(app.flow, ActionFlow::Idle);
+
+        // `C` clears directly, no popup.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('C'))).await;
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::ClearRowColor(_))
+        ));
+        assert!(matches!(app.flow, ActionFlow::Done { .. }));
+        app.flow = ActionFlow::Idle;
+
+        // An unknown key is ignored.
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::F(9))).await);
+    }
+
+    #[tokio::test]
+    async fn an_action_that_needs_the_daemon_fails_visibly_when_it_is_down() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1; // the worktree row, not the repo header
+                             // Open the menu and pick "Close Window" (ProceedWithoutConfirm, one
+                             // daemon call) — the socket does not exist, so the batch reports it.
+        let targets = app.tree.targets(&view);
+        run_action(&mut app, &dispatcher, ActionKind::CloseWindow, targets).await;
+        match &app.flow {
+            ActionFlow::Done {
+                outcome: actions::ActionOutcome::BatchDone { results },
+            } => assert!(results.iter().all(|(_, r)| r.is_err())),
+            other => panic!("unexpected flow: {other:?}"),
+        }
+        assert!(status_hint(&app).contains("failed"));
+
+        // A two-phase check against a dead daemon is refused, not confirmed.
+        let targets = app.tree.targets(&view);
+        run_action(&mut app, &dispatcher, ActionKind::CloseWorktree, targets).await;
+        assert!(matches!(app.flow, ActionFlow::Failed { .. }));
+        assert!(status_hint(&app).starts_with("failed:"));
+
+        // A confirm that arrives is answered by y/n.
+        app.flow = ActionFlow::AwaitingConfirm {
+            action: ActionKind::CloseWorktree,
+            targets: Vec::new(),
+            prompt: actions::ConfirmPrompt::default(),
+        };
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('n'))).await;
+        assert_eq!(app.flow, ActionFlow::Idle);
+        app.flow = ActionFlow::AwaitingConfirm {
+            action: ActionKind::CloseWorktree,
+            targets: Vec::new(),
+            prompt: actions::ConfirmPrompt::default(),
+        };
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('y'))).await;
+        assert!(matches!(app.flow, ActionFlow::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn chrome_chords_without_a_terminal_leave_notices() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        handle_key(&mut app, &view, &dispatcher, alt('l')).await;
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("no terminal tab"));
+        handle_key(&mut app, &view, &dispatcher, alt('c')).await;
+        assert_eq!(app.notice.as_deref(), Some("nothing selected"));
+        handle_key(&mut app, &view, &dispatcher, alt('w')).await; // no tab: no-op
+        assert_eq!(app.focus, Focus::Tree);
+        handle_key(&mut app, &view, &dispatcher, alt('e')).await;
+        assert_eq!(app.focus, Focus::Tree);
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+        )
+        .await;
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT),
+        )
+        .await;
+        // A stray PTY event for a tab that no longer exists is ignored.
+        assert!(!app.handle_pty_event(99, TermEvent::Wakeup));
+        app.forward_focus(true); // no terminal: no-op
+    }
+
+    #[tokio::test]
+    async fn relocate_wizard_fails_cleanly_without_sessions_and_cancels() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let view = view_with(&[&path, "/repo/other"]);
+
+        // No Claude sessions exist for a fresh temp dir.
+        start_relocate_flow(&mut app, &view, RelocationMode::Move);
+        assert!(matches!(app.flow, ActionFlow::Failed { .. }));
+        app.flow = ActionFlow::Idle;
+
+        // Navigating and cancelling each picker step.
+        let session = actions::relocate_types::SessionInfo {
+            id: "s1".to_string(),
+            jsonl_path: dir.path().join("s1.jsonl"),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            has_sidecar: false,
+        };
+        app.relocate = Some(RelocateStep::PickSession {
+            mode: RelocationMode::Copy,
+            source_worktree: dir.path().to_path_buf(),
+            source_dir: dir.path().to_path_buf(),
+            sessions: vec![session.clone(), session.clone()],
+            selected: 0,
+        });
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Down)).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Up)).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Enter)).await;
+        assert!(matches!(
+            app.relocate,
+            Some(RelocateStep::PickDestination { .. })
+        ));
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('j'))).await;
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('n'))).await; // no-op here
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
+        assert!(app.relocate.is_none());
+
+        // The confirm step can be declined.
+        app.relocate = Some(RelocateStep::Confirm {
+            mode: RelocationMode::Copy,
+            source_dir: dir.path().to_path_buf(),
+            session,
+            dest_worktree: PathBuf::from("/repo/other"),
+            prompt: actions::ConfirmPrompt::default(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &view, &mut app)).unwrap();
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('n'))).await;
+        assert!(app.relocate.is_none());
+        assert_eq!(clamp_selection(5, 1, 0), 0);
+        assert!(relative_mtime(std::time::SystemTime::now()).ends_with("ago"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_tab_takes_focus_keys_and_closes_cleanly() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy(), "/repo/other"]);
+
+        // Inject a scripted shell as the tab, exactly as open_tab would.
+        let request = super::super::terminal::pty::SpawnRequest {
+            tab: 1,
+            program: Some((
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "sleep 5".to_string()],
+            )),
+            cwd: here.clone(),
+            size: GridSize { cols: 40, lines: 6 },
+            extra_env: Vec::new(),
+        };
+        let tab = TerminalTab::from_request(TabKind::Shell, request, app.pty_tx.clone()).unwrap();
+        app.terminal = Some(tab);
+        app.focus = Focus::Terminal;
+
+        // Keys go to the child, Esc included; chords are still chrome.
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('x'))).await);
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await);
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::CapsLock)).await);
+        handle_key(&mut app, &view, &dispatcher, alt('e')).await;
+        assert_eq!(app.focus, Focus::Tree);
+        handle_key(&mut app, &view, &dispatcher, alt('l')).await;
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(status_hint(&app).contains("alt-e tree"));
+        app.forward_focus(false);
+        app.forward_focus(true);
+
+        // Opening the same worktree again just focuses; another is refused.
+        app.focus = Focus::Tree;
+        app.open_tab(
+            TabKind::Shell,
+            here.clone(),
+            GridSize {
+                cols: 80,
+                lines: 24,
+            },
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        app.open_tab(
+            TabKind::Shell,
+            PathBuf::from("/repo/other"),
+            GridSize {
+                cols: 80,
+                lines: 24,
+            },
+        );
+        assert!(app.notice.as_deref().unwrap_or("").contains("one tab"));
+
+        // Drawing lays out both panes, resizes the emulator to the pane, and
+        // shows the quit confirm when `q` is pressed with a live child.
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &view, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("WORKTREES"));
+        app.focus = Focus::Tree;
+        assert!(!handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('q'))).await);
+        assert!(app.quit_confirm);
+        terminal.draw(|frame| draw(frame, &view, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Quit?"));
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('n'))).await;
+        assert!(!app.quit_confirm);
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Esc)).await;
+        assert!(app.quit_confirm);
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('x'))).await; // ignored
+        assert!(handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('y'))).await);
+        app.quit_confirm = false;
+
+        // Live PTY events flow through the tab; then alt-w closes it.
+        assert!(app.handle_pty_event(1, TermEvent::Wakeup));
+        assert!(!app.handle_pty_event(1, TermEvent::Bell));
+        assert!(app.handle_pty_event(1, TermEvent::ChildExit(std::process::ExitStatus::default())));
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("terminal exited"));
+        app.terminal.as_mut().unwrap().exit_status = None; // pretend it is still live
+        handle_key(&mut app, &view, &dispatcher, alt('w')).await;
+        assert!(app.terminal.is_none());
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(matches!(commands.try_recv(), Ok(HubCommand::ClearOpenTab(p)) if p == here));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_tab_for_cursor_spawns_and_reports_here_then_replaces_an_exited_tab() {
+        let (mut app, _dispatcher, mut commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy()]);
+        app.tree.cursor = 1; // the worktree row, not the repo header
+
+        // Route the real spawn through a scripted child by pre-seeding an
+        // exited tab: open_tab must close it and spawn afresh.
+        let request = super::super::terminal::pty::SpawnRequest {
+            tab: 1,
+            program: Some((
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "true".to_string()],
+            )),
+            cwd: here.clone(),
+            size: GridSize { cols: 40, lines: 6 },
+            extra_env: Vec::new(),
+        };
+        let mut tab =
+            TerminalTab::from_request(TabKind::Shell, request, app.pty_tx.clone()).unwrap();
+        tab.exit_status = Some(std::process::ExitStatus::default());
+        app.terminal = Some(tab);
+
+        // A missing cursor row is a notice, not a spawn.
+        let empty = WorktreesViewModel::default();
+        open_tab_for_cursor(&mut app, &empty, TabKind::Shell);
+        assert_eq!(app.notice.as_deref(), Some("no row selected"));
+
+        // With a row: the exited tab is closed (ClearOpenTab) and the user's
+        // shell is spawned in its place (SetOpenTab).
+        open_tab_for_cursor(&mut app, &view, TabKind::Shell);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::ClearOpenTab(_))
+        ));
+        match commands.try_recv() {
+            Ok(HubCommand::SetOpenTab(p)) => assert_eq!(p, here),
+            other => {
+                // Spawning the login shell can legitimately fail on a
+                // minimal CI image; then the notice carries the error.
+                assert!(
+                    app.notice.is_some(),
+                    "neither a tab nor a notice: {other:?}"
+                );
+            }
+        }
+        if let Some(tab) = app.terminal.as_mut() {
+            tab.shutdown();
+        }
+    }
+
     #[test]
     fn layout_gives_the_tree_the_full_width_until_a_tab_exists() {
         let area = Rect::new(0, 0, 100, 30);

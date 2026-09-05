@@ -344,6 +344,106 @@ mod tests {
     }
 
     #[test]
+    fn every_navigation_and_editing_key_has_a_legacy_encoding() {
+        let mode = TermMode::default();
+        let none = KeyModifiers::NONE;
+        let cases: &[(KeyCode, &[u8])] = &[
+            (KeyCode::Tab, b"\t"),
+            (KeyCode::BackTab, b"\x1b[Z"),
+            (KeyCode::Down, b"\x1b[B"),
+            (KeyCode::Right, b"\x1b[C"),
+            (KeyCode::Left, b"\x1b[D"),
+            (KeyCode::Home, b"\x1b[H"),
+            (KeyCode::End, b"\x1b[F"),
+            (KeyCode::Insert, b"\x1b[2~"),
+            (KeyCode::PageUp, b"\x1b[5~"),
+            (KeyCode::F(2), b"\x1bOQ"),
+            (KeyCode::F(6), b"\x1b[17~"),
+            (KeyCode::F(7), b"\x1b[18~"),
+            (KeyCode::F(8), b"\x1b[19~"),
+            (KeyCode::F(9), b"\x1b[20~"),
+            (KeyCode::F(10), b"\x1b[21~"),
+            (KeyCode::F(11), b"\x1b[23~"),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                encode_key(&key(*code, none), mode).as_deref(),
+                Some(*expected),
+                "{code:?}"
+            );
+        }
+        // Home/End follow application-cursor mode like the arrows do.
+        let app = mode | TermMode::APP_CURSOR;
+        assert_eq!(
+            encode_key(&key(KeyCode::Home, none), app),
+            Some(b"\x1bOH".to_vec())
+        );
+        // A modified F1–F4 takes the CSI form.
+        assert_eq!(
+            encode_key(&key(KeyCode::F(1), KeyModifiers::CONTROL), mode),
+            Some(b"\x1b[1;5P".to_vec())
+        );
+    }
+
+    #[test]
+    fn control_punctuation_maps_to_the_c0_bytes_and_alt_prefixes_enter() {
+        let mode = TermMode::default();
+        let ctrl = KeyModifiers::CONTROL;
+        let cases: &[(char, u8)] = &[
+            (' ', 0x00),
+            ('@', 0x00),
+            ('[', 0x1b),
+            ('\\', 0x1c),
+            (']', 0x1d),
+            ('^', 0x1e),
+            ('_', 0x1f),
+            ('/', 0x1f),
+            ('?', 0x7f),
+            ('A', 0x01),
+        ];
+        for (c, byte) in cases {
+            assert_eq!(
+                encode_key(&key(KeyCode::Char(*c), ctrl), mode),
+                Some(vec![*byte]),
+                "ctrl-{c}"
+            );
+        }
+        // A character with no control mapping passes through unchanged.
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('1'), ctrl), mode),
+            Some(b"1".to_vec())
+        );
+        // Alt prefixes Enter/Backspace with ESC.
+        assert_eq!(
+            encode_key(&key(KeyCode::Enter, KeyModifiers::ALT), mode),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Backspace, KeyModifiers::CONTROL), mode),
+            Some(vec![0x08])
+        );
+    }
+
+    #[test]
+    fn shift_page_down_is_a_scroll_chord() {
+        assert_eq!(
+            chrome_key(&key(KeyCode::PageDown, KeyModifiers::SHIFT)),
+            Some(ChromeKey::ScrollPageDown)
+        );
+        assert_eq!(
+            chrome_key(&key(KeyCode::PageDown, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            chrome_key(&key(
+                KeyCode::Char('t'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Some(ChromeKey::NewClaudeTab)
+        );
+    }
+
+    #[test]
     fn paste_is_bracketed_only_when_the_child_asked_for_it() {
         assert_eq!(paste_bytes("a\nb", TermMode::default()), b"a\rb".to_vec());
         assert_eq!(

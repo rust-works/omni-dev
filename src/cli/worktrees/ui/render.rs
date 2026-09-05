@@ -318,6 +318,129 @@ mod tests {
         assert_eq!(line_color(&wt), Color::Green);
     }
 
+    fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn sample_view() -> WorktreesViewModel {
+        use super::super::view_model::{GithubIdentity, RepoRow};
+        let mut open = worktree_row();
+        open.path = PathBuf::from("/repo/wt-open");
+        open.branch = Some("feature/x".to_string());
+        open.open = true;
+        open.ahead_behind = AheadBehindState::Known {
+            ahead: 2,
+            behind: 1,
+            main_behind: Some(3),
+        };
+        open.pr = Some(PrBadgeRow {
+            number: 42,
+            is_draft: true,
+            checks: PrCheckState::Pending,
+            url: String::new(),
+        });
+        let mut main = worktree_row();
+        main.path = PathBuf::from("/repo");
+        main.is_main = true;
+        main.branch = Some("main".to_string());
+        main.ahead_behind = AheadBehindState::Loading;
+        WorktreesViewModel {
+            repos: vec![RepoRow {
+                main_repo: "repo".to_string(),
+                github: Some(GithubIdentity {
+                    owner: "acme".to_string(),
+                    name: "repo".to_string(),
+                }),
+                root: PathBuf::from("/repo"),
+                polling_enabled: true,
+                row_color: Some("charts.blue".to_string()),
+                worktrees: vec![main, open],
+            }],
+            show_closed: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn draw_tree_pane_renders_rows_gutter_and_focus_border() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let view = sample_view();
+        let tree = TreeState {
+            cursor: 2,
+            marked: std::iter::once(PathBuf::from("/repo/wt-open")).collect(),
+        };
+        for focused in [true, false] {
+            let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+            terminal
+                .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &tree, focused))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("WORKTREES"));
+            assert!(text.contains("repo  (github: acme/repo)  [polling]  (charts.blue)"));
+            assert!(text.contains("feature/x  +2 -1 main-3  #42 draft"));
+            assert!(text.contains("▌"), "the marked row has a gutter");
+            assert!(text.contains("*. main  ..."), "main marker + loading state");
+        }
+    }
+
+    #[test]
+    fn draw_tree_pane_with_no_repos_says_so() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        let view = WorktreesViewModel::default();
+        terminal
+            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &TreeState::default(), true))
+            .unwrap();
+        assert!(buffer_text(&terminal).contains("No repositories open."));
+    }
+
+    #[test]
+    fn draw_status_bar_shows_feed_states_marks_and_the_hint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut view = sample_view();
+        view.worktrees_status = FeedStatus::Live;
+        view.sessions_status = FeedStatus::Reconnecting {
+            attempt: 2,
+            retry_in: std::time::Duration::from_secs(3),
+        };
+        let tree = TreeState {
+            cursor: 0,
+            marked: std::iter::once(PathBuf::from("/repo")).collect(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_status_bar(frame, frame.area(), &view, &tree, "press a"))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("1 marked"));
+        assert!(text.contains("worktrees: live"));
+        assert!(text.contains("reconnecting (attempt 2, retry in 3s)"));
+        assert!(text.contains("closed hidden"));
+        assert!(text.contains("press a"));
+
+        view.sessions_status = FeedStatus::Polling;
+        view.worktrees_status = FeedStatus::Connecting;
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_status_bar(frame, frame.area(), &view, &TreeState::default(), ""))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("polling (daemon predates live updates)"));
+        assert!(text.contains("worktrees: connecting"));
+    }
+
     #[test]
     fn default_row_with_no_signal_is_reset() {
         assert_eq!(line_color(&worktree_row()), Color::Reset);

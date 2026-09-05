@@ -112,19 +112,29 @@ impl TerminalTab {
         let request = pty::SpawnRequest {
             tab: id,
             program,
-            cwd: opened_in.clone(),
+            cwd: opened_in,
             size,
             extra_env: Vec::new(),
         };
+        Self::from_request(kind, request, tx)
+    }
+
+    /// Spawns whatever `request` names — the seam that lets tests run a
+    /// scripted `/bin/sh` through the exact code path `spawn` uses.
+    pub(crate) fn from_request(
+        kind: TabKind,
+        request: pty::SpawnRequest,
+        tx: mpsc::UnboundedSender<(TabId, TermEvent)>,
+    ) -> Result<Self> {
         let handle = pty::spawn(&request, tx)?;
         Ok(Self {
-            id,
+            id: request.tab,
             kind,
-            opened_in,
+            opened_in: request.cwd,
             handle: Some(handle),
             title: None,
             exit_status: None,
-            size,
+            size: request.size,
         })
     }
 
@@ -428,6 +438,203 @@ mod tests {
             term.selection.is_none(),
             "a column change must clear the selection"
         );
+    }
+
+    fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn sh_tab(script: &str, tx: mpsc::UnboundedSender<(TabId, TermEvent)>) -> TerminalTab {
+        let request = pty::SpawnRequest {
+            tab: 7,
+            program: Some((
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), script.to_string()],
+            )),
+            cwd: std::env::temp_dir(),
+            size: GridSize { cols: 40, lines: 6 },
+            extra_env: Vec::new(),
+        };
+        TerminalTab::from_request(TabKind::Shell, request, tx).unwrap()
+    }
+
+    /// Feeds every event into the tab until `done` or the timeout; returns
+    /// the effects seen.
+    #[cfg(unix)]
+    async fn pump(
+        tab: &mut TerminalTab,
+        rx: &mut mpsc::UnboundedReceiver<(TabId, TermEvent)>,
+        mut done: impl FnMut(&TabEffect, &TerminalTab) -> bool,
+    ) -> Vec<TabEffect> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut effects = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some((_, event))) => {
+                    let effect = tab.handle_event(event);
+                    let finished = done(&effect, tab);
+                    effects.push(effect);
+                    if finished {
+                        return effects;
+                    }
+                }
+                _ => return effects,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_tab_renders_its_grid_title_and_cursor_then_reports_exit() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Output, a wide char, a title, a colour query and a text-area query
+        // (both answered by the emulator through PtyWrite), then linger so
+        // the tab can be drawn while alive.
+        let script = "printf 'hi 你好\\n'; printf '\\033]2;tab-title\\a'; \
+                      printf '\\033]10;?\\a\\033[18t'; sleep 1";
+        let mut tab = sh_tab(script, tx);
+        assert_eq!(tab.id(), 7);
+        assert!(tab.is_alive());
+        assert!(tab.selection_to_string().is_none());
+        assert!(!tab.mode().contains(TermMode::ALT_SCREEN));
+
+        pump(&mut tab, &mut rx, |_, t| {
+            t.title.as_deref() == Some("tab-title")
+        })
+        .await;
+        assert_eq!(tab.title.as_deref(), Some("tab-title"));
+
+        // Resize (both the grid and the PTY) before drawing.
+        tab.resize(GridSize { cols: 60, lines: 8 });
+        tab.resize(GridSize { cols: 60, lines: 8 }); // no-op on the same size
+        tab.resize(GridSize { cols: 1, lines: 0 }); // refused: below the minimum
+
+        // Give the emulator a moment to have parsed the output, then draw.
+        pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Redraw).await;
+        let mut terminal = Terminal::new(TestBackend::new(64, 10)).unwrap();
+        terminal
+            .draw(|frame| tab.draw(frame, frame.area(), true))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        // The wide char's spacer cell is skipped for diffing but still
+        // contributes its blank symbol here, so check the halves.
+        assert!(text.contains("hi 你"), "grid text was: {text}");
+        assert!(text.contains("好"), "grid text was: {text}");
+        assert!(text.contains("shell"), "pane title names the kind");
+        assert!(
+            text.contains("tab-title"),
+            "pane title carries the child's title"
+        );
+
+        // Unfocused draw takes the reversed-cell cursor path.
+        terminal
+            .draw(|frame| tab.draw(frame, frame.area(), false))
+            .unwrap();
+        // A too-small area is a no-op rather than a panic.
+        terminal
+            .draw(|frame| tab.draw(frame, Rect::new(0, 0, 2, 2), true))
+            .unwrap();
+
+        // Scrollback controls and input are accepted while alive.
+        tab.scroll(Scroll::PageUp);
+        tab.scroll(Scroll::Bottom);
+        tab.write_input(Vec::new()); // empty input is dropped
+        tab.write_input(b"\n".to_vec());
+
+        // A selection set on the emulator is rendered and extractable.
+        {
+            let handle = tab.handle.as_ref().unwrap();
+            let mut term = handle.term.lock();
+            let mut selection = Selection::new(
+                SelectionType::Simple,
+                Point::new(Line(0), Column(0)),
+                Side::Left,
+            );
+            selection.update(Point::new(Line(0), Column(1)), Side::Right);
+            term.selection = Some(selection);
+        }
+        assert_eq!(tab.selection_to_string().as_deref(), Some("hi"));
+        terminal
+            .draw(|frame| tab.draw(frame, frame.area(), true))
+            .unwrap();
+
+        // The child exits after its sleep.
+        let effects = pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Exited).await;
+        assert!(effects.contains(&TabEffect::Exited));
+        assert!(tab.exit_status.is_some());
+        assert!(!tab.is_alive());
+        terminal
+            .draw(|frame| tab.draw(frame, frame.area(), false))
+            .unwrap();
+        assert!(buffer_text(&terminal).contains("[exited 0]"));
+
+        // Shutdown reaps the thread; the tab is inert afterwards.
+        tab.shutdown();
+        tab.shutdown(); // idempotent
+        assert!(!tab.is_alive());
+        assert_eq!(tab.mode(), TermMode::default());
+        assert!(tab.selection_to_string().is_none());
+        tab.write_input(b"x".to_vec());
+        tab.scroll(Scroll::PageUp);
+        tab.resize(GridSize { cols: 20, lines: 5 });
+        terminal
+            .draw(|frame| tab.draw(frame, frame.area(), true))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn synthetic_events_map_to_the_documented_effects() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tab = sh_tab("sleep 1", tx);
+        assert_eq!(
+            tab.handle_event(TermEvent::ClipboardStore(
+                alacritty_terminal::term::ClipboardType::Clipboard,
+                "copied".to_string()
+            )),
+            TabEffect::CopyToClipboard("copied".to_string())
+        );
+        assert_eq!(
+            tab.handle_event(TermEvent::Title("t".to_string())),
+            TabEffect::Redraw
+        );
+        assert_eq!(tab.handle_event(TermEvent::ResetTitle), TabEffect::Redraw);
+        assert_eq!(tab.title, None);
+        assert_eq!(tab.handle_event(TermEvent::Bell), TabEffect::None);
+        assert_eq!(
+            tab.handle_event(TermEvent::MouseCursorDirty),
+            TabEffect::None
+        );
+        assert_eq!(
+            tab.handle_event(TermEvent::CursorBlinkingChange),
+            TabEffect::None
+        );
+        assert_eq!(tab.handle_event(TermEvent::Wakeup), TabEffect::Redraw);
+        assert_eq!(
+            tab.handle_event(TermEvent::ClipboardLoad(
+                alacritty_terminal::term::ClipboardType::Clipboard,
+                std::sync::Arc::new(|s: &str| s.to_string())
+            )),
+            TabEffect::None
+        );
+        assert_eq!(
+            tab.handle_event(TermEvent::PtyWrite("\x1b[1;1R".to_string())),
+            TabEffect::None
+        );
+        assert_eq!(tab.handle_event(TermEvent::Exit), TabEffect::Exited);
+        pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Exited).await;
+        tab.shutdown();
     }
 
     #[test]
