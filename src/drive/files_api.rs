@@ -565,13 +565,24 @@ pub(crate) enum WriteCapability {
 /// insufficient OAuth scope. No client-side scope pre-check exists (mirrors
 /// Gmail's label-mutation commands): the mutating call is always attempted,
 /// and Google's 403 is made actionable here instead.
-fn append_write_scope_hint(err: anyhow::Error, capability: WriteCapability) -> anyhow::Error {
+///
+/// Matches **both** spellings Google ships for the same condition:
+/// `insufficientPermissions` in Drive v3's legacy `error.errors[].reason`
+/// envelope, and `PERMISSION_DENIED` in the `google.rpc` `error.status`
+/// envelope newer services use — Sheets v4 among them (issue #1589). Matching
+/// only the legacy string would leave every Sheets 403 hint-less, and would do
+/// so silently: the call still fails, just without telling the operator which
+/// login flag fixes it. See `crate::drive::api_client::error_reason`.
+pub(in crate::drive) fn append_write_scope_hint(
+    err: anyhow::Error,
+    capability: WriteCapability,
+) -> anyhow::Error {
     let is_insufficient_permissions = matches!(
         err.downcast_ref::<DriveError>(),
         Some(DriveError::ApiRequestFailed {
             reason: Some(reason),
             ..
-        }) if reason == "insufficientPermissions"
+        }) if reason == "insufficientPermissions" || reason == "PERMISSION_DENIED"
     );
     if !is_insufficient_permissions {
         return err;
@@ -1558,6 +1569,41 @@ mod tests {
             reason: Some("insufficientPermissions".to_string()),
         }
         .into()
+    }
+
+    /// The same condition as [`insufficient_permissions_error`], spelled the
+    /// way the `google.rpc` envelope spells it — what Sheets v4 returns.
+    fn permission_denied_error() -> anyhow::Error {
+        DriveError::ApiRequestFailed {
+            status: 403,
+            body: String::new(),
+            reason: Some("PERMISSION_DENIED".to_string()),
+        }
+        .into()
+    }
+
+    #[test]
+    fn append_write_scope_hint_also_matches_the_google_rpc_permission_denied_spelling() {
+        // Regression guard for issue #1589: Sheets v4 has no
+        // `error.errors[].reason`, so a hint keyed only on
+        // "insufficientPermissions" would never fire for it — and would fail
+        // silently, leaving the operator a bare 403 with no flag to run.
+        let msg = append_write_scope_hint(permission_denied_error(), WriteCapability::EditContent)
+            .to_string();
+        assert!(msg.contains("--write-file"), "{msg}");
+        assert!(msg.contains("--write-full"), "{msg}");
+    }
+
+    #[test]
+    fn append_write_scope_hint_ignores_an_unrelated_reason_code() {
+        let err: anyhow::Error = DriveError::ApiRequestFailed {
+            status: 404,
+            body: "gone".to_string(),
+            reason: Some("notFound".to_string()),
+        }
+        .into();
+        let msg = append_write_scope_hint(err, WriteCapability::EditContent).to_string();
+        assert!(!msg.contains("--write-file"), "{msg}");
     }
 
     #[test]

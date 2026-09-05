@@ -8,7 +8,10 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::drive::account::DRIVE_ACCOUNT_ENV;
-use crate::drive::auth::{DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET, DRIVE_REFRESH_TOKEN, DRIVE_SCOPE};
+use crate::drive::auth::{
+    DRIVE_API_URL, DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET, DRIVE_REFRESH_TOKEN, DRIVE_SCOPE,
+};
+use crate::drive::sheets::client::SHEETS_API_URL;
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the Drive
 /// credential environment variables.
@@ -32,6 +35,13 @@ impl EnvGuard {
         let lock = DRIVE_ENV_MUTEX
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // The two `*_API_URL` host overrides are snapshotted for two
+        // reasons: a developer with one exported must not silently redirect
+        // a test's requests, and a test that points one at a local server
+        // must not leak that setting into the next test. Their absence here
+        // was already a latent hazard for `DRIVE_API_URL`; `SHEETS_API_URL`
+        // makes it sharper, since without an override a Sheets client
+        // defaults to the *real* `sheets.googleapis.com`.
         let keys = [
             "HOME",
             DRIVE_CLIENT_ID,
@@ -39,6 +49,8 @@ impl EnvGuard {
             DRIVE_REFRESH_TOKEN,
             DRIVE_SCOPE,
             DRIVE_ACCOUNT_ENV,
+            DRIVE_API_URL,
+            SHEETS_API_URL,
         ];
         let snapshot = keys
             .into_iter()
@@ -66,7 +78,20 @@ impl EnvGuard {
         std::env::remove_var(DRIVE_REFRESH_TOKEN);
         std::env::remove_var(DRIVE_SCOPE);
         std::env::remove_var(DRIVE_ACCOUNT_ENV);
+        std::env::remove_var(DRIVE_API_URL);
+        std::env::remove_var(SHEETS_API_URL);
         dir
+    }
+
+    /// Points both Google API host overrides at a dead local address.
+    ///
+    /// For tests that exercise a code path which *constructs* a client
+    /// without a wiremock server in hand. Without this a `SheetsClient`
+    /// falls back to the real `sheets.googleapis.com`, so a routing test
+    /// would make an outbound request to Google.
+    pub(crate) fn redirect_api_hosts_to_a_dead_port(&self) {
+        std::env::set_var(DRIVE_API_URL, "http://127.0.0.1:1");
+        std::env::set_var(SHEETS_API_URL, "http://127.0.0.1:1");
     }
 }
 

@@ -1,37 +1,51 @@
 //! Drive REST API client.
 //!
-//! Thin `reqwest` wrapper that attaches a Bearer access token (refreshed by
-//! an owned [`DriveSession`]) to every request, retries HTTP 429 via the
-//! shared [`retry_429`](crate::utils::http::retry_429) driver, and retries
-//! exactly once on HTTP 401 by forcing a session refresh. Modelled on
-//! [`crate::datadog::client::DatadogClient`] (and `crate::gmail::client::GmailClient`,
-//! its closest sibling); the difference is Bearer-token auth with in-process
-//! refresh instead of two static API keys.
+//! A typed wrapper around [`GoogleApiClient`], the shared Google transport
+//! (`crate::drive::api_client`), pinned to the Drive v3 host. The transport
+//! attaches a Bearer access token refreshed by a shared
+//! [`DriveSession`](crate::drive::auth::DriveSession),
+//! retries HTTP 429 and Google's 403-shaped quota signal via the shared
+//! [`retry_if`](crate::utils::http::retry_if) driver, and retries exactly once
+//! on HTTP 401 by forcing a session refresh.
+//!
+//! Everything host-agnostic moved into `api_client.rs` in issue #1589 so the
+//! Sheets API — a *different host*, which a `/drive/v3/...` base URL cannot
+//! reach — could reuse it. What stays here is what is genuinely Drive's: the
+//! default host, the `DRIVE_API_URL` override, and the type identity that
+//! keeps `FilesApi` from being pointed at the wrong API.
 
-use anyhow::{Context, Result};
-use reqwest::{Client, Response};
+use anyhow::Result;
+use reqwest::Response;
 use url::Url;
 
-use crate::drive::auth::{DriveCredentials, DriveSession};
+use crate::drive::api_client::GoogleApiClient;
+use crate::drive::auth::DriveCredentials;
 use crate::drive::error::DriveError;
-use crate::request_log;
 use crate::utils::env::{EnvSource, SystemEnv};
-use crate::utils::http::{connect_timeout, read_timeout, retry_if};
+
+/// The `service` tag Drive's HTTP records carry in the request log.
+///
+/// `SheetsClient` deliberately uses this **same** tag: the mutation records
+/// are already hardcoded `service: "drive"`
+/// (`crate::request_log::build_drive_mutation_record`), so splitting the HTTP
+/// records off under a separate service would make `omni-dev log --service
+/// drive` stop covering half of one feature's traffic. The host stays visible
+/// in each record's URL.
+pub(crate) const SERVICE_TAG: &str = "drive";
 
 /// HTTP client for the Drive v3 REST API.
 pub struct DriveClient {
-    client: Client,
-    base_url: String,
-    session: DriveSession,
+    inner: GoogleApiClient,
 }
 
 impl std::fmt::Debug for DriveClient {
     // Hand-written, not derived: omits `session` entirely rather than
     // relying on every nested `Secret` staying wrapped — the safest
-    // possible redaction is "not mentioned at all."
+    // possible redaction is "not mentioned at all." Deriving would also
+    // print the inner client's field names, including `session`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DriveClient")
-            .field("base_url", &self.base_url)
+            .field("base_url", &self.inner.base_url())
             .finish_non_exhaustive()
     }
 }
@@ -53,16 +67,8 @@ impl DriveClient {
     /// For production use, construct via [`Self::from_credentials`]; tests
     /// pass a wiremock URL directly.
     pub fn new(base_url: &str, credentials: &DriveCredentials) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(connect_timeout())
-            .read_timeout(read_timeout())
-            .build()
-            .context("Failed to build HTTP client")?;
-        let session = DriveSession::new(client.clone(), credentials);
         Ok(Self {
-            client,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            session,
+            inner: GoogleApiClient::new(base_url, credentials, SERVICE_TAG)?,
         })
     }
 
@@ -95,7 +101,17 @@ impl DriveClient {
     /// Returns the API base URL (without trailing slash).
     #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.inner.base_url()
+    }
+
+    /// The shared transport, for deriving a client against another Google
+    /// host that reuses this one's OAuth session and connection pool.
+    ///
+    /// `dead_code`-allowed until `SheetsClient` lands in the following commit
+    /// (see [`GoogleApiClient::derived`]).
+    #[allow(dead_code)]
+    pub(in crate::drive) fn transport(&self) -> &GoogleApiClient {
+        &self.inner
     }
 
     /// Builds an absolute API URL by joining `path` onto `base_url`.
@@ -104,7 +120,7 @@ impl DriveClient {
     /// functions in the API façade modules — and their unit tests, which
     /// pass literal base URLs — can call it without an instance.
     pub(crate) fn api_url(base_url: &str, path: &str) -> Result<Url> {
-        Url::parse(&format!("{base_url}{path}")).context("Invalid Drive base URL")
+        GoogleApiClient::api_url(base_url, path)
     }
 
     /// Checks `response` for success and deserialises its JSON body into `T`.
@@ -113,10 +129,7 @@ impl DriveClient {
         response: Response,
         context: &'static str,
     ) -> Result<T> {
-        if !response.status().is_success() {
-            return Err(Self::response_to_error(response).await.into());
-        }
-        response.json().await.context(context)
+        self.inner.parse_response(response, context).await
     }
 
     /// Sends an authenticated GET and deserialises the JSON body into `T`.
@@ -125,23 +138,14 @@ impl DriveClient {
         url: &str,
         context: &'static str,
     ) -> Result<T> {
-        let response = self.get_json(url).await?;
-        self.parse_response(response, context).await
+        self.inner.get_parsed(url, context).await
     }
 
     /// Sends an authenticated GET request and returns the raw response.
     ///
-    /// Retries exactly once on HTTP 401 by forcing a session refresh — see
-    /// [`Self::send_authorized`] for why both a proactive and a reactive
-    /// refresh path exist.
+    /// Retries exactly once on HTTP 401 by forcing a session refresh.
     pub async fn get_json(&self, url: &str) -> Result<Response> {
-        self.send_authorized(url, "GET", |client, token| {
-            client
-                .get(url)
-                .bearer_auth(token)
-                .header("Accept", "application/json")
-        })
-        .await
+        self.inner.get_json(url).await
     }
 
     /// Sends an authenticated GET request without forcing an `Accept:
@@ -150,10 +154,7 @@ impl DriveClient {
     /// [`Self::get_json`] for the JSON counterpart. Retries exactly once on
     /// HTTP 401, identically to `get_json`.
     pub async fn get_bytes(&self, url: &str) -> Result<Response> {
-        self.send_authorized(url, "GET", |client, token| {
-            client.get(url).bearer_auth(token)
-        })
-        .await
+        self.inner.get_bytes(url).await
     }
 
     /// Sends an authenticated POST request with a JSON body and returns the
@@ -163,14 +164,7 @@ impl DriveClient {
         url: &str,
         body: &T,
     ) -> Result<Response> {
-        self.send_authorized(url, "POST", |client, token| {
-            client
-                .post(url)
-                .bearer_auth(token)
-                .header("Content-Type", "application/json")
-                .json(body)
-        })
-        .await
+        self.inner.post_json(url, body).await
     }
 
     /// Sends an authenticated PATCH request with a JSON body and returns the
@@ -181,14 +175,7 @@ impl DriveClient {
         url: &str,
         body: &T,
     ) -> Result<Response> {
-        self.send_authorized(url, "PATCH", |client, token| {
-            client
-                .patch(url)
-                .bearer_auth(token)
-                .header("Content-Type", "application/json")
-                .json(body)
-        })
-        .await
+        self.inner.patch_json(url, body).await
     }
 
     /// Sends an authenticated POST request with a raw byte body and returns
@@ -196,19 +183,8 @@ impl DriveClient {
     /// `multipart/related` body [`crate::drive::files_api::FilesApi::upload`]
     /// hand-assembles (Drive's upload endpoint rejects the
     /// `multipart/form-data` `reqwest::multipart::Form` would produce).
-    ///
-    /// `body` is cloned per send attempt (`send_authorized`'s `build`
-    /// closure is `Fn`, not `FnOnce` — it may run twice, once on a 401
-    /// retry — and [`reqwest::RequestBuilder::body`] takes ownership).
     pub async fn post_bytes(&self, url: &str, body: &[u8], content_type: &str) -> Result<Response> {
-        self.send_authorized(url, "POST", |client, token| {
-            client
-                .post(url)
-                .bearer_auth(token)
-                .header("Content-Type", content_type)
-                .body(body.to_vec())
-        })
-        .await
+        self.inner.post_bytes(url, body, content_type).await
     }
 
     /// Sends an authenticated PATCH request with a raw byte body and
@@ -222,181 +198,53 @@ impl DriveClient {
         body: &[u8],
         content_type: &str,
     ) -> Result<Response> {
-        self.send_authorized(url, "PATCH", |client, token| {
-            client
-                .patch(url)
-                .bearer_auth(token)
-                .header("Content-Type", content_type)
-                .body(body.to_vec())
-        })
-        .await
-    }
-
-    /// Sends a request built by `build`, retrying exactly once on HTTP 401.
-    ///
-    /// [`DriveSession::access_token`] already refreshes proactively when the
-    /// tracked expiry is near — this reactive path exists for what
-    /// proactive tracking can't see: clock skew against Google's clock, or
-    /// the token being invalidated server-side mid-run (revoked access). A
-    /// second 401 after the retry is authoritative: either the refresh
-    /// produced a token that was also rejected, or another caller's
-    /// already-current token was reused and still rejected — either way the
-    /// problem isn't staleness, so it surfaces as an ordinary
-    /// `ApiRequestFailed` rather than retrying again.
-    async fn send_authorized<F>(
-        &self,
-        url: &str,
-        method: &'static str,
-        build: F,
-    ) -> Result<Response>
-    where
-        F: Fn(&Client, &str) -> reqwest::RequestBuilder + Send + Sync,
-    {
-        let token = self
-            .session
-            .access_token()
-            .await
-            .context("Failed to obtain a Drive access token")?;
-        let response = self
-            .send_once(url, method, &build, token.expose_secret())
-            .await?;
-        if response.status().as_u16() != 401 {
-            return Ok(response);
-        }
-        let refreshed = self
-            .session
-            .force_refresh(&token)
-            .await
-            .context("Failed to refresh the Drive access token after a 401")?;
-        self.send_once(url, method, &build, refreshed.expose_secret())
-            .await
-    }
-
-    async fn send_once<F>(
-        &self,
-        url: &str,
-        method: &'static str,
-        build: &F,
-        token: &str,
-    ) -> Result<Response>
-    where
-        F: Fn(&Client, &str) -> reqwest::RequestBuilder + Send + Sync,
-    {
-        retry_if(
-            || build(&self.client, token),
-            |started, result| {
-                request_log::record_http_result("drive", method, url, started, result);
-            },
-            |status, body| status == 429 || is_drive_quota_exceeded(status, body),
-        )
-        .await
-        .with_context(|| format!("Failed to send {method} request to Drive API"))
+        self.inner.patch_bytes(url, body, content_type).await
     }
 
     /// Consumes a non-success response into a [`DriveError`].
     ///
-    /// Parses Drive's `{"error":{"message":...,"errors":[{"reason":...}]}}`
-    /// envelope (the same shape every Google API error uses) into a human
-    /// message when present (falls back to the raw body otherwise). Drive
-    /// signals quota exhaustion as **403** `userRateLimitExceeded`, not
-    /// `429` — unlike plain 429s, that shape now also drives a retry (see
-    /// [`is_drive_quota_exceeded`] via [`retry_if`](crate::utils::http::retry_if)),
-    /// so this only sees the error once retries are exhausted (or the
-    /// reason didn't match).
+    /// Parses Google's `{"error":{"message":...}}` envelope — in either the
+    /// legacy `errors[].reason` or the newer `status` spelling, see
+    /// `api_client::error_reason` — into a human message when present
+    /// (falls back to the raw body otherwise). Drive signals quota
+    /// exhaustion as **403** `userRateLimitExceeded`, not `429`; that shape
+    /// drives a retry, so this only sees the error once retries are
+    /// exhausted (or the reason didn't match).
     pub async fn response_to_error(response: Response) -> DriveError {
-        let status = response.status().as_u16();
-        let raw = response.text().await.unwrap_or_default();
-        let value = serde_json::from_str::<serde_json::Value>(&raw).ok();
-        let reason = value.as_ref().and_then(drive_error_reason);
-        let body = value
-            .as_ref()
-            .and_then(drive_error_message)
-            .map(|message| match &reason {
-                Some(r) => format!("{message} (reason: {r})"),
-                None => message,
-            })
-            .unwrap_or(raw);
-        DriveError::ApiRequestFailed {
-            status,
-            body,
-            reason,
-        }
+        GoogleApiClient::response_to_error(response).await
     }
-}
-
-/// Extracts the `error.errors[0].reason` field from Drive's already-parsed
-/// JSON error envelope, if present.
-fn drive_error_reason(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("error")
-        .and_then(|e| e.get("errors"))
-        .and_then(|e| e.as_array())
-        .and_then(|a| a.first())
-        .and_then(|e| e.get("reason"))
-        .and_then(|r| r.as_str())
-        .map(str::to_string)
-}
-
-/// Extracts the `error.message` field from Drive's already-parsed JSON
-/// error envelope, if present.
-fn drive_error_message(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("error")?
-        .get("message")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// Whether a response is Drive's quota-exhaustion signal — **403** with
-/// `reason` of `userRateLimitExceeded` specifically, not any 403 with a
-/// `reason` field: e.g. `insufficientPermissions` is also a 403 and must
-/// never be retried (retrying a scope/permission error just wastes the
-/// backoff window before failing anyway).
-///
-/// Unlike Gmail's `is_gmail_quota_exceeded`, this does **not** also match
-/// the bare `rateLimitExceeded` reason — that string is confirmed for
-/// Gmail but not confirmed for Drive against
-/// [Drive's error-handling guide](https://developers.google.com/workspace/drive/api/guides/handle-errors);
-/// widen this match only once testing surfaces it. Plain `429` responses
-/// (Drive's other documented rate-limit signal) are already covered by the
-/// literal `status == 429` branch in [`DriveClient::send_once`], independent
-/// of this function.
-fn is_drive_quota_exceeded(status: u16, body: &[u8]) -> bool {
-    if status != 403 {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
-    };
-    matches!(
-        drive_error_reason(&value).as_deref(),
-        Some("userRateLimitExceeded")
-    )
 }
 
 /// Test-only seam letting sibling API-façade test modules (which can't
 /// reach `DriveClient`'s private fields directly, unlike this module's own
 /// `tests` submodule) bootstrap a deterministic access token via wiremock.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod test_support {
-    use super::DriveClient;
-    use crate::drive::auth::{DriveCredentials, DriveSession};
+    use super::{DriveClient, GoogleApiClient, SERVICE_TAG};
+    use crate::drive::auth::DriveCredentials;
 
-    /// Replaces `client`'s session with one pointed at an explicit token
-    /// endpoint.
+    /// Replaces `client`'s transport with one whose session points at an
+    /// explicit token endpoint.
+    ///
+    /// Rebuilds rather than mutating a session in place: the session lives
+    /// behind an `Arc` that a derived client may share, and assigning a new
+    /// one post-hoc would leave any already-derived client pointed at the
+    /// real `oauth2.googleapis.com`. Callers that need a *pair* of clients
+    /// should build the Drive client through this first and derive after.
     pub(crate) fn replace_session(
         client: &mut DriveClient,
         credentials: &DriveCredentials,
         token_endpoint: &str,
     ) {
-        client.session = DriveSession::new_with_token_endpoint(
-            client.client.clone(),
+        let base_url = client.base_url().to_string();
+        client.inner = GoogleApiClient::new_with_token_endpoint(
+            &base_url,
             credentials,
+            SERVICE_TAG,
             token_endpoint,
-        );
+        )
+        .expect("failed to build a test transport");
     }
 }
 
@@ -414,27 +262,6 @@ mod tests {
             refresh_token: Secret::new("refresh-1"),
             scope: DriveGrantedScopes::READONLY,
         }
-    }
-
-    #[test]
-    fn is_drive_quota_exceeded_false_on_non_utf8_body() {
-        assert!(!is_drive_quota_exceeded(403, &[0xff, 0xfe]));
-    }
-
-    #[test]
-    fn is_drive_quota_exceeded_false_on_non_403_status() {
-        assert!(!is_drive_quota_exceeded(
-            429,
-            br#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#
-        ));
-    }
-
-    #[test]
-    fn is_drive_quota_exceeded_true_on_matching_403_reason() {
-        assert!(is_drive_quota_exceeded(
-            403,
-            br#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#
-        ));
     }
 
     #[test]
@@ -510,14 +337,13 @@ mod tests {
             .await;
 
         let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
-        client.session = DriveSession::new_with_token_endpoint(
-            client.client.clone(),
+        test_support::replace_session(
+            &mut client,
             &test_credentials(),
             &format!("{}/token", server.uri()),
         );
         client
     }
-
     #[tokio::test]
     async fn get_json_sends_bearer_auth_header() {
         let server = wiremock::MockServer::start().await;
@@ -973,5 +799,63 @@ mod tests {
             .await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("File not found"));
+    }
+
+    #[tokio::test]
+    async fn put_json_sends_body_and_bearer_auth() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "values": [["a", "b"]],
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = client
+            .transport()
+            .put_json(
+                &format!("{}/test", server.uri()),
+                &serde_json::json!({"values": [["a", "b"]]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn response_to_error_reads_the_google_rpc_envelope_sheets_returns() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "code": 403,
+                        "message": "The caller does not have permission",
+                        "status": "PERMISSION_DENIED",
+                    },
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let response = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        let error = DriveClient::response_to_error(response).await;
+        let DriveError::ApiRequestFailed { reason, .. } = error else {
+            panic!("expected ApiRequestFailed");
+        };
+        assert_eq!(reason.as_deref(), Some("PERMISSION_DENIED"));
     }
 }

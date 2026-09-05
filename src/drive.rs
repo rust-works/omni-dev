@@ -11,6 +11,7 @@
 
 pub mod about_api;
 pub mod account;
+pub mod api_client;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
@@ -22,6 +23,7 @@ pub mod files_api;
 pub mod folder_ancestry;
 pub mod permissions_api;
 pub mod rename;
+pub mod sheets;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;

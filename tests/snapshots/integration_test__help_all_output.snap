@@ -3739,6 +3739,7 @@ Commands:
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
   permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+  sheets       Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4041,6 +4042,58 @@ Arguments:
 Options:
       --limit <LIMIT>    Maximum results to return. `0` means "fetch every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets - Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
+
+Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
+
+Usage: sheets <COMMAND>
+
+Commands:
+  info  Shows a spreadsheet's title and the sheets (tabs) it contains
+  read  Reads cell values from one range, or from every sheet
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets info - Shows a spreadsheet's title and the sheets (tabs) it contains
+
+Shows a spreadsheet's title and the sheets (tabs) it contains
+
+Usage: info [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets read - Reads cell values from one range, or from every sheet
+
+Reads cell values from one range, or from every sheet
+
+Usage: read [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to read, optionally carrying its own `Sheet!` prefix (e.g. `A1:C10`, `'My Sheet'!A:A`). Combined with `--sheet` when bare
+      --sheet <NAME>     Sheet (tab) title to read. Supplies the prefix for a bare `--range`, or selects the whole tab on its own. Conflicts with a `--range` that already names a sheet
+      --render <RENDER>  How cell values are rendered. `formatted` matches the spreadsheet as displayed; `unformatted` yields raw typed numbers rather than locale-formatted strings; `formula` yields formula text [default: formatted] [possible values: formatted, unformatted, formula]
+  -o, --output <OUTPUT>  Output format. The default `table` emits CSV — one block per sheet, each preceded by a `# <title>` comment line when reading more than one. Use `json`/`yaml` to keep values typed and rows ragged [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 

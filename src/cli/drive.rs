@@ -14,6 +14,7 @@ pub(crate) mod permissions;
 pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
+pub(crate) mod sheets;
 pub(crate) mod upload;
 
 use anyhow::Result;
@@ -79,6 +80,9 @@ pub enum DriveSubcommands {
     /// Inspects the folder-scoped write-permission rules gating `drive
     /// create`/`upload`/`edit` (issue #1574).
     Permissions(permissions::PermissionsCommand),
+    /// Reads the cells of a Google Sheet via the Sheets v4 API (issue
+    /// #1589).
+    Sheets(sheets::SheetsCommand),
 }
 
 impl DriveCommand {
@@ -135,6 +139,7 @@ impl DriveSubcommands {
             Self::Edit(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
+            Self::Sheets(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -331,6 +336,41 @@ mod tests {
         };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_info() {
+        // Unlike every other routing test, this one needs an env guard: a
+        // `SheetsClient` with no `SHEETS_API_URL` set resolves the *real*
+        // `sheets.googleapis.com`, so without the redirect this test would
+        // send a request to Google.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Info(sheets::info::InfoCommand {
+                spreadsheet_id: "s1".to_string(),
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_read() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Read(sheets::read::ReadCommand {
+                spreadsheet_id: "s1".to_string(),
+                range: None,
+                sheet: None,
+                render: sheets::read::RenderArg::Formatted,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
