@@ -156,6 +156,106 @@ the `action-works/omni-dev-coverage-check` action) that does not thread the flag
 through: omni-dev reads `.omni-dev/coverage.yaml` directly from the checkout, so
 no wrapper change is needed.
 
+## Excluding or tolerating regions in source
+
+Excluding a whole file is usually too blunt. The noise is typically **one
+function** — a CPU-gated dispatch helper is ten lines inside a two-hundred-line
+file, and ignoring the file hides far more real coverage than noise.
+
+Config cannot name the region either: line numbers are invalidated by every edit
+above them, and function *extents* are absent from the lcov `FN:` records (they
+carry a start line and a mangled symbol, nothing more). So the region is
+delimited **in the source**, with a comment that travels with the code:
+
+```rust
+// omni-dev: coverage tolerate reason="CPU-gated: the avx512f arm only executes on Zen 4+ runners"
+fn detect_fast_bmi2() -> bool {
+    if is_x86_feature_detected!("avx512f") {
+        return true;
+    }
+    cpuid_amd_zen3_or_later()
+}
+// omni-dev: coverage end
+```
+
+omni-dev scans **each revision's own source** — head from the working tree, base
+from the base revision's blob — so no line number is ever recorded, and a region
+that moves, grows, or disappears between base and head is handled by
+construction.
+
+### The two kinds
+
+| Kind       | Effect on the percentages (total, per-file, patch)     | Effect on the delta signals (headline Δ, per-file Δ, notable, indirect) |
+|------------|--------------------------------------------------------|-------------------------------------------------------------------------|
+| `ignore`   | lines removed from **both** reports before analysis     | none — the lines no longer exist                                        |
+| `tolerate` | lines kept; the reported coverage stays honest          | flips **masked**: each tolerated head line is scored with its baseline hit status |
+
+`ignore` is the scoped twin of `ignore-filename-regex`. `tolerate` is the new
+capability: **the number stays truthful, but the noise stops moving the needle.**
+
+**Prefer `tolerate`.** Reach for `ignore` only when the code is genuinely
+unreachable on CI and counting it in the denominator is simply wrong. A
+tolerated region still shows its real coverage in the total and in the per-file
+table; it just cannot manufacture a delta.
+
+### Syntax
+
+```text
+omni-dev: coverage ignore reason="…"     … omni-dev: coverage end
+omni-dev: coverage tolerate reason="…"   … omni-dev: coverage end
+omni-dev: coverage ignore-line reason="…"
+omni-dev: coverage tolerate-line reason="…"
+```
+
+- **Matching is a plain substring** anywhere on a line, so any comment syntax
+  works — `//`, `#`, `--`, `<!-- -->`. Nothing parses the host language, which
+  also means a marker inside a string literal *is* matched.
+- **Both marker lines are inside the region.** They are comments, so they are
+  never executable and never appear in a report.
+- **`reason="…"` is mandatory** on every region start and single-line marker.
+  Silencing has to be explained at the site.
+- **Malformed markers are hard errors** naming `path:line`: a missing or empty
+  reason, an unterminated quote, a nested region, an `end` with no start, or a
+  region left open at end-of-file. An unterminated region is never widened
+  silently to EOF — that would silence an unbounded amount of code nobody looked
+  at.
+
+### How masking works, precisely
+
+For each head file, the tolerated head lines are scored with the hit status of
+their **base counterpart** (found through the same diff alignment used for
+indirect changes; identity for a file the diff never touched). A tolerated line
+with no counterpart — an added line — keeps its real status.
+
+That effective coverage is what feeds the headline Δ, the per-file Δ, the
+"unchanged files also moved" gate, and the indirect-change list. The **displayed
+percentages are always the real, measured values**. So the motivating case
+renders as `Total: 92.79% ⚪ 0 pp` rather than `🔴 -0.01 pp`, with `92.79%` still
+the true number.
+
+Two consequences worth stating outright:
+
+- **Added lines inside a `tolerate` region stay in the patch-coverage
+  denominator.** New code should still be tested even if it flaps later. Added
+  lines inside an `ignore` region leave it, because they are gone from the head
+  report entirely.
+- **Without a baseline** (`--baseline-report` absent), `ignore` still applies —
+  it shapes the total and the patch — while `tolerate` is a no-op, since there
+  are no deltas to mask.
+
+### Markers are never invisible
+
+Whenever a marker applies, the markdown comment gains a collapsed note listing
+each region's path, kind, line span as observed at head, and reason; the YAML and
+JSON views carry the same information in a `markers` array. A reviewer can always
+see what was silenced and why.
+
+### Interaction with the file-level ignore-list
+
+File-level exclusion wins. A file excluded by `--ignore-filename-regex` or
+`coverage.yaml` is never read, so markers inside it are never scanned — and never
+report errors.
+
 ## CI usage
 
 In CI, prefer the reusable
