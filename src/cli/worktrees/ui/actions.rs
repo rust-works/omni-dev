@@ -984,31 +984,42 @@ fn merge_queue_nothing_eligible(report: &super::wire::MergeQueueReplyWire) -> St
     )
 }
 
-pub fn applicable_actions(targets: &[Target]) -> Vec<(ActionKind, &'static str)> {
-    let mut items = Vec::new();
+/// The applicable actions **grouped** in the VS Code extension's own
+/// `0_open`/`1_pr`/`2_claude`/`3_copy`/`4_git`/`9_close` order.
+///
+/// The boundaries were always computed here and then thrown away, since the
+/// `a` menu expressed grouping by item order alone. A menu wants them as
+/// visible rules, so they are returned; empty groups are dropped, so a caller
+/// can put a separator between every pair it gets back without ever emitting
+/// a leading, trailing or doubled rule.
+pub fn applicable_action_groups(targets: &[Target]) -> Vec<Vec<(ActionKind, &'static str)>> {
+    let has_worktree = targets.iter().any(|t| matches!(t, Target::Worktree { .. }));
 
     // 0_open
-    if targets.iter().any(|t| matches!(t, Target::Worktree { .. })) {
-        items.push((ActionKind::Focus, "Open Worktree"));
+    let mut open = Vec::new();
+    if has_worktree {
+        open.push((ActionKind::Focus, "Open Worktree"));
     }
     if !github_urls(targets).is_empty() {
-        items.push((ActionKind::OpenGithubRepository, "Open GitHub Repository"));
+        open.push((ActionKind::OpenGithubRepository, "Open GitHub Repository"));
     }
 
     // 1_pr
-    if targets.iter().any(|t| matches!(t, Target::Worktree { .. })) {
-        items.push((ActionKind::CopyPullRequestUrls, "Copy Pull Request URL(s)"));
+    let mut pr = Vec::new();
+    if has_worktree {
+        pr.push((ActionKind::CopyPullRequestUrls, "Copy Pull Request URL(s)"));
     }
 
     // 2_claude — only for a single worktree row with at least one session;
     // relocating needs one unambiguous source row (see check_relocate_session).
+    let mut claude = Vec::new();
     if let [Target::Worktree { sessions, .. }] = targets {
         if !sessions.is_empty() {
-            items.push((
+            claude.push((
                 ActionKind::MoveClaudeSessionHere,
                 "Move Claude Session Here",
             ));
-            items.push((
+            claude.push((
                 ActionKind::CopyClaudeSessionHere,
                 "Copy Claude Session Here (Fork)",
             ));
@@ -1016,32 +1027,42 @@ pub fn applicable_actions(targets: &[Target]) -> Vec<(ActionKind, &'static str)>
     }
 
     // 3_copy
+    let mut copy = Vec::new();
     if !targets.is_empty() {
-        items.push((ActionKind::CopyDirectory, "Copy Directory"));
+        copy.push((ActionKind::CopyDirectory, "Copy Directory"));
     }
 
-    // 4_git — the group Phase 2 left deliberately empty. Every one of these
-    // drives a daemon op and is two-phase; the safety rules that matter
-    // (leased force only, never force the default branch) live in the
-    // daemon, not here.
-    if targets.iter().any(|t| matches!(t, Target::Worktree { .. })) {
-        items.push((ActionKind::Rebase, "Rebase on main"));
-        items.push((ActionKind::Push, "Push (force-with-lease)"));
-        items.push((ActionKind::MergeQueue, "Add to Merge Queue"));
+    // 4_git — every one of these drives a daemon op and is two-phase; the
+    // safety rules that matter (leased force only, never force the default
+    // branch) live in the daemon, not here.
+    let mut git = Vec::new();
+    if has_worktree {
+        git.push((ActionKind::Rebase, "Rebase on main"));
+        git.push((ActionKind::Push, "Push (force-with-lease)"));
+        git.push((ActionKind::MergeQueue, "Add to Merge Queue"));
     }
 
     // 9_close
-    if targets.iter().any(|t| matches!(t, Target::Worktree { .. })) {
-        items.push((ActionKind::CloseWindow, "Close Window"));
+    let mut close = Vec::new();
+    if has_worktree {
+        close.push((ActionKind::CloseWindow, "Close Window"));
         if targets
             .iter()
             .any(|t| matches!(t, Target::Worktree { is_main: false, .. }))
         {
-            items.push((ActionKind::CloseWorktree, "Close Worktree"));
+            close.push((ActionKind::CloseWorktree, "Close Worktree"));
         }
     }
 
-    items
+    [open, pr, claude, copy, git, close]
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+/// The same list flattened — the order every caller before #1602 saw.
+pub fn applicable_actions(targets: &[Target]) -> Vec<(ActionKind, &'static str)> {
+    applicable_action_groups(targets).concat()
 }
 
 fn row_color_key(target: &Target) -> RowColorKey {

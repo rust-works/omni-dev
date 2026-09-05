@@ -28,7 +28,7 @@ impl RowRef {
         }
     }
 
-    fn path<'a>(&self, view: &'a WorktreesViewModel) -> Option<&'a std::path::Path> {
+    pub(super) fn path<'a>(&self, view: &'a WorktreesViewModel) -> Option<&'a std::path::Path> {
         match self {
             Self::Repo { index } => view.repos.get(*index).map(|r| r.root.as_path()),
             Self::Worktree {

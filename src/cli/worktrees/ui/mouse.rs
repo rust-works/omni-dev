@@ -46,6 +46,17 @@ const WHEEL_LINES: i32 = 3;
 /// Where a mouse event landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
+    /// A selectable row of the open context menu — `index` into its entries.
+    PopupItem { index: usize },
+    /// Inside the open context menu but not on a selectable row: its border,
+    /// a separator, a `…` affordance. Consumed, but does nothing — a menu is
+    /// modal over what it covers, so this must not fall through to the region
+    /// underneath.
+    PopupInert,
+    /// Outside the open context menu, which dismisses it. The event is
+    /// *consumed* by the dismissal and never applied to whatever it landed
+    /// on (contract §7).
+    PopupOutside,
     /// Inside the tree pane: `row` is the flattened row index (the pane's
     /// scroll offset already applied). It may lie past the last row.
     Tree { row: usize },
@@ -82,10 +93,41 @@ impl GroupRegion {
     }
 }
 
+/// An open context menu's hit-testable parts, produced by the same `draw`
+/// pass that renders it (`popup::draw_menu`), so the map and the frame cannot
+/// disagree about where an item is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PopupRegion {
+    /// The menu's outer rect, borders included.
+    pub rect: Rect,
+    /// `(entry index, row rect)` for each **selectable** item currently on
+    /// screen. Separators and the `…` affordances are deliberately absent, so
+    /// no click can land on one.
+    pub items: Vec<(usize, Rect)>,
+}
+
+impl PopupRegion {
+    fn hit(&self, col: u16, row: u16) -> Option<Hit> {
+        if !contains(self.rect, col, row) {
+            return None;
+        }
+        Some(
+            self.items
+                .iter()
+                .find(|(_, rect)| contains(*rect, col, row))
+                .map_or(Hit::PopupInert, |(index, _)| Hit::PopupItem {
+                    index: *index,
+                }),
+        )
+    }
+}
+
 /// The hit-testable regions of the last drawn frame — rebuilt by every
 /// `draw`, so a stale map can only ever be one frame old.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionMap {
+    /// The open context menu, when one is up. Out-ranks every other region.
+    pub popup: Option<PopupRegion>,
     /// The tree pane's inner area (inside its border).
     pub tree: Rect,
     /// The tree's first visible row index.
@@ -102,6 +144,12 @@ pub struct RegionMap {
 
 impl RegionMap {
     pub fn hit(&self, col: u16, row: u16) -> Hit {
+        // An open context menu is modal over everything it covers, so it is
+        // tested before any other region (contract §7). Anything outside it
+        // is a dismissal, not a click on what lies there.
+        if let Some(popup) = &self.popup {
+            return popup.hit(col, row).unwrap_or(Hit::PopupOutside);
+        }
         // Tab strips win over the splitter. A group's strip sits directly
         // under the boundary above it, inside the splitter's 3-row box; if
         // the splitter took that row, every group below the first would
@@ -189,10 +237,24 @@ pub enum TreeClick {
     ToggleMark,
     /// Double-click: open a shell tab here.
     Open,
+    /// Any right-button press: open the context menu here.
+    ContextMenu,
 }
 
 /// Classifies a button-down on a tree row given its multi-click `count`.
+///
+/// **The right button opens the menu whatever modifiers are held, and this
+/// must not change** (contract §6). The #1602 spike measured four terminals
+/// with four different conventions: Ghostty forwards a plain right-click and
+/// keeps shift-right for its own menu; iTerm2 does exactly the reverse;
+/// VS Code forwards both; Terminal.app forwards both and has no menu of its
+/// own. Acting on whatever the host chose to forward is correct in all four
+/// *because* nothing here branches on a modifier. A `Shift` test in either
+/// direction would break precisely one of them.
 pub fn classify_tree_click(button: MouseButton, modifiers: KeyModifiers, count: u8) -> TreeClick {
+    if button == MouseButton::Right {
+        return TreeClick::ContextMenu;
+    }
     if button != MouseButton::Left {
         return TreeClick::Focus;
     }
@@ -378,6 +440,7 @@ mod tests {
     /// one-row strip above a grid, and a splitter between them.
     fn map() -> RegionMap {
         RegionMap {
+            popup: None,
             tree: Rect::new(1, 1, 30, 10),
             tree_offset: 5,
             groups: vec![
@@ -494,6 +557,52 @@ mod tests {
         assert_eq!(map.hit(5, 7), Hit::Tree { row: 11 });
     }
 
+    /// The same map with a menu open over the tree/strip/grid/splitter.
+    fn map_with_popup() -> RegionMap {
+        RegionMap {
+            popup: Some(PopupRegion {
+                rect: Rect::new(20, 3, 30, 6),
+                items: vec![
+                    (0, Rect::new(21, 4, 28, 1)),
+                    // entry 1 is a separator: no rect, deliberately
+                    (2, Rect::new(21, 6, 28, 1)),
+                ],
+            }),
+            ..map()
+        }
+    }
+
+    #[test]
+    fn an_open_menu_out_ranks_every_other_region() {
+        let map = map_with_popup();
+        // Over the tree, a tab strip, a grid and a splitter alike: all
+        // dismissals, never a click on what lies underneath.
+        for (col, row) in [(1, 1), (41, 0), (41, 2), (60, 7)] {
+            assert_eq!(map.hit(col, row), Hit::PopupOutside, "at {col},{row}");
+        }
+        // And the menu's own rows resolve to entry indices.
+        assert_eq!(map.hit(21, 4), Hit::PopupItem { index: 0 });
+        assert_eq!(map.hit(48, 6), Hit::PopupItem { index: 2 });
+    }
+
+    #[test]
+    fn inside_the_menu_borders_and_separators_are_inert_not_dismissals() {
+        let map = map_with_popup();
+        assert_eq!(map.hit(20, 3), Hit::PopupInert, "top-left border");
+        assert_eq!(map.hit(21, 5), Hit::PopupInert, "the separator row");
+        assert_eq!(map.hit(49, 8), Hit::PopupInert, "bottom-right border");
+        // One cell outside the rect is a dismissal.
+        assert_eq!(map.hit(50, 5), Hit::PopupOutside);
+        assert_eq!(map.hit(19, 5), Hit::PopupOutside);
+    }
+
+    #[test]
+    fn without_a_popup_the_other_regions_are_reached_exactly_as_before() {
+        let map = map();
+        assert_eq!(map.hit(21, 4), Hit::Tree { row: 8 });
+        assert!(matches!(map_with_popup().hit(21, 4), Hit::PopupItem { .. }));
+    }
+
     #[test]
     fn drags_are_clamped_to_the_region_they_started_in() {
         let map = map();
@@ -526,7 +635,16 @@ mod tests {
             TreeClick::ToggleMark,
             "a modifier beats the click count"
         );
-        assert_eq!(classify_tree_click(Right, none, 2), TreeClick::Focus);
+        assert_eq!(classify_tree_click(Right, none, 2), TreeClick::ContextMenu);
+        // Contract §6: modifiers never change what the right button means,
+        // because different terminals forward different ones.
+        for mods in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(classify_tree_click(Right, mods, 1), TreeClick::ContextMenu);
+        }
         assert_eq!(
             classify_tree_click(Middle, KeyModifiers::SHIFT, 1),
             TreeClick::Focus
