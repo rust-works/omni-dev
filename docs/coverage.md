@@ -81,8 +81,17 @@ the diff touches**. Coverage is measured by two independent instrumented runs
 (baseline vs head), so lines in untouched files can flip covered↔uncovered purely
 from run-to-run variance and surface as phantom deltas. Genuine cross-file
 effects still surface via a magnitude-gated "notable unchanged" note. Pass
-`--all-files` to restore the unscoped (noisier) report. Patch coverage and the
-total are unaffected by this scoping.
+`--all-files` to restore the unscoped (noisier) report. Patch coverage is
+unaffected by this scoping.
+
+The **headline total** applies the same tolerance the per-file sections do: a
+move smaller than 0.05 pp renders neutral (`⚪`), and the direction emoji is
+taken from the *rounded* value that is printed beside it, so a delta displayed
+as `0 pp` is never painted red or green. When the total does move but no
+per-file row and no "unchanged files also moved" entry accounts for it, the
+headline is annotated `_(not attributable to this diff)_` — the move is then, by
+construction, cross-run variance spread across files rather than an effect of
+the PR. The percentage itself is always the real measured value.
 
 ## Path normalisation
 
