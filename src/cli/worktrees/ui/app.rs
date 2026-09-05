@@ -119,8 +119,26 @@ impl PromptKind {
 fn palette_entries(targets: &[Target]) -> Vec<popup::MenuItem> {
     actions::applicable_actions(targets)
         .into_iter()
-        .map(|(action, label)| popup::MenuItem { action, label })
+        .map(|(action, label)| popup::MenuItem::action(action, label))
         .collect()
+}
+
+/// The applicable actions as menu entries, with a separator between each
+/// pair of groups. `applicable_action_groups` drops empty groups, so this can
+/// never emit a leading, trailing or doubled rule.
+fn grouped_menu_entries(targets: &[Target]) -> Vec<popup::MenuEntry> {
+    let mut entries = Vec::new();
+    for group in actions::applicable_action_groups(targets) {
+        if !entries.is_empty() {
+            entries.push(popup::MenuEntry::Separator);
+        }
+        entries.extend(
+            group.into_iter().map(|(action, label)| {
+                popup::MenuEntry::Item(popup::MenuItem::action(action, label))
+            }),
+        );
+    }
+    entries
 }
 
 /// Filters palette entries by a case-insensitive substring of their label.
@@ -255,7 +273,7 @@ pub async fn run(
                         dirty = true;
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
-                        if handle_mouse(&mut app, &view, mouse) {
+                        if handle_mouse(&mut app, &view, &dispatcher, mouse).await {
                             dirty = true;
                         }
                     }
@@ -460,6 +478,9 @@ fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
         .map(|r| super::layout::boundary_row(r.body))
         .collect();
     app.regions = RegionMap {
+        // Filled in by `draw_popups` below, which is the pass that knows
+        // where the menu actually landed.
+        popup: None,
         tree: Block::default().borders(Borders::ALL).inner(areas.tree),
         tree_offset: app.tree.offset,
         groups: group_rects
@@ -476,7 +497,8 @@ fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
             .map_or((0, 0), |a| (a.x, a.x.saturating_add(a.width))),
     };
     render::draw_status_bar(frame, areas.status, view, &app.tree, &status_hint(app));
-    draw_popups(frame, app);
+    let area = frame.area();
+    app.regions.popup = draw_popups(frame, area, app);
 }
 
 /// Tells the hub which worktree rows are actually on screen, so ahead/behind
@@ -527,8 +549,10 @@ fn status_hint(app: &App) -> String {
     }
 }
 
-fn draw_popups(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+/// Draws whichever popup is open, and returns the hit map for it when that
+/// popup takes the mouse (see [`popup_mouse_enabled`]). Every other popup
+/// returns `None` and so stays inert, exactly as before #1602.
+fn draw_popups(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Option<mouse::PopupRegion> {
     if app.quit_confirm {
         let modal = popup::ConfirmModal {
             prompt: actions::ConfirmPrompt {
@@ -540,7 +564,7 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
             },
         };
         popup::draw_confirm_modal(frame, area, &modal);
-        return;
+        return None;
     }
     if let Some(prompt) = &app.prompt {
         popup::draw_prompt(
@@ -550,11 +574,10 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
             &prompt.input,
             &prompt.status,
         );
-        return;
+        return None;
     }
-    if let Some(menu) = &app.menu {
-        popup::draw_action_menu(frame, area, menu);
-        return;
+    if let Some(menu) = &mut app.menu {
+        return Some(popup::draw_menu(frame, area, menu));
     }
     match &app.relocate {
         Some(RelocateStep::PickSession {
@@ -574,7 +597,7 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
                 .collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             popup::draw_list_popup(frame, area, "Move which Claude session?", &refs, *selected);
-            return;
+            return None;
         }
         Some(RelocateStep::PickDestination {
             candidates,
@@ -584,7 +607,7 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
             let labels: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             popup::draw_list_popup(frame, area, "Move to which worktree?", &refs, *selected);
-            return;
+            return None;
         }
         Some(RelocateStep::Confirm { prompt, .. }) => {
             popup::draw_confirm_modal(
@@ -594,7 +617,7 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
                     prompt: prompt.clone(),
                 },
             );
-            return;
+            return None;
         }
         None => {}
     }
@@ -607,6 +630,7 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
             },
         );
     }
+    None
 }
 
 fn relative_mtime(modified: std::time::SystemTime) -> String {
@@ -618,10 +642,34 @@ fn relative_mtime(modified: std::time::SystemTime) -> String {
 
 // --- Mouse handling ---------------------------------------------------------
 
+/// Whether the popup currently open takes the mouse.
+///
+/// The Phase 4a rule was "popups are chrome and chrome is inert". #1602
+/// narrows that to exactly one exception — a menu you cannot click is not a
+/// menu — and this predicate *is* that exception, so which popups are
+/// clickable stays one legible decision rather than a scatter of
+/// `is_some()` checks. Everything else keeps the old behaviour on purpose:
+/// the confirm modal's keyboard-only `y`/`n` is a feature, not an oversight,
+/// since it gates destructive actions.
+fn popup_mouse_enabled(app: &App) -> bool {
+    app.menu.is_some()
+        && !app.quit_confirm
+        && app.prompt.is_none()
+        && app.relocate.is_none()
+        && !matches!(app.flow, ActionFlow::AwaitingConfirm { .. })
+}
+
 /// Handles one mouse event under the contract in `mouse.rs`. Returns
-/// whether a redraw is needed. Popups are chrome, so the mouse is inert
-/// while one is open.
-fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> bool {
+/// whether a redraw is needed.
+async fn handle_mouse(
+    app: &mut App,
+    view: &WorktreesViewModel,
+    dispatcher: &Dispatcher,
+    mouse: MouseEvent,
+) -> bool {
+    if popup_mouse_enabled(app) {
+        return handle_menu_mouse(app, view, dispatcher, mouse).await;
+    }
     if app.quit_confirm
         || app.menu.is_some()
         || app.prompt.is_some()
@@ -648,7 +696,10 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                     app.drag = DragOrigin::Splitter { index };
                     false
                 }
-                Hit::Chrome => false,
+                // The popup arms are unreachable here: `popup_mouse_enabled`
+                // took every event while a menu was open, and with no menu
+                // the map has no popup region to hit.
+                Hit::PopupItem { .. } | Hit::PopupInert | Hit::PopupOutside | Hit::Chrome => false,
             }
         }
         MouseEventKind::Drag(button) => match app.drag {
@@ -722,7 +773,11 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                         }
                     }
                 }
-                Hit::Splitter { .. } | Hit::Chrome => false,
+                Hit::PopupItem { .. }
+                | Hit::PopupInert
+                | Hit::PopupOutside
+                | Hit::Splitter { .. }
+                | Hit::Chrome => false,
             }
         }
         MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
@@ -730,6 +785,115 @@ fn handle_mouse(app: &mut App, view: &WorktreesViewModel, mouse: MouseEvent) -> 
                 forward_to_child(app, group, mouse.kind, mods, (col, row));
             }
             false
+        }
+    }
+}
+
+/// Handles one mouse event while a context menu is open (contract §7: the
+/// menu is modal over what it covers and inert beyond it).
+///
+/// Every event here is **consumed** — none of them reaches the region under
+/// the menu, including the click that dismisses it.
+async fn handle_menu_mouse(
+    app: &mut App,
+    view: &WorktreesViewModel,
+    dispatcher: &Dispatcher,
+    mouse: MouseEvent,
+) -> bool {
+    // A menu that has not been drawn yet has no region, so every position is
+    // "outside" it. Without this a click before the first frame would arm the
+    // menu instead of dismissing it.
+    let hit = if app.regions.popup.is_some() {
+        app.regions.hit(mouse.column, mouse.row)
+    } else {
+        Hit::PopupOutside
+    };
+    match mouse.kind {
+        // Hover follows the pointer, as every other menu on the platform
+        // does — but only redraws when the highlight actually moves, or the
+        // UI would repaint at pointer-motion rate.
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            let Hit::PopupItem { index } = hit else {
+                return false;
+            };
+            let Some(menu) = app.menu.as_mut() else {
+                return false;
+            };
+            if menu.selected == index {
+                return false;
+            }
+            menu.select_index(index)
+        }
+        MouseEventKind::Down(_) => {
+            if matches!(hit, Hit::PopupOutside) {
+                app.menu = None;
+                return true;
+            }
+            // Arm on a press that starts *inside* the menu. The press that
+            // opened the menu happened outside it, so its release cannot
+            // invoke anything — see `ActionMenu::armed`.
+            if let Some(menu) = app.menu.as_mut() {
+                menu.armed = true;
+                if let Hit::PopupItem { index } = hit {
+                    menu.select_index(index);
+                }
+            }
+            true
+        }
+        MouseEventKind::Up(_) => {
+            let Hit::PopupItem { index } = hit else {
+                return false;
+            };
+            let Some(menu) = app.menu.as_mut() else {
+                return false;
+            };
+            if !menu.armed {
+                return false; // the opening click's own release
+            }
+            if !menu.select_index(index) {
+                return false;
+            }
+            let Some(command) = menu.selected_command() else {
+                return true; // a disabled item: highlighted, not invoked
+            };
+            invoke_menu_command(app, view, dispatcher, command).await;
+            true
+        }
+        // The wheel scrolls the menu rather than the pane beneath it.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = mouse.kind == MouseEventKind::ScrollUp;
+            if let Some(menu) = app.menu.as_mut() {
+                menu.move_selection(if up { -1 } else { 1 });
+            }
+            true
+        }
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => false,
+    }
+}
+
+/// Dispatches one menu command and closes the menu — the single path shared
+/// by `Enter` and by a mouse click, so the two entry points cannot drift.
+async fn invoke_menu_command(
+    app: &mut App,
+    view: &WorktreesViewModel,
+    dispatcher: &Dispatcher,
+    command: popup::MenuCommand,
+) {
+    app.menu = None;
+    match command {
+        popup::MenuCommand::Action(
+            action @ (ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere),
+        ) => {
+            let mode = if action == ActionKind::MoveClaudeSessionHere {
+                RelocationMode::Move
+            } else {
+                RelocationMode::Copy
+            };
+            start_relocate_flow(app, view, mode);
+        }
+        popup::MenuCommand::Action(action) => {
+            let targets = app.tree.targets(view);
+            run_action(app, dispatcher, action, targets).await;
         }
     }
 }
@@ -809,6 +973,25 @@ fn tree_mouse_down(
         TreeClick::Open => {
             app.tree.set_cursor(tree_row, rows);
             open_tab_for_cursor(app, view, TabKind::Shell, false);
+        }
+        TreeClick::ContextMenu => {
+            // The universal convention: right-clicking inside the marked set
+            // acts on the whole set; right-clicking outside it moves the
+            // cursor and acts on that row alone. Both end at
+            // `tree.targets`, so `applicable_actions` filters unchanged.
+            let inside_marks =
+                row_path(view, tree_row).is_some_and(|path| app.tree.marked.contains(&path));
+            if !inside_marks {
+                app.tree.set_cursor(tree_row, rows);
+                app.tree.clear_marks();
+            }
+            let targets = app.tree.targets(view);
+            let mut menu = popup::ActionMenu::with_entries(
+                if inside_marks { "Marked" } else { "Actions" },
+                grouped_menu_entries(&targets),
+            );
+            menu.anchor = popup::Anchor::At { col, row };
+            app.menu = Some(menu);
         }
     }
     if button == MouseButton::Left {
@@ -937,23 +1120,11 @@ async fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => menu.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => menu.move_selection(1),
             KeyCode::Esc => app.menu = None,
+            KeyCode::Home => menu.select_end(false),
+            KeyCode::End => menu.select_end(true),
             KeyCode::Enter => {
-                if let Some(action) = menu.selected_action() {
-                    app.menu = None;
-                    match action {
-                        ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere => {
-                            let mode = if action == ActionKind::MoveClaudeSessionHere {
-                                RelocationMode::Move
-                            } else {
-                                RelocationMode::Copy
-                            };
-                            start_relocate_flow(app, view, mode);
-                        }
-                        _ => {
-                            let targets = app.tree.targets(view);
-                            run_action(app, dispatcher, action, targets).await;
-                        }
-                    }
+                if let Some(command) = menu.selected_command() {
+                    invoke_menu_command(app, view, dispatcher, command).await;
                 }
             }
             _ => {}
@@ -1025,19 +1196,15 @@ async fn handle_key(
         KeyCode::Enter => open_tab_for_cursor(app, view, TabKind::Shell, false),
         KeyCode::Char('a') => {
             let targets = app.tree.targets(view);
-            let items = actions::applicable_actions(&targets)
-                .into_iter()
-                .map(|(action, label)| popup::MenuItem { action, label })
-                .collect();
-            app.menu = Some(popup::ActionMenu::new(items));
+            app.menu = Some(popup::ActionMenu::with_entries(
+                "Actions",
+                grouped_menu_entries(&targets),
+            ));
         }
         KeyCode::Char('c') => {
             let items = row_colors::KNOWN_ROW_COLORS
                 .iter()
-                .map(|&color| popup::MenuItem {
-                    action: ActionKind::SetRowColor(color),
-                    label: color,
-                })
+                .map(|&color| popup::MenuItem::action(ActionKind::SetRowColor(color), color))
                 .collect();
             app.menu = Some(popup::ActionMenu::new(items));
         }
@@ -1100,7 +1267,7 @@ async fn handle_prompt_key(app: &mut App, view: &WorktreesViewModel, key: KeyEve
                 let matches = filter_palette(palette_entries(&targets), &query);
                 match matches.first() {
                     Some(item) => {
-                        let action = item.action;
+                        let popup::MenuCommand::Action(action) = item.command;
                         if matches!(
                             action,
                             ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere
@@ -1268,6 +1435,14 @@ async fn run_action(
             app.flow = ActionFlow::Failed { error: reason };
         }
     }
+}
+
+/// The path of tree row `index`, or `None` when it is past the last row.
+fn row_path(view: &WorktreesViewModel, index: usize) -> Option<PathBuf> {
+    TreeState::visible_rows(view)
+        .get(index)?
+        .path(view)
+        .map(std::path::Path::to_path_buf)
 }
 
 /// The cursor row's path — a repo root or a worktree path — regardless of
@@ -1969,7 +2144,7 @@ mod tests {
 
     #[tokio::test]
     async fn mouse_on_the_tree_focuses_marks_ranges_scrolls_and_ignores_chrome() {
-        let (mut app, _dispatcher, _commands) = test_app();
+        let (mut app, dispatcher, _commands) = test_app();
         let view = view_with(&["/repo/a", "/repo/b", "/repo/c"]); // 4 rows with the header
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         draw_into(&mut terminal, &view, &mut app);
@@ -1979,104 +2154,156 @@ mod tests {
         let down = |row: u16, mods| mouse_at(MouseEventKind::Down(MouseButton::Left), 5, row, mods);
 
         // The border is chrome; a click there does nothing.
-        assert!(!handle_mouse(&mut app, &view, down(0, none)));
+        assert!(!handle_mouse(&mut app, &view, &dispatcher, down(0, none)).await);
         // A click on row 2 moves the cursor there.
-        assert!(handle_mouse(&mut app, &view, down(tree.y + 2, none)));
+        assert!(handle_mouse(&mut app, &view, &dispatcher, down(tree.y + 2, none)).await);
         assert_eq!(app.tree.cursor, 2);
         assert_eq!(app.drag, DragOrigin::Tree { anchor: 2 });
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Up(MouseButton::Left), 5, 3, none)
-        ));
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Up(MouseButton::Left), 5, 3, none)
+            )
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::None);
         assert!(app.tree.marked.is_empty(), "a click alone marks nothing");
 
         // ^-click toggles a mark; ⇧-click marks the range from the cursor.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            down(tree.y + 3, KeyModifiers::CONTROL)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                down(tree.y + 3, KeyModifiers::CONTROL)
+            )
+            .await
+        );
         assert!(app.tree.marked.contains(&PathBuf::from("/repo/c")));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            down(tree.y + 1, KeyModifiers::SHIFT)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                down(tree.y + 1, KeyModifiers::SHIFT)
+            )
+            .await
+        );
         assert_eq!(app.tree.cursor, 1);
         assert_eq!(app.tree.marked.len(), 3, "rows 1..=3 marked");
         app.tree.clear_marks();
 
         // A drag from row 1 to below the pane range-marks down to the last
         // row and stops there (clamped to the tree).
-        assert!(handle_mouse(&mut app, &view, down(tree.y + 1, none)));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Drag(MouseButton::Left), 200, 200, none)
-        ));
+        assert!(handle_mouse(&mut app, &view, &dispatcher, down(tree.y + 1, none)).await);
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), 200, 200, none)
+            )
+            .await
+        );
         assert_eq!(app.tree.cursor, 3);
         assert_eq!(app.tree.marked.len(), 3);
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             mouse_at(MouseEventKind::Up(MouseButton::Left), 200, 200, none),
-        );
+        )
+        .await;
 
         // The wheel moves the cursor; below the last row only focus changes.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::ScrollUp, 5, tree.y, none)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::ScrollUp, 5, tree.y, none)
+            )
+            .await
+        );
         assert_eq!(app.tree.cursor, 2);
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::ScrollDown, 5, tree.y, none)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::ScrollDown, 5, tree.y, none)
+            )
+            .await
+        );
         assert_eq!(app.tree.cursor, 3);
-        assert!(handle_mouse(&mut app, &view, down(tree.y + 8, none)));
+        assert!(handle_mouse(&mut app, &view, &dispatcher, down(tree.y + 8, none)).await);
         assert_eq!(app.tree.cursor, 3);
         // A right-click focuses without starting a drag.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Down(MouseButton::Right), 5, tree.y, none)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Down(MouseButton::Right), 5, tree.y, none)
+            )
+            .await
+        );
         assert_eq!(app.tree.cursor, 0);
         assert_eq!(app.drag, DragOrigin::None);
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Drag(MouseButton::Right), 5, 3, none)
-        ));
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Drag(MouseButton::Right), 5, 3, none)
+            )
+            .await
+        );
         // Moves and horizontal wheel are inert with no terminal.
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Moved, 5, 3, none)
-        ));
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::ScrollLeft, 5, 3, none)
-        ));
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Moved, 5, 3, none)
+            )
+            .await
+        );
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::ScrollLeft, 5, 3, none)
+            )
+            .await
+        );
 
-        // With a popup open the mouse is inert.
+        // #1602 contract §7: a menu takes the mouse. A click outside it
+        // dismisses it, and that click is *consumed* — it must not also move
+        // the cursor to the row it landed on.
         app.menu = Some(popup::ActionMenu::new(Vec::new()));
-        assert!(!handle_mouse(&mut app, &view, down(tree.y, none)));
-        app.menu = None;
+        let cursor_before = app.tree.cursor;
+        assert!(handle_mouse(&mut app, &view, &dispatcher, down(tree.y, none)).await);
+        assert!(app.menu.is_none(), "the outside click dismissed the menu");
+        assert_eq!(
+            app.tree.cursor, cursor_before,
+            "and was consumed, not applied to the row underneath"
+        );
+
+        // Every *other* popup stays inert, exactly as before: the confirm
+        // modal's keyboard-only y/n is a feature, not an oversight.
         app.quit_confirm = true;
-        assert!(!handle_mouse(&mut app, &view, down(tree.y, none)));
+        assert!(!handle_mouse(&mut app, &view, &dispatcher, down(tree.y, none)).await);
         app.quit_confirm = false;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_double_click_on_a_row_opens_a_shell_tab_there() {
-        let (mut app, _dispatcher, _commands) = test_app();
+        let (mut app, dispatcher, _commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let view = view_with(&[&dir.path().to_string_lossy()]);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -2088,18 +2315,20 @@ mod tests {
             y,
             KeyModifiers::NONE,
         );
-        handle_mouse(&mut app, &view, click);
+        handle_mouse(&mut app, &view, &dispatcher, click).await;
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             mouse_at(
                 MouseEventKind::Up(MouseButton::Left),
                 5,
                 y,
                 KeyModifiers::NONE,
             ),
-        );
-        handle_mouse(&mut app, &view, click);
+        )
+        .await;
+        handle_mouse(&mut app, &view, &dispatcher, click).await;
         assert_eq!(app.tree.cursor, 1);
         // Either the login shell spawned (and took focus) or, on a minimal
         // image, the failure is reported — never silence.
@@ -2116,7 +2345,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn mouse_on_the_terminal_selects_by_drag_word_and_line_and_scrolls() {
-        let (mut app, _dispatcher, _commands) = test_app();
+        let (mut app, dispatcher, _commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let view = view_with(&[&dir.path().to_string_lossy()]);
         let tab = scripted_tab(
@@ -2142,60 +2371,88 @@ mod tests {
         // Click focuses the terminal; drag selects; the drag is clamped so
         // overshooting the pane still ends on its last cell.
         app.focus = Focus::Tree;
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Down(MouseButton::Left), 0, 0)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Down(MouseButton::Left), 0, 0)
+            )
+            .await
+        );
         assert_eq!(app.focus, Focus::Terminal);
         assert_eq!(app.drag, DragOrigin::Terminal { group: 0 });
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Drag(MouseButton::Left), 4, 0)
-        ));
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Up(MouseButton::Left), 4, 0)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Drag(MouseButton::Left), 4, 0)
+            )
+            .await
+        );
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Up(MouseButton::Left), 4, 0)
+            )
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::None);
         assert_eq!(
             only_tab(&app).selection_to_string().as_deref(),
             Some("hello")
         );
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Down(MouseButton::Left), 0, 1)
-        ));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Drag(MouseButton::Left), 0, 0, none)
-        ));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Drag(MouseButton::Left), 500, 500, none)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Down(MouseButton::Left), 0, 1)
+            )
+            .await
+        );
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), 0, 0, none)
+            )
+            .await
+        );
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), 500, 500, none)
+            )
+            .await
+        );
         let clamped = only_tab(&app).selection_to_string().unwrap();
         assert!(clamped.starts_with("second line"), "got {clamped:?}");
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             at(MouseEventKind::Up(MouseButton::Left), 0, 1),
-        );
+        )
+        .await;
 
         // Double-click selects the word, triple-click the line.
         let dbl = at(MouseEventKind::Down(MouseButton::Left), 7, 0);
-        handle_mouse(&mut app, &view, dbl);
+        handle_mouse(&mut app, &view, &dispatcher, dbl).await;
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             at(MouseEventKind::Up(MouseButton::Left), 7, 0),
-        );
-        handle_mouse(&mut app, &view, dbl);
+        )
+        .await;
+        handle_mouse(&mut app, &view, &dispatcher, dbl).await;
         assert_eq!(
             only_tab(&app).selection_to_string().as_deref(),
             Some("world")
@@ -2203,17 +2460,21 @@ mod tests {
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             at(MouseEventKind::Up(MouseButton::Left), 7, 0),
-        );
-        handle_mouse(&mut app, &view, dbl);
+        )
+        .await;
+        handle_mouse(&mut app, &view, &dispatcher, dbl).await;
         // A line selection's text carries the line's own trailing newline.
         let line = only_tab(&app).selection_to_string();
         assert_eq!(line.as_deref().map(str::trim_end), Some("hello world"));
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             at(MouseEventKind::Up(MouseButton::Left), 7, 0),
-        );
+        )
+        .await;
         draw_into(&mut terminal, &view, &mut app); // the selection renders
                                                    // alt-c copies (OSC 52 fallback in CI) and consumes the selection.
         handle_chrome_key(&mut app, &view, ChromeKey::Copy);
@@ -2222,39 +2483,59 @@ mod tests {
 
         // The wheel scrolls the emulator's history (no child mouse mode, not
         // the alt screen); a middle click neither pastes nor selects.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::ScrollUp, 1, 1)
-        ));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::ScrollDown, 1, 1)
-        ));
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Down(MouseButton::Middle), 1, 1)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::ScrollUp, 1, 1)
+            )
+            .await
+        );
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::ScrollDown, 1, 1)
+            )
+            .await
+        );
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Down(MouseButton::Middle), 1, 1)
+            )
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::None);
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::Moved, 1, 1)
-        ));
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            at(MouseEventKind::ScrollRight, 1, 1)
-        ));
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::Moved, 1, 1)
+            )
+            .await
+        );
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                at(MouseEventKind::ScrollRight, 1, 1)
+            )
+            .await
+        );
         app.close_tab();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_that_asked_for_the_mouse_receives_it_unless_alt_is_held() {
-        let (mut app, _dispatcher, _commands) = test_app();
+        let (mut app, dispatcher, _commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let view = view_with(&[&dir.path().to_string_lossy()]);
         // Enable SGR click reporting, then print the first nine bytes the
@@ -2273,61 +2554,79 @@ mod tests {
         let none = KeyModifiers::NONE;
 
         // Alt-click: the TUI keeps the mouse and starts a selection.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Down(MouseButton::Left),
-                grid.x,
-                grid.y,
-                KeyModifiers::ALT
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    grid.x,
+                    grid.y,
+                    KeyModifiers::ALT
+                )
             )
-        ));
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::Terminal { group: 0 });
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             mouse_at(
                 MouseEventKind::Up(MouseButton::Left),
                 grid.x,
                 grid.y,
                 KeyModifiers::ALT,
             ),
-        );
+        )
+        .await;
 
         // A plain click goes to the child, as does its release and any
         // motion in between; the child prints what it got.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Down(MouseButton::Left),
-                grid.x,
-                grid.y,
-                none
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    grid.x,
+                    grid.y,
+                    none
+                )
             )
-        ));
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::Child { group: 0 });
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Drag(MouseButton::Left),
-                grid.x + 1,
-                grid.y,
-                none
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    grid.x + 1,
+                    grid.y,
+                    none
+                )
             )
-        ));
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Up(MouseButton::Left),
-                grid.x + 1,
-                grid.y,
-                none
+            .await
+        );
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Up(MouseButton::Left),
+                    grid.x + 1,
+                    grid.y,
+                    none
+                )
             )
-        ));
+            .await
+        );
         assert_eq!(app.drag, DragOrigin::None);
         assert!(
             wait_until(|| {
@@ -2340,11 +2639,15 @@ mod tests {
             buffer_text(&terminal)
         );
         // A wheel notch is forwarded too (no redraw needed for that).
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::ScrollUp, grid.x, grid.y, none)
-        ));
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::ScrollUp, grid.x, grid.y, none)
+            )
+            .await
+        );
         app.close_tab();
     }
 
@@ -2468,7 +2771,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_tab_strip_activates_closes_and_the_splitter_resizes() {
-        let (mut app, _dispatcher, _commands) = test_app();
+        let (mut app, dispatcher, _commands) = test_app();
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path().to_path_buf();
         let view = view_with(&[&here.to_string_lossy()]);
@@ -2490,26 +2793,34 @@ mod tests {
         let spans = app.regions.groups[0].tab_spans.clone();
         assert_eq!(spans.len(), 2, "two tabs on the strip");
         let none = KeyModifiers::NONE;
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Down(MouseButton::Left),
-                spans[0].0,
-                strip.y,
-                none
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    spans[0].0,
+                    strip.y,
+                    none
+                )
             )
-        ));
+            .await
+        );
         assert_eq!(app.panes.focused, 0);
         assert_eq!(app.panes.groups[0].active, 0);
         assert_eq!(app.focus, Focus::Terminal);
 
         // The wheel over a strip cycles that group's tabs.
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::ScrollDown, spans[0].0, strip.y, none)
-        ));
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::ScrollDown, spans[0].0, strip.y, none)
+            )
+            .await
+        );
         assert_eq!(app.panes.groups[0].active, 1);
 
         // Dragging the splitter up shrinks the first group; only the pair
@@ -2518,22 +2829,30 @@ mod tests {
         let before = app.panes.weights.clone();
         // Pressing on a splitter changes nothing visible — it only arms the
         // drag — so it asks for no redraw.
-        assert!(!handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(MouseEventKind::Down(MouseButton::Left), 60, splitter, none)
-        ));
-        assert_eq!(app.drag, DragOrigin::Splitter { index: 0 });
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Drag(MouseButton::Left),
-                60,
-                splitter - 4,
-                none
+        assert!(
+            !handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(MouseEventKind::Down(MouseButton::Left), 60, splitter, none)
             )
-        ));
+            .await
+        );
+        assert_eq!(app.drag, DragOrigin::Splitter { index: 0 });
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    60,
+                    splitter - 4,
+                    none
+                )
+            )
+            .await
+        );
         assert_ne!(app.panes.weights, before, "the drag moved the boundary");
         draw_into(&mut terminal, &view, &mut app);
         let rects = app.panes.arrange(app.terminal_area.unwrap());
@@ -2541,13 +2860,15 @@ mod tests {
         handle_mouse(
             &mut app,
             &view,
+            &dispatcher,
             mouse_at(
                 MouseEventKind::Up(MouseButton::Left),
                 60,
                 splitter - 4,
                 none,
             ),
-        );
+        )
+        .await;
         assert_eq!(app.drag, DragOrigin::None);
 
         // A middle click on a tab closes just that tab.
@@ -2555,16 +2876,20 @@ mod tests {
         let spans = app.regions.groups[0].tab_spans.clone();
         let strip_y = app.regions.groups[0].strip.y;
         let before = app.panes.groups[0].tabs.len();
-        assert!(handle_mouse(
-            &mut app,
-            &view,
-            mouse_at(
-                MouseEventKind::Down(MouseButton::Middle),
-                spans[0].0,
-                strip_y,
-                none
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Middle),
+                    spans[0].0,
+                    strip_y,
+                    none
+                )
             )
-        ));
+            .await
+        );
         assert_eq!(app.panes.groups[0].tabs.len(), before - 1);
 
         shutdown_all(&mut app);
@@ -2614,14 +2939,8 @@ mod tests {
     #[test]
     fn filter_palette_matches_case_insensitively_and_keeps_everything_when_empty() {
         let items = vec![
-            popup::MenuItem {
-                action: ActionKind::CopyDirectory,
-                label: "Copy Directory",
-            },
-            popup::MenuItem {
-                action: ActionKind::Focus,
-                label: "Focus Worktree",
-            },
+            popup::MenuItem::action(ActionKind::CopyDirectory, "Copy Directory"),
+            popup::MenuItem::action(ActionKind::Focus, "Focus Worktree"),
         ];
         assert_eq!(filter_palette(items.clone(), "").len(), 2);
         assert_eq!(filter_palette(items.clone(), "copy").len(), 1);
