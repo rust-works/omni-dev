@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::diff::{DiffModel, FileDiff};
-use super::markers::{FileMarkers, MarkerKind};
+use super::markers::{FileMarkers, MarkerKind, Region};
 use super::model::{CoverageReport, FileCoverage};
 
 /// A base-side → head-side line mapper used during indirect-change detection.
@@ -325,13 +325,19 @@ pub fn analyze_with_markers(
 /// region that is identical on both sides — the ordinary case for a region that
 /// neither moved nor changed — into a single `both` entry.
 fn applied_markers(markers: &Markers) -> Vec<AppliedMarker> {
+    // A region is "the same region" across revisions when its kind and reason
+    // match — *not* when its span does. Matching on the span would report a
+    // region that merely moved between the two revisions as two separate ones,
+    // which is exactly the case this whole design exists to absorb silently.
+    let same_region = |a: &Region, b: &Region| a.kind == b.kind && a.reason == b.reason;
+
     let mut applied: Vec<AppliedMarker> = Vec::new();
     for (path, file) in &markers.head {
         for region in &file.regions {
             let same_at_base = markers
                 .base
                 .get(path)
-                .is_some_and(|base| base.regions.iter().any(|other| other == region));
+                .is_some_and(|base| base.regions.iter().any(|other| same_region(other, region)));
             applied.push(AppliedMarker {
                 path: path.clone(),
                 kind: region.kind,
@@ -351,7 +357,7 @@ fn applied_markers(markers: &Markers) -> Vec<AppliedMarker> {
             let seen_at_head = markers
                 .head
                 .get(path)
-                .is_some_and(|head| head.regions.iter().any(|other| other == region));
+                .is_some_and(|head| head.regions.iter().any(|other| same_region(other, region)));
             if seen_at_head {
                 continue;
             }

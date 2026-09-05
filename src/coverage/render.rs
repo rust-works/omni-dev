@@ -221,15 +221,15 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
     if diff.has_baseline {
         render_delta_table(diff, &mut out);
         render_notable_unchanged(diff, &mut out);
-        render_markers(diff, &mut out);
     } else {
         out.push_str(
             "_No baseline available yet (first run, or the `main` baseline artifact was \
              missing). Per-file deltas will appear on PRs once a baseline has been published \
              from `main`._\n\n",
         );
-        render_markers(diff, &mut out);
     }
+    // Also without a baseline: `ignore` still shapes the total and the patch.
+    render_markers(diff, &mut out);
 
     render_patch_section(diff, opts, &mut out);
 
@@ -253,7 +253,9 @@ fn render_delta_table(diff: &CoverageDiff, out: &mut String) {
         .file_deltas
         .iter()
         .map(|fd| {
-            let delta = fd.before.map(|before| fd.after.unwrap_or(0.0) - before);
+            // `delta()` reads the `tolerate`-masked coverage, so a silenced flip
+            // does not produce a row; `after` stays the real displayed value.
+            let delta = fd.delta();
             Row {
                 path: fd.path.clone(),
                 before: fd.before,

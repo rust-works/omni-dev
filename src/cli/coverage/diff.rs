@@ -695,6 +695,193 @@ mod tests {
         }
     }
 
+    /// Builds a marker line. The introducer is assembled at runtime so this
+    /// file's own fixtures are not themselves markers when omni-dev scans its
+    /// own source — see `crate::coverage::markers::INTRODUCER`.
+    fn marked(kind: &str, reason: &str) -> String {
+        format!(
+            "// {} {kind} reason=\"{reason}\"",
+            crate::coverage::markers::INTRODUCER
+        )
+    }
+
+    /// Builds a repo whose `src/gated.rs` carries a marked region sitting at
+    /// **different line numbers on each side** — the property the whole design
+    /// exists for. Base has the region at lines 1-4; head prepends two lines,
+    /// moving it to 3-6. `kind` of `None` builds the unmarked control.
+    ///
+    /// The gated lines are covered at base and uncovered at head: exactly the
+    /// cross-runner-CPU flip the markers exist to silence.
+    fn repo_with_moved_marker_region(
+        kind: Option<&str>,
+    ) -> (TempDir, PathBuf, String, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let repo = Repository::init(&path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+
+        let (open, close) = match kind {
+            Some(kind) => (
+                marked(kind, "CPU-gated dispatch"),
+                format!("// {} end", crate::coverage::markers::INTRODUCER),
+            ),
+            None => (
+                "// an ordinary comment".to_string(),
+                "// another".to_string(),
+            ),
+        };
+        let base_src =
+            format!("{open}\nfn gated() {{}}\nfn also_gated() {{}}\n{close}\nfn plain() {{}}\n");
+        // Two extra lines above shift the whole region down by two.
+        let head_src = format!(
+            "// a new comment\n// and another\n{open}\nfn gated() {{}}\nfn also_gated() {{}}\n{close}\nfn plain() {{}}\n"
+        );
+
+        let commit = |files: &[(&str, &str)], parent: Option<git2::Oid>| {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for (name, content) in files {
+                let file = path.join(name);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            let parent = parent.map(|id| repo.find_commit(id).unwrap());
+            let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+                .unwrap()
+        };
+
+        let base = commit(&[("src/gated.rs", &base_src)], None);
+        commit(&[("src/gated.rs", &head_src)], Some(base));
+
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        let gated = workdir.join("src/gated.rs");
+
+        // Base: the two gated lines (2, 3) covered, `plain` (5) covered.
+        let base_lcov = workdir.join("base.lcov");
+        fs::write(
+            &base_lcov,
+            format!(
+                "SF:{}\nDA:2,4\nDA:3,4\nDA:5,1\nend_of_record\n",
+                gated.display()
+            ),
+        )
+        .unwrap();
+        // Head: the same two gated lines (now 4, 5) uncovered — a different
+        // runner CPU — and `plain` (now 7) still covered.
+        let head_lcov = workdir.join("head.lcov");
+        fs::write(
+            &head_lcov,
+            format!(
+                "SF:{}\nDA:4,0\nDA:5,0\nDA:7,1\nend_of_record\n",
+                gated.display()
+            ),
+        )
+        .unwrap();
+
+        (dir, workdir, base.to_string(), head_lcov, base_lcov)
+    }
+
+    /// End-to-end: a `tolerate` region read from each revision's own source, at
+    /// different line numbers on each side, masks the flip everywhere — headline
+    /// and per-file row — while the reported percentage stays the real measured
+    /// value, and the region is reported once, not once per revision.
+    #[test]
+    fn tolerate_marker_masks_a_flip_across_a_moved_region() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("tolerate"));
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+
+        assert!(
+            rendered.contains("Total: **33.33%**"),
+            "the displayed percentage must be the real one: {rendered}"
+        );
+        assert!(
+            rendered.contains("\u{26aa} 0 pp vs `main`"),
+            "the masked flip must not move the headline: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\u{1f534}"),
+            "nothing should be painted red: {rendered}"
+        );
+        assert!(
+            rendered.contains("0 ignored region(s), 1 tolerated region(s)"),
+            "a region that merely moved is one region, not two: {rendered}"
+        );
+        assert!(
+            rendered.contains("| `src/gated.rs` | `tolerate` | 3-6 | both |"),
+            "the span reported is the one observed at head: {rendered}"
+        );
+        assert!(
+            rendered.contains("CPU-gated dispatch"),
+            "the reason must be shown: {rendered}"
+        );
+    }
+
+    /// The control that proves the test above measures the marker and not a
+    /// coincidence: the same flip, unmarked, still moves the report.
+    #[test]
+    fn the_same_flip_moves_the_report_without_a_marker() {
+        let (_dir, repo, base, head_lcov, base_lcov) = repo_with_moved_marker_region(None);
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            rendered.contains("\u{1f534}"),
+            "an unmarked flip must still be reported: {rendered}"
+        );
+        assert!(!rendered.contains("region(s)"), "{rendered}");
+    }
+
+    /// `ignore` removes the lines from both reports, so they leave the
+    /// denominator entirely rather than being scored against the baseline.
+    #[test]
+    fn ignore_marker_removes_lines_from_both_reports() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("ignore"));
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let rendered = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            rendered.contains("Total: **100%**"),
+            "only the covered `plain` line should remain in the denominator: {rendered}"
+        );
+        assert!(rendered.contains("1 ignored region(s)"), "{rendered}");
+    }
+
+    /// A malformed marker fails the run loudly, naming the file and line: a
+    /// marker whose author believes it is silencing noise must never be a silent
+    /// no-op.
+    #[test]
+    fn a_malformed_marker_is_a_hard_error() {
+        let (_dir, repo, base, head_lcov, base_lcov) =
+            repo_with_moved_marker_region(Some("tolerate"));
+        // Strip the closing marker from the head worktree, leaving it open.
+        let gated = repo.join("src/gated.rs");
+        let source = fs::read_to_string(&gated).unwrap();
+        let end = format!("// {} end", crate::coverage::markers::INTRODUCER);
+        fs::write(&gated, source.replace(&end, "// not the end")).unwrap();
+
+        let mut cmd = command(head_lcov, &base);
+        cmd.baseline_report = Some(base_lcov);
+        let message = match cmd.run(Some(&repo)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unterminated region must fail the run"),
+        };
+        assert!(message.contains("src/gated.rs:3"), "{message}");
+        assert!(message.contains("unterminated"), "{message}");
+    }
+
     #[test]
     fn run_with_baseline_enables_delta() {
         let (_dir, repo, base) = repo_with_added_file();
