@@ -5,7 +5,7 @@
 //! live-updating view from the moment the data layer lands, matching the
 //! plan's "Phase 1: tree only ... supersedes `worktrees tree`" scope.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -17,17 +17,16 @@ use super::view_model::{
     WorktreeRow, WorktreesViewModel,
 };
 
-pub fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, tree: &TreeState) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-    draw_tree(frame, chunks[0], view, tree);
-    draw_status_bar(frame, chunks[1], view, tree);
-}
-
-fn draw_tree(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel, tree: &TreeState) {
+/// Draws the tree pane into `area`. The border is highlighted while the
+/// pane has keyboard focus (Phase 3 splits focus between the tree and a
+/// terminal tab).
+pub fn draw_tree_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &WorktreesViewModel,
+    tree: &TreeState,
+    focused: bool,
+) {
     let mut items: Vec<ListItem> = Vec::new();
     if view.repos.is_empty() {
         items.push(ListItem::new("No repositories open."));
@@ -60,8 +59,18 @@ fn draw_tree(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel, tree:
     if !items.is_empty() {
         state.select(Some(tree.cursor.min(items.len() - 1)));
     }
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("WORKTREES"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title("WORKTREES"),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -181,7 +190,15 @@ fn sessions_summary(sessions: &[SessionBadge]) -> String {
     format!("{} session(s) ({model}, {source})", sessions.len())
 }
 
-fn draw_status_bar(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel, tree: &TreeState) {
+/// Draws the one-line status bar: feed states, mark count, and `hint` —
+/// the focus-dependent key help (or a transient notice) the app supplies.
+pub fn draw_status_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &WorktreesViewModel,
+    tree: &TreeState,
+    hint: &str,
+) {
     let closed = if view.show_closed { "shown" } else { "hidden" };
     let marked = if tree.marked.is_empty() {
         String::new()
@@ -189,8 +206,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, area: Rect, view: &WorktreesViewModel,
         format!("{} marked   ", tree.marked.len())
     };
     let status = format!(
-        "{marked}worktrees: {}  sessions: {}  closed worktrees {closed}   \
-         space mark  a actions  c/C colour  q quit",
+        "{marked}worktrees: {}  sessions: {}  closed {closed}   {hint}",
         feed_status_label(view.worktrees_status),
         feed_status_label(view.sessions_status),
     );

@@ -395,7 +395,7 @@ does, and the same row-severity ranking `worktrees tree`'s glyph table follows
 (the tree view's `rowColorId`: red > yellow > green > muted). `q`/`Esc`/Ctrl-C
 quits and always restores the terminal, even on an error path.
 
-Phase 2 (this release) adds row navigation/marking (`↑`/`↓`/`j`/`k`, `space`
+Phase 2 added row navigation/marking (`↑`/`↓`/`j`/`k`, `space`
 to mark), an action menu (`a`) filtered to the current selection and grouped
 in the tree view's own `0_open`/`1_pr`/`2_claude`/`3_copy`/`9_close` order, a
 row-colour picker (`c` to set, `C` to clear), and five daemon-free parity
@@ -408,9 +408,26 @@ to the way the tree view's version does — `src/sessions/relocate.rs`), and
 **Focus/Open Worktree** (wraps the daemon's `open` op, identical to `worktrees
 focus`). **Close Worktree**/**Close Window** are the two-phase check→confirm→
 execute flow, fanned out client-side across every marked target since
-`close`'s wire payload isn't batched. Embedded terminals, tabs/splits, mouse
-handling and the rest of the tree view's VS Code-parity surface land in later
-phases.
+`close`'s wire payload isn't batched.
+
+Phase 3 (this release) hosts **one embedded terminal tab** on the right
+([ADR-0072](adrs/adr-0072.md)): `enter` or `alt-t` on a worktree row opens the
+user's shell in it, `alt-⇧t` opens `claude` there — launched through
+`omni-dev claude-wrap`, so the session reports *authoritative* state to the
+daemon ([ADR-0057](adrs/adr-0057.md)) — and the tree's `here` cue lights for
+that worktree, computed locally with no daemon registration. Focus decides
+who gets a key: a focused terminal takes everything verbatim (including
+`Esc`) except `Alt`-chords — `alt-e` back to the tree, `alt-l` to the
+terminal, `alt-w` close the tab, `alt-c` copy the selection, `⇧PgUp`/`⇧PgDn`
+scrollback — so there is no tmux-style prefix. Emulation is
+`alacritty_terminal` in-process: the tab dies with the UI (run the UI inside
+tmux for persistence), `TERM`/`COLORTERM` are set explicitly per spawn, and
+the emulator's own query replies are written back to the child, both of which
+a real interactive child (`vim`, `claude`) needs. The kitty keyboard protocol
+is deliberately not advertised this phase (legacy xterm key encoding, as
+Terminal.app would). PTY contents are never logged. `q` asks before quitting
+while a child is live. Tabs/splits, the mouse/selection contract and the rest
+of the tree view's VS Code-parity surface land in later phases.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests

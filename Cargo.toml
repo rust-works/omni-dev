@@ -55,6 +55,14 @@ ratatui = { version = "0.30", features = ["crossterm"] }
 # optional: the worktrees UI needs it in the default build, unlike the
 # `menu-bar` tray feature it used to be gated behind exclusively.
 arboard = "3.6.1"
+# Terminal emulation + PTY spawn/resize for `omni-dev worktrees ui`'s embedded
+# terminal panes (issue #1585 Phase 3): a complete VTE-based core with
+# scrollback, the selection model (simple/block/semantic/line, soft-wrap-aware
+# extraction), and its own cross-platform `tty` layer — so no separate
+# `portable-pty`. Pinned to 0.26 alongside `ratatui` 0.30 (both need the
+# 1.88 MSRV declared above). Apache-2.0 — the crate's first Apache-2.0 core
+# dependency, noted at review.
+alacritty_terminal = "0.26"
 url = "2.5.8"
 base64 = "0.23"
 futures = "0.3"
