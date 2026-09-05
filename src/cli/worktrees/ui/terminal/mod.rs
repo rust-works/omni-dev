@@ -22,9 +22,11 @@ use std::process::ExitStatus;
 
 use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::event_loop::Msg;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{point_to_viewport, TermMode};
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use anyhow::Result;
 use ratatui::buffer::CellDiffOption;
@@ -235,6 +237,38 @@ impl TerminalTab {
             .and_then(|h| h.term.lock().selection_to_string())
     }
 
+    /// Starts a selection of type `ty` at viewport cell (`col`, `line`) —
+    /// `Simple` for a drag, `Semantic` (word) for a double-click, `Lines`
+    /// for a triple — replacing any existing one. The viewport position is
+    /// resolved against the current scrollback offset so a selection made
+    /// while scrolled back lands on the right history line.
+    pub fn selection_start(&self, col: u16, line: u16, ty: SelectionType) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let mut term = handle.term.lock();
+        let point = viewport_point(&term, col, line);
+        term.selection = Some(Selection::new(ty, point, Side::Left));
+    }
+
+    /// Extends the selection in progress to viewport cell (`col`, `line`).
+    pub fn selection_update(&self, col: u16, line: u16) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let mut term = handle.term.lock();
+        let point = viewport_point(&term, col, line);
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        if let Some(handle) = &self.handle {
+            handle.term.lock().selection = None;
+        }
+    }
+
     /// Stops the PTY thread and reaps the child. The join (and the `Pty`
     /// drop that `SIGHUP`s the child) runs on a blocking thread so a slow
     /// exit never stalls the event loop.
@@ -360,6 +394,14 @@ impl TerminalTab {
     }
 }
 
+/// Resolves a viewport cell (clamped into the grid) to a grid point,
+/// accounting for the scrollback offset.
+fn viewport_point<T>(term: &Term<T>, col: u16, line: u16) -> Point {
+    let col = usize::from(col).min(term.columns().saturating_sub(1));
+    let line = usize::from(line).min(term.screen_lines().saturating_sub(1));
+    viewport_to_point(term.grid().display_offset(), Point::new(line, Column(col)))
+}
+
 /// The answer to a child's OSC 4/10/11 colour query when nothing has
 /// overridden the palette: the xterm defaults, which is what the child would
 /// see from the host terminal in the common case anyway.
@@ -406,9 +448,8 @@ fn default_palette_rgb(index: usize) -> Rgb {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::index::{Column, Line, Point, Side};
-    use alacritty_terminal::selection::{Selection, SelectionType};
-    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::index::Line;
+    use alacritty_terminal::term::Config;
 
     use super::*;
 
@@ -552,22 +593,25 @@ mod tests {
         tab.write_input(Vec::new()); // empty input is dropped
         tab.write_input(b"\n".to_vec());
 
-        // A selection set on the emulator is rendered and extractable.
-        {
-            let handle = tab.handle.as_ref().unwrap();
-            let mut term = handle.term.lock();
-            let mut selection = Selection::new(
-                SelectionType::Simple,
-                Point::new(Line(0), Column(0)),
-                Side::Left,
-            );
-            selection.update(Point::new(Line(0), Column(1)), Side::Right);
-            term.selection = Some(selection);
-        }
+        // A selection made through the mouse-facing API is rendered and
+        // extractable; out-of-range coordinates clamp into the grid.
+        tab.selection_start(0, 0, SelectionType::Simple);
+        tab.selection_update(1, 0);
         assert_eq!(tab.selection_to_string().as_deref(), Some("hi"));
         terminal
             .draw(|frame| tab.draw(frame, frame.area(), true))
             .unwrap();
+        tab.selection_start(1, 0, SelectionType::Semantic);
+        assert_eq!(tab.selection_to_string().as_deref(), Some("hi"));
+        tab.selection_start(0, 0, SelectionType::Lines);
+        assert!(tab
+            .selection_to_string()
+            .is_some_and(|s| s.starts_with("hi 你好")));
+        tab.selection_update(500, 500); // clamped, not a panic
+        tab.clear_selection();
+        assert!(tab.selection_to_string().is_none());
+        tab.selection_update(1, 0); // no selection to extend: a no-op
+        assert!(tab.selection_to_string().is_none());
 
         // The child exits after its sleep.
         let effects = pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Exited).await;
@@ -587,6 +631,9 @@ mod tests {
         assert!(tab.selection_to_string().is_none());
         tab.write_input(b"x".to_vec());
         tab.scroll(Scroll::PageUp);
+        tab.selection_start(0, 0, SelectionType::Simple);
+        tab.selection_update(1, 1);
+        tab.clear_selection();
         tab.resize(GridSize { cols: 20, lines: 5 });
         terminal
             .draw(|frame| tab.draw(frame, frame.area(), true))
@@ -673,6 +720,7 @@ mod tests {
             ("terminal/cells.rs", include_str!("cells.rs")),
             ("app.rs", include_str!("../app.rs")),
             ("keys.rs", include_str!("../keys.rs")),
+            ("mouse.rs", include_str!("../mouse.rs")),
             ("clipboard.rs", include_str!("../clipboard.rs")),
         ];
         let sensitive = [

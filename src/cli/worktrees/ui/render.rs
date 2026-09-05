@@ -19,12 +19,13 @@ use super::view_model::{
 
 /// Draws the tree pane into `area`. The border is highlighted while the
 /// pane has keyboard focus (Phase 3 splits focus between the tree and a
-/// terminal tab).
+/// terminal tab). Writes the list's settled scroll offset back into `tree`
+/// so mouse rows can be mapped to tree rows (Phase 4's `mouse.rs`).
 pub fn draw_tree_pane(
     frame: &mut Frame<'_>,
     area: Rect,
     view: &WorktreesViewModel,
-    tree: &TreeState,
+    tree: &mut TreeState,
     focused: bool,
 ) {
     let mut items: Vec<ListItem> = Vec::new();
@@ -55,7 +56,7 @@ pub fn draw_tree_pane(
             ));
         }
     }
-    let mut state = ListState::default();
+    let mut state = ListState::default().with_offset(tree.offset);
     if !items.is_empty() {
         state.select(Some(tree.cursor.min(items.len() - 1)));
     }
@@ -73,6 +74,7 @@ pub fn draw_tree_pane(
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut state);
+    tree.offset = state.offset();
 }
 
 /// Prepends the multi-select gutter (`▌ ` when marked, two spaces
@@ -373,14 +375,15 @@ mod tests {
         use ratatui::Terminal;
 
         let view = sample_view();
-        let tree = TreeState {
+        let mut tree = TreeState {
             cursor: 2,
             marked: std::iter::once(PathBuf::from("/repo/wt-open")).collect(),
+            offset: 0,
         };
         for focused in [true, false] {
             let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
             terminal
-                .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &tree, focused))
+                .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, focused))
                 .unwrap();
             let text = buffer_text(&terminal);
             assert!(text.contains("WORKTREES"));
@@ -398,10 +401,38 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
         let view = WorktreesViewModel::default();
+        let mut tree = TreeState::default();
         terminal
-            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &TreeState::default(), true))
+            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
             .unwrap();
         assert!(buffer_text(&terminal).contains("No repositories open."));
+    }
+
+    #[test]
+    fn draw_tree_pane_reports_the_offset_the_list_scrolled_to() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Three rows (header + two worktrees) in a pane with one inner line:
+        // a cursor on the last row forces the list to scroll to it.
+        let view = sample_view();
+        let mut tree = TreeState {
+            cursor: 2,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        terminal
+            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
+            .unwrap();
+        assert_eq!(tree.offset, 2);
+        assert!(buffer_text(&terminal).contains("feature/x"));
+
+        // Moving the cursor back up scrolls the offset back with it.
+        tree.cursor = 0;
+        terminal
+            .draw(|frame| draw_tree_pane(frame, frame.area(), &view, &mut tree, true))
+            .unwrap();
+        assert_eq!(tree.offset, 0);
     }
 
     #[test]
@@ -418,6 +449,7 @@ mod tests {
         let tree = TreeState {
             cursor: 0,
             marked: std::iter::once(PathBuf::from("/repo")).collect(),
+            offset: 0,
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
         terminal

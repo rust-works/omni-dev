@@ -42,9 +42,34 @@ impl RowRef {
 pub struct TreeState {
     pub cursor: usize,
     pub marked: HashSet<PathBuf>,
+    /// The first visible row after the last draw — the list widget keeps
+    /// the cursor in view and reports where it settled, which is what maps
+    /// a mouse row back to a tree row.
+    pub offset: usize,
 }
 
 impl TreeState {
+    /// Puts the cursor on `row`, clamped into `[0, row_count)`.
+    pub fn set_cursor(&mut self, row: usize, row_count: usize) {
+        self.cursor = if row_count == 0 {
+            0
+        } else {
+            row.min(row_count - 1)
+        };
+    }
+
+    /// Marks every row from `from` to `to` inclusive (either order) that
+    /// resolves to a path — the `⇧`-click / drag range gesture. Existing
+    /// marks are kept.
+    pub fn mark_range(&mut self, view: &WorktreesViewModel, from: usize, to: usize) {
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        for row in Self::visible_rows(view).iter().skip(lo).take(hi - lo + 1) {
+            if let Some(path) = row.path(view) {
+                self.marked.insert(path.to_path_buf());
+            }
+        }
+    }
+
     /// Flattens the view model's nested repos/worktrees into display order —
     /// a repo header row followed immediately by each of its worktree rows.
     pub fn visible_rows(view: &WorktreesViewModel) -> Vec<RowRef> {
@@ -241,6 +266,25 @@ mod tests {
         state.toggle_mark(PathBuf::from("/repo-b/wt-1"));
         let targets = state.targets(&view);
         assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn set_cursor_clamps_and_mark_range_marks_both_orders_inclusive() {
+        let view = view_with_two_repos();
+        let mut state = TreeState::default();
+        state.set_cursor(99, 5);
+        assert_eq!(state.cursor, 4);
+        state.set_cursor(2, 0);
+        assert_eq!(state.cursor, 0);
+
+        state.mark_range(&view, 3, 1); // reversed order
+        assert_eq!(state.marked.len(), 3); // wt-1, wt-2, repo-b header
+        assert!(state.marked.contains(&PathBuf::from("/repo-a/wt-1")));
+        assert!(state.marked.contains(&PathBuf::from("/repo-b")));
+        state.mark_range(&view, 4, 4);
+        assert_eq!(state.marked.len(), 4, "existing marks are kept");
+        state.mark_range(&view, 40, 50); // past the end: nothing to mark
+        assert_eq!(state.marked.len(), 4);
     }
 
     #[test]
