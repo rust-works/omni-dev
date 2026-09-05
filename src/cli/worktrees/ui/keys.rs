@@ -48,6 +48,8 @@ pub enum ChromeKey {
     ResetLayout,
     /// `alt-f`: search the focused tab's scrollback.
     Find,
+    /// `alt-⇧c`: clear every row colour at once.
+    ClearAllRowColors,
     /// `alt-c`: copy the terminal selection.
     Copy,
     /// `⇧PageUp`: scroll the terminal back a page.
@@ -93,6 +95,10 @@ pub fn chrome_key(key: &KeyEvent) -> Option<ChromeKey> {
         KeyCode::Char('t') if alt => Some(ChromeKey::NewShellTab),
         KeyCode::Char('s') if alt => Some(ChromeKey::SplitShellTab),
         KeyCode::Char('w') if alt => Some(ChromeKey::CloseTab),
+        // Shift-c arrives as `Char('C')`, with or without the SHIFT bit —
+        // the same pair `alt-t`/`alt-⇧t` handles above.
+        KeyCode::Char('C') if alt => Some(ChromeKey::ClearAllRowColors),
+        KeyCode::Char('c') if alt && shift => Some(ChromeKey::ClearAllRowColors),
         KeyCode::Char('c') if alt => Some(ChromeKey::Copy),
         KeyCode::Char('f') if alt => Some(ChromeKey::Find),
         KeyCode::Char(']') if alt => Some(ChromeKey::NextTab),

@@ -28,6 +28,7 @@ mod panes;
 mod popup;
 mod render;
 mod row_colors;
+mod session_layout;
 mod supervisor;
 mod terminal;
 mod tree;

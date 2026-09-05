@@ -24,6 +24,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr as _;
 
 use super::layout::{self, MIN_GROUP_HEIGHT};
+use super::session_layout;
 use super::terminal::{GridSize, TabEffect, TabId, TabKind, TerminalTab};
 
 /// One vertical slice of the terminal side: a tab strip and the active
@@ -315,6 +316,63 @@ impl PaneLayout {
     /// Resets the stack to equal weights — `alt-0`.
     pub fn reset_weights(&mut self) {
         self.weights = layout::even_weights(self.groups.len());
+    }
+
+    /// The stack's persistable shape: which worktree each tab runs in, how
+    /// the groups are weighted, and where focus is. No process state — a
+    /// restored tab is a new child (ADR-0072 §2).
+    pub fn to_saved(&self) -> session_layout::SavedLayout {
+        session_layout::SavedLayout {
+            version: 1,
+            groups: self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| session_layout::SavedGroup {
+                    tabs: group
+                        .tabs
+                        .iter()
+                        .map(|tab| session_layout::SavedTab {
+                            path: tab.opened_in.clone(),
+                            kind: tab.kind.into(),
+                        })
+                        .collect(),
+                    active: group.active,
+                    weight: self.weights.get(index).copied().unwrap_or(1),
+                })
+                .collect(),
+            focused: self.focused,
+        }
+    }
+
+    /// Rebuilds the stack from a saved layout, spawning one child per tab.
+    /// A tab whose spawn fails is skipped and counted rather than aborting
+    /// the restore: a missing shell should cost you that tab, not the
+    /// session. Returns how many tabs failed to spawn.
+    pub fn restore(
+        &mut self,
+        saved: &session_layout::SavedLayout,
+        mut spawn: impl FnMut(TabId, TabKind, &Path) -> Result<TerminalTab>,
+    ) -> usize {
+        let mut failed = 0;
+        for group in &saved.groups {
+            let mut tabs = Vec::with_capacity(group.tabs.len());
+            for saved_tab in &group.tabs {
+                let id = self.take_id();
+                match spawn(id, saved_tab.kind.into(), &saved_tab.path) {
+                    Ok(tab) => tabs.push(tab),
+                    Err(_) => failed += 1,
+                }
+            }
+            if tabs.is_empty() {
+                continue;
+            }
+            let active = group.active.min(tabs.len() - 1);
+            self.groups.push(PaneGroup { tabs, active });
+            self.weights.push(group.weight.max(1));
+        }
+        self.focused = saved.focused.min(self.groups.len().saturating_sub(1));
+        failed
     }
 
     /// Routes one emulator event to the tab it belongs to. Returns `None`
@@ -701,6 +759,119 @@ mod tests {
         for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
             tab.shutdown();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_layout_survives_a_save_and_restore_round_trip() {
+        let (mut panes, dir) = layout_with(2);
+        let here = dir.path().to_path_buf();
+        // Give the first group a second tab and an uneven weight, so the
+        // round trip has something to get wrong.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        panes.focused = 0;
+        panes
+            .open_tab(spawner("sleep 5", here.clone(), tx.clone()))
+            .unwrap();
+        panes.weights = vec![3, 1];
+        panes.focused = 1;
+
+        let saved = panes.to_saved();
+        assert_eq!(saved.groups.len(), 2);
+        assert_eq!(saved.groups[0].tabs.len(), 2);
+        assert_eq!(saved.groups[0].weight, 3);
+        assert_eq!(saved.focused, 1);
+        assert_eq!(saved.groups[0].tabs[0].path, here);
+
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+
+        // Restoring rebuilds the same shape with fresh children.
+        let mut restored = PaneLayout::default();
+        let failed = restored.restore(&saved, |id, kind, path| {
+            let request = super::super::terminal::pty::SpawnRequest {
+                tab: id,
+                program: Some((
+                    "/bin/sh".to_string(),
+                    vec!["-c".to_string(), "sleep 5".to_string()],
+                )),
+                cwd: path.to_path_buf(),
+                size: GridSize { cols: 40, lines: 6 },
+                extra_env: Vec::new(),
+            };
+            TerminalTab::from_request(kind, request, tx.clone())
+        });
+        assert_eq!(failed, 0);
+        assert_eq!(restored.group_count(), 2);
+        assert_eq!(restored.groups[0].tabs.len(), 2);
+        assert_eq!(restored.weights, vec![3, 1]);
+        assert_eq!(restored.focused, 1);
+        assert!(restored.any_alive(), "restored tabs are live children");
+        // Ids are freshly allocated, never carried over.
+        assert!(restored.tabs().all(|t| t.id() > 0));
+        for tab in restored.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_skips_tabs_that_will_not_spawn_and_drops_emptied_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = session_layout::SavedLayout {
+            version: 1,
+            groups: vec![
+                session_layout::SavedGroup {
+                    tabs: vec![session_layout::SavedTab {
+                        path: dir.path().to_path_buf(),
+                        kind: session_layout::SavedTabKind::Shell,
+                    }],
+                    active: 0,
+                    weight: 1,
+                },
+                session_layout::SavedGroup {
+                    tabs: vec![session_layout::SavedTab {
+                        path: dir.path().to_path_buf(),
+                        kind: session_layout::SavedTabKind::Claude,
+                    }],
+                    active: 0,
+                    weight: 1,
+                },
+            ],
+            focused: 1,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut panes = PaneLayout::default();
+        // Fail every Claude tab, as a missing binary would.
+        let failed = panes.restore(&saved, |id, kind, path| {
+            if kind == TabKind::Claude {
+                anyhow::bail!("no such program");
+            }
+            let request = super::super::terminal::pty::SpawnRequest {
+                tab: id,
+                program: Some((
+                    "/bin/sh".to_string(),
+                    vec!["-c".to_string(), "sleep 5".to_string()],
+                )),
+                cwd: path.to_path_buf(),
+                size: GridSize { cols: 40, lines: 6 },
+                extra_env: Vec::new(),
+            };
+            TerminalTab::from_request(kind, request, tx.clone())
+        });
+        assert_eq!(failed, 1, "the failure is counted, not swallowed");
+        assert_eq!(panes.group_count(), 1, "its emptied group is dropped");
+        assert_eq!(panes.focused, 0, "focus is clamped back into range");
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+    }
+
+    #[test]
+    fn an_empty_layout_saves_as_empty() {
+        let panes = PaneLayout::default();
+        assert!(panes.to_saved().is_empty());
     }
 
     #[cfg(unix)]

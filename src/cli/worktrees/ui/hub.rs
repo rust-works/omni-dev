@@ -36,20 +36,17 @@ struct WorktreeOids {
 /// Commands the rendering layer sends into the hub.
 ///
 /// Phase 2's `Dispatcher` (`actions.rs`) constructs `SetRowColor`/
-/// `ClearRowColor` for the `c`/`C` keybindings. `ClearAllRowColors` has no
-/// keybinding yet (no "clear every colour" command in the action menu);
-/// `SetOpenTab`/`ClearOpenTab` await Phase 3's tab lifecycle, and
-/// `SetVisibleRows` awaits Phase 4's scrollable tree (until then the hub
-/// treats every worktree in the latest snapshot as visible by default).
+/// `ClearRowColor` for the `c`/`C` keybindings and `ClearAllRowColors` for
+/// Phase 5's `alt-⇧c`; `SetOpenTab`/`ClearOpenTab` follow Phase 3's tab
+/// lifecycle, and `SetVisibleRows` reports Phase 4c's on-screen rows so
+/// ahead/behind is fetched only for those.
 #[derive(Debug, Clone)]
 pub enum HubCommand {
     SetOpenTab(PathBuf),
     ClearOpenTab(PathBuf),
     SetRowColor(RowColorKey, String),
     ClearRowColor(RowColorKey),
-    #[allow(dead_code)] // no "clear every colour" command yet
     ClearAllRowColors,
-    #[allow(dead_code)] // Phase 4 scrollable tree
     SetVisibleRows(Vec<PathBuf>),
 }
 
