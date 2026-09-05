@@ -92,7 +92,14 @@ fn pct(x: Option<f64>) -> String {
 }
 
 /// Direction emoji for a percentage-point delta.
+///
+/// The direction is taken from the *displayed* (rounded) value, not the raw
+/// one: every caller prints [`fmt_num`] beside this emoji, and `fmt_num` rounds
+/// through [`round2`]. Deriving the arrow from the raw delta let a move in
+/// `(-0.005, 0)` render as a red arrow next to `0 pp` — an alarm colour beside a
+/// number that says nothing moved.
 fn arrow(d: f64) -> &'static str {
+    let d = round2(d);
     if d > 0.0 {
         "🟢"
     } else if d < 0.0 {
@@ -666,6 +673,44 @@ mod tests {
         assert!(md.contains("🟢 5 pp vs `main`"));
         assert!(md.contains("### Indirect coverage changes"));
         assert!(md.contains("`src/b.rs:5`"));
+    }
+
+    /// #1591: the arrow must agree with the number printed beside it. A delta
+    /// inside the rounding interval prints `0 pp`, so it must be neutral rather
+    /// than raising a red alarm next to a number that says nothing moved.
+    #[test]
+    fn markdown_sub_rounding_delta_is_neutral() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.total_after = Some(79.996);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("\u{26aa} 0 pp vs `main`"), "{md}");
+        assert!(
+            !md.contains("\u{1f534}"),
+            "sub-rounding move must not paint red: {md}"
+        );
+    }
+
+    /// The same pairing in the per-file table, which the EPS row filter happens
+    /// to protect, and in the notable-unchanged table, which it does not: that
+    /// section is gated on *covered lines* (>= 10), so a large file can reach it
+    /// with a sub-rounding percentage-point move.
+    #[test]
+    fn notable_unchanged_sub_rounding_delta_is_neutral() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.notable_unchanged = vec![FileDelta {
+            path: "src/big.rs".to_string(),
+            before: Some(90.0),
+            after: Some(89.998),
+        }];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            md.contains("| `src/big.rs` | 90% | 90% | \u{26aa} 0 pp |"),
+            "{md}"
+        );
     }
 
     #[test]
