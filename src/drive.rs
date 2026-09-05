@@ -11,6 +11,7 @@
 
 pub mod about_api;
 pub mod account;
+pub mod api_client;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
