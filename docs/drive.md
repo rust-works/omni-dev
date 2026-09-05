@@ -54,9 +54,10 @@ walkthrough — this page is the topic-by-topic reference.
 11. [Create](#create)
 12. [Upload](#upload)
 13. [Edit](#edit)
-14. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-15. [Troubleshooting](#troubleshooting)
-16. [See also](#see-also)
+14. [Sheets](#sheets)
+15. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+16. [Troubleshooting](#troubleshooting)
+17. [See also](#see-also)
 
 ## Prerequisites
 
@@ -342,13 +343,16 @@ login failure.
 ## Output formats
 
 Every subcommand that renders a list or record (`search`, `read`, `dedupe`,
-`rename`, `move`, `account list`) accepts `-o <format>` (`table` / `json` /
-`yaml` / `yamls` / `jsonl`, default `table`) — the same convention as every
+`rename`, `move`, `create`, `upload`, `edit`, `account list`,
+`permissions show`/`check`, `sheets info`, `sheets read`) accepts
+`-o <format>` (`table` / `json` / `yaml` / `yamls` / `jsonl`, default `table`) — the same convention as every
 other `omni-dev` domain (see [ADR-0046](adrs/adr-0046.md)). `auth login`/
 `auth logout`/`auth status`/`account set-default` print a fixed
 human-readable status line instead and have no `-o` flag. `--out-file`
 exists only on `drive read --content` — metadata always renders via
-`-o/--output`.
+`-o/--output`. One command reads `table` unusually: `drive sheets read`
+renders CSV for it, since a grid of cells is what a spreadsheet range *is*
+(see [Sheets](#sheets)).
 
 ## Search
 
@@ -815,6 +819,109 @@ Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insu
 
 Same request-log behavior as [Create](#create)/[Upload](#upload).
 
+## Sheets
+
+`drive sheets` reads the *cells* of a Google Sheet through the Sheets v4 API
+(issue #1589, [ADR-0073](adrs/adr-0073.md)). The Drive API cannot do this at
+all: it treats a Sheet as an opaque native document with no notion of a range,
+a row or a cell. In particular, `drive read --content` on a Sheet exports **the
+first sheet only**, because Drive's export API has no multi-sheet CSV format —
+`drive sheets read` is the way to get the rest.
+
+No new login flag is needed. Reading works with the `drive.readonly` scope
+every account already has.
+
+#### `drive sheets info`
+
+Shows the workbook title and the sheets (tabs) it contains, with each grid
+sheet's allocated dimensions. Hidden sheets are listed and marked, not omitted.
+
+```bash
+$ omni-dev drive sheets info 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Id: 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Title: 2026 Budget
+Sheets: 3
+  Q1 (1000x26)
+  Q2 (1000x26)
+  Notes [hidden]
+```
+
+#### `drive sheets read`
+
+With neither `--range` nor `--sheet`, reads **every** sheet: one
+`spreadsheets.get` for the tab list, then `values.batchGet` for the data.
+
+```bash
+$ omni-dev drive sheets read 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+# Q1
+Region,Revenue
+North,1200
+South,950
+
+# Q2
+Region,Revenue
+North,1310
+```
+
+Narrow it with `--sheet` (a tab title), `--range` (an A1 range), or both:
+
+```bash
+omni-dev drive sheets read <ID> --sheet 'Q1'
+omni-dev drive sheets read <ID> --range 'A1:B10'
+omni-dev drive sheets read <ID> --sheet 'My Sheet' --range 'A1:B10'
+omni-dev drive sheets read <ID> --range "'My Sheet'!A:A"
+```
+
+`--range` may carry its own `Sheet!` prefix. Passing `--sheet` *as well as* a
+prefixed `--range` is an error rather than a precedence rule, since the two can
+disagree and guessing would read the wrong sheet. Sheet titles are always
+quoted internally, so titles containing spaces, apostrophes or `!` need no
+special handling — and a sheet literally titled `A1` is unambiguous.
+
+Unbounded and open-ended ranges are passed through untouched (`A:A`, `1:2`,
+`A5:A`, a bare sheet name, or a defined name). `omni-dev` deliberately does not
+validate A1 grammar client-side; the server is authoritative and returns a
+clearer error than a local guess would.
+
+**Output formats.** The default `-o table` emits CSV, which is what a grid of
+cells is. When more than one sheet is read, each block is preceded by a
+`# <title>` comment line and separated by a blank line.
+
+Two differences between CSV and the structured formats are worth knowing:
+
+- **CSV pads rows; JSON/YAML do not.** The API truncates trailing empty cells
+  from each row, so rows come back ragged. CSV pads each row to the widest row
+  in that sheet, because a ragged CSV is malformed. `-o json` and `-o yaml`
+  preserve the raggedness, which is the truthful shape.
+- **CSV emits cell content verbatim.** Cell values are content, not chrome, so
+  they are not stripped of control characters — a multi-line cell survives
+  intact as a properly quoted CSV field. Sheet *titles*, which are rendered as
+  chrome, are sanitised.
+
+`-o json`/`-o yaml` emit an ordered **list** of `{title, values}` objects
+rather than a `{title: rows}` map, so workbook order is preserved:
+
+```bash
+omni-dev drive sheets read <ID> -o json
+```
+
+**`--render`** controls how the API renders each cell:
+
+| Value         | Meaning                                                   |
+|---------------|-----------------------------------------------------------|
+| `formatted`   | Locale-formatted strings as displayed in the UI (default) |
+| `unformatted` | Raw typed values — JSON numbers and booleans, not strings |
+| `formula`     | The formula text (`=SUM(A1:A3)`) rather than its result   |
+
+`unformatted` is usually what you want when feeding the output to something
+that will do arithmetic on it; `formatted` matches what `drive read --content`
+already produces for a Sheet.
+
+**Limits.** A whole-workbook read refuses a spreadsheet beyond a fixed sheet
+count rather than returning part of it — silently returning half a workbook is
+indistinguishable from a workbook that small. Narrow the read with `--sheet` or
+`--range` if you hit it.
+
 ## Rate limits and retry behaviour
 
 Drive signals quota exhaustion two ways: a plain **HTTP 429**, and **HTTP
@@ -1021,6 +1128,10 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   `create`/`upload`/`edit`: the `--write-file`/`--write-full` scope tiers,
   the folder-scoped [write-permission gate](#write-permissions) and its
   resolution algorithm, and why both layers are independently required.
+- [ADR-0073](adrs/adr-0073.md) — extends ADR-0069/0070/0071 to add the
+  Sheets v4 API: the shared transport core behind a second Google host, the
+  separate `sheets-write` gate operation and why reusing `edit` was
+  rejected, and the CSV/JSON rendering rules.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.
