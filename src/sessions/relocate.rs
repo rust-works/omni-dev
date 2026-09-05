@@ -79,11 +79,9 @@ pub(crate) struct SessionInfo {
     /// The session id — the `.jsonl` basename, and the sidecar dir name.
     pub(crate) id: String,
     /// Not read by the relocation flow itself (`plan_relocation` derives its
-    /// own paths from `id`/`src_dir`); kept for a future picker preview
-    /// (reading the transcript's head for a human-readable label, ported
-    /// from `moveSessionCommand.ts::readPreview` — deferred to Phase 5
-    /// polish per the plan, see `actions.rs`'s module doc).
-    #[allow(dead_code)]
+    /// own paths from `id`/`src_dir`); read by [`transcript_preview`] to
+    /// label the session picker, the Phase 5 counterpart of the VS Code
+    /// companion's `moveSessionCommand.ts::readPreview`.
     pub(crate) jsonl_path: PathBuf,
     pub(crate) modified: SystemTime,
     /// Whether an `<id>/` sidecar dir (subagent/tool-result overflow)
@@ -166,6 +164,59 @@ pub(crate) fn enumerate_sessions(src_dir: &Path) -> Result<Vec<SessionInfo>> {
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(sessions)
+}
+
+/// The first user prompt in a transcript, trimmed to `max_chars` — a
+/// human-readable label for the session picker, since a bare UUID tells the
+/// user nothing about which session they are about to move (issue #1585
+/// Phase 5; the `readPreview` the VS Code companion does for the same
+/// reason).
+///
+/// Deliberately tolerant of the transcript's schema, which is Claude's and
+/// not ours: it reads whole lines as untyped JSON and looks for the first
+/// user message's text, giving up quietly on anything unexpected rather
+/// than parsing a structure that may change under us (the same reason
+/// `watcher.rs` refuses to decode line schemas). Only the first few lines
+/// are read, so this stays cheap for a long session.
+///
+/// **No transcript content is logged or persisted** — the returned string
+/// goes straight to the picker and nowhere else.
+pub(crate) fn transcript_preview(path: &Path, max_chars: usize) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    const MAX_LINES: usize = 40;
+
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(MAX_LINES) {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let content = value.get("message").and_then(|m| m.get("content"))?;
+        // `content` is either a bare string or an array of typed blocks.
+        let text = match content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .find_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(str::to_string)?,
+            _ => continue,
+        };
+        let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned.is_empty() {
+            continue;
+        }
+        return Some(if cleaned.chars().count() > max_chars {
+            let head: String = cleaned.chars().take(max_chars.saturating_sub(1)).collect();
+            format!("{head}\u{2026}")
+        } else {
+            cleaned
+        });
+    }
+    None
 }
 
 /// Whether `modified` is recent enough that the session may still be live —
@@ -289,6 +340,90 @@ mod tests {
             RelocationMode::Copy,
         );
         assert_eq!(plan_no_sidecar.ops.len(), 1);
+    }
+
+    #[test]
+    fn transcript_preview_reads_the_first_user_prompt_in_either_content_shape() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Content as a bare string.
+        let plain = dir.path().join("plain.jsonl");
+        fs::write(
+            &plain,
+            "{\"type\":\"summary\"}\n\
+             {\"type\":\"user\",\"message\":{\"content\":\"fix the parser\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_preview(&plain, 48).as_deref(),
+            Some("fix the parser")
+        );
+
+        // Content as an array of typed blocks — the common shape.
+        let blocks = dir.path().join("blocks.jsonl");
+        fs::write(
+            &blocks,
+            "{\"type\":\"user\",\"message\":{\"content\":[\
+             {\"type\":\"text\",\"text\":\"add a  glyph\\n  table\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_preview(&blocks, 48).as_deref(),
+            Some("add a glyph table"),
+            "whitespace is collapsed so the label stays one line"
+        );
+    }
+
+    #[test]
+    fn transcript_preview_truncates_and_gives_up_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let long = dir.path().join("long.jsonl");
+        let prompt = "x".repeat(200);
+        fs::write(
+            &long,
+            format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{prompt}\"}}}}\n"),
+        )
+        .unwrap();
+        let preview = transcript_preview(&long, 20).unwrap();
+        assert_eq!(preview.chars().count(), 20);
+        assert!(preview.ends_with('\u{2026}'));
+
+        // A transcript with no user message, malformed lines, an assistant
+        // -only file, and a missing file all yield None rather than an
+        // error — the picker falls back to the session id.
+        let assistant = dir.path().join("assistant.jsonl");
+        fs::write(&assistant, "{\"type\":\"assistant\",\"message\":{}}\n").unwrap();
+        assert_eq!(transcript_preview(&assistant, 48), None);
+
+        let junk = dir.path().join("junk.jsonl");
+        fs::write(&junk, "not json at all\n{\"type\":\n").unwrap();
+        assert_eq!(transcript_preview(&junk, 48), None);
+
+        let empty_prompt = dir.path().join("empty.jsonl");
+        fs::write(
+            &empty_prompt,
+            "{\"type\":\"user\",\"message\":{\"content\":\"   \"}}\n",
+        )
+        .unwrap();
+        assert_eq!(transcript_preview(&empty_prompt, 48), None);
+
+        assert_eq!(transcript_preview(&dir.path().join("nope.jsonl"), 48), None);
+    }
+
+    #[test]
+    fn transcript_preview_reads_only_the_head_of_a_long_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.jsonl");
+        // The only user message is far past the line budget, so the preview
+        // gives up rather than scanning a huge file.
+        let mut contents = String::new();
+        for _ in 0..200 {
+            contents.push_str("{\"type\":\"assistant\",\"message\":{}}\n");
+        }
+        contents.push_str("{\"type\":\"user\",\"message\":{\"content\":\"too late\"}}\n");
+        fs::write(&path, contents).unwrap();
+        assert_eq!(transcript_preview(&path, 48), None);
     }
 
     #[test]

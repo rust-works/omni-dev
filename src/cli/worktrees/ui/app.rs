@@ -33,6 +33,7 @@ use super::hub::{HubCommand, ViewModelHandle};
 use super::keys::{self, ChromeKey, KeyRoute};
 use super::mouse::{self, DragOrigin, Hit, RegionMap, TreeClick, WheelRoute};
 use super::panes;
+use super::session_layout;
 use super::terminal::{GridSize, TabEffect, TabId, TabKind, TerminalTab};
 use super::tree::TreeState;
 use super::view_model::WorktreesViewModel;
@@ -196,6 +197,30 @@ pub async fn run(
         drag: DragOrigin::None,
         clicks: mouse::ClickTracker::default(),
     };
+    // Restore the previous run's pane shape (Phase 5). Tabs are respawned,
+    // never resumed — the children died with the last process — and a tab
+    // that will not spawn is dropped rather than failing the start.
+    let saved = session_layout::load(None);
+    if !saved.is_empty() {
+        let tx = app.pty_tx.clone();
+        let size = GridSize {
+            cols: 80,
+            lines: 24,
+        };
+        let failed = app.panes.restore(&saved, |id, kind, path| {
+            TerminalTab::spawn(id, kind, path.to_path_buf(), size, tx.clone())
+        });
+        for worktree in app.panes.open_worktrees() {
+            let _ = app.commands.send(HubCommand::SetOpenTab(worktree));
+        }
+        if !app.panes.is_empty() {
+            app.focus = Focus::Terminal;
+        }
+        if failed > 0 {
+            app.notice = Some(format!("{failed} saved tab(s) could not be reopened"));
+        }
+    }
+
     let mut last_drawn_generation: Option<u64> = None;
     let mut dirty = true;
     let mut last_draw = tokio::time::Instant::now() - FRAME_INTERVAL;
@@ -267,6 +292,12 @@ pub async fn run(
         }
     }
 
+    // Persist the pane shape before tearing the children down, so the next
+    // run opens the same workspace. Best-effort: failing to write a
+    // convenience file must not fail the command.
+    if let Err(e) = session_layout::save(&app.panes.to_saved(), None) {
+        tracing::debug!("worktrees ui: could not save the layout: {e:#}");
+    }
     for group in &mut app.panes.groups {
         for tab in &mut group.tabs {
             tab.shutdown();
@@ -529,9 +560,17 @@ fn draw_popups(frame: &mut Frame<'_>, app: &App) {
         Some(RelocateStep::PickSession {
             sessions, selected, ..
         }) => {
+            // Prefer the transcript's first prompt over the bare UUID: an
+            // id says nothing about which session you are moving.
             let labels: Vec<String> = sessions
                 .iter()
-                .map(|s| format!("{}  ({})", s.id, relative_mtime(s.modified)))
+                .map(|s| {
+                    let when = relative_mtime(s.modified);
+                    match relocate::transcript_preview(&s.jsonl_path, 48) {
+                        Some(preview) => format!("{preview}  ({when})"),
+                        None => format!("{}  ({when})", s.id),
+                    }
+                })
                 .collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             popup::draw_list_popup(frame, area, "Move which Claude session?", &refs, *selected);
@@ -1121,6 +1160,12 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
             }
         }
         ChromeKey::ResetLayout => app.panes.reset_weights(),
+        ChromeKey::ClearAllRowColors => {
+            // Non-destructive and re-doable by hand, so no confirm — the
+            // same reasoning `C` (clear one row) already follows.
+            let _ = app.commands.send(HubCommand::ClearAllRowColors);
+            app.notice = Some("cleared every row colour".to_string());
+        }
         ChromeKey::Find => {
             if app.panes.active_tab().is_some() {
                 app.prompt = Some(Prompt {
@@ -2686,6 +2731,44 @@ mod tests {
             ),
             other => panic!("expected a new SetVisibleRows, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn alt_shift_c_clears_every_row_colour() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1;
+
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::ALT),
+        )
+        .await;
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::ClearAllRowColors)
+        ));
+        assert_eq!(app.notice.as_deref(), Some("cleared every row colour"));
+
+        // The shifted spelling with the SHIFT bit set reaches it too.
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        )
+        .await;
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HubCommand::ClearAllRowColors)
+        ));
+
+        // Plain alt-c is still Copy, not a clear-all.
+        handle_key(&mut app, &view, &dispatcher, alt('c')).await;
+        assert_eq!(app.notice.as_deref(), Some("nothing selected"));
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

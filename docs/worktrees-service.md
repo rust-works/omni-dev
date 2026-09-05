@@ -507,6 +507,25 @@ distinguishes a plain fast-forward from a leased force and says how many of
 each. A merge-queue check lists the eligible pull requests and, when none
 are, says why for each one it skipped.
 
+Phase 5 finished the feature. The **pane layout persists**: quitting records
+how many groups you had, their sizes, and which worktree each tab was opened
+in, and the next run reopens that workspace. Only the shape is saved —
+terminals live in this process, so a restored tab is a new shell in the same
+place, not a resumed one. Anything that cannot be restored is quietly
+dropped (a worktree you have since deleted, a shell that no longer exists),
+because a startup error about a convenience feature is worse than starting
+with one fewer tab; the status bar says how many were skipped. Quitting with
+nothing open clears the file, so the next run starts fresh.
+
+```
+~/.omni-dev/worktrees-ui-layout.yaml    # 0600, beside the row-colour store
+```
+
+The **Move/Copy Claude Session** picker now labels each session with the
+first prompt from its transcript rather than a bare UUID, so you can tell
+which session you are moving. And **`alt-⇧c`** clears every row colour at
+once, the bulk counterpart of `C`.
+
 **There is no force option anywhere in the terminal UI**, and that is
 deliberate rather than an omission. Every force the daemon issues is
 `--force-with-lease --force-if-includes`, so a remote that moved since you
