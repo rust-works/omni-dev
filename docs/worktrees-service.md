@@ -492,7 +492,30 @@ The tree also tells the daemon which rows are actually on screen, so the
 per-worktree ahead/behind lookup runs for the visible rows rather than every
 worktree in the snapshot.
 
-The rest of the tree view's VS Code-parity surface lands in later phases.
+Phase 4d completed the parity surface with the three batch git actions, on
+the `a` menu's `4_git` group for any worktree row: **Rebase on main**,
+**Push (force-with-lease)** and **Add to Merge Queue**. Each drives the
+daemon's own op — the same one the VS Code tree view calls, running the same
+engine — rather than the CLI's local path, and each is two-phase: the daemon
+plans, you see the plan, and only then does it execute (re-planning from
+scratch, so nothing you confirmed is replayed blindly).
+
+The plans are specific about what is about to happen. A rebase names each
+worktree, its branch, how far behind it is, and warns that a conflict will
+leave that worktree mid-rebase for you to resolve in place. A push
+distinguishes a plain fast-forward from a leased force and says how many of
+each. A merge-queue check lists the eligible pull requests and, when none
+are, says why for each one it skipped.
+
+**There is no force option anywhere in the terminal UI**, and that is
+deliberate rather than an omission. Every force the daemon issues is
+`--force-with-lease --force-if-includes`, so a remote that moved since you
+last fetched is *refused* rather than overwritten, and a repository's
+default branch is never force-pushed at all. When a lease is refused the UI
+says so and names the fix — fetch and rebase — because there is no harder
+push to reach for. A test greps the UI's own action, client and wire code to
+make sure a force field cannot be added to a request without failing the
+build.
 
 Finally, the **companion feed ops** — normally spoken by the VS Code extension —
 are exposed as typed commands so scripted/headless companions and integration tests

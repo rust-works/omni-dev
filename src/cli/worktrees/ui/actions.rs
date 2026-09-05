@@ -133,6 +133,17 @@ pub enum ActionKind {
     CloseWindow,
     /// `remove: true` — the destructive, two-phase delete.
     CloseWorktree,
+    /// Batch-rebase onto each repo's remote default branch, via the
+    /// **daemon's** `rebase` op (ADR-0059) — never the CLI's local engine
+    /// (ADR-0072 §9). Two-phase: plan, confirm, execute.
+    Rebase,
+    /// Publish the selected branches, via the daemon's `push` op
+    /// (ADR-0061). Every force it issues is leased; there is no force
+    /// option anywhere in this surface.
+    Push,
+    /// Enqueue the selected worktrees' PRs, via the daemon's `merge-queue`
+    /// op (ADR-0056).
+    MergeQueue,
     SetRowColor(&'static str),
     ClearRowColor,
 }
@@ -238,6 +249,9 @@ impl Dispatcher {
             | ActionKind::SetRowColor(_)
             | ActionKind::ClearRowColor => CheckReport::ProceedWithoutConfirm,
             ActionKind::CloseWorktree => self.check_close_worktree(targets).await,
+            ActionKind::Rebase => self.check_rebase(targets).await,
+            ActionKind::Push => self.check_push(targets).await,
+            ActionKind::MergeQueue => self.check_merge_queue(targets).await,
             ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere => {
                 CheckReport::Refused {
                     reason: "session relocation is resolved through its own picker flow, \
@@ -256,6 +270,9 @@ impl Dispatcher {
             ActionKind::Focus => self.execute_focus(targets).await,
             ActionKind::CloseWindow => self.execute_close(targets, false).await,
             ActionKind::CloseWorktree => self.execute_close(targets, true).await,
+            ActionKind::Rebase => self.execute_rebase(targets).await,
+            ActionKind::Push => self.execute_push(targets).await,
+            ActionKind::MergeQueue => self.execute_merge_queue(targets).await,
             ActionKind::SetRowColor(color) => self.execute_set_row_color(targets, color),
             ActionKind::ClearRowColor => self.execute_clear_row_color(targets),
             ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere => {
@@ -264,6 +281,303 @@ impl Dispatcher {
                             not the generic execute path"
                         .to_string(),
                 }
+            }
+        }
+    }
+
+    // --- Git write actions (daemon ops) --------------------------------
+    //
+    // All three follow `close`'s two-phase shape: phase 1 asks the daemon
+    // to plan, the plan is rendered into the confirm modal verbatim, and
+    // phase 2 executes only after the user agrees. The daemon re-plans from
+    // scratch on execute, so what is confirmed is advisory, not a token.
+    //
+    // Every safety rule lives in the daemon, deliberately: leased-force
+    // only, `--force-if-includes`, and never force-pushing a repository's
+    // default branch (ADR-0059/ADR-0061). Nothing here can weaken them, and
+    // no force option is offered anywhere in this surface.
+
+    async fn check_rebase(&self, targets: &[Target]) -> CheckReport {
+        let paths = worktree_paths(targets);
+        if paths.is_empty() {
+            return CheckReport::Refused {
+                reason: "select a worktree row to rebase".to_string(),
+            };
+        }
+        match self.client.rebase(&paths, true).await {
+            Err(e) => CheckReport::Refused {
+                reason: format!("{e:#}"),
+            },
+            Ok(plan) => {
+                let pending: Vec<&super::wire::RebaseWorktreeWire> = plan
+                    .worktrees
+                    .iter()
+                    .filter(|w| w.result == "would-rebase")
+                    .collect();
+                if pending.is_empty() {
+                    return CheckReport::Refused {
+                        reason: rebase_nothing_to_do(&plan),
+                    };
+                }
+                let mut body_lines = Vec::new();
+                for w in &pending {
+                    let behind = w.behind.unwrap_or(0);
+                    body_lines.push(format!(
+                        "{} ({}) — {behind} behind {}",
+                        w.path.display(),
+                        w.branch.as_deref().unwrap_or("(detached)"),
+                        w.onto
+                    ));
+                }
+                let mut risk_lines = vec![
+                    "Rebasing rewrites these branches' history.".to_string(),
+                    "A conflict leaves that worktree mid-rebase to resolve in place.".to_string(),
+                ];
+                for f in plan.fetches.iter().filter(|f| !f.ok) {
+                    risk_lines.push(format!(
+                        "fetch of {} failed for {}: {}",
+                        f.onto,
+                        f.repo_root.display(),
+                        f.error.as_deref().unwrap_or("unknown error")
+                    ));
+                }
+                // A repository whose onto ref was resolved locally is never
+                // fetched; say so, since "not fetched" reads as a failure.
+                for f in plan.fetches.iter().filter(|f| f.ok && !f.fetched) {
+                    body_lines.push(format!("{} resolved locally (no fetch)", f.onto));
+                }
+                CheckReport::NeedsConfirm {
+                    prompt: ConfirmPrompt {
+                        title: format!("Rebase {} worktree(s)?", pending.len()),
+                        body_lines,
+                        risk_lines,
+                        info_lines: skipped_lines(&plan),
+                    },
+                    has_risk: true,
+                }
+            }
+        }
+    }
+
+    async fn execute_rebase(&self, targets: &[Target]) -> ActionOutcome {
+        let paths = worktree_paths(targets);
+        match self.client.rebase(&paths, false).await {
+            Err(e) => ActionOutcome::Failed {
+                error: format!("{e:#}"),
+            },
+            Ok(reply) => ActionOutcome::BatchDone {
+                results: reply
+                    .worktrees
+                    .iter()
+                    .map(|w| {
+                        let outcome = match w.result.as_str() {
+                            "rebased" | "up-to-date" => Ok(()),
+                            "conflict" => Err(format!(
+                                "conflict{}: {}",
+                                if w.left_in_place {
+                                    " (left mid-rebase)"
+                                } else {
+                                    " (aborted)"
+                                },
+                                w.detail.as_deref().unwrap_or("")
+                            )),
+                            "fetch-failed" => Err(format!(
+                                "fetch failed: {}",
+                                w.detail.as_deref().unwrap_or("")
+                            )),
+                            "skipped" => {
+                                Err(format!("skipped: {}", w.reason.as_deref().unwrap_or("")))
+                            }
+                            other => Err(other.to_string()),
+                        };
+                        (w.path.clone(), outcome)
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    async fn check_push(&self, targets: &[Target]) -> CheckReport {
+        let paths = worktree_paths(targets);
+        if paths.is_empty() {
+            return CheckReport::Refused {
+                reason: "select a worktree row to push".to_string(),
+            };
+        }
+        match self.client.push(&paths, true).await {
+            Err(e) => CheckReport::Refused {
+                reason: format!("{e:#}"),
+            },
+            Ok(plan) => {
+                let pending: Vec<&super::wire::PushWorktreeWire> = plan
+                    .worktrees
+                    .iter()
+                    .filter(|w| {
+                        matches!(
+                            w.result.as_str(),
+                            "would-fast-forward" | "would-force" | "would-create"
+                        )
+                    })
+                    .collect();
+                if pending.is_empty() {
+                    return CheckReport::Refused {
+                        reason: "nothing to push: every selected branch is up to date or skipped"
+                            .to_string(),
+                    };
+                }
+                let mut body_lines = Vec::new();
+                let mut forced = 0usize;
+                for w in &pending {
+                    let branch = w.branch.as_deref().unwrap_or("(detached)");
+                    let target = format!("{}/{}", w.remote, w.remote_branch);
+                    body_lines.push(match w.result.as_str() {
+                        "would-force" => {
+                            forced += 1;
+                            format!(
+                                "{branch} → {target} — force-with-lease (+{} -{})",
+                                w.ahead.unwrap_or(0),
+                                w.behind.unwrap_or(0)
+                            )
+                        }
+                        "would-create" => format!("{branch} → {target} — new upstream"),
+                        _ => format!(
+                            "{branch} → {target} — fast-forward (+{})",
+                            w.ahead.unwrap_or(0)
+                        ),
+                    });
+                }
+                let mut risk_lines = Vec::new();
+                if forced > 0 {
+                    risk_lines.push(format!(
+                        "{forced} branch(es) publish rewritten history, with a lease."
+                    ));
+                    risk_lines.push(
+                        "The lease is enforced by git: a remote that moved is refused, \
+                         never overwritten."
+                            .to_string(),
+                    );
+                }
+                CheckReport::NeedsConfirm {
+                    prompt: ConfirmPrompt {
+                        title: format!("Push {} branch(es)?", pending.len()),
+                        body_lines,
+                        risk_lines,
+                        info_lines: push_skipped_lines(&plan),
+                    },
+                    has_risk: forced > 0,
+                }
+            }
+        }
+    }
+
+    async fn execute_push(&self, targets: &[Target]) -> ActionOutcome {
+        let paths = worktree_paths(targets);
+        match self.client.push(&paths, false).await {
+            Err(e) => ActionOutcome::Failed {
+                error: format!("{e:#}"),
+            },
+            Ok(reply) => ActionOutcome::BatchDone {
+                results: reply
+                    .worktrees
+                    .iter()
+                    .map(|w| {
+                        let outcome = match w.result.as_str() {
+                            // `forced` distinguishes a leased rewrite from an
+                            // ordinary fast-forward; both succeeded, but the
+                            // user should know which happened.
+                            "pushed" if w.forced => Ok(()),
+                            "pushed" | "created" | "up-to-date" => Ok(()),
+                            "rejected" if w.stale => Err(format!(
+                                "lease refused — the remote moved; fetch and rebase: {}",
+                                w.detail.as_deref().unwrap_or("")
+                            )),
+                            "rejected" => {
+                                Err(format!("rejected: {}", w.detail.as_deref().unwrap_or("")))
+                            }
+                            "skipped" => {
+                                Err(format!("skipped: {}", w.reason.as_deref().unwrap_or("")))
+                            }
+                            other => Err(other.to_string()),
+                        };
+                        (w.path.clone(), outcome)
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    async fn check_merge_queue(&self, targets: &[Target]) -> CheckReport {
+        let paths = worktree_paths(targets);
+        if paths.is_empty() {
+            return CheckReport::Refused {
+                reason: "select a worktree row to enqueue".to_string(),
+            };
+        }
+        match self.client.merge_queue(&paths, true).await {
+            Err(e) => CheckReport::Refused {
+                reason: format!("{e:#}"),
+            },
+            Ok(report) => {
+                if report.eligible.is_empty() {
+                    return CheckReport::Refused {
+                        reason: merge_queue_nothing_eligible(&report),
+                    };
+                }
+                CheckReport::NeedsConfirm {
+                    prompt: ConfirmPrompt {
+                        title: format!("Enqueue {} pull request(s)?", report.eligible.len()),
+                        body_lines: report
+                            .eligible
+                            .iter()
+                            .map(|pr| {
+                                format!(
+                                    "#{} {} — {}{}",
+                                    pr.number,
+                                    pr.branch,
+                                    pr.url,
+                                    if pr.already_queued {
+                                        " (already queued)"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            })
+                            .collect(),
+                        risk_lines: Vec::new(),
+                        info_lines: report
+                            .skipped
+                            .iter()
+                            .map(|s| {
+                                let pr = s.number.map(|n| format!("#{n} ")).unwrap_or_default();
+                                format!("skipped {pr}{}: {} ({})", s.path, s.detail, s.kind)
+                            })
+                            .collect(),
+                    },
+                    has_risk: false,
+                }
+            }
+        }
+    }
+
+    async fn execute_merge_queue(&self, targets: &[Target]) -> ActionOutcome {
+        let paths = worktree_paths(targets);
+        match self.client.merge_queue(&paths, false).await {
+            Err(e) => ActionOutcome::Failed {
+                error: format!("{e:#}"),
+            },
+            Ok(reply) => {
+                let mut results: Vec<(PathBuf, Result<(), String>)> = reply
+                    .queued
+                    .iter()
+                    .map(|pr| (PathBuf::from(&pr.path), Ok(())))
+                    .collect();
+                results.extend(
+                    reply
+                        .failed
+                        .iter()
+                        .map(|f| (PathBuf::from(&f.path), Err(f.detail.clone()))),
+                );
+                ActionOutcome::BatchDone { results }
             }
         }
     }
@@ -580,6 +894,96 @@ pub(crate) mod relocate_types {
 /// `9_close` menu-group order (verified against `editors/vscode/package.json`'s
 /// `view/item/context` entries). `2_claude` (Move/Copy session here) has no
 /// VS Code equivalent — placed beside `1_pr` as another row-detail action.
+/// The worktree paths in `targets`, ignoring repo header rows — what the
+/// three git ops address (they act on worktrees, not repositories).
+fn worktree_paths(targets: &[Target]) -> Vec<PathBuf> {
+    targets
+        .iter()
+        .filter_map(|t| match t {
+            Target::Worktree { path, .. } => Some(path.clone()),
+            Target::Repo { .. } => None,
+        })
+        .collect()
+}
+
+/// Why a rebase plan has nothing pending — the difference between "already
+/// up to date" and "every fetch failed" matters to the user.
+fn rebase_nothing_to_do(plan: &super::wire::RebaseReplyWire) -> String {
+    let failed: Vec<&super::wire::RebaseFetchWire> =
+        plan.fetches.iter().filter(|f| !f.ok).collect();
+    if !failed.is_empty() && plan.fetches.len() == failed.len() {
+        return format!(
+            "could not fetch: {}",
+            failed
+                .iter()
+                .map(|f| f.error.as_deref().unwrap_or("unknown error"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    "nothing to rebase: every selected worktree is already up to date or skipped".to_string()
+}
+
+/// The skipped/blocked rows of a rebase plan, as confirm-modal info lines.
+fn skipped_lines(plan: &super::wire::RebaseReplyWire) -> Vec<String> {
+    plan.worktrees
+        .iter()
+        .filter(|w| w.result != "would-rebase")
+        .map(|w| {
+            format!(
+                "{}: {}{}",
+                w.path.display(),
+                w.result,
+                w.reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// The non-pending rows of a push plan, as confirm-modal info lines.
+fn push_skipped_lines(plan: &super::wire::PushReplyWire) -> Vec<String> {
+    plan.worktrees
+        .iter()
+        .filter(|w| {
+            !matches!(
+                w.result.as_str(),
+                "would-fast-forward" | "would-force" | "would-create"
+            )
+        })
+        .map(|w| {
+            format!(
+                "{}: {}{}",
+                w.path.display(),
+                w.result,
+                w.reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// Why a merge-queue check found nothing eligible, naming the reasons the
+/// daemon gave rather than a bare "nothing to do".
+fn merge_queue_nothing_eligible(report: &super::wire::MergeQueueReplyWire) -> String {
+    if report.skipped.is_empty() {
+        return "no eligible pull requests in the selection".to_string();
+    }
+    format!(
+        "no eligible pull requests: {}",
+        report
+            .skipped
+            .iter()
+            .map(|s| format!("{} ({})", s.detail, s.kind))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
 pub fn applicable_actions(targets: &[Target]) -> Vec<(ActionKind, &'static str)> {
     let mut items = Vec::new();
 
@@ -614,6 +1018,16 @@ pub fn applicable_actions(targets: &[Target]) -> Vec<(ActionKind, &'static str)>
     // 3_copy
     if !targets.is_empty() {
         items.push((ActionKind::CopyDirectory, "Copy Directory"));
+    }
+
+    // 4_git — the group Phase 2 left deliberately empty. Every one of these
+    // drives a daemon op and is two-phase; the safety rules that matter
+    // (leased force only, never force the default branch) live in the
+    // daemon, not here.
+    if targets.iter().any(|t| matches!(t, Target::Worktree { .. })) {
+        items.push((ActionKind::Rebase, "Rebase on main"));
+        items.push((ActionKind::Push, "Push (force-with-lease)"));
+        items.push((ActionKind::MergeQueue, "Add to Merge Queue"));
     }
 
     // 9_close
@@ -784,6 +1198,8 @@ async fn futures_util_join_all<T>(futures: Vec<impl std::future::Future<Output =
 mod tests {
     use super::*;
 
+    use serde_json::json;
+
     fn worktree_target(path: &str, pr_url: Option<&str>) -> Target {
         Target::Worktree {
             path: PathBuf::from(path),
@@ -799,6 +1215,309 @@ mod tests {
         Target::Repo {
             root: PathBuf::from(root),
             github: github.map(|(o, n)| (o.to_string(), n.to_string())),
+        }
+    }
+
+    /// A fake daemon that records the request line it received and answers
+    /// with `reply`. The shared `fake_daemon_reply` discards the request,
+    /// but the payload is exactly what the force-option tests assert on.
+    fn capturing_daemon(
+        reply: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_util::codec::{Framed, LinesCodec};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let req = framed.next().await.unwrap().unwrap();
+            let _ = tx.send(req);
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+        });
+        (dir, sock, rx)
+    }
+
+    fn dispatcher_on(sock: &Path) -> (Dispatcher, mpsc::UnboundedReceiver<HubCommand>) {
+        let (commands, rx) = mpsc::unbounded_channel();
+        (
+            Dispatcher::new(WorktreesClient::new(sock.to_path_buf()), commands),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn rebase_check_plans_and_lists_only_the_pending_worktrees() {
+        let reply = json!({ "ok": true, "payload": {
+            "fetches": [{ "repo_root": "/repo", "onto": "origin/main", "fetched": true, "ok": true }],
+            "worktrees": [
+                { "path": "/repo/a", "branch": "feat-a", "onto": "origin/main",
+                  "result": "would-rebase", "behind": 3 },
+                { "path": "/repo/b", "branch": "feat-b", "onto": "origin/main",
+                  "result": "up-to-date" },
+                { "path": "/repo/c", "branch": "feat-c", "onto": "origin/main",
+                  "result": "skipped", "reason": "dirty" }
+            ]
+        }});
+        let (_dir, sock, req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![
+            worktree_target("/repo/a", None),
+            worktree_target("/repo/b", None),
+            worktree_target("/repo/c", None),
+        ];
+        let report = dispatcher.check(ActionKind::Rebase, &targets).await;
+        match report {
+            CheckReport::NeedsConfirm { prompt, has_risk } => {
+                assert!(has_risk, "rewriting history is a risk");
+                assert!(prompt.title.contains("1 worktree"));
+                assert_eq!(prompt.body_lines.len(), 1, "only the pending one");
+                assert!(prompt.body_lines[0].contains("feat-a"));
+                assert!(prompt.body_lines[0].contains("3 behind"));
+                assert!(prompt.risk_lines.iter().any(|l| l.contains("rewrites")));
+                // The non-pending rows are reported, not hidden.
+                assert_eq!(prompt.info_lines.len(), 2);
+                assert!(prompt.info_lines.iter().any(|l| l.contains("dirty")));
+            }
+            other => panic!("expected NeedsConfirm, got {other:?}"),
+        }
+
+        // The plan phase must be check-only, and must never ask for force.
+        let sent: serde_json::Value = serde_json::from_str(&req.await.unwrap()).unwrap();
+        let payload = &sent["payload"];
+        assert_eq!(sent["op"], "rebase");
+        assert_eq!(payload["check"], true);
+        assert_eq!(payload["confirmed"], false);
+        assert!(
+            payload.get("force").is_none(),
+            "no force field is ever sent"
+        );
+        assert!(payload.get("onto").is_none(), "the UI never overrides onto");
+    }
+
+    #[tokio::test]
+    async fn rebase_check_refuses_when_every_fetch_failed_and_says_why() {
+        let reply = json!({ "ok": true, "payload": {
+            "fetches": [{ "repo_root": "/repo", "onto": "origin/main", "fetched": true,
+                          "ok": false, "error": "ssh: no key" }],
+            "worktrees": [{ "path": "/repo/a", "onto": "origin/main",
+                            "result": "fetch-failed", "detail": "ssh: no key" }]
+        }});
+        let (_dir, sock, _req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![worktree_target("/repo/a", None)];
+        match dispatcher.check(ActionKind::Rebase, &targets).await {
+            CheckReport::Refused { reason } => assert!(reason.contains("ssh: no key"), "{reason}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_execute_reports_per_target_outcomes_including_a_left_conflict() {
+        let reply = json!({ "ok": true, "payload": { "fetches": [], "worktrees": [
+            { "path": "/repo/a", "onto": "origin/main", "result": "rebased", "behind": 2 },
+            { "path": "/repo/b", "onto": "origin/main", "result": "conflict",
+              "detail": "CONFLICT in x.rs", "left_in_place": true }
+        ]}});
+        let (_dir, sock, req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![
+            worktree_target("/repo/a", None),
+            worktree_target("/repo/b", None),
+        ];
+        match dispatcher.execute(ActionKind::Rebase, &targets).await {
+            ActionOutcome::BatchDone { results } => {
+                assert_eq!(results.len(), 2);
+                assert!(results[0].1.is_ok());
+                let err = results[1].1.as_ref().unwrap_err();
+                assert!(err.contains("left mid-rebase"), "{err}");
+                assert!(err.contains("CONFLICT in x.rs"), "{err}");
+            }
+            other => panic!("expected BatchDone, got {other:?}"),
+        }
+        let sent: serde_json::Value = serde_json::from_str(&req.await.unwrap()).unwrap();
+        assert_eq!(sent["payload"]["confirmed"], true);
+        assert_eq!(sent["payload"]["check"], false);
+        // Conflicts are left in place to resolve, matching the tree view.
+        assert_eq!(sent["payload"]["keep_conflicts"], true);
+    }
+
+    #[tokio::test]
+    async fn push_check_distinguishes_a_lease_from_a_fast_forward() {
+        let reply = json!({ "ok": true, "payload": { "worktrees": [
+            { "path": "/repo/a", "branch": "feat-a", "remote": "origin",
+              "remote_branch": "feat-a", "result": "would-force", "ahead": 4, "behind": 2 },
+            { "path": "/repo/b", "branch": "feat-b", "remote": "origin",
+              "remote_branch": "feat-b", "result": "would-fast-forward", "ahead": 1 },
+            { "path": "/repo/c", "branch": "feat-c", "remote": "origin",
+              "remote_branch": "feat-c", "result": "up-to-date" }
+        ]}});
+        let (_dir, sock, req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![
+            worktree_target("/repo/a", None),
+            worktree_target("/repo/b", None),
+            worktree_target("/repo/c", None),
+        ];
+        match dispatcher.check(ActionKind::Push, &targets).await {
+            CheckReport::NeedsConfirm { prompt, has_risk } => {
+                assert!(has_risk, "a leased force is a risk");
+                assert_eq!(prompt.body_lines.len(), 2);
+                assert!(prompt.body_lines[0].contains("force-with-lease"));
+                assert!(prompt.body_lines[1].contains("fast-forward"));
+                assert!(prompt
+                    .risk_lines
+                    .iter()
+                    .any(|l| l.contains("lease is enforced by git")));
+                assert!(prompt.info_lines.iter().any(|l| l.contains("up-to-date")));
+            }
+            other => panic!("expected NeedsConfirm, got {other:?}"),
+        }
+
+        // The load-bearing assertion of ADR-0061: the UI cannot ask for a
+        // bare force, because it never sends one.
+        let sent: serde_json::Value = serde_json::from_str(&req.await.unwrap()).unwrap();
+        let payload = &sent["payload"];
+        assert_eq!(sent["op"], "push");
+        assert!(payload.get("force").is_none());
+        assert!(payload.get("force_with_lease").is_none());
+        assert!(payload.get("remote").is_none(), "no remote override");
+    }
+
+    #[tokio::test]
+    async fn push_execute_names_a_refused_lease_as_such() {
+        let reply = json!({ "ok": true, "payload": { "worktrees": [
+            { "path": "/repo/a", "branch": "a", "remote": "origin", "remote_branch": "a",
+              "result": "pushed", "forced": true },
+            { "path": "/repo/b", "branch": "b", "remote": "origin", "remote_branch": "b",
+              "result": "rejected", "detail": "stale info", "stale": true }
+        ]}});
+        let (_dir, sock, _req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![
+            worktree_target("/repo/a", None),
+            worktree_target("/repo/b", None),
+        ];
+        match dispatcher.execute(ActionKind::Push, &targets).await {
+            ActionOutcome::BatchDone { results } => {
+                assert!(results[0].1.is_ok());
+                let err = results[1].1.as_ref().unwrap_err();
+                // The user is told the fix is a fetch and rebase, not a
+                // harder push — there is no harder push to reach for.
+                assert!(err.contains("lease refused"), "{err}");
+                assert!(err.contains("fetch and rebase"), "{err}");
+            }
+            other => panic!("expected BatchDone, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_queue_check_lists_eligible_prs_and_refuses_when_none_are() {
+        let reply = json!({ "ok": true, "payload": {
+            "eligible": [{ "path": "/repo/a", "number": 42, "url": "u", "branch": "feat-a" }],
+            "skipped": [{ "path": "/repo/b", "kind": "no-pr", "detail": "no open PR" }]
+        }});
+        let (_dir, sock, _req) = capturing_daemon(reply);
+        let (dispatcher, _cmds) = dispatcher_on(&sock);
+        let targets = vec![
+            worktree_target("/repo/a", None),
+            worktree_target("/repo/b", None),
+        ];
+        match dispatcher.check(ActionKind::MergeQueue, &targets).await {
+            CheckReport::NeedsConfirm { prompt, has_risk } => {
+                assert!(!has_risk, "enqueueing is not destructive");
+                assert!(prompt.body_lines[0].contains("#42"));
+                assert!(prompt.info_lines[0].contains("no open PR"));
+            }
+            other => panic!("expected NeedsConfirm, got {other:?}"),
+        }
+
+        let none = json!({ "ok": true, "payload": { "eligible": [],
+            "skipped": [{ "path": "/repo/b", "kind": "no-pr", "detail": "no open PR" }] }});
+        let (_dir2, sock2, _req2) = capturing_daemon(none);
+        let (dispatcher, _cmds) = dispatcher_on(&sock2);
+        match dispatcher.check(ActionKind::MergeQueue, &targets).await {
+            CheckReport::Refused { reason } => assert!(reason.contains("no open PR"), "{reason}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_git_actions_refuse_a_selection_with_no_worktree_rows() {
+        // A repo header alone is not a valid target for any of the three:
+        // they act on worktrees. No daemon is contacted at all.
+        let (dispatcher, _cmds) = dispatcher_on(Path::new("/tmp/nonexistent-4d.sock"));
+        let targets = vec![repo_target("/repo", None)];
+        for action in [ActionKind::Rebase, ActionKind::Push, ActionKind::MergeQueue] {
+            match dispatcher.check(action, &targets).await {
+                CheckReport::Refused { reason } => {
+                    assert!(reason.contains("select a worktree"), "{action:?}: {reason}");
+                }
+                other => panic!("{action:?}: expected Refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_git_actions_are_offered_only_for_worktree_rows() {
+        let git = [ActionKind::Rebase, ActionKind::Push, ActionKind::MergeQueue];
+        let repo_only = applicable_actions(&[repo_target("/repo", None)]);
+        for action in git {
+            assert!(
+                !repo_only.iter().any(|(a, _)| *a == action),
+                "{action:?} offered on a repo row"
+            );
+        }
+        let with_worktree = applicable_actions(&[worktree_target("/repo/a", None)]);
+        for action in git {
+            assert!(
+                with_worktree.iter().any(|(a, _)| *a == action),
+                "{action:?} missing for a worktree row"
+            );
+        }
+    }
+
+    /// The surface-level half of ADR-0061's guarantee: no force escape
+    /// hatch exists anywhere in this module or the client it calls. The
+    /// daemon enforces the lease; this keeps the *UI* from ever asking to
+    /// bypass it, which is the part a reviewer of this crate can check.
+    #[test]
+    fn no_force_escape_hatch_exists_in_the_ui_surface() {
+        let sources = [
+            ("actions.rs", include_str!("actions.rs")),
+            ("client.rs", include_str!("client.rs")),
+            ("wire.rs", include_str!("wire.rs")),
+        ];
+        for (name, source) in sources {
+            // Only production code: the tests below deliberately assert on
+            // the *absence* of a force field, so they name it.
+            let code_only = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for (number, line) in code_only.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with("///") {
+                    continue; // prose may discuss force; code may not request it
+                }
+                let asks_for_force = code.contains("\"force\"")
+                    || code.contains("--force\"")
+                    || code.contains("force: true")
+                    || code.contains("\"no_verify\"");
+                assert!(
+                    !asks_for_force,
+                    "{name}:{}: the UI must never request a force: {line}",
+                    number + 1
+                );
+            }
         }
     }
 

@@ -194,6 +194,137 @@ pub struct SafetyReportWire {
     pub info: Vec<CloseNoteWire>,
 }
 
+/// The `rebase` op's reply: the per-repository fetch outcomes and the
+/// per-worktree classifications. Mirrors `git::worktree_rebase`'s
+/// `FetchOutcome`/`WorktreeOutcome`, whose result enum is `#[serde(flatten)]`ed
+/// into the worktree object — so the discriminant arrives as a sibling
+/// `result` field rather than a nested object.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RebaseReplyWire {
+    #[serde(default)]
+    pub fetches: Vec<RebaseFetchWire>,
+    #[serde(default)]
+    pub worktrees: Vec<RebaseWorktreeWire>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RebaseFetchWire {
+    #[serde(default)]
+    pub repo_root: PathBuf,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub onto: String,
+    #[serde(default)]
+    pub fetched: bool,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RebaseWorktreeWire {
+    #[serde(default)]
+    pub path: PathBuf,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub branch: Option<String>,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub onto: String,
+    /// The flattened `RebaseResult` discriminant, kebab-case: `rebased`,
+    /// `would-rebase`, `up-to-date`, `skipped`, `conflict`, `fetch-failed`.
+    #[serde(default, deserialize_with = "sanitized")]
+    pub result: String,
+    #[serde(default)]
+    pub behind: Option<usize>,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub reason: Option<String>,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub left_in_place: bool,
+}
+
+/// The `push` op's reply. Mirrors `git::worktree_push`'s `WorktreeOutcome`,
+/// with `PushResult` flattened the same way [`RebaseWorktreeWire`] flattens
+/// its own.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PushReplyWire {
+    #[serde(default)]
+    pub worktrees: Vec<PushWorktreeWire>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PushWorktreeWire {
+    #[serde(default)]
+    pub path: PathBuf,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub branch: Option<String>,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub remote: String,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub remote_branch: String,
+    /// The flattened `PushResult` discriminant, kebab-case: `up-to-date`,
+    /// `would-fast-forward`, `would-force`, `would-create`, `pushed`,
+    /// `created`, `rejected`, `skipped`.
+    #[serde(default, deserialize_with = "sanitized")]
+    pub result: String,
+    #[serde(default)]
+    pub ahead: Option<usize>,
+    #[serde(default)]
+    pub behind: Option<usize>,
+    #[serde(default)]
+    pub forced: bool,
+    /// A refused **lease** — the remote moved since this worktree last saw
+    /// it. The signal that the fix is a fetch and a rebase, never a harder
+    /// push (ADR-0061).
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub detail: Option<String>,
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub reason: Option<String>,
+}
+
+/// The `merge-queue` op's reply. Phase 1 fills `eligible`/`skipped`; phase 2
+/// fills `queued`/`skipped`/`failed`. One type covers both since every field
+/// defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeQueueReplyWire {
+    #[serde(default)]
+    pub eligible: Vec<MergeQueuePrWire>,
+    #[serde(default)]
+    pub queued: Vec<MergeQueuePrWire>,
+    #[serde(default)]
+    pub skipped: Vec<MergeQueueSkipWire>,
+    #[serde(default)]
+    pub failed: Vec<MergeQueueSkipWire>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeQueuePrWire {
+    #[serde(default, deserialize_with = "sanitized")]
+    pub path: String,
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub url: String,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub branch: String,
+    #[serde(default)]
+    pub already_queued: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeQueueSkipWire {
+    #[serde(default, deserialize_with = "sanitized")]
+    pub path: String,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "sanitized")]
+    pub detail: String,
+    #[serde(default)]
+    pub number: Option<u64>,
+}
+
 /// One risk/info note in a [`SafetyReportWire`]: a machine `kind` slug and a
 /// human-readable `detail` — mirrors the daemon's private `Note`.
 #[derive(Debug, Clone, Default, Deserialize)]
