@@ -43,9 +43,7 @@ struct WorktreeOids {
 /// treats every worktree in the latest snapshot as visible by default).
 #[derive(Debug, Clone)]
 pub enum HubCommand {
-    #[allow(dead_code)] // Phase 3 tab lifecycle
     SetOpenTab(PathBuf),
-    #[allow(dead_code)] // Phase 3 tab lifecycle
     ClearOpenTab(PathBuf),
     SetRowColor(RowColorKey, String),
     ClearRowColor(RowColorKey),

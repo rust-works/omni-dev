@@ -95,3 +95,4 @@ by Michael Nygard.
 | [ADR-0069](adr-0069.md)  | ✅ Accepted                              | 2026-08-15 | A Drive-Specific Named-Account Store and Read-Only OAuth2 Client, Mirroring Gmail's Design  |
 | [ADR-0070](adr-0070.md)  | ✅ Accepted                              | 2026-08-18 | Security-Gated Rename/Move for the Drive Integration                                        |
 | [ADR-0071](adr-0071.md)  | ✅ Accepted                              | 2026-08-25 | Folder-Scoped Write Permissions for the Drive Integration                                   |
+| [ADR-0072](adr-0072.md)  | ✅ Accepted                              | 2026-09-05 | A Terminal UI for the Worktrees View                                                        |
