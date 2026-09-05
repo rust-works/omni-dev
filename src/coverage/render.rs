@@ -737,11 +737,11 @@ mod tests {
         let mut diff = sample_diff();
         diff.has_baseline = true;
         diff.total_before = Some(80.0);
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/big.rs".to_string(),
-            before: Some(90.0),
-            after: Some(89.998),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/big.rs".to_string(),
+            Some(90.0),
+            Some(89.998),
+        )];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(
             md.contains("| `src/big.rs` | 90% | 90% | \u{26aa} 0 pp |"),
@@ -798,11 +798,11 @@ mod tests {
         diff.has_baseline = true;
         diff.total_before = Some(85.0);
         diff.total_after = Some(80.0);
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/big.rs".to_string(),
-            before: Some(90.0),
-            after: Some(60.0),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/big.rs".to_string(),
+            Some(90.0),
+            Some(60.0),
+        )];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(!md.contains("not attributable to this diff"), "{md}");
     }
@@ -854,34 +854,15 @@ mod tests {
             total_after: Some(80.0),
             total_before: Some(80.0), // equal → ⚪ 0 pp
             file_deltas: vec![
-                FileDelta {
-                    path: "src/new.rs".to_string(),
-                    before: None,
-                    after: Some(50.0),
-                },
-                FileDelta {
-                    path: "src/down.rs".to_string(),
-                    before: Some(100.0),
-                    after: Some(70.0),
-                },
-                FileDelta {
-                    path: "src/up.rs".to_string(),
-                    before: Some(70.0),
-                    after: Some(90.0),
-                },
-                FileDelta {
-                    path: "src/tiny.rs".to_string(),
-                    before: Some(90.0),
-                    after: Some(90.02), // below EPS → filtered out
-                },
-                FileDelta {
-                    path: "src/gone.rs".to_string(),
-                    before: Some(50.0),
-                    after: None, // After renders as em dash
-                },
+                FileDelta::new("src/new.rs".to_string(), None, Some(50.0)),
+                FileDelta::new("src/down.rs".to_string(), Some(100.0), Some(70.0)),
+                FileDelta::new("src/up.rs".to_string(), Some(70.0), Some(90.0)),
+                // below EPS → filtered out
+                FileDelta::new("src/tiny.rs", Some(90.0), Some(90.02)),
+                // `After` renders as an em dash
+                FileDelta::new("src/gone.rs", Some(50.0), None),
             ],
-            notable_unchanged: Vec::new(),
-            indirect: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -977,17 +958,9 @@ mod tests {
     fn markdown_renders_notable_unchanged_note() {
         let mut diff = baseline_diff();
         diff.notable_unchanged = vec![
-            FileDelta {
-                path: "src/other.rs".to_string(),
-                before: Some(80.0),
-                after: Some(60.0),
-            },
+            FileDelta::new("src/other.rs".to_string(), Some(80.0), Some(60.0)),
             // Absent from the baseline → delta() is None → renders as "🆕 new".
-            FileDelta {
-                path: "src/fresh.rs".to_string(),
-                before: None,
-                after: Some(55.0),
-            },
+            FileDelta::new("src/fresh.rs".to_string(), None, Some(55.0)),
         ];
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(md.contains("unchanged file(s) also moved (not attributed to this PR)"));
@@ -999,11 +972,11 @@ mod tests {
     #[test]
     fn json_includes_notable_unchanged() {
         let mut diff = baseline_diff();
-        diff.notable_unchanged = vec![FileDelta {
-            path: "src/other.rs".to_string(),
-            before: Some(80.0),
-            after: Some(60.0),
-        }];
+        diff.notable_unchanged = vec![FileDelta::new(
+            "src/other.rs".to_string(),
+            Some(80.0),
+            Some(60.0),
+        )];
         let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
