@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-09-05
+
 ### Added
 - **`omni-dev worktrees ui` — a full-screen terminal UI for the worktrees tree (Phase 1: read-only view)** ([#1585](https://github.com/rust-works/omni-dev/issues/1585)): a `ratatui`-based app that supersedes `worktrees tree --follow` for interactive use, redrawing on every live `worktrees`/`sessions` push from the daemon rather than one static snapshot. It reuses the daemon's existing `subscribe` push protocol behind a new reconnect-with-full-jitter-backoff supervisor (`src/cli/worktrees/ui/supervisor.rs`) that falls back to one-shot polling against an older daemon that doesn't know the `subscribe` op, and joins the tree/sessions feeds with a local ahead/behind cache, row-colour store (`~/.omni-dev/worktrees-ui-row-colors.yaml`), and open-tab state into one merged view model (`src/cli/worktrees/ui/{hub,view_model}.rs`). Each row's colour follows the same severity ranking the tree view's `rowColorId` uses (red > yellow > green > muted from PR-check/session state), with an in-flight git operation or a user's own row-colour tag taking precedence over it. `q`/`Esc`/Ctrl-C quits and always restores the terminal. Actions, embedded terminals and tabs, and the rest of the tree view's VS Code-parity surface are later phases. See [docs/worktrees-service.md](docs/worktrees-service.md).
 - **`omni-dev worktrees ui` gains actions (Phase 2)** ([#1585](https://github.com/rust-works/omni-dev/issues/1585)): row navigation and multi-select (`↑`/`↓`/`j`/`k`, `space`), an action menu (`a`) filtered to the current selection and grouped in the tree view's own `0_open`/`1_pr`/`2_claude`/`3_copy`/`9_close` order (`src/cli/worktrees/ui/{actions,tree,popup}.rs`), the row-colour write path (`c`/`C`, wired onto Phase 1's already-working store), and five daemon-free parity commands ported from the VS Code companion: Open GitHub Repository, Copy Directory, Copy Pull Request URL(s) (built entirely from the already-live snapshot, needing no `gh` lookup unlike the companion's version), Move/Copy Claude Session Here (`src/sessions/relocate.rs` — pure `~/.claude/projects/` filesystem manipulation; the cursor row is always the relocation's *source*, the one adaptation a TUI needs since it has no "current window" to default a source to), and Focus/Open Worktree (wraps the daemon's `open` op, identical to `worktrees focus`). Close Worktree/Close Window are the two-phase check→confirm→execute flow, fanned out client-side across every marked target concurrently since the daemon's `close` op isn't batched on the wire. `WorktreesClient`'s new `open`/`close_check`/`close_execute` ops (and the existing `fetch_ahead_behind`) now share the crate's `call_service` request/origin-stamping helper instead of hand-rolling their own. `arboard` (clipboard writes) moves from an optional, macOS-only, `menu-bar`-feature-gated dependency to a plain unconditional one, since the UI needs it on both macOS and Linux in the default build.
@@ -1564,7 +1566,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.42.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.43.0...HEAD
+[0.43.0]: https://github.com/rust-works/omni-dev/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/rust-works/omni-dev/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/rust-works/omni-dev/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/rust-works/omni-dev/compare/v0.39.0...v0.40.0

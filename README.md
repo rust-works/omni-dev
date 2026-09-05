@@ -553,7 +553,11 @@ Attribute a per-line coverage report to a git diff and report **patch
 coverage** — the share of added lines that are tested — plus the uncovered new
 lines, per-file deltas, and indirect coverage changes. Reads lcov, llvm-cov
 JSON, or Cobertura XML (auto-detected), renders markdown/YAML/JSON, and can gate
-a branch. It powers the project's PR coverage comment and runs locally too. See
+a branch. Coverage that is inherently non-deterministic across runs — a
+CPU-gated region measured on two different runner CPUs — can be excluded by file
+or, more precisely, by source comment markers that `ignore` a region or
+`tolerate` it (keeping its real coverage in the total while masking its
+flips). It powers the project's PR coverage comment and runs locally too. See
 [docs/coverage.md](docs/coverage.md).
 
 ```bash
