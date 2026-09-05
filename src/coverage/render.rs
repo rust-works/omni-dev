@@ -92,13 +92,55 @@ fn pct(x: Option<f64>) -> String {
 }
 
 /// Direction emoji for a percentage-point delta.
+///
+/// The direction is taken from the *displayed* (rounded) value, not the raw
+/// one: every caller prints [`fmt_num`] beside this emoji, and `fmt_num` rounds
+/// through [`round2`]. Deriving the arrow from the raw delta let a move in
+/// `(-0.005, 0)` render as a red arrow next to `0 pp` — an alarm colour beside a
+/// number that says nothing moved.
 fn arrow(d: f64) -> &'static str {
+    let d = round2(d);
     if d > 0.0 {
         "🟢"
     } else if d < 0.0 {
         "🔴"
     } else {
         "⚪"
+    }
+}
+
+/// Direction emoji for the *headline* total delta.
+///
+/// The per-file sections have suppressed cross-run measurement variance since
+/// #973 — delta-table rows need `|d| >= EPS`, and an untouched file needs a net
+/// move of `NOTABLE_UNCHANGED_LINES` covered lines — but the headline had no
+/// equivalent gate, so every flip those sections hid still accumulated here and
+/// was painted red. Applying the same `EPS` tolerance keeps the comment
+/// internally consistent: a sub-tolerance total move is neutral, while the
+/// number itself is still printed truthfully beside it.
+fn headline_arrow(d: f64) -> &'static str {
+    if d.abs() < EPS {
+        "⚪"
+    } else {
+        arrow(d)
+    }
+}
+
+/// Annotates the headline when the total moved but no per-file section can
+/// account for it — the move is then, by construction, not attributable to this
+/// diff. Without this a reader sees a total delta above a comment whose every
+/// other section says nothing changed.
+fn unattributed_note(diff: &CoverageDiff, d: f64) -> &'static str {
+    let moved = round2(d) != 0.0;
+    let explained = diff
+        .file_deltas
+        .iter()
+        .any(|fd| fd.delta().is_none_or(|d| d.abs() >= EPS))
+        || !diff.notable_unchanged.is_empty();
+    if moved && !explained {
+        " _(not attributable to this diff)_"
+    } else {
+        ""
     }
 }
 
@@ -146,10 +188,11 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
             (after, Some(before)) => {
                 let d = after.unwrap_or(0.0) - before;
                 out.push_str(&format!(
-                    "Total: **{}** {} {} pp vs `main`\n\n",
+                    "Total: **{}** {} {} pp vs `main`{}\n\n",
                     pct(after),
-                    arrow(d),
-                    fmt_num(d)
+                    headline_arrow(d),
+                    fmt_num(d),
+                    unattributed_note(diff, d)
                 ));
             }
             (after, None) => {
@@ -666,6 +709,102 @@ mod tests {
         assert!(md.contains("🟢 5 pp vs `main`"));
         assert!(md.contains("### Indirect coverage changes"));
         assert!(md.contains("`src/b.rs:5`"));
+    }
+
+    /// #1591: the arrow must agree with the number printed beside it. A delta
+    /// inside the rounding interval prints `0 pp`, so it must be neutral rather
+    /// than raising a red alarm next to a number that says nothing moved.
+    #[test]
+    fn markdown_sub_rounding_delta_is_neutral() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.total_after = Some(79.996);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("\u{26aa} 0 pp vs `main`"), "{md}");
+        assert!(
+            !md.contains("\u{1f534}"),
+            "sub-rounding move must not paint red: {md}"
+        );
+    }
+
+    /// The same pairing in the per-file table, which the EPS row filter happens
+    /// to protect, and in the notable-unchanged table, which it does not: that
+    /// section is gated on *covered lines* (>= 10), so a large file can reach it
+    /// with a sub-rounding percentage-point move.
+    #[test]
+    fn notable_unchanged_sub_rounding_delta_is_neutral() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.notable_unchanged = vec![FileDelta {
+            path: "src/big.rs".to_string(),
+            before: Some(90.0),
+            after: Some(89.998),
+        }];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            md.contains("| `src/big.rs` | 90% | 90% | \u{26aa} 0 pp |"),
+            "{md}"
+        );
+    }
+
+    /// #1592: the #2444 shape — a docs-only PR whose headline moved because one
+    /// CPU-conditional function flipped between two runner CPUs, while every
+    /// per-file section of the same comment reported nothing.
+    #[test]
+    fn markdown_sub_eps_total_move_is_neutral_and_annotated() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(92.8012);
+        diff.total_after = Some(92.7924);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            !md.contains("\u{1f534}"),
+            "sub-EPS move must not paint red: {md}"
+        );
+        assert!(md.contains("Total: **92.79%** \u{26aa} -0.01 pp"), "{md}");
+        assert!(md.contains("_(not attributable to this diff)_"), "{md}");
+    }
+
+    /// Above the tolerance the headline still reports the direction — but with
+    /// nothing below it to account for the move, it says so.
+    #[test]
+    fn markdown_unexplained_total_move_is_annotated() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(85.0);
+        diff.total_after = Some(80.0);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(
+            md.contains("\u{1f534} -5 pp vs `main` _(not attributable to this diff)_"),
+            "{md}"
+        );
+    }
+
+    /// A move a per-file row *does* explain is left unannotated.
+    #[test]
+    fn markdown_explained_total_move_is_not_annotated() {
+        let diff = baseline_diff();
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(!md.contains("not attributable"), "{md}");
+    }
+
+    /// A notable-unchanged entry also counts as an explanation, even though it
+    /// is not attributed to the PR: the reader can see where the move came from.
+    #[test]
+    fn markdown_notable_unchanged_explains_total_move() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(85.0);
+        diff.total_after = Some(80.0);
+        diff.notable_unchanged = vec![FileDelta {
+            path: "src/big.rs".to_string(),
+            before: Some(90.0),
+            after: Some(60.0),
+        }];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(!md.contains("not attributable to this diff"), "{md}");
     }
 
     #[test]
