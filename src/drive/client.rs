@@ -33,6 +33,11 @@ use crate::utils::env::{EnvSource, SystemEnv};
 /// in each record's URL.
 pub(crate) const SERVICE_TAG: &str = "drive";
 
+/// Human-readable API name for Drive error messages. Unlike
+/// [`SERVICE_TAG`], which both clients share, this differs per API so a
+/// Sheets failure doesn't announce itself as a Drive one.
+pub(crate) const API_NAME: &str = "Drive";
+
 /// HTTP client for the Drive v3 REST API.
 pub struct DriveClient {
     inner: GoogleApiClient,
@@ -68,7 +73,7 @@ impl DriveClient {
     /// pass a wiremock URL directly.
     pub fn new(base_url: &str, credentials: &DriveCredentials) -> Result<Self> {
         Ok(Self {
-            inner: GoogleApiClient::new(base_url, credentials, SERVICE_TAG)?,
+            inner: GoogleApiClient::new(base_url, credentials, SERVICE_TAG, API_NAME)?,
         })
     }
 
@@ -211,7 +216,7 @@ impl DriveClient {
     /// drives a retry, so this only sees the error once retries are
     /// exhausted (or the reason didn't match).
     pub async fn response_to_error(response: Response) -> DriveError {
-        GoogleApiClient::response_to_error(response).await
+        GoogleApiClient::response_to_error(API_NAME, response).await
     }
 }
 
@@ -221,7 +226,7 @@ impl DriveClient {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) mod test_support {
-    use super::{DriveClient, GoogleApiClient, SERVICE_TAG};
+    use super::{DriveClient, GoogleApiClient, API_NAME, SERVICE_TAG};
     use crate::drive::auth::DriveCredentials;
 
     /// Replaces `client`'s transport with one whose session points at an
@@ -242,6 +247,7 @@ pub(crate) mod test_support {
             &base_url,
             credentials,
             SERVICE_TAG,
+            API_NAME,
             token_endpoint,
         )
         .expect("failed to build a test transport");
@@ -828,6 +834,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_drive_failure_still_names_drive() {
+        // The other half of the pair: threading an API name must not have
+        // changed what Drive's own failures say.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let response = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        let text = DriveClient::response_to_error(response).await.to_string();
+        assert!(text.starts_with("Drive API request failed"), "{text}");
     }
 
     #[tokio::test]

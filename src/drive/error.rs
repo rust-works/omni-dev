@@ -46,8 +46,16 @@ pub enum DriveError {
     CredentialsNotFound,
 
     /// A Drive API request failed.
-    #[error("Drive API request failed: HTTP {status}: {body}")]
+    #[error("{api} API request failed: HTTP {status}: {body}")]
     ApiRequestFailed {
+        /// Which Google API produced this — `"Drive"` or `"Sheets"`.
+        ///
+        /// Carried rather than hardcoded because both APIs share one
+        /// transport and one `DriveError`: a Sheets 403 that announced
+        /// itself as a *Drive* failure sent the reader to the wrong API's
+        /// docs, and that is the message a new user is most likely to hit
+        /// (a `drive.file` grant cannot write a browser-created Sheet).
+        api: &'static str,
         /// HTTP status code.
         status: u16,
         /// Response body text (or an extracted `error.message`/`reason`
@@ -157,6 +165,7 @@ mod tests {
     #[test]
     fn api_request_failed_display() {
         let err = DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 403,
             body: "insufficientPermissions".to_string(),
             reason: None,
@@ -174,6 +183,7 @@ mod tests {
     #[test]
     fn reason_returns_the_structured_field() {
         let err = DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 404,
             body: "Not Found (reason: notFound)".to_string(),
             reason: Some("notFound".to_string()),
@@ -184,6 +194,7 @@ mod tests {
     #[test]
     fn reason_is_none_when_the_structured_field_is_absent() {
         let err = DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 500,
             body: "Internal Server Error".to_string(),
             reason: None,
@@ -194,6 +205,7 @@ mod tests {
     #[test]
     fn reason_ignores_a_reason_like_substring_embedded_in_the_body() {
         let err = DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 400,
             body: "Message already explains itself (reason: not the real one)".to_string(),
             reason: None,
