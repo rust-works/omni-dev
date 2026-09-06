@@ -177,8 +177,9 @@ pub const REAP_GRACE: Duration = Duration::from_millis(250);
 /// So the sequence is unconditional and synchronous, and the caller runs it
 /// before the join. `SIGKILL` to an already-exited child is `ESRCH`, a no-op:
 /// a child that honoured `SIGHUP` is still reported as dying of `SIGHUP`.
-/// The cost is that shutdown always spends the grace period on a blocking
-/// thread, which is the price of being deterministic on every platform.
+/// The cost is that shutdown always spends the grace period on a plain OS
+/// thread, detached from the async runtime, which is the price of being
+/// deterministic on every platform.
 #[cfg(unix)]
 pub fn reap_child_group(pid: i32, grace: Duration) {
     use nix::sys::signal::{killpg, Signal};

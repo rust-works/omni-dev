@@ -364,15 +364,33 @@ impl TerminalTab {
     /// Stops the PTY thread and reaps the child.
     ///
     /// The join — and the `Pty` drop inside it, which `SIGHUP`s the child and
-    /// then `wait()`s — runs on a blocking thread so a slow exit never stalls
-    /// the event loop. But "off the event loop" was never the whole problem
-    /// (#1605): that `wait()` has no deadline, and dropping the `tokio`
-    /// runtime waits for blocking tasks, so a child that ignores `SIGHUP`
-    /// could keep the *process* alive after the UI had already restored the
-    /// terminal and handed back the prompt.
+    /// then `wait()`s — runs on a plain, detached OS thread so a slow exit
+    /// never stalls the event loop. But "off the event loop" was never the
+    /// whole problem (#1605): that `wait()` has no deadline, and dropping the
+    /// `tokio` runtime waits for blocking tasks, so a child that ignores
+    /// `SIGHUP` could keep the *process* alive after the UI had already
+    /// restored the terminal and handed back the prompt.
     ///
     /// So the group is reaped first, with escalation, and only then is the
     /// thread joined — by which point the drop's `wait()` returns at once.
+    ///
+    /// **Why a raw `std::thread`, not `tokio::task::spawn_blocking` (#1611).**
+    /// The obvious choice is `spawn_blocking`, and that is what this used to
+    /// do — but its future is tracked by the runtime even though nobody ever
+    /// awaits it, so `Runtime::drop()` still blocks until it finishes (in a
+    /// `#[tokio::test]`'s per-test runtime, and in `main.rs`'s). That
+    /// reintroduces exactly the class of hang #1605 fixed, this time from a
+    /// second, independent cause: on macOS, a `TabKind::Shell` tab's child is
+    /// `/usr/bin/login` (see `spawn` above), and a killed `login` can land in
+    /// the kernel's own exit teardown (`ps` shows state `Es+`) and never
+    /// finish it — confirmed live via `lldb`, reading the actual pid argument
+    /// of the blocked `wait4()` syscall. The reap escalation above still
+    /// genuinely kills it; it is the **kernel's own reap** that stalls, which
+    /// nothing in this process can bound. So instead of trying to bound the
+    /// unboundable, the join and drop move to a plain OS thread that is
+    /// spawned and immediately detached (its `JoinHandle` dropped) — nothing
+    /// ever waits on it, so a stuck kernel-side teardown can no longer wedge
+    /// a test's runtime, or the real CLI's, on shutdown.
     pub fn shutdown(&mut self) {
         let Some(mut handle) = self.handle.take() else {
             return;
@@ -380,10 +398,12 @@ impl TerminalTab {
         let _ = handle.sender.send(Msg::Shutdown);
         let pid = handle.child_pid;
         if let Some(thread) = handle.take_thread() {
-            tokio::task::spawn_blocking(move || {
-                pty::reap_child_group(pid, pty::REAP_GRACE);
-                let _ = thread.join();
-            });
+            let _ = std::thread::Builder::new()
+                .name("terminal-tab-reap".into())
+                .spawn(move || {
+                    pty::reap_child_group(pid, pty::REAP_GRACE);
+                    let _ = thread.join();
+                });
         }
     }
 
@@ -775,6 +795,63 @@ mod tests {
         terminal
             .draw(|frame| tab.draw(frame, frame.area(), true))
             .unwrap();
+    }
+
+    /// The structural property `shutdown` relies on (#1611): a plain,
+    /// detached `std::thread` is never joined by anything, so it cannot hold
+    /// up a `tokio::Runtime`'s drop no matter how long it runs — unlike a
+    /// `tokio::task::spawn_blocking` task, which the runtime always joins on
+    /// drop even when nobody awaits it (see the counter-example below). This
+    /// can't be pinned against the real macOS failure (a `login` process
+    /// stuck in the kernel's own exit teardown) on demand, so it is pinned
+    /// against a thread that deliberately never returns instead.
+    #[test]
+    fn a_never_finishing_detached_thread_does_not_block_runtime_drop() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _ = std::thread::Builder::new()
+            .name("never-finishing".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            drop(rt);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "Runtime::drop must not wait on a detached OS thread"
+        );
+        let _ = watchdog.join();
+    }
+
+    /// The counterpart to the test above: `spawn_blocking` is what `shutdown`
+    /// used to use, and this is why it had to change. Left `#[ignore]`d as
+    /// living documentation of the regression #1611 fixed — running it hangs
+    /// the process, which is exactly the bug.
+    #[test]
+    #[ignore = "demonstrates the pre-#1611 hang; would block the test binary forever if run"]
+    fn a_never_finishing_spawn_blocking_task_blocks_runtime_drop() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn_blocking(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            drop(rt);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err(),
+            "Runtime::drop was expected to hang waiting on the blocking task"
+        );
+        let _ = watchdog.join();
     }
 
     #[cfg(unix)]
