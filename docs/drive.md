@@ -590,7 +590,8 @@ never a missed visibility increase. See
 ## Write permissions
 
 `drive create`/`drive upload`/`drive edit`, and `drive sheets
-write`/`append`/`clear`/`create` (below), need a much broader OAuth grant
+write`/`append`/`clear`/`create`/`add-sheet`/`rename-sheet`/`insert-rows`/
+`insert-columns` (below), need a much broader OAuth grant
 than rename/move — `--write-file`/`--write-full` — but Google's
 scopes are all-or-nothing across your whole Drive. There's no way to tell
 Google "only let this credential write inside folder X." So `omni-dev` adds
@@ -602,13 +603,14 @@ permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation      | Default | Granted to                                      |
-|----------------|---------|-------------------------------------------------|
-| `read`         | allow   | `search`, `read`, `dedupe` (not yet enforced)   |
-| `create`       | deny    | `create`, `sheets create`                       |
-| `upload`       | deny    | `upload`                                        |
-| `edit`         | deny    | `edit` — raw file content only                  |
-| `sheets-write` | deny    | `sheets write`, `sheets append`, `sheets clear` |
+| Operation          | Default | Granted to                                                          |
+|--------------------|---------|---------------------------------------------------------------------|
+| `read`             | allow   | `search`, `read`, `dedupe` (not yet enforced)                       |
+| `create`           | deny    | `create`, `sheets create`                                           |
+| `upload`           | deny    | `upload`                                                            |
+| `edit`             | deny    | `edit` — raw file content only                                      |
+| `sheets-write`     | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values       |
+| `sheets-structure` | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns` |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -622,6 +624,18 @@ would have retroactively turned those rules into cell-write permission with
 no config change and no re-consent. If you want a folder's existing `edit`
 grant to cover Sheets too, add `sheets-write` to it explicitly. See
 [ADR-0073](adrs/adr-0073.md) §3.
+
+**`sheets-structure` is separate from `sheets-write` for the same reason.**
+Every `allow: ["sheets-write"]` rule that exists today was written when
+structural edits were impossible, so reusing it would have turned those
+rules into permission to restructure a workbook — again with no config
+change and no re-consent. Granting one does not grant the other; name both
+if you want both. See [ADR-0075](adrs/adr-0075.md) §1.
+
+Note what `sheets-structure` does **not** cover: there is no way to delete a
+sheet, a row or a column through `omni-dev` at all. Those requests are not
+implemented, and the deferral is deliberate — see
+[Structural limits](#structural-limits) below.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from:
@@ -650,7 +664,8 @@ the one Drive it came from:
   below.
 - `recursive` — when `true`, the rule also matches every descendant of
   `folder_id`, not just the folder itself.
-- `allow`/`deny` — any of `read`, `create`, `upload`, `edit`. A `deny`
+- `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
+  `sheets-write`, `sheets-structure`. A `deny`
   entry is schema-ready today for a future `search`/`read`/`dedupe`
   enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); `create`/`upload`/`edit` are enforced
@@ -660,8 +675,8 @@ the one Drive it came from:
 0, then its parent, grandparent, …), the closest matching rule wins; if
 rules at the same depth disagree, `deny` wins. No matching rule anywhere
 falls through to the default policy table above. `drive create`/`drive
-upload` resolve the chain from `--parent`; `drive edit` resolves it from
-the target file's *current* parent(s) — unioned across every current
+upload` resolve the chain from `--parent`; `drive edit` and every `drive
+sheets` mutating verb resolve it from the target file's *current* parent(s) — unioned across every current
 parent for a legacy multi-parent file, with `deny` winning if any parent
 disagrees.
 
@@ -832,9 +847,10 @@ Same request-log behavior as [Create](#create)/[Upload](#upload).
 
 ## Sheets
 
-`drive sheets` reads the *cells* of a Google Sheet through the Sheets v4 API
-(issue #1589, [ADR-0073](adrs/adr-0073.md)). The Drive API cannot do this at
-all: it treats a Sheet as an opaque native document with no notion of a range,
+`drive sheets` reads and writes the *cells* of a Google Sheet through the
+Sheets v4 API (issue #1589, [ADR-0073](adrs/adr-0073.md)), and edits its
+*structure* (issue #1613, [ADR-0075](adrs/adr-0075.md)). The Drive API
+cannot do either: it treats a Sheet as an opaque native document with no notion of a range,
 a row or a cell. In particular, `drive read --content` on a Sheet exports **the
 first sheet only**, because Drive's export API has no multi-sheet CSV format —
 `drive sheets read` is the way to get the rest.
@@ -1027,6 +1043,70 @@ rolled back automatically.
 ```
 
 Delete it yourself if you don't want it.
+
+#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns
+
+Structural edits — changing the *shape* of a workbook rather than its cell
+values. Gated by the separate `sheets-structure` operation (above), so a
+folder granted `sheets-write` cannot be restructured without an explicit
+additional grant.
+
+Every one of these previews with `--dry-run` first:
+
+```bash
+# What would change, and to what — no mutation is attempted.
+omni-dev drive sheets insert-rows <ID> --sheet Q2 --at 5 --count 3 --dry-run
+```
+
+```
+Would insert 3 row(s) before row 5 of 'Q2' (sheetId 118293) in 'Budget'
+  (500 rows -> 503; existing rows 5-500 shift down)
+```
+
+That second line is the point of a structural dry run. An insert's effect
+isn't expressible as a range — it shifts everything below it — so the
+preview names the resulting dimension *and* the shift, read from the sheet's
+real current size rather than assumed.
+
+```bash
+# Add a tab. --rows/--columns are optional; omitted takes Sheets' own
+# defaults (1000 x 26) rather than a size omni-dev invents.
+omni-dev drive sheets add-sheet <ID> --title Q3
+omni-dev drive sheets add-sheet <ID> --title Q3 --index 2 --rows 200 --columns 8
+
+# Rename a tab, by its current title.
+omni-dev drive sheets rename-sheet <ID> --sheet Q2 --title 'Q2 (final)'
+
+# Insert rows or columns. --at is 1-based and inclusive — the row or column
+# number the spreadsheet itself shows — and inserts *before* it.
+omni-dev drive sheets insert-rows <ID> --sheet Q2 --at 5 --count 3
+omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
+```
+
+`--at 5` puts the new rows above the current row 5. Column A is 1.
+`--count` defaults to 1.
+
+Two refusals are specific to these verbs, and both are checked before
+anything is written so a `--dry-run` can never promise a change the real run
+then fails:
+
+```
+Refused: 'Budget' has no sheet titled 'Nope'. Available: 'Q1', 'Q2'
+Refused: 'Budget' already has a sheet titled 'Q1'
+```
+
+<a id="structural-limits"></a>
+**Structural limits — no deletion, at all.** There is deliberately no
+`delete-sheet`, no `delete-rows`, no `delete-columns`, and no way to send a
+raw `spreadsheets.batchUpdate` request array. Deletion is the one structural
+operation whose blast radius exceeds its arguments: deleting rows 5–10 also
+rewrites every formula referencing them across the whole workbook, and
+deleting a sheet destroys data with no per-cell footprint. It is deferred to
+its own design pass rather than shipped behind a flag, and the requests are
+not modelled in the code at all, so no combination of flags can reach one.
+If you need to delete something, do it in the Sheets UI. Formatting, data
+validation, protected ranges and sheet reordering are likewise not
+implemented yet. See [ADR-0075](adrs/adr-0075.md).
 
 **Limits.** A whole-workbook read refuses a spreadsheet beyond a fixed sheet
 count rather than returning part of it — silently returning half a workbook is
@@ -1243,6 +1323,10 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   Sheets v4 API: the shared transport core behind a second Google host, the
   separate `sheets-write` gate operation and why reusing `edit` was
   rejected, and the CSV/JSON rendering rules.
+- [ADR-0075](adrs/adr-0075.md) — extends ADR-0073 with structural edits via
+  `spreadsheets.batchUpdate`: the separate `sheets-structure` gate
+  operation, why the surface is typed verbs with no raw request
+  passthrough, and why deletion is deferred rather than gated.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.

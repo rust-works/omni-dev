@@ -51,7 +51,7 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
         writeln!(
             out,
             "No write-permission rules configured for this account — every \
-             create/upload/edit is refused everywhere. Add rules under \
+             write operation is refused everywhere. Add rules under \
              drive.accounts.<name>.write_permissions.rules in \
              ~/.omni-dev/settings.json."
         )

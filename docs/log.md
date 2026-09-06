@@ -34,7 +34,8 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `prune`: a JSON `pruned` list of `{path, branch, commit}`. See
   [Recovering a removed worktree](#recovering-a-removed-worktree).
 - **`kind: "drivemutation"`** — one per `omni-dev drive rename`/`drive
-  move`/`drive create`/`drive upload`/`drive edit` attempt, written from
+  move`/`drive create`/`drive upload`/`drive edit`/`drive sheets *` attempt,
+  written from
   *inside* the mutation itself so it covers every current and future caller
   (CLI today, MCP later), not just the CLI. Includes a refused move
   (`Blocked`, ADR-0070) or create/upload/edit (`Blocked` by the folder
@@ -62,6 +63,20 @@ types, so the log is a complete invocation history, not just an HTTP history:
   resolves an open-ended range against the sheet's real extent — which is
   what makes `omni-dev log --query kind:drivemutation` able to answer "how
   much did that write touch", not just "a write happened".
+
+  Structural edits (issue
+  [#1613](https://github.com/rust-works/omni-dev/issues/1613),
+  [ADR-0075](adrs/adr-0075.md)) use the same kind again, with `operation` of
+  `sheets-add-sheet`/`sheets-rename-sheet`/`sheets-insert-rows`/
+  `sheets-insert-columns` — **one record per verb**, which is also one per
+  `spreadsheets.batchUpdate` request, since each verb sends a batch of
+  exactly one. They add three more omit-if-absent context keys: `sheet_id`
+  (the stable numeric id the API addresses, which survives a later rename
+  and so is the only durable answer to "which tab was this"), `sheet_title`
+  (its title at the time), and `dimension_range` (e.g. `"ROWS 5:7"`,
+  1-based inclusive like the CLI's `--at`). `dimension_range` is the
+  structural analogue of `range`, for effects A1 notation cannot express; a
+  structural verb sets no `range` and no cell counts.
 
 Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and

@@ -464,6 +464,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_add_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::AddSheet(sheets::structure::AddSheetCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                title: "Q3".to_string(),
+                index: None,
+                rows: None,
+                columns: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // Reaches the engine, which never returns `Err` — every failure is a
+        // `StructureResult` variant (ADR-0073 §13).
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_rename_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::RenameSheet(
+                sheets::structure::RenameSheetCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    title: "Q3".to_string(),
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_insert_rows() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::InsertRows(sheets::structure::InsertRowsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q2".to_string(),
+                at: 5,
+                count: 3,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_insert_columns() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::InsertColumns(
+                sheets::structure::InsertColumnsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    at: 2,
+                    count: 1,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),

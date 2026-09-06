@@ -909,6 +909,19 @@ pub struct DriveMutationOutcome {
     /// Cells the Sheets API reported writing — the number that answers "how
     /// much did that write actually touch".
     pub updated_cells: Option<i64>,
+    /// The stable numeric id of the sheet a structural verb acted on
+    /// (issue #1613). Unlike a title it survives a later rename, so it is
+    /// the only durable answer to "which tab was this". `None` for every
+    /// non-structural verb.
+    pub sheet_id: Option<i64>,
+    /// The sheet's title at the time of the attempt — for `add-sheet`, the
+    /// title being created.
+    pub sheet_title: Option<String>,
+    /// The rows or columns a structural verb spanned, e.g. `"ROWS 5:7"`,
+    /// 1-based and inclusive like the CLI's `--at`. The structural analogue
+    /// of [`Self::range`], for effects A1 notation cannot express; absent
+    /// for verbs that span no dimension.
+    pub dimension_range: Option<String>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -991,6 +1004,15 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(cells) = outcome.updated_cells {
         context.insert("updated_cells".to_string(), cells.to_string());
+    }
+    if let Some(sheet_id) = outcome.sheet_id {
+        context.insert("sheet_id".to_string(), sheet_id.to_string());
+    }
+    if let Some(sheet_title) = outcome.sheet_title {
+        context.insert("sheet_title".to_string(), sheet_title);
+    }
+    if let Some(dimension_range) = outcome.dimension_range {
+        context.insert("dimension_range".to_string(), dimension_range);
     }
     rec.context = context;
     rec
@@ -1720,6 +1742,60 @@ mod tests {
         assert_eq!(rec.context.get("resolved_folder_id"), None);
         assert_eq!(rec.context.get("decided_by_folder_id"), None);
         assert_eq!(rec.context.get("decided_by_depth"), None);
+    }
+
+    #[test]
+    fn build_drive_mutation_record_includes_the_structural_context_keys() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-insert-rows",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "changed".to_string(),
+                sheet_id: Some(118_293),
+                sheet_title: Some("Q2".to_string()),
+                dimension_range: Some("ROWS 5:7".to_string()),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.command, vec!["drive", "sheets-insert-rows"]);
+        assert_eq!(
+            rec.context.get("sheet_id").map(String::as_str),
+            Some("118293")
+        );
+        assert_eq!(
+            rec.context.get("sheet_title").map(String::as_str),
+            Some("Q2")
+        );
+        assert_eq!(
+            rec.context.get("dimension_range").map(String::as_str),
+            Some("ROWS 5:7")
+        );
+        // A structural verb has no A1 range and reports no cell counts, so
+        // those keys stay absent rather than being written as empty.
+        assert_eq!(rec.context.get("range"), None);
+        assert_eq!(rec.context.get("updated_cells"), None);
+    }
+
+    #[test]
+    fn build_drive_mutation_record_omits_structural_keys_for_a_cell_write() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-write",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "written".to_string(),
+                range: Some("A1:B2".to_string()),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.context.get("sheet_id"), None);
+        assert_eq!(rec.context.get("sheet_title"), None);
+        assert_eq!(rec.context.get("dimension_range"), None);
     }
 
     #[test]
