@@ -868,9 +868,12 @@ mod tests {
     #[tokio::test]
     async fn select_all_scroll_to_bottom_and_cursor_position_work_as_expected() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // A script that outputs lines so we have scrollback, sets a title,
-        // then sleeps to let us interact with it.
-        let script = "printf 'line1\\nline2\\nline3\\n'; \
+        // The grid is 6 lines (`sh_tab`), so the output must exceed that or
+        // there is no scrollback at all and `PageUp` has nowhere to go — the
+        // reason an earlier three-line version of this script could never
+        // have passed. 30 lines guarantees history on any run.
+        let script = "i=1; while [ $i -le 30 ]; do printf 'line%d\\n' $i; \
+                      i=$((i+1)); done; \
                       printf '\\033]2;test-title\\a'; \
                       sleep 2";
         let mut tab = sh_tab(script, tx);
