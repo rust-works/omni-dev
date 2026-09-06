@@ -48,7 +48,14 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `resolved_folder_id`/`decided_by_folder_id`/`decided_by_depth`
   (the folder the write-permission gate evaluated against, and which
   configured rule, if any, decided the verdict — absent for the ungated
-  `rename`/`move`). See [docs/drive.md](drive.md#write-permissions).
+  `rename`/`move`), and `decided_by_file_id` when a **file** rule decided
+  it (issue [#1612](https://github.com/rust-works/omni-dev/issues/1612)).
+  `decided_by_file_id` is mutually exclusive with `decided_by_folder_id`,
+  deliberately: a file id never appears in the folder field, so an existing
+  `--query decided_by_folder_id:<id>` cannot start matching a different
+  kind of id. A file rule matches the target itself, so it walks no chain —
+  `decided_by_depth` and `resolved_folder_id` are both absent alongside it.
+  See [docs/drive.md](drive.md#write-permissions).
 
   Cell writes through the Sheets API (issue
   [#1589](https://github.com/rust-works/omni-dev/issues/1589),
