@@ -9,7 +9,7 @@ use std::io::Read as _;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::cli::drive::format::{output_as, OutputFormat};
+use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::cli::drive::helpers;
 use crate::cli::drive::sheets::values::{self, ValuesFormat};
 use crate::drive::client::DriveClient;
@@ -243,7 +243,12 @@ async fn run_write(client: &DriveClient, opts: &WriteOptions, output: &OutputFor
     if output_as(&outcome, output)? {
         return Ok(());
     }
-    println!("{}", describe(&outcome, opts.verb));
+    // The rendered line carries a Drive-supplied file name and, on a
+    // `Blocked`, the deciding rule's id. `describe` lives in the engine
+    // layer and stays free of the CLI, so the sanitizing happens here —
+    // on the whole line, since none of its own literals contain a
+    // control character for the filter to eat.
+    println!("{}", sanitize_for_terminal(&describe(&outcome, opts.verb)));
     Ok(())
 }
 

@@ -10,9 +10,9 @@ use crate::cli::drive::format::{
 use crate::cli::drive::helpers::active_account_rules;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
-use crate::drive::folder_ancestry;
+use crate::drive::folder_ancestry::{self, DecisionSource, FileTargetDecision};
 use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
-use crate::drive::write_gate::{Decision, DriveOperation, FolderPermissionRule, Verdict};
+use crate::drive::write_gate::{self, DriveOperation, FolderPermissionRule, Verdict};
 
 /// `--operation`'s value set — a thin CLI-layer copy of
 /// [`DriveOperation`], kept separate so the pure engine module has no
@@ -43,9 +43,9 @@ impl From<OperationArg> for DriveOperation {
 
 /// Evaluates the configured write-permission rules against a real target
 /// and prints the verdict — the same [`folder_ancestry::resolve_decision`]/
-/// [`folder_ancestry::resolve_decision_for_parents`] the real
-/// `create`/`upload`/`edit` engine modules call, so this diagnostic can
-/// never drift from actual enforcement.
+/// [`folder_ancestry::resolve_decision_for_file_target`] the real
+/// `create`/`upload`/`edit`/`sheets write` engine modules call, so this
+/// diagnostic can never drift from actual enforcement.
 #[derive(Parser)]
 pub struct CheckCommand {
     /// The folder or file id to evaluate.
@@ -85,10 +85,21 @@ pub struct CheckReport {
     pub operation: String,
     /// `"allow"` or `"deny"`.
     pub verdict: String,
-    /// The folder id of the rule that decided this, if any.
+    /// The folder id of the rule that decided this, if a folder rule did.
     pub decided_by_folder_id: Option<String>,
     /// How many levels above the target that rule's folder sits.
     pub decided_by_depth: Option<usize>,
+    /// The file id of the rule that decided this, if a **file** rule did
+    /// (issue #1612). Mutually exclusive with `decided_by_folder_id`.
+    pub decided_by_file_id: Option<String>,
+    /// How the verdict was reached: `"file-rule"`, `"folder-chain"` or
+    /// `"no-visible-parents"`.
+    ///
+    /// `"no-visible-parents"` is the answer to "why can't I grant this
+    /// with a folder rule?" — the diagnostic this whole report exists to
+    /// give. Always `"folder-chain"` for a folder target, which never
+    /// consults file rules.
+    pub evaluated_via: String,
 }
 
 impl JsonlSerialize for CheckReport {
@@ -110,7 +121,9 @@ async fn run_check(
     output: &OutputFormat,
 ) -> Result<()> {
     let files_api = FilesApi::new(client);
-    let decision = evaluate_target(&files_api, target_id, op, rules).await?;
+    let evaluated = evaluate_target(&files_api, target_id, op, rules).await?;
+    let decision = evaluated.decision;
+    let log_fields = write_gate::decided_by_log_fields(decision.decided_by.as_ref());
     let report = CheckReport {
         target_id: target_id.to_string(),
         operation: op.to_string(),
@@ -118,8 +131,10 @@ async fn run_check(
             Verdict::Allow => "allow".to_string(),
             Verdict::Deny => "deny".to_string(),
         },
-        decided_by_folder_id: decision.decided_by.as_ref().map(|d| d.folder_id.clone()),
-        decided_by_depth: decision.decided_by.as_ref().map(|d| d.depth),
+        decided_by_folder_id: log_fields.folder_id,
+        decided_by_depth: log_fields.depth,
+        decided_by_file_id: log_fields.file_id,
+        evaluated_via: evaluated_via(evaluated.source).to_string(),
     };
     if output_as(&report, output)? {
         return Ok(());
@@ -128,29 +143,58 @@ async fn run_check(
     Ok(())
 }
 
-/// Fetches `target_id` and evaluates `op` against it: a folder target's
-/// chain starts at itself (mirrors `create`/`upload`'s `--parent`
-/// semantics, reusing the already-fetched metadata via
-/// [`folder_ancestry::resolve_decision_from`] rather than re-fetching it);
-/// a file target's chain starts at its *current* parent(s), unioned across
-/// every legacy multi-parent via
-/// [`folder_ancestry::resolve_decision_for_parents`] (mirrors `drive
-/// edit`'s semantics) — an orphan file with no parent degenerates to the
-/// bare default policy.
+/// Fetches `target_id` and evaluates `op` against it.
+///
+/// A **folder** target's chain starts at itself (mirrors `create`/
+/// `upload`'s `--parent` semantics, reusing the already-fetched metadata
+/// via [`folder_ancestry::resolve_decision_from`] rather than re-fetching
+/// it). `file_id` rules deliberately do **not** apply to a folder target:
+/// a folder target means "create or upload something inside this", and a
+/// `file_id` rule naming a folder id would just be a worse spelling of a
+/// non-recursive `folder_id` rule.
+///
+/// A **file** target goes through
+/// [`folder_ancestry::resolve_decision_for_file_target`] — the same single
+/// entry point `drive edit` and `drive sheets write` use, which is what
+/// lets this diagnostic claim it can never drift from actual enforcement.
 async fn evaluate_target(
     files_api: &FilesApi<'_>,
     target_id: &str,
     op: DriveOperation,
     rules: &[FolderPermissionRule],
-) -> Result<Decision> {
+) -> Result<FileTargetDecision> {
     let target = files_api.get_metadata(target_id).await?;
     if target.mime_type == GOOGLE_FOLDER_MIME_TYPE {
-        return folder_ancestry::resolve_decision_from(files_api, target, op, rules).await;
+        let decision = folder_ancestry::resolve_decision_from(files_api, target, op, rules).await?;
+        return Ok(FileTargetDecision {
+            decision,
+            resolved_folder_id: None,
+            source: DecisionSource::FolderChain,
+        });
     }
-    let (decision, _resolved_folder_id) =
-        folder_ancestry::resolve_decision_for_parents(files_api, &target.parents, op, rules)
-            .await?;
-    Ok(decision)
+    folder_ancestry::resolve_decision_for_file_target(files_api, &target, op, rules).await
+}
+
+/// The `evaluated_via` string for a [`DecisionSource`].
+///
+/// Kebab-case to match every other machine-readable string this CLI emits.
+const fn evaluated_via(source: DecisionSource) -> &'static str {
+    match source {
+        DecisionSource::FileRule => "file-rule",
+        DecisionSource::FolderChain => "folder-chain",
+        DecisionSource::NoVisibleParents => "no-visible-parents",
+    }
+}
+
+/// Whether `print_report` should emit the `no visible parents` note.
+///
+/// Gated on the verdict as well as the source. `read` defaults to
+/// [`Verdict::Allow`] on an empty chain, so a link-shared target checked for
+/// `read` reaches the renderer having been *permitted* — advice on how to
+/// grant it would read as a refusal that isn't one. The note only ever helps
+/// an operator staring at a `deny` they cannot name a folder rule to fix.
+fn should_note_no_visible_parents(evaluated_via: &str, verdict: &str) -> bool {
+    evaluated_via == "no-visible-parents" && verdict == "deny"
 }
 
 /// Prints a `CheckReport` in the plain-text (non-`output_as`) form.
@@ -165,7 +209,21 @@ fn print_report(report: &CheckReport) {
                 sanitize_for_terminal(folder_id)
             );
         }
-        _ => println!("decided by: default policy (no matching rule)"),
+        _ => match &report.decided_by_file_id {
+            Some(file_id) => println!(
+                "decided by: rule on file {}",
+                sanitize_for_terminal(file_id)
+            ),
+            None => println!("decided by: default policy (no matching rule)"),
+        },
+    }
+    // The one line this diagnostic exists to print: it names the *only*
+    // rule shape that could ever change this verdict.
+    if should_note_no_visible_parents(&report.evaluated_via, &report.verdict) {
+        println!(
+            "note:       this target has no parent folder visible to this account, so no\n\
+             \x20           folder_id rule can apply — grant it with a file_id rule instead"
+        );
     }
 }
 
@@ -231,12 +289,13 @@ mod tests {
     }
 
     fn rule(folder_id: &str, recursive: bool, allow: &[DriveOperation]) -> FolderPermissionRule {
-        FolderPermissionRule {
-            folder_id: folder_id.to_string(),
-            recursive,
-            allow: allow.iter().copied().collect(),
-            deny: std::collections::HashSet::default(),
-        }
+        FolderPermissionRule::folder(folder_id)
+            .recursive(recursive)
+            .allowing(allow.iter().copied())
+    }
+
+    fn file_rule(file_id: &str, allow: &[DriveOperation]) -> FolderPermissionRule {
+        FolderPermissionRule::file(file_id).allowing(allow.iter().copied())
     }
 
     #[tokio::test]
@@ -262,7 +321,61 @@ mod tests {
         let decision = evaluate_target(&files_api, "folder-1", DriveOperation::Create, &rules)
             .await
             .unwrap();
-        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.decision.verdict, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn run_check_assembles_the_report_from_the_evaluated_decision() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = [rule("folder-1", false, &[DriveOperation::Create])];
+
+        run_check(
+            &client,
+            "folder-1",
+            DriveOperation::Create,
+            &rules,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_check_prints_a_deny_verdict_in_table_format() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // No rules at all: default policy denies Create, and the Table
+        // format exercises run_check's print_report call (JSON always
+        // short-circuits before it).
+        run_check(
+            &client,
+            "folder-1",
+            DriveOperation::Create,
+            &[],
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -291,7 +404,7 @@ mod tests {
         let decision = evaluate_target(&files_api, "file-1", DriveOperation::Edit, &rules)
             .await
             .unwrap();
-        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.decision.verdict, Verdict::Allow);
     }
 
     #[tokio::test]
@@ -312,11 +425,11 @@ mod tests {
         let decision = evaluate_target(&files_api, "orphan", DriveOperation::Read, &[])
             .await
             .unwrap();
-        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.decision.verdict, Verdict::Allow);
         let decision = evaluate_target(&files_api, "orphan", DriveOperation::Edit, &[])
             .await
             .unwrap();
-        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.decision.verdict, Verdict::Deny);
     }
 
     #[tokio::test]
@@ -356,7 +469,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            decision.verdict,
+            decision.decision.verdict,
             Verdict::Deny,
             "deny-parent has no matching rule and edit defaults deny, which must win over allow-parent"
         );
@@ -385,8 +498,151 @@ mod tests {
             verdict: "deny".to_string(),
             decided_by_folder_id: None,
             decided_by_depth: None,
+            decided_by_file_id: None,
+            evaluated_via: "folder-chain".to_string(),
         };
         // Smoke test only — print_report writes to stdout directly.
         print_report(&report);
+    }
+
+    #[test]
+    fn print_report_renders_a_file_rule_and_the_no_visible_parents_note() {
+        print_report(&CheckReport {
+            target_id: "x1".to_string(),
+            operation: "sheets-write".to_string(),
+            verdict: "allow".to_string(),
+            decided_by_folder_id: None,
+            decided_by_depth: None,
+            decided_by_file_id: Some("x1".to_string()),
+            evaluated_via: "file-rule".to_string(),
+        });
+        print_report(&CheckReport {
+            target_id: "x2".to_string(),
+            operation: "sheets-write".to_string(),
+            verdict: "deny".to_string(),
+            decided_by_folder_id: None,
+            decided_by_depth: None,
+            decided_by_file_id: None,
+            evaluated_via: "no-visible-parents".to_string(),
+        });
+    }
+
+    #[test]
+    fn the_no_visible_parents_note_is_gated_on_a_deny() {
+        assert!(should_note_no_visible_parents("no-visible-parents", "deny"));
+        // `read` defaults to allow on an empty chain, so this pairing is
+        // reachable — and must not advise granting what was permitted.
+        assert!(!should_note_no_visible_parents(
+            "no-visible-parents",
+            "allow"
+        ));
+        assert!(!should_note_no_visible_parents("folder-chain", "deny"));
+        assert!(!should_note_no_visible_parents("file-rule", "deny"));
+    }
+
+    #[test]
+    fn evaluated_via_maps_every_decision_source() {
+        assert_eq!(evaluated_via(DecisionSource::FileRule), "file-rule");
+        assert_eq!(evaluated_via(DecisionSource::FolderChain), "folder-chain");
+        assert_eq!(
+            evaluated_via(DecisionSource::NoVisibleParents),
+            "no-visible-parents"
+        );
+    }
+
+    // ── file-id rules (issue #1612) ────────────────────────────────────
+
+    /// Mounts `GET /drive/v3/files/<id>` returning a plain file with
+    /// `parents`.
+    fn mount_plain_file(id: &'static str, parents: &[&str]) -> wiremock::Mock {
+        let parents: Vec<String> = parents.iter().map(|p| (*p).to_string()).collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": "text/plain", "parents": parents,
+                })),
+            )
+    }
+
+    #[tokio::test]
+    async fn a_file_rule_decides_a_file_target_without_walking_its_parents() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // `never-mounted` is deliberately absent: wiremock panics if the
+        // ancestor walk happens at all.
+        mount_plain_file("file-1", &["never-mounted"])
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let rules = [file_rule("file-1", &[DriveOperation::SheetsWrite])];
+
+        let evaluated = evaluate_target(&files_api, "file-1", DriveOperation::SheetsWrite, &rules)
+            .await
+            .unwrap();
+
+        assert_eq!(evaluated.decision.verdict, Verdict::Allow);
+        assert_eq!(evaluated.source, DecisionSource::FileRule);
+    }
+
+    #[tokio::test]
+    async fn a_parentless_file_target_is_reported_as_no_visible_parents() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_plain_file("file-1", &[]).mount(&server).await;
+        let files_api = FilesApi::new(&client);
+
+        let evaluated = evaluate_target(&files_api, "file-1", DriveOperation::Edit, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(evaluated.source, DecisionSource::NoVisibleParents);
+        assert_eq!(evaluated.decision.verdict, Verdict::Deny);
+    }
+
+    #[tokio::test]
+    async fn no_visible_parents_still_answers_allow_for_read() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_plain_file("file-1", &[]).mount(&server).await;
+        let files_api = FilesApi::new(&client);
+
+        let evaluated = evaluate_target(&files_api, "file-1", DriveOperation::Read, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(evaluated.decision.verdict, Verdict::Allow);
+        assert_eq!(evaluated.source, DecisionSource::NoVisibleParents);
+    }
+
+    #[tokio::test]
+    async fn a_file_rule_does_not_apply_to_a_folder_target() {
+        // A folder target means "create/upload something inside this", and
+        // a `file_id` rule naming a folder id would just be a worse
+        // spelling of a non-recursive `folder_id` rule. Deliberately inert.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let rules = [file_rule("folder-1", &[DriveOperation::Create])];
+
+        let evaluated = evaluate_target(&files_api, "folder-1", DriveOperation::Create, &rules)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            evaluated.decision.verdict,
+            Verdict::Deny,
+            "a file_id rule must not grant a folder target"
+        );
+        assert_eq!(evaluated.decision.decided_by, None);
     }
 }

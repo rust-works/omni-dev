@@ -594,10 +594,10 @@ write`/`append`/`clear`/`create` (below), need a much broader OAuth grant
 than rename/move — `--write-file`/`--write-full` — but Google's
 scopes are all-or-nothing across your whole Drive. There's no way to tell
 Google "only let this credential write inside folder X." So `omni-dev` adds
-its own, independent, local policy layer on top: a folder-scoped
-allow/deny rule list in `settings.json`, evaluated **before** any mutating
-API call is attempted, regardless of what the OAuth scope would technically
-permit.
+its own, independent, local policy layer on top: an allow/deny rule list
+in `settings.json` — scoped to a folder, or to a single file — evaluated
+**before** any mutating API call is attempted, regardless of what the OAuth
+scope would technically permit.
 
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
@@ -624,7 +624,8 @@ grant to cover Sheets too, add `sheets-write` to it explicitly. See
 [ADR-0073](adrs/adr-0073.md) §3.
 
 Rules live per Drive account, since a folder id only means something inside
-the one Drive it came from:
+the one Drive it came from. A rule keys on **either** a `folder_id` or a
+`file_id` — exactly one, never both:
 
 ```jsonc
 {
@@ -635,7 +636,11 @@ the one Drive it came from:
           "rules": [
             { "folder_id": "1AbC...AiWorkspace",  "recursive": true,  "allow": ["create", "upload", "edit"] },
             { "folder_id": "1XyZ...DropZone",     "recursive": false, "allow": ["create"] },
-            { "folder_id": "1Sen...Confidential",  "recursive": true,  "deny": ["read"] }
+            { "folder_id": "1Sen...Confidential", "recursive": true,  "deny": ["read"] },
+
+            // File rules — for a file you can't reach with a folder rule.
+            { "file_id": "1Sh4r3d...QuarterlyPlan",   "allow": ["sheets-write"] },
+            { "file_id": "1Sh4r3d...SignedContract",  "deny":  ["edit", "sheets-write"] }
           ]
         }
       }
@@ -648,22 +653,64 @@ the one Drive it came from:
   aren't unique, and files can have multiple parents). Find one with
   [`drive permissions lookup-folder`](#drive-permissions-lookup-folder)
   below.
+- `file_id` — Drive's own canonical **file** id, matched against the target
+  itself. See [Granting a file shared with you](#granting-a-file-shared-with-you).
 - `recursive` — when `true`, the rule also matches every descendant of
-  `folder_id`, not just the folder itself.
-- `allow`/`deny` — any of `read`, `create`, `upload`, `edit`. A `deny`
-  entry is schema-ready today for a future `search`/`read`/`dedupe`
-  enforcement fast-follow (not wired up yet — see
-  [ADR-0071](adrs/adr-0071.md) §11); `create`/`upload`/`edit` are enforced
-  now.
+  `folder_id`, not just the folder itself. Only valid on a `folder_id`
+  rule: a file has no descendants, so `recursive: true` alongside a
+  `file_id` is a configuration error rather than a no-op.
+- `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
+  `sheets-write`. A `deny` entry for `read` is schema-ready today for a
+  future `search`/`read`/`dedupe` enforcement fast-follow (not wired up
+  yet — see [ADR-0071](adrs/adr-0071.md) §11); the write operations are
+  enforced now.
 
-**Resolution**: for a target's ancestor chain (the folder itself at depth
-0, then its parent, grandparent, …), the closest matching rule wins; if
-rules at the same depth disagree, `deny` wins. No matching rule anywhere
-falls through to the default policy table above. `drive create`/`drive
-upload` resolve the chain from `--parent`; `drive edit` resolves it from
-the target file's *current* parent(s) — unioned across every current
-parent for a legacy multi-parent file, with `deny` winning if any parent
-disagrees.
+A rule that names neither key, names both, or puts `recursive: true` on a
+`file_id` is a **settings load error**, not a silently-ignored rule — and
+the failure is closed: a settings file that fails to parse yields no rules
+at all, so every write is refused until it is fixed.
+
+**Resolution**: a `file_id` rule naming the target is checked first, at
+what is effectively **depth −1** — strictly more specific than any folder
+rule. Otherwise, for the target's ancestor chain (the folder itself at
+depth 0, then its parent, grandparent, …), the closest matching rule wins;
+if rules at the same depth disagree, `deny` wins. No matching rule anywhere
+falls through to the default policy table above.
+
+Because a file rule is closer than every folder rule, it wins in **both**
+directions: a file `deny` overrides a recursive folder `allow`, and a file
+`allow` overrides a folder `deny`. That includes the multi-parent case —
+"`deny` wins across parents" is a tie-break among a target's several
+parents, which are peers of each other; a file rule is not one of them.
+
+`drive create`/`drive upload`/`drive sheets create` resolve the chain from
+`--parent`, so a `file_id` rule never applies to them: their target is a
+folder, and the file being created has no id yet. `drive edit` and `drive
+sheets write`/`append`/`clear` resolve from the target file's *current*
+parent(s) — unioned across every current parent for a legacy multi-parent
+file, with `deny` winning if any parent disagrees — but only after the
+`file_id` lookup has come up empty.
+
+#### Granting a file shared with you
+
+`files.get` returns only the parents **this account can see**. A file
+shared with you by link or email is not in a folder you can see, so it
+comes back with no parents at all — which means no `folder_id` rule you
+could write would ever apply to it, and before file rules there was no way
+to permit writing to it short of moving it into your own Drive.
+
+A `file_id` rule is the fix. Grab the id out of the URL
+(`https://docs.google.com/spreadsheets/d/<id>/edit`) and name it directly:
+
+```jsonc
+{ "file_id": "1Sh4r3d...QuarterlyPlan", "allow": ["sheets-write"] }
+```
+
+Confirm it with `drive permissions check <id> --operation sheets-write`,
+which reports `decided by: rule on file <id>`. When no rule applies, that
+same command prints a `note:` line saying the target has no visible parent
+— that is the signal to reach for a `file_id` rule rather than hunting for
+a folder rule bug.
 
 ### Diagnostics
 
@@ -674,10 +721,14 @@ useful for authoring and debugging rules before relying on them.
 
 ```bash
 $ omni-dev drive permissions show
-FOLDER_ID              RECURSIVE  ALLOW                DENY
-1AbC...AiWorkspace      true       create,edit,upload   -
-1XyZ...DropZone         false      create               -
+SCOPE   TARGET_ID                RECURSIVE  ALLOW                DENY
+folder  1AbC...AiWorkspace       true       create,edit,upload   -
+folder  1XyZ...DropZone          false      create               -
+file    1Sh4r3d...QuarterlyPlan  -          sheets-write         -
 ```
+
+`RECURSIVE` shows `-` rather than `false` for a file rule: the column has
+no meaning there.
 
 Reads only `settings.json` — no network call. With no rules configured, it
 explains that every write is refused everywhere and points at the
@@ -704,14 +755,39 @@ target:     1AbC...AiWorkspace
 operation:  create
 verdict:    allow
 decided by: rule on folder 1AbC...AiWorkspace (depth 0)
+
+$ omni-dev drive permissions check 1Sh4r3d...QuarterlyPlan --operation sheets-write
+target:     1Sh4r3d...QuarterlyPlan
+operation:  sheets-write
+verdict:    allow
+decided by: rule on file 1Sh4r3d...QuarterlyPlan
+
+$ omni-dev drive permissions check 1Unknown...Shared --operation sheets-write
+target:     1Unknown...Shared
+operation:  sheets-write
+verdict:    deny
+decided by: default policy (no matching rule)
+note:       this target has no parent folder visible to this account, so no
+            folder_id rule can apply — grant it with a file_id rule instead
 ```
 
 Evaluates the real configured rules against a real target and operation —
-the exact `resolve_ancestor_chain`/`write_gate::resolve` functions
-`create`/`upload`/`edit` themselves call, so this diagnostic can never
-drift from actual enforcement. Accepts either a folder id (checked
-directly) or a file id (checked from its current parent(s), matching
-`edit`'s own semantics).
+the exact functions `create`/`upload`/`edit`/`sheets write` themselves
+call, so this diagnostic can never drift from actual enforcement. Accepts
+either a folder id (checked directly) or a file id (its own `file_id`
+rules first, then its current parent(s), matching `edit`'s own semantics).
+
+The `note:` line is the one this command exists for: it appears only on a
+`deny` against a target with no visible parent, which is the single case
+where no `folder_id` rule could ever help. It is gated on the verdict as
+well, because `read` defaults to allow on an empty ancestor chain — a
+link-shared target checked for `read` is *permitted*, and advice on how to
+grant it would read as a refusal that isn't one.
+
+`-o json` adds `decided_by_file_id` and `evaluated_via` (`"file-rule"`,
+`"folder-chain"` or `"no-visible-parents"`) alongside the existing
+`decided_by_folder_id`/`decided_by_depth`, which keep their exact meaning —
+a file id never appears in the folder field.
 
 ## Create
 
@@ -1200,7 +1276,7 @@ Same shape as the rename/move hint above, but for `create`/`upload` (needs
 [Edit](#edit)). Re-run `drive auth login` with the named flag(s), then
 retry.
 
-### `Blocked` — refused by the folder write-permission gate
+### `Blocked` — refused by the write-permission gate
 
 ```bash
 $ omni-dev drive create --name "x" --parent 1Sen...Confidential
@@ -1210,9 +1286,38 @@ Blocked: x in 1Sen...Confidential
 
 This is not an error — the command exits 0, same as a `Blocked` move (see
 [Move](#move)). No `files.create`/`files.update` call was ever made. Run
-`drive permissions check <folder-id> --operation <op>` to see exactly which
-rule (if any) decided the refusal, and [Write
+`drive permissions check <id> --operation <op>` to see exactly which rule
+(if any) decided the refusal, and [Write
 permissions](#write-permissions) to add a rule that allows it.
+
+A refusal naming a rule says which kind decided it — `refused by rule on
+folder <id> (depth 2)` or `refused by rule on file <id>`. A file rule has
+no depth because it matches the target itself, and it beats every folder
+rule (see [Resolution](#write-permissions)).
+
+### `Refused: … has no parent folder visible to this account`
+
+```bash
+$ omni-dev drive sheets write 1Sh4r3d...Plan --range 'A1' --values data.csv
+Refused: 'Quarterly Plan' has no parent folder visible to this account, so no
+folder rule can apply to it. This is normal for a Sheet shared by link or
+email. Grant it by id instead: add {"file_id": "<spreadsheet id>", "allow":
+["sheets-write"]} to write_permissions.rules.
+```
+
+`files.get` returns only the parents **this account** can see, and a file
+shared with you by link or email is not in a folder you can see — so it
+arrives with none, and the gate has no ancestor chain to evaluate.
+
+This is deliberately *not* reported as an ordinary `Blocked`: there is no
+`folder_id` rule you could write that would change it, so telling you to
+fix your folder rules would send you hunting for a bug that isn't there.
+The fix is a `file_id` rule — see [Granting a file shared with
+you](#granting-a-file-shared-with-you). `drive edit` reports the same way
+for a shared binary file.
+
+If you would rather not grant by id, the alternative still works: add the
+file to a folder in your own Drive and grant that folder.
 
 ### No default export format for a Google-native file
 
@@ -1237,8 +1342,8 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   `move`'s safety gate, and the three-flag opt-in model.
 - [ADR-0071](adrs/adr-0071.md) — extends ADR-0069/ADR-0070 to add
   `create`/`upload`/`edit`: the `--write-file`/`--write-full` scope tiers,
-  the folder-scoped [write-permission gate](#write-permissions) and its
-  resolution algorithm, and why both layers are independently required.
+  the [write-permission gate](#write-permissions) and its resolution
+  algorithm, and why both layers are independently required.
 - [ADR-0073](adrs/adr-0073.md) — extends ADR-0069/0070/0071 to add the
   Sheets v4 API: the shared transport core behind a second Google host, the
   separate `sheets-write` gate operation and why reusing `edit` was

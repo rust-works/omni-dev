@@ -96,9 +96,10 @@ fn print_outcome(outcome: &CreateOutcome) {
             println!("Blocked: {name} in {parent}");
             match decided_by {
                 Some(rule) => println!(
-                    "  refused by rule on folder {} (depth {})",
-                    sanitize_for_terminal(&rule.folder_id),
-                    rule.depth
+                    "  refused by rule on {} {}{}",
+                    rule.kind_label(),
+                    sanitize_for_terminal(rule.id()),
+                    rule.depth_suffix()
                 ),
                 None => println!("  refused by default policy (no matching rule)"),
             }
@@ -167,7 +168,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::collections::HashSet::default(),
@@ -224,6 +226,16 @@ mod tests {
             name: "f".to_string(),
             parent_folder_id: "p".to_string(),
             result: CreateResult::Blocked { decided_by: None },
+        });
+        print_outcome(&CreateOutcome {
+            name: "f".to_string(),
+            parent_folder_id: "p".to_string(),
+            result: CreateResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
         });
         print_outcome(&CreateOutcome {
             name: "f".to_string(),

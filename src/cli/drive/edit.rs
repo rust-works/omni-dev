@@ -19,7 +19,7 @@ use crate::drive::write_gate::FolderPermissionRule;
 const DEFAULT_CONTENT_MIME_TYPE: &str = "application/octet-stream";
 
 /// Replaces an existing file's content, gated by the account's configured
-/// folder write-permission rules (issue #1574). Requires the `drive.file`
+/// write-permission rules (issues #1574, #1612). Requires the `drive.file`
 /// scope if `omni-dev` created the file, or the unrestricted `drive` scope
 /// for any pre-existing file (`drive auth login --write-file` or
 /// `--write-full`).
@@ -123,13 +123,22 @@ fn print_outcome(outcome: &EditOutcome) {
                  raw content to replace"
             );
         }
+        EditResult::RefusedNoVisibleParents => {
+            println!(
+                "Refused: {file_id} has no parent folder visible to this account, so no folder \
+                 rule can apply to it. This is normal for a file shared by link or email. \
+                 Grant it by id instead: add {{\"file_id\": \"<file id>\", \"allow\": \
+                 [\"edit\"]}} to write_permissions.rules."
+            );
+        }
         EditResult::Blocked { decided_by } => {
             println!("Blocked: {file_id}");
             match decided_by {
                 Some(rule) => println!(
-                    "  refused by rule on folder {} (depth {})",
-                    sanitize_for_terminal(&rule.folder_id),
-                    rule.depth
+                    "  refused by rule on {} {}{}",
+                    rule.kind_label(),
+                    sanitize_for_terminal(rule.id()),
+                    rule.depth_suffix()
                 ),
                 None => println!("  refused by default policy (no matching rule)"),
             }
@@ -191,7 +200,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
@@ -281,8 +291,25 @@ mod tests {
         print_outcome(&EditOutcome {
             file_id: "f1".to_string(),
             file_name: Some("f".to_string()),
+            resolved_folder_id: None,
+            result: EditResult::RefusedNoVisibleParents,
+        });
+        print_outcome(&EditOutcome {
+            file_id: "f1".to_string(),
+            file_name: Some("f".to_string()),
             resolved_folder_id: Some("p".to_string()),
             result: EditResult::Blocked { decided_by: None },
+        });
+        print_outcome(&EditOutcome {
+            file_id: "f1".to_string(),
+            file_name: Some("f".to_string()),
+            resolved_folder_id: Some("p".to_string()),
+            result: EditResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
         });
         print_outcome(&EditOutcome {
             file_id: "f1".to_string(),

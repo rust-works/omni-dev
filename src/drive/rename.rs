@@ -93,6 +93,7 @@ fn record_attempt(
         resolved_folder_id: None,
         decided_by_folder_id: None,
         decided_by_depth: None,
+        decided_by_file_id: None,
         error,
         duration,
         ..Default::default()
