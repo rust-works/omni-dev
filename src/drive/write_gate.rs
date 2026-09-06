@@ -120,7 +120,7 @@ impl DriveOperation {
 
 /// One configured permission rule, keyed on **either** a folder id or a
 /// file id — exactly one of the two, enforced when the settings file is
-/// deserialized (see [`RawPermissionRule`]).
+/// deserialized (see the private `RawPermissionRule` below).
 ///
 /// Ids are Drive's own canonical ids, not paths — Drive objects have no
 /// stable, unique path (names collide, files can have multiple legacy

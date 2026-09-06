@@ -5,12 +5,14 @@
 //! `create`/`upload` (whose gate chain starts at the caller-given
 //! `--parent`), `edit`'s chain starts at the target's *current* parent
 //! folder(s) — `files.get` first, then
-//! [`folder_ancestry::resolve_decision_for_parents`] resolves and combines
-//! a decision per parent for a legacy multi-parent file (mirrors
-//! `visibility.rs`'s existing multi-parent-union contract; shared with
-//! `drive permissions check`'s identical file-target case). An orphan file
-//! with no parent degenerates to the bare default policy, correctly, via
-//! an empty chain.
+//! [`folder_ancestry::resolve_decision_for_file_target`], which consults a
+//! `file_id` rule before the parents (issue #1612) and otherwise resolves
+//! and combines a decision per parent for a legacy multi-parent file
+//! (mirrors `visibility.rs`'s existing multi-parent-union contract; shared
+//! with `drive permissions check`'s identical file-target case). A target
+//! with no visible parent and no file rule is refused as
+//! [`EditResult::RefusedNoVisibleParents`] rather than degenerating to a
+//! bare default-policy `Blocked`.
 //!
 //! Still single-target, so this follows `create.rs`/`upload.rs`'s linear-
 //! function shape, not `file_move.rs`'s batch Plan/Execute.
