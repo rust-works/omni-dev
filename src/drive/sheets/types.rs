@@ -250,6 +250,180 @@ pub struct ClearValuesResponse {
     pub cleared_range: Option<String>,
 }
 
+/// One `spreadsheets.batchUpdate` request.
+///
+/// **Externally tagged**, which is exactly Sheets' own wire shape:
+/// `{"addSheet": {...}}`. That is also why this type is the enforcement
+/// point for issue #1613's central safety property — the destructive
+/// requests (`deleteSheet`, `deleteDimension`, `deleteRange`) have no
+/// variant here, so no caller anywhere in the crate can construct one. See
+/// `structure.rs`'s `no_destructive_request_is_reachable` guard.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchUpdateRequestItem {
+    /// Add a new sheet to the workbook.
+    AddSheet(AddSheetRequest),
+    /// Change an existing sheet's properties (we only ever send `title`).
+    UpdateSheetProperties(UpdateSheetPropertiesRequest),
+    /// Insert empty rows or columns, shifting existing ones.
+    InsertDimension(InsertDimensionRequest),
+}
+
+/// Body of `spreadsheets.batchUpdate`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchUpdateRequest {
+    /// The requests to apply. Every v1 structural verb sends exactly one,
+    /// which is what makes partial application unobservable.
+    pub requests: Vec<BatchUpdateRequestItem>,
+}
+
+/// `AddSheetRequest` — wraps the new sheet's properties.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AddSheetRequest {
+    /// Properties of the sheet to add.
+    pub properties: NewSheetProperties,
+}
+
+/// The properties of a sheet being added.
+///
+/// Distinct from [`SheetProperties`], which is a *response* type: this one
+/// omits `sheetId` (the server assigns it) and every field is optional
+/// except the title, so an omitted `--rows` inherits Sheets' own default
+/// rather than us inventing one.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct NewSheetProperties {
+    /// The new sheet's title.
+    pub title: String,
+    /// Zero-based position in the workbook. Omitted means "append".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<i64>,
+    /// Initial grid dimensions. Omitted means Sheets' default (1000 x 26).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "gridProperties")]
+    pub grid_properties: Option<GridProperties>,
+}
+
+/// `UpdateSheetPropertiesRequest`.
+///
+/// `fields` is a field mask and is **not** optional: an empty mask is an
+/// error, and a mask naming more than we set would blank the unnamed fields.
+/// We always send `"title"` and only ever populate the title.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateSheetPropertiesRequest {
+    /// The properties to write. `sheet_id` selects the target.
+    pub properties: SheetPropertiesUpdate,
+    /// The field mask limiting what this request may change.
+    pub fields: String,
+}
+
+/// The mutable subset of a sheet's properties this crate can set.
+///
+/// Deliberately not [`SheetProperties`]: reusing the response type would
+/// serialise whatever else it happened to carry, and a field mask widened by
+/// accident is how an unintended property gets overwritten.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SheetPropertiesUpdate {
+    /// Which sheet to modify.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// The new title.
+    pub title: String,
+}
+
+/// Which axis a [`DimensionRange`] runs along.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum Dimension {
+    /// Rows.
+    #[serde(rename = "ROWS")]
+    Rows,
+    /// Columns.
+    #[serde(rename = "COLUMNS")]
+    Columns,
+}
+
+impl Dimension {
+    /// The wire spelling, also used in the request log's `dimension_range`
+    /// context field and in human-readable output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "ROWS",
+            Self::Columns => "COLUMNS",
+        }
+    }
+
+    /// Singular noun for human-readable output ("row" / "column").
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Rows => "row",
+            Self::Columns => "column",
+        }
+    }
+}
+
+/// A half-open, **zero-based** span of rows or columns.
+///
+/// The zero-based half-open shape is the API's, not the CLI's: `--at` is
+/// 1-based and inclusive, matching A1 and the spreadsheet UI. The single
+/// conversion lives in `structure.rs::dimension_range`, never at a call
+/// site.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DimensionRange {
+    /// The sheet the span belongs to.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// Rows or columns.
+    pub dimension: Dimension,
+    /// First index, inclusive, zero-based.
+    #[serde(rename = "startIndex")]
+    pub start_index: i64,
+    /// Last index, **exclusive**, zero-based.
+    #[serde(rename = "endIndex")]
+    pub end_index: i64,
+}
+
+/// `InsertDimensionRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InsertDimensionRequest {
+    /// Where to insert.
+    pub range: DimensionRange,
+    /// Whether the inserted rows/columns inherit formatting from the ones
+    /// before them rather than after. Always `false` here: `true` is
+    /// rejected outright by the API when `start_index` is 0, so a fixed
+    /// `false` is the only value that works for every legal `--at`.
+    #[serde(rename = "inheritFromBefore")]
+    pub inherit_from_before: bool,
+}
+
+/// Response to `spreadsheets.batchUpdate`.
+///
+/// Only `replies` is modelled, and only the `addSheet` arm of it: the new
+/// sheet's server-assigned `sheetId` is the one fact the response carries
+/// that the request did not already know, and the request log records it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct BatchUpdateResponse {
+    /// One reply per request, in request order. Replies for requests with
+    /// nothing to report are empty objects, not omitted.
+    #[serde(default)]
+    pub replies: Vec<BatchUpdateReply>,
+}
+
+/// One reply within a [`BatchUpdateResponse`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct BatchUpdateReply {
+    /// Present only for an `addSheet` request.
+    #[serde(default, rename = "addSheet")]
+    pub add_sheet: Option<AddSheetReply>,
+}
+
+/// The `addSheet` arm of a [`BatchUpdateReply`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AddSheetReply {
+    /// The created sheet's properties, including its assigned `sheetId`.
+    #[serde(default)]
+    pub properties: Option<SheetProperties>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

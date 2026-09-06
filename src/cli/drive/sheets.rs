@@ -1,5 +1,6 @@
-//! CLI commands for `omni-dev drive sheets` — reading the *cells* of a
-//! Google Sheet via the Sheets v4 API (issue #1589).
+//! CLI commands for `omni-dev drive sheets` — reading and writing the
+//! *cells* of a Google Sheet via the Sheets v4 API (issue #1589), and
+//! editing its *structure* via `spreadsheets.batchUpdate` (issue #1613).
 //!
 //! Nested under `drive` rather than given its own top-level tree so it
 //! inherits `--account` resolution, the `auth` commands and the write-
@@ -9,6 +10,7 @@
 pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
+pub(crate) mod structure;
 pub(crate) mod values;
 pub(crate) mod write;
 
@@ -17,7 +19,7 @@ use clap::{Parser, Subcommand};
 
 use crate::drive::client::DriveClient;
 
-/// Reads and writes the cells of a Google Sheet.
+/// Reads and writes the cells and structure of a Google Sheet.
 #[derive(Parser)]
 pub struct SheetsCommand {
     /// The sheets subcommand to execute.
@@ -45,6 +47,19 @@ pub enum SheetsSubcommands {
     /// Creates a new Google Sheet, optionally seeded with values. Gated by
     /// the folder write-permission rules' `create` operation (issue #1589).
     Create(create::CreateCommand),
+    /// Adds a new sheet (tab) to a spreadsheet. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1613).
+    AddSheet(structure::AddSheetCommand),
+    /// Renames an existing sheet. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1613).
+    RenameSheet(structure::RenameSheetCommand),
+    /// Inserts empty rows, shifting existing rows down. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1613).
+    InsertRows(structure::InsertRowsCommand),
+    /// Inserts empty columns, shifting existing columns right. Gated by the
+    /// folder write-permission rules' `sheets-structure` operation
+    /// (issue #1613).
+    InsertColumns(structure::InsertColumnsCommand),
 }
 
 impl SheetsCommand {
@@ -62,6 +77,10 @@ impl SheetsCommand {
             SheetsSubcommands::Append(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Clear(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Create(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddSheet(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::RenameSheet(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::InsertRows(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::InsertColumns(cmd) => cmd.execute(client).await,
         }
     }
 }
