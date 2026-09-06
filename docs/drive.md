@@ -777,9 +777,12 @@ call, so this diagnostic can never drift from actual enforcement. Accepts
 either a folder id (checked directly) or a file id (its own `file_id`
 rules first, then its current parent(s), matching `edit`'s own semantics).
 
-The `note:` line is the one this command exists for: it appears only when
-the target has no visible parent, which is the single case where no
-`folder_id` rule could ever help.
+The `note:` line is the one this command exists for: it appears only on a
+`deny` against a target with no visible parent, which is the single case
+where no `folder_id` rule could ever help. It is gated on the verdict as
+well, because `read` defaults to allow on an empty ancestor chain — a
+link-shared target checked for `read` is *permitted*, and advice on how to
+grant it would read as a refusal that isn't one.
 
 `-o json` adds `decided_by_file_id` and `evaluated_via` (`"file-rule"`,
 `"folder-chain"` or `"no-visible-parents"`) alongside the existing
