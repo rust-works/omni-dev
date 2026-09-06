@@ -4,6 +4,12 @@
 //! Impure sibling to `write_gate` — mirrors `crate::drive::file_move`'s
 //! role relative to `crate::drive::visibility`: this module does the
 //! fetching, `write_gate` does the (pure) classifying.
+//!
+//! Despite the name it is not only about folders: since issue #1612 a rule
+//! may name a **file id**, and [`resolve_decision_for_file_target`] is the
+//! single entry point for a file target — it checks that rule before
+//! walking (or, for a target with no visible parents, instead of walking)
+//! any ancestor chain.
 
 use anyhow::Result;
 
@@ -133,6 +139,86 @@ pub async fn resolve_decision_from(
     }
 }
 
+/// How a file target's verdict was reached.
+///
+/// Matched exhaustively by every caller, so a future source cannot be
+/// silently mishandled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionSource {
+    /// A `file_id` rule named the target itself. No `files.get` on any
+    /// parent was issued — and none could have changed the verdict, since
+    /// a file rule sits at depth −1.
+    FileRule,
+    /// The target's current parent chain(s) decided it, or fell through to
+    /// the default policy with a chain actually resolved.
+    FolderChain,
+    /// The target has no parents this account can see **and** no file rule
+    /// named this operation — the one case where no folder id the operator
+    /// could name would ever help. `decision` is the bare default policy,
+    /// *not* a forced refusal: `Read` still defaults to allow, so a
+    /// caller that wants to refuse must check the verdict too.
+    NoVisibleParents,
+}
+
+/// The full evaluation of a **file** target.
+#[derive(Debug, Clone)]
+pub struct FileTargetDecision {
+    /// The verdict, and the rule that decided it.
+    pub decision: Decision,
+    /// The single folder the chain resolved through, when the target had
+    /// exactly one parent. Always `None` for `FileRule` and
+    /// `NoVisibleParents`, neither of which walks a chain.
+    pub resolved_folder_id: Option<String>,
+    /// How the verdict was reached.
+    pub source: DecisionSource,
+}
+
+/// Resolves `op` for a file target whose metadata the caller already has.
+///
+/// **This is the only entry point for a file target**, which is why
+/// [`resolve_decision_for_parents`] is private: it owns the ordering — a
+/// `file_id` rule first, then the current-parent chains, then the
+/// no-visible-parents case — so `drive sheets write`, `drive edit` and
+/// `drive permissions check` cannot drift apart on it.
+///
+/// The short-circuit is exact rather than an optimization: a file rule
+/// sits at depth −1, so no folder rule at any depth of any parent chain
+/// can beat it, and skipping the walk cannot change the verdict. That is
+/// the same argument that already licenses [`resolve_decision_from`]'s
+/// early return — and it is what makes a file **shared by link or email**
+/// grantable at all, since such a target has no chain to walk.
+///
+/// The fetch-failure-is-always-`Err` invariant [`resolve_ancestor_chain`]
+/// documents applies to the chain-walking branch.
+pub async fn resolve_decision_for_file_target(
+    files_api: &FilesApi<'_>,
+    target: &DriveFile,
+    op: DriveOperation,
+    rules: &[FolderPermissionRule],
+) -> Result<FileTargetDecision> {
+    if let Some(decision) = write_gate::resolve_file_rule(&target.id, op, rules) {
+        return Ok(FileTargetDecision {
+            decision,
+            resolved_folder_id: None,
+            source: DecisionSource::FileRule,
+        });
+    }
+    if target.parents.is_empty() {
+        return Ok(FileTargetDecision {
+            decision: write_gate::resolve(&[], op, rules),
+            resolved_folder_id: None,
+            source: DecisionSource::NoVisibleParents,
+        });
+    }
+    let (decision, resolved_folder_id) =
+        resolve_decision_for_parents(files_api, &target.parents, op, rules).await?;
+    Ok(FileTargetDecision {
+        decision,
+        resolved_folder_id,
+        source: DecisionSource::FolderChain,
+    })
+}
+
 /// Resolves `op` against `parents` (a target's *current* parent ids).
 ///
 /// Combines the per-parent [`Decision`]s via
@@ -141,14 +227,12 @@ pub async fn resolve_decision_from(
 /// when there's exactly one parent — `None` for an orphan target or a
 /// multi-parent target, where no single folder id would be accurate.
 ///
-/// Shared by `drive edit` (`crate::drive::content_edit`) and `drive
-/// permissions check` (`crate::cli::drive::permissions::check`) — the two
-/// callers whose target's chain starts at its *current* parent(s) rather
-/// than a caller-supplied `--parent`. Centralizing the combine loop here
-/// is what lets `permissions check` claim it can never drift from actual
-/// enforcement: previously only the primitives were shared and this
-/// orchestration was duplicated at both call sites.
-pub async fn resolve_decision_for_parents(
+/// **Private on purpose** (issue #1612): every file target must go through
+/// [`resolve_decision_for_file_target`], which consults `file_id` rules
+/// first. A caller reaching this primitive directly would skip that step
+/// and silently refuse a file that was explicitly granted — so the
+/// restriction is a compile error rather than a convention.
+async fn resolve_decision_for_parents(
     files_api: &FilesApi<'_>,
     parents: &[String],
     op: DriveOperation,
@@ -331,7 +415,8 @@ mod tests {
         // it; wiremock panics with "no matching mock" if it does.
         let files_api = FilesApi::new(&client);
         let rules = [FolderPermissionRule {
-            folder_id: "child".to_string(),
+            folder_id: Some("child".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::collections::HashSet::default(),
@@ -392,7 +477,8 @@ mod tests {
             ..Default::default()
         };
         let rules = [FolderPermissionRule {
-            folder_id: "child".to_string(),
+            folder_id: Some("child".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Read).collect(),
             deny: std::collections::HashSet::default(),
@@ -427,7 +513,8 @@ mod tests {
         mount_folder("parent-1", None).mount(&server).await;
         let files_api = FilesApi::new(&client);
         let rules = [FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
@@ -454,13 +541,15 @@ mod tests {
         let files_api = FilesApi::new(&client);
         let rules = [
             FolderPermissionRule {
-                folder_id: "allow-parent".to_string(),
+                folder_id: Some("allow-parent".to_string()),
+                file_id: None,
                 recursive: false,
                 allow: std::iter::once(DriveOperation::Edit).collect(),
                 deny: std::collections::HashSet::default(),
             },
             FolderPermissionRule {
-                folder_id: "deny-parent".to_string(),
+                folder_id: Some("deny-parent".to_string()),
+                file_id: None,
                 recursive: false,
                 allow: std::collections::HashSet::default(),
                 deny: std::iter::once(DriveOperation::Edit).collect(),
@@ -477,5 +566,131 @@ mod tests {
         .unwrap();
         assert_eq!(decision.verdict, write_gate::Verdict::Deny);
         assert_eq!(resolved_folder_id, None);
+    }
+
+    // ── file targets (issue #1612) ────────────────────────────────────
+
+    fn target_file(id: &str, parents: &[&str]) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            parents: parents.iter().map(|p| (*p).to_string()).collect(),
+            ..DriveFile::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_rule_decides_without_fetching_any_parent() {
+        // The load-bearing test for issue #1612. The target names a parent
+        // that is deliberately NOT mounted: if the walk happens at all,
+        // wiremock panics with "no matching mock". That is what makes the
+        // short-circuit an assertion rather than a claim — and it is the
+        // same property that lets a link-shared file with *no* visible
+        // parent be granted.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let files_api = FilesApi::new(&client);
+        let rules = [FolderPermissionRule::file("target").allowing([DriveOperation::SheetsWrite])];
+
+        let evaluated = resolve_decision_for_file_target(
+            &files_api,
+            &target_file("target", &["never-mounted"]),
+            DriveOperation::SheetsWrite,
+            &rules,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluated.decision.verdict, write_gate::Verdict::Allow);
+        assert_eq!(evaluated.source, DecisionSource::FileRule);
+        assert_eq!(evaluated.resolved_folder_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_parentless_target_with_no_file_rule_reports_no_visible_parents() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let files_api = FilesApi::new(&client);
+
+        let evaluated = resolve_decision_for_file_target(
+            &files_api,
+            &target_file("orphan", &[]),
+            DriveOperation::SheetsWrite,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluated.source, DecisionSource::NoVisibleParents);
+        assert_eq!(evaluated.decision.verdict, write_gate::Verdict::Deny);
+        assert_eq!(evaluated.decision.decided_by, None);
+    }
+
+    #[tokio::test]
+    async fn no_visible_parents_still_allows_read_by_default_policy() {
+        // `NoVisibleParents` is a *why*, not a verdict: forcing it to deny
+        // would break reading a shared file, which defaults to allow.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let files_api = FilesApi::new(&client);
+
+        let evaluated = resolve_decision_for_file_target(
+            &files_api,
+            &target_file("orphan", &[]),
+            DriveOperation::Read,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluated.source, DecisionSource::NoVisibleParents);
+        assert_eq!(evaluated.decision.verdict, write_gate::Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_file_allow_beats_a_denying_parent() {
+        // `combine_across_parents`' deny-wins is a tie-break among peers.
+        // A file rule is not a peer — it sits at depth −1 — so it wins.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let files_api = FilesApi::new(&client);
+        let rules = [
+            FolderPermissionRule::folder("deny-parent").denying([DriveOperation::Edit]),
+            FolderPermissionRule::file("target").allowing([DriveOperation::Edit]),
+        ];
+
+        let evaluated = resolve_decision_for_file_target(
+            &files_api,
+            &target_file("target", &["deny-parent"]),
+            DriveOperation::Edit,
+            &rules,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluated.decision.verdict, write_gate::Verdict::Allow);
+        assert_eq!(evaluated.source, DecisionSource::FileRule);
+    }
+
+    #[tokio::test]
+    async fn a_target_with_parents_and_no_file_rule_walks_the_chain_as_before() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_folder("parent", None).mount(&server).await;
+        let files_api = FilesApi::new(&client);
+        let rules = [FolderPermissionRule::folder("parent").allowing([DriveOperation::Edit])];
+
+        let evaluated = resolve_decision_for_file_target(
+            &files_api,
+            &target_file("target", &["parent"]),
+            DriveOperation::Edit,
+            &rules,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluated.decision.verdict, write_gate::Verdict::Allow);
+        assert_eq!(evaluated.source, DecisionSource::FolderChain);
+        assert_eq!(evaluated.resolved_folder_id.as_deref(), Some("parent"));
     }
 }

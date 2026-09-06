@@ -112,14 +112,16 @@ pub enum WriteResult {
     /// a confusing thing to say about a shortcut *to* a spreadsheet — the
     /// same distinction `drive read --content` already draws.
     RefusedShortcut,
-    /// The target has no parents this account can see, so the folder gate
-    /// has no ancestor chain to evaluate and no rule could ever grant it.
+    /// The target has no parents this account can see, so the gate has no
+    /// ancestor chain to evaluate — **and** no `file_id` rule named it
+    /// either, so nothing granted it.
     ///
     /// Distinct from `Blocked { decided_by: None }`, which means "a chain
-    /// was resolved and no rule matched". Conflating them would tell an
-    /// operator to fix their rules when no rule they could write would help
-    /// — the fix is to put the Sheet in a folder they control. This is the
-    /// common shape for a Sheet shared by link or email.
+    /// was resolved and no rule matched". Conflating them would send an
+    /// operator off to fix folder rules when no folder rule they could
+    /// write would help. This is the common shape for a Sheet shared by
+    /// link or email; since issue #1612 the fix is a `file_id` rule, and
+    /// this variant is reached only once that lookup has come up empty.
     RefusedNoVisibleParents,
     /// The folder write-permission gate refused it.
     Blocked {
@@ -271,20 +273,18 @@ async fn write_inner(
             mime_type: target.mime_type.clone(),
         });
     }
-    if target.parents.is_empty() {
-        return with_target(WriteResult::RefusedNoVisibleParents);
-    }
-
     // ── The gate ───────────────────────────────────────────────────────
-    let (decision, resolved_folder_id) = match folder_ancestry::resolve_decision_for_parents(
+    // A `file_id` rule is consulted *before* the parents are looked at, so
+    // a Sheet with no visible parent can still be granted (issue #1612).
+    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
         &files_api,
-        &target.parents,
+        &target,
         DriveOperation::SheetsWrite,
         rules,
     )
     .await
     {
-        Ok(pair) => pair,
+        Ok(evaluated) => evaluated,
         // A chain that could not be resolved is a refusal, never a silent
         // allow — ADR-0071 §3's highest-priority invariant.
         Err(err) => {
@@ -293,6 +293,19 @@ async fn write_inner(
             })
         }
     };
+
+    // Only *after* the file-rule lookup has come up empty is "no visible
+    // parents" the real story; reporting it sooner would refuse a target
+    // an explicit `file_id` rule had already granted.
+    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
+        return with_target(WriteResult::RefusedNoVisibleParents);
+    }
+
+    let folder_ancestry::FileTargetDecision {
+        decision,
+        resolved_folder_id,
+        ..
+    } = evaluated;
 
     let gated = |result| WriteOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
@@ -369,7 +382,7 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
         WriteResult::Blocked { decided_by } => decided_by.as_ref(),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
     let (updated_range, updated_rows, updated_columns, updated_cells) = match &outcome.result {
         WriteResult::Written {
             updated_range,
@@ -391,8 +404,9 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
         file_name: outcome.file_name.clone().unwrap_or_default(),
         status: outcome.result.log_status().to_string(),
         resolved_folder_id: outcome.resolved_folder_id.clone(),
-        decided_by_folder_id,
-        decided_by_depth,
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
         range: outcome.range.clone(),
         updated_range,
         updated_rows,
@@ -436,15 +450,18 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             verb.label()
         ),
         WriteResult::RefusedNoVisibleParents => format!(
-            "Refused: '{name}' has no parent folder visible to this account, so no \
-             write-permission rule can apply to it. This is normal for a Sheet shared by link \
-             or email. Add it to a folder in your own Drive, then grant that folder \
-             `sheets-write`."
+            "Refused: '{name}' has no parent folder visible to this account, so no folder \
+             rule can apply to it. This is normal for a Sheet shared by link or email. \
+             Grant it by id instead: add {{\"file_id\": \"<spreadsheet id>\", \"allow\": \
+             [\"sheets-write\"]}} to write_permissions.rules. (Adding it to a folder in your \
+             own Drive and granting that folder `sheets-write` also works.)"
         ),
         WriteResult::Blocked { decided_by } => match decided_by {
             Some(rule) => format!(
-                "Blocked: {range} of '{name}' — refused by rule on folder {} (depth {})",
-                rule.folder_id, rule.depth
+                "Blocked: {range} of '{name}' — refused by rule on {} {}{}",
+                rule.kind_label(),
+                rule.id(),
+                rule.depth_suffix()
             ),
             None => format!(
                 "Blocked: {range} of '{name}' — refused by default policy (no matching rule)"
@@ -543,7 +560,8 @@ mod tests {
 
     fn allow_rule(folder: &str) -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: folder.to_string(),
+            folder_id: Some(folder.to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
@@ -628,10 +646,11 @@ mod tests {
             WriteResult::RefusedNoVisibleParents
         ));
         // The message must not send the operator off to fix rules that
-        // could never apply.
+        // could never apply — it names the one rule shape that works.
         let text = describe(&outcome, WriteVerb::Write);
         assert!(text.contains("no parent folder visible"), "{text}");
-        assert!(text.contains("Add it to a folder"), "{text}");
+        assert!(text.contains("file_id"), "{text}");
+        assert!(text.contains("Adding it to a folder"), "{text}");
     }
 
     // ── the gate ───────────────────────────────────────────────────────
@@ -667,7 +686,8 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let deny_rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
@@ -697,7 +717,8 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let edit_only = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: HashSet::default(),
@@ -1147,5 +1168,92 @@ mod tests {
         let decision =
             write_gate::resolve(&["folder".to_string()], DriveOperation::SheetsWrite, &[]);
         assert_eq!(decision.verdict, Verdict::Deny);
+    }
+
+    // ── file-id rules (issue #1612) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_file_rule_grants_a_sheet_with_no_visible_parents() {
+        // The case issue #1612 exists for: before file rules there was no
+        // rule an operator could write that would permit this at all.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "updatedRange": "'Q1'!A1:B2", "updatedRows": 1, "updatedCells": 2,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Write, false),
+            &[FolderPermissionRule::file("sheet-1").allowing([DriveOperation::SheetsWrite])],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.result, WriteResult::Written { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_rule_denies_even_when_a_parent_folder_would_allow() {
+        // Depth −1 beats depth 0 in the restrictive direction too.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        // No mock for parent-1 and none for any Sheets endpoint: the file
+        // rule must decide before either is reached.
+
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Write, false),
+            &[
+                allow_rule("parent-1"),
+                FolderPermissionRule::file("sheet-1").denying([DriveOperation::SheetsWrite]),
+            ],
+        )
+        .await;
+
+        match &outcome.result {
+            WriteResult::Blocked { decided_by } => {
+                let rule = decided_by.as_ref().expect("a file rule decided this");
+                assert_eq!(rule.kind_label(), "file");
+                assert_eq!(rule.id(), "sheet-1");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        let text = describe(&outcome, WriteVerb::Write);
+        assert!(text.contains("refused by rule on file sheet-1"), "{text}");
+        assert!(!text.contains("depth"), "a file rule has no depth: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_no_visible_parents_message_names_a_file_rule_as_the_fix() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let outcome = write(&drive, &sheets, &opts(WriteVerb::Write, false), &[]).await;
+        let text = describe(&outcome, WriteVerb::Write);
+        assert!(text.contains("file_id"), "{text}");
+        assert!(text.contains("sheets-write"), "{text}");
     }
 }

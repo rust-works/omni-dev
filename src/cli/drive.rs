@@ -65,8 +65,8 @@ pub enum DriveSubcommands {
     /// write-permission rules (issue #1574). Requires the `drive.file` or
     /// `drive` scope (`drive auth login --write-file`/`--write-full`).
     Upload(upload::UploadCommand),
-    /// Replaces an existing file's content, gated by the folder
-    /// write-permission rules (issue #1574). Requires the `drive.file`
+    /// Replaces an existing file's content, gated by the
+    /// write-permission rules (issues #1574, #1612). Requires the `drive.file`
     /// scope if `omni-dev` created the file, or the unrestricted `drive`
     /// scope for any pre-existing file (`drive auth login --write-file`
     /// or `--write-full`).
@@ -77,9 +77,9 @@ pub enum DriveSubcommands {
     /// Moves one or more Drive files into a destination folder. Requires
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
-    /// Inspects the folder-scoped write-permission rules gating `drive
+    /// Inspects the write-permission rules gating `drive
     /// create`/`upload`/`edit` and `drive sheets
-    /// write`/`append`/`clear`/`create` (issues #1574, #1589).
+    /// write`/`append`/`clear`/`create` (issues #1574, #1589, #1612).
     Permissions(permissions::PermissionsCommand),
     /// Reads and writes the cells of a Google Sheet via the Sheets v4 API
     /// (issue #1589).

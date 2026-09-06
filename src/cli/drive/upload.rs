@@ -118,9 +118,10 @@ fn print_outcome(outcome: &UploadOutcome) {
             println!("Blocked: {name} in {parent}");
             match decided_by {
                 Some(rule) => println!(
-                    "  refused by rule on folder {} (depth {})",
-                    sanitize_for_terminal(&rule.folder_id),
-                    rule.depth
+                    "  refused by rule on {} {}{}",
+                    rule.kind_label(),
+                    sanitize_for_terminal(rule.id()),
+                    rule.depth_suffix()
                 ),
                 None => println!("  refused by default policy (no matching rule)"),
             }
@@ -192,7 +193,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Upload).collect(),
             deny: std::collections::HashSet::default(),

@@ -895,6 +895,16 @@ pub struct DriveMutationOutcome {
     pub decided_by_folder_id: Option<String>,
     /// How many levels above `resolved_folder_id` that rule's folder sits.
     pub decided_by_depth: Option<usize>,
+    /// The file id of the configured rule that decided the write-gate
+    /// verdict, when a **file** rule did (issue #1612).
+    ///
+    /// Mutually exclusive with `decided_by_folder_id`, deliberately: a file
+    /// id must never appear in the folder field, or an existing
+    /// `omni-dev log --query decided_by_folder_id:X` would silently start
+    /// matching a different kind of id. A file rule matches the target
+    /// itself, so it has no depth and walks no chain — `decided_by_depth`
+    /// and `resolved_folder_id` are both `None` alongside it.
+    pub decided_by_file_id: Option<String>,
     /// The A1 range a Sheets write targeted (issue #1589). `None` for every
     /// non-Sheets verb.
     pub range: Option<String>,
@@ -976,6 +986,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(decided_by_depth) = outcome.decided_by_depth {
         context.insert("decided_by_depth".to_string(), decided_by_depth.to_string());
+    }
+    if let Some(decided_by_file_id) = outcome.decided_by_file_id {
+        context.insert("decided_by_file_id".to_string(), decided_by_file_id);
     }
     if let Some(range) = outcome.range {
         context.insert("range".to_string(), range);
