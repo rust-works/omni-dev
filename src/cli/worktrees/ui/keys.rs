@@ -56,6 +56,12 @@ pub enum ChromeKey {
     ScrollPageUp,
     /// `⇧PageDown`: scroll the terminal forward a page.
     ScrollPageDown,
+    /// `alt-m`: open the context menu for whatever has focus (the tree row
+    /// under the cursor, or the focused terminal tab).
+    ///
+    /// The platform-conventional menu key, `⇧F10`, is deliberately **not**
+    /// bound here — see the `chrome_key` match arm below for why.
+    ContextMenu,
 }
 
 /// Where one key press goes.
@@ -101,6 +107,16 @@ pub fn chrome_key(key: &KeyEvent) -> Option<ChromeKey> {
         KeyCode::Char('c') if alt && shift => Some(ChromeKey::ClearAllRowColors),
         KeyCode::Char('c') if alt => Some(ChromeKey::Copy),
         KeyCode::Char('f') if alt => Some(ChromeKey::Find),
+        KeyCode::Char('m') if alt => Some(ChromeKey::ContextMenu),
+        // ⇧F10 is the platform-conventional "open context menu" key, but it
+        // is NOT recognised here. `encode_key` below already encodes
+        // `F(10)` as `\x1b[21~` for the child, and this module's contract
+        // (see the module doc comment and ADR-0072 §5) is that a focused
+        // terminal receives every key verbatim except `Alt`-chords — that
+        // is what lets this UI skip a tmux-style prefix. Claiming ⇧F10 as
+        // chrome would take it away from children and punch a hole in that
+        // rule. So ⇧F10 is handled tree-side in app.rs instead, where no
+        // child is listening — do not "fix" this by adding it here.
         KeyCode::Char(']') if alt => Some(ChromeKey::NextTab),
         KeyCode::Char('[') if alt => Some(ChromeKey::PrevTab),
         KeyCode::Char('0') if alt => Some(ChromeKey::ResetLayout),
@@ -482,6 +498,20 @@ mod tests {
             )),
             Some(ChromeKey::NewClaudeTab)
         );
+    }
+
+    #[test]
+    fn alt_m_opens_the_context_menu_but_f10_does_not() {
+        assert_eq!(
+            chrome_key(&key(KeyCode::Char('m'), KeyModifiers::ALT)),
+            Some(ChromeKey::ContextMenu)
+        );
+        // ⇧F10 is the platform-conventional menu key, but it is handled
+        // tree-side in app.rs, not here — see the ContextMenu match arm.
+        // A bare F10 and a shifted F10 must both stay non-chrome so the
+        // child terminal keeps receiving them verbatim.
+        assert_eq!(chrome_key(&key(KeyCode::F(10), KeyModifiers::NONE)), None);
+        assert_eq!(chrome_key(&key(KeyCode::F(10), KeyModifiers::SHIFT)), None);
     }
 
     #[test]

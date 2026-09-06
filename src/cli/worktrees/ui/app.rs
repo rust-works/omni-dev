@@ -138,7 +138,33 @@ fn grouped_menu_entries(targets: &[Target]) -> Vec<popup::MenuEntry> {
             }),
         );
     }
+    // Row Colour is its own group: it is neither a git action nor a close,
+    // and a submenu keeps eleven colours from burying the rest of the menu.
+    // `c` still opens the flat picker, so nobody loses the shortcut.
+    if !targets.is_empty() {
+        if !entries.is_empty() {
+            entries.push(popup::MenuEntry::Separator);
+        }
+        entries.push(popup::MenuEntry::Submenu {
+            label: "Row Colour",
+            items: row_color_items(),
+        });
+        entries.push(popup::MenuEntry::Item(popup::MenuItem::action(
+            ActionKind::ClearRowColor,
+            "Clear Row Colour",
+        )));
+    }
     entries
+}
+
+/// The row-colour palette as menu items — shared by the `c` picker and the
+/// context menu's *Row Colour* submenu, so the two cannot list different
+/// colours.
+fn row_color_items() -> Vec<popup::MenuItem> {
+    row_colors::KNOWN_ROW_COLORS
+        .iter()
+        .map(|&color| popup::MenuItem::action(ActionKind::SetRowColor(color), color))
+        .collect()
 }
 
 /// Filters palette entries by a case-insensitive substring of their label.
@@ -450,6 +476,7 @@ fn layout(area: Rect, has_terminal: bool) -> Areas {
 }
 
 fn draw(frame: &mut Frame<'_>, view: &WorktreesViewModel, app: &mut App) {
+    dismiss_menu_if_origin_gone(app, view);
     let areas = layout(frame.area(), !app.panes.is_empty());
     render::draw_tree_pane(
         frame,
@@ -577,7 +604,7 @@ fn draw_popups(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Option<mouse
         return None;
     }
     if let Some(menu) = &mut app.menu {
-        return Some(popup::draw_menu(frame, area, menu));
+        return Some(popup::draw_menu(frame, area, menu, app.glyphs));
     }
     match &app.relocate {
         Some(RelocateStep::PickSession {
@@ -699,7 +726,11 @@ async fn handle_mouse(
                 // The popup arms are unreachable here: `popup_mouse_enabled`
                 // took every event while a menu was open, and with no menu
                 // the map has no popup region to hit.
-                Hit::PopupItem { .. } | Hit::PopupInert | Hit::PopupOutside | Hit::Chrome => false,
+                Hit::PopupItem { .. }
+                | Hit::PopupSubmenuItem { .. }
+                | Hit::PopupInert
+                | Hit::PopupOutside
+                | Hit::Chrome => false,
             }
         }
         MouseEventKind::Drag(button) => match app.drag {
@@ -774,6 +805,7 @@ async fn handle_mouse(
                     }
                 }
                 Hit::PopupItem { .. }
+                | Hit::PopupSubmenuItem { .. }
                 | Hit::PopupInert
                 | Hit::PopupOutside
                 | Hit::Splitter { .. }
@@ -813,20 +845,49 @@ async fn handle_menu_mouse(
         // does — but only redraws when the highlight actually moves, or the
         // UI would repaint at pointer-motion rate.
         MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-            let Hit::PopupItem { index } = hit else {
-                return false;
-            };
             let Some(menu) = app.menu.as_mut() else {
                 return false;
             };
-            if menu.selected == index {
-                return false;
+            match hit {
+                Hit::PopupSubmenuItem { index } => {
+                    if menu.submenu_selected == index {
+                        return false;
+                    }
+                    menu.submenu_selected = index;
+                    true
+                }
+                Hit::PopupItem { index } => {
+                    if menu.selected == index {
+                        return false;
+                    }
+                    // Hovering a different parent row closes a submenu that
+                    // is no longer the one under the pointer.
+                    menu.close_submenu();
+                    menu.select_index(index)
+                }
+                _ => false,
             }
-            menu.select_index(index)
         }
-        MouseEventKind::Down(_) => {
+        MouseEventKind::Down(button) => {
             if matches!(hit, Hit::PopupOutside) {
                 app.menu = None;
+                app.regions.popup = None;
+                // A *right*-click outside re-targets: dismiss, then treat the
+                // press as a fresh context-menu request where it landed. Any
+                // other button just dismisses, and is consumed either way —
+                // contract §7's "never applied to what it landed on".
+                if button == MouseButton::Right {
+                    if let Hit::Tree { row: tree_row } = app.regions.hit(mouse.column, mouse.row) {
+                        return tree_mouse_down(
+                            app,
+                            view,
+                            tree_row,
+                            button,
+                            mouse.modifiers,
+                            (mouse.column, mouse.row),
+                        );
+                    }
+                }
                 return true;
             }
             // Arm on a press that starts *inside* the menu. The press that
@@ -834,27 +895,37 @@ async fn handle_menu_mouse(
             // invoke anything — see `ActionMenu::armed`.
             if let Some(menu) = app.menu.as_mut() {
                 menu.armed = true;
-                if let Hit::PopupItem { index } = hit {
-                    menu.select_index(index);
+                match hit {
+                    Hit::PopupItem { index } => {
+                        menu.close_submenu();
+                        menu.select_index(index);
+                    }
+                    Hit::PopupSubmenuItem { index } => menu.submenu_selected = index,
+                    _ => {}
                 }
             }
             true
         }
         MouseEventKind::Up(_) => {
-            let Hit::PopupItem { index } = hit else {
-                return false;
-            };
             let Some(menu) = app.menu.as_mut() else {
                 return false;
             };
             if !menu.armed {
                 return false; // the opening click's own release
             }
-            if !menu.select_index(index) {
-                return false;
+            match hit {
+                Hit::PopupSubmenuItem { index } => menu.submenu_selected = index,
+                Hit::PopupItem { index } => {
+                    if !menu.select_index(index) {
+                        return false;
+                    }
+                }
+                _ => return false,
             }
-            let Some(command) = menu.selected_command() else {
-                return true; // a disabled item: highlighted, not invoked
+            // A click on a submenu *row* expands it rather than dispatching,
+            // exactly as `Enter` does — one `activate` for both routes.
+            let Some(command) = menu.activate() else {
+                return true;
             };
             invoke_menu_command(app, view, dispatcher, command).await;
             true
@@ -991,6 +1062,7 @@ fn tree_mouse_down(
                 grouped_menu_entries(&targets),
             );
             menu.anchor = popup::Anchor::At { col, row };
+            menu.origin_row = row_path(view, tree_row);
             app.menu = Some(menu);
         }
     }
@@ -1119,11 +1191,23 @@ async fn handle_key(
         match code {
             KeyCode::Up | KeyCode::Char('k') => menu.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => menu.move_selection(1),
-            KeyCode::Esc => app.menu = None,
+            // One `Esc` closes one level: the submenu first, the menu only
+            // once no submenu is open.
+            KeyCode::Esc => {
+                if !menu.close_submenu() {
+                    app.menu = None;
+                }
+            }
+            KeyCode::Right => {
+                menu.open_selected_submenu();
+            }
+            KeyCode::Left => {
+                menu.close_submenu();
+            }
             KeyCode::Home => menu.select_end(false),
             KeyCode::End => menu.select_end(true),
             KeyCode::Enter => {
-                if let Some(command) = menu.selected_command() {
+                if let Some(command) = menu.activate() {
                     invoke_menu_command(app, view, dispatcher, command).await;
                 }
             }
@@ -1194,6 +1278,11 @@ async fn handle_key(
             }
         }
         KeyCode::Enter => open_tab_for_cursor(app, view, TabKind::Shell, false),
+        // The platform-conventional menu key. Handled here rather than in
+        // `keys::chrome_key` on purpose: `encode_key` already sends F10 to a
+        // child, and only Alt-chords are chrome (ADR-0072 §5). Tree-focused
+        // is exactly where no child is listening, so nothing is stolen.
+        KeyCode::F(10) => open_context_menu_for_focus(app, view),
         KeyCode::Char('a') => {
             let targets = app.tree.targets(view);
             app.menu = Some(popup::ActionMenu::with_entries(
@@ -1202,11 +1291,7 @@ async fn handle_key(
             ));
         }
         KeyCode::Char('c') => {
-            let items = row_colors::KNOWN_ROW_COLORS
-                .iter()
-                .map(|&color| popup::MenuItem::action(ActionKind::SetRowColor(color), color))
-                .collect();
-            app.menu = Some(popup::ActionMenu::new(items));
+            app.menu = Some(popup::ActionMenu::new(row_color_items()));
         }
         KeyCode::Char('C') => {
             let targets = app.tree.targets(view);
@@ -1361,6 +1446,7 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
                 None => "nothing selected".to_string(),
             });
         }
+        ChromeKey::ContextMenu => open_context_menu_for_focus(app, view),
         ChromeKey::ScrollPageUp => {
             if let Some(tab) = app.panes.active_tab() {
                 tab.scroll(Scroll::PageUp);
@@ -1434,6 +1520,60 @@ async fn run_action(
         CheckReport::Refused { reason } => {
             app.flow = ActionFlow::Failed { error: reason };
         }
+    }
+}
+
+/// Opens the context menu for whatever currently has focus, anchored where
+/// the eye already is: the cursor row in the tree, the focused grid's
+/// top-left otherwise. The keyboard route into every menu the mouse can
+/// reach (`alt-m`, and `⇧F10` while the tree has focus).
+fn open_context_menu_for_focus(app: &mut App, view: &WorktreesViewModel) {
+    let targets = app.tree.targets(view);
+    let entries = grouped_menu_entries(&targets);
+    if entries.is_empty() {
+        app.notice = Some("no actions for this row".to_string());
+        return;
+    }
+    let anchor = if app.focus == Focus::Tree {
+        let row = app
+            .tree
+            .cursor
+            .saturating_sub(app.tree.offset)
+            .try_into()
+            .unwrap_or(u16::MAX);
+        popup::Anchor::At {
+            col: app.regions.tree.x,
+            row: app.regions.tree.y.saturating_add(row),
+        }
+    } else {
+        app.regions
+            .groups
+            .get(app.panes.focused)
+            .map_or(popup::Anchor::Centered, |g| popup::Anchor::At {
+                col: g.grid.x,
+                row: g.grid.y,
+            })
+    };
+    let mut menu = popup::ActionMenu::with_entries("Actions", entries);
+    menu.anchor = anchor;
+    menu.origin_row = cursor_row_path(&app.tree, view);
+    app.menu = Some(menu);
+}
+
+/// Closes a context menu whose subject row has gone.
+///
+/// The tree is live: a daemon push can remove a worktree while its menu is
+/// open. Checked every frame, because that push is exactly what redraws.
+fn dismiss_menu_if_origin_gone(app: &mut App, view: &WorktreesViewModel) {
+    let Some(origin) = app.menu.as_ref().and_then(|m| m.origin_row.clone()) else {
+        return;
+    };
+    let still_there = TreeState::visible_rows(view)
+        .iter()
+        .any(|row| row.path(view) == Some(origin.as_path()));
+    if !still_there {
+        app.menu = None;
+        app.notice = Some("that row is gone — menu closed".to_string());
     }
 }
 
@@ -2342,6 +2482,7 @@ mod tests {
         // A hand-built region, standing in for what `draw_menu` would have
         // reported: two one-row items inside a small popup rect.
         app.regions.popup = Some(mouse::PopupRegion {
+            submenu: None,
             rect: Rect::new(9, 4, 12, 4),
             items: vec![(0, Rect::new(10, 5, 10, 1)), (1, Rect::new(10, 6, 10, 1))],
         });
@@ -2450,6 +2591,49 @@ mod tests {
         .await;
         assert!(app.menu.is_none());
         assert!(matches!(app.flow, ActionFlow::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_context_menu_closes_when_its_subject_row_disappears() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/wt-1", "/repo/wt-2"]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        draw_into(&mut terminal, &view, &mut app);
+
+        // Right-click the second worktree row: the menu takes it as subject.
+        let row = app.regions.tree.y + 2;
+        handle_mouse(
+            &mut app,
+            &view,
+            &dispatcher,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Right),
+                5,
+                row,
+                KeyModifiers::NONE,
+            ),
+        )
+        .await;
+        assert!(app.menu.is_some(), "the right-click opened a menu");
+        assert!(
+            app.menu
+                .as_ref()
+                .and_then(|m| m.origin_row.as_ref())
+                .is_some(),
+            "and recorded which row it acts on"
+        );
+
+        // A daemon push removes that worktree while the menu is open. The
+        // menu must not survive to act on whatever slid into its place.
+        let shrunk = view_with(&["/repo/wt-1"]);
+        draw_into(&mut terminal, &shrunk, &mut app);
+        assert!(app.menu.is_none(), "the menu closed with its subject");
+        assert!(app.notice.is_some(), "and said why");
+
+        // A menu with no row subject (the `c` picker) is unaffected.
+        app.menu = Some(popup::ActionMenu::new(row_color_items()));
+        draw_into(&mut terminal, &shrunk, &mut app);
+        assert!(app.menu.is_some(), "no subject, nothing to outlive");
     }
 
     #[cfg(unix)]

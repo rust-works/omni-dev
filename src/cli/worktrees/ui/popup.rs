@@ -11,6 +11,8 @@
 //!   frame cannot disagree about where an item is — the same invariant
 //!   `GroupRegion::tab_spans` already keeps for tab strips.
 
+use std::path::PathBuf;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,7 +20,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::actions::{ActionKind, ConfirmPrompt};
-use super::mouse::PopupRegion;
+use super::glyph::{Glyph, GlyphMode};
+use super::mouse::{PopupRegion, SubmenuRegion};
 
 /// What invoking a menu entry does.
 ///
@@ -65,17 +68,40 @@ impl MenuItem {
 
 /// A row of a menu. Separators carry no command and are skipped by keyboard
 /// navigation and by hit-testing alike, so neither route can select one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
     Item(MenuItem),
     Separator,
+    /// One level of submenu — *Row Colour ▸*. Deliberately holds a flat
+    /// `Vec<MenuItem>` and not `Vec<MenuEntry>`: arbitrary nesting was
+    /// rejected in #1602, and a flat list makes "one level only" structural
+    /// rather than a convention someone can quietly break.
+    Submenu {
+        label: &'static str,
+        items: Vec<MenuItem>,
+    },
 }
 
 impl MenuEntry {
     fn item(&self) -> Option<&MenuItem> {
         match self {
             Self::Item(item) => Some(item),
-            Self::Separator => None,
+            Self::Separator | Self::Submenu { .. } => None,
+        }
+    }
+
+    /// Whether the keyboard and the mouse can land on this row. A submenu
+    /// row is selectable but carries no command of its own — activating it
+    /// opens the submenu instead.
+    fn is_selectable(&self) -> bool {
+        !matches!(self, Self::Separator)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Item(item) => item.label,
+            Self::Submenu { label, .. } => label,
+            Self::Separator => "",
         }
     }
 }
@@ -153,6 +179,18 @@ pub struct ActionMenu {
     /// Only a press that starts inside the menu arms it, and only an armed
     /// menu can be invoked by a release.
     pub armed: bool,
+    /// The tree row the menu was opened from, when it was opened from one.
+    ///
+    /// A context menu names a *subject*, so it must not outlive it. The tree
+    /// is live — a daemon push can remove the worktree the menu is acting on
+    /// while it is open — and a menu still offering *Close Worktree* for a
+    /// row that has gone would act on whatever row slid into its place.
+    /// `None` for menus with no row subject (the `c` picker).
+    pub origin_row: Option<PathBuf>,
+    /// The entry index of the open submenu, if any. At most one, ever.
+    pub open_submenu: Option<usize>,
+    /// Index into the open submenu's items.
+    pub submenu_selected: usize,
 }
 
 impl ActionMenu {
@@ -170,6 +208,9 @@ impl ActionMenu {
             scroll: 0,
             anchor: Anchor::Centered,
             armed: false,
+            origin_row: None,
+            open_submenu: None,
+            submenu_selected: 0,
         };
         // Opening on a separator would make the first `Enter` do nothing.
         if menu.entry_is_selectable(0) {
@@ -180,7 +221,37 @@ impl ActionMenu {
     }
 
     fn entry_is_selectable(&self, index: usize) -> bool {
-        self.entries.get(index).is_some_and(|e| e.item().is_some())
+        self.entries
+            .get(index)
+            .is_some_and(MenuEntry::is_selectable)
+    }
+
+    /// The open submenu's items, if one is open.
+    fn submenu_items(&self) -> Option<&[MenuItem]> {
+        match self.entries.get(self.open_submenu?)? {
+            MenuEntry::Submenu { items, .. } => Some(items),
+            MenuEntry::Item(_) | MenuEntry::Separator => None,
+        }
+    }
+
+    /// Opens the submenu on the selected row, if it is one. `→`, and what
+    /// `Enter` does on a submenu row.
+    pub fn open_selected_submenu(&mut self) -> bool {
+        if matches!(
+            self.entries.get(self.selected),
+            Some(MenuEntry::Submenu { .. })
+        ) {
+            self.open_submenu = Some(self.selected);
+            self.submenu_selected = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Closes the open submenu, returning whether one was open — `←`, and
+    /// what `Esc` does *first*, so one `Esc` never closes both levels.
+    pub fn close_submenu(&mut self) -> bool {
+        self.open_submenu.take().is_some()
     }
 
     /// The next selectable index from `from` walking by `step`, or `None`
@@ -199,8 +270,18 @@ impl ActionMenu {
     }
 
     /// Moves the selection by `delta` items, skipping separators and stopping
-    /// at either end rather than wrapping.
+    /// at either end rather than wrapping. Drives the open submenu when there
+    /// is one, since that is what the eye is on.
     pub fn move_selection(&mut self, delta: isize) {
+        if let Some(len) = self.submenu_items().map(<[MenuItem]>::len) {
+            if len == 0 {
+                return;
+            }
+            let max = (len - 1) as isize;
+            let current = (self.submenu_selected.min(len - 1)) as isize;
+            self.submenu_selected = (current + delta).clamp(0, max) as usize;
+            return;
+        }
         let step = if delta < 0 { -1 } else { 1 };
         for _ in 0..delta.abs() {
             match self.next_selectable(self.selected, step) {
@@ -242,15 +323,33 @@ impl ActionMenu {
         false
     }
 
-    /// The command the selection would dispatch — `None` on an empty menu or
-    /// a disabled item, which is what makes a disabled entry inert to
-    /// `Enter` as well as to the mouse.
+    /// The command the selection would dispatch — `None` on an empty menu, a
+    /// disabled item, or a submenu row (which opens rather than dispatches).
+    /// That `None` is what makes a disabled entry inert to `Enter` as well as
+    /// to the mouse.
     pub fn selected_command(&self) -> Option<MenuCommand> {
+        if let Some(items) = self.submenu_items() {
+            return items
+                .get(self.submenu_selected)
+                .filter(|item| item.enabled)
+                .map(|item| item.command);
+        }
         self.entries
             .get(self.selected)?
             .item()
             .filter(|item| item.enabled)
             .map(|item| item.command)
+    }
+
+    /// What `Enter` (or a click) does: opens the submenu on a submenu row,
+    /// otherwise yields the command to dispatch. Keeping this one method
+    /// stops the key path and the mouse path from disagreeing about which
+    /// rows dispatch and which expand.
+    pub fn activate(&mut self) -> Option<MenuCommand> {
+        if self.open_submenu.is_none() && self.open_selected_submenu() {
+            return None;
+        }
+        self.selected_command()
     }
 
     /// Scrolls so the selection is visible in a window `rows` tall.
@@ -280,7 +379,12 @@ const MENU_WIDTH: u16 = 50;
 
 /// Draws `menu` and returns the region describing what was drawn, for
 /// `RegionMap`.
-pub fn draw_menu(frame: &mut Frame<'_>, area: Rect, menu: &mut ActionMenu) -> PopupRegion {
+pub fn draw_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    menu: &mut ActionMenu,
+    glyphs: GlyphMode,
+) -> PopupRegion {
     let wanted_height = menu.entries.len().saturating_add(2).min(u16::MAX as usize) as u16;
     let popup_area = place(menu.anchor, MENU_WIDTH, wanted_height, area);
     let rows = usize::from(popup_area.height.saturating_sub(2));
@@ -289,6 +393,9 @@ pub fn draw_menu(frame: &mut Frame<'_>, area: Rect, menu: &mut ActionMenu) -> Po
     let truncated = menu.entries.len() > rows;
     let mut lines: Vec<ListItem> = Vec::with_capacity(rows);
     let mut items: Vec<(usize, Rect)> = Vec::new();
+    // The screen row of the open submenu's parent, once we reach it — the
+    // submenu is drawn beside it, so it must be laid out after the parent.
+    let mut submenu_row: Option<u16> = None;
     let inner_x = popup_area.x + 1;
     let inner_width = popup_area.width.saturating_sub(2);
 
@@ -314,15 +421,27 @@ pub fn draw_menu(frame: &mut Frame<'_>, area: Rect, menu: &mut ActionMenu) -> Po
                 "─".repeat(usize::from(inner_width)),
                 Style::default().fg(Color::DarkGray),
             )))),
-            MenuEntry::Item(item) => {
-                let style = if !item.enabled {
+            MenuEntry::Item(_) | MenuEntry::Submenu { .. } => {
+                let enabled = entry.item().is_none_or(|item| item.enabled);
+                let style = if !enabled {
                     Style::default().fg(Color::DarkGray)
                 } else if index == menu.selected {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
                 };
-                lines.push(ListItem::new(Line::from(Span::styled(item.label, style))));
+                // A submenu row is marked with a trailing arrow, right-aligned
+                // so the column reads down the menu.
+                let text = match entry {
+                    MenuEntry::Submenu { label, .. } => {
+                        let arrow = Glyph::SubmenuArrow.as_str(glyphs);
+                        let pad =
+                            usize::from(inner_width).saturating_sub(label.chars().count() + 1);
+                        format!("{label}{}{arrow}", " ".repeat(pad))
+                    }
+                    _ => entry.label().to_string(),
+                };
+                lines.push(ListItem::new(Line::from(Span::styled(text, style))));
                 items.push((
                     index,
                     Rect {
@@ -332,6 +451,9 @@ pub fn draw_menu(frame: &mut Frame<'_>, area: Rect, menu: &mut ActionMenu) -> Po
                         height: 1,
                     },
                 ));
+                if menu.open_submenu == Some(index) {
+                    submenu_row = Some(row_y);
+                }
             }
         }
     }
@@ -343,9 +465,63 @@ pub fn draw_menu(frame: &mut Frame<'_>, area: Rect, menu: &mut ActionMenu) -> Po
             .title(menu.title.to_string()),
     );
     frame.render_widget(list, popup_area);
+
+    // The submenu is drawn last so it sits above the parent, and only when
+    // its parent row is actually on screen — a submenu whose row scrolled
+    // out of view would otherwise float unattached.
+    let submenu = submenu_row.and_then(|row| {
+        let items = menu.submenu_items()?;
+        let height = (items.len() as u16).saturating_add(2);
+        // Beside the parent, flipping to its left when there is no room.
+        let col = if popup_area.right().saturating_add(MENU_WIDTH) <= area.right() {
+            popup_area.right()
+        } else {
+            popup_area.x.saturating_sub(MENU_WIDTH)
+        };
+        let rect = place(Anchor::At { col, row }, MENU_WIDTH, height, area);
+        frame.render_widget(Clear, rect);
+        let rows: Vec<ListItem> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let style = if !item.enabled {
+                    Style::default().fg(Color::DarkGray)
+                } else if i == menu.submenu_selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(item.label, style)))
+            })
+            .collect();
+        frame.render_widget(
+            List::new(rows).block(Block::default().borders(Borders::ALL)),
+            rect,
+        );
+        let item_rects = (0..items.len())
+            .map(|i| {
+                (
+                    i,
+                    Rect {
+                        x: rect.x + 1,
+                        y: rect.y + 1 + i as u16,
+                        width: rect.width.saturating_sub(2),
+                        height: 1,
+                    },
+                )
+            })
+            .filter(|(_, r)| r.y < rect.bottom().saturating_sub(1))
+            .collect();
+        Some(SubmenuRegion {
+            rect,
+            items: item_rects,
+        })
+    });
+
     PopupRegion {
         rect: popup_area,
         items,
+        submenu,
     }
 }
 
@@ -613,6 +789,83 @@ mod tests {
         assert_eq!(menu.selected_command(), None);
     }
 
+    /// A plain item beside a *Row Colour* submenu, mirroring `app.rs`'s
+    /// real context-menu shape.
+    fn submenu_entries() -> Vec<MenuEntry> {
+        vec![
+            MenuEntry::Item(MenuItem::action(ActionKind::Focus, "Open Worktree")),
+            MenuEntry::Submenu {
+                label: "Row Colour",
+                items: vec![
+                    MenuItem::action(ActionKind::SetRowColor("red"), "red"),
+                    MenuItem::action(ActionKind::SetRowColor("blue"), "blue"),
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn activate_on_a_submenu_row_opens_it_and_a_second_activate_dispatches_the_selected_item() {
+        let mut menu = ActionMenu::with_entries("t", submenu_entries());
+        menu.selected = 1;
+        assert_eq!(menu.activate(), None, "opening must not dispatch");
+        assert_eq!(menu.open_submenu, Some(1));
+        assert_eq!(menu.submenu_selected, 0);
+        assert_eq!(
+            menu.activate(),
+            Some(MenuCommand::Action(ActionKind::SetRowColor("red"))),
+            "the second activate dispatches the selected submenu item"
+        );
+    }
+
+    #[test]
+    fn close_submenu_reports_whether_one_was_open() {
+        let mut menu = ActionMenu::with_entries("t", submenu_entries());
+        menu.selected = 1;
+        assert!(!menu.close_submenu(), "nothing open yet");
+        menu.open_selected_submenu();
+        assert!(menu.close_submenu(), "one was open");
+        assert!(!menu.close_submenu(), "already closed");
+    }
+
+    #[test]
+    fn move_selection_drives_the_submenu_while_open_and_the_parent_once_closed() {
+        let mut menu = ActionMenu::with_entries("t", submenu_entries());
+        menu.selected = 1;
+        menu.open_selected_submenu();
+        menu.move_selection(1);
+        assert_eq!(menu.submenu_selected, 1, "submenu selection moved");
+        assert_eq!(menu.selected, 1, "parent selection untouched while open");
+        menu.close_submenu();
+        menu.move_selection(-1);
+        assert_eq!(
+            menu.selected, 0,
+            "with nothing open, the parent moves again"
+        );
+    }
+
+    #[test]
+    fn selected_command_is_none_for_a_disabled_item_inside_an_open_submenu() {
+        let mut menu = ActionMenu::with_entries(
+            "t",
+            vec![MenuEntry::Submenu {
+                label: "Row Colour",
+                items: vec![MenuItem {
+                    command: MenuCommand::Action(ActionKind::SetRowColor("red")),
+                    label: "red",
+                    enabled: false,
+                }],
+            }],
+        );
+        menu.selected = 0;
+        menu.open_selected_submenu();
+        assert_eq!(
+            menu.selected_command(),
+            None,
+            "disabled items are inert inside a submenu too"
+        );
+    }
+
     #[test]
     fn home_and_end_are_inert_with_nothing_selectable() {
         let mut menu =
@@ -642,7 +895,14 @@ mod tests {
         menu.anchor = Anchor::At { col: 4, row: 2 };
         let mut region = None;
         terminal
-            .draw(|frame| region = Some(draw_menu(frame, frame.area(), &mut menu)))
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
             .unwrap();
         let region = region.unwrap();
         assert_eq!(region.rect, Rect::new(4, 2, MENU_WIDTH, 5));
@@ -657,6 +917,34 @@ mod tests {
     }
 
     #[test]
+    fn draw_menu_marks_a_submenu_row_with_the_arrow_and_reports_its_item_rects() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut menu = ActionMenu::with_entries("Actions", submenu_entries());
+        menu.selected = 1;
+        menu.open_selected_submenu();
+        menu.anchor = Anchor::At { col: 4, row: 2 };
+        let mut region = None;
+        terminal
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
+            .unwrap();
+        let region = region.unwrap();
+        let submenu = region.submenu.expect("the submenu row is open");
+        assert_eq!(submenu.items.len(), 2, "one rect per submenu item");
+        let text = buffer_text(&terminal);
+        assert!(text.contains('▸'), "the submenu row is arrow-marked");
+        assert!(text.contains("red"));
+        assert!(text.contains("blue"));
+    }
+
+    #[test]
     fn a_menu_taller_than_the_frame_scrolls_and_shows_the_affordances() {
         let backend = TestBackend::new(60, 6);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -667,7 +955,14 @@ mod tests {
         menu.selected = 19;
         let mut region = None;
         terminal
-            .draw(|frame| region = Some(draw_menu(frame, frame.area(), &mut menu)))
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
             .unwrap();
         let region = region.unwrap();
         assert_eq!(
@@ -688,7 +983,7 @@ mod tests {
         menu.selected = 0;
         terminal
             .draw(|frame| {
-                draw_menu(frame, frame.area(), &mut menu);
+                draw_menu(frame, frame.area(), &mut menu, GlyphMode::Unicode);
             })
             .unwrap();
         assert!(
@@ -716,7 +1011,14 @@ mod tests {
         menu.selected = 0;
         let mut region = None;
         terminal
-            .draw(|frame| region = Some(draw_menu(frame, frame.area(), &mut menu)))
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
             .unwrap();
         let region = region.unwrap();
         let (_, rect) = region.items[0];
