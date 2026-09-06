@@ -68,6 +68,21 @@ pub enum DriveOperation {
     /// config change and no re-consent — the exact silent widening this
     /// gate's default-deny posture exists to prevent.
     SheetsWrite,
+    /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
+    /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
+    /// renaming and inserting rows or columns.
+    ///
+    /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
+    /// reason that one is not folded into [`Self::Edit`]. Every existing
+    /// `allow: ["sheets-write"]` rule was written when structural edits were
+    /// impossible, so reusing it here would retroactively upgrade those rules
+    /// into permission to restructure a workbook with no config change and no
+    /// re-consent.
+    ///
+    /// The same argument binds future work: row and sheet **deletion** must
+    /// not later join this variant either, or granting it today would silently
+    /// become consent to destroy data tomorrow.
+    SheetsStructure,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -80,6 +95,7 @@ impl std::fmt::Display for DriveOperation {
             Self::Upload => "upload",
             Self::Edit => "edit",
             Self::SheetsWrite => "sheets-write",
+            Self::SheetsStructure => "sheets-structure",
         };
         write!(f, "{s}")
     }
@@ -94,7 +110,11 @@ impl DriveOperation {
     fn default_policy(self) -> Verdict {
         match self {
             Self::Read => Verdict::Allow,
-            Self::Create | Self::Upload | Self::Edit | Self::SheetsWrite => Verdict::Deny,
+            Self::Create
+            | Self::Upload
+            | Self::Edit
+            | Self::SheetsWrite
+            | Self::SheetsStructure => Verdict::Deny,
         }
     }
 }
@@ -399,6 +419,7 @@ mod tests {
             DriveOperation::Upload,
             DriveOperation::Edit,
             DriveOperation::SheetsWrite,
+            DriveOperation::SheetsStructure,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
             assert_eq!(
@@ -414,6 +435,10 @@ mod tests {
         assert_eq!(DriveOperation::Upload.to_string(), "upload");
         assert_eq!(DriveOperation::Edit.to_string(), "edit");
         assert_eq!(DriveOperation::SheetsWrite.to_string(), "sheets-write");
+        assert_eq!(
+            DriveOperation::SheetsStructure.to_string(),
+            "sheets-structure"
+        );
     }
 
     #[test]
@@ -432,6 +457,33 @@ mod tests {
         let sheets = resolve(&chain(&["target"]), DriveOperation::SheetsWrite, &rules);
         assert_eq!(edit.verdict, Verdict::Allow);
         assert_eq!(sheets.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn sheets_structure_defaults_to_deny_like_every_other_write() {
+        let decision = resolve(&chain(&["f"]), DriveOperation::SheetsStructure, &[]);
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(decision.decided_by.is_none());
+    }
+
+    #[test]
+    fn a_sheets_write_rule_does_not_grant_sheets_structure() {
+        // The whole reason for a second Sheets variant (issue #1613): an
+        // existing `allow: ["sheets-write"]` rule was written when structural
+        // edits were impossible, so it must not silently gain the power to
+        // add, rename or reshape sheets.
+        let rules = [rule("target", true, &[DriveOperation::SheetsWrite], &[])];
+        let write = resolve(&chain(&["target"]), DriveOperation::SheetsWrite, &rules);
+        let structure = resolve(&chain(&["target"]), DriveOperation::SheetsStructure, &rules);
+        assert_eq!(write.verdict, Verdict::Allow);
+        assert_eq!(structure.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn an_edit_rule_does_not_grant_sheets_structure() {
+        let rules = [rule("target", true, &[DriveOperation::Edit], &[])];
+        let structure = resolve(&chain(&["target"]), DriveOperation::SheetsStructure, &rules);
+        assert_eq!(structure.verdict, Verdict::Deny);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::drive::api_client::GoogleApiClient;
 use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
-    AppendValuesResponse, BatchGetValuesResponse, ClearValuesResponse, Spreadsheet,
-    UpdateValuesResponse, ValueRange,
+    AppendValuesResponse, BatchGetValuesResponse, BatchUpdateRequest, BatchUpdateRequestItem,
+    BatchUpdateResponse, ClearValuesResponse, Spreadsheet, UpdateValuesResponse, ValueRange,
 };
 
 /// `fields` mask for `spreadsheets.get`.
@@ -221,6 +221,36 @@ impl<'a> SheetsApi<'a> {
             .await
             .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
     }
+
+    /// Applies structural `requests` to a spreadsheet (issue #1613).
+    ///
+    /// `pub(in crate::drive)` like the other mutating methods: that fence is
+    /// what makes gate bypass impossible by construction, since no module
+    /// outside `crate::drive` — where every engine runs the write gate first
+    /// — can reach it.
+    ///
+    /// Takes already-built [`BatchUpdateRequestItem`]s rather than a raw
+    /// JSON body, so the only requests expressible are the ones that type
+    /// models. That is the type-level half of the guarantee its doc comment
+    /// describes.
+    pub(in crate::drive) async fn batch_update(
+        &self,
+        spreadsheet_id: &str,
+        requests: Vec<BatchUpdateRequestItem>,
+    ) -> Result<BatchUpdateResponse> {
+        let url = build_batch_update_url(self.client.base_url(), spreadsheet_id)?;
+        let body = BatchUpdateRequest { requests };
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Sheets batchUpdate response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
 }
 
 /// Appends `segments` to `url`'s path, percent-encoding each one.
@@ -342,6 +372,19 @@ fn build_values_clear_url(base_url: &str, spreadsheet_id: &str, range: &str) -> 
         &mut url,
         &[spreadsheet_id, "values", &format!("{range}:clear")],
     )?;
+    Ok(url)
+}
+
+/// `POST /v4/spreadsheets/{id}:batchUpdate`.
+///
+/// Unlike the `values.*` builders, nothing caller-influenced reaches the
+/// path — a spreadsheet id is `[A-Za-z0-9_-]`. The `:batchUpdate` suffix
+/// rides the id segment, following the `values:batchGet` precedent above;
+/// `:` carries no meaning inside a path segment, so it survives encoding.
+fn build_batch_update_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    push_path_segments(&mut url, &[&format!("{spreadsheet_id}:batchUpdate")])?;
     Ok(url)
 }
 

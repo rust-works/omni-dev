@@ -3955,7 +3955,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4054,16 +4054,41 @@ Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
 Usage: sheets <COMMAND>
 
 Commands:
-  info    Shows a spreadsheet's title and the sheets (tabs) it contains
-  read    Reads cell values from one range, or from every sheet
-  write   Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
-  append  Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
-  clear   Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
-  create  Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
-  help    Print this message or the help of the given subcommand(s)
+  info            Shows a spreadsheet's title and the sheets (tabs) it contains
+  read            Reads cell values from one range, or from every sheet
+  write           Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  append          Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
+  clear           Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
+  create          Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
+  add-sheet       Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  rename-sheet    Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  insert-rows     Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  insert-columns  Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets add-sheet - Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Usage: add-sheet [OPTIONS] --title <TITLE> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --title <TITLE>    Title for the new sheet. Must not already exist in the workbook
+      --index <N>        Zero-based position in the workbook. Omitted appends to the end
+      --rows <N>         Initial row count. Omitted takes Sheets' own default (1000)
+      --columns <N>      Initial column count. Omitted takes Sheets' own default (26)
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -4144,6 +4169,46 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets insert-columns - Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Usage: insert-columns [OPTIONS] --sheet <NAME> --at <COLUMN> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <COLUMN>      Insert before this column, 1-based (column A is 1)
+      --count <N>        How many columns to insert [default: 1]
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets insert-rows - Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Usage: insert-rows [OPTIONS] --sheet <NAME> --at <ROW> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <ROW>         Insert before this row, 1-based — the row number the spreadsheet itself shows. `--at 5` puts the new rows above the current row 5
+      --count <N>        How many rows to insert [default: 1]
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets read - Reads cell values from one range, or from every sheet
 
 Reads cell values from one range, or from every sheet
@@ -4158,6 +4223,25 @@ Options:
       --sheet <NAME>     Sheet (tab) title to read. Supplies the prefix for a bare `--range`, or selects the whole tab on its own. Conflicts with a `--range` that already names a sheet
       --render <RENDER>  How cell values are rendered. `formatted` matches the spreadsheet as displayed; `unformatted` yields raw typed numbers rather than locale-formatted strings; `formula` yields formula text [default: formatted] [possible values: formatted, unformatted, formula]
   -o, --output <OUTPUT>  Output format. The default `table` emits CSV — one block per sheet, each preceded by a `# <title>` comment line when reading more than one. Use `json`/`yaml` to keep values typed and rows ragged [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets rename-sheet - Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+
+Usage: rename-sheet [OPTIONS] --sheet <NAME> --title <TITLE> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Current title of the sheet to rename
+      --title <TITLE>    The new title
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
