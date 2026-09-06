@@ -591,11 +591,16 @@ mod tests {
             matches!(e, TermEvent::ClipboardStore(..))
         })
         .await;
-        let stored = events.iter().find_map(|e| match e {
-            TermEvent::ClipboardStore(_, text) => Some(text.clone()),
-            _ => None,
-        });
-        assert_eq!(stored.as_deref(), Some("hello"));
+        // `drain_until` returns as soon as `done` matches, so on success the
+        // terminating (last) event *is* the `ClipboardStore` — asserting on
+        // it directly (rather than scanning all of `events` with
+        // `find_map`) keeps this deterministic instead of depending on how
+        // many unrelated events happen to precede it.
+        match events.last() {
+            Some(TermEvent::ClipboardStore(_, text)) => assert_eq!(text, "hello"),
+            Some(_) => panic!("terminating event was not a ClipboardStore"),
+            None => panic!("no events were observed before the timeout"),
+        }
         shutdown(handle);
     }
 
