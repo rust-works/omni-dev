@@ -309,9 +309,14 @@ pub enum DecidingRule {
 impl DecidingRule {
     /// The id this rule keys on — a file id or a folder id.
     ///
-    /// Deliberately *not* rendered here: every caller is a CLI surface
-    /// that must run the id through `sanitize_for_terminal` first, and
-    /// this module stays free of the CLI layer.
+    /// Deliberately *not* rendered here: the id is operator-supplied but
+    /// the strings it sits beside are not, and this module stays free of
+    /// the CLI layer. Every render site must therefore sanitize before the
+    /// line reaches a terminal — the three CLI sites (`drive edit`,
+    /// `upload`, `create`) run the id through `sanitize_for_terminal`
+    /// directly; the two engine-layer `describe` functions (`sheets write`,
+    /// `sheets create`) embed it raw and their CLI callers sanitize the
+    /// whole rendered line instead.
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
@@ -331,7 +336,7 @@ impl DecidingRule {
 
     /// `" (depth 2)"` for a folder rule, `""` for a file rule.
     ///
-    /// Exists so the six `describe`/`print_report` sites are one identical
+    /// Exists so the five `describe`/`print_report` sites are one identical
     /// line — `"refused by rule on {kind} {id}{suffix}"` — and cannot drift
     /// into disagreeing about how a file rule is worded.
     #[must_use]
