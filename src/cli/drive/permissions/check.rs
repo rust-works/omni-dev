@@ -24,6 +24,9 @@ pub enum OperationArg {
     Create,
     Upload,
     Edit,
+    /// Writing cells into a Google Sheet — distinct from `Edit`, see
+    /// [`DriveOperation::SheetsWrite`].
+    SheetsWrite,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -33,6 +36,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::Create => Self::Create,
             OperationArg::Upload => Self::Upload,
             OperationArg::Edit => Self::Edit,
+            OperationArg::SheetsWrite => Self::SheetsWrite,
         }
     }
 }
@@ -171,6 +175,30 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
+
+    #[test]
+    fn operation_arg_maps_onto_every_drive_operation() {
+        assert_eq!(
+            DriveOperation::from(OperationArg::Read),
+            DriveOperation::Read
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Create),
+            DriveOperation::Create
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Upload),
+            DriveOperation::Upload
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Edit),
+            DriveOperation::Edit
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::SheetsWrite),
+            DriveOperation::SheetsWrite
+        );
+    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {

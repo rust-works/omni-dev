@@ -589,8 +589,9 @@ never a missed visibility increase. See
 
 ## Write permissions
 
-`drive create`/`drive upload`/`drive edit` (below) need a much broader OAuth
-grant than rename/move — `--write-file`/`--write-full` — but Google's
+`drive create`/`drive upload`/`drive edit`, and `drive sheets
+write`/`append`/`clear`/`create` (below), need a much broader OAuth grant
+than rename/move — `--write-file`/`--write-full` — but Google's
 scopes are all-or-nothing across your whole Drive. There's no way to tell
 Google "only let this credential write inside folder X." So `omni-dev` adds
 its own, independent, local policy layer on top: a folder-scoped
@@ -601,16 +602,26 @@ permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation | Default |
-|-----------|---------|
-| `read`    | allow   |
-| `create`  | deny    |
-| `upload`  | deny    |
-| `edit`    | deny    |
+| Operation      | Default | Granted to                                      |
+|----------------|---------|-------------------------------------------------|
+| `read`         | allow   | `search`, `read`, `dedupe` (not yet enforced)   |
+| `create`       | deny    | `create`, `sheets create`                       |
+| `upload`       | deny    | `upload`                                        |
+| `edit`         | deny    | `edit` — raw file content only                  |
+| `sheets-write` | deny    | `sheets write`, `sheets append`, `sheets clear` |
 
 There is no "enabled: true" flag — an absent or empty rule list already
-means "deny every create/upload/edit everywhere," via this table alone,
-which *is* the disabled state.
+means "deny every write everywhere," via this table alone, which *is* the
+disabled state.
+
+**`sheets-write` is deliberately separate from `edit`.** Writing cells is a
+content mutation, so folding it into `edit` would have been the obvious
+choice — but every `allow: ["edit"]` rule that exists today was written when
+`drive edit` refused every Google-native document outright. Reusing `edit`
+would have retroactively turned those rules into cell-write permission with
+no config change and no re-consent. If you want a folder's existing `edit`
+grant to cover Sheets too, add `sheets-write` to it explicitly. See
+[ADR-0073](adrs/adr-0073.md) §3.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from:
@@ -916,6 +927,106 @@ omni-dev drive sheets read <ID> -o json
 `unformatted` is usually what you want when feeding the output to something
 that will do arithmetic on it; `formatted` matches what `drive read --content`
 already produces for a Sheet.
+
+#### `drive sheets write` / `append` / `clear`
+
+Writing cells is gated by the folder [write permissions](#write-permissions)
+under the **`sheets-write`** operation, and needs the `drive.file` or `drive`
+scope (`drive auth login --write-file` / `--write-full`). `drive.file` reaches
+only Sheets `omni-dev` itself created; a pre-existing Sheet needs
+`--write-full`.
+
+```bash
+# Overwrite a range from a CSV file
+omni-dev drive sheets write <ID> --range 'A1:B10' --values ./cells.csv
+
+# Append rows after the end of a table, from stdin
+printf 'North,1200\nSouth,950\n' | omni-dev drive sheets append <ID> --range 'A:B' --values -
+
+# Clear a range's values, leaving formatting intact
+omni-dev drive sheets clear <ID> --range 'Q1!A2:B100'
+```
+
+**Always dry-run first.** `--dry-run` reports the gate verdict *and* the
+parsed dimensions, which is how you catch a transposed or ragged input before
+it lands:
+
+```bash
+$ omni-dev drive sheets write <ID> --range 'A1:B10' --values ./cells.csv --dry-run
+Would write: 10 row(s) x 2 column(s) into A1:B10 of '2026 Budget'
+```
+
+A dry run makes no Sheets API call and writes no request-log record, matching
+`create`/`upload`/`edit`.
+
+**`--values`** takes a file path or `-` for stdin. CSV by default; JSON (an
+array of arrays) when the path ends in `.json` or `--values-format json` is
+given. Ragged rows are preserved rather than padded — padding would write
+empty strings over cells you never mentioned. The first CSV row is **data,
+not a header**.
+
+**`--input` is the one option whose wrong value silently mangles data:**
+
+- **`user-entered`** (default) — parse each value as if typed into the UI:
+  `=SUM(A1:A3)` becomes a formula, `2026-09-06` a date, `1,234` a number.
+- **`raw`** — store every value verbatim as text; a leading `=` stays literal
+  rather than becoming a formula.
+
+Neither errors on the "wrong" choice — you get formulas you meant as text, or
+text you meant as formulas. The dry run echoes nothing about this, so decide
+it deliberately.
+
+**Refusals you may see**, each distinct from a rule denial:
+
+- *not a Google Sheet* — the id points at something else. Checked before the
+  gate; the operation is meaningless rather than disallowed.
+- *is a shortcut* — shortcuts are never followed. Resolve the target
+  spreadsheet's id and use that.
+- *no parent folder visible to this account* — the Sheet was shared with you
+  by link or email and is not in a folder you can see, so it has no ancestor
+  chain and **no rule you could write would grant it**. Add it to a folder in
+  your own Drive (`drive move`), then grant that folder `sheets-write`.
+  Granting a rule against a file id directly is a
+  [known gap](adrs/adr-0073.md), not currently supported.
+
+Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
+the output, not `$?`.
+
+#### `drive sheets create`
+
+Creates a spreadsheet, optionally seeded with values. Gated under the
+**`create`** operation, not `sheets-write` — the same rule that governs
+`drive create`.
+
+```bash
+omni-dev drive sheets create --name '2027 Budget' --parent <FOLDER_ID>
+omni-dev drive sheets create --name '2027 Budget' --parent <FOLDER_ID> --values ./seed.csv
+```
+
+Without `--values` this is shorthand for
+`drive create --mime-type application/vnd.google-apps.spreadsheet`, which
+does the same thing; the reason it exists is `--values` and being
+discoverable inside the `sheets` tree.
+
+**The seeding write is not separately gated.** A folder that grants `create`
+but not `sheets-write` can still be seeded: the `create` verdict authorises
+the pair. That is safe only because the id being written is always the one
+`files.create` just returned inside an already-cleared folder, never
+something you supplied — gating it separately would make `--values` unusable
+in a create-only folder for no gain. See [ADR-0073](adrs/adr-0073.md) §11.
+
+**If seeding fails after the spreadsheet is created**, you get a *partial
+failure* naming the new file id, because there is no `files.delete` anywhere
+in this integration and the empty spreadsheet cannot be rolled back
+automatically:
+
+```
+Partially failed: created '2027 Budget' (1AbC…) in <FOLDER_ID>, but writing
+its values failed: … The spreadsheet exists and is empty — it cannot be
+rolled back automatically.
+```
+
+Delete it yourself if you don't want it.
 
 **Limits.** A whole-workbook read refuses a spreadsheet beyond a fixed sheet
 count rather than returning part of it — silently returning half a workbook is

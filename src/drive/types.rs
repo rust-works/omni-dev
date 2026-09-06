@@ -29,6 +29,21 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 /// copy, not a rename of that one.
 pub(crate) const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
+/// MIME type marking a Google Sheet.
+///
+/// Engine-layer copy, for the same reason [`GOOGLE_FOLDER_MIME_TYPE`] is one:
+/// `crate::cli::drive::read`'s `GOOGLE_SHEET` is a CLI-layer constant, and an
+/// engine module depending on it would invert the layering. Not a rename of
+/// that one — both stay.
+pub(crate) const GOOGLE_SHEET_MIME_TYPE: &str = "application/vnd.google-apps.spreadsheet";
+
+/// MIME type marking a Drive shortcut.
+///
+/// Shortcuts are never followed: a shortcut to a spreadsheet is refused with
+/// its own message rather than being silently resolved, matching
+/// `drive read --content`'s existing behaviour.
+pub(crate) const GOOGLE_SHORTCUT_MIME_TYPE: &str = "application/vnd.google-apps.shortcut";
+
 /// An owner of a Drive file, as embedded in `files.list`/`files.get`'s
 /// `owners[]` field (requested via the `fields` param's
 /// `owners(displayName,emailAddress)` sub-selector — see `files_api.rs`).

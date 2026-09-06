@@ -1,5 +1,6 @@
 //! CLI commands for `omni-dev drive permissions` — read-only diagnostics
-//! for the folder-scoped write-permission gate (issue #1574).
+//! for the folder-scoped write-permission gate (issue #1574), including the
+//! `sheets-write` operation added for the Sheets API (issue #1589).
 
 pub(crate) mod check;
 pub(crate) mod lookup_folder;
@@ -11,7 +12,8 @@ use clap::{Parser, Subcommand};
 use crate::cli::drive::helpers;
 
 /// Inspects the folder-scoped write-permission rules gating `drive
-/// create`/`upload`/`edit`.
+/// create`/`upload`/`edit` and `drive sheets
+/// write`/`append`/`clear`/`create`.
 #[derive(Parser)]
 pub struct PermissionsCommand {
     /// The permissions subcommand to execute.

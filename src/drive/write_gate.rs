@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 /// settings-file rule shape (`crate::utils::settings::WritePermissionsSettings`)
 /// — no separate wire type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum DriveOperation {
     /// List/read/export/download.
     Read,
@@ -58,17 +58,28 @@ pub enum DriveOperation {
     Upload,
     /// Replace an existing file's content.
     Edit,
+    /// Write cells into an existing Google Sheet via the Sheets API
+    /// (issue #1589, [ADR-0073](../../docs/adrs/adr-0073.md) §3).
+    ///
+    /// Deliberately **not** folded into [`Self::Edit`]. Every existing
+    /// `allow: ["edit"]` rule was written when `drive edit` refused every
+    /// Google-native document outright, so reusing `Edit` here would
+    /// retroactively upgrade those rules into cell-write permission with no
+    /// config change and no re-consent — the exact silent widening this
+    /// gate's default-deny posture exists to prevent.
+    SheetsWrite,
 }
 
 impl std::fmt::Display for DriveOperation {
-    /// Lowercase, matching the `#[serde(rename_all = "lowercase")]` wire
-    /// form — used by `drive permissions show`/`check`'s rendering.
+    /// Matches the `#[serde(rename_all = "kebab-case")]` wire form — used
+    /// by `drive permissions show`/`check`'s rendering.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::Read => "read",
             Self::Create => "create",
             Self::Upload => "upload",
             Self::Edit => "edit",
+            Self::SheetsWrite => "sheets-write",
         };
         write!(f, "{s}")
     }
@@ -83,7 +94,7 @@ impl DriveOperation {
     fn default_policy(self) -> Verdict {
         match self {
             Self::Read => Verdict::Allow,
-            Self::Create | Self::Upload | Self::Edit => Verdict::Deny,
+            Self::Create | Self::Upload | Self::Edit | Self::SheetsWrite => Verdict::Deny,
         }
     }
 }
@@ -378,11 +389,49 @@ mod tests {
     }
 
     #[test]
-    fn display_matches_the_serde_lowercase_wire_form() {
+    fn display_matches_the_serde_kebab_case_wire_form() {
+        // Display is hand-written, so it can drift from the derive. Every
+        // variant is asserted against a round-trip through serde rather
+        // than a second hand-written literal, which would drift with it.
+        for op in [
+            DriveOperation::Read,
+            DriveOperation::Create,
+            DriveOperation::Upload,
+            DriveOperation::Edit,
+            DriveOperation::SheetsWrite,
+        ] {
+            let wire = serde_json::to_string(&op).unwrap();
+            assert_eq!(
+                format!("\"{op}\""),
+                wire,
+                "Display drifted from serde for {op:?}"
+            );
+        }
+        // The pre-existing spellings are pinned literally: switching
+        // `rename_all` to kebab-case must not have moved any of them.
         assert_eq!(DriveOperation::Read.to_string(), "read");
         assert_eq!(DriveOperation::Create.to_string(), "create");
         assert_eq!(DriveOperation::Upload.to_string(), "upload");
         assert_eq!(DriveOperation::Edit.to_string(), "edit");
+        assert_eq!(DriveOperation::SheetsWrite.to_string(), "sheets-write");
+    }
+
+    #[test]
+    fn sheets_write_defaults_to_deny_like_every_other_write() {
+        let decision = resolve(&chain(&["f"]), DriveOperation::SheetsWrite, &[]);
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(decision.decided_by.is_none());
+    }
+
+    #[test]
+    fn an_edit_rule_does_not_grant_sheets_write() {
+        // The whole reason for a separate variant: an existing
+        // `allow: ["edit"]` rule must not silently gain cell-write power.
+        let rules = [rule("target", true, &[DriveOperation::Edit], &[])];
+        let edit = resolve(&chain(&["target"]), DriveOperation::Edit, &rules);
+        let sheets = resolve(&chain(&["target"]), DriveOperation::SheetsWrite, &rules);
+        assert_eq!(edit.verdict, Verdict::Allow);
+        assert_eq!(sheets.verdict, Verdict::Deny);
     }
 
     #[test]

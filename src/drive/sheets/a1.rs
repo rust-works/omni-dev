@@ -85,6 +85,36 @@ pub(crate) fn sheet_title_of(range: &str) -> Option<String> {
     split_sheet_prefix(range).map(|(title, _)| title)
 }
 
+/// Whether `range`, taken as a whole, is itself a quoted reference to an
+/// entire other sheet (`'Q1'`, with nothing after the closing quote) —
+/// [`quote_sheet_title`]'s own output shape for "the whole sheet named X"
+/// (see [`compose`]'s `(Some(sheet), None)` arm).
+///
+/// [`split_sheet_prefix`] correctly returns `None` for this shape (there is
+/// no `!` to split on), but it still names a sheet, so it still conflicts
+/// with an explicit `--sheet` the same way `Sheet1!A1:B2` does. An unquoted
+/// bare name (`Q1`) is deliberately **not** covered — this module doesn't
+/// validate A1 grammar, and a bare identifier is indistinguishable from a
+/// defined name.
+fn is_whole_sheet_reference(range: &str) -> bool {
+    let Some(rest) = range.strip_prefix('\'') else {
+        return false;
+    };
+    let mut chars = rest.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+        // A doubled quote is a literal apostrophe, not the closing one.
+        if rest[idx + 1..].starts_with('\'') {
+            chars.next();
+            continue;
+        }
+        return rest[idx + 1..].is_empty();
+    }
+    false
+}
+
 /// Builds the range to send, from an optional `--sheet` and an optional
 /// `--range`.
 ///
@@ -104,7 +134,7 @@ pub(crate) fn compose(sheet: Option<&str>, range: Option<&str>) -> Result<String
     match (sheet, range) {
         (Some(sheet), Some(range)) => {
             anyhow::ensure!(
-                split_sheet_prefix(range).is_none(),
+                split_sheet_prefix(range).is_none() && !is_whole_sheet_reference(range),
                 "--range {range:?} already names a sheet, so --sheet {sheet:?} would be \
                  ambiguous; drop one of them"
             );
@@ -269,6 +299,15 @@ mod tests {
     #[test]
     fn compose_rejects_sheet_alongside_an_already_prefixed_range() {
         let err = compose(Some("Other"), Some("Sheet1!A1:B2")).unwrap_err();
+        assert!(err.to_string().contains("already names a sheet"), "{err}");
+    }
+
+    #[test]
+    fn compose_rejects_sheet_alongside_a_quoted_whole_sheet_range() {
+        // `'Q1'` on its own names a whole other sheet just as much as
+        // `Sheet1!A1:B2` does — `split_sheet_prefix` alone would miss this
+        // since there's no `!` to split on.
+        let err = compose(Some("Other"), Some("'Q1'")).unwrap_err();
         assert!(err.to_string().contains("already names a sheet"), "{err}");
     }
 

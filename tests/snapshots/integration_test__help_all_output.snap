@@ -3738,8 +3738,8 @@ Commands:
   edit         Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
-  permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
-  sheets       Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
+  permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
+  sheets       Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3927,9 +3927,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive permissions - Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+omni-dev drive permissions - Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
 
-Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
 
 Usage: permissions <COMMAND>
 
@@ -3955,7 +3955,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4047,19 +4047,83 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets - Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
+omni-dev drive sheets - Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
 
-Reads the cells of a Google Sheet via the Sheets v4 API (issue #1589)
+Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
 
 Usage: sheets <COMMAND>
 
 Commands:
-  info  Shows a spreadsheet's title and the sheets (tabs) it contains
-  read  Reads cell values from one range, or from every sheet
-  help  Print this message or the help of the given subcommand(s)
+  info    Shows a spreadsheet's title and the sheets (tabs) it contains
+  read    Reads cell values from one range, or from every sheet
+  write   Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  append  Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
+  clear   Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
+  create  Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets append - Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
+
+Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
+
+Usage: append [OPTIONS] --values <PATH|-> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>                     A1 range identifying the table to append to, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>                   Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --values <PATH|->                Rows to append: a local file path, or `-` to read stdin
+      --values-format <VALUES_FORMAT>  How to parse `--values`. `auto` infers from the file extension [default: auto] [possible values: auto, csv, json]
+      --input <INPUT>                  How the API interprets the values (see `drive sheets write`) [default: user-entered] [possible values: user-entered, raw]
+      --dry-run                        Reports the gate verdict and the parsed dimensions without calling the Sheets API
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets clear - Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
+
+Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
+
+Usage: clear [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to clear, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or clears the whole tab on its own
+      --dry-run          Reports the gate verdict without calling the Sheets API
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets create - Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
+
+Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
+
+Usage: create [OPTIONS] --name <NAME> --parent <FOLDER_ID>
+
+Options:
+      --name <NAME>                    The new spreadsheet's title
+      --parent <FOLDER_ID>             The folder id to create it in — what the write-permission gate is evaluated against
+      --values <PATH|->                Optional initial values, written to `Sheet1!A1` onwards: a local file path, or `-` to read stdin
+      --values-format <VALUES_FORMAT>  How to parse `--values`. `auto` infers from the file extension [default: auto] [possible values: auto, csv, json]
+      --input <INPUT>                  How the API interprets the values (see `drive sheets write`) [default: user-entered] [possible values: user-entered, raw]
+      --dry-run                        Reports the gate verdict without creating anything
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================
@@ -4095,6 +4159,28 @@ Options:
       --render <RENDER>  How cell values are rendered. `formatted` matches the spreadsheet as displayed; `unformatted` yields raw typed numbers rather than locale-formatted strings; `formula` yields formula text [default: formatted] [possible values: formatted, unformatted, formula]
   -o, --output <OUTPUT>  Output format. The default `table` emits CSV — one block per sheet, each preceded by a `# <title>` comment line when reading more than one. Use `json`/`yaml` to keep values typed and rows ragged [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets write - Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Usage: write [OPTIONS] --values <PATH|-> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>                     A1 range to write, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>                   Sheet (tab) title. Supplies the prefix for a bare `--range`. Conflicts with a `--range` that already names a sheet
+      --values <PATH|->                Values to write: a local file path, or `-` to read stdin. CSV unless the path ends in `.json` or `--values-format` says otherwise
+      --values-format <VALUES_FORMAT>  How to parse `--values`. `auto` infers from the file extension [default: auto] [possible values: auto, csv, json]
+      --input <INPUT>                  How the API interprets the values. `user-entered` (the default) parses formulas, dates and numbers the way typing them into the UI would; `raw` stores every value verbatim as text [default: user-entered] [possible values: user-entered, raw]
+      --dry-run                        Reports the gate verdict and the parsed dimensions without calling the Sheets API
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================

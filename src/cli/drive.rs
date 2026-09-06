@@ -78,10 +78,11 @@ pub enum DriveSubcommands {
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
     /// Inspects the folder-scoped write-permission rules gating `drive
-    /// create`/`upload`/`edit` (issue #1574).
+    /// create`/`upload`/`edit` and `drive sheets
+    /// write`/`append`/`clear`/`create` (issues #1574, #1589).
     Permissions(permissions::PermissionsCommand),
-    /// Reads the cells of a Google Sheet via the Sheets v4 API (issue
-    /// #1589).
+    /// Reads and writes the cells of a Google Sheet via the Sheets v4 API
+    /// (issue #1589).
     Sheets(sheets::SheetsCommand),
 }
 
@@ -371,6 +372,95 @@ mod tests {
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_write() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Write(sheets::write::WriteCommand {
+                spreadsheet_id: "s1".to_string(),
+                range: Some("A1".to_string()),
+                sheet: None,
+                values: "/definitely/not/here.csv".to_string(),
+                values_format: sheets::values::ValuesFormat::Auto,
+                input: sheets::write::InputArg::UserEntered,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_append() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Append(sheets::write::AppendCommand {
+                spreadsheet_id: "s1".to_string(),
+                range: Some("A1".to_string()),
+                sheet: None,
+                values: "/definitely/not/here.csv".to_string(),
+                values_format: sheets::values::ValuesFormat::Auto,
+                input: sheets::write::InputArg::UserEntered,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_clear() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Clear(sheets::write::ClearCommand {
+                spreadsheet_id: "s1".to_string(),
+                range: Some("A1".to_string()),
+                sheet: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // Unlike its siblings this returns `Ok`, and that is the contract,
+        // not an accident: `write`/`append` fail here only because reading
+        // `--values` fails *before* the engine. `clear` reaches the engine,
+        // which never returns `Err` — every failure is a `WriteResult`
+        // variant and the process still exits 0 (ADR-0070 §10, ADR-0071
+        // §12). Scripts must inspect the output, not `$?`.
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_create() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Create(sheets::create::CreateCommand {
+                name: "Budget".to_string(),
+                parent: "parent-1".to_string(),
+                values: None,
+                values_format: sheets::values::ValuesFormat::Auto,
+                input: sheets::write::InputArg::UserEntered,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // Like `clear`, this reaches the engine (no `--values` to fail
+        // reading first), and `create` never returns `Err` either — every
+        // failure is a `CreateResult` variant (ADR-0070 §10, ADR-0071 §12).
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
     #[tokio::test]

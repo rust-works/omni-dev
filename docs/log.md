@@ -46,9 +46,22 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `added_principals`/`removed_principals` (comma-separated,
   `move`-only) and `crosses_drive_boundary` (`move`-only), plus
   `resolved_folder_id`/`decided_by_folder_id`/`decided_by_depth`
-  (`create`/`upload`/`edit`-only — the folder the write-permission gate
-  evaluated against, and which configured rule, if any, decided the
-  verdict). See [docs/drive.md](drive.md#write-permissions).
+  (the folder the write-permission gate evaluated against, and which
+  configured rule, if any, decided the verdict — absent for the ungated
+  `rename`/`move`). See [docs/drive.md](drive.md#write-permissions).
+
+  Cell writes through the Sheets API (issue
+  [#1589](https://github.com/rust-works/omni-dev/issues/1589),
+  [ADR-0073](adrs/adr-0073.md)) use this same kind, with `operation` of
+  `sheets-write`/`sheets-append`/`sheets-clear`/`sheets-create` — so
+  `command` reads `["drive", "sheets-write"]` even though the CLI spells it
+  `drive sheets write`. They add five more omit-if-absent context keys:
+  `range` (the A1 range as composed and sent), and `updated_range`,
+  `updated_rows`, `updated_columns`, `updated_cells` (what the API reported
+  actually changing). `updated_range` can differ from `range` — the server
+  resolves an open-ended range against the sheet's real extent — which is
+  what makes `omni-dev log --query kind:drivemutation` able to answer "how
+  much did that write touch", not just "a write happened".
 
 Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and
