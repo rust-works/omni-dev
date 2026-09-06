@@ -104,8 +104,8 @@ pub async fn resolve_decision(
 /// folder's metadata in hand.
 ///
 /// Avoids re-fetching `start` as this walk's own first `files.get`.
-/// Shared by [`resolve_decision_for_parents`] and `drive permissions
-/// check`'s folder-target path.
+/// Shared by the private `resolve_decision_for_parents` and `drive
+/// permissions check`'s folder-target path.
 pub async fn resolve_decision_from(
     files_api: &FilesApi<'_>,
     start: DriveFile,
@@ -175,11 +175,12 @@ pub struct FileTargetDecision {
 
 /// Resolves `op` for a file target whose metadata the caller already has.
 ///
-/// **This is the only entry point for a file target**, which is why
-/// [`resolve_decision_for_parents`] is private: it owns the ordering — a
-/// `file_id` rule first, then the current-parent chains, then the
-/// no-visible-parents case — so `drive sheets write`, `drive edit` and
-/// `drive permissions check` cannot drift apart on it.
+/// **This is the only entry point for a file target**, and the reason
+/// `resolve_decision_for_parents` below is private rather than `pub`: this
+/// function owns the ordering — a `file_id` rule first, then the
+/// current-parent chains, then the no-visible-parents case — so `drive
+/// sheets write`, `drive edit` and `drive permissions check` cannot drift
+/// apart on it.
 ///
 /// The short-circuit is exact rather than an optimization: a file rule
 /// sits at depth −1, so no folder rule at any depth of any parent chain

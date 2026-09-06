@@ -43,9 +43,9 @@ impl From<OperationArg> for DriveOperation {
 
 /// Evaluates the configured write-permission rules against a real target
 /// and prints the verdict — the same [`folder_ancestry::resolve_decision`]/
-/// [`folder_ancestry::resolve_decision_for_parents`] the real
-/// `create`/`upload`/`edit` engine modules call, so this diagnostic can
-/// never drift from actual enforcement.
+/// [`folder_ancestry::resolve_decision_for_file_target`] the real
+/// `create`/`upload`/`edit`/`sheets write` engine modules call, so this
+/// diagnostic can never drift from actual enforcement.
 #[derive(Parser)]
 pub struct CheckCommand {
     /// The folder or file id to evaluate.
