@@ -144,51 +144,55 @@ impl PtyHandle {
 /// How long a child is given to honour `SIGHUP` before it is killed.
 pub const REAP_GRACE: Duration = Duration::from_millis(250);
 
-/// Ends the child's whole process group, escalating if it does not go.
+/// Ends the child's whole process group: `SIGHUP`, a grace period, then
+/// `SIGKILL` unconditionally.
 ///
 /// **Why this exists (#1605).** Dropping `tty::Pty` sends the *direct child*
 /// `SIGHUP` and then blocks in `child.wait()` with no deadline. A shell that
-/// ignores or blocks `SIGHUP` — or one still waiting on a foreground job of
-/// its own — therefore hangs the wait forever. That is not merely a slow
-/// exit: the drop runs on a blocking task, and dropping the `tokio` runtime
-/// waits for those, so `worktrees ui` could restore the terminal, hand the
-/// user their prompt back, and then never exit.
+/// ignores or blocks the signal — or one still waiting on a foreground job of
+/// its own — hangs that wait forever. The blocking join keeps it off the
+/// event loop, but that was never the whole problem: dropping the `tokio`
+/// runtime waits for blocking tasks, so `worktrees ui` could restore the
+/// terminal, hand back the prompt, and then never exit.
 ///
-/// Two things make this the fix rather than a workaround. It signals the
-/// **process group**, so a shell's own children go too (the `Pty` drop
-/// reaches only the shell). And it **escalates**: `SIGHUP` first so a
-/// well-behaved child still exits cleanly and its `drain_on_exit` output is
-/// kept, then `SIGKILL` only for one that would otherwise hang us.
+/// Two properties make this a fix rather than a workaround. It signals the
+/// **process group**, so a shell's own children go too — `alacritty_terminal`
+/// calls `setsid()` in the child's `pre_exec`, making its pgid its pid, while
+/// the `Pty` drop reaches only the shell. (Same approach as
+/// `claude::ai::claude_cli::kill_and_reap`.) And it **escalates**, so a
+/// well-behaved child still exits on `SIGHUP` with its `drain_on_exit` output
+/// intact; only one that would otherwise hang us is killed.
 ///
-/// Best-effort throughout — a child that has already exited yields `ESRCH`,
-/// which is success, not failure. Never reaps the child itself: the `Pty`
-/// drop's `wait()` is what does that, and it now returns promptly.
+/// Two things it deliberately does **not** do, both learned the hard way:
 ///
-/// Signalling the group rather than the process follows the precedent set by
-/// `claude::ai::claude_cli::kill_and_reap`, which reaps its subprocess tree
-/// the same way. The difference is the escalation: that one is a timeout kill
-/// and goes straight to `SIGKILL`, whereas a tab close should let a
-/// well-behaved shell exit on its own first.
+/// * It does not poll the group for liveness. A dead-but-unreaped child is a
+///   zombie, and a zombie still answers `kill(pid, 0)` on Linux while macOS
+///   reports it gone — so a liveness poll cannot tell "exited" from "ignoring
+///   us", and would burn the whole grace on every clean exit on one platform
+///   while short-circuiting on the other.
+/// * It does not hand the escalation to a watchdog thread that races the
+///   join. Unblocking a stuck wait must not itself depend on winning a race
+///   under load.
+///
+/// So the sequence is unconditional and synchronous, and the caller runs it
+/// before the join. `SIGKILL` to an already-exited child is `ESRCH`, a no-op:
+/// a child that honoured `SIGHUP` is still reported as dying of `SIGHUP`.
+/// The cost is that shutdown always spends the grace period on a blocking
+/// thread, which is the price of being deterministic on every platform.
 #[cfg(unix)]
 pub fn reap_child_group(pid: i32, grace: Duration) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
+    // Never signal pid 0 (our own group) or init. `kill(-1, …)` means every
+    // process we may signal, so negatives are refused outright rather than
+    // merely being unlikely.
     if pid <= 1 {
-        return; // never signal pid 0 (our own group) or init
+        return;
     }
     let group = Pid::from_raw(pid);
     let _ = killpg(group, Signal::SIGHUP);
-
-    let deadline = std::time::Instant::now() + grace;
-    while std::time::Instant::now() < deadline {
-        // `None` sends no signal and only asks whether the group still
-        // exists; `Err` means it is gone.
-        if killpg(group, None).is_err() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    std::thread::sleep(grace);
     let _ = killpg(group, Signal::SIGKILL);
 }
 
@@ -271,100 +275,125 @@ mod reap_tests {
 
     use super::*;
 
-    /// #1605: reaping is **bounded** even when the child ignores `SIGHUP`.
-    ///
-    /// This is the whole fix in one test. `trap '' HUP` makes the signal
-    /// ignored and inherited as ignored, so nothing but the escalation to
-    /// `SIGKILL` can end it — which is exactly the case whose unbounded
-    /// `child.wait()` could keep `worktrees ui` alive after it had already
-    /// restored the terminal.
-    ///
-    /// `process_group(0)` puts the child in its own group, mirroring the
-    /// `setsid()` that `alacritty_terminal` does in a real PTY spawn, so the
-    /// group-wide signal here is the same one production sends.
-    #[test]
-    fn reaping_is_bounded_when_the_child_ignores_sighup() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "trap '' HUP; sleep 60"])
+    /// `process_group(0)` mirrors the `setsid()` a real PTY spawn does, so
+    /// the group-wide signal under test is the one production sends.
+    fn group_leader(script: &str) -> std::process::Child {
+        let child = Command::new("/bin/sh")
+            .args(["-c", script])
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
-        // Let the shell install its trap before signalling it.
+        // Let the shell install any trap before it is signalled.
         std::thread::sleep(Duration::from_millis(100));
+        child
+    }
 
+    fn sigkill() -> i32 {
+        nix::sys::signal::Signal::SIGKILL as i32
+    }
+
+    fn sighup() -> i32 {
+        nix::sys::signal::Signal::SIGHUP as i32
+    }
+
+    /// #1605, the whole fix: a child that cannot be `SIGHUP`ed away is still
+    /// gone within the grace period, so the wait it would have blocked
+    /// forever returns.
+    ///
+    /// `trap '' HUP` makes the signal ignored *and* inherited as ignored, so
+    /// nothing but the escalation can end this.
+    #[test]
+    fn a_child_ignoring_sighup_is_escalated_and_reaped() {
+        let mut child = group_leader("trap '' HUP; sleep 60");
+        let pid = i32::try_from(child.id()).unwrap();
         let started = Instant::now();
         reap_child_group(pid, REAP_GRACE);
-        let signalling = started.elapsed();
-
-        // The wait must now return effectively immediately — that is the
-        // property the bug violated, and the reason the process could
-        // outlive the UI.
-        let waited = Instant::now();
+        // Stands in for the join the real caller makes: it returns only once
+        // the child is actually gone.
         let status = child.wait().unwrap();
-        assert!(
-            waited.elapsed() < Duration::from_secs(2),
-            "wait() took {:?} after reaping; it should be immediate",
-            waited.elapsed()
-        );
+
         assert_eq!(
             status.signal(),
-            Some(libc_sigkill()),
+            Some(sigkill()),
             "a child ignoring SIGHUP must be escalated to SIGKILL"
         );
-        // Generous, but far below the unbounded hang it replaces: the grace
-        // period is 250ms, so anything near a second means no escalation.
         assert!(
-            signalling < Duration::from_secs(2),
-            "reaping took {signalling:?}, which is not bounded"
+            started.elapsed() < Duration::from_secs(5),
+            "reaping took {:?}; it is meant to be bounded by the grace period",
+            started.elapsed()
         );
     }
 
-    /// A child that exits on `SIGHUP` is never escalated, and returns well
-    /// inside the grace period rather than waiting it out.
+    /// A well-behaved child dies of `SIGHUP` and is **never** escalated —
+    /// asserted on the exit signal, not on elapsed time, so it cannot be
+    /// marginal. This is the case the earlier group-liveness poll got wrong:
+    /// a zombie still answers `kill(pid, 0)` on Linux, so polling the group
+    /// burned the whole grace period and escalated even here.
     #[test]
-    fn a_well_behaved_child_exits_on_sighup_without_escalation() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 60"])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+    fn a_well_behaved_child_dies_of_sighup_and_is_never_escalated() {
+        let mut child = group_leader("sleep 60");
         let pid = i32::try_from(child.id()).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-
-        let started = Instant::now();
         reap_child_group(pid, REAP_GRACE);
-        assert!(
-            started.elapsed() < REAP_GRACE,
-            "a child that honours SIGHUP should not wait out the grace period"
-        );
         let status = child.wait().unwrap();
-        assert_ne!(
+
+        assert_eq!(
             status.signal(),
-            Some(libc_sigkill()),
-            "a well-behaved child must not be SIGKILLed"
+            Some(sighup()),
+            "a child that honours SIGHUP must die of it, not of SIGKILL"
         );
     }
 
-    /// Signalling our own group (pid 0) or init would be catastrophic, so
-    /// both are refused outright rather than merely being unlikely.
+    /// The pid captured from a **real PTY spawn** is the group leader we can
+    /// signal — the assumption the whole fix rests on, and the one the
+    /// `Command`-based tests above cannot check, since they build the group
+    /// themselves with `process_group(0)` rather than relying on the
+    /// `setsid()` inside `alacritty_terminal`'s spawn.
     #[test]
-    fn pid_zero_and_init_are_never_signalled() {
-        reap_child_group(0, Duration::from_millis(1));
-        reap_child_group(1, Duration::from_millis(1));
-        reap_child_group(-5, Duration::from_millis(1));
-        // Reaching here at all is the assertion: none of those signalled
-        // anything, so this process and its group are still running.
+    fn a_pty_spawned_child_is_a_signallable_group_leader() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let request = SpawnRequest {
+            tab: 99,
+            program: Some((
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "sleep 30".to_string()],
+            )),
+            cwd: std::env::temp_dir(),
+            size: GridSize { cols: 40, lines: 6 },
+            extra_env: Vec::new(),
+        };
+        let handle = spawn(&request, tx).unwrap();
+        let pid = handle.child_pid;
+        assert!(pid > 1, "spawn must capture a real pid, got {pid}");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            killpg(Pid::from_raw(pid), None).is_ok(),
+            "the captured pid is not a process-group leader, so a group-wide \
+             signal would miss the child entirely"
+        );
+        reap_child_group(pid, Duration::from_millis(50));
+        assert_eq!(
+            killpg(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "the group survived reaping"
+        );
     }
 
-    fn libc_sigkill() -> i32 {
-        nix::sys::signal::Signal::SIGKILL as i32
+    /// Signalling our own group, init, or "every process we may signal"
+    /// would each be catastrophic, so all three are refused outright.
+    #[test]
+    fn pid_zero_init_and_negatives_are_never_signalled() {
+        for pid in [0, 1, -1, -5] {
+            reap_child_group(pid, Duration::from_millis(1));
+        }
+        // Reaching here is the assertion: this process and its group — which
+        // include the test runner — are still alive.
+        std::thread::sleep(Duration::from_millis(30));
     }
 }
 
