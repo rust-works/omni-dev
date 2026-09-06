@@ -186,6 +186,17 @@ const fn evaluated_via(source: DecisionSource) -> &'static str {
     }
 }
 
+/// Whether `print_report` should emit the `no visible parents` note.
+///
+/// Gated on the verdict as well as the source. `read` defaults to
+/// [`Verdict::Allow`] on an empty chain, so a link-shared target checked for
+/// `read` reaches the renderer having been *permitted* — advice on how to
+/// grant it would read as a refusal that isn't one. The note only ever helps
+/// an operator staring at a `deny` they cannot name a folder rule to fix.
+fn should_note_no_visible_parents(evaluated_via: &str, verdict: &str) -> bool {
+    evaluated_via == "no-visible-parents" && verdict == "deny"
+}
+
 /// Prints a `CheckReport` in the plain-text (non-`output_as`) form.
 fn print_report(report: &CheckReport) {
     println!("target:     {}", sanitize_for_terminal(&report.target_id));
@@ -208,7 +219,7 @@ fn print_report(report: &CheckReport) {
     }
     // The one line this diagnostic exists to print: it names the *only*
     // rule shape that could ever change this verdict.
-    if report.evaluated_via == "no-visible-parents" {
+    if should_note_no_visible_parents(&report.evaluated_via, &report.verdict) {
         println!(
             "note:       this target has no parent folder visible to this account, so no\n\
              \x20           folder_id rule can apply — grant it with a file_id rule instead"
@@ -460,6 +471,19 @@ mod tests {
             decided_by_file_id: None,
             evaluated_via: "no-visible-parents".to_string(),
         });
+    }
+
+    #[test]
+    fn the_no_visible_parents_note_is_gated_on_a_deny() {
+        assert!(should_note_no_visible_parents("no-visible-parents", "deny"));
+        // `read` defaults to allow on an empty chain, so this pairing is
+        // reachable — and must not advise granting what was permitted.
+        assert!(!should_note_no_visible_parents(
+            "no-visible-parents",
+            "allow"
+        ));
+        assert!(!should_note_no_visible_parents("folder-chain", "deny"));
+        assert!(!should_note_no_visible_parents("file-rule", "deny"));
     }
 
     #[test]
