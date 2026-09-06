@@ -25,6 +25,12 @@ use crate::utils::env::{EnvSource, SystemEnv};
 /// forced egress proxy.
 pub const SHEETS_API_URL: &str = "SHEETS_API_URL";
 
+/// Human-readable API name for Sheets error messages.
+///
+/// The request-log tag stays `SERVICE_TAG` (`"drive"`) so one feature's
+/// traffic is not split across two services; only the *message* differs.
+const API_NAME: &str = "Sheets";
+
 /// HTTP client for the Sheets v4 REST API.
 pub struct SheetsClient {
     inner: GoogleApiClient,
@@ -55,7 +61,7 @@ impl SheetsClient {
     /// second token refresh per invocation.
     pub fn new(base_url: &str, credentials: &DriveCredentials) -> Result<Self> {
         Ok(Self {
-            inner: GoogleApiClient::new(base_url, credentials, SERVICE_TAG)?,
+            inner: GoogleApiClient::new(base_url, credentials, SERVICE_TAG, API_NAME)?,
         })
     }
 
@@ -83,7 +89,7 @@ impl SheetsClient {
     ) -> Result<Self> {
         let base_url = Self::resolve_base_url(env);
         Ok(Self {
-            inner: drive.transport().derived(&base_url, SERVICE_TAG),
+            inner: drive.transport().derived(&base_url, SERVICE_TAG, API_NAME),
         })
     }
 
@@ -161,6 +167,33 @@ mod tests {
         let sheets =
             SheetsClient::new("https://sheets.googleapis.com/", &test_credentials()).unwrap();
         assert_eq!(sheets.base_url(), "https://sheets.googleapis.com");
+    }
+
+    #[tokio::test]
+    async fn a_sheets_failure_names_sheets_not_drive() {
+        // Regression guard for the message a new user is most likely to
+        // hit: a `drive.file` grant cannot write a Sheet created in the
+        // browser, and the resulting 403 previously announced itself as a
+        // *Drive* failure — sending the reader to the wrong API's docs.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/boom"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {"code": 403, "message": "The caller does not have permission",
+                              "status": "PERMISSION_DENIED"},
+                })),
+            )
+            .mount(&server)
+            .await;
+        let response = reqwest::get(format!("{}/boom", server.uri()))
+            .await
+            .unwrap();
+
+        let err = GoogleApiClient::response_to_error(API_NAME, response).await;
+        let text = err.to_string();
+        assert!(text.starts_with("Sheets API request failed"), "{text}");
+        assert!(!text.contains("Drive API request failed"), "{text}");
     }
 
     #[test]

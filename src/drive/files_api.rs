@@ -1564,6 +1564,7 @@ mod tests {
 
     fn insufficient_permissions_error() -> anyhow::Error {
         DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 403,
             body: String::new(),
             reason: Some("insufficientPermissions".to_string()),
@@ -1575,6 +1576,7 @@ mod tests {
     /// way the `google.rpc` envelope spells it — what Sheets v4 returns.
     fn permission_denied_error() -> anyhow::Error {
         DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 403,
             body: String::new(),
             reason: Some("PERMISSION_DENIED".to_string()),
@@ -1597,6 +1599,7 @@ mod tests {
     #[test]
     fn append_write_scope_hint_ignores_an_unrelated_reason_code() {
         let err: anyhow::Error = DriveError::ApiRequestFailed {
+            api: "Drive",
             status: 404,
             body: "gone".to_string(),
             reason: Some("notFound".to_string()),

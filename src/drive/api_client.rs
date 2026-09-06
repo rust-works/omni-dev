@@ -40,8 +40,12 @@ pub(crate) struct GoogleApiClient {
     /// refresh the same refresh token twice per invocation.
     session: Arc<DriveSession>,
     /// The `service` tag every HTTP record carries
-    /// ([`request_log::record_http_result`]).
+    /// ([`request_log::record_http_result`]). Deliberately the same for
+    /// Drive and Sheets — see `crate::drive::client::SERVICE_TAG`.
     service: &'static str,
+    /// Human-readable API name for error messages (`"Drive"`/`"Sheets"`).
+    /// Distinct from [`Self::service`] precisely because that one is shared.
+    api_name: &'static str,
 }
 
 impl std::fmt::Debug for GoogleApiClient {
@@ -52,6 +56,7 @@ impl std::fmt::Debug for GoogleApiClient {
         f.debug_struct("GoogleApiClient")
             .field("base_url", &self.base_url)
             .field("service", &self.service)
+            .field("api_name", &self.api_name)
             .finish_non_exhaustive()
     }
 }
@@ -62,6 +67,7 @@ impl GoogleApiClient {
         base_url: &str,
         credentials: &DriveCredentials,
         service: &'static str,
+        api_name: &'static str,
     ) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(connect_timeout())
@@ -69,7 +75,9 @@ impl GoogleApiClient {
             .build()
             .context("Failed to build HTTP client")?;
         let session = Arc::new(DriveSession::new(client.clone(), credentials));
-        Ok(Self::from_parts(client, base_url, session, service))
+        Ok(Self::from_parts(
+            client, base_url, session, service, api_name,
+        ))
     }
 
     /// Builds a transport reusing an existing client and OAuth session,
@@ -83,12 +91,18 @@ impl GoogleApiClient {
     /// the following commit; the extraction is what makes that possible, so
     /// the seam ships with the extraction rather than trailing it.
     #[allow(dead_code)]
-    pub(crate) fn derived(&self, base_url: &str, service: &'static str) -> Self {
+    pub(crate) fn derived(
+        &self,
+        base_url: &str,
+        service: &'static str,
+        api_name: &'static str,
+    ) -> Self {
         Self::from_parts(
             self.client.clone(),
             base_url,
             Arc::clone(&self.session),
             service,
+            api_name,
         )
     }
 
@@ -97,12 +111,14 @@ impl GoogleApiClient {
         base_url: &str,
         session: Arc<DriveSession>,
         service: &'static str,
+        api_name: &'static str,
     ) -> Self {
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             session,
             service,
+            api_name,
         }
     }
 
@@ -132,7 +148,9 @@ impl GoogleApiClient {
         context: &'static str,
     ) -> Result<T> {
         if !response.status().is_success() {
-            return Err(Self::response_to_error(response).await.into());
+            return Err(Self::response_to_error(self.api_name, response)
+                .await
+                .into());
         }
         response.json().await.context(context)
     }
@@ -334,7 +352,7 @@ impl GoogleApiClient {
     /// Parses Google's error envelope into a human message when present
     /// (falls back to the raw body otherwise). See [`error_reason`] for why
     /// two envelope shapes have to be understood.
-    pub(crate) async fn response_to_error(response: Response) -> DriveError {
+    pub(crate) async fn response_to_error(api: &'static str, response: Response) -> DriveError {
         let status = response.status().as_u16();
         let raw = response.text().await.unwrap_or_default();
         let value = serde_json::from_str::<serde_json::Value>(&raw).ok();
@@ -348,6 +366,7 @@ impl GoogleApiClient {
             })
             .unwrap_or(raw);
         DriveError::ApiRequestFailed {
+            api,
             status,
             body,
             reason,
@@ -437,6 +456,7 @@ impl GoogleApiClient {
         base_url: &str,
         credentials: &DriveCredentials,
         service: &'static str,
+        api_name: &'static str,
         token_endpoint: &str,
     ) -> Result<Self> {
         let client = Client::builder()
@@ -449,7 +469,9 @@ impl GoogleApiClient {
             credentials,
             token_endpoint,
         ));
-        Ok(Self::from_parts(client, base_url, session, service))
+        Ok(Self::from_parts(
+            client, base_url, session, service, api_name,
+        ))
     }
 }
 
@@ -561,17 +583,26 @@ mod tests {
 
     #[test]
     fn new_strips_trailing_slash() {
-        let client =
-            GoogleApiClient::new("https://example.test/", &test_credentials(), "drive").unwrap();
+        let client = GoogleApiClient::new(
+            "https://example.test/",
+            &test_credentials(),
+            "drive",
+            "Drive",
+        )
+        .unwrap();
         assert_eq!(client.base_url(), "https://example.test");
     }
 
     #[test]
     fn derived_shares_the_session_and_swaps_the_host() {
-        let drive =
-            GoogleApiClient::new("https://www.googleapis.com", &test_credentials(), "drive")
-                .unwrap();
-        let sheets = drive.derived("https://sheets.googleapis.com", "drive");
+        let drive = GoogleApiClient::new(
+            "https://www.googleapis.com",
+            &test_credentials(),
+            "drive",
+            "Drive",
+        )
+        .unwrap();
+        let sheets = drive.derived("https://sheets.googleapis.com", "drive", "Sheets");
         assert_eq!(sheets.base_url(), "https://sheets.googleapis.com");
         assert_eq!(drive.base_url(), "https://www.googleapis.com");
         assert!(
@@ -582,8 +613,13 @@ mod tests {
 
     #[test]
     fn debug_never_mentions_the_session_field() {
-        let client =
-            GoogleApiClient::new("https://example.test", &test_credentials(), "drive").unwrap();
+        let client = GoogleApiClient::new(
+            "https://example.test",
+            &test_credentials(),
+            "drive",
+            "Drive",
+        )
+        .unwrap();
         let debug = format!("{client:?}");
         assert!(!debug.contains("secret-1"));
         assert!(!debug.contains("refresh-1"));
