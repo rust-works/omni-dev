@@ -76,8 +76,11 @@ pub enum ValueInputOption {
     ///
     /// The default because it is what a person means by "write this into the
     /// sheet". It is also the one option whose *wrong* value silently
-    /// mangles data rather than erroring, which is why both spellings are
-    /// spelled out in `--help` and echoed by `--dry-run`.
+    /// mangles data rather than erroring — neither choice fails, you just
+    /// get formulas you meant as text or the reverse — which is why both
+    /// spellings are spelled out in `--help` and in `docs/drive.md`. Note
+    /// `--dry-run` does *not* echo it: there is no wrong-looking output to
+    /// spot, so it has to be chosen deliberately.
     #[default]
     UserEntered,
     /// Store every value verbatim as a string. A leading `=` stays literal

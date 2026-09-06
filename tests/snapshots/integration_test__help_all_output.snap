@@ -3738,7 +3738,7 @@ Commands:
   edit         Replaces an existing file's content, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
-  permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+  permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
   sheets       Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
   help         Print this message or the help of the given subcommand(s)
 
@@ -3927,9 +3927,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive permissions - Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+omni-dev drive permissions - Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
 
-Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` (issue #1574)
+Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
 
 Usage: permissions <COMMAND>
 

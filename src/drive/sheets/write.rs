@@ -128,10 +128,21 @@ pub enum WriteResult {
         decided_by: Option<DecidingRule>,
     },
     /// The mutation succeeded.
+    ///
+    /// Every count is optional because the API may omit it — which is why
+    /// [`describe`] reads the *verb* to decide what happened rather than
+    /// inferring "a clear" from an absent cell count.
     Written {
         /// The server-normalised range actually written or cleared.
         #[serde(skip_serializing_if = "Option::is_none")]
         updated_range: Option<String>,
+        /// Rows the API reported changing. `None` for a clear, which
+        /// reports no counts at all.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_rows: Option<i64>,
+        /// Columns the API reported changing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_columns: Option<i64>,
         /// Cells the API reported changing.
         #[serde(skip_serializing_if = "Option::is_none")]
         updated_cells: Option<i64>,
@@ -320,6 +331,8 @@ async fn write_inner(
             .await
             .map(|response| WriteResult::Written {
                 updated_range: response.cleared_range,
+                updated_rows: None,
+                updated_columns: None,
                 updated_cells: None,
             }),
     };
@@ -329,9 +342,15 @@ async fn write_inner(
     }))
 }
 
+/// Carries **every** count the API reported through to the outcome, not just
+/// the cell count: `updated_rows`/`updated_columns` are what let a
+/// transposed write be spotted in the request log after the fact, and
+/// `docs/log.md` documents them as recorded.
 fn into_written(response: UpdateValuesResponse) -> WriteResult {
     WriteResult::Written {
         updated_range: response.updated_range,
+        updated_rows: response.updated_rows,
+        updated_columns: response.updated_columns,
         updated_cells: response.updated_cells,
     }
 }
@@ -351,12 +370,19 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
         _ => None,
     };
     let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
-    let (updated_range, updated_cells) = match &outcome.result {
+    let (updated_range, updated_rows, updated_columns, updated_cells) = match &outcome.result {
         WriteResult::Written {
             updated_range,
+            updated_rows,
+            updated_columns,
             updated_cells,
-        } => (updated_range.clone(), *updated_cells),
-        _ => (None, None),
+        } => (
+            updated_range.clone(),
+            *updated_rows,
+            *updated_columns,
+            *updated_cells,
+        ),
+        _ => (None, None, None, None),
     };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -369,6 +395,8 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
         decided_by_depth,
         range: outcome.range.clone(),
         updated_range,
+        updated_rows,
+        updated_columns,
         updated_cells,
         error,
         duration,
@@ -388,6 +416,11 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
         .unwrap_or(&outcome.spreadsheet_id);
     let range = outcome.range.as_deref().unwrap_or("(unresolved range)");
     match &outcome.result {
+        // A clear carries no values, so its dimensions are always 0 x 0 —
+        // printing them would be noise, not reassurance.
+        WriteResult::WouldWrite { .. } if verb == WriteVerb::Clear => {
+            format!("Would clear: {range} of '{name}'")
+        }
         WriteResult::WouldWrite { rows, columns } => format!(
             "Would {}: {rows} row(s) x {columns} column(s) into {range} of '{name}'",
             verb.label()
@@ -420,11 +453,17 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
         WriteResult::Written {
             updated_range,
             updated_cells,
+            ..
         } => {
             let where_ = updated_range.as_deref().unwrap_or(range);
-            match updated_cells {
-                Some(cells) => format!("Wrote {cells} cell(s) to {where_} of '{name}'"),
-                None => format!("Cleared {where_} of '{name}'"),
+            // Keyed on the verb, never on an absent cell count: the API is
+            // allowed to omit the counts (see `UpdateValuesResponse`), and
+            // inferring "a clear" from that would report a destructive
+            // outcome for a write that was nothing of the sort.
+            match (verb, updated_cells) {
+                (WriteVerb::Clear, _) => format!("Cleared {where_} of '{name}'"),
+                (_, Some(cells)) => format!("Wrote {cells} cell(s) to {where_} of '{name}'"),
+                (_, None) => format!("Wrote to {where_} of '{name}'"),
             }
         }
         WriteResult::Failed { detail } => {
@@ -734,9 +773,12 @@ mod tests {
             outcome.result,
             WriteResult::Written {
                 updated_range: Some("'Q1'!A1:B2".to_string()),
+                updated_rows: Some(1),
+                updated_columns: None,
                 updated_cells: Some(2),
             }
         );
+        assert!(describe(&outcome, WriteVerb::Write).starts_with("Wrote 2 cell(s) "));
     }
 
     #[tokio::test]
@@ -758,6 +800,57 @@ mod tests {
         o.input = ValueInputOption::Raw;
         let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         assert!(matches!(outcome.result, WriteResult::Written { .. }));
+    }
+
+    // ── describing an outcome ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_write_whose_response_omits_the_counts_is_not_described_as_a_clear() {
+        // `UpdateValuesResponse` deliberately tolerates missing counts, so
+        // "no cell count" must never stand in for "this was a clear" — that
+        // would report a destructive outcome for a plain write.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Write, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome, WriteVerb::Write);
+        assert!(!text.contains("Cleared"), "{text}");
+        assert!(text.starts_with("Wrote to "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_clear_dry_run_omits_the_always_zero_dimensions() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Clear, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome, WriteVerb::Clear);
+        assert!(!text.contains("row(s)"), "{text}");
+        assert_eq!(text, "Would clear: A1:B2 of 'sheet-1'");
     }
 
     #[tokio::test]
@@ -797,6 +890,8 @@ mod tests {
             outcome.result,
             WriteResult::Written {
                 updated_range: Some("'Q1'!A4:B4".to_string()),
+                updated_rows: None,
+                updated_columns: None,
                 updated_cells: Some(2),
             }
         );
@@ -833,6 +928,8 @@ mod tests {
             outcome.result,
             WriteResult::Written {
                 updated_range: Some("'Q1'!A1:B2".to_string()),
+                updated_rows: None,
+                updated_columns: None,
                 updated_cells: None,
             }
         );

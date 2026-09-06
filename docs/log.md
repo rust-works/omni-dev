@@ -55,7 +55,7 @@ types, so the log is a complete invocation history, not just an HTTP history:
   [ADR-0073](adrs/adr-0073.md)) use this same kind, with `operation` of
   `sheets-write`/`sheets-append`/`sheets-clear`/`sheets-create` — so
   `command` reads `["drive", "sheets-write"]` even though the CLI spells it
-  `drive sheets write`. They add four more omit-if-absent context keys:
+  `drive sheets write`. They add five more omit-if-absent context keys:
   `range` (the A1 range as composed and sent), and `updated_range`,
   `updated_rows`, `updated_columns`, `updated_cells` (what the API reported
   actually changing). `updated_range` can differ from `range` — the server
