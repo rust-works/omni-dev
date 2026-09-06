@@ -284,6 +284,46 @@ impl PaneLayout {
         closed
     }
 
+    /// Closes every tab in group `index`, shutting each one down exactly as
+    /// [`Self::close_tab`] does, then removes the group itself. Returns the
+    /// `opened_in` of every tab closed, in close order — see
+    /// [`Self::close_other_tabs`] for why a `Vec` rather than an `Option`: a
+    /// whole group can retire several different worktrees' `here` cues at
+    /// once, and a caller that only saw the last one would leave the others
+    /// lit for a tab that no longer exists.
+    ///
+    /// Unlike `close_other_tabs`/`close_tabs_to_right`, this always empties
+    /// the group, so — like [`Self::close_tab`] when a group empties — it
+    /// removes the group, removes its entry from `self.weights`, and clamps
+    /// `self.focused` back into range. Closing the last group is legal and
+    /// leaves the layout empty, exactly as closing the last tab in the last
+    /// group already does via `close_tab`, so that case gets no special
+    /// handling here beyond the same clamp every other case goes through.
+    ///
+    /// A no-op returning an empty `Vec` for an out-of-range `index`.
+    pub fn close_group(&mut self, index: usize) -> Vec<PathBuf> {
+        let Some(group) = self.groups.get_mut(index) else {
+            return Vec::new();
+        };
+        let mut closed = Vec::with_capacity(group.tabs.len());
+        // Remove from the back so earlier indices never shift out from
+        // under us.
+        for tab_index in (0..group.tabs.len()).rev() {
+            let mut tab = group.tabs.remove(tab_index);
+            tab.shutdown();
+            closed.push(tab.opened_in);
+        }
+        closed.reverse(); // report in close order, not removal order
+        self.groups.remove(index);
+        if index < self.weights.len() {
+            self.weights.remove(index);
+        }
+        if self.focused >= self.groups.len() {
+            self.focused = self.groups.len().saturating_sub(1);
+        }
+        closed
+    }
+
     /// Closes the focused group's active tab.
     pub fn close_active(&mut self) -> Option<PathBuf> {
         let addr = TabAddr {
@@ -822,6 +862,91 @@ mod tests {
             2,
             "the bad addresses touched nothing"
         );
+
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_group_removes_the_group_and_reports_every_closed_worktree() {
+        let (mut panes, _dir) = layout_with(0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            panes
+                .split(spawner("sleep 5", d.path().to_path_buf(), tx.clone()))
+                .unwrap();
+        }
+        assert_eq!(panes.group_count(), 3);
+
+        // Give the middle group a second tab so closing it retires more
+        // than one worktree at once.
+        panes.focused = 1;
+        let extra_dir = tempfile::tempdir().unwrap();
+        panes
+            .open_tab(spawner("sleep 5", extra_dir.path().to_path_buf(), tx))
+            .unwrap();
+        assert_eq!(panes.groups[1].tabs.len(), 2);
+        panes.weights = vec![1, 2, 3];
+        panes.focused = 2; // the last group, so removing group 1 shifts it down
+
+        let closed = panes.close_group(1);
+
+        assert_eq!(panes.group_count(), 2, "the closed group is removed");
+        assert_eq!(panes.weights, vec![1, 3], "its weight goes with it");
+        let expected: HashSet<PathBuf> =
+            [dirs[1].path().to_path_buf(), extra_dir.path().to_path_buf()]
+                .into_iter()
+                .collect();
+        let got: HashSet<PathBuf> = closed.iter().cloned().collect();
+        assert_eq!(
+            got, expected,
+            "every tab in the group is reported, not just one"
+        );
+        assert_eq!(closed.len(), 2, "no duplicates");
+        assert_eq!(
+            panes.focused, 1,
+            "a later focus shifts down with the removed group"
+        );
+
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_group_clamps_focus_when_it_was_the_last_group() {
+        let (mut panes, dir) = layout_with(1);
+        let here = dir.path().to_path_buf();
+        assert_eq!(panes.group_count(), 1);
+
+        let closed = panes.close_group(0);
+
+        assert_eq!(closed, vec![here], "the only tab is reported");
+        assert!(panes.is_empty(), "the layout is now empty");
+        assert!(panes.weights.is_empty());
+        assert_eq!(
+            panes.focused, 0,
+            "focus is clamped back into range, not left dangling"
+        );
+
+        // Out-of-range addresses — including on an already-empty layout —
+        // are no-ops.
+        assert!(panes.close_group(0).is_empty());
+        assert!(panes.close_group(9).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_group_with_an_out_of_range_index_is_a_no_op() {
+        let (mut panes, _dir) = layout_with(2);
+
+        assert!(panes.close_group(9).is_empty());
+        assert_eq!(panes.group_count(), 2, "nothing was touched");
+        assert_eq!(panes.weights.len(), 2);
 
         for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
             tab.shutdown();

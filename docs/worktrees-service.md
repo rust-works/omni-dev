@@ -525,6 +525,45 @@ nothing open clears the file, so the next run starts fresh.
 ~/.omni-dev/worktrees-ui-layout.yaml    # 0600, beside the row-colour store
 ```
 
+**Right-click context menus** (#1602) cover all four interactive surfaces.
+Right-click a **tree row** for the same actions the `a` key offers — inside a
+marked set it acts on the whole set, outside it the cursor moves there first
+— with the row-colour palette folded in as a *Row Colour ▸* submenu. A **tab**
+offers *Close Tab*, *Close Other Tabs*, *Close Tabs to the Right*, *Move to
+Group Above/Below*, *Split Below* and the two new-tab actions. A **terminal
+grid** offers *Copy* (greyed without a selection), *Select All*, *Clear
+Selection*, *Find in Scrollback*, *Scroll to Bottom* and *Close Tab*. A
+**splitter** offers *Reset Layout* and *Close Group Above/Below*, and empty
+tree space or the status bar offers a small global menu. Nothing here is a new
+capability: every entry was already reachable from a key or the `a` menu, and
+the destructive ones go through the same two-phase confirm.
+
+**Use the keyboard route if right-click does not work in your terminal.**
+`alt-m` (or `F10`) opens the context menu for whatever has focus, and it is
+the only gesture that works everywhere. Right-click delivery is genuinely
+inconsistent between terminals, measured on macOS:
+
+| Terminal | plain right-click | shift + right-click |
+|---|---|---|
+| Terminal.app | opens the menu | opens the menu |
+| Ghostty | opens the menu | Ghostty's own menu |
+| iTerm2 | iTerm2's own menu | opens the menu |
+| VS Code terminal | opens the menu | opens the menu (VS Code's own also appears) |
+
+The UI deliberately does not inspect modifiers on a right-click — it acts on
+whatever the host forwards, which is what makes one rule correct in all four.
+In the VS Code terminal both menus appear at once because its macOS default
+`terminal.integrated.rightClickBehavior` is `selectWord`, which selects a word
+*and* opens VS Code's menu while still forwarding to the app; setting it to
+`"nothing"` suppresses VS Code's, at the cost of losing that menu in every
+other VS Code terminal. Using `alt-m` there costs nothing. kitty, WezTerm,
+Alacritty, tmux, GNOME Terminal and Windows Terminal are **unverified**.
+
+*Paste is deliberately absent* from the grid menu: the UI only ever writes to
+the clipboard, and adding a read would create a clipboard→PTY path that does
+not exist today. A guard test keeps it that way.
+
+
 The **Move/Copy Claude Session** picker now labels each session with the
 first prompt from its transcript rather than a bare UUID, so you can tell
 which session you are moving. And **`alt-⇧c`** clears every row colour at

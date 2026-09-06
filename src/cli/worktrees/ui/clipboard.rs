@@ -99,4 +99,51 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("OSC 52"));
     }
+
+    /// This module only ever *writes* to the clipboard (`arboard::set_text`,
+    /// and the OSC 52 fallback above). That is a deliberate decision, not an
+    /// oversight: issue #1602 left *Paste* out of the terminal-grid context
+    /// menu specifically because adding a clipboard read would open a
+    /// clipboard→PTY byte path that does not exist today — a real
+    /// capability change that deserves its own decision rather than a free
+    /// ride on a menu item. The emulator is likewise left at
+    /// `Osc52::OnlyCopy` (ADR-0072 §4) so a child cannot read the clipboard
+    /// either; this guard is the other half of that same guarantee — the UI
+    /// itself must not be able to read it either. Modeled on
+    /// `no_force_escape_hatch_exists_in_the_ui_surface` in `actions.rs`.
+    #[test]
+    fn no_host_clipboard_read_exists_in_the_ui_surface() {
+        let sources = [
+            ("clipboard.rs", include_str!("clipboard.rs")),
+            ("app.rs", include_str!("app.rs")),
+            ("menu.rs", include_str!("menu.rs")),
+            ("popup.rs", include_str!("popup.rs")),
+            ("terminal/mod.rs", include_str!("terminal/mod.rs")),
+        ];
+        for (name, source) in sources {
+            // Only production code: tests (including this one) are exempt,
+            // since a guard that can't name what it forbids can't test
+            // itself, and prose below may discuss the absence of a read.
+            let code_only = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for (number, line) in code_only.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with("///") {
+                    continue; // prose may discuss clipboard reads; code may not perform one
+                }
+                // `get_text`/`get_contents` are arboard's actual read APIs.
+                // `.get(` alone is far too broad (HashMap/Vec lookups), so
+                // it only counts when paired with `arboard::Clipboard` on
+                // the same line.
+                let reads_the_clipboard = code.contains("get_text")
+                    || code.contains("get_contents")
+                    || code.contains("Clipboard::get")
+                    || (code.contains("arboard::Clipboard") && code.contains(".get("));
+                assert!(
+                    !reads_the_clipboard,
+                    "{name}:{}: the UI must never read the host clipboard: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
 }
