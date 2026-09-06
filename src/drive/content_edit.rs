@@ -101,10 +101,14 @@ pub struct EditOutcome {
     /// the initial `files.get` itself failed).
     pub file_name: Option<String>,
     /// The folder the write-permission gate evaluated against — the
-    /// target's resolved current parent, when the target has exactly one;
-    /// `None` for an orphan target, a target refused before the gate ran
-    /// (`RefusedNativeDocument`), or a target with more than one current
-    /// parent (no single folder to report).
+    /// target's resolved current parent, when the target has exactly one
+    /// *and* the ancestor chain is what decided the verdict. `None` for an
+    /// orphan target, a target refused before the gate ran
+    /// (`RefusedNativeDocument`), a target with more than one current
+    /// parent (no single folder to report), or a target decided by a
+    /// `file_id` rule (issue #1612) — that short-circuits at depth −1
+    /// before any parent is fetched, so no folder was evaluated even when
+    /// the target has exactly one.
     pub resolved_folder_id: Option<String>,
     /// The result.
     pub result: EditResult,

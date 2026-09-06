@@ -885,9 +885,12 @@ pub struct DriveMutationOutcome {
     pub crosses_drive_boundary: bool,
     /// The folder the write-permission gate evaluated against (issue
     /// #1574) — the `--parent` for `create`/`upload`, the target's current
-    /// parent for `edit`. `None` for `rename`/`move` (never gated) and for
-    /// a `content_edit` outcome that short-circuited before the gate (a
-    /// Google-native-document refusal).
+    /// parent for `edit`. `None` for `rename`/`move` (never gated), for a
+    /// `content_edit` outcome that short-circuited before the gate (a
+    /// Google-native-document refusal), and for any verdict a `file_id`
+    /// rule decided (issue #1612), which is settled at depth −1 without
+    /// evaluating a folder at all. In that last case `decided_by_file_id`
+    /// carries the id instead.
     pub resolved_folder_id: Option<String>,
     /// The folder id of the configured rule that decided the write-gate
     /// verdict, when one did (as opposed to the bare default policy).
