@@ -571,7 +571,7 @@ fn status_hint(app: &App) -> String {
             "alt-e tree  alt-t tab  alt-s split  alt-[/] cycle  alt-w close  alt-c copy".to_string()
         }
         (_, Focus::Tree) => {
-            "↑↓ move  space mark  enter/alt-t shell tab  alt-⇧t claude tab  a actions  c/C colour  q quit".to_string()
+            "↑↓ move  space mark  enter/alt-t shell tab  alt-⇧t claude tab  a/alt-m actions  c/C colour  q quit".to_string()
         }
     }
 }
@@ -679,11 +679,22 @@ fn relative_mtime(modified: std::time::SystemTime) -> String {
 /// the confirm modal's keyboard-only `y`/`n` is a feature, not an oversight,
 /// since it gates destructive actions.
 fn popup_mouse_enabled(app: &App) -> bool {
-    app.menu.is_some()
-        && !app.quit_confirm
-        && app.prompt.is_none()
-        && app.relocate.is_none()
-        && !matches!(app.flow, ActionFlow::AwaitingConfirm { .. })
+    app.menu.is_some() && !blocking_modal_open(app)
+}
+
+/// Whether a popup that is *not* a context menu owns the screen.
+///
+/// `draw_popups` and `handle_key` walk their popups in different orders — a
+/// menu draws above the relocate picker and the confirm modal but takes keys
+/// after the picker — so a menu opened while one of these is up is either
+/// visible and dead or replaces a modal that is still live in `app.flow`.
+/// One predicate keeps "a context menu never appears over another modal" a
+/// single decision, shared with [`popup_mouse_enabled`].
+fn blocking_modal_open(app: &App) -> bool {
+    app.quit_confirm
+        || app.prompt.is_some()
+        || app.relocate.is_some()
+        || matches!(app.flow, ActionFlow::AwaitingConfirm { .. })
 }
 
 /// Handles one mouse event under the contract in `mouse.rs`. Returns
@@ -897,7 +908,13 @@ async fn handle_menu_mouse(
                 menu.armed = true;
                 match hit {
                     Hit::PopupItem { index } => {
-                        menu.close_submenu();
+                        // Leave the submenu of the row being pressed alone,
+                        // so the release can *toggle* it shut. Closing it
+                        // here would let `activate` reopen it on the release
+                        // and make a second click on the parent a no-op.
+                        if menu.open_submenu != Some(index) {
+                            menu.close_submenu();
+                        }
                         menu.select_index(index);
                     }
                     Hit::PopupSubmenuItem { index } => menu.submenu_selected = index,
@@ -915,6 +932,13 @@ async fn handle_menu_mouse(
             }
             match hit {
                 Hit::PopupSubmenuItem { index } => menu.submenu_selected = index,
+                // Releasing on the parent of the open submenu closes it —
+                // the conventional toggle. `Down` deliberately left it open
+                // so this can see that it was.
+                Hit::PopupItem { index } if menu.open_submenu == Some(index) => {
+                    menu.close_submenu();
+                    return true;
+                }
                 Hit::PopupItem { index } => {
                     if !menu.select_index(index) {
                         return false;
@@ -1282,13 +1306,23 @@ async fn handle_key(
         // `keys::chrome_key` on purpose: `encode_key` already sends F10 to a
         // child, and only Alt-chords are chrome (ADR-0072 §5). Tree-focused
         // is exactly where no child is listening, so nothing is stolen.
+        //
+        // Matched with *or without* `⇧` deliberately. The convention is
+        // ⇧F10, but terminals disagree about whether they report the
+        // modifier at all (some send a bare `\x1b[21~`, some `\x1b[21;2~`,
+        // some a different key entirely), and the "nothing is stolen"
+        // argument covers bare F10 just as well. `alt-m` is the chord for
+        // terminals that send neither.
         KeyCode::F(10) => open_context_menu_for_focus(app, view),
         KeyCode::Char('a') => {
             let targets = app.tree.targets(view);
-            app.menu = Some(popup::ActionMenu::with_entries(
-                "Actions",
-                grouped_menu_entries(&targets),
-            ));
+            let mut menu =
+                popup::ActionMenu::with_entries("Actions", grouped_menu_entries(&targets));
+            // Same subject, same guard as the right-click and `alt-m`
+            // routes: this menu builds the identical entries, so it must not
+            // outlive its row either.
+            menu.origin_row = cursor_row_path(&app.tree, view);
+            app.menu = Some(menu);
         }
         KeyCode::Char('c') => {
             app.menu = Some(popup::ActionMenu::new(row_color_items()));
@@ -1528,6 +1562,12 @@ async fn run_action(
 /// top-left otherwise. The keyboard route into every menu the mouse can
 /// reach (`alt-m`, and `⇧F10` while the tree has focus).
 fn open_context_menu_for_focus(app: &mut App, view: &WorktreesViewModel) {
+    // Chrome chords are dispatched over every popup, so this is reachable
+    // while a prompt, the relocate picker or a two-phase confirm is up. A
+    // menu must not appear over any of them — see [`blocking_modal_open`].
+    if blocking_modal_open(app) {
+        return;
+    }
     let targets = app.tree.targets(view);
     let entries = grouped_menu_entries(&targets);
     if entries.is_empty() {
@@ -2052,6 +2092,101 @@ mod tests {
         };
         handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('y'))).await;
         assert!(matches!(app.flow, ActionFlow::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn alt_m_and_f10_both_open_the_context_menu_from_the_tree() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1; // a worktree row, so there are actions to offer
+
+        handle_key(&mut app, &view, &dispatcher, alt('m')).await;
+        assert!(app.menu.is_some(), "alt-m opens the menu");
+        assert!(
+            app.menu
+                .as_ref()
+                .and_then(|m| m.origin_row.as_ref())
+                .is_some(),
+            "and records the row it acts on, like the right-click route"
+        );
+        assert!(
+            matches!(
+                app.menu.as_ref().map(|m| m.anchor),
+                Some(popup::Anchor::At { .. })
+            ),
+            "anchored at the cursor, not centred like the `a` menu"
+        );
+        app.menu = None;
+
+        // F10 with and without the conventional shift: terminals disagree
+        // about whether they report the modifier, and neither steals a key
+        // from a child while the tree has focus.
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::F(10))).await;
+        assert!(app.menu.is_some(), "bare F10 opens it");
+        app.menu = None;
+        handle_key(
+            &mut app,
+            &view,
+            &dispatcher,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT),
+        )
+        .await;
+        assert!(app.menu.is_some(), "shift-F10 opens it too");
+    }
+
+    #[tokio::test]
+    async fn the_a_menu_and_the_context_menu_offer_the_same_entries() {
+        // The two entry points must not drift: one filter, two routes.
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1;
+
+        handle_key(&mut app, &view, &dispatcher, press(KeyCode::Char('a'))).await;
+        let from_a = app.menu.take().expect("`a` opens a menu").entries;
+        handle_key(&mut app, &view, &dispatcher, alt('m')).await;
+        let from_alt_m = app.menu.take().expect("alt-m opens a menu").entries;
+        assert_eq!(from_a, from_alt_m);
+    }
+
+    #[tokio::test]
+    async fn the_context_menu_key_is_inert_over_another_modal() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.tree.cursor = 1;
+
+        // Chrome chords are dispatched over every popup, and `draw_popups`
+        // ranks a menu *above* the confirm modal while `handle_key` ranks it
+        // *below* the relocate picker. So an ungated alt-m yields either a
+        // menu you can see and not drive, or one that silently replaces a
+        // pending two-phase confirmation.
+        app.flow = ActionFlow::AwaitingConfirm {
+            action: ActionKind::CloseWorktree,
+            targets: app.tree.targets(&view),
+            prompt: actions::ConfirmPrompt {
+                title: "Close?".to_string(),
+                ..Default::default()
+            },
+        };
+        handle_key(&mut app, &view, &dispatcher, alt('m')).await;
+        assert!(app.menu.is_none(), "no menu over a confirm modal");
+        assert!(
+            matches!(app.flow, ActionFlow::AwaitingConfirm { .. }),
+            "and the pending confirm survives"
+        );
+        app.flow = ActionFlow::Idle;
+
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Palette,
+            input: String::new(),
+            status: String::new(),
+        });
+        handle_key(&mut app, &view, &dispatcher, alt('m')).await;
+        assert!(app.menu.is_none(), "no menu over a prompt");
+        app.prompt = None;
+
+        // And with nothing in the way it still works.
+        handle_key(&mut app, &view, &dispatcher, alt('m')).await;
+        assert!(app.menu.is_some());
     }
 
     #[tokio::test]
@@ -2591,6 +2726,57 @@ mod tests {
         .await;
         assert!(app.menu.is_none());
         assert!(matches!(app.flow, ActionFlow::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn clicking_a_submenu_row_toggles_it_open_and_shut() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.menu = Some(popup::ActionMenu::with_entries(
+            "Actions",
+            vec![
+                popup::MenuEntry::Item(popup::MenuItem::action(ActionKind::Focus, "Open Worktree")),
+                popup::MenuEntry::Submenu {
+                    label: "Row Colour",
+                    items: vec![popup::MenuItem::action(
+                        ActionKind::SetRowColor("red"),
+                        "red",
+                    )],
+                },
+            ],
+        ));
+        // Stands in for what `draw_menu` would have reported.
+        app.regions.popup = Some(mouse::PopupRegion {
+            submenu: None,
+            rect: Rect::new(9, 4, 12, 4),
+            items: vec![(0, Rect::new(10, 5, 10, 1)), (1, Rect::new(10, 6, 10, 1))],
+        });
+        let none = KeyModifiers::NONE;
+        let click = |row: u16| {
+            [
+                mouse_at(MouseEventKind::Down(MouseButton::Left), 12, row, none),
+                mouse_at(MouseEventKind::Up(MouseButton::Left), 12, row, none),
+            ]
+        };
+
+        for event in click(6) {
+            handle_mouse(&mut app, &view, &dispatcher, event).await;
+        }
+        assert_eq!(
+            app.menu.as_ref().and_then(|m| m.open_submenu),
+            Some(1),
+            "the first click on the submenu row opens it"
+        );
+
+        for event in click(6) {
+            handle_mouse(&mut app, &view, &dispatcher, event).await;
+        }
+        assert_eq!(
+            app.menu.as_ref().and_then(|m| m.open_submenu),
+            None,
+            "and the second closes it rather than reopening it"
+        );
+        assert!(app.menu.is_some(), "the menu itself stays open either way");
     }
 
     #[tokio::test]

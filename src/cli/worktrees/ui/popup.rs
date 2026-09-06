@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::actions::{ActionKind, ConfirmPrompt};
 use super::glyph::{Glyph, GlyphMode};
@@ -294,7 +295,19 @@ impl ActionMenu {
     /// Selects the first/last item — `Home`/`End`. Walks inward from just
     /// outside the range, so the end entry itself is considered and a
     /// trailing separator is skipped.
+    ///
+    /// Drives the open submenu when there is one, for the same reason
+    /// [`Self::move_selection`] does: the eye is on the submenu, and
+    /// [`Self::selected_command`] reads from it. Moving the *parent*
+    /// highlight here instead would leave `Enter` dispatching a submenu item
+    /// while a different row is the one lit up.
     pub fn select_end(&mut self, last: bool) {
+        if let Some(len) = self.submenu_items().map(<[MenuItem]>::len) {
+            if len > 0 {
+                self.submenu_selected = if last { len - 1 } else { 0 };
+            }
+            return;
+        }
         let (from, step) = if last {
             (self.entries.len() as isize, -1)
         } else {
@@ -376,6 +389,45 @@ pub struct ConfirmModal {
 /// Width of a menu popup. Fixed rather than content-derived so a menu does
 /// not resize as its filtered contents change under the palette.
 const MENU_WIDTH: u16 = 50;
+
+/// Narrowest a submenu is allowed to get, so a list of short labels still
+/// reads as a menu rather than a sliver.
+const MIN_SUBMENU_WIDTH: u16 = 14;
+
+/// A submenu is sized to its content, not to [`MENU_WIDTH`].
+///
+/// The parent is a fixed 50 columns wide precisely so it does not resize as
+/// its contents change, but a *submenu* inheriting that width cannot fit
+/// beside its parent in an 80-column terminal — and a 50-wide box for eleven
+/// colour names would be mostly empty even where it fits. Measured in display
+/// cells, like every other width in this UI.
+fn submenu_width(items: &[MenuItem]) -> u16 {
+    let longest = items
+        .iter()
+        .map(|item| UnicodeWidthStr::width(item.label))
+        .max()
+        .unwrap_or(0);
+    // +2 for the borders.
+    u16::try_from(longest.saturating_add(2))
+        .unwrap_or(MENU_WIDTH)
+        .clamp(MIN_SUBMENU_WIDTH, MENU_WIDTH)
+}
+
+/// Where a `width`-wide submenu goes relative to its already-placed parent.
+///
+/// Right of the parent, flipping to its left when that overflows, and only
+/// clamping into the frame when neither side fits. The clamp is last on
+/// purpose: it is the one case that *overlaps* the parent, which hides the
+/// very row the submenu belongs to.
+fn submenu_col(parent: Rect, width: u16, area: Rect) -> u16 {
+    if parent.right().saturating_add(width) <= area.right() {
+        parent.right()
+    } else if parent.x >= area.x.saturating_add(width) {
+        parent.x - width
+    } else {
+        area.right().saturating_sub(width)
+    }
+}
 
 /// Draws `menu` and returns the region describing what was drawn, for
 /// `RegionMap`.
@@ -466,19 +518,21 @@ pub fn draw_menu(
     );
     frame.render_widget(list, popup_area);
 
-    // The submenu is drawn last so it sits above the parent, and only when
-    // its parent row is actually on screen — a submenu whose row scrolled
-    // out of view would otherwise float unattached.
+    // A submenu whose parent row is not on screen has nothing to hang off,
+    // and leaving `open_submenu` set would let `selected_command` dispatch an
+    // item nobody can see. Closing it here keeps "what is open is what is
+    // drawn" true by construction rather than by the callers being careful.
+    if submenu_row.is_none() {
+        menu.open_submenu = None;
+    }
+
+    // The submenu is drawn last so it sits above the parent.
     let submenu = submenu_row.and_then(|row| {
         let items = menu.submenu_items()?;
         let height = (items.len() as u16).saturating_add(2);
-        // Beside the parent, flipping to its left when there is no room.
-        let col = if popup_area.right().saturating_add(MENU_WIDTH) <= area.right() {
-            popup_area.right()
-        } else {
-            popup_area.x.saturating_sub(MENU_WIDTH)
-        };
-        let rect = place(Anchor::At { col, row }, MENU_WIDTH, height, area);
+        let width = submenu_width(items).min(area.width);
+        let col = submenu_col(popup_area, width, area);
+        let rect = place(Anchor::At { col, row }, width, height, area);
         frame.render_widget(Clear, rect);
         let rows: Vec<ListItem> = items
             .iter()
@@ -819,6 +873,37 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_drive_the_open_submenu_rather_than_the_parent() {
+        let mut menu = ActionMenu::with_entries("t", submenu_entries());
+        menu.selected = 1;
+        menu.open_selected_submenu();
+        menu.submenu_selected = 1;
+
+        menu.select_end(false); // Home
+        assert_eq!(menu.submenu_selected, 0, "Home moves inside the submenu");
+        assert_eq!(
+            menu.selected, 1,
+            "and leaves the parent highlight on the submenu's own row"
+        );
+        // The bug this guards: moving the *parent* highlight here would leave
+        // `Enter` dispatching a submenu item while another row is lit up.
+        assert_eq!(
+            menu.selected_command(),
+            Some(MenuCommand::Action(ActionKind::SetRowColor("red"))),
+            "what Enter dispatches is what is highlighted"
+        );
+
+        menu.select_end(true); // End
+        assert_eq!(menu.submenu_selected, 1);
+        assert_eq!(menu.selected, 1);
+
+        // With nothing open, both drive the parent again.
+        menu.close_submenu();
+        menu.select_end(false);
+        assert_eq!(menu.selected, 0);
+    }
+
+    #[test]
     fn close_submenu_reports_whether_one_was_open() {
         let mut menu = ActionMenu::with_entries("t", submenu_entries());
         menu.selected = 1;
@@ -942,6 +1027,117 @@ mod tests {
         assert!(text.contains('▸'), "the submenu row is arrow-marked");
         assert!(text.contains("red"));
         assert!(text.contains("blue"));
+    }
+
+    #[test]
+    fn a_submenu_is_sized_to_its_content_and_never_covers_its_parent() {
+        // 80 columns is the case that used to break: the parent is a fixed
+        // 50 wide, so a submenu inheriting that width had nowhere to go but
+        // on top of it, wiping out the very row it belongs to.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut menu = ActionMenu::with_entries("Actions", submenu_entries());
+        menu.selected = 1;
+        menu.open_selected_submenu();
+        menu.anchor = Anchor::At { col: 4, row: 2 };
+        let mut region = None;
+        terminal
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
+            .unwrap();
+        let region = region.unwrap();
+        let sub = region.submenu.expect("the submenu row is open").rect;
+        assert_eq!(
+            sub.width, MIN_SUBMENU_WIDTH,
+            "sized to content, floored at the minimum"
+        );
+        assert!(
+            sub.x >= region.rect.right(),
+            "beside the parent ({sub:?} vs {:?}), not on top of it",
+            region.rect
+        );
+        assert!(sub.right() <= 80, "and inside the frame");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Row Colour"),
+            "the parent row it belongs to is still legible"
+        );
+    }
+
+    #[test]
+    fn a_submenu_flips_left_when_there_is_no_room_to_the_right() {
+        let area = Rect::new(0, 0, 80, 24);
+        let parent = Rect::new(28, 2, MENU_WIDTH, 6); // right() == 78
+        assert_eq!(
+            submenu_col(parent, 20, area),
+            8,
+            "no room right of 78, so it goes left of the parent"
+        );
+    }
+
+    #[test]
+    fn a_submenu_clamps_into_the_frame_only_when_neither_side_fits() {
+        let area = Rect::new(0, 0, 30, 24);
+        let parent = Rect::new(4, 2, 24, 6); // right() == 28
+        assert_eq!(
+            submenu_col(parent, 20, area),
+            10,
+            "neither side fits, so it abuts the frame's right edge"
+        );
+    }
+
+    #[test]
+    fn submenu_width_is_the_longest_label_plus_borders_clamped_both_ways() {
+        let short = [MenuItem::action(ActionKind::SetRowColor("red"), "red")];
+        assert_eq!(submenu_width(&short), MIN_SUBMENU_WIDTH, "floored");
+        let long = [MenuItem::action(
+            ActionKind::Focus,
+            "a label far longer than fifty columns could ever hope to be",
+        )];
+        assert_eq!(submenu_width(&long), MENU_WIDTH, "capped at the parent's");
+    }
+
+    #[test]
+    fn a_submenu_whose_parent_row_scrolled_out_of_view_is_closed_not_left_open() {
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut entries: Vec<MenuEntry> = (0..20)
+            .map(|_| MenuEntry::Item(MenuItem::action(ActionKind::Focus, "Open Worktree")))
+            .collect();
+        entries.push(MenuEntry::Submenu {
+            label: "Row Colour",
+            items: vec![MenuItem::action(ActionKind::SetRowColor("red"), "red")],
+        });
+        let mut menu = ActionMenu::with_entries("Actions", entries);
+        menu.selected = 20;
+        menu.open_selected_submenu();
+        // Scroll the parent row out from under the open submenu.
+        menu.scroll = 0;
+        menu.selected = 0;
+        let mut region = None;
+        terminal
+            .draw(|frame| {
+                region = Some(draw_menu(
+                    frame,
+                    frame.area(),
+                    &mut menu,
+                    GlyphMode::Unicode,
+                ));
+            })
+            .unwrap();
+        assert!(region.unwrap().submenu.is_none(), "nothing was drawn");
+        assert_eq!(menu.open_submenu, None, "so nothing is left open");
+        assert_eq!(
+            menu.selected_command(),
+            Some(MenuCommand::Action(ActionKind::Focus)),
+            "and Enter dispatches the visible row, not the vanished submenu"
+        );
     }
 
     #[test]
