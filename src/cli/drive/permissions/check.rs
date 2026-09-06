@@ -325,6 +325,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_check_assembles_the_report_from_the_evaluated_decision() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = [rule("folder-1", false, &[DriveOperation::Create])];
+
+        run_check(
+            &client,
+            "folder-1",
+            DriveOperation::Create,
+            &rules,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_check_prints_a_deny_verdict_in_table_format() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // No rules at all: default policy denies Create, and the Table
+        // format exercises run_check's print_report call (JSON always
+        // short-circuits before it).
+        run_check(
+            &client,
+            "folder-1",
+            DriveOperation::Create,
+            &[],
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn file_target_evaluates_from_its_parent() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;

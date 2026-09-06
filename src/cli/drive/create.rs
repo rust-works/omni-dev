@@ -230,6 +230,16 @@ mod tests {
         print_outcome(&CreateOutcome {
             name: "f".to_string(),
             parent_folder_id: "p".to_string(),
+            result: CreateResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
+        });
+        print_outcome(&CreateOutcome {
+            name: "f".to_string(),
+            parent_folder_id: "p".to_string(),
             result: CreateResult::Created {
                 file_id: "id1".to_string(),
             },
