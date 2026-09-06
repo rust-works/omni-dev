@@ -361,16 +361,27 @@ impl TerminalTab {
         Some((col, row))
     }
 
-    /// Stops the PTY thread and reaps the child. The join (and the `Pty`
-    /// drop that `SIGHUP`s the child) runs on a blocking thread so a slow
-    /// exit never stalls the event loop.
+    /// Stops the PTY thread and reaps the child.
+    ///
+    /// The join — and the `Pty` drop inside it, which `SIGHUP`s the child and
+    /// then `wait()`s — runs on a blocking thread so a slow exit never stalls
+    /// the event loop. But "off the event loop" was never the whole problem
+    /// (#1605): that `wait()` has no deadline, and dropping the `tokio`
+    /// runtime waits for blocking tasks, so a child that ignores `SIGHUP`
+    /// could keep the *process* alive after the UI had already restored the
+    /// terminal and handed back the prompt.
+    ///
+    /// So the group is reaped first, with escalation, and only then is the
+    /// thread joined — by which point the drop's `wait()` returns at once.
     pub fn shutdown(&mut self) {
         let Some(mut handle) = self.handle.take() else {
             return;
         };
         let _ = handle.sender.send(Msg::Shutdown);
+        let pid = handle.child_pid;
         if let Some(thread) = handle.take_thread() {
             tokio::task::spawn_blocking(move || {
+                pty::reap_child_group(pid, pty::REAP_GRACE);
                 let _ = thread.join();
             });
         }
