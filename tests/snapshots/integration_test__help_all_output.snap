@@ -4054,8 +4054,8 @@ Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
 Usage: sheets <COMMAND>
 
 Commands:
-  info    Shows a spreadsheet's title and the sheets (tabs) it contains
-  read    Reads cell values from one range, or from every sheet
+  info    Shows a spreadsheet's title and the sheets (tabs) it contains (mirrors the `drive_sheets_info` MCP tool)
+  read    Reads cell values from one range, or from every sheet (mirrors the `drive_sheets_read` MCP tool)
   write   Overwrites the cells of a range, gated by the folder write-permission rules (issue #1589). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   append  Appends rows after the last row of a range's table, gated by the folder write-permission rules (issue #1589)
   clear   Clears a range's values, leaving formatting intact. Gated by the folder write-permission rules (issue #1589)
@@ -4128,9 +4128,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets info - Shows a spreadsheet's title and the sheets (tabs) it contains
+omni-dev drive sheets info - Shows a spreadsheet's title and the sheets (tabs) it contains (mirrors the `drive_sheets_info` MCP tool)
 
-Shows a spreadsheet's title and the sheets (tabs) it contains
+Shows a spreadsheet's title and the sheets (tabs) it contains (mirrors the `drive_sheets_info` MCP tool)
 
 Usage: info [OPTIONS] <SPREADSHEET_ID>
 
@@ -4144,9 +4144,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets read - Reads cell values from one range, or from every sheet
+omni-dev drive sheets read - Reads cell values from one range, or from every sheet (mirrors the `drive_sheets_read` MCP tool)
 
-Reads cell values from one range, or from every sheet
+Reads cell values from one range, or from every sheet (mirrors the `drive_sheets_read` MCP tool)
 
 Usage: read [OPTIONS] <SPREADSHEET_ID>
 

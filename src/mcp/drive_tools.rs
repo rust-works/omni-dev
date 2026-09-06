@@ -21,6 +21,14 @@
 //! `gmail_search`: `files.list` returns full metadata per hit in one call
 //! (see `src/drive/files_api.rs`'s module doc), so there's no
 //! ids-then-hydrate split to expose.
+//!
+//! `drive_sheets_info`/`drive_sheets_read` mirror the CLI's `drive sheets
+//! info`/`read` (#1614) — read-only, so, like the rest of this file, they
+//! consult no permission gate and write no request-log record (a known,
+//! deliberate gap across the whole Drive read surface, not something
+//! specific to Sheets; see [ADR-0071](../../docs/adrs/adr-0071.md) §11 and
+//! [ADR-0073](../../docs/adrs/adr-0073.md) §5). The write verbs (`write`/
+//! `append`/`clear`) have no MCP equivalent yet, per ADR-0073 §12.
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -39,6 +47,9 @@ use crate::drive::account;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::{FilesApi, DEFAULT_SEARCH_LIMIT};
+use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::read::{read as sheets_read, ReadOptions};
 use crate::utils::settings::Settings;
 
 use super::error::tool_error;
@@ -131,6 +142,42 @@ pub struct DriveFileReadParams {
     /// a mismatch or a missing checksum.
     #[serde(default)]
     pub verify: Option<bool>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for the `drive_sheets_info` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriveSheetsInfoParams {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL). Required.
+    pub spreadsheet_id: String,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for the `drive_sheets_read` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriveSheetsReadParams {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL). Required.
+    pub spreadsheet_id: String,
+    /// A1 range to read, optionally carrying its own `Sheet!` prefix (e.g.
+    /// `A1:C10`, `'My Sheet'!A:A`). Combined with `sheet` when bare. Omit
+    /// both `range` and `sheet` to read every sheet in the workbook (capped
+    /// at 200 sheets).
+    #[serde(default)]
+    pub range: Option<String>,
+    /// Sheet (tab) title to read. Supplies the prefix for a bare `range`,
+    /// or selects the whole tab on its own. Conflicts with a `range` that
+    /// already names a sheet.
+    #[serde(default)]
+    pub sheet: Option<String>,
+    /// How cell values are rendered: `formatted` (default) matches the
+    /// spreadsheet as displayed; `unformatted` yields raw typed numbers
+    /// rather than locale-formatted strings; `formula` yields formula text.
+    #[serde(default)]
+    pub render: Option<String>,
     #[doc = account_param_doc!()]
     #[serde(default)]
     pub account: Option<String>,
@@ -239,6 +286,48 @@ impl OmniDevServer {
         } else {
             Ok(build_truncated_result(text))
         }
+    }
+
+    /// Tool: a spreadsheet's title and the sheets (tabs) it contains.
+    #[tool(
+        description = "Show a Sheets spreadsheet's title and the sheets (tabs) it contains — \
+                       id, title, index, hidden flag, and grid dimensions per tab. Use this to \
+                       discover sheet titles before calling `drive_sheets_read` with a `sheet` \
+                       parameter. \
+                       Read-only. Mirrors `omni-dev drive sheets info`. Output is YAML."
+    )]
+    pub async fn drive_sheets_info(
+        &self,
+        Parameters(params): Parameters<DriveSheetsInfoParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let yaml = run_sheets_info(&client, &params)
+            .await
+            .map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
+    }
+
+    /// Tool: read cell values from a Sheets spreadsheet.
+    #[tool(
+        description = "Read cell values from a Sheets spreadsheet. Set `range` (e.g. `A1:C10`, \
+                       `'My Sheet'!A:A`) and/or `sheet` (a tab title) to read one range or one \
+                       whole tab; omit both to read every sheet in the workbook (capped at 200 \
+                       sheets — call `drive_sheets_info` first on a larger workbook). `render` \
+                       controls how values come back: `formatted` (default) matches the \
+                       spreadsheet as displayed, `unformatted` yields raw typed numbers, \
+                       `formula` yields formula text. Rows are ragged, exactly as the API \
+                       returns them (trailing empty cells are not padded). \
+                       Read-only. Mirrors `omni-dev drive sheets read`. Output is YAML."
+    )]
+    pub async fn drive_sheets_read(
+        &self,
+        Parameters(params): Parameters<DriveSheetsReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let yaml = run_sheets_read(&client, &params)
+            .await
+            .map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
     }
 
     /// Tool: list configured named Drive accounts.
@@ -419,6 +508,43 @@ fn parse_read_format(raw: Option<&str>) -> Result<ReadFormat> {
     }
 }
 
+async fn run_sheets_info(client: &DriveClient, params: &DriveSheetsInfoParams) -> Result<String> {
+    let sheets = SheetsClient::from_drive_client(client)?;
+    let spreadsheet = SheetsApi::new(&sheets)
+        .get_spreadsheet(&params.spreadsheet_id)
+        .await?;
+    yaml_result(&spreadsheet)
+}
+
+async fn run_sheets_read(client: &DriveClient, params: &DriveSheetsReadParams) -> Result<String> {
+    let render = parse_render_option(params.render.as_deref())?;
+    let sheets = SheetsClient::from_drive_client(client)?;
+    let opts = ReadOptions {
+        spreadsheet_id: params.spreadsheet_id.clone(),
+        range: params.range.clone(),
+        sheet: params.sheet.clone(),
+        render,
+    };
+    let outcome = sheets_read(&SheetsApi::new(&sheets), &opts).await?;
+    yaml_result(&outcome)
+}
+
+/// Parses an MCP-supplied render-option string. `None` defaults to
+/// `formatted`, mirroring `RenderArg::default()` in
+/// `src/cli/drive/sheets/read.rs`.
+fn parse_render_option(raw: Option<&str>) -> Result<ValueRenderOption> {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("formatted") => Ok(ValueRenderOption::Formatted),
+        Some("unformatted") => Ok(ValueRenderOption::Unformatted),
+        Some("formula") => Ok(ValueRenderOption::Formula),
+        Some(other) => {
+            anyhow::bail!(
+                "unknown render {other:?} (expected 'formatted', 'unformatted', or 'formula')"
+            )
+        }
+    }
+}
+
 fn yaml_result<T: Serialize>(data: &T) -> Result<String> {
     serde_yaml::to_string(data).context("Failed to serialize result as YAML")
 }
@@ -430,6 +556,7 @@ mod tests {
 
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes, SCOPE_READONLY};
+    use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::drive::test_support::EnvGuard;
     use crate::utils::secret::Secret;
 
@@ -1100,6 +1227,223 @@ mod tests {
         assert!(err.to_string().contains("verify requires format"), "{err}");
     }
 
+    // ── parse_render_option ─────────────────────────────────────────
+
+    #[test]
+    fn parse_render_option_defaults_to_formatted() {
+        assert_eq!(
+            parse_render_option(None).unwrap(),
+            ValueRenderOption::Formatted
+        );
+    }
+
+    #[test]
+    fn parse_render_option_accepts_known_strings() {
+        assert_eq!(
+            parse_render_option(Some("formatted")).unwrap(),
+            ValueRenderOption::Formatted
+        );
+        assert_eq!(
+            parse_render_option(Some("unformatted")).unwrap(),
+            ValueRenderOption::Unformatted
+        );
+        assert_eq!(
+            parse_render_option(Some("formula")).unwrap(),
+            ValueRenderOption::Formula
+        );
+    }
+
+    #[test]
+    fn parse_render_option_is_case_insensitive() {
+        assert_eq!(
+            parse_render_option(Some("FORMULA")).unwrap(),
+            ValueRenderOption::Formula
+        );
+    }
+
+    #[test]
+    fn parse_render_option_rejects_unknown_value() {
+        let err = parse_render_option(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("render"), "{err}");
+    }
+
+    // ── run_sheets_info / run_sheets_read ───────────────────────────
+
+    /// Points `SHEETS_API_URL` at `server` for the guard's lifetime, so
+    /// `SheetsClient::from_drive_client`'s real `SystemEnv` lookup (inside
+    /// `run_sheets_info`/`run_sheets_read`) resolves to the mock server
+    /// instead of the real `sheets.googleapis.com`. Mirrors
+    /// `EnvGuard::redirect_api_hosts_to_a_dead_port`'s pattern of setting
+    /// the var directly once the guard already holds the process-wide lock.
+    fn point_sheets_api_at(_guard: &EnvGuard, server: &wiremock::MockServer) {
+        std::env::set_var(SHEETS_API_URL, server.uri());
+    }
+
+    #[tokio::test]
+    async fn run_sheets_info_returns_spreadsheet_as_yaml() {
+        let guard = EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        point_sheets_api_at(&guard, &server);
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/s1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "s1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"title": "Q1"}}],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_sheets_info(
+            &client,
+            &DriveSheetsInfoParams {
+                spreadsheet_id: "s1".to_string(),
+                account: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("spreadsheetId: s1"), "{yaml}");
+        assert!(yaml.contains("title: Q1"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_sheets_info_propagates_a_not_found_error() {
+        let guard = EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        point_sheets_api_at(&guard, &server);
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/missing"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"code": 404, "message": "Requested entity was not found.",
+                              "status": "NOT_FOUND"},
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = run_sheets_info(
+            &client,
+            &DriveSheetsInfoParams {
+                spreadsheet_id: "missing".to_string(),
+                account: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_sheets_read_single_range_returns_values_as_yaml() {
+        let guard = EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        point_sheets_api_at(&guard, &server);
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/s1/values/A1:B2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "range": "Sheet1!A1:B2",
+                    "values": [["a", "b"], ["1", "2"]],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_sheets_read(
+            &client,
+            &DriveSheetsReadParams {
+                spreadsheet_id: "s1".to_string(),
+                range: Some("A1:B2".to_string()),
+                sheet: None,
+                render: None,
+                account: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("- - a"), "{yaml}");
+        assert!(yaml.contains("- '1'"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_sheets_read_whole_workbook_fetches_every_sheet() {
+        let guard = EnvGuard::take();
+        let server = wiremock::MockServer::start().await;
+        point_sheets_api_at(&guard, &server);
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/s1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "s1",
+                    "properties": {"title": "Book"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/s1/values:batchGet",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "s1",
+                    "valueRanges": [
+                        {"range": "Q1!A1:Z1000", "values": [["x"]]},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = run_sheets_read(
+            &client,
+            &DriveSheetsReadParams {
+                spreadsheet_id: "s1".to_string(),
+                range: None,
+                sheet: None,
+                render: None,
+                account: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("title: Q1"), "{yaml}");
+        assert!(yaml.contains("- x"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_sheets_read_rejects_unknown_render_value() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let err = run_sheets_read(
+            &client,
+            &DriveSheetsReadParams {
+                spreadsheet_id: "s1".to_string(),
+                range: Some("A1".to_string()),
+                sheet: None,
+                render: Some("bogus".to_string()),
+                account: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("render"), "{err}");
+    }
+
     // ── Tool handler bodies (smoke + auth-status full path) ───────────
 
     #[tokio::test(flavor = "current_thread")]
@@ -1191,6 +1535,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_sheets_info_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .drive_sheets_info(Parameters(DriveSheetsInfoParams {
+                spreadsheet_id: "s1".to_string(),
+                account: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_sheets_read_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .drive_sheets_read(Parameters(DriveSheetsReadParams {
+                spreadsheet_id: "s1".to_string(),
+                range: None,
+                sheet: None,
+                render: None,
+                account: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_sheets_read_handler_honors_named_account_param() {
+        // A named `account` reaches `create_client_for` — an unknown name
+        // surfaces as the account-resolution error, not the generic "not
+        // configured" one, proving the param actually propagates.
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .drive_sheets_read(Parameters(DriveSheetsReadParams {
+                spreadsheet_id: "s1".to_string(),
+                range: None,
+                sheet: None,
+                render: None,
+                account: Some("bogus".to_string()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("unknown Drive account 'bogus'"));
     }
 
     // ── run_account_list / drive_account_list ──────────────────────────
