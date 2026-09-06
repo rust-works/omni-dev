@@ -281,6 +281,21 @@ mod tests {
         );
     }
 
+    /// `labels()` also has to see past the tree menu's one non-`Item` entry
+    /// that isn't a separator: the *Row Colour* submenu.
+    #[test]
+    fn labels_reports_a_submenus_own_label() {
+        let entries = tree_menu(&[Target::Worktree {
+            path: std::path::PathBuf::from("/repo/wt"),
+            is_main: false,
+            github: None,
+            pr_url: None,
+            branch: None,
+            sessions: Vec::new(),
+        }]);
+        assert!(labels(&entries).contains(&"Row Colour"));
+    }
+
     #[test]
     fn no_menu_shape_has_stray_separators() {
         assert_no_stray_separators(&strip_menu(1, 0, 1, 0));

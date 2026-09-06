@@ -938,6 +938,13 @@ mod tests {
             pos_after_shutdown.is_none(),
             "cursor_position must return None when tab is shut down"
         );
+
+        // select_all on a dead tab (no handle) is a no-op, not a panic.
+        tab.select_all();
+        assert!(
+            tab.selection_to_string().is_none(),
+            "a shutdown tab has no handle to select in"
+        );
     }
 
     /// The security invariant from issue #1585: PTY traffic, the emulator's

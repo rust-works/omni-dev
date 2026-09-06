@@ -2807,6 +2807,144 @@ mod tests {
         assert!(matches!(app.flow, ActionFlow::Failed { .. }));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ui_action_close_other_and_close_to_right_clear_the_here_cue_for_every_closed_tab() {
+        let (mut app, dispatcher, mut commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            let tab = scripted_tab(&app, "sleep 5", d.path().to_path_buf());
+            install_tab(&mut app, tab);
+        }
+        assert_eq!(app.panes.groups[0].tabs.len(), 3);
+
+        // Closing everything but tab 1 clears the cue for tabs 0 and 2, but
+        // not for the surviving anchor.
+        app.menu_tab = Some(panes::TabAddr { group: 0, tab: 1 });
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Ui(popup::UiAction::CloseOtherTabs),
+        )
+        .await;
+        assert!(app.menu.is_none());
+        assert_eq!(app.panes.groups[0].tabs.len(), 1, "only the anchor remains");
+        let cleared: Vec<PathBuf> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                HubCommand::ClearOpenTab(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(cleared.contains(&dirs[0].path().to_path_buf()));
+        assert!(cleared.contains(&dirs[2].path().to_path_buf()));
+        assert!(!cleared.contains(&dirs[1].path().to_path_buf()));
+
+        // Same for `CloseTabsToRight`, with a fresh set of tabs so none of
+        // them overlaps a worktree that is still open from phase one.
+        let dirs2: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs2 {
+            let tab = scripted_tab(&app, "sleep 5", d.path().to_path_buf());
+            install_tab(&mut app, tab);
+        }
+        assert_eq!(app.panes.groups[0].tabs.len(), 4, "the anchor plus 3 more");
+        app.menu_tab = Some(panes::TabAddr { group: 0, tab: 1 });
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Ui(popup::UiAction::CloseTabsToRight),
+        )
+        .await;
+        assert_eq!(
+            app.panes.groups[0].tabs.len(),
+            2,
+            "the two tabs left of it survive"
+        );
+        let cleared: Vec<PathBuf> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                HubCommand::ClearOpenTab(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(cleared.contains(&dirs2[1].path().to_path_buf()));
+        assert!(cleared.contains(&dirs2[2].path().to_path_buf()));
+        assert!(!cleared.contains(&dirs2[0].path().to_path_buf()));
+
+        shutdown_all(&mut app);
+    }
+
+    /// A stale `menu_tab` naming a command run with nothing open at all —
+    /// the closes are no-ops, but the menu still resets `focus` to the tree
+    /// since the layout was already empty.
+    #[tokio::test]
+    async fn ui_action_close_resets_focus_to_tree_when_the_layout_is_already_empty() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.focus = Focus::Terminal;
+        app.menu_tab = Some(panes::TabAddr { group: 0, tab: 0 });
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Ui(popup::UiAction::CloseOtherTabs),
+        )
+        .await;
+
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    /// A `menu` command with no `menu_tab` set (the palette and the command
+    /// menu never set one) is a no-op rather than a panic.
+    #[tokio::test]
+    async fn ui_action_close_variants_without_a_menu_tab_are_a_no_op() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        app.menu_tab = None;
+        app.menu = Some(popup::ActionMenu::new(Vec::new()));
+
+        invoke_menu_command(
+            &mut app,
+            &view,
+            &dispatcher,
+            popup::MenuCommand::Ui(popup::UiAction::CloseTabsToRight),
+        )
+        .await;
+
+        assert!(app.menu.is_none(), "the command still closes the menu");
+        assert!(app.panes.is_empty());
+    }
+
+    /// `SelectAll`, `ClearSelection` and `ScrollToBottom` forward to the
+    /// active tab exactly like their chord equivalents — this just pins that
+    /// the menu wiring reaches them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ui_action_select_all_clear_selection_and_scroll_to_bottom_touch_the_active_tab() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let view = view_with(&["/repo/a"]);
+        let dir = tempfile::tempdir().unwrap();
+        let tab = scripted_tab(&app, "sleep 5", dir.path().to_path_buf());
+        install_tab(&mut app, tab);
+
+        for ui in [
+            popup::UiAction::SelectAll,
+            popup::UiAction::ClearSelection,
+            popup::UiAction::ScrollToBottom,
+        ] {
+            app.menu = Some(popup::ActionMenu::new(Vec::new()));
+            invoke_menu_command(&mut app, &view, &dispatcher, popup::MenuCommand::Ui(ui)).await;
+            assert!(app.menu.is_none());
+        }
+
+        shutdown_all(&mut app);
+    }
+
     #[tokio::test]
     async fn clicking_a_submenu_row_toggles_it_open_and_shut() {
         let (mut app, dispatcher, _commands) = test_app();
@@ -3579,6 +3717,59 @@ mod tests {
             .await
         );
         assert_eq!(app.panes.groups[0].tabs.len(), before - 1);
+
+        shutdown_all(&mut app);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn right_clicking_a_tab_focuses_it_before_opening_the_strip_menu() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let view = view_with(&[&here.to_string_lossy()]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        for _ in 0..2 {
+            let tab = scripted_tab(&app, "sleep 5", here.clone());
+            install_tab(&mut app, tab);
+        }
+        draw_into(&mut terminal, &view, &mut app);
+        let strip = app.regions.groups[0].strip;
+        let spans = app.regions.groups[0].tab_spans.clone();
+        assert_eq!(spans.len(), 2, "two tabs on the strip");
+        assert_eq!(app.panes.groups[0].active, 1, "the second tab opened last");
+
+        let none = KeyModifiers::NONE;
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Right),
+                    spans[0].0,
+                    strip.y,
+                    none
+                )
+            )
+            .await
+        );
+        assert_eq!(
+            app.panes.groups[0].active, 0,
+            "right-click focuses the tab under the pointer, like left-click"
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        let menu = app.menu.as_ref().expect("the strip menu opened");
+        assert_eq!(menu.title, "Tab");
+        assert_eq!(
+            menu.anchor,
+            popup::Anchor::At {
+                col: spans[0].0,
+                row: strip.y
+            }
+        );
+        assert_eq!(app.menu_tab, Some(panes::TabAddr { group: 0, tab: 0 }));
 
         shutdown_all(&mut app);
     }
