@@ -63,6 +63,9 @@ pub enum Glyph {
     Closed,
     /// The repository's main working tree.
     MainMarker,
+    /// The ▸ marker shown on a menu row that opens a submenu.
+    /// Reuses MainMarker's already-Narrow U+25B8 character.
+    SubmenuArrow,
     /// No main marker — the column's blank, kept in the table so the two
     /// states are guaranteed the same width.
     NotMain,
@@ -116,9 +119,10 @@ impl Glyph {
             // `*` in both: the mockup's ▌/✔ are Ambiguous, and no narrow
             // unicode form reads better here than the ASCII one.
             Self::Here => ("*", "*"),
-            Self::Open => ("\u{25cf}", "o"),       // ● Narrow
-            Self::Closed => ("\u{00b7}", "."),     // · Narrow
-            Self::MainMarker => ("\u{25b8}", ">"), // ▸ Narrow
+            Self::Open => ("\u{25cf}", "o"),         // ● Narrow
+            Self::Closed => ("\u{00b7}", "."),       // · Narrow
+            Self::MainMarker => ("\u{25b8}", ">"),   // ▸ Narrow
+            Self::SubmenuArrow => ("\u{25b8}", ">"), // ▸ Narrow
             Self::NotMain => (" ", " "),
             Self::InFlight => ("~", "~"),
             Self::Operation => ("!", "!"),
@@ -211,6 +215,7 @@ mod tests {
         Glyph::Open,
         Glyph::Closed,
         Glyph::MainMarker,
+        Glyph::SubmenuArrow,
         Glyph::NotMain,
         Glyph::InFlight,
         Glyph::Operation,
@@ -236,6 +241,7 @@ mod tests {
                 Glyph::Open => "Open",
                 Glyph::Closed => "Closed",
                 Glyph::MainMarker => "MainMarker",
+                Glyph::SubmenuArrow => "SubmenuArrow",
                 Glyph::NotMain => "NotMain",
                 Glyph::InFlight => "InFlight",
                 Glyph::Operation => "Operation",
@@ -251,7 +257,7 @@ mod tests {
             };
             assert!(!named.is_empty());
         }
-        assert_eq!(ALL.len(), 16, "ALL must list every variant exactly once");
+        assert_eq!(ALL.len(), 17, "ALL must list every variant exactly once");
     }
 
     /// The table's reason for existing: a glyph that is not one cell wide

@@ -53,6 +53,8 @@ pub enum Hit {
     /// modal over what it covers, so this must not fall through to the region
     /// underneath.
     PopupInert,
+    /// A selectable row of the open **submenu** — `index` into its items.
+    PopupSubmenuItem { index: usize },
     /// Outside the open context menu, which dismisses it. The event is
     /// *consumed* by the dismissal and never applied to whatever it landed
     /// on (contract §7).
@@ -93,6 +95,14 @@ impl GroupRegion {
     }
 }
 
+/// The open submenu's rect and its item rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubmenuRegion {
+    pub rect: Rect,
+    /// `(item index, row rect)` for each visible submenu item.
+    pub items: Vec<(usize, Rect)>,
+}
+
 /// An open context menu's hit-testable parts, produced by the same `draw`
 /// pass that renders it (`popup::draw_menu`), so the map and the frame cannot
 /// disagree about where an item is.
@@ -104,10 +114,26 @@ pub struct PopupRegion {
     /// screen. Separators and the `…` affordances are deliberately absent, so
     /// no click can land on one.
     pub items: Vec<(usize, Rect)>,
+    /// The open submenu, when one is open.
+    pub submenu: Option<SubmenuRegion>,
 }
 
 impl PopupRegion {
     fn hit(&self, col: u16, row: u16) -> Option<Hit> {
+        // The submenu is drawn above the parent, so it is tested first —
+        // otherwise a submenu overlapping its parent would be unclickable.
+        if let Some(sub) = &self.submenu {
+            if contains(sub.rect, col, row) {
+                return Some(
+                    sub.items
+                        .iter()
+                        .find(|(_, rect)| contains(*rect, col, row))
+                        .map_or(Hit::PopupInert, |(index, _)| Hit::PopupSubmenuItem {
+                            index: *index,
+                        }),
+                );
+            }
+        }
         if !contains(self.rect, col, row) {
             return None;
         }
@@ -561,6 +587,7 @@ mod tests {
     fn map_with_popup() -> RegionMap {
         RegionMap {
             popup: Some(PopupRegion {
+                submenu: None,
                 rect: Rect::new(20, 3, 30, 6),
                 items: vec![
                     (0, Rect::new(21, 4, 28, 1)),
@@ -594,6 +621,48 @@ mod tests {
         // One cell outside the rect is a dismissal.
         assert_eq!(map.hit(50, 5), Hit::PopupOutside);
         assert_eq!(map.hit(19, 5), Hit::PopupOutside);
+    }
+
+    /// `map_with_popup`'s menu with an open submenu placed clear of the
+    /// parent's own rect.
+    fn map_with_submenu() -> RegionMap {
+        let mut map = map_with_popup();
+        map.popup.as_mut().unwrap().submenu = Some(SubmenuRegion {
+            rect: Rect::new(60, 3, 20, 4),
+            items: vec![(0, Rect::new(61, 4, 18, 1)), (1, Rect::new(61, 5, 18, 1))],
+        });
+        map
+    }
+
+    #[test]
+    fn a_point_on_a_submenu_item_row_hits_popup_submenu_item_with_its_index() {
+        let map = map_with_submenu();
+        assert_eq!(map.hit(65, 4), Hit::PopupSubmenuItem { index: 0 });
+        assert_eq!(map.hit(65, 5), Hit::PopupSubmenuItem { index: 1 });
+    }
+
+    #[test]
+    fn inside_the_submenu_rect_but_off_an_item_row_is_inert() {
+        let map = map_with_submenu();
+        // Row 6 is inside the submenu's rect (y 3..7) but past its one
+        // item row (y 5).
+        assert_eq!(map.hit(65, 6), Hit::PopupInert);
+    }
+
+    #[test]
+    fn the_submenu_is_tested_before_the_parent_menu_when_the_rects_overlap() {
+        let mut map = map_with_popup();
+        // Deliberately overlaps the parent menu's rect (20,3,30,6) and its
+        // own item-0 row (21,4,28,1) at the exact point under test.
+        map.popup.as_mut().unwrap().submenu = Some(SubmenuRegion {
+            rect: Rect::new(25, 4, 10, 3),
+            items: vec![(0, Rect::new(25, 4, 8, 1))],
+        });
+        assert_eq!(
+            map.hit(26, 4),
+            Hit::PopupSubmenuItem { index: 0 },
+            "the submenu wins even though the parent's own item 0 covers the same cell"
+        );
     }
 
     #[test]
