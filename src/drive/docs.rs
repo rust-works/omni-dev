@@ -24,3 +24,4 @@
 //! could not call them without widening that fence.
 
 pub mod client;
+pub mod types;
