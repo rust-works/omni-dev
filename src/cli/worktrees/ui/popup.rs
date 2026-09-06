@@ -22,19 +22,46 @@ use unicode_width::UnicodeWidthStr;
 
 use super::actions::{ActionKind, ConfirmPrompt};
 use super::glyph::{Glyph, GlyphMode};
+use super::keys::ChromeKey;
 use super::mouse::{PopupRegion, SubmenuRegion};
 
 /// What invoking a menu entry does.
 ///
-/// Only [`Self::Action`] exists today because it is the only variant with a
-/// caller: the tree-row menu, the `c` row-colour picker and the `:` palette
-/// all dispatch an [`ActionKind`]. #1602 Phase 3 adds `Chrome(ChromeKey)` and
-/// a `Ui(..)` variant for the tab-strip and terminal-grid menus, whose
-/// entries are not actions at all. Those are pure additions — every call site
-/// already speaks `MenuCommand`, so the field-type churn happens once, here.
+/// Three kinds, because a menu entry is not always an action. The tree-row
+/// menu dispatches [`ActionKind`]s; the tab-strip and terminal-grid menus
+/// (#1602 Phase 3) mostly re-use chords the chrome already implements; and a
+/// few entries exist only in a menu and have no key at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// A selection action — the same list the `a` menu and `:` palette use.
     Action(ActionKind),
+    /// A chord the chrome already handles, invoked from a menu instead of
+    /// from the keyboard. Routing these through the *existing* `ChromeKey`
+    /// dispatch rather than reimplementing them is what keeps a menu entry
+    /// and its shortcut from drifting apart.
+    Chrome(ChromeKey),
+    /// An entry with no chord behind it.
+    Ui(UiAction),
+}
+
+/// Menu-only commands: the ones with no [`ChromeKey`] and no [`ActionKind`].
+///
+/// Deliberately small. Anything here is reachable *only* from a menu, so each
+/// variant is a decision to add a capability the keyboard cannot reach — the
+/// opposite of the rest of this surface, where the menu is a second route to
+/// something that already had one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiAction {
+    /// Close every tab in this group except the clicked one.
+    CloseOtherTabs,
+    /// Close the tabs after the clicked one in this group.
+    CloseTabsToRight,
+    /// Select the whole scrollback of the focused grid.
+    SelectAll,
+    /// Drop the grid's selection without copying it.
+    ClearSelection,
+    /// Jump the grid back to the live edge.
+    ScrollToBottom,
 }
 
 /// One selectable entry — the command it dispatches and its display label.

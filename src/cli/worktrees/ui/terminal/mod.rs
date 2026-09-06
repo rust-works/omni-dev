@@ -311,6 +311,56 @@ impl TerminalTab {
         }
     }
 
+    /// Selects the entire scrollback and screen content. The selection spans
+    /// from the topmost scrollback line at column 0 to the last cell of the
+    /// last screen line, and can be extracted via `selection_to_string()`.
+    pub fn select_all(&self) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let mut term = handle.term.lock();
+        let grid = term.grid();
+
+        // Start at the topmost line of scrollback, column 0.
+        let history = grid.total_lines() - grid.screen_lines();
+        let start = Point::new(Line(-i32::try_from(history).unwrap_or(i32::MAX)), Column(0));
+
+        // End at the last cell of the last screen line.
+        let end = Point::new(
+            Line(i32::try_from(grid.screen_lines().saturating_sub(1)).unwrap_or(0)),
+            Column(grid.columns().saturating_sub(1)),
+        );
+
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+    }
+
+    /// Resets the display offset to the live edge, scrolling the viewport to
+    /// the bottom of the scrollback and live input area.
+    pub fn scroll_to_bottom(&self) {
+        self.scroll(Scroll::Bottom);
+    }
+
+    /// Returns the cursor's 0-based (column, line) position within the current
+    /// viewport, or `None` if there is no live terminal or the cursor is
+    /// scrolled out of view.
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        let handle = self.handle.as_ref()?;
+        let term = handle.term.lock();
+        let content = term.renderable_content();
+
+        if content.cursor.shape == CursorShape::Hidden {
+            return None;
+        }
+
+        let cursor = point_to_viewport(content.display_offset, content.cursor.point)?;
+        let col = u16::try_from(cursor.column.0).ok()?;
+        let row = u16::try_from(cursor.line).ok()?;
+
+        Some((col, row))
+    }
+
     /// Stops the PTY thread and reaps the child. The join (and the `Pty`
     /// drop that `SIGHUP`s the child) runs on a blocking thread so a slow
     /// exit never stalls the event loop.
@@ -811,6 +861,89 @@ mod tests {
                 g: 238,
                 b: 238
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn select_all_scroll_to_bottom_and_cursor_position_work_as_expected() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // The grid is 6 lines (`sh_tab`), so the output must exceed that or
+        // there is no scrollback at all and `PageUp` has nowhere to go — the
+        // reason an earlier three-line version of this script could never
+        // have passed. 30 lines guarantees history on any run.
+        let script = "i=1; while [ $i -le 30 ]; do printf 'line%d\\n' $i; \
+                      i=$((i+1)); done; \
+                      printf '\\033]2;test-title\\a'; \
+                      sleep 2";
+        let mut tab = sh_tab(script, tx);
+
+        // Wait for the output and title to be set.
+        pump(&mut tab, &mut rx, |_, t| {
+            t.title.as_deref() == Some("test-title")
+        })
+        .await;
+
+        // Give the emulator a moment to parse everything.
+        pump(&mut tab, &mut rx, |e, _| *e == TabEffect::Redraw).await;
+
+        // Test select_all: should select all content including scrollback.
+        tab.select_all();
+        let selected = tab.selection_to_string();
+        assert!(
+            selected.is_some(),
+            "select_all must create a selection with content"
+        );
+        let selected_text = selected.unwrap();
+        assert!(
+            selected_text.contains("line1") && selected_text.contains("line2"),
+            "select_all must select scrollback content: {selected_text}"
+        );
+
+        // Test scroll_to_bottom: scroll up first, then reset to bottom.
+        tab.scroll(Scroll::PageUp);
+        let term = tab.handle.as_ref().unwrap().term.lock();
+        let offset_after_scroll_up = term.grid().display_offset();
+        drop(term);
+        assert!(
+            offset_after_scroll_up > 0,
+            "page up must increase display offset"
+        );
+
+        tab.scroll_to_bottom();
+        let term = tab.handle.as_ref().unwrap().term.lock();
+        let offset_after_scroll_to_bottom = term.grid().display_offset();
+        drop(term);
+        assert_eq!(
+            offset_after_scroll_to_bottom, 0,
+            "scroll_to_bottom must reset display offset to 0"
+        );
+
+        // Test cursor_position: should return valid coordinates while alive.
+        let pos = tab.cursor_position();
+        assert!(
+            pos.is_some(),
+            "cursor_position must return Some for a live terminal"
+        );
+        if let Some((col, row)) = pos {
+            // The cursor should be at a reasonable position within the grid.
+            assert!(col < 40, "cursor column must be within grid width");
+            assert!(row < 6, "cursor row must be within grid height");
+        }
+
+        // Test cursor_position on a shutdown tab: should return None.
+        tab.shutdown();
+        let pos_after_shutdown = tab.cursor_position();
+        assert!(
+            pos_after_shutdown.is_none(),
+            "cursor_position must return None when tab is shut down"
+        );
+
+        // select_all on a dead tab (no handle) is a no-op, not a panic.
+        tab.select_all();
+        assert!(
+            tab.selection_to_string().is_none(),
+            "a shutdown tab has no handle to select in"
         );
     }
 

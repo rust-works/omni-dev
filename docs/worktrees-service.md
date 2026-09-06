@@ -441,9 +441,13 @@ began in, and only the terminal grid can be selected at all (the tree,
 borders and status bar have no selection model, so the chrome can never end
 up on the clipboard). A child that requested mouse reporting (`claude`,
 `vim`, `less`) receives the mouse instead of the TUI, with `⌥` held taking
-it back for selection; the host terminal's own **shift-drag** still bypasses
-the app entirely in terminals that honour that convention (iTerm2, kitty,
-WezTerm, Ghostty), which is the escape hatch for selecting across panes.
+it back for selection. Most terminals also keep a gesture of their own that
+bypasses the app entirely and does host-side selection — the escape hatch for
+selecting across panes — but **which gesture varies by terminal**: measured on
+macOS, Ghostty keeps shift-drag, **iTerm2 keeps option-drag** (and forwards
+shift-drag to the app), and the VS Code integrated terminal keeps neither, so
+there `⌥` is the way to reclaim the mouse. The UI deliberately does not detect
+or special-case any of them.
 Phase 4b turned the terminal side into a **stack of tab groups**. `alt-t`
 opens a tab in the focused group and `alt-s` splits a new group below it;
 `alt-[`/`alt-]` cycle tabs, `alt-1`…`alt-9` pick one, `alt-↑`/`alt-↓` move
