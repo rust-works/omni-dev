@@ -67,6 +67,10 @@ struct App {
     panes: panes::PaneLayout,
     /// `q` with a live child asks first; the answer lands here.
     quit_confirm: bool,
+    /// Set by a menu-invoked *Quit*. A key can quit by returning `true` from
+    /// `handle_key`; a menu is dispatched from the mouse path, which has no
+    /// such channel, so the loop checks this instead.
+    quit_requested: bool,
     /// A one-line message for the status bar, cleared on the next key.
     notice: Option<String>,
     pty_tx: mpsc::UnboundedSender<(TabId, TermEvent)>,
@@ -88,6 +92,9 @@ struct App {
     /// entries act on the tab that was right-clicked, which is not
     /// necessarily the active one.
     menu_tab: Option<panes::TabAddr>,
+    /// The splitter a layout context menu was opened on — that menu's
+    /// subject, the boundary's analogue of `menu_tab`.
+    menu_splitter: Option<usize>,
     /// The drag in progress, if any, and the region it is clamped to.
     drag: DragOrigin,
     clicks: mouse::ClickTracker,
@@ -192,6 +199,7 @@ pub async fn run(
         focus: Focus::Tree,
         panes: panes::PaneLayout::default(),
         quit_confirm: false,
+        quit_requested: false,
         notice: None,
         pty_tx,
         commands,
@@ -201,6 +209,7 @@ pub async fn run(
         regions: RegionMap::default(),
         terminal_area: None,
         menu_tab: None,
+        menu_splitter: None,
         drag: DragOrigin::None,
         clicks: mouse::ClickTracker::default(),
     };
@@ -264,6 +273,9 @@ pub async fn run(
                     Some(Ok(Event::Mouse(mouse))) => {
                         if handle_mouse(&mut app, &view, &dispatcher, mouse).await {
                             dirty = true;
+                        }
+                        if app.quit_requested {
+                            break;
                         }
                     }
                     Some(Ok(Event::Paste(text))) => {
@@ -696,7 +708,33 @@ async fn handle_mouse(
                     strip_mouse_down(app, group, tab, button, (col, row))
                 }
                 Hit::Splitter { index } => {
-                    app.drag = DragOrigin::Splitter { index };
+                    // Only the left button resizes. Before #1602 the button
+                    // was never checked here, so a right-drag on a boundary
+                    // resized the pair — the latent bug the issue spotted.
+                    match button {
+                        MouseButton::Left => {
+                            app.drag = DragOrigin::Splitter { index };
+                            false
+                        }
+                        MouseButton::Right => {
+                            let mut m =
+                                popup::ActionMenu::with_entries("Layout", menu::splitter_menu());
+                            m.anchor = popup::Anchor::At { col, row };
+                            app.menu = Some(m);
+                            app.menu_splitter = Some(index);
+                            true
+                        }
+                        MouseButton::Middle => false,
+                    }
+                }
+                Hit::Chrome => {
+                    if button == MouseButton::Right {
+                        let mut m = popup::ActionMenu::with_entries("Menu", menu::global_menu());
+                        m.anchor = popup::Anchor::At { col, row };
+                        app.menu = Some(m);
+                        app.menu_splitter = None;
+                        return true;
+                    }
                     false
                 }
                 // The popup arms are unreachable here: `popup_mouse_enabled`
@@ -705,8 +743,7 @@ async fn handle_mouse(
                 Hit::PopupItem { .. }
                 | Hit::PopupSubmenuItem { .. }
                 | Hit::PopupInert
-                | Hit::PopupOutside
-                | Hit::Chrome => false,
+                | Hit::PopupOutside => false,
             }
         }
         MouseEventKind::Drag(button) => match app.drag {
@@ -1000,6 +1037,36 @@ fn run_ui_action(app: &mut App, ui: popup::UiAction) {
         popup::UiAction::ScrollToBottom => {
             if let Some(tab) = app.panes.active_tab() {
                 tab.scroll_to_bottom();
+            }
+        }
+        popup::UiAction::CloseGroupAbove | popup::UiAction::CloseGroupBelow => {
+            let Some(splitter) = app.menu_splitter else {
+                return;
+            };
+            // Splitter `n` sits between groups `n` and `n + 1`.
+            let group = if ui == popup::UiAction::CloseGroupAbove {
+                splitter
+            } else {
+                splitter + 1
+            };
+            let closed = app.panes.close_group(group);
+            let still_open = app.panes.open_worktrees();
+            for worktree in closed {
+                if !still_open.contains(&worktree) {
+                    let _ = app.commands.send(HubCommand::ClearOpenTab(worktree));
+                }
+            }
+            if app.panes.is_empty() {
+                app.focus = Focus::Tree;
+            }
+        }
+        // Routes through the same confirm gate `q` uses, rather than a second
+        // quit path: a live child still gets asked about.
+        popup::UiAction::Quit => {
+            if app.panes.any_alive() {
+                app.quit_confirm = true;
+            } else {
+                app.quit_requested = true;
             }
         }
     }
@@ -1960,12 +2027,14 @@ mod tests {
             prompt: None,
             reported_visible: Vec::new(),
             quit_confirm: false,
+            quit_requested: false,
             notice: None,
             pty_tx,
             commands,
             regions: RegionMap::default(),
             terminal_area: None,
             menu_tab: None,
+            menu_splitter: None,
             drag: DragOrigin::None,
             clicks: mouse::ClickTracker::default(),
         };

@@ -62,6 +62,12 @@ pub enum UiAction {
     ClearSelection,
     /// Jump the grid back to the live edge.
     ScrollToBottom,
+    /// Close the pane group above the splitter that was clicked.
+    CloseGroupAbove,
+    /// Close the pane group below the splitter that was clicked.
+    CloseGroupBelow,
+    /// Quit, via the same confirm gate `q` uses.
+    Quit,
 }
 
 /// One selectable entry — the command it dispatches and its display label.

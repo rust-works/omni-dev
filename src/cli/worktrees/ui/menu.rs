@@ -115,6 +115,50 @@ pub fn strip_menu(groups: usize, group: usize, tabs: usize, tab: usize) -> Vec<M
     entries
 }
 
+/// The menu for the boundary between two pane groups.
+///
+/// `index` is the splitter's index, so the groups it sits between are
+/// `index` and `index + 1` — which is why the two close entries can always
+/// be offered here, unlike the strip menu's move-to-group pair.
+pub fn splitter_menu() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::Item(MenuItem::new(
+            MenuCommand::Chrome(ChromeKey::ResetLayout),
+            "Reset Layout",
+        )),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::new(
+            MenuCommand::Ui(UiAction::CloseGroupAbove),
+            "Close Group Above",
+        )),
+        MenuEntry::Item(MenuItem::new(
+            MenuCommand::Ui(UiAction::CloseGroupBelow),
+            "Close Group Below",
+        )),
+    ]
+}
+
+/// The menu for chrome with no subject of its own — empty tree space below
+/// the last row, and the status bar.
+///
+/// Deliberately tiny. There is no row, tab or grid under the pointer, so
+/// anything here must make sense with no subject at all; an entry that needs
+/// one belongs on the surface that has one.
+pub fn global_menu() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::Item(MenuItem::new(
+            MenuCommand::Chrome(ChromeKey::NewShellTab),
+            "New Shell Tab",
+        )),
+        MenuEntry::Item(MenuItem::new(
+            MenuCommand::Chrome(ChromeKey::ResetLayout),
+            "Reset Layout",
+        )),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::new(MenuCommand::Ui(UiAction::Quit), "Quit")),
+    ]
+}
+
 /// The terminal-grid menu.
 ///
 /// *Copy* is the one entry that is **disabled rather than hidden**: it is the
@@ -155,6 +199,25 @@ pub fn grid_menu(has_selection: bool) -> Vec<MenuEntry> {
             MenuCommand::Chrome(ChromeKey::CloseTab),
             "Close Tab",
         )),
+    ]
+}
+
+/// Every menu this module can build, for the structural tests below.
+///
+/// Kept next to the builders on purpose: a new surface menu that is not
+/// listed here silently escapes both the separator-shape check and the
+/// keyboard-reachability check, so adding one is meant to be a visible edit.
+#[cfg(test)]
+fn every_menu_shape() -> Vec<(&'static str, Vec<MenuEntry>)> {
+    vec![
+        ("strip: first group, first of three", strip_menu(3, 0, 3, 0)),
+        ("strip: middle group, middle tab", strip_menu(3, 1, 3, 1)),
+        ("strip: last group, last tab", strip_menu(3, 2, 3, 2)),
+        ("strip: lone group, lone tab", strip_menu(1, 0, 1, 0)),
+        ("grid: with a selection", grid_menu(true)),
+        ("grid: without a selection", grid_menu(false)),
+        ("splitter", splitter_menu()),
+        ("global", global_menu()),
     ]
 }
 
@@ -313,5 +376,84 @@ mod tests {
             branch: None,
             sessions: Vec::new(),
         }]));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod parity_tests {
+    use super::*;
+
+    /// Everything a menu can dispatch must also be reachable without a mouse.
+    ///
+    /// Asserted structurally rather than case by case, per #1602 §6: each
+    /// command is either an [`ActionKind`] (reachable from the `a` menu and
+    /// the `:` palette), a [`ChromeKey`] (reachable from its own chord), or a
+    /// [`UiAction`] — and `UiAction` is the *only* kind with no keyboard
+    /// route of its own, which is why it is deliberately small and why every
+    /// variant is enumerated here. Adding one forces a decision: give it a
+    /// chord, or accept in writing that it is menu-only.
+    ///
+    /// Menu-only is acceptable — the menu itself is opened by `alt-m`/`F10`,
+    /// so no *menu* is mouse-only even when an entry has no direct chord.
+    /// What this test forbids is that set growing silently.
+    #[test]
+    fn every_menu_command_is_reachable_without_a_mouse() {
+        // The complete set of commands with no chord of their own. Update
+        // this deliberately, never to make the test pass.
+        let menu_only = [
+            UiAction::CloseOtherTabs,
+            UiAction::CloseTabsToRight,
+            UiAction::SelectAll,
+            UiAction::ClearSelection,
+            UiAction::ScrollToBottom,
+            UiAction::CloseGroupAbove,
+            UiAction::CloseGroupBelow,
+            UiAction::Quit,
+        ];
+        for (name, entries) in every_menu_shape() {
+            for entry in &entries {
+                let MenuEntry::Item(item) = entry else {
+                    continue;
+                };
+                match item.command {
+                    // An Action is reachable from the `a` menu and the `:`
+                    // palette; a Chrome command from its own chord. Both are
+                    // keyboard-reachable by construction, so neither needs a
+                    // check — only `Ui` can lack a route.
+                    MenuCommand::Action(_) | MenuCommand::Chrome(_) => {}
+                    MenuCommand::Ui(ui) => assert!(
+                        menu_only.contains(&ui),
+                        "{name}: {ui:?} has no chord and is not in the acknowledged \
+                         menu-only set — give it one or add it deliberately"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// No menu may open or close with a rule, or show two in a row — the
+    /// classic bug when entries are hidden conditionally.
+    #[test]
+    fn no_menu_shape_has_stray_separators() {
+        for (name, entries) in every_menu_shape() {
+            assert!(
+                !matches!(entries.first(), Some(MenuEntry::Separator)),
+                "{name}: leading separator"
+            );
+            assert!(
+                !matches!(entries.last(), Some(MenuEntry::Separator)),
+                "{name}: trailing separator"
+            );
+            for pair in entries.windows(2) {
+                assert!(
+                    !matches!(
+                        (&pair[0], &pair[1]),
+                        (MenuEntry::Separator, MenuEntry::Separator)
+                    ),
+                    "{name}: two adjacent separators"
+                );
+            }
+        }
     }
 }
