@@ -87,3 +87,212 @@ async fn run_create(
     println!("{}", describe(&outcome));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    /// A `DriveClient` pointed at `server`, whose token endpoint is already
+    /// mocked. Callers must additionally point `SHEETS_API_URL` at the same
+    /// server, since `run_create` derives its `SheetsClient` internally from
+    /// the real process environment.
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    fn mount_folder(id: &str) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id,
+                    "mimeType": "application/vnd.google-apps.folder", "parents": [],
+                })),
+            )
+    }
+
+    fn opts(dry_run: bool) -> CreateOptions {
+        CreateOptions {
+            name: "Budget".to_string(),
+            parent_folder_id: "parent-1".to_string(),
+            values: Vec::new(),
+            input: InputArg::UserEntered.into(),
+            dry_run,
+        }
+    }
+
+    fn allow_create_rule_settings() -> serde_json::Value {
+        serde_json::json!({
+            "rules": [{
+                "folder_id": "parent-1",
+                "recursive": true,
+                "allow": ["create"],
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn run_create_reports_blocked_by_default_policy() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_folder("parent-1").mount(&server).await;
+        // No settings written, so there is no configured account: the gate
+        // defaults to deny and `files.create` must never be called.
+
+        run_create(&client, &opts(false), &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_create_allowed_creates_and_renders_table_output() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[("write_permissions", allow_create_rule_settings())],
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "new-sheet", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        run_create(&client, &opts(false), &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_create_json_output_short_circuits_before_the_table_line() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_folder("parent-1").mount(&server).await;
+
+        run_create(&client, &opts(false), &OutputFormat::Json)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_command_execute_with_no_values_dispatches_through_run_create() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_folder("parent-1").mount(&server).await;
+
+        let cmd = CreateCommand {
+            name: "Budget".to_string(),
+            parent: "parent-1".to_string(),
+            values: None,
+            values_format: ValuesFormat::Auto,
+            input: InputArg::UserEntered,
+            dry_run: false,
+            output: OutputFormat::Table,
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_command_execute_reads_values_from_a_file() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[("write_permissions", allow_create_rule_settings())],
+        )
+        .unwrap();
+
+        let values_path = dir.path().join("cells.csv");
+        std::fs::write(&values_path, "a,b\n").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "new-sheet", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"updatedCells": 2})),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = CreateCommand {
+            name: "Budget".to_string(),
+            parent: "parent-1".to_string(),
+            values: Some(values_path.to_str().unwrap().to_string()),
+            values_format: ValuesFormat::Auto,
+            input: InputArg::UserEntered,
+            dry_run: false,
+            output: OutputFormat::Table,
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+}

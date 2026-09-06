@@ -1723,6 +1723,48 @@ mod tests {
     }
 
     #[test]
+    fn build_drive_mutation_record_includes_range_and_every_sheets_count() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-write",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "written".to_string(),
+                removed_principals: vec!["bob@example.com".to_string()],
+                range: Some("A1:B2".to_string()),
+                updated_range: Some("'Q1'!A1:B2".to_string()),
+                updated_rows: Some(3),
+                updated_columns: Some(2),
+                updated_cells: Some(6),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("removed_principals").map(String::as_str),
+            Some("bob@example.com")
+        );
+        assert_eq!(rec.context.get("range").map(String::as_str), Some("A1:B2"));
+        assert_eq!(
+            rec.context.get("updated_range").map(String::as_str),
+            Some("'Q1'!A1:B2")
+        );
+        assert_eq!(
+            rec.context.get("updated_rows").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            rec.context.get("updated_columns").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            rec.context.get("updated_cells").map(String::as_str),
+            Some("6")
+        );
+    }
+
+    #[test]
     fn record_kind_drive_mutation_serializes_as_drivemutation_and_round_trips() {
         let rec = build_drive_mutation_record(
             DriveMutationOutcome {

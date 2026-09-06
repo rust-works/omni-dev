@@ -577,6 +577,9 @@ mod tests {
             outcome.result,
             WriteResult::RefusedNotASpreadsheet { .. }
         ));
+        let text = describe(&outcome, WriteVerb::Append);
+        assert!(text.contains("is not a Google Sheet"), "{text}");
+        assert!(text.contains("drive sheets append"), "{text}");
     }
 
     #[tokio::test]
@@ -639,6 +642,39 @@ mod tests {
             matches!(outcome.result, WriteResult::Blocked { decided_by: None }),
             "{:?}",
             outcome.result
+        );
+        let text = describe(&outcome, WriteVerb::Write);
+        assert!(
+            text.contains("refused by default policy (no matching rule)"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let deny_rule = FolderPermissionRule {
+            folder_id: "parent-1".to_string(),
+            recursive: true,
+            allow: HashSet::default(),
+            deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
+        };
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Write, false),
+            &[deny_rule],
+        )
+        .await;
+        let text = describe(&outcome, WriteVerb::Write);
+        assert!(
+            text.contains("refused by rule on folder parent-1"),
+            "{text}"
         );
     }
 
@@ -1017,6 +1053,83 @@ mod tests {
         assert_eq!(WriteVerb::Write.log_operation(), "sheets-write");
         assert_eq!(WriteVerb::Append.log_operation(), "sheets-append");
         assert_eq!(WriteVerb::Clear.log_operation(), "sheets-clear");
+    }
+
+    #[test]
+    fn labels_are_distinct_present_tense_verbs() {
+        assert_eq!(WriteVerb::Write.label(), "write");
+        assert_eq!(WriteVerb::Append.label(), "append");
+        assert_eq!(WriteVerb::Clear.label(), "clear");
+    }
+
+    #[test]
+    fn log_status_covers_every_variant() {
+        assert_eq!(
+            WriteResult::WouldWrite {
+                rows: 0,
+                columns: 0
+            }
+            .log_status(),
+            "would-write"
+        );
+        assert_eq!(
+            WriteResult::RefusedNotASpreadsheet {
+                mime_type: String::new()
+            }
+            .log_status(),
+            "refused-not-a-spreadsheet"
+        );
+        assert_eq!(
+            WriteResult::RefusedShortcut.log_status(),
+            "refused-shortcut"
+        );
+        assert_eq!(
+            WriteResult::RefusedNoVisibleParents.log_status(),
+            "refused-no-visible-parents"
+        );
+        assert_eq!(
+            WriteResult::Blocked { decided_by: None }.log_status(),
+            "blocked"
+        );
+        assert_eq!(
+            WriteResult::Written {
+                updated_range: None,
+                updated_rows: None,
+                updated_columns: None,
+                updated_cells: None,
+            }
+            .log_status(),
+            "written"
+        );
+        assert_eq!(
+            WriteResult::Failed {
+                detail: String::new()
+            }
+            .log_status(),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = WriteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            range: Some("A1:B2".to_string()),
+            resolved_folder_id: Some("parent-1".to_string()),
+            result: WriteResult::Written {
+                updated_range: Some("A1:B2".to_string()),
+                updated_rows: Some(1),
+                updated_columns: Some(2),
+                updated_cells: Some(2),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "written");
     }
 
     #[test]

@@ -416,6 +416,10 @@ mod tests {
                 seeded_cells: None,
             }
         );
+        assert_eq!(
+            describe(&outcome),
+            "Created: 'Budget' (new-sheet) in parent-1"
+        );
     }
 
     #[tokio::test]
@@ -450,6 +454,10 @@ mod tests {
                 file_id: "new-sheet".to_string(),
                 seeded_cells: Some(4),
             }
+        );
+        assert_eq!(
+            describe(&outcome),
+            "Created: 'Budget' (new-sheet) in parent-1, seeded 4 cell(s)"
         );
     }
 
@@ -511,6 +519,46 @@ mod tests {
             outcome.result,
             CreateResult::Blocked { decided_by: None }
         ));
+        assert_eq!(
+            describe(&outcome),
+            "Blocked: 'Budget' in parent-1 — refused by default policy (no matching rule)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
+        let deny_rule = FolderPermissionRule {
+            folder_id: "parent-1".to_string(),
+            recursive: true,
+            allow: HashSet::default(),
+            deny: std::iter::once(DriveOperation::Create).collect(),
+        };
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_folder("parent-1").mount(&server).await;
+        let outcome = create(&drive, &sheets, &opts(Vec::new(), false), &[deny_rule]).await;
+        let text = describe(&outcome);
+        assert!(
+            text.contains("refused by rule on folder parent-1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_files_create_call_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let outcome = create(&drive, &sheets, &opts(Vec::new(), false), &[allow_rule()]).await;
+        assert!(matches!(outcome.result, CreateResult::Failed { .. }));
+        let text = describe(&outcome);
+        assert!(text.starts_with("Failed: 'Budget' in parent-1"), "{text}");
     }
 
     #[tokio::test]
@@ -532,6 +580,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dry_run_with_no_values_omits_the_seed_dimensions() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let outcome = create(&drive, &sheets, &opts(Vec::new(), true), &[allow_rule()]).await;
+        assert_eq!(
+            outcome.result,
+            CreateResult::WouldCreate {
+                rows: 0,
+                columns: 0
+            }
+        );
+        assert_eq!(
+            describe(&outcome),
+            "Would create: spreadsheet 'Budget' in parent-1"
+        );
+    }
+
+    #[tokio::test]
     async fn ancestor_chain_fetch_failure_produces_failed_not_allow() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -543,6 +611,64 @@ mod tests {
 
         let outcome = create(&drive, &sheets, &opts(Vec::new(), false), &[allow_rule()]).await;
         assert!(matches!(outcome.result, CreateResult::Failed { .. }));
+        assert!(describe(&outcome).starts_with("Failed: 'Budget' in parent-1"));
+    }
+
+    #[test]
+    fn log_status_covers_every_variant() {
+        assert_eq!(
+            CreateResult::WouldCreate {
+                rows: 0,
+                columns: 0
+            }
+            .log_status(),
+            "would-create"
+        );
+        assert_eq!(
+            CreateResult::Blocked { decided_by: None }.log_status(),
+            "blocked"
+        );
+        assert_eq!(
+            CreateResult::Created {
+                file_id: "a".to_string(),
+                seeded_cells: None
+            }
+            .log_status(),
+            "created"
+        );
+        assert_eq!(
+            CreateResult::CreatedValuesFailed {
+                file_id: "a".to_string(),
+                detail: String::new()
+            }
+            .log_status(),
+            "created-values-failed"
+        );
+        assert_eq!(
+            CreateResult::Failed {
+                detail: String::new()
+            }
+            .log_status(),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = CreateOutcome {
+            name: "Budget".to_string(),
+            parent_folder_id: "parent-1".to_string(),
+            result: CreateResult::Created {
+                file_id: "new-sheet".to_string(),
+                seeded_cells: None,
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "created");
     }
 
     #[test]

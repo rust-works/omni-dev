@@ -492,6 +492,51 @@ mod tests {
         assert!(err.to_string().contains("per-request cap"), "{err}");
     }
 
+    // ── values.update / values.append / values.clear ──────────────────
+
+    #[test]
+    fn update_url_sends_the_value_input_option() {
+        let url =
+            build_values_update_url(BASE, "s", "A1:B2", ValueInputOption::UserEntered).unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/s/values/A1:B2");
+        let input = url
+            .query_pairs()
+            .find(|(k, _)| k == "valueInputOption")
+            .map(|(_, v)| v.to_string());
+        assert_eq!(input, Some("USER_ENTERED".to_string()));
+    }
+
+    #[test]
+    fn update_url_percent_encodes_a_quoted_sheet_title() {
+        let url =
+            build_values_update_url(BASE, "s", "'My Sheet'!A1", ValueInputOption::Raw).unwrap();
+        assert!(url.path().contains("'My%20Sheet'"), "{url}");
+    }
+
+    #[test]
+    fn append_url_keeps_the_colon_suffix_and_sets_insert_rows() {
+        let url =
+            build_values_append_url(BASE, "s", "A1:B2", ValueInputOption::UserEntered).unwrap();
+        assert!(url.as_str().contains("/values/A1:B2:append"), "{url}");
+        let insert_data_option = url
+            .query_pairs()
+            .find(|(k, _)| k == "insertDataOption")
+            .map(|(_, v)| v.to_string());
+        assert_eq!(insert_data_option, Some("INSERT_ROWS".to_string()));
+        let input = url
+            .query_pairs()
+            .find(|(k, _)| k == "valueInputOption")
+            .map(|(_, v)| v.to_string());
+        assert_eq!(input, Some("USER_ENTERED".to_string()));
+    }
+
+    #[test]
+    fn clear_url_keeps_the_colon_suffix_and_sends_no_query() {
+        let url = build_values_clear_url(BASE, "s", "A1:B2").unwrap();
+        assert!(url.as_str().contains("/values/A1:B2:clear"), "{url}");
+        assert!(url.query().is_none(), "{url}");
+    }
+
     // ── base URL handling ──────────────────────────────────────────────
 
     #[test]

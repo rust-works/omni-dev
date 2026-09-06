@@ -441,6 +441,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_create() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::Create(sheets::create::CreateCommand {
+                name: "Budget".to_string(),
+                parent: "parent-1".to_string(),
+                values: None,
+                values_format: sheets::values::ValuesFormat::Auto,
+                input: sheets::write::InputArg::UserEntered,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // Like `clear`, this reaches the engine (no `--values` to fail
+        // reading first), and `create` never returns `Err` either — every
+        // failure is a `CreateResult` variant (ADR-0070 §10, ADR-0071 §12).
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),

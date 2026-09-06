@@ -176,6 +176,30 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
+    #[test]
+    fn operation_arg_maps_onto_every_drive_operation() {
+        assert_eq!(
+            DriveOperation::from(OperationArg::Read),
+            DriveOperation::Read
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Create),
+            DriveOperation::Create
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Upload),
+            DriveOperation::Upload
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::Edit),
+            DriveOperation::Edit
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::SheetsWrite),
+            DriveOperation::SheetsWrite
+        );
+    }
+
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
             client_id: "client-1".to_string(),
