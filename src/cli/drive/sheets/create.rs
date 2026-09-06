@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::drive::format::{output_as, OutputFormat};
+use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::cli::drive::helpers;
 use crate::cli::drive::sheets::values::ValuesFormat;
 use crate::cli::drive::sheets::write::{read_values, InputArg};
@@ -84,7 +84,10 @@ async fn run_create(
     if output_as(&outcome, output)? {
         return Ok(());
     }
-    println!("{}", describe(&outcome));
+    // Sanitized on the whole rendered line, as in `sheets write`: the
+    // line interpolates a server-supplied file id, an API error detail
+    // and the deciding rule's id.
+    println!("{}", sanitize_for_terminal(&describe(&outcome)));
     Ok(())
 }
 
