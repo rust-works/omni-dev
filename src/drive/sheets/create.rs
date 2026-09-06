@@ -285,7 +285,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         CreateResult::Blocked { decided_by } => decided_by.as_ref(),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
     let updated_cells = match &outcome.result {
         CreateResult::Created { seeded_cells, .. } => *seeded_cells,
         _ => None,
@@ -297,8 +297,9 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         file_name: outcome.name.clone(),
         status: outcome.result.log_status().to_string(),
         resolved_folder_id: Some(outcome.parent_folder_id.clone()),
-        decided_by_folder_id,
-        decided_by_depth,
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
         updated_cells,
         error,
         duration,
@@ -321,8 +322,10 @@ pub fn describe(outcome: &CreateOutcome) -> String {
         ),
         CreateResult::Blocked { decided_by } => match decided_by {
             Some(rule) => format!(
-                "Blocked: '{name}' in {parent} — refused by rule on folder {} (depth {})",
-                rule.folder_id, rule.depth
+                "Blocked: '{name}' in {parent} — refused by rule on {} {}{}",
+                rule.kind_label(),
+                rule.id(),
+                rule.depth_suffix()
             ),
             None => format!(
                 "Blocked: '{name}' in {parent} — refused by default policy (no matching rule)"
@@ -410,7 +413,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: HashSet::default(),
@@ -534,7 +538,8 @@ mod tests {
         // No PUT mock: a seed attempt would surface as Failed, not Blocked.
 
         let rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
@@ -598,7 +603,8 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
         let deny_rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::Create).collect(),

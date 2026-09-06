@@ -43,29 +43,38 @@ fn run_show(rules: &[FolderPermissionRule], output: &OutputFormat) -> Result<()>
     render_rules_table(rules, &mut handle)
 }
 
-/// Renders rules as an aligned text table: `FOLDER_ID | RECURSIVE | ALLOW |
-/// DENY`. An empty input prints a message explaining that every write is
-/// refused everywhere until a rule is configured.
+/// Renders rules as an aligned text table: `SCOPE | TARGET_ID | RECURSIVE
+/// | ALLOW | DENY`. An empty input prints a message explaining that every
+/// write is refused everywhere until a rule is configured.
+///
+/// `RECURSIVE` renders `-` for a file rule rather than `false`: a file has
+/// no descendants, so `false` would imply the column means something there
+/// (issue #1612).
 fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Result<()> {
     if rules.is_empty() {
         writeln!(
             out,
             "No write-permission rules configured for this account — every \
-             create/upload/edit is refused everywhere. Add rules under \
+             create/upload/edit/sheets-write is refused everywhere. Add rules under \
              drive.accounts.<name>.write_permissions.rules in \
-             ~/.omni-dev/settings.json."
+             ~/.omni-dev/settings.json, keyed on either a folder_id or a file_id."
         )
         .context("Failed to write empty-table message")?;
         return Ok(());
     }
 
+    let scopes: Vec<&str> = rules.iter().map(rule_scope).collect();
+    let scope_width = "SCOPE"
+        .len()
+        .max(scopes.iter().map(|s| s.len()).max().unwrap_or(0));
     let ids: Vec<String> = rules
         .iter()
-        .map(|r| sanitize_for_terminal(&r.folder_id))
+        .map(|r| sanitize_for_terminal(rule_target_id(r)))
         .collect();
-    let id_width = "FOLDER_ID"
+    let id_width = "TARGET_ID"
         .len()
         .max(ids.iter().map(String::len).max().unwrap_or(0));
+    let recursives: Vec<String> = rules.iter().map(format_recursive).collect();
     let allow_strings: Vec<String> = rules.iter().map(|r| format_op_set(&r.allow)).collect();
     let allow_width = "ALLOW"
         .len()
@@ -77,19 +86,48 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
 
     writeln!(
         out,
-        "{:<id_width$}  RECURSIVE  {:<allow_width$}  {:<deny_width$}",
-        "FOLDER_ID", "ALLOW", "DENY"
+        "{:<scope_width$}  {:<id_width$}  RECURSIVE  {:<allow_width$}  {:<deny_width$}",
+        "SCOPE", "TARGET_ID", "ALLOW", "DENY"
     )
     .context("Failed to write header row")?;
-    for (i, rule) in rules.iter().enumerate() {
+    for i in 0..rules.len() {
         writeln!(
             out,
-            "{:<id_width$}  {:<9}  {:<allow_width$}  {:<deny_width$}",
-            ids[i], rule.recursive, allow_strings[i], deny_strings[i],
+            "{:<scope_width$}  {:<id_width$}  {:<9}  {:<allow_width$}  {:<deny_width$}",
+            scopes[i], ids[i], recursives[i], allow_strings[i], deny_strings[i],
         )
         .context("Failed to write rule row")?;
     }
     Ok(())
+}
+
+/// `"folder"` or `"file"` — which id this rule keys on.
+///
+/// Deserialization guarantees exactly one is set, so the fallback is
+/// unreachable for any rule that came from a settings file.
+fn rule_scope(rule: &FolderPermissionRule) -> &'static str {
+    if rule.file_id.is_some() {
+        "file"
+    } else {
+        "folder"
+    }
+}
+
+/// The id this rule keys on, whichever kind it is.
+fn rule_target_id(rule: &FolderPermissionRule) -> &str {
+    rule.file_id
+        .as_deref()
+        .or(rule.folder_id.as_deref())
+        .unwrap_or("-")
+}
+
+/// `true`/`false` for a folder rule, `-` for a file rule.
+fn format_recursive(rule: &FolderPermissionRule) -> String {
+    if rule.file_id.is_some() {
+        "-".to_string()
+    } else {
+        rule.recursive.to_string()
+    }
 }
 
 /// Renders an operation set as a stable, comma-joined, alphabetically
@@ -113,7 +151,8 @@ mod tests {
 
     fn sample_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "folder-1".to_string(),
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: [DriveOperation::Create, DriveOperation::Upload]
                 .into_iter()
@@ -137,7 +176,8 @@ mod tests {
         let mut buf = Vec::new();
         render_rules_table(&rules, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("FOLDER_ID"));
+        assert!(out.contains("SCOPE"));
+        assert!(out.contains("TARGET_ID"));
         assert!(out.contains("RECURSIVE"));
         assert!(out.contains("ALLOW"));
         assert!(out.contains("DENY"));
@@ -150,7 +190,8 @@ mod tests {
     #[test]
     fn render_table_uses_dash_for_empty_op_sets() {
         let rules = [FolderPermissionRule {
-            folder_id: "folder-1".to_string(),
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::collections::HashSet::default(),
             deny: std::collections::HashSet::default(),
@@ -164,7 +205,8 @@ mod tests {
     #[test]
     fn render_table_strips_control_bytes_from_folder_id() {
         let rules = [FolderPermissionRule {
-            folder_id: "fo\rlder\x1b[31m".to_string(),
+            folder_id: Some("fo\rlder\x1b[31m".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::collections::HashSet::default(),
             deny: std::collections::HashSet::default(),
@@ -194,5 +236,56 @@ mod tests {
     #[test]
     fn run_show_json_path_returns_ok() {
         run_show(&[sample_rule()], &OutputFormat::Json).unwrap();
+    }
+
+    // ── file-id rules (issue #1612) ────────────────────────────────────
+
+    fn sample_file_rule() -> FolderPermissionRule {
+        FolderPermissionRule::file("sheet-1").allowing([DriveOperation::SheetsWrite])
+    }
+
+    #[test]
+    fn render_table_labels_each_rule_with_its_scope() {
+        let rules = [sample_rule(), sample_file_rule()];
+        let mut buf = Vec::new();
+        render_rules_table(&rules, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("SCOPE"), "{out}");
+        assert!(out.contains("TARGET_ID"), "{out}");
+        assert!(out.contains("folder"), "{out}");
+        assert!(out.contains("file"), "{out}");
+        assert!(out.contains("sheet-1"), "{out}");
+    }
+
+    #[test]
+    fn render_table_shows_a_dash_not_false_for_a_file_rules_recursive() {
+        // `false` would imply the column means something for a file rule.
+        let rules = [sample_file_rule()];
+        let mut buf = Vec::new();
+        render_rules_table(&rules, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("false"), "{out}");
+    }
+
+    #[test]
+    fn render_table_strips_control_bytes_from_a_file_id_too() {
+        let rules = [FolderPermissionRule::file("sh\reet\x1b[31m")];
+        let mut buf = Vec::new();
+        render_rules_table(&rules, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains(|c: char| c.is_control() && c != '\n'),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_empty_table_message_names_sheets_write_and_both_rule_keys() {
+        let mut buf = Vec::new();
+        render_rules_table(&[], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("sheets-write"), "{out}");
+        assert!(out.contains("folder_id"), "{out}");
+        assert!(out.contains("file_id"), "{out}");
     }
 }

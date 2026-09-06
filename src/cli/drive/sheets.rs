@@ -32,15 +32,15 @@ pub enum SheetsSubcommands {
     Info(info::InfoCommand),
     /// Reads cell values from one range, or from every sheet.
     Read(read::ReadCommand),
-    /// Overwrites the cells of a range, gated by the folder
-    /// write-permission rules (issue #1589). Requires the `drive.file` or
+    /// Overwrites the cells of a range, gated by the
+    /// write-permission rules (issues #1589, #1612). Requires the `drive.file` or
     /// `drive` scope (`drive auth login --write-file`/`--write-full`).
     Write(write::WriteCommand),
     /// Appends rows after the last row of a range's table, gated by the
-    /// folder write-permission rules (issue #1589).
+    /// write-permission rules (issues #1589, #1612).
     Append(write::AppendCommand),
     /// Clears a range's values, leaving formatting intact. Gated by the
-    /// folder write-permission rules (issue #1589).
+    /// write-permission rules (issues #1589, #1612).
     Clear(write::ClearCommand),
     /// Creates a new Google Sheet, optionally seeded with values. Gated by
     /// the folder write-permission rules' `create` operation (issue #1589).

@@ -51,6 +51,16 @@ pub enum EditResult {
     /// client-side, before the gate — this isn't a policy decision, the
     /// operation is simply nonsensical for this target.
     RefusedNativeDocument,
+    /// The target has no parents this account can see and no `file_id`
+    /// rule named it, so nothing could grant it (issue #1612).
+    ///
+    /// Mirrors `crate::drive::sheets::write::WriteResult`'s variant of the
+    /// same name. Before #1612 this case fell into `Blocked { decided_by:
+    /// None }`, which reads as "no rule matched, fix your rules" when no
+    /// *folder* rule the operator could write would have helped — the
+    /// latent gap [ADR-0073](../../docs/adrs/adr-0073.md) §4 flagged for
+    /// `drive edit`.
+    RefusedNoVisibleParents,
     /// The folder write-permission gate refused it.
     Blocked {
         /// The rule that decided the refusal, if any.
@@ -72,6 +82,7 @@ impl EditResult {
         match self {
             Self::WouldEdit => "would-edit",
             Self::RefusedNativeDocument => "refused-native-document",
+            Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::Blocked { .. } => "blocked",
             Self::Edited => "edited",
             Self::Failed { .. } => "failed",
@@ -149,9 +160,11 @@ async fn edit_inner(
         };
     }
 
-    let (decision, resolved_folder_id) = match folder_ancestry::resolve_decision_for_parents(
+    // A `file_id` rule is consulted before the parents are, so a file
+    // shared by link or email can still be granted (issue #1612).
+    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
         &files_api,
-        &target.parents,
+        &target,
         DriveOperation::Edit,
         rules,
     )
@@ -169,6 +182,21 @@ async fn edit_inner(
             }
         }
     };
+
+    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
+        return EditOutcome {
+            file_id: opts.file_id.clone(),
+            file_name: Some(target.name),
+            resolved_folder_id: None,
+            result: EditResult::RefusedNoVisibleParents,
+        };
+    }
+
+    let folder_ancestry::FileTargetDecision {
+        decision,
+        resolved_folder_id,
+        ..
+    } = evaluated;
 
     if decision.verdict == write_gate::Verdict::Deny {
         return EditOutcome {
@@ -217,7 +245,7 @@ fn record_attempt(outcome: &EditOutcome, duration: Duration) {
         EditResult::Blocked { decided_by } => decided_by.as_ref(),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: "edit",
         file_id: outcome.file_id.clone(),
@@ -227,8 +255,9 @@ fn record_attempt(outcome: &EditOutcome, duration: Duration) {
         removed_principals: Vec::new(),
         crosses_drive_boundary: false,
         resolved_folder_id: outcome.resolved_folder_id.clone(),
-        decided_by_folder_id,
-        decided_by_depth,
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
         error,
         duration,
         ..Default::default()
@@ -310,7 +339,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
@@ -371,7 +401,8 @@ mod tests {
         // ancestor-chain walk and before any mutating call, even though
         // an allow-everything rule set would otherwise permit it.
         let permissive_rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
@@ -382,13 +413,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_file_uses_default_policy() {
+    async fn orphan_file_is_refused_as_having_no_visible_parents() {
+        // Before issue #1612 this reported `Blocked { decided_by: None }`,
+        // i.e. "no rule matched" — true but unhelpful, since no *folder*
+        // rule could ever match a target with no chain. It is now its own
+        // outcome, whose message names the `file_id` rule that would work.
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         mount_file("orphan", "text/plain", &[]).mount(&server).await;
 
         let outcome = edit(&client, &opts_for("orphan", false), &[]).await;
-        assert!(matches!(outcome.result, EditResult::Blocked { .. }));
+        assert!(matches!(
+            outcome.result,
+            EditResult::RefusedNoVisibleParents
+        ));
         assert_eq!(outcome.resolved_folder_id, None);
     }
 
@@ -493,5 +531,86 @@ mod tests {
         let real_outcome = edit(&client, &opts(false), &[]).await;
         assert!(matches!(dry_run_outcome.result, EditResult::Blocked { .. }));
         assert!(matches!(real_outcome.result, EditResult::Blocked { .. }));
+    }
+
+    // ── file-id rules (issue #1612) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_file_rule_grants_a_target_with_no_visible_parents() {
+        // The `drive edit` half of the shared-file gap: a binary file
+        // shared by link arrives with no parents, so no folder rule could
+        // ever apply to it.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &[]).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "file-1", "name": "file-1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = edit(
+            &client,
+            &opts(false),
+            &[FolderPermissionRule::file("file-1").allowing([DriveOperation::Edit])],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.result, EditResult::Edited),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parentless_target_is_now_refused_distinctly_not_generically_blocked() {
+        // Before #1612 this reported `Blocked { decided_by: None }`, which
+        // reads as "fix your rules" when no folder rule would have helped.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &[]).mount(&server).await;
+
+        let outcome = edit(&client, &opts(false), &[]).await;
+
+        assert!(matches!(
+            outcome.result,
+            EditResult::RefusedNoVisibleParents
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-no-visible-parents");
+    }
+
+    #[tokio::test]
+    async fn a_file_deny_beats_an_allowing_parent_folder() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        // No parent-1 mock and no PATCH mock: the file rule must decide
+        // before either is reached.
+
+        let outcome = edit(
+            &client,
+            &opts(false),
+            &[
+                allow_rule(),
+                FolderPermissionRule::file("file-1").denying([DriveOperation::Edit]),
+            ],
+        )
+        .await;
+
+        match &outcome.result {
+            EditResult::Blocked { decided_by } => {
+                let rule = decided_by.as_ref().expect("a file rule decided this");
+                assert_eq!(rule.kind_label(), "file");
+                assert_eq!(rule.id(), "file-1");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 }

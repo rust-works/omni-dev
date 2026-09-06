@@ -146,7 +146,7 @@ mod tests {
 
         let rules = active_account_rules().unwrap();
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].folder_id, "folder-1");
+        assert_eq!(rules[0].folder_id.as_deref(), Some("folder-1"));
         assert!(rules[0]
             .allow
             .contains(&crate::drive::write_gate::DriveOperation::Create));
