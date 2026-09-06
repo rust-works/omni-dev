@@ -291,8 +291,25 @@ mod tests {
         print_outcome(&EditOutcome {
             file_id: "f1".to_string(),
             file_name: Some("f".to_string()),
+            resolved_folder_id: None,
+            result: EditResult::RefusedNoVisibleParents,
+        });
+        print_outcome(&EditOutcome {
+            file_id: "f1".to_string(),
+            file_name: Some("f".to_string()),
             resolved_folder_id: Some("p".to_string()),
             result: EditResult::Blocked { decided_by: None },
+        });
+        print_outcome(&EditOutcome {
+            file_id: "f1".to_string(),
+            file_name: Some("f".to_string()),
+            resolved_folder_id: Some("p".to_string()),
+            result: EditResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
         });
         print_outcome(&EditOutcome {
             file_id: "f1".to_string(),

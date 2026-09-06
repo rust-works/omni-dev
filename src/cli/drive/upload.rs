@@ -284,6 +284,16 @@ mod tests {
         print_outcome(&UploadOutcome {
             name: "f".to_string(),
             parent_folder_id: "p".to_string(),
+            result: UploadResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
+        });
+        print_outcome(&UploadOutcome {
+            name: "f".to_string(),
+            parent_folder_id: "p".to_string(),
             result: UploadResult::Uploaded {
                 file_id: "id1".to_string(),
             },
