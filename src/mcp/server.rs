@@ -404,6 +404,8 @@ mod tests {
             "drive_file_read",
             "drive_account_list",
             "drive_dedupe",
+            "drive_sheets_info",
+            "drive_sheets_read",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

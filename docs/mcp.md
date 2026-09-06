@@ -249,14 +249,16 @@ valid names.
 | `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
 | `gmail_account_list` | List configured Gmail accounts — name, cached email, scope, default. Never a secret |
 
-### Drive (5 tools)
+### Drive (7 tools)
 
-Read-only access (search, dedupe, file metadata/content) via OAuth2, mirroring
-the Gmail tool surface one-for-one. Authentication uses `DRIVE_CLIENT_ID` +
-`DRIVE_CLIENT_SECRET` + a refresh token stored by `omni-dev drive auth login`.
-`rename`/`move` (the CLI's write operations, gated behind the opt-in
-`drive.metadata` scope) have no MCP equivalent. See [Drive Guide](drive.md)
-and [ADR-0069](adrs/adr-0069.md).
+Read-only access (search, dedupe, file metadata/content, Sheets info/read)
+via OAuth2, mirroring the Gmail tool surface one-for-one. Authentication uses
+`DRIVE_CLIENT_ID` + `DRIVE_CLIENT_SECRET` + a refresh token stored by
+`omni-dev drive auth login`. `rename`/`move` (the CLI's write operations,
+gated behind the opt-in `drive.metadata` scope) have no MCP equivalent, and
+neither do the Sheets write verbs (`write`/`append`/`clear`) — deferred
+pending their own design ([#1614](https://github.com/rust-works/omni-dev/issues/1614)).
+See [Drive Guide](drive.md) and [ADR-0069](adrs/adr-0069.md).
 
 Every tool below (except `drive_account_list`) takes an optional `account`
 parameter selecting a named Drive account configured via `drive account`
@@ -269,6 +271,8 @@ parameter selecting a named Drive account configured via `drive account`
 | `drive_search` | Search files (Drive query syntax); returns full metadata per hit, including checksums when present |
 | `drive_dedupe` | Find files sharing the same content hash within a query's results, grouped by `md5Checksum` |
 | `drive_file_read` | Read a file's metadata (default) or content (`format: "content"`); `output_file` writes binary content to disk; `verify: true` checks the fetched SHA-256 against Drive's reported checksum |
+| `drive_sheets_info` | A spreadsheet's title and the sheets (tabs) it contains — id, title, index, hidden flag, grid dimensions |
+| `drive_sheets_read` | Read cell values from one range, one sheet, or the whole workbook (capped at 200 sheets); `render` selects formatted/unformatted/formula values |
 | `drive_account_list` | List configured Drive accounts — name, cached email, scope, default. Never a secret |
 
 ### AI / Config (5 tools)

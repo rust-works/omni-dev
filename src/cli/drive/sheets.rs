@@ -28,9 +28,11 @@ pub struct SheetsCommand {
 /// Sheets subcommands.
 #[derive(Subcommand)]
 pub enum SheetsSubcommands {
-    /// Shows a spreadsheet's title and the sheets (tabs) it contains.
+    /// Shows a spreadsheet's title and the sheets (tabs) it contains
+    /// (mirrors the `drive_sheets_info` MCP tool).
     Info(info::InfoCommand),
-    /// Reads cell values from one range, or from every sheet.
+    /// Reads cell values from one range, or from every sheet (mirrors the
+    /// `drive_sheets_read` MCP tool).
     Read(read::ReadCommand),
     /// Overwrites the cells of a range, gated by the folder
     /// write-permission rules (issue #1589). Requires the `drive.file` or
