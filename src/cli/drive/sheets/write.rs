@@ -4,6 +4,8 @@
 //! gate wiring, `--dry-run` handling, output rendering and request logging
 //! cannot drift between them.
 
+use std::io::Read as _;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
@@ -194,7 +196,21 @@ impl ClearCommand {
 /// Shared with `sheets create`, which takes the same flag.
 pub(crate) fn read_values(source: &str, format: ValuesFormat) -> Result<Vec<Vec<String>>> {
     let content = if source == "-" {
-        std::io::read_to_string(std::io::stdin()).context("Failed to read --values from stdin")?
+        // Bounded at the cap + 1 so an unbounded stream is never buffered
+        // past it before being refused — there's no upfront size to stat
+        // for a pipe, unlike the file branch below. Mirrors
+        // `crate::cli::drive::edit`'s `read_stdin_content`.
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .take(crate::drive::files_api::MAX_UPLOAD_BYTES + 1)
+            .read_to_end(&mut buf)
+            .context("Failed to read --values from stdin")?;
+        anyhow::ensure!(
+            buf.len() as u64 <= crate::drive::files_api::MAX_UPLOAD_BYTES,
+            "--values from stdin is over the {} byte cap",
+            crate::drive::files_api::MAX_UPLOAD_BYTES
+        );
+        String::from_utf8(buf).context("--values from stdin is not valid UTF-8")?
     } else {
         // Bounded by the same cap `drive upload`/`edit` use, so a stray
         // multi-gigabyte file is refused rather than buffered.

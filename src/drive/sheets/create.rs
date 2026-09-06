@@ -9,15 +9,22 @@
 //! command the user never typed, alongside this verb's own. One user-visible
 //! verb, one gate check, one log record.
 //!
-//! **The seeding write is ungated**, and that is a decision rather than an
-//! oversight. Routing it through the `sheets write` engine would re-run the
-//! gate under `SheetsWrite` against the *new* file's parents, which defaults
-//! to deny — so `sheets create --values` would create an empty spreadsheet
-//! and then report itself blocked. The `Create` verdict authorises the pair.
-//! That is only defensible because the target id is always the one
-//! `files.create` just returned inside an already-cleared folder, never a
-//! caller-supplied id; `drive upload` sets the precedent of writing content
-//! under `Upload` rather than `Edit`.
+//! **The seeding write only checks for an explicit `SheetsWrite` deny**,
+//! never the bare default policy, and that is a decision rather than an
+//! oversight. Routing it through the ordinary `sheets write` engine (which
+//! honors default-deny like every other write) would re-run the gate under
+//! `SheetsWrite` against the *new* file's parents, which defaults to deny
+//! when no rule mentions `sheets-write` at all — so `sheets create --values`
+//! would create an empty spreadsheet and then report itself blocked on every
+//! folder that only grants `create`. The `Create` verdict alone authorises
+//! the pair, *unless* an operator has gone out of their way to add an
+//! explicit `deny: ["sheets-write"]` rule on this folder — that is a
+//! deliberate signal this module still honors, distinguished from "no rule
+//! at all" via [`write_gate::Decision::decided_by`]. This is only defensible
+//! because the target id is always the one `files.create` just returned
+//! inside an already-cleared folder, never a caller-supplied id; `drive
+//! upload` sets the precedent of writing content under `Upload` rather than
+//! `Edit`.
 
 use std::time::{Duration, Instant};
 
@@ -193,6 +200,37 @@ async fn create_inner(
         });
     }
 
+    // An explicit `deny: ["sheets-write"]` on this folder still refuses the
+    // seed, even though `Create` alone authorises it otherwise — see this
+    // module's header. `decided_by.is_some()` is what distinguishes that
+    // deliberate signal from the bare default policy (no rule mentions
+    // `sheets-write` at all), which must **not** block a folder that only
+    // grants `create`.
+    if !opts.values.is_empty() {
+        let sheets_write_decision = match folder_ancestry::resolve_decision(
+            &files_api,
+            &opts.parent_folder_id,
+            DriveOperation::SheetsWrite,
+            rules,
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(err) => {
+                return finish(CreateResult::Failed {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        if sheets_write_decision.verdict == write_gate::Verdict::Deny
+            && sheets_write_decision.decided_by.is_some()
+        {
+            return finish(CreateResult::Blocked {
+                decided_by: sheets_write_decision.decided_by,
+            });
+        }
+    }
+
     if opts.dry_run {
         return finish(CreateResult::WouldCreate {
             rows: opts.values.len(),
@@ -219,7 +257,7 @@ async fn create_inner(
         });
     }
 
-    // The ungated seed. `created.id` is the id `files.create` just returned,
+    // The seed itself. `created.id` is the id `files.create` just returned,
     // never anything the caller supplied — see this module's header.
     match SheetsApi::new(sheets)
         .values_update(&created.id, SEED_RANGE, &opts.values, opts.input)
@@ -423,13 +461,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeds_values_into_sheet1_a1_with_one_ungated_write() {
+    async fn seeds_values_into_sheet1_a1_checking_both_create_and_sheets_write_gates() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
-        // `parent-1` is mounted once: the gate runs for Create only. A
-        // second gate check for the seed would need it again, and its
-        // absence here is what proves the seed is ungated.
-        mount_folder("parent-1").expect(1).mount(&server).await;
+        // `parent-1` is fetched twice: once resolving the `Create` decision,
+        // once resolving the `SheetsWrite` one for the seed — see this
+        // module's header for why the seed still checks for an *explicit*
+        // deny.
+        mount_folder("parent-1").expect(2).mount(&server).await;
         mount_create().mount(&server).await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path(
@@ -463,9 +502,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_create_only_rule_is_enough_to_seed() {
-        // The consequence of the ungated seed: a folder granting `create`
-        // but not `sheets-write` must still allow `--values`. If the seed
-        // were gated this would come back Blocked.
+        // A folder granting `create` but with no `sheets-write` rule at all
+        // must still allow `--values`: the seed's second check only refuses
+        // an *explicit* `sheets-write` deny, never the bare default policy.
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_folder("parent-1").mount(&server).await;
@@ -481,6 +520,37 @@ mod tests {
         let values = vec![vec!["x".to_string()]];
         let outcome = create(&drive, &sheets, &opts(values, false), &[allow_rule()]).await;
         assert!(matches!(outcome.result, CreateResult::Created { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_sheets_write_deny_blocks_the_seed_even_with_a_create_allow() {
+        // The gap this test closes: a folder that allows `create` but
+        // explicitly denies `sheets-write` must not let `--values` seed the
+        // new file anyway.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_create().mount(&server).await;
+        // No PUT mock: a seed attempt would surface as Failed, not Blocked.
+
+        let rule = FolderPermissionRule {
+            folder_id: "parent-1".to_string(),
+            recursive: true,
+            allow: std::iter::once(DriveOperation::Create).collect(),
+            deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
+        };
+        let values = vec![vec!["x".to_string()]];
+        let outcome = create(&drive, &sheets, &opts(values, false), &[rule]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                CreateResult::Blocked {
+                    decided_by: Some(_)
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
     }
 
     #[tokio::test]

@@ -459,11 +459,19 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             // Keyed on the verb, never on an absent cell count: the API is
             // allowed to omit the counts (see `UpdateValuesResponse`), and
             // inferring "a clear" from that would report a destructive
-            // outcome for a write that was nothing of the sort.
+            // outcome for a write that was nothing of the sort. `Append` gets
+            // its own wording too, so a successful append doesn't read
+            // identically to a destructive overwrite.
             match (verb, updated_cells) {
                 (WriteVerb::Clear, _) => format!("Cleared {where_} of '{name}'"),
-                (_, Some(cells)) => format!("Wrote {cells} cell(s) to {where_} of '{name}'"),
-                (_, None) => format!("Wrote to {where_} of '{name}'"),
+                (WriteVerb::Append, Some(cells)) => {
+                    format!("Appended {cells} cell(s) to {where_} of '{name}'")
+                }
+                (WriteVerb::Append, None) => format!("Appended to {where_} of '{name}'"),
+                (WriteVerb::Write, Some(cells)) => {
+                    format!("Wrote {cells} cell(s) to {where_} of '{name}'")
+                }
+                (WriteVerb::Write, None) => format!("Wrote to {where_} of '{name}'"),
             }
         }
         WriteResult::Failed { detail } => {
@@ -931,6 +939,8 @@ mod tests {
                 updated_cells: Some(2),
             }
         );
+        // A successful append must not read identically to an overwrite.
+        assert!(describe(&outcome, WriteVerb::Append).starts_with("Appended 2 cell(s) "));
     }
 
     #[tokio::test]
