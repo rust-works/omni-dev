@@ -19,12 +19,42 @@
 //!    its events are encoded for it instead of starting a selection —
 //!    unless `Alt` is held, which takes them back for TUI selection.
 //!    Re-evaluated on every mouse-down.
-//! 5. **The shift-drag escape hatch is implemented by omission.** Terminals
-//!    that honour the xterm convention (iTerm2, kitty, WezTerm, Ghostty,
-//!    Windows Terminal, GNOME Terminal) never deliver a shift-drag to the
-//!    app at all — they do their own selection. Nothing here detects or
-//!    special-cases `Shift` on a drag; doing so would re-implement a
-//!    suppression the host already performed. **Do not add it.**
+//! 5. **The host's selection escape hatch is implemented by omission.**
+//!    Terminals that honour the convention keep the gesture and do their own
+//!    selection, never delivering it to the app. Nothing here detects or
+//!    special-cases the modifier; doing so would re-implement a suppression
+//!    the host already performed. **Do not add it.**
+//!
+//!    **The modifier is terminal-specific, and this was measured** (#1602
+//!    Phase 0 spike, macOS): Ghostty keeps **shift**-drag and does its own
+//!    selection; **iTerm2 keeps option-drag** and *forwards* shift-drag to
+//!    the app; VS Code forwards both and has no host hatch at all, relying
+//!    on §4's `⌥`-reclaim instead. Earlier revisions of this clause said the
+//!    gesture was universally shift and named iTerm2 as an example — both
+//!    halves were wrong. Every terminal tested does provide *some* working
+//!    path to select out of a mouse-reporting child; which gesture it is, is
+//!    not ours to know or to encode.
+//! 6. **The right button opens a menu, never a selection or a paste.** No
+//!    right-button path produces selectable text, reads the clipboard, or
+//!    writes to a PTY other than §4's forward to a child that asked for the
+//!    mouse. A right-click's only outcomes are: open a menu, forward to a
+//!    reporting child, or nothing.
+//!
+//!    **It never inspects modifiers, and must not start** — also measured.
+//!    Four terminals, four conventions: Terminal.app forwards a right-click
+//!    with or without shift; Ghostty forwards a plain right-click and keeps
+//!    shift-right for its own menu; **iTerm2 does exactly the reverse**; VS
+//!    Code forwards both and shows its own menu as well. Acting on whatever
+//!    the host chose to forward is correct in all four *because* nothing
+//!    branches on a modifier — a `Shift` test in either direction would
+//!    break precisely one of them. ([`classify_tree_click`] carries the same
+//!    note where it would be "fixed".)
+//! 7. **A menu is modal over the region beneath it, and inert beyond it.**
+//!    While a context menu is open its rect out-ranks every other region in
+//!    [`RegionMap::hit`]; the first click outside dismisses it and is
+//!    *consumed*, never applied to what it landed on. This is the one
+//!    exception to §1's "chrome is not interactive", and it is bounded to
+//!    menus by `app::popup_mouse_enabled`.
 //!
 //! Nothing here touches PTY bytes or selection text: this module decides
 //! and encodes, `app.rs` applies.

@@ -23,6 +23,7 @@ mod hub;
 mod keys;
 mod layout;
 mod local_state;
+mod menu;
 mod mouse;
 mod panes;
 mod popup;

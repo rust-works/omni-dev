@@ -218,6 +218,72 @@ impl PaneLayout {
         Some(tab.opened_in)
     }
 
+    /// Closes every tab in `addr.group` except `addr.tab`, shutting each one
+    /// down exactly as [`Self::close_tab`] does. Returns the `opened_in` of
+    /// every tab closed, in close order — a `Vec` rather than an `Option`
+    /// because closing several tabs at once (the tab-strip menu's "Close
+    /// Other Tabs") can retire several different worktrees' `here` cues, and
+    /// a caller that only saw the last one would leave the others lit for a
+    /// tab that no longer exists.
+    ///
+    /// The anchor tab always survives, so unlike `close_tab` this can never
+    /// empty the group — there is deliberately no group-removal or
+    /// weight-vector handling here.
+    pub fn close_other_tabs(&mut self, addr: TabAddr) -> Vec<PathBuf> {
+        let Some(group) = self.groups.get_mut(addr.group) else {
+            return Vec::new();
+        };
+        if addr.tab >= group.tabs.len() {
+            return Vec::new();
+        }
+        let mut closed = Vec::with_capacity(group.tabs.len() - 1);
+        // Remove from the back so earlier indices — including the anchor —
+        // never shift out from under us.
+        for index in (0..group.tabs.len()).rev() {
+            if index == addr.tab {
+                continue;
+            }
+            let mut tab = group.tabs.remove(index);
+            tab.shutdown();
+            closed.push(tab.opened_in);
+        }
+        closed.reverse(); // report in close order, not removal order
+                          // Only the anchor is left, so it is now the group's sole tab; run it
+                          // through clamp_active anyway rather than assuming, since a future
+                          // reader would otherwise have to re-derive that 0 is always in range.
+        group.active = 0;
+        group.clamp_active();
+        self.focused = addr.group;
+        closed
+    }
+
+    /// Closes every tab in `addr.group` after index `addr.tab`, shutting
+    /// each one down exactly as [`Self::close_tab`] does. Returns the
+    /// `opened_in` of every tab closed, in close order — see
+    /// [`Self::close_other_tabs`] for why a `Vec` rather than an `Option`.
+    ///
+    /// The anchor tab and everything left of it always survive, so unlike
+    /// `close_tab` this can never empty the group — there is deliberately
+    /// no group-removal or weight-vector handling here.
+    pub fn close_tabs_to_right(&mut self, addr: TabAddr) -> Vec<PathBuf> {
+        let Some(group) = self.groups.get_mut(addr.group) else {
+            return Vec::new();
+        };
+        if addr.tab >= group.tabs.len() {
+            return Vec::new();
+        }
+        let mut closed = Vec::with_capacity(group.tabs.len() - addr.tab - 1);
+        for index in (addr.tab + 1..group.tabs.len()).rev() {
+            let mut tab = group.tabs.remove(index);
+            tab.shutdown();
+            closed.push(tab.opened_in);
+        }
+        closed.reverse(); // report in close order, not removal order
+        group.clamp_active();
+        self.focused = addr.group;
+        closed
+    }
+
     /// Closes the focused group's active tab.
     pub fn close_active(&mut self) -> Option<PathBuf> {
         let addr = TabAddr {
@@ -649,6 +715,117 @@ mod tests {
         assert_eq!(panes.focused, 0);
         assert!(panes.close_active().is_none(), "nothing left to close");
         assert!(panes.close_tab(TabAddr { group: 9, tab: 9 }).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_other_tabs_leaves_the_anchor_and_reports_every_closed_worktree() {
+        let (mut panes, _dir) = layout_with(0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            panes
+                .open_tab(spawner("sleep 5", d.path().to_path_buf(), tx.clone()))
+                .unwrap();
+        }
+        assert_eq!(panes.groups[0].tabs.len(), 4);
+        let anchor = dirs[1].path().to_path_buf();
+
+        let closed = panes.close_other_tabs(TabAddr { group: 0, tab: 1 });
+
+        assert_eq!(panes.group_count(), 1, "never empties the group");
+        assert_eq!(panes.groups[0].tabs.len(), 1, "only the anchor remains");
+        assert_eq!(panes.groups[0].tabs[0].opened_in, anchor);
+        assert_eq!(
+            panes.groups[0].active, 0,
+            "the survivor is now the active tab"
+        );
+        assert_eq!(panes.focused, 0);
+        let expected: HashSet<PathBuf> = [
+            dirs[0].path().to_path_buf(),
+            dirs[2].path().to_path_buf(),
+            dirs[3].path().to_path_buf(),
+        ]
+        .into_iter()
+        .collect();
+        let got: HashSet<PathBuf> = closed.iter().cloned().collect();
+        assert_eq!(
+            got, expected,
+            "every non-anchor tab is reported, not just one"
+        );
+        assert_eq!(closed.len(), 3, "no duplicates, no anchor");
+
+        // Out-of-range addresses are no-ops.
+        assert!(panes
+            .close_other_tabs(TabAddr { group: 9, tab: 0 })
+            .is_empty());
+        assert!(panes
+            .close_other_tabs(TabAddr { group: 0, tab: 9 })
+            .is_empty());
+        assert_eq!(
+            panes.groups[0].tabs.len(),
+            1,
+            "the bad addresses touched nothing"
+        );
+
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tabs_to_right_leaves_the_anchor_and_everything_left_of_it() {
+        let (mut panes, _dir) = layout_with(0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            panes
+                .open_tab(spawner("sleep 5", d.path().to_path_buf(), tx.clone()))
+                .unwrap();
+        }
+        // The last-opened tab holds focus already; closing to its right of
+        // the anchor leaves `active` pointing past the surviving tabs, so
+        // this also exercises the clamp.
+        assert_eq!(panes.groups[0].active, 3);
+
+        let closed = panes.close_tabs_to_right(TabAddr { group: 0, tab: 1 });
+
+        assert_eq!(panes.group_count(), 1, "never empties the group");
+        assert_eq!(
+            panes.groups[0].tabs.len(),
+            2,
+            "the anchor and everything left of it survive"
+        );
+        assert_eq!(panes.groups[0].tabs[0].opened_in, dirs[0].path());
+        assert_eq!(panes.groups[0].tabs[1].opened_in, dirs[1].path());
+        assert_eq!(
+            panes.groups[0].active, 1,
+            "active is clamped back into range"
+        );
+        assert_eq!(panes.focused, 0);
+        assert_eq!(
+            closed,
+            vec![dirs[2].path().to_path_buf(), dirs[3].path().to_path_buf()],
+            "every tab to the right is reported, in close order, not just one"
+        );
+
+        // Out-of-range addresses are no-ops.
+        assert!(panes
+            .close_tabs_to_right(TabAddr { group: 9, tab: 0 })
+            .is_empty());
+        assert!(panes
+            .close_tabs_to_right(TabAddr { group: 0, tab: 9 })
+            .is_empty());
+        assert_eq!(
+            panes.groups[0].tabs.len(),
+            2,
+            "the bad addresses touched nothing"
+        );
+
+        for tab in panes.groups.iter_mut().flat_map(|g| g.tabs.iter_mut()) {
+            tab.shutdown();
+        }
     }
 
     #[cfg(unix)]

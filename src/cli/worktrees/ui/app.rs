@@ -31,13 +31,14 @@ use super::actions::{self, ActionFlow, ActionKind, CheckReport, Dispatcher, Targ
 use super::glyph::GlyphMode;
 use super::hub::{HubCommand, ViewModelHandle};
 use super::keys::{self, ChromeKey, KeyRoute};
+use super::menu;
 use super::mouse::{self, DragOrigin, Hit, RegionMap, TreeClick, WheelRoute};
 use super::panes;
 use super::session_layout;
 use super::terminal::{GridSize, TabEffect, TabId, TabKind, TerminalTab};
 use super::tree::TreeState;
 use super::view_model::WorktreesViewModel;
-use super::{clipboard, popup, render, row_colors};
+use super::{clipboard, popup, render};
 use crate::sessions::relocate::{self, RelocationMode};
 
 /// Which pane receives keys.
@@ -82,6 +83,11 @@ struct App {
     /// The terminal side's rect as of the last frame — what a splitter drag
     /// recomputes weights against.
     terminal_area: Option<Rect>,
+    /// The tab a tab-strip context menu was opened on — that menu's subject,
+    /// the strip's analogue of `ActionMenu::origin_row`. A strip menu's
+    /// entries act on the tab that was right-clicked, which is not
+    /// necessarily the active one.
+    menu_tab: Option<panes::TabAddr>,
     /// The drag in progress, if any, and the region it is clamped to.
     drag: DragOrigin,
     clicks: mouse::ClickTracker,
@@ -120,50 +126,6 @@ fn palette_entries(targets: &[Target]) -> Vec<popup::MenuItem> {
     actions::applicable_actions(targets)
         .into_iter()
         .map(|(action, label)| popup::MenuItem::action(action, label))
-        .collect()
-}
-
-/// The applicable actions as menu entries, with a separator between each
-/// pair of groups. `applicable_action_groups` drops empty groups, so this can
-/// never emit a leading, trailing or doubled rule.
-fn grouped_menu_entries(targets: &[Target]) -> Vec<popup::MenuEntry> {
-    let mut entries = Vec::new();
-    for group in actions::applicable_action_groups(targets) {
-        if !entries.is_empty() {
-            entries.push(popup::MenuEntry::Separator);
-        }
-        entries.extend(
-            group.into_iter().map(|(action, label)| {
-                popup::MenuEntry::Item(popup::MenuItem::action(action, label))
-            }),
-        );
-    }
-    // Row Colour is its own group: it is neither a git action nor a close,
-    // and a submenu keeps eleven colours from burying the rest of the menu.
-    // `c` still opens the flat picker, so nobody loses the shortcut.
-    if !targets.is_empty() {
-        if !entries.is_empty() {
-            entries.push(popup::MenuEntry::Separator);
-        }
-        entries.push(popup::MenuEntry::Submenu {
-            label: "Row Colour",
-            items: row_color_items(),
-        });
-        entries.push(popup::MenuEntry::Item(popup::MenuItem::action(
-            ActionKind::ClearRowColor,
-            "Clear Row Colour",
-        )));
-    }
-    entries
-}
-
-/// The row-colour palette as menu items — shared by the `c` picker and the
-/// context menu's *Row Colour* submenu, so the two cannot list different
-/// colours.
-fn row_color_items() -> Vec<popup::MenuItem> {
-    row_colors::KNOWN_ROW_COLORS
-        .iter()
-        .map(|&color| popup::MenuItem::action(ActionKind::SetRowColor(color), color))
         .collect()
 }
 
@@ -238,6 +200,7 @@ pub async fn run(
         reported_visible: Vec::new(),
         regions: RegionMap::default(),
         terminal_area: None,
+        menu_tab: None,
         drag: DragOrigin::None,
         clicks: mouse::ClickTracker::default(),
     };
@@ -729,7 +692,9 @@ async fn handle_mouse(
                     col: gc,
                     line,
                 } => terminal_mouse_down(app, group, button, mods, (gc, line), (col, row)),
-                Hit::TabStrip { group, tab } => strip_mouse_down(app, group, tab, button),
+                Hit::TabStrip { group, tab } => {
+                    strip_mouse_down(app, group, tab, button, (col, row))
+                }
                 Hit::Splitter { index } => {
                     app.drag = DragOrigin::Splitter { index };
                     false
@@ -990,13 +955,66 @@ async fn invoke_menu_command(
             let targets = app.tree.targets(view);
             run_action(app, dispatcher, action, targets).await;
         }
+        // Re-uses the chord's own handler rather than reimplementing it, so a
+        // menu entry and its keyboard shortcut cannot drift apart.
+        popup::MenuCommand::Chrome(chrome) => handle_chrome_key(app, view, chrome),
+        popup::MenuCommand::Ui(ui) => run_ui_action(app, ui),
+    }
+}
+
+/// Runs a menu-only command — the handful with no chord and no
+/// [`ActionKind`] behind them.
+fn run_ui_action(app: &mut App, ui: popup::UiAction) {
+    match ui {
+        popup::UiAction::CloseOtherTabs | popup::UiAction::CloseTabsToRight => {
+            let Some(addr) = app.menu_tab else {
+                return;
+            };
+            let closed = if ui == popup::UiAction::CloseOtherTabs {
+                app.panes.close_other_tabs(addr)
+            } else {
+                app.panes.close_tabs_to_right(addr)
+            };
+            // Every closed tab may have retired a worktree's "here" cue, so
+            // each one is checked — not just the last.
+            let still_open = app.panes.open_worktrees();
+            for worktree in closed {
+                if !still_open.contains(&worktree) {
+                    let _ = app.commands.send(HubCommand::ClearOpenTab(worktree));
+                }
+            }
+            if app.panes.is_empty() {
+                app.focus = Focus::Tree;
+            }
+        }
+        popup::UiAction::SelectAll => {
+            if let Some(tab) = app.panes.active_tab() {
+                tab.select_all();
+            }
+        }
+        popup::UiAction::ClearSelection => {
+            if let Some(tab) = app.panes.active_tab() {
+                tab.clear_selection();
+            }
+        }
+        popup::UiAction::ScrollToBottom => {
+            if let Some(tab) = app.panes.active_tab() {
+                tab.scroll_to_bottom();
+            }
+        }
     }
 }
 
 /// A button-down on a tab strip: left activates the tab (or focuses the
 /// group when the click is past the last one), middle closes it — the
 /// conventional tab-strip gestures.
-fn strip_mouse_down(app: &mut App, group: usize, tab: Option<usize>, button: MouseButton) -> bool {
+fn strip_mouse_down(
+    app: &mut App,
+    group: usize,
+    tab: Option<usize>,
+    button: MouseButton,
+    (col, row): (u16, u16),
+) -> bool {
     app.focus = Focus::Terminal;
     app.drag = DragOrigin::None;
     app.panes.focused = group.min(app.panes.group_count().saturating_sub(1));
@@ -1015,8 +1033,24 @@ fn strip_mouse_down(app: &mut App, group: usize, tab: Option<usize>, button: Mou
                 }
             }
         }
-        MouseButton::Left | MouseButton::Right => {
+        MouseButton::Left => {
             app.panes.focus(panes::TabAddr { group, tab });
+        }
+        MouseButton::Right => {
+            // Focus first, so the menu's subject is the tab you clicked and
+            // is also the tab you can see highlighted — matching left-click.
+            let addr = panes::TabAddr { group, tab };
+            app.panes.focus(addr);
+            let entries = menu::strip_menu(
+                app.panes.group_count(),
+                group,
+                app.panes.groups.get(group).map_or(0, |g| g.tabs.len()),
+                tab,
+            );
+            let mut m = popup::ActionMenu::with_entries("Tab", entries);
+            m.anchor = popup::Anchor::At { col, row };
+            app.menu = Some(m);
+            app.menu_tab = Some(addr);
         }
     }
     true
@@ -1083,7 +1117,7 @@ fn tree_mouse_down(
             let targets = app.tree.targets(view);
             let mut menu = popup::ActionMenu::with_entries(
                 if inside_marks { "Marked" } else { "Actions" },
-                grouped_menu_entries(&targets),
+                menu::tree_menu(&targets),
             );
             menu.anchor = popup::Anchor::At { col, row };
             menu.origin_row = row_path(view, tree_row);
@@ -1133,6 +1167,21 @@ fn terminal_mouse_down(
         };
         tab.selection_start(gc, line, ty);
         app.drag = DragOrigin::Terminal { group };
+        return true;
+    }
+    if button == MouseButton::Right {
+        // Reached only when the child did *not* take the event above:
+        // contract §4 keeps its priority untouched, and `⌥` is how you take
+        // the mouse back from a reporting child — the same rule the left
+        // button already follows, so no new modifier and no new precedence.
+        let has_selection = tab.selection_to_string().is_some();
+        let mut m = popup::ActionMenu::with_entries("Terminal", menu::grid_menu(has_selection));
+        m.anchor = popup::Anchor::At { col, row };
+        app.menu = Some(m);
+        app.menu_tab = app.panes.groups.get(group).map(|g| panes::TabAddr {
+            group,
+            tab: g.active,
+        });
     }
     true
 }
@@ -1316,8 +1365,7 @@ async fn handle_key(
         KeyCode::F(10) => open_context_menu_for_focus(app, view),
         KeyCode::Char('a') => {
             let targets = app.tree.targets(view);
-            let mut menu =
-                popup::ActionMenu::with_entries("Actions", grouped_menu_entries(&targets));
+            let mut menu = popup::ActionMenu::with_entries("Actions", menu::tree_menu(&targets));
             // Same subject, same guard as the right-click and `alt-m`
             // routes: this menu builds the identical entries, so it must not
             // outlive its row either.
@@ -1325,7 +1373,7 @@ async fn handle_key(
             app.menu = Some(menu);
         }
         KeyCode::Char('c') => {
-            app.menu = Some(popup::ActionMenu::new(row_color_items()));
+            app.menu = Some(popup::ActionMenu::new(menu::row_color_items()));
         }
         KeyCode::Char('C') => {
             let targets = app.tree.targets(view);
@@ -1386,7 +1434,12 @@ async fn handle_prompt_key(app: &mut App, view: &WorktreesViewModel, key: KeyEve
                 let matches = filter_palette(palette_entries(&targets), &query);
                 match matches.first() {
                     Some(item) => {
-                        let popup::MenuCommand::Action(action) = item.command;
+                        // `palette_entries` is built from `applicable_actions`,
+                        // so every entry is an Action; a Chrome/Ui command
+                        // cannot reach the palette.
+                        let popup::MenuCommand::Action(action) = item.command else {
+                            return;
+                        };
                         if matches!(
                             action,
                             ActionKind::MoveClaudeSessionHere | ActionKind::CopyClaudeSessionHere
@@ -1562,42 +1615,67 @@ async fn run_action(
 /// top-left otherwise. The keyboard route into every menu the mouse can
 /// reach (`alt-m`, and `⇧F10` while the tree has focus).
 fn open_context_menu_for_focus(app: &mut App, view: &WorktreesViewModel) {
-    // Chrome chords are dispatched over every popup, so this is reachable
-    // while a prompt, the relocate picker or a two-phase confirm is up. A
-    // menu must not appear over any of them — see [`blocking_modal_open`].
+    // Chrome chords are dispatched over every popup, so this entry point must
+    // gate itself: a context menu drawn over a two-phase confirm would let
+    // `Enter` dispatch a fresh action and discard the pending confirmation.
+    // Same predicate `popup_mouse_enabled` uses, so "a context menu never
+    // appears over another modal" stays one decision.
     if blocking_modal_open(app) {
         return;
     }
+    // The menu must match the surface that has focus, not always the tree —
+    // `alt-m` over a terminal offers the grid's entries.
+    if app.focus == Focus::Terminal {
+        let group = app.panes.focused;
+        let Some(tab) = app.panes.group_tab(group) else {
+            app.notice = Some("no terminal tab".to_string());
+            return;
+        };
+        let has_selection = tab.selection_to_string().is_some();
+        // Anchored at the emulator's own cursor, which is where the eye
+        // already is; the grid's top-left is the fallback when the cursor is
+        // hidden or scrolled out of view.
+        let cursor = tab.cursor_position();
+        let anchor = app
+            .regions
+            .groups
+            .get(group)
+            .map_or(popup::Anchor::Centered, |g| {
+                let (col, line) = cursor.unwrap_or((0, 0));
+                popup::Anchor::At {
+                    col: g.grid.x.saturating_add(col),
+                    row: g.grid.y.saturating_add(line),
+                }
+            });
+        let mut m = popup::ActionMenu::with_entries("Terminal", menu::grid_menu(has_selection));
+        m.anchor = anchor;
+        app.menu = Some(m);
+        app.menu_tab = app.panes.groups.get(group).map(|g| panes::TabAddr {
+            group,
+            tab: g.active,
+        });
+        return;
+    }
     let targets = app.tree.targets(view);
-    let entries = grouped_menu_entries(&targets);
+    let entries = menu::tree_menu(&targets);
     if entries.is_empty() {
         app.notice = Some("no actions for this row".to_string());
         return;
     }
-    let anchor = if app.focus == Focus::Tree {
-        let row = app
-            .tree
-            .cursor
-            .saturating_sub(app.tree.offset)
-            .try_into()
-            .unwrap_or(u16::MAX);
-        popup::Anchor::At {
-            col: app.regions.tree.x,
-            row: app.regions.tree.y.saturating_add(row),
-        }
-    } else {
-        app.regions
-            .groups
-            .get(app.panes.focused)
-            .map_or(popup::Anchor::Centered, |g| popup::Anchor::At {
-                col: g.grid.x,
-                row: g.grid.y,
-            })
+    let row = app
+        .tree
+        .cursor
+        .saturating_sub(app.tree.offset)
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let mut m = popup::ActionMenu::with_entries("Actions", entries);
+    m.anchor = popup::Anchor::At {
+        col: app.regions.tree.x,
+        row: app.regions.tree.y.saturating_add(row),
     };
-    let mut menu = popup::ActionMenu::with_entries("Actions", entries);
-    menu.anchor = anchor;
-    menu.origin_row = cursor_row_path(&app.tree, view);
-    app.menu = Some(menu);
+    m.origin_row = cursor_row_path(&app.tree, view);
+    app.menu = Some(m);
+    app.menu_tab = None;
 }
 
 /// Closes a context menu whose subject row has gone.
@@ -1887,6 +1965,7 @@ mod tests {
             commands,
             regions: RegionMap::default(),
             terminal_area: None,
+            menu_tab: None,
             drag: DragOrigin::None,
             clicks: mouse::ClickTracker::default(),
         };
@@ -2609,7 +2688,7 @@ mod tests {
         let (mut app, dispatcher, mut commands) = test_app();
         let view = view_with(&["/repo/a"]);
         let none = KeyModifiers::NONE;
-        let colors = row_colors::KNOWN_ROW_COLORS;
+        let colors = crate::cli::worktrees::ui::row_colors::KNOWN_ROW_COLORS;
         app.menu = Some(popup::ActionMenu::new(vec![
             popup::MenuItem::action(ActionKind::SetRowColor(colors[0]), "a"),
             popup::MenuItem::action(ActionKind::SetRowColor(colors[1]), "b"),
@@ -2817,7 +2896,7 @@ mod tests {
         assert!(app.notice.is_some(), "and said why");
 
         // A menu with no row subject (the `c` picker) is unaffected.
-        app.menu = Some(popup::ActionMenu::new(row_color_items()));
+        app.menu = Some(popup::ActionMenu::new(menu::row_color_items()));
         draw_into(&mut terminal, &shrunk, &mut app);
         assert!(app.menu.is_some(), "no subject, nothing to outlive");
     }
@@ -3169,6 +3248,93 @@ mod tests {
                 mouse_at(MouseEventKind::ScrollUp, grid.x, grid.y, none)
             )
             .await
+        );
+        app.close_tab();
+    }
+
+    /// Contract §4 regression (#1602 Phase 3): right-click priority must
+    /// match left-click's. A reporting child gets a right-click encoded and
+    /// written to it with **no** menu opening; `⌥` takes the mouse back and
+    /// opens the terminal-grid menu, writing nothing. Setup mirrors
+    /// `a_child_that_asked_for_the_mouse_receives_it_unless_alt_is_held`
+    /// exactly: same `dd`-then-`od` script that blocks for one 9-byte SGR
+    /// press and echoes it back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn right_click_on_a_reporting_child_forwards_unless_alt_is_held() {
+        let (mut app, dispatcher, _commands) = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let view = view_with(&[&dir.path().to_string_lossy()]);
+        let script = "stty -echo -icanon min 1 time 0; printf '\\033[?1000h\\033[?1006h'; \
+                      dd bs=1 count=9 2>/dev/null | od -An -c; sleep 2";
+        let tab = scripted_tab(&app, script, dir.path().to_path_buf());
+        install_tab(&mut app, tab);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        draw_into(&mut terminal, &view, &mut app);
+        let grid = grid_rect(&app);
+        assert!(
+            wait_until(|| only_tab(&app).mode().contains(TermMode::SGR_MOUSE)).await,
+            "the child never enabled mouse reporting"
+        );
+        let none = KeyModifiers::NONE;
+
+        // Alt-right-click: the TUI keeps the mouse and opens the grid menu
+        // instead of forwarding — the same rule the left button already
+        // follows for taking the mouse back from a reporting child. Nothing
+        // is written: the `dd` in the script is still blocked on its first
+        // read, which the next case's assertions depend on.
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Right),
+                    grid.x,
+                    grid.y,
+                    KeyModifiers::ALT
+                )
+            )
+            .await
+        );
+        assert!(app.menu.is_some(), "alt-right-click should open the menu");
+        assert_eq!(
+            app.drag,
+            DragOrigin::None,
+            "opening the menu starts no drag"
+        );
+        app.menu = None; // close it so the next click isn't eaten by the popup
+
+        // A plain right-click goes to the child instead, with no menu.
+        assert!(
+            handle_mouse(
+                &mut app,
+                &view,
+                &dispatcher,
+                mouse_at(
+                    MouseEventKind::Down(MouseButton::Right),
+                    grid.x,
+                    grid.y,
+                    none
+                )
+            )
+            .await
+        );
+        assert!(
+            app.menu.is_none(),
+            "the child took the mouse; no menu should open"
+        );
+        assert_eq!(app.drag, DragOrigin::Child { group: 0 });
+        assert!(
+            wait_until(|| {
+                draw_into(&mut terminal, &view, &mut app);
+                let text: String = buffer_text(&terminal).split_whitespace().collect();
+                text.contains("033[<2;1;1M")
+            })
+            .await,
+            "the child never echoed the right-click SGR press \
+             (or the alt-held click leaked bytes to it): {}",
+            buffer_text(&terminal)
         );
         app.close_tab();
     }
