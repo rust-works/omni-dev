@@ -55,7 +55,7 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
         writeln!(
             out,
             "No write-permission rules configured for this account — every \
-             create/upload/edit/sheets-write is refused everywhere. Add rules under \
+             create/upload/edit/sheets-write/sheets-structure is refused everywhere. Add rules under \
              drive.accounts.<name>.write_permissions.rules in \
              ~/.omni-dev/settings.json, keyed on either a folder_id or a file_id."
         )

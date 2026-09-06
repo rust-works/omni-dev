@@ -87,6 +87,21 @@ pub enum DriveOperation {
     /// config change and no re-consent — the exact silent widening this
     /// gate's default-deny posture exists to prevent.
     SheetsWrite,
+    /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
+    /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
+    /// renaming and inserting rows or columns.
+    ///
+    /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
+    /// reason that one is not folded into [`Self::Edit`]. Every existing
+    /// `allow: ["sheets-write"]` rule was written when structural edits were
+    /// impossible, so reusing it here would retroactively upgrade those rules
+    /// into permission to restructure a workbook with no config change and no
+    /// re-consent.
+    ///
+    /// The same argument binds future work: row and sheet **deletion** must
+    /// not later join this variant either, or granting it today would silently
+    /// become consent to destroy data tomorrow.
+    SheetsStructure,
     /// Replace or append *text* in an existing Google Doc via the Docs API
     /// (issue #1615, [ADR-0076](../../docs/adrs/adr-0076.md) §2).
     ///
@@ -116,6 +131,7 @@ impl std::fmt::Display for DriveOperation {
             Self::Upload => "upload",
             Self::Edit => "edit",
             Self::SheetsWrite => "sheets-write",
+            Self::SheetsStructure => "sheets-structure",
             Self::DocsWrite => "docs-write",
         };
         write!(f, "{s}")
@@ -131,9 +147,12 @@ impl DriveOperation {
     fn default_policy(self) -> Verdict {
         match self {
             Self::Read => Verdict::Allow,
-            Self::Create | Self::Upload | Self::Edit | Self::SheetsWrite | Self::DocsWrite => {
-                Verdict::Deny
-            }
+            Self::Create
+            | Self::Upload
+            | Self::Edit
+            | Self::SheetsWrite
+            | Self::SheetsStructure
+            | Self::DocsWrite => Verdict::Deny,
         }
     }
 }
@@ -724,6 +743,7 @@ mod tests {
             DriveOperation::Upload,
             DriveOperation::Edit,
             DriveOperation::SheetsWrite,
+            DriveOperation::SheetsStructure,
             DriveOperation::DocsWrite,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
@@ -740,6 +760,10 @@ mod tests {
         assert_eq!(DriveOperation::Upload.to_string(), "upload");
         assert_eq!(DriveOperation::Edit.to_string(), "edit");
         assert_eq!(DriveOperation::SheetsWrite.to_string(), "sheets-write");
+        assert_eq!(
+            DriveOperation::SheetsStructure.to_string(),
+            "sheets-structure"
+        );
         assert_eq!(DriveOperation::DocsWrite.to_string(), "docs-write");
     }
 
@@ -762,18 +786,49 @@ mod tests {
     }
 
     #[test]
+    fn sheets_structure_defaults_to_deny_like_every_other_write() {
+        let decision = resolve(&chain(&["f"]), DriveOperation::SheetsStructure, &[]);
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(decision.decided_by.is_none());
+    }
+
+    #[test]
     fn docs_write_defaults_to_deny_like_every_other_write() {
         let decision = resolve(&chain(&["f"]), DriveOperation::DocsWrite, &[]);
         assert_eq!(decision.verdict, Verdict::Deny);
         assert!(decision.decided_by.is_none());
     }
 
-    /// ADR-0076 §2 runs ADR-0073 §3's argument in **two** directions, so
-    /// both are pinned: an `edit` grant predates Docs being reachable at
-    /// all, and a `sheets-write` grant is lexically about cells.
     #[test]
-    fn neither_an_edit_nor_a_sheets_write_rule_grants_docs_write() {
-        for granted in [DriveOperation::Edit, DriveOperation::SheetsWrite] {
+    fn a_sheets_write_rule_does_not_grant_sheets_structure() {
+        // The whole reason for a second Sheets variant (issue #1613): an
+        // existing `allow: ["sheets-write"]` rule was written when structural
+        // edits were impossible, so it must not silently gain the power to
+        // add, rename or reshape sheets.
+        let rules = [rule("target", true, &[DriveOperation::SheetsWrite], &[])];
+        let write = resolve(&chain(&["target"]), DriveOperation::SheetsWrite, &rules);
+        let structure = resolve(&chain(&["target"]), DriveOperation::SheetsStructure, &rules);
+        assert_eq!(write.verdict, Verdict::Allow);
+        assert_eq!(structure.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn an_edit_rule_does_not_grant_sheets_structure() {
+        let rules = [rule("target", true, &[DriveOperation::Edit], &[])];
+        let structure = resolve(&chain(&["target"]), DriveOperation::SheetsStructure, &rules);
+        assert_eq!(structure.verdict, Verdict::Deny);
+    }
+
+    /// ADR-0076 §2 runs ADR-0073 §3's argument in **three** directions, so
+    /// all are pinned: an `edit` grant predates Docs being reachable at
+    /// all, and both Sheets grants are lexically about cells.
+    #[test]
+    fn neither_an_edit_nor_a_sheets_write_nor_a_sheets_structure_rule_grants_docs_write() {
+        for granted in [
+            DriveOperation::Edit,
+            DriveOperation::SheetsWrite,
+            DriveOperation::SheetsStructure,
+        ] {
             let rules = [rule("target", true, &[granted], &[])];
             let held = resolve(&chain(&["target"]), granted, &rules);
             let docs = resolve(&chain(&["target"]), DriveOperation::DocsWrite, &rules);
@@ -787,7 +842,8 @@ mod tests {
     }
 
     /// The converse, so the separation is not accidentally one-way: a
-    /// `docs-write` grant must not confer cell writes or raw content edits.
+    /// `docs-write` grant must not confer cell writes, structural sheet
+    /// edits, or raw content edits.
     #[test]
     fn a_docs_write_rule_grants_nothing_else() {
         let rules = [rule("target", true, &[DriveOperation::DocsWrite], &[])];
@@ -798,6 +854,7 @@ mod tests {
         for other in [
             DriveOperation::Edit,
             DriveOperation::SheetsWrite,
+            DriveOperation::SheetsStructure,
             DriveOperation::Create,
             DriveOperation::Upload,
         ] {
