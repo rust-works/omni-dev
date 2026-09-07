@@ -118,9 +118,18 @@ fn print_outcome(outcome: &EditOutcome) {
     match &outcome.result {
         EditResult::WouldEdit => println!("Would edit: {file_id}"),
         EditResult::RefusedNativeDocument => {
+            // The refusal itself is unchanged (ADR-0076 §1): a media PATCH
+            // has no meaningful content to replace for a native document,
+            // and making it "work" would mean convert-on-import re-upload,
+            // which destroys comments, suggestions, revision history, tabs
+            // and formatting. What it *can* do is name the commands that
+            // work, which it previously did not — leaving a user who had
+            // just been refused with no route forward.
             println!(
                 "Refused: {file_id} is a Google-native document (Docs/Sheets/Slides/...) — no \
-                 raw content to replace"
+                 raw content to replace. Edit a Doc with `omni-dev drive docs \
+                 replace`/`append`, or a Sheet with `omni-dev drive sheets \
+                 write`/`append`/`clear`."
             );
         }
         EditResult::RefusedNoVisibleParents => {

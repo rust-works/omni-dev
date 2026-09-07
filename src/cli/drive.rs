@@ -415,6 +415,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_docs_create() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Create(docs::create::CreateCommand {
+                name: "n".to_string(),
+                parent: "folder-1".to_string(),
+                text: None,
+                text_file: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_info() {
         // Unlike every other routing test, this one needs an env guard: a
         // `SheetsClient` with no `SHEETS_API_URL` set resolves the *real*

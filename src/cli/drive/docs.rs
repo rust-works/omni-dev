@@ -6,6 +6,7 @@
 //! `auth` commands and the write-permission diagnostics, because a Doc is a
 //! Drive file and the permission gate is a Drive concept.
 
+pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
 pub(crate) mod write;
@@ -37,6 +38,9 @@ pub enum DocsSubcommands {
     /// Appends text to the end of a document, gated by the write-permission
     /// rules (issue #1615).
     Append(write::AppendCommand),
+    /// Creates a new Google Doc, optionally seeded with text. Gated by the
+    /// write-permission rules' `create` operation (issue #1615).
+    Create(create::CreateCommand),
 }
 
 impl DocsCommand {
@@ -52,6 +56,7 @@ impl DocsCommand {
             DocsSubcommands::Read(cmd) => cmd.execute(client).await,
             DocsSubcommands::Replace(cmd) => cmd.execute(client).await,
             DocsSubcommands::Append(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }
 }

@@ -1308,6 +1308,42 @@ entirely, and the edit is refused up front rather than attempted unleased.
   Replacing text *with nothing* (`--replace ""`) is the supported way to
   remove it.
 
+#### `drive docs create`
+
+Creates a Google Doc, optionally seeded with text. Gated by the `create`
+operation, not `docs-write`.
+
+```bash
+$ omni-dev drive docs create --name "Q4 Plan" --parent 1FoLdEr… --text "Draft."
+Created: 'Q4 Plan' (1NeW…) in 1FoLdEr…, seeded with 6 char(s)
+```
+
+`--text-file <PATH>` (or `-` for stdin) is the alternative to `--text`.
+
+The seed is **not** separately gated under `docs-write` in the normal case:
+routing it through the write engine would re-check `docs-write` against the
+new file's parents, which defaults to deny, so `--text` would create an empty
+document and then report itself blocked on every folder that grants only
+`create`. The `create` verdict authorises the pair — which is defensible only
+because the id being written is one this same invocation just created inside
+an already-cleared folder. An **explicit** `deny: ["docs-write"]` on that
+folder is a deliberate signal and *does* block the seed, before anything is
+created.
+
+If creation succeeds but seeding fails, the result says so and names the new
+document's id:
+
+```
+Partially failed: created 'Q4 Plan' (1NeW…) in 1FoLdEr…, but seeding its text
+failed: … The document exists and is empty — it cannot be rolled back
+automatically.
+```
+
+There is no `files.delete` anywhere in this integration, so an empty document
+cannot be cleaned up automatically and must never be reported as a plain
+failure that leaves something you can't find. Delete it yourself if you don't
+want it.
+
 ## Rate limits and retry behaviour
 
 Drive signals quota exhaustion two ways: a plain **HTTP 429**, and **HTTP
