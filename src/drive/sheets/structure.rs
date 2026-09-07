@@ -315,6 +315,14 @@ pub struct StructureOutcome {
     /// resolved it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_folder_id: Option<String>,
+    /// Which mutation was attempted.
+    ///
+    /// Not serialised: the caller already knows which verb it invoked, and
+    /// the JSON shape is a stable output contract. It is carried so
+    /// [`describe`] can render an outcome from the outcome alone, rather
+    /// than taking a verb a caller could mismatch against it.
+    #[serde(skip)]
+    pub verb: StructureVerb,
     /// What happened.
     pub result: StructureResult,
 }
@@ -373,6 +381,7 @@ async fn structure_inner(
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: None,
         resolved_folder_id: None,
+        verb: opts.verb.clone(),
         result,
     };
 
@@ -404,6 +413,7 @@ async fn structure_inner(
                 spreadsheet_id: opts.spreadsheet_id.clone(),
                 file_name: Some(target.name),
                 resolved_folder_id: None,
+                verb: opts.verb.clone(),
                 result,
             };
         }
@@ -414,6 +424,7 @@ async fn structure_inner(
                 spreadsheet_id: opts.spreadsheet_id.clone(),
                 file_name: Some(target.name),
                 resolved_folder_id: None,
+                verb: opts.verb.clone(),
                 result: StructureResult::Failed { detail },
             };
         }
@@ -428,6 +439,7 @@ async fn structure_inner(
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
+        verb: opts.verb.clone(),
         result,
     };
 
@@ -810,7 +822,8 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
 /// current dimensions, the resulting ones, and — for an insert — the shift
 /// that no bounded range could express.
 #[must_use]
-pub fn describe(outcome: &StructureOutcome, verb: &StructureVerb) -> String {
+pub fn describe(outcome: &StructureOutcome) -> String {
+    let verb = &outcome.verb;
     let book = outcome.file_name.as_deref().map_or_else(
         || format!("'{}'", outcome.spreadsheet_id),
         |n| format!("'{n}'"),
@@ -1314,7 +1327,7 @@ mod tests {
             outcome.result,
             StructureResult::RefusedNotASpreadsheet { .. }
         ));
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("is not a Google Sheet"), "{text}");
         assert!(text.contains("drive sheets rename-sheet"), "{text}");
     }
@@ -1338,7 +1351,7 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome.result, StructureResult::RefusedShortcut));
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("is a shortcut"), "{text}");
     }
 
@@ -1354,7 +1367,7 @@ mod tests {
             outcome.result,
             StructureResult::RefusedNoVisibleParents
         ));
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("no parent folder visible"), "{text}");
         // Names the operation the operator would have to grant, so the
         // message is actionable rather than merely accurate.
@@ -1379,7 +1392,7 @@ mod tests {
             outcome.result,
             StructureResult::Blocked { decided_by: None }
         ));
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("default policy"), "{text}");
     }
 
@@ -1499,7 +1512,7 @@ mod tests {
             &[allow_rule("parent-1")],
         )
         .await;
-        let text = describe(&outcome, &insert_rows());
+        let text = describe(&outcome);
         // The answer to "what does --dry-run show when the effect isn't a
         // range": the real before/after, plus the shift a range can't express.
         assert!(
@@ -1553,7 +1566,7 @@ mod tests {
             outcome.result,
             StructureResult::RefusedSheetNotFound { .. }
         ));
-        let text = describe(&outcome, &verb);
+        let text = describe(&outcome);
         assert!(text.contains("no sheet titled 'Nope'"), "{text}");
         assert!(text.contains("'Q1'"), "{text}");
         assert!(text.contains("'Q2'"), "{text}");
@@ -1588,7 +1601,7 @@ mod tests {
             outcome.result,
             StructureResult::RefusedSheetExists { .. }
         ));
-        assert!(describe(&outcome, &verb).contains("already has a sheet titled 'Q1'"));
+        assert!(describe(&outcome).contains("already has a sheet titled 'Q1'"));
     }
 
     /// The rename analogue of the `add-sheet` test above: renaming to a
@@ -1620,7 +1633,7 @@ mod tests {
             outcome.result,
             StructureResult::RefusedSheetExists { .. }
         ));
-        assert!(describe(&outcome, &verb).contains("already has a sheet titled 'Q1'"));
+        assert!(describe(&outcome).contains("already has a sheet titled 'Q1'"));
 
         let dry = structure(
             &drive,
@@ -1688,7 +1701,7 @@ mod tests {
             panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
         };
         assert!(detail.contains("--count"), "{detail}");
-        assert!(describe(&outcome, &verb).starts_with("Refused: --count"));
+        assert!(describe(&outcome).starts_with("Refused: --count"));
     }
 
     #[tokio::test]
@@ -1846,7 +1859,7 @@ mod tests {
             outcome.result,
             StructureResult::WouldChange { .. }
         ));
-        let text = describe(&outcome, &verb);
+        let text = describe(&outcome);
         assert!(text.contains("500 rows -> 502"), "{text}");
         assert!(text.contains("appended at the end"), "{text}");
         assert!(!text.contains("501-500"), "{text}");
@@ -2045,7 +2058,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(describe(&outcome, &add_sheet()).contains("sheetId 999"));
+        assert!(describe(&outcome).contains("sheetId 999"));
     }
 
     #[tokio::test]
@@ -2290,7 +2303,7 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("refused by rule on file sheet-1"), "{text}");
         assert!(!text.contains("depth"), "a file rule has no depth: {text}");
     }
@@ -2303,7 +2316,7 @@ mod tests {
             .mount(&server)
             .await;
         let outcome = structure(&drive, &sheets, &opts(rename(), false), &[]).await;
-        let text = describe(&outcome, &rename());
+        let text = describe(&outcome);
         assert!(text.contains("file_id"), "{text}");
         assert!(text.contains("sheets-structure"), "{text}");
     }

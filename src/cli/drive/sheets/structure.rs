@@ -215,7 +215,7 @@ async fn run_structure(
     if output_as(&outcome, output)? {
         return Ok(());
     }
-    println!("{}", sanitize_rendered(&describe(&outcome, &opts.verb)));
+    println!("{}", sanitize_rendered(&describe(&outcome)));
     Ok(())
 }
 
