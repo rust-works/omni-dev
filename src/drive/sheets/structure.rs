@@ -1,10 +1,13 @@
 //! Structural and destructive spreadsheet edits via `spreadsheets.batchUpdate`.
 //!
 //! The `drive sheets add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`
-//! (additive, issue #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)) and
+//! (additive, issue #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)),
+//! `duplicate-sheet`/`reorder-sheet`/`hide-sheet`/`show-sheet` (also
+//! additive, issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md)), and
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (destructive,
-//! issue #1623, [ADR-0077](../../../docs/adrs/adr-0077.md)) engines, gated by
-//! the ADR-0071 folder write-permission rules.
+//! issue #1623,
+//! [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md))
+//! engines, gated by the ADR-0071 folder write-permission rules.
 //!
 //! [ADR-0073](../../../docs/adrs/adr-0073.md) §12 deferred this surface
 //! because `batchUpdate` is where "one call destroys far more than its
@@ -57,9 +60,9 @@ use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, DeleteDimensionRequest,
-    DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange, GridProperties, GridRange,
-    InsertDimensionRequest, NewSheetProperties, SheetProperties, SheetPropertiesUpdate,
-    ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
+    DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange, DuplicateSheetRequest,
+    GridProperties, GridRange, InsertDimensionRequest, NewSheetProperties, SheetProperties,
+    SheetPropertiesUpdate, ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -154,6 +157,29 @@ pub enum StructureVerb {
         /// Which way to shift the remaining cells afterward.
         shift: ShiftDimension,
     },
+    /// Copy an existing sheet within the same workbook.
+    DuplicateSheet {
+        /// Title of the sheet to copy.
+        sheet: String,
+        /// Title for the copy; `None` takes Sheets' own "Copy of X" default.
+        title: Option<String>,
+        /// Zero-based position for the copy; `None` appends.
+        index: Option<i64>,
+    },
+    /// Move an existing sheet to a new position among its siblings.
+    ReorderSheet {
+        /// Title of the sheet to move.
+        sheet: String,
+        /// The new zero-based position.
+        index: i64,
+    },
+    /// Hide or show an existing sheet.
+    SetSheetVisibility {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// `true` hides it, `false` shows it.
+        hidden: bool,
+    },
 }
 
 impl StructureVerb {
@@ -172,6 +198,10 @@ impl StructureVerb {
             Self::DeleteRows { .. } => "sheets-delete-rows",
             Self::DeleteColumns { .. } => "sheets-delete-columns",
             Self::DeleteRange { .. } => "sheets-delete-range",
+            Self::DuplicateSheet { .. } => "sheets-duplicate-sheet",
+            Self::ReorderSheet { .. } => "sheets-reorder-sheet",
+            Self::SetSheetVisibility { hidden: true, .. } => "sheets-hide-sheet",
+            Self::SetSheetVisibility { hidden: false, .. } => "sheets-show-sheet",
         }
     }
 
@@ -185,7 +215,10 @@ impl StructureVerb {
             Self::AddSheet { .. }
             | Self::RenameSheet { .. }
             | Self::InsertRows { .. }
-            | Self::InsertColumns { .. } => DriveOperation::SheetsStructure,
+            | Self::InsertColumns { .. }
+            | Self::DuplicateSheet { .. }
+            | Self::ReorderSheet { .. }
+            | Self::SetSheetVisibility { .. } => DriveOperation::SheetsStructure,
             Self::DeleteSheet { .. }
             | Self::DeleteRows { .. }
             | Self::DeleteColumns { .. }
@@ -206,6 +239,10 @@ impl StructureVerb {
             Self::DeleteRows { .. } => "delete-rows",
             Self::DeleteColumns { .. } => "delete-columns",
             Self::DeleteRange { .. } => "delete-range",
+            Self::DuplicateSheet { .. } => "duplicate-sheet",
+            Self::ReorderSheet { .. } => "reorder-sheet",
+            Self::SetSheetVisibility { hidden: true, .. } => "hide-sheet",
+            Self::SetSheetVisibility { hidden: false, .. } => "show-sheet",
         }
     }
 
@@ -220,7 +257,10 @@ impl StructureVerb {
             | Self::DeleteSheet { sheet }
             | Self::DeleteRows { sheet, .. }
             | Self::DeleteColumns { sheet, .. }
-            | Self::DeleteRange { sheet, .. } => sheet,
+            | Self::DeleteRange { sheet, .. }
+            | Self::DuplicateSheet { sheet, .. }
+            | Self::ReorderSheet { sheet, .. }
+            | Self::SetSheetVisibility { sheet, .. } => sheet,
         }
     }
 
@@ -230,17 +270,23 @@ impl StructureVerb {
     /// The companion to [`Self::sheet_title`], which necessarily reports the
     /// title a rename started from — without this the request log could say
     /// which tab was renamed but not to what, the one structural effect a
-    /// record could not otherwise reconstruct.
-    const fn new_sheet_title(&self) -> Option<&String> {
+    /// record could not otherwise reconstruct. `DuplicateSheet`'s explicit
+    /// `--title`, when given, is the same kind of fact for the same reason:
+    /// the copy's name is not recoverable from `sheet_title` alone, which
+    /// necessarily names the *source*.
+    fn new_sheet_title(&self) -> Option<&String> {
         match self {
             Self::RenameSheet { new_title, .. } => Some(new_title),
+            Self::DuplicateSheet { title, .. } => title.as_ref(),
             Self::AddSheet { .. }
             | Self::InsertRows { .. }
             | Self::InsertColumns { .. }
             | Self::DeleteSheet { .. }
             | Self::DeleteRows { .. }
             | Self::DeleteColumns { .. }
-            | Self::DeleteRange { .. } => None,
+            | Self::DeleteRange { .. }
+            | Self::ReorderSheet { .. }
+            | Self::SetSheetVisibility { .. } => None,
         }
     }
 
@@ -254,7 +300,10 @@ impl StructureVerb {
             Self::AddSheet { .. }
             | Self::RenameSheet { .. }
             | Self::DeleteSheet { .. }
-            | Self::DeleteRange { .. } => None,
+            | Self::DeleteRange { .. }
+            | Self::DuplicateSheet { .. }
+            | Self::ReorderSheet { .. }
+            | Self::SetSheetVisibility { .. } => None,
         }
     }
 }
@@ -646,6 +695,32 @@ fn resolve_sheet(
                 available: workbook.sheet_titles(),
             }),
         },
+        // Like `add-sheet`, a given `--title` must not already be in use —
+        // and unlike `rename-sheet`, colliding with the *source's own*
+        // title is still a collision: the source keeps its name, so a copy
+        // asking for that same name would land on an existing sheet either
+        // way.
+        StructureVerb::DuplicateSheet { title, .. } => match found {
+            Some(props) => {
+                if let Some(new_title) = title {
+                    let collides = workbook
+                        .sheets
+                        .iter()
+                        .filter_map(|sheet| sheet.properties.as_ref())
+                        .any(|other| other.title == *new_title);
+                    if collides {
+                        return Err(StructureResult::RefusedSheetExists {
+                            title: new_title.clone(),
+                        });
+                    }
+                }
+                Ok(Some(SheetSnapshot::from_properties(props)))
+            }
+            None => Err(StructureResult::RefusedSheetNotFound {
+                title: wanted.to_string(),
+                available: workbook.sheet_titles(),
+            }),
+        },
         _ => match found {
             Some(props) => Ok(Some(SheetSnapshot::from_properties(props))),
             None => Err(StructureResult::RefusedSheetNotFound {
@@ -696,7 +771,10 @@ fn validate_verb_args(
             }
             Ok(())
         }
-        StructureVerb::RenameSheet { .. } | StructureVerb::DeleteSheet { .. } => Ok(()),
+        StructureVerb::RenameSheet { .. }
+        | StructureVerb::DeleteSheet { .. }
+        | StructureVerb::DuplicateSheet { index: None, .. }
+        | StructureVerb::SetSheetVisibility { hidden: false, .. } => Ok(()),
         StructureVerb::InsertRows { at, count, .. } => {
             validate_insert_bounds(Dimension::Rows, *at, *count, sheet)
         }
@@ -716,6 +794,53 @@ fn validate_verb_args(
             end_column,
             ..
         } => validate_delete_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
+        StructureVerb::DuplicateSheet {
+            index: Some(index), ..
+        } => {
+            // Same bound as `add-sheet`'s `--index`: a duplicate also adds
+            // one sheet, so the valid positions are identical.
+            let max = workbook.sheets.len() as i64;
+            if *index < 0 || *index > max {
+                return invalid(format!(
+                    "--index must be between 0 and {max} inclusive (the workbook has \
+                     {max} sheet(s)), got {index}"
+                ));
+            }
+            Ok(())
+        }
+        StructureVerb::ReorderSheet { index, .. } => {
+            // Unlike `add-sheet`/`duplicate-sheet`, this repositions an
+            // *existing* sheet rather than adding one, so the top of the
+            // valid range is one less.
+            let len = workbook.sheets.len() as i64;
+            let max = len - 1;
+            if *index < 0 || *index > max {
+                return invalid(format!(
+                    "--index must be between 0 and {max} inclusive (the workbook has \
+                     {len} sheet(s)), got {index}"
+                ));
+            }
+            Ok(())
+        }
+        StructureVerb::SetSheetVisibility {
+            sheet: title,
+            hidden: true,
+        } => {
+            let target_id = sheet.and_then(|s| s.sheet_id);
+            let another_stays_visible = workbook
+                .sheets
+                .iter()
+                .filter_map(|s| s.properties.as_ref())
+                .filter(|props| props.sheet_id != target_id)
+                .any(|props| !props.hidden.unwrap_or(false));
+            if !another_stays_visible {
+                return invalid(format!(
+                    "hiding '{title}' would leave the workbook with no visible sheets; \
+                     Sheets requires at least one"
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -908,7 +1033,8 @@ fn build_request(
             BatchUpdateRequestItem::UpdateSheetProperties(UpdateSheetPropertiesRequest {
                 properties: SheetPropertiesUpdate {
                     sheet_id: sheet_id("rename-sheet")?,
-                    title: new_title.clone(),
+                    title: Some(new_title.clone()),
+                    ..Default::default()
                 },
                 // Exactly the one field we set. A wider mask would blank
                 // every property it named but we left unpopulated.
@@ -969,6 +1095,33 @@ fn build_request(
             ),
             shift_dimension: *shift,
         })),
+        StructureVerb::DuplicateSheet { title, index, .. } => Ok(
+            BatchUpdateRequestItem::DuplicateSheet(DuplicateSheetRequest {
+                source_sheet_id: sheet_id("duplicate-sheet")?,
+                insert_sheet_index: *index,
+                new_sheet_name: title.clone(),
+            }),
+        ),
+        StructureVerb::ReorderSheet { index, .. } => Ok(
+            BatchUpdateRequestItem::UpdateSheetProperties(UpdateSheetPropertiesRequest {
+                properties: SheetPropertiesUpdate {
+                    sheet_id: sheet_id("reorder-sheet")?,
+                    index: Some(*index),
+                    ..Default::default()
+                },
+                fields: "index".to_string(),
+            }),
+        ),
+        StructureVerb::SetSheetVisibility { hidden, .. } => Ok(
+            BatchUpdateRequestItem::UpdateSheetProperties(UpdateSheetPropertiesRequest {
+                properties: SheetPropertiesUpdate {
+                    sheet_id: sheet_id(if *hidden { "hide-sheet" } else { "show-sheet" })?,
+                    hidden: Some(*hidden),
+                    ..Default::default()
+                },
+                fields: "hidden".to_string(),
+            }),
+        ),
     }
 }
 
@@ -984,20 +1137,22 @@ fn grid_range(
 ) -> GridRange {
     GridRange {
         sheet_id,
-        start_row_index: start_row - 1,
-        end_row_index: end_row,
-        start_column_index: start_column - 1,
-        end_column_index: end_column,
+        start_row_index: Some(start_row - 1),
+        end_row_index: Some(end_row),
+        start_column_index: Some(start_column - 1),
+        end_column_index: Some(end_column),
     }
 }
 
 /// The `sheetId` the server assigned to a newly added sheet, if this reply
-/// carries one.
+/// carries one — via `addSheet` or `duplicateSheet`, whichever this batch
+/// happened to contain (`structure.rs` never sends both in one request, so
+/// there is no ambiguity to resolve between them).
 fn added_sheet_id(response: &BatchUpdateResponse) -> Option<i64> {
     response
         .replies
         .iter()
-        .find_map(|reply| reply.add_sheet.as_ref())
+        .find_map(|reply| reply.add_sheet.as_ref().or(reply.duplicate_sheet.as_ref()))
         .and_then(|added| added.properties.as_ref())
         .and_then(|props| props.sheet_id)
 }
@@ -1290,6 +1445,37 @@ fn describe_would_change(
             *shift,
             book,
         )],
+        StructureVerb::DuplicateSheet {
+            sheet: from,
+            title,
+            index,
+        } => {
+            let to = title.as_deref().map_or_else(
+                || " as a copy Sheets names automatically".to_string(),
+                |title| format!(" as '{title}'"),
+            );
+            let position = index.map_or_else(
+                || " at the end".to_string(),
+                |index| format!(" at index {index}"),
+            );
+            vec![format!(
+                "Would duplicate sheet '{from}'{id}{to}{position} of {book} \
+                 ({sheet_count} sheet(s) -> {})",
+                sheet_count + 1
+            )]
+        }
+        StructureVerb::ReorderSheet { sheet: from, index } => {
+            vec![format!(
+                "Would move sheet '{from}'{id} to index {index} in {book}"
+            )]
+        }
+        StructureVerb::SetSheetVisibility {
+            sheet: from,
+            hidden,
+        } => {
+            let verb_word = if *hidden { "hide" } else { "show" };
+            vec![format!("Would {verb_word} sheet '{from}'{id} in {book}")]
+        }
     }
 }
 
@@ -1516,6 +1702,24 @@ fn describe_changed(
             *shift,
             book,
         ),
+        StructureVerb::DuplicateSheet {
+            sheet: from, title, ..
+        } => {
+            let to = title
+                .as_deref()
+                .map_or_else(String::new, |title| format!(" as '{title}'"));
+            format!("Duplicated sheet '{from}'{to}{id} in {book}")
+        }
+        StructureVerb::ReorderSheet { sheet: from, index } => {
+            format!("Moved sheet '{from}'{id} to index {index} in {book}")
+        }
+        StructureVerb::SetSheetVisibility {
+            sheet: from,
+            hidden,
+        } => {
+            let verb_word = if *hidden { "Hid" } else { "Showed" };
+            format!("{verb_word} sheet '{from}'{id} in {book}")
+        }
     }
 }
 
@@ -1857,6 +2061,19 @@ mod tests {
                 sheet: "Q1".to_string(),
                 at: 1,
                 count: 1,
+            },
+            StructureVerb::DuplicateSheet {
+                sheet: "Q1".to_string(),
+                title: None,
+                index: None,
+            },
+            StructureVerb::ReorderSheet {
+                sheet: "Q1".to_string(),
+                index: 0,
+            },
+            StructureVerb::SetSheetVisibility {
+                sheet: "Q1".to_string(),
+                hidden: true,
             },
         ] {
             assert_eq!(verb.gate_operation(), DriveOperation::SheetsStructure);

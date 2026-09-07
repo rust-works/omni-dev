@@ -128,6 +128,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            protected_ranges: Vec::new(),
         }
     }
 

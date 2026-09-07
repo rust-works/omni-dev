@@ -963,6 +963,38 @@ pub struct DriveMutationOutcome {
     /// content. The searched, replacement and inserted **text** are
     /// deliberately never recorded; `docs/log.md` documents what is.
     pub required_revision_id: Option<String>,
+    /// A human-readable summary of what a formatting/dimension-property
+    /// verb changed (issue #1643) — `format-cells`' populated `CellFormat`
+    /// fields, `update-borders`' sides and style, `merge-cells`'/
+    /// `unmerge-cells`' effect, or the dimension property set. The
+    /// formatting analogue of [`Self::dimension_range`]: these verbs can
+    /// send more than one field in a single request, so a single `range`-
+    /// or `dimension_range`-shaped key can't name the effect on its own.
+    pub fields_changed: Option<String>,
+    /// `merge-cells` only (issue #1643): the non-top-left, non-blank cells
+    /// a merge discarded, as `"A1: value"` strings — the one formatting
+    /// request that destroys data, so its record says exactly what was
+    /// lost rather than only that a merge happened.
+    pub discarded_cells: Vec<String>,
+    /// The data validation condition type a `set-data-validation` applied
+    /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,
+    /// `"CUSTOM_FORMULA"` — or `"cleared"` for `clear-data-validation`.
+    /// `None` for every non-validation verb.
+    pub validation_type: Option<String>,
+    /// The stable numeric id of a protected range a protection verb acted
+    /// on (issue #1643, [ADR-0077](../docs/adrs/adr-0077.md)). Set by
+    /// `protect-range` from the `addProtectedRange` reply (the id is
+    /// server-assigned, like [`Self::sheet_id`] for `add-sheet`) and by
+    /// `update-protection`/`unprotect-range` from the range they resolved
+    /// against.
+    pub protected_range_id: Option<i64>,
+    /// Editors a `protect-range`/`update-protection` granted an exemption
+    /// from the protection. Empty unless the verb actually changed the
+    /// editor list.
+    pub protection_editors_added: Vec<String>,
+    /// Editors an `update-protection` removed the exemption from — the
+    /// decrease-side counterpart of [`Self::protection_editors_added`].
+    pub protection_editors_removed: Vec<String>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1072,6 +1104,36 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(revision) = outcome.required_revision_id {
         context.insert("required_revision_id".to_string(), revision);
+    }
+    if let Some(fields_changed) = outcome.fields_changed {
+        context.insert("fields_changed".to_string(), fields_changed);
+    }
+    if !outcome.discarded_cells.is_empty() {
+        context.insert(
+            "discarded_cells".to_string(),
+            outcome.discarded_cells.join("; "),
+        );
+    }
+    if let Some(validation_type) = outcome.validation_type {
+        context.insert("validation_type".to_string(), validation_type);
+    }
+    if let Some(protected_range_id) = outcome.protected_range_id {
+        context.insert(
+            "protected_range_id".to_string(),
+            protected_range_id.to_string(),
+        );
+    }
+    if !outcome.protection_editors_added.is_empty() {
+        context.insert(
+            "protection_editors_added".to_string(),
+            outcome.protection_editors_added.join(","),
+        );
+    }
+    if !outcome.protection_editors_removed.is_empty() {
+        context.insert(
+            "protection_editors_removed".to_string(),
+            outcome.protection_editors_removed.join(","),
+        );
     }
     rec.context = context;
     rec

@@ -605,16 +605,17 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation          | Default | Granted to                                                             |
-|--------------------|---------|------------------------------------------------------------------------|
-| `read`             | allow   | `search`, `read`, `dedupe` (not yet enforced)                          |
-| `create`           | deny    | `create`, `sheets create`                                              |
-| `upload`           | deny    | `upload`                                                               |
-| `edit`             | deny    | `edit` — raw file content only                                         |
-| `sheets-write`     | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values          |
-| `sheets-structure` | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`    |
-| `sheets-delete`    | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
-| `docs-write`       | deny    | `docs replace`, `docs append`                                          |
+| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                    |
+|---------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                 |
+| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                     |
+| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                      |
+| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                 |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                        |
+| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                |
+| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                 |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -641,19 +642,38 @@ again.** Every `allow: ["sheets-structure"]` rule that exists today was
 written when deletion was impossible, so reusing it would have turned those
 rules into permission to destroy data — again with no config change and no
 re-consent. Granting `sheets-structure` does not grant `sheets-delete`; name
-both if you want both. See [ADR-0077](adrs/adr-0077.md).
+both if you want both. See [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md).
+
+**`sheets-structure` also covers formatting, data validation, duplicating a
+sheet, and reorder/hide** (issue #1643, [ADR-0078](adrs/adr-0078.md)). None
+of that destroys data — `merge-cells` is the one request that discards
+non-top-left values, and its `--dry-run` (and real run) names every cell
+that would be lost before it happens — so it earns the same operation as
+the original four verbs rather than a new one.
+
+**`sheets-protection` is separate from `sheets-structure`, and the reason is
+different in kind from every split above.** A protected range is a
+*permission* inside the document — who may edit, not what the sheet
+contains. `update-protection` can widen who may edit, and
+`unprotect-range` removes a guard someone deliberately placed. Folding
+either into `sheets-structure` would let a grant meant for "may
+reformat/validate/restructure this workbook" silently double as "may also
+change who can edit it." See [ADR-0078](adrs/adr-0078.md) §2.
+`drive sheets list-protections` is a plain read and needs no grant, the same
+as `sheets info`.
 
 **`docs-write` is separate from all four**, and the same argument runs
 again. An `allow: ["edit"]` rule predates Docs being reachable through this
-tool at all; an `allow: ["sheets-write"]`, `allow: ["sheets-structure"]` or
-`allow: ["sheets-delete"]` rule was written when the same was true, and all
-three are about *cells*, so letting any of them govern prose would make the
+tool at all; an `allow: ["sheets-write"]`, `allow: ["sheets-structure"]`,
+`allow: ["sheets-delete"]` or `allow: ["sheets-protection"]` rule was
+written when the same was true, and all four are about *cells or
+who-may-edit-them*, so letting any of them govern prose would make the
 config vocabulary say something untrue. Grant `docs-write` explicitly. See
 [ADR-0076](adrs/adr-0076.md) §2.
 
 Each write operation is independent in both directions: `docs-write` confers
-no cell writes, no structural sheet edits, no destructive sheet edits, and no
-raw-content edits either.
+no cell writes, no structural sheet edits, no destructive sheet edits, no
+protection changes, and no raw-content edits either.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from. A rule keys on **either** a `folder_id` or a
@@ -1140,7 +1160,7 @@ rolled back automatically.
 
 Delete it yourself if you don't want it.
 
-#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns
+#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns / duplicate-sheet / reorder-sheet / hide-sheet / show-sheet
 
 Structural edits — changing the *shape* of a workbook rather than its cell
 values. Gated by the separate `sheets-structure` operation (above), so a
@@ -1182,6 +1202,21 @@ omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
 `--at 5` puts the new rows above the current row 5. Column A is 1.
 `--count` defaults to 1.
 
+```bash
+# Copy a sheet. --title omitted takes Sheets' own "Copy of X" default;
+# --index omitted appends. A given --title must not already be in use,
+# including by the source sheet itself.
+omni-dev drive sheets duplicate-sheet <ID> --sheet Q2 --title 'Q2 (copy)'
+
+# Move a sheet to a new zero-based position among its siblings.
+omni-dev drive sheets reorder-sheet <ID> --sheet Q2 --index 0
+
+# Hide/show a tab. Hiding the workbook's last visible sheet is refused —
+# Sheets requires at least one to stay visible.
+omni-dev drive sheets hide-sheet <ID> --sheet Q2
+omni-dev drive sheets show-sheet <ID> --sheet Q2
+```
+
 Several refusals are specific to these verbs, and all of them are checked
 before anything is written so a `--dry-run` can never promise a change the
 real run then fails:
@@ -1211,7 +1246,7 @@ Destructive edits — the same `spreadsheets.batchUpdate` mechanism as above,
 but these actually remove data. Gated by the separate `sheets-delete`
 operation, **not** `sheets-structure`: a folder granted `sheets-structure`
 cannot delete anything without an explicit additional grant, and vice versa.
-See [ADR-0077](adrs/adr-0077.md).
+See [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md).
 
 There is still no interactive confirmation and no `--force` anywhere in this
 tool, deletion included — the permission gate and an honest `--dry-run` are
@@ -1265,8 +1300,108 @@ needed
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
 `--at`/`--count` (or the range bounds) must name rows/columns/cells that
 already exist — deletion has no append-boundary case, since everything named
-must be real. Formatting, data validation, protected ranges and sheet
-reordering are still not implemented.
+must be real.
+
+#### drive sheets format-cells / update-borders / merge-cells / unmerge-cells / auto-resize-dimension / update-dimension-properties
+
+Cell and border formatting, merging, and row/column sizing. Also gated by
+`sheets-structure` — see [ADR-0078](adrs/adr-0078.md).
+
+```bash
+# Format cells. At least one property flag is required; the batchUpdate
+# fields mask sent is built from exactly the flags given.
+omni-dev drive sheets format-cells <ID> --sheet Q2 --range A1:D1 \
+  --bold true --background '#FFFF00'
+
+# Only a curated CellFormat subset is reachable: bold/italic/strikethrough/
+# underline, font-size, text-color/background (#RRGGBB), horizontal-align/
+# vertical-align, number-format (with --number-format-type), and wrap.
+# Font family, rotation, hyperlink display, padding and text direction are
+# not — use the Sheets UI for those.
+omni-dev drive sheets format-cells <ID> --sheet Q2 --range B2:B100 \
+  --number-format '#,##0.00' --number-format-type currency
+
+# Borders: at least one of --top/--bottom/--left/--right/--all.
+omni-dev drive sheets update-borders <ID> --sheet Q2 --range A1:D1 --all \
+  --style solid-medium --color '#000000'
+
+# Merging discards every value but the top-left's. --dry-run lists exactly
+# which cells and values would be lost — read it before running for real.
+omni-dev drive sheets merge-cells <ID> --sheet Q2 --range A1:D1 --dry-run
+omni-dev drive sheets unmerge-cells <ID> --sheet Q2 --range A1:D1
+
+# Resize rows/columns. --start/--end are 1-based and inclusive.
+omni-dev drive sheets auto-resize-dimension <ID> --sheet Q2 \
+  --dimension columns --start 1 --end 4
+omni-dev drive sheets update-dimension-properties <ID> --sheet Q2 \
+  --dimension columns --start 1 --end 1 --pixel-size 200
+```
+
+```
+Would merge (MERGE_ALL), discarding 3 cell(s): B1: old note; C1: 12; D1: draft
+```
+
+`format-cells` can never write a *value* — it builds a `repeatCell` request
+whose payload has no field to put one in, regardless of what flags are
+given, so a `sheets-structure` grant that lets you reformat a workbook can
+never be used to change what it says.
+
+#### drive sheets set-data-validation / clear-data-validation
+
+Restricts what may be entered into a range. Also gated by
+`sheets-structure`.
+
+```bash
+# Exactly one condition flag is required.
+omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range C2:C100 \
+  --one-of-list Draft,Final,Archived
+omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range D2:D100 \
+  --number-between 0 100
+omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range E2:E100 --checkbox
+omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range F2:F100 \
+  --custom-formula '=F2<=D2'
+
+# --show-warning allows an invalid entry through with a warning instead of
+# rejecting it outright (the default).
+omni-dev drive sheets clear-data-validation <ID> --sheet Q2 --range C2:C100
+```
+
+Only these four condition shapes are reachable; Sheets' several dozen
+others (per-type date/text conditions, `NUMBER_GREATER`, …) are not.
+
+#### drive sheets protect-range / update-protection / unprotect-range / list-protections
+
+Protected ranges, gated by the **separate `sheets-protection`** operation —
+not `sheets-structure`. See [ADR-0078](adrs/adr-0078.md) §2 for why: a
+protected range is a permission inside the document, not a structural
+change.
+
+```bash
+# Protect a range, or an entire sheet with --whole-sheet.
+omni-dev drive sheets protect-range <ID> --sheet Q2 --range A1:A10 \
+  --description 'Locked headers' --editor teammate@example.com
+omni-dev drive sheets protect-range <ID> --sheet Signed --whole-sheet --description Final
+
+# See what's protected — a plain, ungated read.
+omni-dev drive sheets list-protections <ID>
+
+# Change or remove an existing protection, resolved by exact range match.
+omni-dev drive sheets update-protection <ID> --sheet Q2 --range A1:A10 \
+  --add-editor another@example.com --remove-editor teammate@example.com
+omni-dev drive sheets unprotect-range <ID> --sheet Q2 --range A1:A10
+
+# A whole-sheet protection has no range of its own — --whole-sheet is the
+# only way to update-protection/unprotect-range one.
+omni-dev drive sheets unprotect-range <ID> --sheet Signed --whole-sheet
+```
+
+`update-protection`/`unprotect-range` need the *exact* range (or, with
+`--whole-sheet`, the exact sheet) a protection covers — `list-protections`
+is how you find it, since Sheets exposes no other user-facing handle. An
+ambiguous or non-matching target is refused rather than guessed at. Sheets
+has no incremental editor add/remove either: `--add-editor`/
+`--remove-editor` compute the full resulting list from the protection's
+current editors before sending it.
 
 **Limits.** A whole-workbook read refuses a spreadsheet beyond a fixed sheet
 count rather than returning part of it — silently returning half a workbook is
@@ -1780,10 +1915,18 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   `spreadsheets.batchUpdate`: the separate `sheets-structure` gate
   operation, why the surface is typed verbs with no raw request
   passthrough, and why deletion is deferred rather than gated.
-- [ADR-0077](adrs/adr-0077.md) — the deferred deletion design pass: the
-  separate `sheets-delete` gate operation, why the typed-verbs-only property
-  survives deletion too, and why there is still no interactive confirmation
-  or `--force` for the most dangerous operation in the tree.
+- [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md) — the
+  deferred deletion design pass: the separate `sheets-delete` gate
+  operation, why the typed-verbs-only property survives deletion too, and
+  why there is still no interactive confirmation or `--force` for the most
+  dangerous operation in the tree.
+- [ADR-0078](adrs/adr-0078.md) — the remaining `spreadsheets.batchUpdate`
+  surface: formatting, data validation and protected ranges. Why formatting
+  and data validation join the existing `sheets-structure` operation while
+  protected ranges get their own `sheets-protection` operation instead
+  (a permission change inside the document, not a structural one), and
+  `merge-cells`' `--dry-run` honesty requirement for the one request here
+  that discards data.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.
