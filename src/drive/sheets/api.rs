@@ -223,31 +223,10 @@ impl<'a> SheetsApi<'a> {
     }
 }
 
-/// Appends `segments` to `url`'s path, percent-encoding each one.
-///
-/// **This is the load-bearing detail of this module.** A Sheets range goes in
-/// the URL *path* and is caller-influenced text that routinely contains
-/// characters with URL meaning: a sheet titled with a `#` truncates the path
-/// into a fragment, a `?` starts a query string, a `/` invents a path
-/// segment, and a space is simply invalid. Every one of those silently reads
-/// or writes the wrong cells rather than erroring.
-///
-/// `files_api.rs`'s `format!("/drive/v3/files/{file_id}")` sites are safe
-/// only because Drive ids are `[A-Za-z0-9_-]`; do not generalise from them.
-fn push_path_segments(url: &mut Url, segments: &[&str]) -> Result<()> {
-    let mut path = url
-        .path_segments_mut()
-        .map_err(|()| anyhow::anyhow!("Invalid Sheets base URL: cannot be a base"))?;
-    for segment in segments {
-        path.push(segment);
-    }
-    Ok(())
-}
-
 fn build_spreadsheet_get_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
-    push_path_segments(&mut url, &[spreadsheet_id])?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS);
     Ok(url)
@@ -261,7 +240,7 @@ fn build_values_get_url(
 ) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
-    push_path_segments(&mut url, &[spreadsheet_id, "values", range])?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id, "values", range])?;
     url.query_pairs_mut()
         .append_pair("valueRenderOption", render.as_str());
     Ok(url)
@@ -288,7 +267,7 @@ fn build_values_batch_get_url(
     // `:batchGet` is a suffix on the `values` segment, not a segment of its
     // own; `:` carries no meaning inside a path segment so it survives
     // encoding untouched.
-    push_path_segments(&mut url, &[spreadsheet_id, "values:batchGet"])?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id, "values:batchGet"])?;
     {
         let mut pairs = url.query_pairs_mut();
         for range in ranges {
@@ -307,7 +286,7 @@ fn build_values_update_url(
 ) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
-    push_path_segments(&mut url, &[spreadsheet_id, "values", range])?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id, "values", range])?;
     url.query_pairs_mut()
         .append_pair("valueInputOption", input.as_str());
     Ok(url)
@@ -321,7 +300,7 @@ fn build_values_append_url(
 ) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
-    push_path_segments(
+    GoogleApiClient::push_path_segments(
         &mut url,
         &[spreadsheet_id, "values", &format!("{range}:append")],
     )?;
@@ -338,7 +317,7 @@ fn build_values_append_url(
 fn build_values_clear_url(base_url: &str, spreadsheet_id: &str, range: &str) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
-    push_path_segments(
+    GoogleApiClient::push_path_segments(
         &mut url,
         &[spreadsheet_id, "values", &format!("{range}:clear")],
     )?;

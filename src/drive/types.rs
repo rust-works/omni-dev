@@ -37,6 +37,21 @@ pub(crate) const GOOGLE_FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.fo
 /// that one — both stay.
 pub(crate) const GOOGLE_SHEET_MIME_TYPE: &str = "application/vnd.google-apps.spreadsheet";
 
+/// MIME type marking a Google Doc.
+///
+/// Engine-layer copy, for the same reason [`GOOGLE_FOLDER_MIME_TYPE`] and
+/// [`GOOGLE_SHEET_MIME_TYPE`] are: `crate::cli::drive::read`'s `GOOGLE_DOC`
+/// is a CLI-layer constant, and an engine module depending on it would
+/// invert the layering. Not a rename of that one — both stay.
+pub(crate) const GOOGLE_DOC_MIME_TYPE: &str = "application/vnd.google-apps.document";
+
+/// MIME type marking a Google Slides presentation.
+///
+/// Present only so the Docs commands can say "Slides isn't supported yet"
+/// instead of the generic "not a Google Doc" — there is no Slides surface in
+/// the tree, and adding one is a separate issue.
+pub(crate) const GOOGLE_SLIDES_MIME_TYPE: &str = "application/vnd.google-apps.presentation";
+
 /// MIME type marking a Drive shortcut.
 ///
 /// Shortcuts are never followed: a shortcut to a spreadsheet is refused with

@@ -56,9 +56,10 @@ walkthrough — this page is the topic-by-topic reference.
 12. [Upload](#upload)
 13. [Edit](#edit)
 14. [Sheets](#sheets)
-15. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-16. [Troubleshooting](#troubleshooting)
-17. [See also](#see-also)
+15. [Docs](#docs)
+16. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+17. [Troubleshooting](#troubleshooting)
+18. [See also](#see-also)
 
 ## Prerequisites
 
@@ -1033,6 +1034,123 @@ Delete it yourself if you don't want it.
 count rather than returning part of it — silently returning half a workbook is
 indistinguishable from a workbook that small. Narrow the read with `--sheet` or
 `--range` if you hit it.
+
+## Docs
+
+`drive docs` reads the *structural model* of a Google Doc through the Docs v1
+API (issue #1615). Editing is a separate, later phase; today this tree is
+read-only.
+
+No new login flag is needed. Reading works with the `drive.readonly` scope
+every account already has — the Docs API accepts the Drive scopes, exactly as
+the Sheets API does.
+
+### Why this exists alongside `drive read --content`
+
+`drive read --content` already exports a Doc to markdown, and for reading the
+*prose* it is the better command. What an export structurally cannot give you
+is the **address space**. Every Docs edit is addressed by a numeric index into
+the document, and a markdown rendering has no path back to one. So:
+
+- **`drive read --content` is the prose channel.**
+- **`drive docs read` is the model channel** — each element's `[start, end)`
+  index range, its kind, its style, and the document's `revisionId`.
+
+That is also why indices are shown by default rather than behind a flag:
+without them this command would just be a worse `drive read --content`.
+
+### Indices are UTF-16 code units
+
+This is the one thing worth internalising before using the output for
+anything. Docs indices count **UTF-16 code units**, not characters and not
+bytes, and `endIndex` is exclusive. The distinction is invisible in ASCII and
+matters the moment a document contains an emoji or a CJK character: `😀` is one
+character, two UTF-16 code units and four UTF-8 bytes.
+
+`omni-dev` never computes an index itself — it only reports what the server
+sent — so nothing here rounds the difference away silently.
+
+### Tabs
+
+Google Docs supports tabs, and `drive docs` always requests every tab's
+content. That is deliberate: a request without it returns only the **first**
+tab, in a response shaped identically to a single-tab document, so reading a
+third of a document would be indistinguishable from reading all of a small
+one. (That is precisely the trap `drive read --content` still has on a Sheet,
+where it exports the first sheet only.)
+
+Narrow with `--tab <TAB_ID>` after the fact. An unknown tab id is an error
+listing the real ones, never an empty result.
+
+#### `drive docs info`
+
+Shows the document's identity, its revision, its per-tab counts and its
+heading outline.
+
+```bash
+$ omni-dev drive docs info 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Id: 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Title: Design Doc
+Revision: ALm37BXk3nQ
+Tabs: 2
+Named ranges: 1
+  intro (1 range(s))
+
+Tab: t.0 "Overview" — 12045 chars, 143 paragraphs, 2 tables, 1 section breaks
+  HEADING_1  [1..18)  Overview
+  HEADING_2  [220..241)  Goals
+
+Tab: t.1 "Appendix" — 890 chars, 12 paragraphs
+  HEADING_1  [1..12)  Appendix
+```
+
+Two fields are worth more than they look:
+
+- **`Revision`** is the token an edit has to present so a write against a
+  document that changed underneath it is refused rather than misapplied.
+  Nothing else in the CLI surfaces it. When you see
+  `Revision: (none — read-only access)`, Google withheld it because the account
+  has no edit access — and a later edit will refuse for that reason.
+- **Named ranges** are the *stable* way to name a region. An index shifts on
+  every insertion; a named range's name does not.
+
+#### `drive docs read`
+
+One line per structural element, indented by nesting depth.
+
+```bash
+$ omni-dev drive docs read 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+START  END  KIND           STYLE        TEXT
+    0    1  section-break
+    1   18  paragraph      HEADING_1    Overview
+   18  220  paragraph      NORMAL_TEXT  This document describes the approach…
+  220  241  paragraph      HEADING_2    Goals
+  241  310  table                       3x2
+  243  251    paragraph    NORMAL_TEXT  Name
+  252  266    paragraph    NORMAL_TEXT  Description
+```
+
+With more than one tab, each block is preceded by a `# <tabId> <title>` line.
+
+`--suggestions-view default|inline|accepted|without` selects which view of
+pending suggestions the text *and the indices* are reported against. It is a
+correctness knob rather than a display preference: a document with pending
+suggestions has a different index space per view.
+
+**Output formats.** `-o table` (the default) **sanitises** element text,
+stripping control characters. This differs from `drive sheets read`, whose CSV
+emits cell values verbatim, and the difference is deliberate: CSV is an
+interchange format that must round-trip, so stripping there would corrupt real
+data, while this table is an orientation view whose entire value is column
+alignment — a soft line break or an escape sequence in the text would destroy
+it. Use **`-o json`** when you want content: it is the unsanitised channel and
+carries every field. **`-o jsonl`** emits **one line per element**, with the
+document id, revision and tab id repeated on each, so a single line is
+self-describing to `jq`.
+
+**Known gap.** Only the document **body** is read. Headers, footers and
+footnotes live in their own index segments and do not appear — the Docs
+counterpart of "export gives you the first sheet only".
 
 ## Rate limits and retry behaviour
 

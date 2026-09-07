@@ -97,3 +97,4 @@ by Michael Nygard.
 | [ADR-0071](adr-0071.md)  | ✅ Accepted                              | 2026-08-25 | Folder-Scoped Write Permissions for the Drive Integration                                   |
 | [ADR-0072](adr-0072.md)  | ✅ Accepted                              | 2026-09-05 | A Terminal UI for the Worktrees View                                                        |
 | [ADR-0073](adr-0073.md)  | ✅ Accepted                              | 2026-09-06 | Google Sheets API Support for the Drive Integration                                         |
+| [ADR-0076](adr-0076.md)  | ✅ Accepted                              | 2026-09-07 | Google Docs Text Mutation Behind a Revision Lease                                           |

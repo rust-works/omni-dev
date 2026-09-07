@@ -141,6 +141,31 @@ impl GoogleApiClient {
         Url::parse(&format!("{base_url}{path}")).context("Invalid Drive base URL")
     }
 
+    /// Appends `segments` to `url`'s path, percent-encoding each one.
+    ///
+    /// **This is the safe counterpart to [`Self::api_url`]**, and lives
+    /// beside it because that method's doc comment describes exactly the
+    /// hazard this one exists to remove. A Sheets A1 range goes in the URL
+    /// *path* and is caller-influenced text that routinely contains
+    /// characters with URL meaning: a sheet titled with a `#` truncates the
+    /// path into a fragment, a `?` starts a query string, a `/` invents a
+    /// path segment, and a space is simply invalid. Every one of those
+    /// silently reads or writes the wrong cells rather than erroring.
+    ///
+    /// `files_api.rs`'s `format!("/drive/v3/files/{{file_id}}")` sites are
+    /// safe only because Drive ids are `[A-Za-z0-9_-]`; do not generalise
+    /// from them. New façades should reach for this even when their own ids
+    /// happen to be opaque, so no second precedent for `format!` exists.
+    pub(crate) fn push_path_segments(url: &mut Url, segments: &[&str]) -> Result<()> {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("Invalid API base URL: cannot be a base"))?;
+        for segment in segments {
+            path.push(segment);
+        }
+        Ok(())
+    }
+
     /// Checks `response` for success and deserialises its JSON body into `T`.
     pub(crate) async fn parse_response<T: serde::de::DeserializeOwned>(
         &self,
