@@ -4,6 +4,7 @@ pub(crate) mod account;
 pub(crate) mod auth;
 pub(crate) mod create;
 pub(crate) mod dedupe;
+pub(crate) mod docs;
 pub(crate) mod edit;
 pub(crate) mod format;
 pub(crate) mod helpers;
@@ -81,6 +82,9 @@ pub enum DriveSubcommands {
     /// create`/`upload`/`edit` and `drive sheets
     /// write`/`append`/`clear`/`create` (issues #1574, #1589).
     Permissions(permissions::PermissionsCommand),
+    /// Reads the structure and text of a Google Doc via the Docs v1 API
+    /// (issue #1615).
+    Docs(docs::DocsCommand),
     /// Reads and writes the cells of a Google Sheet via the Sheets v4 API
     /// (issue #1589).
     Sheets(sheets::SheetsCommand),
@@ -140,6 +144,7 @@ impl DriveSubcommands {
             Self::Edit(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
+            Self::Docs(cmd) => cmd.execute(client).await,
             Self::Sheets(cmd) => cmd.execute(client).await,
         }
     }
@@ -337,6 +342,40 @@ mod tests {
         };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_docs_info() {
+        // Like the Sheets routing tests, this needs an env guard: a
+        // `DocsClient` with no `DOCS_API_URL` set resolves the *real*
+        // `docs.googleapis.com`, so without the redirect this test would
+        // send a request to Google.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Info(docs::info::InfoCommand {
+                document_id: "d1".to_string(),
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_docs_read() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Read(docs::read::ReadCommand {
+                document_id: "d1".to_string(),
+                tab: None,
+                suggestions_view: docs::read::SuggestionsViewArg::Default,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]

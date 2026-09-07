@@ -3739,6 +3739,7 @@ Commands:
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
   permissions  Inspects the folder-scoped write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589)
+  docs         Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
   sheets       Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
   help         Print this message or the help of the given subcommand(s)
 
@@ -3883,6 +3884,61 @@ Options:
       --limit <LIMIT>    Maximum results to scan. `0` means "scan every match" (capped at a hard ceiling to bound run time) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs - Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
+
+Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
+
+Usage: docs <COMMAND>
+
+Commands:
+  info  Shows a document's title, revision id and structural outline
+  read  Reads a document's structural elements with their index ranges
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive docs info - Shows a document's title, revision id and structural outline
+
+Shows a document's title, revision id and structural outline
+
+Usage: info [OPTIONS] <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Document id (the `/d/<ID>/` segment of a Docs URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs read - Reads a document's structural elements with their index ranges
+
+Reads a document's structural elements with their index ranges
+
+Usage: read [OPTIONS] <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Document id (the `/d/<ID>/` segment of a Docs URL)
+
+Options:
+      --tab <TAB>
+          Restrict output to one tab id (see `drive docs info`)
+      --suggestions-view <SUGGESTIONS_VIEW>
+          Which suggestion view the text and indices are reported against [default: default] [possible values: default, inline, accepted, without]
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
