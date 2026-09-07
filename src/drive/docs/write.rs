@@ -192,8 +192,13 @@ pub enum WriteResult {
     /// A replace landed.
     Replaced {
         /// What the *server* reported changing.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        occurrences_changed: Option<i64>,
+        ///
+        /// Not `Option`: a replace always has an answer, and "nothing
+        /// matched" is a count rather than an absence of one. Docs omits
+        /// `occurrencesChanged` entirely when it is zero (proto3), so the
+        /// zero is resolved at the boundary — see
+        /// [`crate::drive::docs::write_types::BatchUpdateDocumentResponse::occurrences_changed_for_replace`].
+        occurrences_changed: i64,
     },
     /// An append landed.
     Appended {
@@ -454,7 +459,7 @@ async fn write_inner(
     {
         Ok(response) => match &opts.payload {
             WritePayload::Replace { .. } => WriteResult::Replaced {
-                occurrences_changed: response.occurrences_changed(),
+                occurrences_changed: response.occurrences_changed_for_replace(),
             },
             WritePayload::Append { text } => WriteResult::Appended {
                 chars: text.chars().count(),
@@ -529,7 +534,7 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
     let occurrences_changed = match &outcome.result {
         WriteResult::Replaced {
             occurrences_changed,
-        } => *occurrences_changed,
+        } => Some(*occurrences_changed),
         _ => None,
     };
     let inserted_chars = match &outcome.result {
@@ -612,10 +617,7 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
         },
         WriteResult::Replaced {
             occurrences_changed,
-        } => match occurrences_changed {
-            Some(count) => format!("Replaced: {count} occurrence(s) in '{name}'"),
-            None => format!("Replaced: '{name}' (the API reported no count)"),
-        },
+        } => format!("Replaced: {occurrences_changed} occurrence(s) in '{name}'"),
         WriteResult::Appended { chars, bytes } => {
             format!("Appended: {chars} char(s) / {bytes} byte(s) to '{name}'")
         }
@@ -959,7 +961,7 @@ mod tests {
         assert_eq!(
             outcome.result,
             WriteResult::Replaced {
-                occurrences_changed: Some(1)
+                occurrences_changed: 1
             }
         );
         assert_eq!(outcome.required_revision_id.as_deref(), Some("rev-abc"));
@@ -1191,7 +1193,7 @@ mod tests {
         assert_eq!(
             outcome.result,
             WriteResult::Replaced {
-                occurrences_changed: Some(0)
+                occurrences_changed: 0
             }
         );
     }
