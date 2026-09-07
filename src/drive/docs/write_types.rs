@@ -184,17 +184,39 @@ pub struct BatchUpdateDocumentResponse {
 }
 
 impl BatchUpdateDocumentResponse {
-    /// The `occurrencesChanged` the server reported, when the single request
-    /// was a `replaceAllText`.
+    /// The `occurrencesChanged` the server reported, exactly as sent.
     ///
-    /// `None` is normal rather than an error: an `insertText` replies with an
-    /// empty object. Same absent-is-not-empty lesson as `ValueRange::values`.
+    /// `None` means the field was absent, which happens in **two** unrelated
+    /// cases — which is why callers that know they sent a `replaceAllText`
+    /// should use [`Self::occurrences_changed_for_replace`] instead:
+    ///
+    /// - an `insertText` replies with an empty object, so there is genuinely
+    ///   no count; and
+    /// - a `replaceAllText` that matched **nothing** also omits it, because
+    ///   Docs serialises proto3 JSON and proto3 omits zero-valued integers.
+    ///
+    /// Observed live (2026-09-07): a replace matching 2 occurrences returns
+    /// `occurrencesChanged: 2`, and one matching 0 returns the field not at
+    /// all. Same rule as `StructuralElement::start_index`.
     #[must_use]
     pub fn occurrences_changed(&self) -> Option<i64> {
         self.replies
             .first()
             .and_then(|reply| reply.replace_all_text.as_ref())
             .and_then(|reply| reply.occurrences_changed)
+    }
+
+    /// The count for a request the caller knows was a `replaceAllText`,
+    /// resolving proto3's omitted zero to `0`.
+    ///
+    /// A replace always has an answer — "nothing matched" is a count, not an
+    /// absence of one — so this returns `i64` rather than `Option<i64>`. The
+    /// caller supplies the missing piece of information that disambiguates
+    /// [`Self::occurrences_changed`]'s two `None` cases: that the request was
+    /// a replace, so an absent field can only mean zero.
+    #[must_use]
+    pub fn occurrences_changed_for_replace(&self) -> i64 {
+        self.occurrences_changed().unwrap_or(0)
     }
 }
 
@@ -277,6 +299,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.occurrences_changed(), Some(7));
+    }
+
+    /// The shape Google actually returns for a replace that matched
+    /// **nothing**, observed live on 2026-09-07: proto3 omits the
+    /// zero-valued integer, so the field is simply absent.
+    ///
+    /// Reading that as "unknown" is the bug this pins — a replace that
+    /// matched nothing has an answer, and it is zero. The mock in the
+    /// original test sent `occurrencesChanged: 0`, which Google never does,
+    /// which is exactly why only a live run caught it.
+    #[test]
+    fn a_replace_that_matched_nothing_omits_the_count_and_reads_as_zero() {
+        let response: BatchUpdateDocumentResponse = serde_json::from_value(serde_json::json!({
+            "documentId": "d1",
+            "replies": [{"replaceAllText": {}}],
+        }))
+        .unwrap();
+        assert_eq!(response.occurrences_changed(), None, "absent on the wire");
+        assert_eq!(
+            response.occurrences_changed_for_replace(),
+            0,
+            "but a replace knows absent means zero"
+        );
+    }
+
+    /// A reply carrying no `replaceAllText` section at all resolves the same
+    /// way for a replace: still zero, never "unknown".
+    #[test]
+    fn a_bare_reply_object_also_reads_as_zero_for_a_replace() {
+        let response: BatchUpdateDocumentResponse = serde_json::from_value(serde_json::json!({
+            "documentId": "d1", "replies": [{}],
+        }))
+        .unwrap();
+        assert_eq!(response.occurrences_changed_for_replace(), 0);
     }
 
     /// An `insertText` replies with an empty object; that is normal.
