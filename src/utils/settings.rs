@@ -2004,7 +2004,7 @@ mod tests {
         let settings = Settings::load_from_path(&path).unwrap();
         let rules = &settings.drive.accounts["work"].write_permissions.rules;
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].folder_id, "folder-1");
+        assert_eq!(rules[0].folder_id.as_deref(), Some("folder-1"));
         assert!(rules[0].recursive);
         assert!(rules[0]
             .allow
@@ -2142,5 +2142,112 @@ mod tests {
 
         Settings::set_drive_default_account(&path, None).unwrap();
         assert!(read_json(&path)["drive"].get("default_account").is_none());
+    }
+
+    // ── file-id rules (issue #1612) ─────────────────────────────────────
+
+    /// Writes `rules` as an account's `write_permissions.rules` and loads it.
+    fn load_with_rules(rules_json: &str) -> Result<Settings> {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"drive":{{"accounts":{{"work":{{"write_permissions":{{"rules":{rules_json}}}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        Settings::load_from_path(&path)
+    }
+
+    #[test]
+    fn a_file_id_rule_round_trips_through_settings_load() {
+        let settings =
+            load_with_rules(r#"[{"file_id":"sheet-1","allow":["sheets-write"]}]"#).unwrap();
+        let rules = &settings.drive.accounts["work"].write_permissions.rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].file_id.as_deref(), Some("sheet-1"));
+        assert_eq!(rules[0].folder_id, None);
+        assert!(!rules[0].recursive);
+        assert!(rules[0]
+            .allow
+            .contains(&crate::drive::write_gate::DriveOperation::SheetsWrite));
+    }
+
+    #[test]
+    fn folder_and_file_rules_coexist_in_one_list() {
+        let settings = load_with_rules(
+            r#"[{"folder_id":"f1","recursive":true,"allow":["create"]},
+                {"file_id":"x1","deny":["edit"]}]"#,
+        )
+        .unwrap();
+        let rules = &settings.drive.accounts["work"].write_permissions.rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].folder_id.as_deref(), Some("f1"));
+        assert_eq!(rules[1].file_id.as_deref(), Some("x1"));
+    }
+
+    #[test]
+    fn a_rule_naming_no_target_fails_the_whole_load() {
+        // Fail-closed: `active_account_rules` turns a load error into an
+        // empty rule set, which denies every write.
+        assert!(load_with_rules(r#"[{"allow":["create"]}]"#).is_err());
+    }
+
+    #[test]
+    fn a_rule_naming_both_targets_fails_the_whole_load() {
+        assert!(load_with_rules(r#"[{"folder_id":"f1","file_id":"x1"}]"#).is_err());
+    }
+
+    #[test]
+    fn recursive_true_on_a_file_rule_fails_the_whole_load() {
+        assert!(load_with_rules(r#"[{"file_id":"x1","recursive":true}]"#).is_err());
+    }
+
+    #[test]
+    fn an_older_binary_would_fail_closed_on_a_file_rule() {
+        // The backward-compatibility claim, pinned. An older binary has
+        // `folder_id: String` (required), so a file rule is a missing-field
+        // error there — exactly what this asserts by omitting `folder_id`
+        // from a shape that requires one. `Settings::load()` then fails and
+        // `active_account_rules` degrades to zero rules: every write denied,
+        // never silently widened. Same mechanism ADR-0073 §3 accepted for a
+        // new `DriveOperation` variant.
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldFolderPermissionRule {
+            folder_id: String,
+        }
+        let err = serde_json::from_str::<OldFolderPermissionRule>(r#"{"file_id":"x1"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("folder_id"), "{err}");
+    }
+
+    #[test]
+    fn upsert_drive_account_preserves_file_id_rules_it_cannot_understand() {
+        // Settings *writes* go through an untyped `serde_json::Value`
+        // merge, so an older binary running `drive auth login` cannot drop
+        // the file rules it failed to parse.
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"drive":{"accounts":{"work":{"write_permissions":{"rules":[
+                {"file_id":"sheet-1","allow":["sheets-write"]}]}}}}}"#,
+        )
+        .unwrap();
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[("email", serde_json::Value::String("a@b.c".to_string()))],
+        )
+        .unwrap();
+
+        let reloaded = Settings::load_from_path(&path).unwrap();
+        let rules = &reloaded.drive.accounts["work"].write_permissions.rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].file_id.as_deref(), Some("sheet-1"));
     }
 }

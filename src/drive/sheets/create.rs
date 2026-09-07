@@ -285,7 +285,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         CreateResult::Blocked { decided_by } => decided_by.as_ref(),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
     let updated_cells = match &outcome.result {
         CreateResult::Created { seeded_cells, .. } => *seeded_cells,
         _ => None,
@@ -297,8 +297,9 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         file_name: outcome.name.clone(),
         status: outcome.result.log_status().to_string(),
         resolved_folder_id: Some(outcome.parent_folder_id.clone()),
-        decided_by_folder_id,
-        decided_by_depth,
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
         updated_cells,
         error,
         duration,
@@ -321,8 +322,10 @@ pub fn describe(outcome: &CreateOutcome) -> String {
         ),
         CreateResult::Blocked { decided_by } => match decided_by {
             Some(rule) => format!(
-                "Blocked: '{name}' in {parent} — refused by rule on folder {} (depth {})",
-                rule.folder_id, rule.depth
+                "Blocked: '{name}' in {parent} — refused by rule on {} {}{}",
+                rule.kind_label(),
+                rule.id(),
+                rule.depth_suffix()
             ),
             None => format!(
                 "Blocked: '{name}' in {parent} — refused by default policy (no matching rule)"
@@ -350,6 +353,91 @@ pub fn describe(outcome: &CreateOutcome) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Every `describe` arm renders to exactly one line.
+    ///
+    /// The `sheets write` twin of this test carries the full reasoning: the
+    /// CLI caller sanitizes the whole rendered line rather than each
+    /// interpolation, so an arm that emitted a newline would be silently
+    /// flattened by `sanitize_for_terminal` instead of failing anything.
+    #[test]
+    fn every_describe_arm_renders_a_single_line() {
+        for result in every_create_result() {
+            let outcome = CreateOutcome {
+                name: "Quarterly Plan".to_string(),
+                parent_folder_id: "folder-1".to_string(),
+                result,
+            };
+            let rendered = describe(&outcome);
+            assert_eq!(
+                rendered.lines().count(),
+                1,
+                "describe emitted {} lines for {:?}: {rendered:?}",
+                rendered.lines().count(),
+                outcome.result
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "describe emitted a control character for {:?}: {rendered:?}",
+                outcome.result
+            );
+        }
+    }
+
+    /// One of every `CreateResult` variant.
+    ///
+    /// Exhaustive and wildcard-free, so a new variant breaks the build until
+    /// it is covered by `every_describe_arm_renders_a_single_line`.
+    fn every_create_result() -> Vec<CreateResult> {
+        let all = vec![
+            CreateResult::WouldCreate {
+                rows: 0,
+                columns: 0,
+            },
+            CreateResult::WouldCreate {
+                rows: 2,
+                columns: 3,
+            },
+            CreateResult::Blocked { decided_by: None },
+            CreateResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 0,
+                }),
+            },
+            CreateResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "sheet-1".to_string(),
+                }),
+            },
+            CreateResult::Created {
+                file_id: "sheet-1".to_string(),
+                seeded_cells: Some(6),
+            },
+            CreateResult::Created {
+                file_id: "sheet-1".to_string(),
+                seeded_cells: None,
+            },
+            CreateResult::CreatedValuesFailed {
+                file_id: "sheet-1".to_string(),
+                detail: "the API said no".to_string(),
+            },
+            CreateResult::Failed {
+                detail: "the API said no".to_string(),
+            },
+        ];
+        for result in &all {
+            match result {
+                CreateResult::WouldCreate { .. }
+                | CreateResult::Blocked { .. }
+                | CreateResult::Created { .. }
+                | CreateResult::CreatedValuesFailed { .. }
+                | CreateResult::Failed { .. } => (),
+            }
+        }
+        all
+    }
+
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::test_support::env::MapEnv;
@@ -410,7 +498,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: HashSet::default(),
@@ -534,7 +623,8 @@ mod tests {
         // No PUT mock: a seed attempt would surface as Failed, not Blocked.
 
         let rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
@@ -598,7 +688,8 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
         let deny_rule = FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::Create).collect(),

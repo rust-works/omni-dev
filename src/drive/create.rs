@@ -181,7 +181,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         CreateResult::Blocked { decided_by } => decided_by.as_ref(),
         _ => None,
     };
-    let (decided_by_folder_id, decided_by_depth) = write_gate::decided_by_log_fields(decided_by);
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: "create",
         file_id: match &outcome.result {
@@ -196,8 +196,9 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         removed_principals: Vec::new(),
         crosses_drive_boundary: false,
         resolved_folder_id: Some(outcome.parent_folder_id.clone()),
-        decided_by_folder_id,
-        decided_by_depth,
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
         error,
         duration,
         ..Default::default()
@@ -259,7 +260,8 @@ mod tests {
 
     fn allow_rule() -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: false,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::collections::HashSet::default(),
