@@ -1406,6 +1406,42 @@ fn log_filters_slow_requests_and_failed_runs() {
 }
 
 #[test]
+fn log_query_status_matches_drivemutation_context_not_http_status_code() {
+    // The documented form from docs/drive.md (#1624): a `drivemutation`
+    // record has no `status_code`, so `status:` there must match the domain
+    // status in `context["status"]`, not fall through to the HTTP path.
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let lines = [
+        r#"{"id":"0001","invocation_id":"inv-a","kind":"drivemutation","timestamp":"2026-07-01T00:00:00.000Z","service":"drive","command":["drive","move"],"context":{"status":"blocked","file_id":"f1"}}"#,
+        r#"{"id":"0002","invocation_id":"inv-b","kind":"drivemutation","timestamp":"2026-07-01T00:00:01.000Z","service":"drive","command":["drive","move"],"context":{"status":"moved","file_id":"f2"}}"#,
+        r#"{"id":"0003","invocation_id":"inv-c","kind":"http","timestamp":"2026-07-01T00:00:02.000Z","service":"drive","status_code":200}"#,
+    ];
+    fs::write(&log, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let out = run_with_log(
+        &log,
+        &[
+            "log",
+            "--query",
+            "kind:drivemutation status:blocked",
+            "-o",
+            "json",
+        ],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""id":"0001""#),
+        "blocked drivemutation record present:\n{stdout}"
+    );
+    assert!(!stdout.contains(r#""id":"0002""#), "moved record excluded");
+    assert!(
+        !stdout.contains(r#""id":"0003""#),
+        "unrelated http record excluded"
+    );
+}
+
+#[test]
 fn log_filters_by_service_and_bounded_window() {
     let dir = TempDir::new().unwrap();
     let log = seeded_log(dir.path());

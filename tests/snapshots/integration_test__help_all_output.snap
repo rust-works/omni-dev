@@ -5191,7 +5191,7 @@ Options:
       --since <DUR_OR_TS>  Lower time bound: relative (`30m`, `2h`, `1d`, `1w`) or absolute (`2026-07-01`, RFC3339). Same forms as `omni-dev log --since`
       --until <DUR_OR_TS>  Upper time bound (same forms as `--since`; a relative value means that long ago)
       --source <SOURCE>    Restrict to records from one source [possible values: cli, daemon, mcp]
-      --kind <KIND>        Restrict to one record kind (`--kind gh` shows the GitHub breakdown) [possible values: invocation, http, gh, worktree]
+      --kind <KIND>        Restrict to one record kind (`--kind gh` shows the GitHub breakdown) [possible values: invocation, http, gh, worktree, drivemutation]
       --json               Emit JSON instead of a table
   -h, --help               Print help
 

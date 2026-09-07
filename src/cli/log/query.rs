@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 
-use crate::request_log::{LogRecord, Source};
+use crate::request_log::{LogRecord, RecordKind, Source};
 
 /// The raw, borrowed flag values used to build a [`Filter`].
 pub struct FilterInput<'a> {
@@ -282,6 +282,14 @@ fn field_matches(rec: &LogRecord, field: &str, value: &str) -> bool {
             .is_some_and(|s| source_str(s).eq_ignore_ascii_case(value)),
         "service" => opt_eq_ci(rec.service.as_deref(), value),
         "method" => opt_eq_ci(rec.method.as_deref(), value),
+        // A `drivemutation` record has no `status_code` — its domain status
+        // (`blocked`, `written`, `stale-revision`, ...) lives in
+        // `context["status"]`. Exact match (not `contains_ci`): the status
+        // set is enum-like and several values share substrings
+        // (`written`/`would-write`, `blocked`/`refused-*`).
+        "status" if rec.kind == RecordKind::DriveMutation => {
+            opt_eq_ci(rec.context.get("status").map(String::as_str), value)
+        }
         // `status` keeps its class syntax (`5xx`, `4xx,5xx`); a leading
         // comparator (`status:>=400`) routes to the numeric matcher instead.
         "status" if has_comparator(value) => numeric_match(rec.status_code.map(i64::from), value),
@@ -844,6 +852,31 @@ mod tests {
             ("branch:other-branch", false),
             ("path:demo-wt", true),
             ("commit:abc", false), // key absent from context
+        ];
+        for (q, expected) in cases {
+            let parsed = parse_query(q).unwrap();
+            assert_eq!(parsed.eval(&rec, &raw), expected, "query: {q}");
+        }
+    }
+
+    #[test]
+    fn query_status_is_kind_aware_for_drivemutation() {
+        // A `drivemutation` record has no `status_code`; its domain status
+        // lives in `context["status"]` and matches by exact case-insensitive
+        // equality, not substring (see #1624).
+        let mut rec = LogRecord {
+            kind: RecordKind::DriveMutation,
+            ..LogRecord::default()
+        };
+        rec.context
+            .insert("status".to_string(), "blocked".to_string());
+        let raw = serde_json::to_string(&rec).unwrap().to_ascii_lowercase();
+
+        let cases = [
+            ("status:blocked", true),
+            ("status:BLOCKED", true),
+            ("status:written", false),
+            ("status:block", false), // exact match, not substring
         ];
         for (q, expected) in cases {
             let parsed = parse_query(q).unwrap();
