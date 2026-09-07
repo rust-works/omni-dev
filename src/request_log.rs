@@ -940,6 +940,12 @@ pub struct DriveMutationOutcome {
     /// of [`Self::range`], for effects A1 notation cannot express; absent
     /// for verbs that span no dimension.
     pub dimension_range: Option<String>,
+    /// The rectangular cell range a `delete-range` verb spanned (issue
+    /// #1623), e.g. `"rows 2-10, columns 2-4"`, 1-based inclusive like the
+    /// CLI's `--start-row`/`--end-row`/`--start-column`/`--end-column`. The
+    /// `deleteRange` analogue of [`Self::dimension_range`], which only ever
+    /// spans one axis. `None` for every other verb.
+    pub grid_range: Option<String>,
     /// Occurrences the Docs API reported changing (issue #1615). `None` for
     /// every verb but `docs replace`.
     ///
@@ -1054,6 +1060,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(dimension_range) = outcome.dimension_range {
         context.insert("dimension_range".to_string(), dimension_range);
+    }
+    if let Some(grid_range) = outcome.grid_range {
+        context.insert("grid_range".to_string(), grid_range);
     }
     if let Some(occurrences) = outcome.occurrences_changed {
         context.insert("occurrences_changed".to_string(), occurrences.to_string());
@@ -1829,6 +1838,35 @@ mod tests {
         assert_eq!(rec.context.get("updated_cells"), None);
         // An insert renames nothing.
         assert_eq!(rec.context.get("sheet_new_title"), None);
+        // An insert spans one dimension, not a rectangle.
+        assert_eq!(rec.context.get("grid_range"), None);
+    }
+
+    #[test]
+    fn build_drive_mutation_record_includes_the_grid_range_key_for_a_delete_range() {
+        // The `deleteRange` analogue of the dimension_range test above (issue
+        // #1623): a rectangle spans both axes at once, so it gets its own
+        // key rather than overloading `dimension_range`, which
+        // `StructureVerb::dimension` reports `None` for on this verb.
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-delete-range",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "changed".to_string(),
+                sheet_id: Some(118_293),
+                sheet_title: Some("Q2".to_string()),
+                grid_range: Some("rows 2-4, columns 2-3".to_string()),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("grid_range").map(String::as_str),
+            Some("rows 2-4, columns 2-3")
+        );
+        assert_eq!(rec.context.get("dimension_range"), None);
     }
 
     #[test]
@@ -1879,6 +1917,7 @@ mod tests {
         assert_eq!(rec.context.get("sheet_title"), None);
         assert_eq!(rec.context.get("sheet_new_title"), None);
         assert_eq!(rec.context.get("dimension_range"), None);
+        assert_eq!(rec.context.get("grid_range"), None);
     }
 
     #[test]

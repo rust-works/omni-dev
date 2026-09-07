@@ -605,15 +605,16 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation          | Default | Granted to                                                          |
-|--------------------|---------|----------------------------------------------------------------------|
-| `read`             | allow   | `search`, `read`, `dedupe` (not yet enforced)                       |
-| `create`           | deny    | `create`, `sheets create`                                           |
-| `upload`           | deny    | `upload`                                                            |
-| `edit`             | deny    | `edit` — raw file content only                                      |
-| `sheets-write`     | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values       |
-| `sheets-structure` | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns` |
-| `docs-write`       | deny    | `docs replace`, `docs append`                                       |
+| Operation          | Default | Granted to                                                             |
+|--------------------|---------|------------------------------------------------------------------------|
+| `read`             | allow   | `search`, `read`, `dedupe` (not yet enforced)                          |
+| `create`           | deny    | `create`, `sheets create`                                              |
+| `upload`           | deny    | `upload`                                                               |
+| `edit`             | deny    | `edit` — raw file content only                                         |
+| `sheets-write`     | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values          |
+| `sheets-structure` | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`    |
+| `sheets-delete`    | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
+| `docs-write`       | deny    | `docs replace`, `docs append`                                          |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -635,21 +636,24 @@ rules into permission to restructure a workbook — again with no config
 change and no re-consent. Granting one does not grant the other; name both
 if you want both. See [ADR-0075](adrs/adr-0075.md) §1.
 
-Note what `sheets-structure` does **not** cover: there is no way to delete a
-sheet, a row or a column through `omni-dev` at all. Those requests are not
-implemented, and the deferral is deliberate — see
-[Structural limits](#structural-limits) below.
+**`sheets-delete` is separate from `sheets-structure`, for the same reason
+again.** Every `allow: ["sheets-structure"]` rule that exists today was
+written when deletion was impossible, so reusing it would have turned those
+rules into permission to destroy data — again with no config change and no
+re-consent. Granting `sheets-structure` does not grant `sheets-delete`; name
+both if you want both. See [ADR-0077](adrs/adr-0077.md).
 
-**`docs-write` is separate from all three**, and the same argument runs
+**`docs-write` is separate from all four**, and the same argument runs
 again. An `allow: ["edit"]` rule predates Docs being reachable through this
-tool at all; an `allow: ["sheets-write"]` or `allow: ["sheets-structure"]`
-rule was written when the same was true, and both operations are about
-*cells*, so letting either govern prose would make the config vocabulary say
-something untrue. Grant `docs-write` explicitly. See
+tool at all; an `allow: ["sheets-write"]`, `allow: ["sheets-structure"]` or
+`allow: ["sheets-delete"]` rule was written when the same was true, and all
+three are about *cells*, so letting any of them govern prose would make the
+config vocabulary say something untrue. Grant `docs-write` explicitly. See
 [ADR-0076](adrs/adr-0076.md) §2.
 
 Each write operation is independent in both directions: `docs-write` confers
-no cell writes, no structural sheet edits, and no raw-content edits either.
+no cell writes, no structural sheet edits, no destructive sheet edits, and no
+raw-content edits either.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from. A rule keys on **either** a `folder_id` or a
@@ -688,10 +692,10 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   rule: a file has no descendants, so `recursive: true` alongside a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
-  `sheets-write`, `sheets-structure`. A `deny` entry for `read` is
-  schema-ready today for a future `search`/`read`/`dedupe` enforcement
-  fast-follow (not wired up yet — see [ADR-0071](adrs/adr-0071.md) §11);
-  the write operations are enforced now.
+  `sheets-write`, `sheets-structure`, `sheets-delete`, `docs-write`. A `deny`
+  entry for `read` is schema-ready today for a future `search`/`read`/
+  `dedupe` enforcement fast-follow (not wired up yet — see
+  [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
 
 A rule that names neither key, names both, or puts `recursive: true` on a
 `file_id` is a **settings load error**, not a silently-ignored rule — and
@@ -1201,18 +1205,68 @@ you may add, so `omni-dev` doesn't invent one, and Sheets remains the
 authority on how large a sheet may actually get. A count large enough to
 overflow the row/column index space is refused rather than sent.
 
-<a id="structural-limits"></a>
-**Structural limits — no deletion, at all.** There is deliberately no
-`delete-sheet`, no `delete-rows`, no `delete-columns`, and no way to send a
-raw `spreadsheets.batchUpdate` request array. Deletion is the one structural
-operation whose blast radius exceeds its arguments: deleting rows 5–10 also
-rewrites every formula referencing them across the whole workbook, and
-deleting a sheet destroys data with no per-cell footprint. It is deferred to
-its own design pass rather than shipped behind a flag, and the requests are
-not modelled in the code at all, so no combination of flags can reach one.
-If you need to delete something, do it in the Sheets UI. Formatting, data
-validation, protected ranges and sheet reordering are likewise not
-implemented yet. See [ADR-0075](adrs/adr-0075.md).
+#### drive sheets delete-sheet / delete-rows / delete-columns / delete-range
+
+Destructive edits — the same `spreadsheets.batchUpdate` mechanism as above,
+but these actually remove data. Gated by the separate `sheets-delete`
+operation, **not** `sheets-structure`: a folder granted `sheets-structure`
+cannot delete anything without an explicit additional grant, and vice versa.
+See [ADR-0077](adrs/adr-0077.md).
+
+There is still no interactive confirmation and no `--force` anywhere in this
+tool, deletion included — the permission gate and an honest `--dry-run` are
+the whole consent mechanism, the same as every other write in this
+integration. And there is still no raw `spreadsheets.batchUpdate` request
+array: every verb, destructive or not, is its own typed command.
+
+```bash
+# What would be destroyed — no mutation is attempted.
+omni-dev drive sheets delete-rows <ID> --sheet Q2 --at 5 --count 3 --dry-run
+```
+
+```
+Would delete 3 row(s) 5-7 of 'Q2' (sheetId 118293) in 'Budget'
+  (500 rows -> 497; existing rows 8-500 shift up; formulas elsewhere in the
+   workbook that reference the deleted rows may break, which cannot be
+   checked automatically)
+```
+
+That caveat is deliberate and load-bearing: checking whether some other
+sheet's formula references what would be deleted would mean reading the
+whole workbook's formulas, not just the target's own dimensions, and
+`--dry-run` for a destructive verb stays exactly as structural as the
+additive one above — no extra `values.get` read, no cell content in its
+output or the request log.
+
+```bash
+# Delete an entire tab. Cannot be undone through omni-dev.
+omni-dev drive sheets delete-sheet <ID> --sheet Q2
+
+# Delete rows or columns. --at is 1-based inclusive, same as insert-rows.
+omni-dev drive sheets delete-rows <ID> --sheet Q2 --at 5 --count 3
+omni-dev drive sheets delete-columns <ID> --sheet Q2 --at 2
+
+# Delete a rectangular range, shifting what remains up or left to close the
+# gap. All four bounds are required — an open-ended span is delete-rows/
+# delete-columns's job, not this one's.
+omni-dev drive sheets delete-range <ID> --sheet Q2 \
+  --start-row 2 --end-row 4 --start-column 2 --end-column 3 --shift rows
+```
+
+Every real (non-`--dry-run`) delete says how to recover, since there is no
+`files.delete` or undo anywhere in this integration:
+
+```
+Deleted sheet 'Q2' (sheetId 118293) from 'Budget'; this cannot be undone
+through omni-dev — use Google Drive's version history to recover it if
+needed
+```
+
+The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
+`--at`/`--count` (or the range bounds) must name rows/columns/cells that
+already exist — deletion has no append-boundary case, since everything named
+must be real. Formatting, data validation, protected ranges and sheet
+reordering are still not implemented.
 
 **Limits.** A whole-workbook read refuses a spreadsheet beyond a fixed sheet
 count rather than returning part of it — silently returning half a workbook is
@@ -1726,6 +1780,10 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   `spreadsheets.batchUpdate`: the separate `sheets-structure` gate
   operation, why the surface is typed verbs with no raw request
   passthrough, and why deletion is deferred rather than gated.
+- [ADR-0077](adrs/adr-0077.md) — the deferred deletion design pass: the
+  separate `sheets-delete` gate operation, why the typed-verbs-only property
+  survives deletion too, and why there is still no interactive confirmation
+  or `--force` for the most dangerous operation in the tree.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.

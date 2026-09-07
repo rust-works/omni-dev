@@ -4071,7 +4071,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, docs-write]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, docs-write]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4180,6 +4180,10 @@ Commands:
   rename-sheet    Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-rows     Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-columns  Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  delete-sheet    Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-rows     Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-columns  Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-range    Deletes a rectangular cell range, shifting the remainder along one axis. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
   help            Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4265,6 +4269,87 @@ Options:
       --dry-run                        Reports the gate verdict without creating anything
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-columns - Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Usage: delete-columns [OPTIONS] --sheet <NAME> --at <COLUMN> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <COLUMN>      First column to delete, 1-based inclusive (column A is 1)
+      --count <N>        How many columns to delete [default: 1]
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-range - Deletes a rectangular cell range, shifting the remainder along one axis. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Deletes a rectangular cell range, shifting the remainder along one axis. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Usage: delete-range [OPTIONS] --sheet <NAME> --start-row <ROW> --end-row <ROW> --start-column <COLUMN> --end-column <COLUMN> --shift <SHIFT> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --start-row <ROW>        First row of the range, 1-based inclusive
+      --end-row <ROW>          Last row of the range, 1-based inclusive
+      --start-column <COLUMN>  First column of the range, 1-based inclusive
+      --end-column <COLUMN>    Last column of the range, 1-based inclusive
+      --shift <SHIFT>          Which way to shift the remaining cells afterward [possible values: rows, columns]
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-rows - Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Usage: delete-rows [OPTIONS] --sheet <NAME> --at <ROW> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <ROW>         First row to delete, 1-based inclusive — the row number the spreadsheet itself shows
+      --count <N>        How many rows to delete [default: 1]
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-sheet - Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+
+Usage: delete-sheet [OPTIONS] --sheet <NAME> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to delete
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

@@ -1,6 +1,7 @@
 //! CLI commands for `omni-dev drive sheets` — reading and writing the
-//! *cells* of a Google Sheet via the Sheets v4 API (issue #1589), and
-//! editing its *structure* via `spreadsheets.batchUpdate` (issue #1613).
+//! *cells* of a Google Sheet via the Sheets v4 API (issue #1589), editing
+//! its *structure* via `spreadsheets.batchUpdate` (issue #1613), and
+//! *destructively* editing it the same way (issue #1623).
 //!
 //! Nested under `drive` rather than given its own top-level tree so it
 //! inherits `--account` resolution, the `auth` commands and the write-
@@ -60,6 +61,22 @@ pub enum SheetsSubcommands {
     /// folder write-permission rules' `sheets-structure` operation
     /// (issue #1613).
     InsertColumns(structure::InsertColumnsCommand),
+    /// Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder
+    /// write-permission rules' `sheets-delete` operation (issue #1623).
+    /// Cannot be undone through omni-dev.
+    DeleteSheet(structure::DeleteSheetCommand),
+    /// Deletes whole rows, shifting existing rows up. Gated by the folder
+    /// write-permission rules' `sheets-delete` operation (issue #1623).
+    /// Cannot be undone through omni-dev.
+    DeleteRows(structure::DeleteRowsCommand),
+    /// Deletes whole columns, shifting existing columns left. Gated by the
+    /// folder write-permission rules' `sheets-delete` operation (issue
+    /// #1623). Cannot be undone through omni-dev.
+    DeleteColumns(structure::DeleteColumnsCommand),
+    /// Deletes a rectangular cell range, shifting the remainder along one
+    /// axis. Gated by the folder write-permission rules' `sheets-delete`
+    /// operation (issue #1623). Cannot be undone through omni-dev.
+    DeleteRange(structure::DeleteRangeCommand),
 }
 
 impl SheetsCommand {
@@ -81,6 +98,10 @@ impl SheetsCommand {
             SheetsSubcommands::RenameSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertRows(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertColumns(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteSheet(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteRows(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteColumns(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteRange(cmd) => cmd.execute(client).await,
         }
     }
 }

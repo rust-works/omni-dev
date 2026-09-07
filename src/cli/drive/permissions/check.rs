@@ -30,6 +30,9 @@ pub enum OperationArg {
     /// Structurally editing a Google Sheet — distinct from `SheetsWrite`,
     /// see [`DriveOperation::SheetsStructure`].
     SheetsStructure,
+    /// Destructively editing a Google Sheet — distinct from
+    /// `SheetsStructure`, see [`DriveOperation::SheetsDelete`].
+    SheetsDelete,
     /// Replacing or appending text in a Google Doc — distinct from both
     /// `Edit` and `SheetsWrite`, see [`DriveOperation::DocsWrite`].
     DocsWrite,
@@ -44,6 +47,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::Edit => Self::Edit,
             OperationArg::SheetsWrite => Self::SheetsWrite,
             OperationArg::SheetsStructure => Self::SheetsStructure,
+            OperationArg::SheetsDelete => Self::SheetsDelete,
             OperationArg::DocsWrite => Self::DocsWrite,
         }
     }
@@ -267,6 +271,10 @@ mod tests {
         assert_eq!(
             DriveOperation::from(OperationArg::SheetsStructure),
             DriveOperation::SheetsStructure
+        );
+        assert_eq!(
+            DriveOperation::from(OperationArg::SheetsDelete),
+            DriveOperation::SheetsDelete
         );
     }
 

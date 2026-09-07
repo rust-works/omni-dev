@@ -1,12 +1,14 @@
-//! Structural spreadsheet edits via `spreadsheets.batchUpdate`.
+//! Structural and destructive spreadsheet edits via `spreadsheets.batchUpdate`.
 //!
 //! The `drive sheets add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`
-//! engines, gated by the ADR-0071 folder write-permission rules (issue
-//! #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)).
+//! (additive, issue #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)) and
+//! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (destructive,
+//! issue #1623, [ADR-0077](../../../docs/adrs/adr-0077.md)) engines, gated by
+//! the ADR-0071 folder write-permission rules.
 //!
 //! [ADR-0073](../../../docs/adrs/adr-0073.md) §12 deferred this surface
 //! because `batchUpdate` is where "one call destroys far more than its
-//! arguments suggest". Three properties answer that, and each is structural
+//! arguments suggest". Two properties answer that, and each is structural
 //! rather than a matter of care:
 //!
 //! - **Typed verbs, no raw request passthrough.** Every verb builds its own
@@ -14,14 +16,22 @@
 //!   exact effect. There is no `--requests file.json` and deliberately no
 //!   escape hatch, following [ADR-0061](../../../docs/adrs/adr-0061.md)'s
 //!   handling of force-push: the dangerous form must be unreachable, not
-//!   merely discouraged.
-//! - **No destructive request is modelled at all.** `deleteSheet`,
-//!   `deleteDimension` and `deleteRange` have no Rust representation, so they
-//!   cannot be constructed. The `no_destructive_request_is_reachable` test
-//!   pins that.
-//! - **A distinct gate operation.** [`DriveOperation::SheetsStructure`], not
-//!   `SheetsWrite` — see its doc comment for why reuse would be silent
-//!   privilege widening.
+//!   merely discouraged. This still holds for the destructive verbs added by
+//!   ADR-0077 — they gained typed variants, not a passthrough.
+//! - **A distinct gate operation per risk class.** Additive verbs check
+//!   [`DriveOperation::SheetsStructure`]; the four destructive verbs check
+//!   [`DriveOperation::SheetsDelete`] instead — never folded together, and
+//!   never reusing `SheetsWrite` either. See each variant's doc comment for
+//!   why reuse would be silent privilege widening. [`StructureVerb::gate_operation`]
+//!   is the single place this split is decided.
+//!
+//! ADR-0075 §3/§4 originally kept `deleteSheet`/`deleteDimension`/
+//! `deleteRange` unreachable at the type level, pinned by a
+//! `no_destructive_request_is_reachable` grep-guard test. ADR-0077
+//! supersedes that: those requests are now reachable, but only through this
+//! module's gated, validated path — never through a raw passthrough, and
+//! never under the `sheets-structure` operation an existing `allow` rule may
+//! already grant.
 //!
 //! Shape follows `write.rs` exactly: a public wrapper that logs, an `_inner`
 //! that classifies then mutates, and `--dry-run` as an early return *after*
@@ -30,7 +40,11 @@
 //! issue a single `spreadsheets.get`, because describing a structural effect
 //! honestly requires the sheet's real current dimensions. It still issues no
 //! `batchUpdate`, and a gate-blocked attempt still issues no Sheets call at
-//! all.
+//! all. `--dry-run` for a destructive verb stays structural-only — no
+//! `values.get` read and no cell content in its output or the request log —
+//! and instead states a fixed caveat that formulas elsewhere in the workbook
+//! may reference what would be deleted, which cannot be checked from the
+//! sheet's own dimensions (ADR-0077).
 
 use std::time::{Duration, Instant};
 
@@ -42,9 +56,10 @@ use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
-    AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, Dimension, DimensionRange,
-    GridProperties, InsertDimensionRequest, NewSheetProperties, SheetProperties,
-    SheetPropertiesUpdate, Spreadsheet, UpdateSheetPropertiesRequest,
+    AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, DeleteDimensionRequest,
+    DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange, GridProperties, GridRange,
+    InsertDimensionRequest, NewSheetProperties, SheetProperties, SheetPropertiesUpdate,
+    ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -95,6 +110,50 @@ pub enum StructureVerb {
         /// How many columns to insert.
         count: i64,
     },
+    /// Delete an entire sheet from the workbook.
+    DeleteSheet {
+        /// Title of the sheet to delete.
+        sheet: String,
+    },
+    /// Delete whole rows, shifting the remainder up to close the gap.
+    DeleteRows {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first row to delete, inclusive.
+        at: i64,
+        /// How many rows to delete.
+        count: i64,
+    },
+    /// Delete whole columns, shifting the remainder left to close the gap.
+    DeleteColumns {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first column to delete, inclusive.
+        at: i64,
+        /// How many columns to delete.
+        count: i64,
+    },
+    /// Delete a rectangular cell range, shifting the remainder along one
+    /// axis to close the gap.
+    ///
+    /// All four bounds are required together: this crate only ever sends a
+    /// fully-bounded [`GridRange`]. An open-ended range on one axis would
+    /// degenerate into [`Self::DeleteRows`]/[`Self::DeleteColumns`]
+    /// semantics and is out of scope here.
+    DeleteRange {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first row, inclusive.
+        start_row: i64,
+        /// 1-based last row, inclusive.
+        end_row: i64,
+        /// 1-based first column, inclusive.
+        start_column: i64,
+        /// 1-based last column, inclusive.
+        end_column: i64,
+        /// Which way to shift the remaining cells afterward.
+        shift: ShiftDimension,
+    },
 }
 
 impl StructureVerb {
@@ -109,6 +168,28 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "sheets-rename-sheet",
             Self::InsertRows { .. } => "sheets-insert-rows",
             Self::InsertColumns { .. } => "sheets-insert-columns",
+            Self::DeleteSheet { .. } => "sheets-delete-sheet",
+            Self::DeleteRows { .. } => "sheets-delete-rows",
+            Self::DeleteColumns { .. } => "sheets-delete-columns",
+            Self::DeleteRange { .. } => "sheets-delete-range",
+        }
+    }
+
+    /// Which [`DriveOperation`] gates this verb.
+    ///
+    /// The single place the additive/destructive split is decided — see the
+    /// module doc comment and [`DriveOperation::SheetsDelete`]'s doc comment
+    /// for why the two must never share an operation.
+    const fn gate_operation(&self) -> DriveOperation {
+        match self {
+            Self::AddSheet { .. }
+            | Self::RenameSheet { .. }
+            | Self::InsertRows { .. }
+            | Self::InsertColumns { .. } => DriveOperation::SheetsStructure,
+            Self::DeleteSheet { .. }
+            | Self::DeleteRows { .. }
+            | Self::DeleteColumns { .. }
+            | Self::DeleteRange { .. } => DriveOperation::SheetsDelete,
         }
     }
 
@@ -121,6 +202,10 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "rename-sheet",
             Self::InsertRows { .. } => "insert-rows",
             Self::InsertColumns { .. } => "insert-columns",
+            Self::DeleteSheet { .. } => "delete-sheet",
+            Self::DeleteRows { .. } => "delete-rows",
+            Self::DeleteColumns { .. } => "delete-columns",
+            Self::DeleteRange { .. } => "delete-range",
         }
     }
 
@@ -131,7 +216,11 @@ impl StructureVerb {
             Self::AddSheet { title, .. } => title,
             Self::RenameSheet { sheet, .. }
             | Self::InsertRows { sheet, .. }
-            | Self::InsertColumns { sheet, .. } => sheet,
+            | Self::InsertColumns { sheet, .. }
+            | Self::DeleteSheet { sheet }
+            | Self::DeleteRows { sheet, .. }
+            | Self::DeleteColumns { sheet, .. }
+            | Self::DeleteRange { sheet, .. } => sheet,
         }
     }
 
@@ -145,16 +234,27 @@ impl StructureVerb {
     const fn new_sheet_title(&self) -> Option<&String> {
         match self {
             Self::RenameSheet { new_title, .. } => Some(new_title),
-            Self::AddSheet { .. } | Self::InsertRows { .. } | Self::InsertColumns { .. } => None,
+            Self::AddSheet { .. }
+            | Self::InsertRows { .. }
+            | Self::InsertColumns { .. }
+            | Self::DeleteSheet { .. }
+            | Self::DeleteRows { .. }
+            | Self::DeleteColumns { .. }
+            | Self::DeleteRange { .. } => None,
         }
     }
 
-    /// The axis an insert runs along, or `None` for the non-insert verbs.
+    /// The axis an insert or a row/column delete runs along, or `None` for
+    /// the verbs with no single axis (`add-sheet`, `rename-sheet`,
+    /// `delete-sheet`, `delete-range`).
     const fn dimension(&self) -> Option<Dimension> {
         match self {
-            Self::InsertRows { .. } => Some(Dimension::Rows),
-            Self::InsertColumns { .. } => Some(Dimension::Columns),
-            Self::AddSheet { .. } | Self::RenameSheet { .. } => None,
+            Self::InsertRows { .. } | Self::DeleteRows { .. } => Some(Dimension::Rows),
+            Self::InsertColumns { .. } | Self::DeleteColumns { .. } => Some(Dimension::Columns),
+            Self::AddSheet { .. }
+            | Self::RenameSheet { .. }
+            | Self::DeleteSheet { .. }
+            | Self::DeleteRange { .. } => None,
         }
     }
 }
@@ -393,7 +493,7 @@ async fn structure_inner(
     let (target, decision, resolved_folder_id) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
-        DriveOperation::SheetsStructure,
+        opts.verb.gate_operation(),
         rules,
     )
     .await
@@ -596,13 +696,26 @@ fn validate_verb_args(
             }
             Ok(())
         }
-        StructureVerb::RenameSheet { .. } => Ok(()),
+        StructureVerb::RenameSheet { .. } | StructureVerb::DeleteSheet { .. } => Ok(()),
         StructureVerb::InsertRows { at, count, .. } => {
             validate_insert_bounds(Dimension::Rows, *at, *count, sheet)
         }
         StructureVerb::InsertColumns { at, count, .. } => {
             validate_insert_bounds(Dimension::Columns, *at, *count, sheet)
         }
+        StructureVerb::DeleteRows { at, count, .. } => {
+            validate_delete_dimension_bounds(Dimension::Rows, *at, *count, sheet)
+        }
+        StructureVerb::DeleteColumns { at, count, .. } => {
+            validate_delete_dimension_bounds(Dimension::Columns, *at, *count, sheet)
+        }
+        StructureVerb::DeleteRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            ..
+        } => validate_delete_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
     }
 }
 
@@ -654,6 +767,98 @@ fn validate_insert_bounds(
                 "--at {at} is past the end of the sheet, which has {current} {noun}(s); \
                  the furthest valid position is {max_at}",
                 noun = dimension.noun(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `DeleteRows`/`DeleteColumns` half of [`validate_verb_args`].
+///
+/// Mirrors [`validate_insert_bounds`], but deletion has no append-boundary
+/// case: every row/column named must already exist, so the exclusive end
+/// index may never exceed the sheet's current size.
+fn validate_delete_dimension_bounds(
+    dimension: Dimension,
+    at: i64,
+    count: i64,
+    sheet: Option<&SheetSnapshot>,
+) -> Result<(), StructureResult> {
+    let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
+
+    if count < 1 {
+        return invalid(format!("--count must be at least 1, got {count}"));
+    }
+    if at < 1 {
+        return invalid(format!("--at must be at least 1, got {at}"));
+    }
+    let Some(last) = at.checked_sub(1).and_then(|start| start.checked_add(count)) else {
+        return invalid(format!(
+            "--at {at} with --count {count} overflows the {noun} index space",
+            noun = dimension.noun(),
+        ));
+    };
+    let current = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    };
+    if let Some(current) = current {
+        if last > current {
+            return invalid(format!(
+                "--at {at} with --count {count} reaches {noun} {end}, past the end of the \
+                 sheet, which has {current} {noun}(s)",
+                noun = dimension.noun(),
+                end = at + count - 1,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `DeleteRange` half of [`validate_verb_args`].
+///
+/// Checks both axes are well-ordered and within the sheet's current bounds —
+/// the same "never promise a change the real run then rejects" reasoning as
+/// [`validate_insert_bounds`], applied to a rectangle instead of a span.
+fn validate_delete_range_bounds(
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+    sheet: Option<&SheetSnapshot>,
+) -> Result<(), StructureResult> {
+    let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
+
+    if start_row < 1 {
+        return invalid(format!("--start-row must be at least 1, got {start_row}"));
+    }
+    if start_column < 1 {
+        return invalid(format!(
+            "--start-column must be at least 1, got {start_column}"
+        ));
+    }
+    if end_row < start_row {
+        return invalid(format!(
+            "--end-row ({end_row}) must be at or after --start-row ({start_row})"
+        ));
+    }
+    if end_column < start_column {
+        return invalid(format!(
+            "--end-column ({end_column}) must be at or after --start-column ({start_column})"
+        ));
+    }
+    if let Some(current) = sheet.and_then(|s| s.row_count) {
+        if end_row > current {
+            return invalid(format!(
+                "--end-row {end_row} is past the end of the sheet, which has {current} row(s)"
+            ));
+        }
+    }
+    if let Some(current) = sheet.and_then(|s| s.column_count) {
+        if end_column > current {
+            return invalid(format!(
+                "--end-column {end_column} is past the end of the sheet, which has {current} \
+                 column(s)"
             ));
         }
     }
@@ -727,6 +932,62 @@ fn build_request(
                 inherit_from_before: false,
             }),
         ),
+        StructureVerb::DeleteSheet { .. } => {
+            Ok(BatchUpdateRequestItem::DeleteSheet(DeleteSheetRequest {
+                sheet_id: sheet_id("delete-sheet")?,
+            }))
+        }
+        StructureVerb::DeleteRows { at, count, .. } => Ok(BatchUpdateRequestItem::DeleteDimension(
+            DeleteDimensionRequest {
+                range: dimension_range(sheet_id("delete-rows")?, Dimension::Rows, *at, *count),
+            },
+        )),
+        StructureVerb::DeleteColumns { at, count, .. } => Ok(
+            BatchUpdateRequestItem::DeleteDimension(DeleteDimensionRequest {
+                range: dimension_range(
+                    sheet_id("delete-columns")?,
+                    Dimension::Columns,
+                    *at,
+                    *count,
+                ),
+            }),
+        ),
+        StructureVerb::DeleteRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+            ..
+        } => Ok(BatchUpdateRequestItem::DeleteRange(DeleteRangeRequest {
+            range: grid_range(
+                sheet_id("delete-range")?,
+                *start_row,
+                *end_row,
+                *start_column,
+                *end_column,
+            ),
+            shift_dimension: *shift,
+        })),
+    }
+}
+
+/// Converts 1-based inclusive row/column bounds into the API's zero-based
+/// half-open [`GridRange`]. The [`dimension_range`] of `DeleteRange`: the
+/// single conversion site for the same reason.
+fn grid_range(
+    sheet_id: i64,
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+) -> GridRange {
+    GridRange {
+        sheet_id,
+        start_row_index: start_row - 1,
+        end_row_index: end_row,
+        start_column_index: start_column - 1,
+        end_column_index: end_column,
     }
 }
 
@@ -757,7 +1018,9 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
     let dimension = verb.dimension()?;
     let (at, count) = match verb {
         StructureVerb::InsertRows { at, count, .. }
-        | StructureVerb::InsertColumns { at, count, .. } => (*at, *count),
+        | StructureVerb::InsertColumns { at, count, .. }
+        | StructureVerb::DeleteRows { at, count, .. }
+        | StructureVerb::DeleteColumns { at, count, .. } => (*at, *count),
         _ => return None,
     };
     // A span is only meaningful for a positive count. `count < 1` is a
@@ -770,6 +1033,25 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
     }
     let end = at.checked_add(count).and_then(|end| end.checked_sub(1))?;
     Some(format!("{} {at}:{end}", dimension.as_str()))
+}
+
+/// The `grid_range` context value the request log records for a
+/// `delete-range` verb, e.g. `"rows 2-10, columns 2-4"` — 1-based inclusive,
+/// matching the CLI's `--start-row`/`--end-row`/`--start-column`/
+/// `--end-column`. `None` for every other verb.
+fn grid_range_label(verb: &StructureVerb) -> Option<String> {
+    match verb {
+        StructureVerb::DeleteRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            ..
+        } => Some(format!(
+            "rows {start_row}-{end_row}, columns {start_column}-{end_column}"
+        )),
+        _ => None,
+    }
 }
 
 /// Emits the `kind: "drivemutation"` record.
@@ -806,6 +1088,7 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         sheet_title: Some(opts.verb.sheet_title().to_string()),
         sheet_new_title: opts.verb.new_sheet_title().map(ToString::to_string),
         dimension_range: dimension_range_label(&opts.verb),
+        grid_range: grid_range_label(&opts.verb),
         error,
         duration,
         ..Default::default()
@@ -863,13 +1146,16 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
              resolve the target spreadsheet's id and use that instead",
             verb.label()
         )],
-        StructureResult::RefusedNoVisibleParents => vec![format!(
-            "Refused: {book} has no parent folder visible to this account, so no folder \
-             rule can apply to it. This is normal for a Sheet shared by link or email. \
-             Grant it by id instead: add {{\"file_id\": \"<spreadsheet id>\", \"allow\": \
-             [\"sheets-structure\"]}} to write_permissions.rules. (Adding it to a folder in \
-             your own Drive and granting that folder `sheets-structure` also works.)"
-        )],
+        StructureResult::RefusedNoVisibleParents => {
+            let op = verb.gate_operation();
+            vec![format!(
+                "Refused: {book} has no parent folder visible to this account, so no folder \
+                 rule can apply to it. This is normal for a Sheet shared by link or email. \
+                 Grant it by id instead: add {{\"file_id\": \"<spreadsheet id>\", \"allow\": \
+                 [\"{op}\"]}} to write_permissions.rules. (Adding it to a folder in your own \
+                 Drive and granting that folder `{op}` also works.)"
+            )]
+        }
         StructureResult::RefusedSheetNotFound { title, available } => {
             let list = if available.is_empty() {
                 "none".to_string()
@@ -890,18 +1176,26 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
             )]
         }
         StructureResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
-        StructureResult::Blocked { decided_by } => vec![match decided_by {
-            Some(rule) => format!(
-                "Blocked: structural edits to {book} refused by rule on {} {}{}",
-                rule.kind_label(),
-                rule.id(),
-                rule.depth_suffix()
-            ),
-            None => format!(
-                "Blocked: structural edits to {book} refused by default policy (no matching \
-                 rule for sheets-structure)"
-            ),
-        }],
+        StructureResult::Blocked { decided_by } => {
+            let op = verb.gate_operation();
+            let action = if matches!(op, DriveOperation::SheetsDelete) {
+                "destructive edits"
+            } else {
+                "structural edits"
+            };
+            vec![match decided_by {
+                Some(rule) => format!(
+                    "Blocked: {action} to {book} refused by rule on {} {}{}",
+                    rule.kind_label(),
+                    rule.id(),
+                    rule.depth_suffix()
+                ),
+                None => format!(
+                    "Blocked: {action} to {book} refused by default policy (no matching rule \
+                     for {op})"
+                ),
+            }]
+        }
         StructureResult::Changed { sheet, sheet_id } => {
             vec![describe_changed(verb, sheet.as_ref(), *sheet_id, &book)]
         }
@@ -960,6 +1254,42 @@ fn describe_would_change(
             at,
             count,
         } => describe_would_insert(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::DeleteSheet { sheet: from } => {
+            vec![format!(
+                "Would delete sheet '{from}'{id} from {book} ({sheet_count} sheet(s) -> {}); \
+                 {FORMULA_CAVEAT}",
+                sheet_count.saturating_sub(1)
+            )]
+        }
+        StructureVerb::DeleteRows {
+            sheet: from,
+            at,
+            count,
+        } => describe_would_delete_dimension(Dimension::Rows, from, &id, *at, *count, sheet, book),
+        StructureVerb::DeleteColumns {
+            sheet: from,
+            at,
+            count,
+        } => {
+            describe_would_delete_dimension(Dimension::Columns, from, &id, *at, *count, sheet, book)
+        }
+        StructureVerb::DeleteRange {
+            sheet: from,
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+        } => vec![describe_would_delete_range(
+            from,
+            &id,
+            *start_row,
+            *end_row,
+            *start_column,
+            *end_column,
+            *shift,
+            book,
+        )],
     }
 }
 
@@ -1029,6 +1359,106 @@ fn describe_would_insert(
     ]
 }
 
+/// A destructive `--dry-run` cannot check whether some formula elsewhere in
+/// the workbook references what would be deleted — that would need reading
+/// every other sheet's formulas, not just this verb's own target, and ADR-0077
+/// keeps a destructive dry run structural-only (no extra `values.get` read,
+/// no cell content in its output or the request log). This fixed caveat is
+/// the honest substitute.
+const FORMULA_CAVEAT: &str =
+    "formulas elsewhere in the workbook that reference this may break, which cannot be \
+     checked automatically";
+
+/// The `DeleteRows`/`DeleteColumns` arm of [`describe_would_change`].
+///
+/// Mirrors [`describe_would_insert`]'s shape (a summary line plus a shift
+/// line), shrinking instead of growing and shifting the opposite direction.
+/// Unlike insert, deletion has no append-boundary case — every row/column
+/// named already exists — so the "nothing remains after" branch replaces
+/// insert's "appended at the end" one.
+#[allow(clippy::too_many_arguments)]
+fn describe_would_delete_dimension(
+    dimension: Dimension,
+    from: &str,
+    id: &str,
+    at: i64,
+    count: i64,
+    sheet: Option<&SheetSnapshot>,
+    book: &str,
+) -> Vec<String> {
+    let Some(last) = at.checked_add(count).and_then(|end| end.checked_sub(1)) else {
+        return vec![format!(
+            "Would delete {count} {noun}(s) from {noun} {at} of '{from}'{id} in {book}",
+            noun = dimension.noun(),
+        )];
+    };
+    let summary = format!(
+        "Would delete {count} {noun}(s) {at}-{last} of '{from}'{id} in {book}",
+        noun = dimension.noun(),
+    );
+    let before = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    };
+    let Some(before) = before else {
+        return vec![summary];
+    };
+    let Some(after) = before.checked_sub(count) else {
+        return vec![summary];
+    };
+    let existing = if last < before {
+        format!(
+            "; existing {plural} {next}-{before} shift {direction}",
+            plural = plural(dimension),
+            next = last + 1,
+            direction = match dimension {
+                Dimension::Rows => "up",
+                Dimension::Columns => "left",
+            },
+        )
+    } else {
+        format!(
+            "; nothing remains after the deleted {plural}",
+            plural = plural(dimension)
+        )
+    };
+    vec![
+        summary,
+        format!(
+            "  ({before} {plural} -> {after}{existing}; {FORMULA_CAVEAT})",
+            plural = plural(dimension),
+        ),
+    ]
+}
+
+/// The `DeleteRange` arm of [`describe_would_change`].
+///
+/// `deleteRange` never changes the sheet's `rowCount`/`columnCount` — it
+/// shifts cells within the same bounded grid — so unlike the dimension
+/// deletes there is no "before -> after" size line to add; the rectangle and
+/// shift direction already say the whole effect in one line.
+#[allow(clippy::too_many_arguments)]
+fn describe_would_delete_range(
+    from: &str,
+    id: &str,
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+    shift: ShiftDimension,
+    book: &str,
+) -> String {
+    let direction = match shift {
+        ShiftDimension::Rows => "up",
+        ShiftDimension::Columns => "left",
+    };
+    format!(
+        "Would delete rows {start_row}-{end_row}, columns {start_column}-{end_column} of \
+         '{from}'{id} in {book}, shifting remaining cells {direction} to close the gap; \
+         {FORMULA_CAVEAT}"
+    )
+}
+
 fn describe_changed(
     verb: &StructureVerb,
     sheet: Option<&SheetSnapshot>,
@@ -1056,6 +1486,36 @@ fn describe_changed(
             at,
             count,
         } => describe_inserted(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::DeleteSheet { sheet: from } => {
+            format!("Deleted sheet '{from}'{id} from {book}; {RECOVERY_NOTE}")
+        }
+        StructureVerb::DeleteRows {
+            sheet: from,
+            at,
+            count,
+        } => describe_deleted_dimension(Dimension::Rows, from, &id, *at, *count, sheet, book),
+        StructureVerb::DeleteColumns {
+            sheet: from,
+            at,
+            count,
+        } => describe_deleted_dimension(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::DeleteRange {
+            sheet: from,
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+        } => describe_deleted_range(
+            from,
+            &id,
+            *start_row,
+            *end_row,
+            *start_column,
+            *end_column,
+            *shift,
+            book,
+        ),
     }
 }
 
@@ -1083,6 +1543,62 @@ fn describe_inserted(
     format!(
         "Inserted {count} {noun}(s) before {noun} {at} of '{from}'{id} in {book}{now}",
         noun = dimension.noun(),
+    )
+}
+
+/// There is no `files.delete` or undo anywhere in this integration (ADR-0077):
+/// Drive's own version history is the only recovery path, so every
+/// destructive real-run message says so.
+const RECOVERY_NOTE: &str =
+    "this cannot be undone through omni-dev — use Google Drive's version history to recover it \
+     if needed";
+
+/// The `DeleteRows`/`DeleteColumns` arm of [`describe_changed`].
+#[allow(clippy::too_many_arguments)]
+fn describe_deleted_dimension(
+    dimension: Dimension,
+    from: &str,
+    id: &str,
+    at: i64,
+    count: i64,
+    sheet: Option<&SheetSnapshot>,
+    book: &str,
+) -> String {
+    let last = at.checked_add(count).and_then(|end| end.checked_sub(1));
+    let range = last.map_or_else(|| at.to_string(), |last| format!("{at}-{last}"));
+    let now = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    }
+    .and_then(|before| before.checked_sub(count))
+    .map_or_else(String::new, |after| {
+        format!(" ({after} {} now)", plural(dimension))
+    });
+    format!(
+        "Deleted {count} {noun}(s) {range} of '{from}'{id} in {book}{now}; {RECOVERY_NOTE}",
+        noun = dimension.noun(),
+    )
+}
+
+/// The `DeleteRange` arm of [`describe_changed`].
+#[allow(clippy::too_many_arguments)]
+fn describe_deleted_range(
+    from: &str,
+    id: &str,
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+    shift: ShiftDimension,
+    book: &str,
+) -> String {
+    let direction = match shift {
+        ShiftDimension::Rows => "up",
+        ShiftDimension::Columns => "left",
+    };
+    format!(
+        "Deleted rows {start_row}-{end_row}, columns {start_column}-{end_column} of '{from}'{id} \
+         in {book}, shifted remaining cells {direction}; {RECOVERY_NOTE}"
     )
 }
 
@@ -1226,51 +1742,102 @@ mod tests {
         }
     }
 
-    // ── the safety property this whole module exists for ───────────────
+    fn delete_sheet() -> StructureVerb {
+        StructureVerb::DeleteSheet {
+            sheet: "Q2".to_string(),
+        }
+    }
 
-    /// No destructive `batchUpdate` request is reachable from any production
-    /// path in the Sheets surface.
-    ///
-    /// Modelled on `no_force_escape_hatch_exists_in_the_ui_surface`
-    /// (`src/cli/worktrees/ui/actions.rs`) and enforcing the same kind of
-    /// guarantee: [ADR-0061](../../../docs/adrs/adr-0061.md) established
-    /// that an operation's dangerous form must be *unreachable*, not merely
-    /// discouraged. `deleteSheet` and `deleteDimension` are what ADR-0073
-    /// §12 called the sharp edge, and they are deferred to their own design
-    /// pass — so no production line may name one, and a future request type
-    /// cannot be added without failing the build.
+    fn delete_rows() -> StructureVerb {
+        StructureVerb::DeleteRows {
+            sheet: "Q2".to_string(),
+            at: 5,
+            count: 3,
+        }
+    }
+
+    fn delete_range() -> StructureVerb {
+        StructureVerb::DeleteRange {
+            sheet: "Q2".to_string(),
+            start_row: 2,
+            end_row: 4,
+            start_column: 2,
+            end_column: 3,
+            shift: ShiftDimension::Rows,
+        }
+    }
+
+    fn delete_allow_rule(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: Some(folder.to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsDelete).collect(),
+            deny: HashSet::default(),
+        }
+    }
+
+    // ── the safety property this module now enforces ───────────────────
+    //
+    // ADR-0075 §3/§4 kept every destructive `batchUpdate` request
+    // unreachable at the type level, pinned by a
+    // `no_destructive_request_is_reachable` grep-guard test. ADR-0077
+    // (issue #1623) supersedes that: the requests are now reachable, but
+    // only through `StructureVerb::gate_operation` routing them to
+    // `DriveOperation::SheetsDelete` — never `SheetsStructure`, and never
+    // through a raw passthrough (there still isn't one). The tests below are
+    // what replace the old grep-guard: they pin the *new* invariant instead
+    // of the old absence.
+
     #[test]
-    fn no_destructive_request_is_reachable() {
-        let sources = [
-            ("structure.rs", include_str!("structure.rs")),
-            ("api.rs", include_str!("api.rs")),
-            ("types.rs", include_str!("types.rs")),
-        ];
-        for (name, source) in sources {
-            // Production code only: the prose above and the assertions here
-            // deliberately name the requests they forbid.
-            let code_only = source.split("#[cfg(test)]").next().unwrap_or(source);
-            for (number, line) in code_only.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") || code.starts_with("///") || code.starts_with("//!") {
-                    continue; // prose may discuss deletion; code may not request it
-                }
-                for forbidden in [
-                    "deleteSheet",
-                    "deleteDimension",
-                    "deleteRange",
-                    "DeleteSheet",
-                    "DeleteDimension",
-                    "DeleteRange",
-                ] {
-                    assert!(
-                        !code.contains(forbidden),
-                        "{name}:{}: a destructive batchUpdate request must stay unreachable: \
-                         {line}",
-                        number + 1
-                    );
-                }
-            }
+    fn every_delete_verb_gates_on_sheets_delete_not_sheets_structure() {
+        for verb in [
+            StructureVerb::DeleteSheet {
+                sheet: "Q1".to_string(),
+            },
+            StructureVerb::DeleteRows {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+            },
+            StructureVerb::DeleteColumns {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+            },
+            StructureVerb::DeleteRange {
+                sheet: "Q1".to_string(),
+                start_row: 1,
+                end_row: 2,
+                start_column: 1,
+                end_column: 2,
+                shift: ShiftDimension::Rows,
+            },
+        ] {
+            assert_eq!(verb.gate_operation(), DriveOperation::SheetsDelete);
+        }
+    }
+
+    #[test]
+    fn every_additive_verb_still_gates_on_sheets_structure() {
+        for verb in [
+            add_sheet(),
+            StructureVerb::RenameSheet {
+                sheet: "Q1".to_string(),
+                new_title: "Q2".to_string(),
+            },
+            StructureVerb::InsertRows {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+            },
+            StructureVerb::InsertColumns {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+            },
+        ] {
+            assert_eq!(verb.gate_operation(), DriveOperation::SheetsStructure);
         }
     }
 
@@ -1411,6 +1978,23 @@ mod tests {
         assert!(text.contains("sheets-structure"), "{text}");
     }
 
+    /// The same message for a delete verb must name `sheets-delete`, not
+    /// `sheets-structure` — suggesting the wrong operation here would send an
+    /// operator to grant a capability that does not cover what they asked
+    /// for.
+    #[tokio::test]
+    async fn a_delete_verbs_no_visible_parents_message_names_sheets_delete() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let outcome = structure(&drive, &sheets, &opts(delete_sheet(), false), &[]).await;
+        let text = describe(&outcome);
+        assert!(text.contains("sheets-delete"), "{text}");
+        assert!(!text.contains("sheets-structure"), "{text}");
+    }
+
     // ── the gate ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1434,6 +2018,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blocked_delete_names_destructive_edits_and_sheets_delete() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let outcome = structure(&drive, &sheets, &opts(delete_sheet(), false), &[]).await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::Blocked { decided_by: None }
+        ));
+        let text = describe(&outcome);
+        assert!(text.contains("destructive edits"), "{text}");
+        assert!(text.contains("default policy"), "{text}");
+        assert!(text.contains("sheets-delete"), "{text}");
+        assert!(!text.contains("structural edits"), "{text}");
+    }
+
+    #[tokio::test]
     async fn a_sheets_write_rule_alone_does_not_permit_a_structural_edit() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -1451,6 +2055,39 @@ mod tests {
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
         }];
+        let outcome = structure(&drive, &sheets, &opts(rename(), false), &rules).await;
+        assert!(matches!(outcome.result, StructureResult::Blocked { .. }));
+    }
+
+    /// The property ADR-0077 exists to protect: a folder granted
+    /// `sheets-structure` before deletion existed must not silently gain the
+    /// power to destroy data now that it does.
+    #[tokio::test]
+    async fn a_sheets_structure_rule_alone_does_not_permit_deletion() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let rules = [allow_rule("parent-1")]; // grants SheetsStructure only
+        for verb in [delete_sheet(), delete_rows(), delete_range()] {
+            let outcome = structure(&drive, &sheets, &opts(verb, false), &rules).await;
+            assert!(matches!(outcome.result, StructureResult::Blocked { .. }));
+        }
+    }
+
+    /// The converse: `sheets-delete` must not grant the additive verbs
+    /// either — the two operations are siblings, not a hierarchy.
+    #[tokio::test]
+    async fn a_sheets_delete_rule_alone_does_not_permit_a_structural_edit() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let rules = [delete_allow_rule("parent-1")];
         let outcome = structure(&drive, &sheets, &opts(rename(), false), &rules).await;
         assert!(matches!(outcome.result, StructureResult::Blocked { .. }));
     }
@@ -1559,6 +2196,108 @@ mod tests {
         assert!(text.contains("500 rows -> 503"), "{text}");
         assert!(text.contains("shift down"), "{text}");
         assert!(text.contains("sheetId 118293"), "{text}");
+    }
+
+    /// A destructive dry run must never issue `batchUpdate` either, and stays
+    /// structural-only (ADR-0077): no `values.get`, no cell content, just the
+    /// same single `spreadsheets.get` an additive dry run already issues.
+    #[tokio::test]
+    async fn dry_run_never_calls_batch_update_for_a_delete_verb() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        for verb in [delete_sheet(), delete_rows(), delete_range()] {
+            let outcome = structure(
+                &drive,
+                &sheets,
+                &opts(verb, true),
+                &[delete_allow_rule("parent-1")],
+            )
+            .await;
+            assert!(matches!(
+                outcome.result,
+                StructureResult::WouldChange { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_names_the_deleted_dimensions_and_the_shift_plus_the_caveat() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_rows(), true),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would delete 3 row(s) 5-7"), "{text}");
+        assert!(text.contains("500 rows -> 497"), "{text}");
+        assert!(text.contains("shift up"), "{text}");
+        assert!(
+            text.contains("formulas elsewhere in the workbook"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_names_the_deleted_sheet_and_the_caveat() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_sheet(), true),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would delete sheet 'Q2'"), "{text}");
+        assert!(text.contains("2 sheet(s) -> 1"), "{text}");
+        assert!(
+            text.contains("formulas elsewhere in the workbook"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_names_the_deleted_range_and_the_shift() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_range(), true),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(
+            text.contains("Would delete rows 2-4, columns 2-3"),
+            "{text}"
+        );
+        assert!(text.contains("shifting remaining cells up"), "{text}");
     }
 
     #[tokio::test]
@@ -2066,6 +2805,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_sheet_sends_the_resolved_sheet_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_sheet(), false),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(describe(&outcome).contains("Deleted sheet 'Q2'"));
+        assert!(describe(&outcome).contains("Google Drive's version history"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        assert_eq!(body["requests"][0]["deleteSheet"]["sheetId"], 118_293);
+        assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_rows_sends_a_zero_based_half_open_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_rows(), false),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let delete = &body["requests"][0]["deleteDimension"];
+        assert_eq!(delete["range"]["dimension"], "ROWS");
+        assert_eq!(delete["range"]["sheetId"], 118_293);
+        // `--at 5 --count 3` on the wire, 1-based inclusive to 0-based
+        // half-open — same conversion as insert, same site.
+        assert_eq!(delete["range"]["startIndex"], 4);
+        assert_eq!(delete["range"]["endIndex"], 7);
+    }
+
+    #[tokio::test]
+    async fn delete_range_sends_a_zero_based_half_open_grid_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_range(), false),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let delete = &body["requests"][0]["deleteRange"];
+        assert_eq!(delete["range"]["sheetId"], 118_293);
+        // `--start-row 2 --end-row 4 --start-column 2 --end-column 3` on the
+        // wire, 1-based inclusive to 0-based half-open.
+        assert_eq!(delete["range"]["startRowIndex"], 1);
+        assert_eq!(delete["range"]["endRowIndex"], 4);
+        assert_eq!(delete["range"]["startColumnIndex"], 1);
+        assert_eq!(delete["range"]["endColumnIndex"], 3);
+        assert_eq!(delete["shiftDimension"], "ROWS");
+    }
+
+    #[tokio::test]
+    async fn delete_dimension_past_the_end_of_the_sheet_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Q2 has 500 rows; deleting 5 rows starting at 499 reaches row 503.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRows {
+                    sheet: "Q2".to_string(),
+                    at: 499,
+                    count: 5,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_range_with_end_before_start_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 5,
+                    end_row: 2,
+                    start_column: 1,
+                    end_column: 2,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn add_sheet_reports_the_server_assigned_sheet_id() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -2183,6 +3092,14 @@ mod tests {
                 at: 1,
                 count: 1,
             },
+            delete_sheet(),
+            delete_rows(),
+            StructureVerb::DeleteColumns {
+                sheet: "Q2".to_string(),
+                at: 1,
+                count: 1,
+            },
+            delete_range(),
         ];
         let names: Vec<&str> = verbs.iter().map(StructureVerb::log_operation).collect();
         assert_eq!(
@@ -2192,6 +3109,10 @@ mod tests {
                 "sheets-rename-sheet",
                 "sheets-insert-rows",
                 "sheets-insert-columns",
+                "sheets-delete-sheet",
+                "sheets-delete-rows",
+                "sheets-delete-columns",
+                "sheets-delete-range",
             ]
         );
         // One record per user-visible verb means the operations must not
@@ -2286,11 +3207,21 @@ mod tests {
     /// the terminal without passing through this check.
     #[test]
     fn no_describe_line_contains_a_newline() {
-        for verb in [add_sheet(), rename(), insert_rows()] {
-            let is_insert = verb.dimension().is_some();
+        for verb in [
+            add_sheet(),
+            rename(),
+            insert_rows(),
+            delete_sheet(),
+            delete_rows(),
+            delete_range(),
+        ] {
+            // A verb with a single axis (insert or delete-dimension) earns a
+            // second `WouldChange` line for the shift; every other verb,
+            // additive or destructive, stays one line.
+            let has_dimension_shift = verb.dimension().is_some();
             for result in every_structure_result() {
                 let previews_an_insert =
-                    is_insert && matches!(result, StructureResult::WouldChange { .. });
+                    has_dimension_shift && matches!(result, StructureResult::WouldChange { .. });
                 let outcome = StructureOutcome {
                     spreadsheet_id: "sheet-1".to_string(),
                     file_name: Some("Budget".to_string()),
