@@ -79,8 +79,9 @@ pub enum DriveSubcommands {
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
     /// Inspects the write-permission rules gating `drive
-    /// create`/`upload`/`edit` and `drive sheets
-    /// write`/`append`/`clear`/`create` (issues #1574, #1589, #1612).
+    /// create`/`upload`/`edit`, `drive sheets
+    /// write`/`append`/`clear`/`create` and `drive docs
+    /// replace`/`append`/`create` (issues #1574, #1589, #1612, #1615).
     Permissions(permissions::PermissionsCommand),
     /// Reads the structure and text of a Google Doc via the Docs v1 API
     /// (issue #1615).
@@ -376,6 +377,77 @@ mod tests {
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    /// The Docs *write* verbs return `Ok(())` even when the API is
+    /// unreachable, which is the exit-code convention rather than an
+    /// oversight: a `Blocked`/`Failed`/`StaleRevision` outcome rides the
+    /// **output**, and `$?` stays 0 (ADR-0076 §13, and ADR-0070 §10 before
+    /// it). So these assert `is_ok()` — which still proves routing, since
+    /// every other arm of `dispatch` would surface the dead port as an
+    /// `Err` — and in doing so pin the convention itself.
+    ///
+    /// `clear_credentials` is what makes that deterministic: without it
+    /// `active_account_rules` reads the developer's real
+    /// `~/.omni-dev/settings.json`, so the result depends on the machine.
+    #[tokio::test]
+    async fn dispatch_routes_docs_replace() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Replace(docs::write::ReplaceCommand {
+                document_id: "d1".to_string(),
+                search: "a".to_string(),
+                replace: "b".to_string(),
+                ignore_case: false,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_docs_append() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Append(docs::write::AppendCommand {
+                document_id: "d1".to_string(),
+                text: Some("x".to_string()),
+                text_file: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // See `dispatch_routes_docs_replace` for why this is `is_ok()`.
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_docs_create() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Create(docs::create::CreateCommand {
+                name: "n".to_string(),
+                parent: "folder-1".to_string(),
+                text: None,
+                text_file: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        // See `dispatch_routes_docs_replace` for why this is `is_ok()`.
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
     #[tokio::test]

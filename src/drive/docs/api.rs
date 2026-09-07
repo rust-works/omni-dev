@@ -38,6 +38,11 @@ use url::Url;
 use crate::drive::api_client::GoogleApiClient;
 use crate::drive::docs::client::DocsClient;
 use crate::drive::docs::types::Document;
+use crate::drive::docs::write_types::{
+    BatchUpdateDocumentRequest, BatchUpdateDocumentResponse, DocsRequest,
+};
+use crate::drive::error::DriveError;
+use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
 
 /// Maximum `documents.get` response accepted into memory.
 ///
@@ -116,6 +121,72 @@ impl<'a> DocsApi<'a> {
             .parse_response(response, "Failed to parse Docs document")
             .await
     }
+
+    /// Applies **one** request to a document, under a revision lease.
+    ///
+    /// The single mutating entry point for Docs, and every part of the
+    /// signature is load-bearing (ADR-0076 §3, §4):
+    ///
+    /// - It takes one [`DocsRequest`], not a `Vec`, so "one verb, one
+    ///   request, one batch, one log record" is a signature rather than a
+    ///   convention — and the batch-ordering hazard, where an insertion
+    ///   shifts every later request's indices, cannot arise.
+    /// - `required_revision_id` is `&str`, not `Option<&str>`, so there is
+    ///   no unleased path to reach for.
+    /// - `pub(in crate::drive)` keeps it behind the same visibility fence as
+    ///   `FilesApi::create` and `SheetsApi::values_update`, so nothing
+    ///   outside `crate::drive` — where every engine runs the gate first —
+    ///   can even compile a call to it.
+    pub(in crate::drive) async fn batch_update(
+        &self,
+        document_id: &str,
+        request: DocsRequest,
+        required_revision_id: &str,
+    ) -> Result<BatchUpdateDocumentResponse> {
+        let url = build_batch_update_url(self.client.base_url(), document_id)?;
+        let body = BatchUpdateDocumentRequest::new(request, required_revision_id);
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Docs batchUpdate response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
+}
+
+/// Whether `err` is Google refusing a `batchUpdate` because the revision
+/// lease no longer matches.
+///
+/// **Confirmed against the live API** (ADR-0076 §6): a stale
+/// `requiredRevisionId` returns HTTP 400 with the `google.rpc` envelope,
+/// `error.status` of `INVALID_ARGUMENT` and the message
+/// `"The required revision ID '<id>' does not match the latest revision."`.
+///
+/// `INVALID_ARGUMENT` is **not** Docs-specific — it is the same status a
+/// malformed request carries — which is exactly why this matches the status
+/// code in conjunction with a message substring rather than trusting the
+/// status alone. Matching on the status would classify every malformed
+/// request as a lost lease and tell the user to re-run something that can
+/// never succeed.
+///
+/// The failure direction is safe either way. A false negative degrades to
+/// `WriteResult::Failed`, which still carries the server's own message
+/// verbatim; nothing was written on either path, because a one-request
+/// `batchUpdate` is atomic. There is no input for which this returns `true`
+/// and a write has happened.
+pub(in crate::drive) fn is_stale_revision(err: &anyhow::Error) -> bool {
+    /// The distinctive part of Google's message, lowercased for comparison.
+    const STALE_MARKER: &str = "does not match the latest revision";
+
+    matches!(
+        err.downcast_ref::<DriveError>(),
+        Some(DriveError::ApiRequestFailed { status: 400, body, .. })
+            if body.to_ascii_lowercase().contains(STALE_MARKER)
+    )
 }
 
 /// Refuses a `documents.get` whose declared `Content-Length` exceeds
@@ -155,6 +226,18 @@ fn build_document_get_url(
         pairs.append_pair("includeTabsContent", "true");
         pairs.append_pair("suggestionsViewMode", suggestions.as_str());
     }
+    Ok(url)
+}
+
+/// Builds the `documents.batchUpdate` URL.
+///
+/// `:batchUpdate` is a suffix on the id path segment, so it is appended to
+/// the id *before* the segment is pushed — pushing it separately would
+/// percent-encode the `:` into its own segment.
+fn build_batch_update_url(base_url: &str, document_id: &str) -> Result<Url> {
+    let mut url =
+        GoogleApiClient::api_url(base_url, "/v1/documents").context("Invalid Docs base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[&format!("{document_id}:batchUpdate")])?;
     Ok(url)
 }
 
@@ -275,5 +358,111 @@ mod tests {
     #[test]
     fn check_document_size_allows_a_missing_content_length() {
         assert!(check_document_size(None).is_ok());
+    }
+
+    #[test]
+    fn batch_update_url_appends_the_method_to_the_id_segment() {
+        let url = build_batch_update_url(BASE, "d1").unwrap();
+        // One segment, with a literal `:` — not `d1/%3AbatchUpdate`.
+        assert_eq!(url.path(), "/v1/documents/d1:batchUpdate");
+    }
+
+    #[test]
+    fn batch_update_url_respects_a_wiremock_style_base() {
+        let url = build_batch_update_url("http://127.0.0.1:8080", "d1").unwrap();
+        assert_eq!(url.port(), Some(8080));
+        assert_eq!(url.path(), "/v1/documents/d1:batchUpdate");
+    }
+
+    fn api_error(status: u16, body: &str) -> anyhow::Error {
+        DriveError::ApiRequestFailed {
+            api: "Docs",
+            status,
+            body: body.to_string(),
+            reason: Some("INVALID_ARGUMENT".to_string()),
+        }
+        .into()
+    }
+
+    /// The exact shape observed live (ADR-0076 §6).
+    #[test]
+    fn is_stale_revision_matches_the_confirmed_400() {
+        let err = api_error(
+            400,
+            "The required revision ID 'ALm37BXk3nQ' does not match the latest revision.",
+        );
+        assert!(is_stale_revision(&err));
+    }
+
+    /// The whole reason this matches a message substring rather than the
+    /// status: `INVALID_ARGUMENT` is what a *malformed* request carries too,
+    /// and telling the user to re-run one would be advice that can never
+    /// work.
+    #[test]
+    fn is_stale_revision_ignores_an_unrelated_invalid_argument_400() {
+        let err = api_error(400, "Invalid requests[0].insertText: index out of bounds");
+        assert!(!is_stale_revision(&err));
+    }
+
+    #[test]
+    fn is_stale_revision_ignores_a_403_and_a_500() {
+        for status in [403, 500] {
+            let err = api_error(status, "does not match the latest revision");
+            assert!(!is_stale_revision(&err), "status {status}");
+        }
+    }
+
+    #[test]
+    fn is_stale_revision_ignores_a_non_drive_error() {
+        assert!(!is_stale_revision(&anyhow::anyhow!(
+            "does not match the latest revision"
+        )));
+    }
+
+    /// The surface-level half of ADR-0076 §3's guarantee, modelled on
+    /// ADR-0061's `no_force_escape_hatch_exists_in_the_ui_surface`.
+    ///
+    /// The type fence in `write_types.rs` already stops `writeControl` being
+    /// omitted or made optional. It does **not** stop someone adding a
+    /// `targetRevisionId` field, or hand-building a `serde_json::json!` body
+    /// that bypasses the typed struct entirely — and that second route is
+    /// not hypothetical, since `sheets/api.rs` builds request bodies exactly
+    /// that way. This closes both, and also pins §4's claim that no
+    /// destructive request is constructible.
+    #[test]
+    fn no_destructive_or_unleased_request_is_reachable() {
+        let sources = [
+            ("api.rs", include_str!("api.rs")),
+            ("write_types.rs", include_str!("write_types.rs")),
+        ];
+        for (name, source) in sources {
+            // Production code only: the tests and docs below deliberately
+            // name the things they assert the absence of.
+            let code_only = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for (number, line) in code_only.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue; // prose may discuss a rebase; code may not request one
+                }
+                let bypasses = code.contains("targetRevisionId")
+                    || code.contains("target_revision_id")
+                    || code.contains("--force")
+                    || code.contains("force: true");
+                assert!(
+                    !bypasses,
+                    "{name}:{}: the Docs write path must never bypass the lease: {line}",
+                    number + 1
+                );
+                let destroys = code.contains("deleteContentRange")
+                    || code.contains("deletePositionedObject")
+                    || code.contains("deleteTableRow")
+                    || code.contains("deleteTableColumn");
+                assert!(
+                    !destroys,
+                    "{name}:{}: no destructive Docs request may be constructible: {line}",
+                    number + 1
+                );
+            }
+        }
     }
 }

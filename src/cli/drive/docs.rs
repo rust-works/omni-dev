@@ -6,8 +6,10 @@
 //! `auth` commands and the write-permission diagnostics, because a Doc is a
 //! Drive file and the permission gate is a Drive concept.
 
+pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
+pub(crate) mod write;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -29,6 +31,16 @@ pub enum DocsSubcommands {
     Info(info::InfoCommand),
     /// Reads a document's structural elements with their index ranges.
     Read(read::ReadCommand),
+    /// Replaces every occurrence of some text, gated by the
+    /// write-permission rules (issue #1615). Requires the `drive.file` or
+    /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    Replace(write::ReplaceCommand),
+    /// Appends text to the end of a document, gated by the write-permission
+    /// rules (issue #1615).
+    Append(write::AppendCommand),
+    /// Creates a new Google Doc, optionally seeded with text. Gated by the
+    /// write-permission rules' `create` operation (issue #1615).
+    Create(create::CreateCommand),
 }
 
 impl DocsCommand {
@@ -42,6 +54,9 @@ impl DocsCommand {
         match self.command {
             DocsSubcommands::Info(cmd) => cmd.execute(client).await,
             DocsSubcommands::Read(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Replace(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Append(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }
 }

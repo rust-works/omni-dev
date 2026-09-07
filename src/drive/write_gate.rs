@@ -87,6 +87,23 @@ pub enum DriveOperation {
     /// config change and no re-consent — the exact silent widening this
     /// gate's default-deny posture exists to prevent.
     SheetsWrite,
+    /// Replace or append *text* in an existing Google Doc via the Docs API
+    /// (issue #1615, [ADR-0076](../../docs/adrs/adr-0076.md) §2).
+    ///
+    /// Folded into neither [`Self::Edit`] nor [`Self::SheetsWrite`], and the
+    /// argument runs in both directions. Every `allow: ["edit"]` rule was
+    /// written when `drive edit` refused every Google-native document
+    /// outright — which it still does. Every `allow: ["sheets-write"]` rule
+    /// was written when Docs were unreachable through this tool, and that
+    /// operation is *lexically* about cells, so making it govern prose would
+    /// be a lie told by the config vocabulary itself.
+    ///
+    /// **This binds future work.** A Docs *deletion* verb must not be folded
+    /// into this variant either: a grant issued today for "may replace text"
+    /// must not silently become consent to remove content tomorrow. When
+    /// deletion is designed it needs its own operation, or explicit
+    /// re-consent. Same rule ADR-0075 §1 records for `sheets-structure`.
+    DocsWrite,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -99,6 +116,7 @@ impl std::fmt::Display for DriveOperation {
             Self::Upload => "upload",
             Self::Edit => "edit",
             Self::SheetsWrite => "sheets-write",
+            Self::DocsWrite => "docs-write",
         };
         write!(f, "{s}")
     }
@@ -113,7 +131,9 @@ impl DriveOperation {
     fn default_policy(self) -> Verdict {
         match self {
             Self::Read => Verdict::Allow,
-            Self::Create | Self::Upload | Self::Edit | Self::SheetsWrite => Verdict::Deny,
+            Self::Create | Self::Upload | Self::Edit | Self::SheetsWrite | Self::DocsWrite => {
+                Verdict::Deny
+            }
         }
     }
 }
@@ -704,6 +724,7 @@ mod tests {
             DriveOperation::Upload,
             DriveOperation::Edit,
             DriveOperation::SheetsWrite,
+            DriveOperation::DocsWrite,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
             assert_eq!(
@@ -719,6 +740,7 @@ mod tests {
         assert_eq!(DriveOperation::Upload.to_string(), "upload");
         assert_eq!(DriveOperation::Edit.to_string(), "edit");
         assert_eq!(DriveOperation::SheetsWrite.to_string(), "sheets-write");
+        assert_eq!(DriveOperation::DocsWrite.to_string(), "docs-write");
     }
 
     #[test]
@@ -737,6 +759,54 @@ mod tests {
         let sheets = resolve(&chain(&["target"]), DriveOperation::SheetsWrite, &rules);
         assert_eq!(edit.verdict, Verdict::Allow);
         assert_eq!(sheets.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn docs_write_defaults_to_deny_like_every_other_write() {
+        let decision = resolve(&chain(&["f"]), DriveOperation::DocsWrite, &[]);
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(decision.decided_by.is_none());
+    }
+
+    /// ADR-0076 §2 runs ADR-0073 §3's argument in **two** directions, so
+    /// both are pinned: an `edit` grant predates Docs being reachable at
+    /// all, and a `sheets-write` grant is lexically about cells.
+    #[test]
+    fn neither_an_edit_nor_a_sheets_write_rule_grants_docs_write() {
+        for granted in [DriveOperation::Edit, DriveOperation::SheetsWrite] {
+            let rules = [rule("target", true, &[granted], &[])];
+            let held = resolve(&chain(&["target"]), granted, &rules);
+            let docs = resolve(&chain(&["target"]), DriveOperation::DocsWrite, &rules);
+            assert_eq!(held.verdict, Verdict::Allow, "{granted:?}");
+            assert_eq!(
+                docs.verdict,
+                Verdict::Deny,
+                "an allow:[{granted}] rule must not leak into docs-write"
+            );
+        }
+    }
+
+    /// The converse, so the separation is not accidentally one-way: a
+    /// `docs-write` grant must not confer cell writes or raw content edits.
+    #[test]
+    fn a_docs_write_rule_grants_nothing_else() {
+        let rules = [rule("target", true, &[DriveOperation::DocsWrite], &[])];
+        assert_eq!(
+            resolve(&chain(&["target"]), DriveOperation::DocsWrite, &rules).verdict,
+            Verdict::Allow
+        );
+        for other in [
+            DriveOperation::Edit,
+            DriveOperation::SheetsWrite,
+            DriveOperation::Create,
+            DriveOperation::Upload,
+        ] {
+            assert_eq!(
+                resolve(&chain(&["target"]), other, &rules).verdict,
+                Verdict::Deny,
+                "an allow:[docs-write] rule must not leak into {other}"
+            );
+        }
     }
 
     #[test]

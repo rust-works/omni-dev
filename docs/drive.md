@@ -611,6 +611,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`       | deny    | `upload`                                        |
 | `edit`         | deny    | `edit` — raw file content only                  |
 | `sheets-write` | deny    | `sheets write`, `sheets append`, `sheets clear` |
+| `docs-write`   | deny    | `docs replace`, `docs append`                   |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -624,6 +625,16 @@ would have retroactively turned those rules into cell-write permission with
 no config change and no re-consent. If you want a folder's existing `edit`
 grant to cover Sheets too, add `sheets-write` to it explicitly. See
 [ADR-0073](adrs/adr-0073.md) §3.
+
+**`docs-write` is separate from both**, and the same argument runs twice. An
+`allow: ["edit"]` rule predates Docs being reachable through this tool at
+all; an `allow: ["sheets-write"]` rule was written when the same was true,
+and that operation is about *cells*, so letting it govern prose would make
+the config vocabulary say something untrue. Grant `docs-write` explicitly.
+See [ADR-0076](adrs/adr-0076.md) §2.
+
+Each write operation is independent in both directions: `docs-write` confers
+no cell writes and no raw-content edits either.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from. A rule keys on **either** a `folder_id` or a
@@ -1227,6 +1238,111 @@ self-describing to `jq`.
 **Known gap.** Only the document **body** is read. Headers, footers and
 footnotes live in their own index segments and do not appear — the Docs
 counterpart of "export gives you the first sheet only".
+
+### Editing a document
+
+`drive docs replace` and `drive docs append` mutate text, gated by the
+`docs-write` permission (see [Write permissions](#write-permissions)) and
+requiring `--write-file` or `--write-full`.
+
+```bash
+# Preview first — reports the occurrence count without sending anything
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4 --dry-run
+Would replace: 7 occurrence(s) in 'Roadmap' (counted from the copy just read)
+
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4
+Replaced: 7 occurrence(s) in 'Roadmap'
+
+$ omni-dev drive docs append 1AbC… --text $'\nAppended by omni-dev.'
+Appended: 22 char(s) / 22 byte(s) to 'Roadmap'
+```
+
+`append` also takes `--text-file <PATH>`, or `--text-file -` for stdin.
+
+#### Every edit is leased against a revision
+
+This is the part worth understanding. `documents.batchUpdate` is addressed
+by *index*, and the indices an edit is computed from come from a read that
+has already returned. If someone edits the document in between, those
+indices still resolve — just against different text. Nothing errors; the
+edit simply lands in the wrong place.
+
+So every edit presents the `revisionId` from the read that computed it, and
+Google refuses the write if the document has moved:
+
+```
+Refused: 'Roadmap' changed since it was read (revision lease ALm37BXk3nQ no
+longer current) — nothing was written. Re-run to apply against the current
+version.
+```
+
+Nothing was written — the batch is atomic. **Re-running is the fix**, and it
+is the only one: there is deliberately no flag to force the write through,
+because the alternative the API offers rebases your edit over the other
+person's changes and reports success on a document nobody has looked at.
+See [ADR-0076](adrs/adr-0076.md) §3.
+
+If the account has only read access Google withholds the revision id
+entirely, and the edit is refused up front rather than attempted unleased.
+
+#### Things to know
+
+- **`--search` is a literal substring, never a regex**, and matching is
+  **case-sensitive by default** — which inverts the API's own default. Under
+  Google's default, `--search it` also rewrites `It` and `IT`, in a verb with
+  no undo. Use `--ignore-case` when you want that.
+- **`--dry-run`'s occurrence count is an estimate.** It is counted over the
+  body text this command read, while the server matches over its own view —
+  a match can span a styling boundary, or sit in a header or footnote that
+  is not fetched. The count never decides anything: a count of zero still
+  sends the request, because reporting "nothing to do" from an estimate
+  would be wrong exactly when the estimate is. The real run reports the
+  server's own number.
+- **`replace` spans every tab; `append` lands in the first.** That asymmetry
+  is the Docs API's, confirmed against it directly, and it is why the preview
+  counts across all tabs.
+- **`append` adds no separator.** Appending `hello` to a document ending
+  `world` gives `worldhello`. Include a leading newline if you want one.
+- **Deletion is not supported**, and not merely unimplemented: no delete
+  request is constructible anywhere in this codebase, enforced by a test.
+  Replacing text *with nothing* (`--replace ""`) is the supported way to
+  remove it.
+
+#### `drive docs create`
+
+Creates a Google Doc, optionally seeded with text. Gated by the `create`
+operation, not `docs-write`.
+
+```bash
+$ omni-dev drive docs create --name "Q4 Plan" --parent 1FoLdEr… --text "Draft."
+Created: 'Q4 Plan' (1NeW…) in 1FoLdEr…, seeded with 6 char(s)
+```
+
+`--text-file <PATH>` (or `-` for stdin) is the alternative to `--text`.
+
+The seed is **not** separately gated under `docs-write` in the normal case:
+routing it through the write engine would re-check `docs-write` against the
+new file's parents, which defaults to deny, so `--text` would create an empty
+document and then report itself blocked on every folder that grants only
+`create`. The `create` verdict authorises the pair — which is defensible only
+because the id being written is one this same invocation just created inside
+an already-cleared folder. An **explicit** `deny: ["docs-write"]` on that
+folder is a deliberate signal and *does* block the seed, before anything is
+created.
+
+If creation succeeds but seeding fails, the result says so and names the new
+document's id:
+
+```
+Partially failed: created 'Q4 Plan' (1NeW…) in 1FoLdEr…, but seeding its text
+failed: … The document exists and is empty — it cannot be rolled back
+automatically.
+```
+
+There is no `files.delete` anywhere in this integration, so an empty document
+cannot be cleaned up automatically and must never be reported as a plain
+failure that leaves something you can't find. Delete it yourself if you don't
+want it.
 
 ## Rate limits and retry behaviour
 

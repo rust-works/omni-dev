@@ -1,6 +1,7 @@
 //! CLI commands for `omni-dev drive permissions` — read-only diagnostics
 //! for the write-permission gate (issue #1574), including the
-//! `sheets-write` operation added for the Sheets API (issue #1589) and the
+//! `sheets-write` operation added for the Sheets API (issue #1589), the
+//! `docs-write` operation added for the Docs API (issue #1615), and the
 //! file-id-keyed rules added in issue #1612.
 
 pub(crate) mod check;
@@ -13,8 +14,9 @@ use clap::{Parser, Subcommand};
 use crate::cli::drive::helpers;
 
 /// Inspects the write-permission rules gating `drive
-/// create`/`upload`/`edit` and `drive sheets
-/// write`/`append`/`clear`/`create`.
+/// create`/`upload`/`edit`, `drive sheets
+/// write`/`append`/`clear`/`create` and `drive docs
+/// replace`/`append`/`create`.
 #[derive(Parser)]
 pub struct PermissionsCommand {
     /// The permissions subcommand to execute.

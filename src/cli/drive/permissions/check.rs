@@ -27,6 +27,9 @@ pub enum OperationArg {
     /// Writing cells into a Google Sheet — distinct from `Edit`, see
     /// [`DriveOperation::SheetsWrite`].
     SheetsWrite,
+    /// Replacing or appending text in a Google Doc — distinct from both
+    /// `Edit` and `SheetsWrite`, see [`DriveOperation::DocsWrite`].
+    DocsWrite,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -37,6 +40,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::Upload => Self::Upload,
             OperationArg::Edit => Self::Edit,
             OperationArg::SheetsWrite => Self::SheetsWrite,
+            OperationArg::DocsWrite => Self::DocsWrite,
         }
     }
 }

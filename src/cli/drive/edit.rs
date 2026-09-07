@@ -114,40 +114,68 @@ async fn run_edit(
 }
 
 fn print_outcome(outcome: &EditOutcome) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    // Best-effort, like every other `println!` this replaced: a broken pipe
+    // must not turn a completed edit into a failure.
+    let _ = write_outcome(outcome, &mut handle);
+}
+
+/// Renders an outcome to `out`.
+///
+/// Split from [`print_outcome`] so the wording is testable, following the
+/// `render_*_table` convention the rest of the `drive` CLI already uses.
+/// Worth doing here specifically because two of these lines exist to point a
+/// refused user at the command that *does* work, and a hint that silently
+/// stopped naming the right command would be invisible otherwise.
+fn write_outcome(outcome: &EditOutcome, out: &mut dyn std::io::Write) -> std::io::Result<()> {
     let file_id = sanitize_for_terminal(&outcome.file_id);
     match &outcome.result {
-        EditResult::WouldEdit => println!("Would edit: {file_id}"),
+        EditResult::WouldEdit => writeln!(out, "Would edit: {file_id}")?,
         EditResult::RefusedNativeDocument => {
-            println!(
+            // The refusal itself is unchanged (ADR-0076 §1): a media PATCH
+            // has no meaningful content to replace for a native document,
+            // and making it "work" would mean convert-on-import re-upload,
+            // which destroys comments, suggestions, revision history, tabs
+            // and formatting. What it *can* do is name the commands that
+            // work, which it previously did not — leaving a user who had
+            // just been refused with no route forward.
+            writeln!(
+                out,
                 "Refused: {file_id} is a Google-native document (Docs/Sheets/Slides/...) — no \
-                 raw content to replace"
-            );
+                 raw content to replace. Edit a Doc with `omni-dev drive docs \
+                 replace`/`append`, or a Sheet with `omni-dev drive sheets \
+                 write`/`append`/`clear`."
+            )?;
         }
         EditResult::RefusedNoVisibleParents => {
-            println!(
+            writeln!(
+                out,
                 "Refused: {file_id} has no parent folder visible to this account, so no folder \
                  rule can apply to it. This is normal for a file shared by link or email. \
                  Grant it by id instead: add {{\"file_id\": \"<file id>\", \"allow\": \
                  [\"edit\"]}} to write_permissions.rules."
-            );
+            )?;
         }
         EditResult::Blocked { decided_by } => {
-            println!("Blocked: {file_id}");
+            writeln!(out, "Blocked: {file_id}")?;
             match decided_by {
-                Some(rule) => println!(
+                Some(rule) => writeln!(
+                    out,
                     "  refused by rule on {} {}{}",
                     rule.kind_label(),
                     sanitize_for_terminal(rule.id()),
                     rule.depth_suffix()
-                ),
-                None => println!("  refused by default policy (no matching rule)"),
+                )?,
+                None => writeln!(out, "  refused by default policy (no matching rule)")?,
             }
         }
-        EditResult::Edited => println!("Edited: {file_id}"),
+        EditResult::Edited => writeln!(out, "Edited: {file_id}")?,
         EditResult::Failed { detail } => {
-            println!("Failed: {file_id}: {}", sanitize_for_terminal(detail));
+            writeln!(out, "Failed: {file_id}: {}", sanitize_for_terminal(detail))?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -274,56 +302,106 @@ mod tests {
         assert!(!Path::new("-").exists());
     }
 
+    fn rendered(result: EditResult) -> String {
+        let mut buf = Vec::new();
+        write_outcome(
+            &EditOutcome {
+                file_id: "f1".to_string(),
+                file_name: Some("f".to_string()),
+                resolved_folder_id: None,
+                result,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Every variant renders exactly one line (two for `Blocked`, which
+    /// carries its reason on a second), and none of them panics.
     #[test]
-    fn print_outcome_smoke_test_every_variant() {
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: Some("p".to_string()),
-            result: EditResult::WouldEdit,
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: None,
-            result: EditResult::RefusedNativeDocument,
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: None,
-            result: EditResult::RefusedNoVisibleParents,
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: Some("p".to_string()),
-            result: EditResult::Blocked { decided_by: None },
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: Some("p".to_string()),
-            result: EditResult::Blocked {
-                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
-                    folder_id: "parent-1".to_string(),
-                    depth: 0,
-                }),
+    fn every_variant_renders() {
+        for (result, lines) in [
+            (EditResult::WouldEdit, 1),
+            (EditResult::RefusedNativeDocument, 1),
+            (EditResult::RefusedNoVisibleParents, 1),
+            (EditResult::Edited, 1),
+            (
+                EditResult::Failed {
+                    detail: "boom".to_string(),
+                },
+                1,
+            ),
+            (EditResult::Blocked { decided_by: None }, 2),
+            (
+                EditResult::Blocked {
+                    decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                        folder_id: "parent-1".to_string(),
+                        depth: 0,
+                    }),
+                },
+                2,
+            ),
+            (
+                EditResult::Blocked {
+                    decided_by: Some(crate::drive::write_gate::DecidingRule::File {
+                        file_id: "f1".to_string(),
+                    }),
+                },
+                2,
+            ),
+        ] {
+            let text = rendered(result);
+            assert_eq!(text.lines().count(), lines, "{text}");
+            assert!(text.contains("f1"), "{text}");
+        }
+    }
+
+    /// The native-document refusal must name **both** trees that can do the
+    /// job. This is the whole reason the line exists: `drive edit` refuses a
+    /// Doc or a Sheet by design (ADR-0076 §1), so without a route forward
+    /// the user is simply stuck. It went three weeks naming neither, which
+    /// is exactly the drift an untested message invites.
+    #[test]
+    fn the_native_document_refusal_names_both_drive_docs_and_drive_sheets() {
+        let text = rendered(EditResult::RefusedNativeDocument);
+        assert!(text.contains("drive docs"), "{text}");
+        assert!(text.contains("drive sheets"), "{text}");
+        assert!(text.contains("no raw content to replace"), "{text}");
+    }
+
+    /// The parentless refusal names the fix that actually works — a
+    /// `file_id` rule — rather than sending the reader off to write a
+    /// folder rule that can never match (issue #1612).
+    #[test]
+    fn the_parentless_refusal_names_a_file_id_rule_as_the_fix() {
+        let text = rendered(EditResult::RefusedNoVisibleParents);
+        assert!(text.contains("file_id"), "{text}");
+    }
+
+    /// Server- and operator-supplied strings reach a terminal here, so both
+    /// the file id and a failure detail are sanitized.
+    #[test]
+    fn rendering_strips_control_bytes_from_untrusted_strings() {
+        let mut buf = Vec::new();
+        write_outcome(
+            &EditOutcome {
+                file_id: "f\u{1b}[31m1".to_string(),
+                file_name: None,
+                resolved_folder_id: None,
+                result: EditResult::Failed {
+                    detail: "bad\nnews".to_string(),
+                },
             },
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: Some("f".to_string()),
-            resolved_folder_id: Some("p".to_string()),
-            result: EditResult::Edited,
-        });
-        print_outcome(&EditOutcome {
-            file_id: "f1".to_string(),
-            file_name: None,
-            resolved_folder_id: None,
-            result: EditResult::Failed {
-                detail: "boom".to_string(),
-            },
-        });
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "an embedded newline must not add a row: {text}"
+        );
     }
 }
