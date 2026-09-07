@@ -29,3 +29,4 @@ pub mod read;
 pub mod structure;
 pub mod target;
 pub mod types;
+pub mod write_types;
