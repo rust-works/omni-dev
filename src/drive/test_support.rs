@@ -11,6 +11,7 @@ use crate::drive::account::DRIVE_ACCOUNT_ENV;
 use crate::drive::auth::{
     DRIVE_API_URL, DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET, DRIVE_REFRESH_TOKEN, DRIVE_SCOPE,
 };
+use crate::drive::docs::client::DOCS_API_URL;
 use crate::drive::sheets::client::SHEETS_API_URL;
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the Drive
@@ -35,13 +36,14 @@ impl EnvGuard {
         let lock = DRIVE_ENV_MUTEX
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // The two `*_API_URL` host overrides are snapshotted for two
+        // The three `*_API_URL` host overrides are snapshotted for two
         // reasons: a developer with one exported must not silently redirect
         // a test's requests, and a test that points one at a local server
         // must not leak that setting into the next test. Their absence here
         // was already a latent hazard for `DRIVE_API_URL`; `SHEETS_API_URL`
-        // makes it sharper, since without an override a Sheets client
-        // defaults to the *real* `sheets.googleapis.com`.
+        // and `DOCS_API_URL` make it sharper, since without an override
+        // those clients default to the *real* `sheets.googleapis.com` /
+        // `docs.googleapis.com`.
         let keys = [
             "HOME",
             DRIVE_CLIENT_ID,
@@ -51,6 +53,7 @@ impl EnvGuard {
             DRIVE_ACCOUNT_ENV,
             DRIVE_API_URL,
             SHEETS_API_URL,
+            DOCS_API_URL,
         ];
         let snapshot = keys
             .into_iter()
@@ -80,18 +83,25 @@ impl EnvGuard {
         std::env::remove_var(DRIVE_ACCOUNT_ENV);
         std::env::remove_var(DRIVE_API_URL);
         std::env::remove_var(SHEETS_API_URL);
+        std::env::remove_var(DOCS_API_URL);
         dir
     }
 
-    /// Points both Google API host overrides at a dead local address.
+    /// Points every Google API host override at a dead local address.
     ///
     /// For tests that exercise a code path which *constructs* a client
-    /// without a wiremock server in hand. Without this a `SheetsClient`
-    /// falls back to the real `sheets.googleapis.com`, so a routing test
-    /// would make an outbound request to Google.
+    /// without a wiremock server in hand. Without this a `SheetsClient` or
+    /// `DocsClient` falls back to the real `sheets.googleapis.com` /
+    /// `docs.googleapis.com`, so a routing test would make an outbound
+    /// request to Google.
+    ///
+    /// Every new second-host client must be added here as well as to
+    /// [`Self::take`]'s snapshot — this is the one of the two whose omission
+    /// is silent, because the test still passes while talking to Google.
     pub(crate) fn redirect_api_hosts_to_a_dead_port(&self) {
         std::env::set_var(DRIVE_API_URL, "http://127.0.0.1:1");
         std::env::set_var(SHEETS_API_URL, "http://127.0.0.1:1");
+        std::env::set_var(DOCS_API_URL, "http://127.0.0.1:1");
     }
 }
 
