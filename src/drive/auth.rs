@@ -159,6 +159,38 @@ impl DriveGrantedScopes {
         .join(" ")
     }
 
+    /// Returns the human-readable scope list `drive auth status` prints —
+    /// the same set as [`Self::as_str`], in the same order, with the
+    /// `https://www.googleapis.com/auth/` prefix dropped and comma-separated.
+    ///
+    /// Deliberately derived from the flags rather than branched on a
+    /// predicate. This type used to be a two-state enum, where
+    /// `if allows_write() { … } else { … }` was faithful;
+    /// [ADR-0071](../../docs/adrs/adr-0071.md) §1 replaced it with four
+    /// independent bits, at which point any such branch necessarily
+    /// misreports three of the fifteen non-empty combinations *and* names a
+    /// scope the account may not hold. Rendering the bits is the only shape
+    /// that cannot drift as bits are added.
+    ///
+    /// Returns `"(none)"` for the empty set rather than an empty string, so
+    /// the status line never reads `Granted scope: ` with nothing after it.
+    #[must_use]
+    pub fn summary(self) -> String {
+        let names: Vec<&str> = [
+            self.readonly.then_some("drive.readonly"),
+            self.metadata.then_some("drive.metadata"),
+            self.file.then_some("drive.file"),
+            self.full.then_some("drive"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if names.is_empty() {
+            return "(none)".to_string();
+        }
+        names.join(", ")
+    }
+
     /// Parses Google's space-separated granted-scope response. Every
     /// recognized token independently sets its own flag (order-independent,
     /// unlike a first-match branch).
@@ -1273,6 +1305,96 @@ mod tests {
             None
         );
         assert_eq!(DriveGrantedScopes::from_granted(""), None);
+    }
+
+    /// The bug from issue #1645, pinned at its sharpest: an account holding
+    /// `readonly` + the unrestricted `drive` must not be described as
+    /// holding `drive.metadata`. The old binary branch reported exactly
+    /// that — naming a scope the account lacks while hiding the one it has,
+    /// wrong in both directions at once.
+    #[test]
+    fn summary_never_invents_metadata_for_a_full_scope_account() {
+        let scope = DriveGrantedScopes {
+            readonly: true,
+            metadata: false,
+            file: false,
+            full: true,
+        };
+        assert_eq!(scope.summary(), "drive.readonly, drive");
+        assert!(
+            !scope.summary().contains("metadata"),
+            "the account holds no metadata scope"
+        );
+    }
+
+    /// The exact string `docs/drive.md` promises for a
+    /// `--write --write-file` login — a written contract the previous
+    /// implementation could not produce for any input.
+    #[test]
+    fn summary_matches_the_documented_write_write_file_example() {
+        let scope = DriveGrantedScopes {
+            readonly: true,
+            metadata: true,
+            file: true,
+            full: false,
+        };
+        assert_eq!(
+            scope.summary(),
+            "drive.readonly, drive.metadata, drive.file"
+        );
+    }
+
+    /// Every one of the sixteen combinations renders exactly the flags that
+    /// are set, in table order — which is the property a predicate branch
+    /// cannot have.
+    #[test]
+    fn summary_renders_exactly_the_flags_that_are_set() {
+        for bits in 0..16u8 {
+            let scope = DriveGrantedScopes {
+                readonly: bits & 1 != 0,
+                metadata: bits & 2 != 0,
+                file: bits & 4 != 0,
+                full: bits & 8 != 0,
+            };
+            let summary = scope.summary();
+            for (set, name) in [
+                (scope.readonly, "drive.readonly"),
+                (scope.metadata, "drive.metadata"),
+                (scope.file, "drive.file"),
+                (scope.full, "drive"),
+            ] {
+                // `drive` is a substring of the others, so compare against
+                // the split fields rather than the joined string.
+                let present = summary.split(", ").any(|part| part == name);
+                assert_eq!(present, set, "{name} in {summary:?} (bits {bits})");
+            }
+        }
+    }
+
+    #[test]
+    fn summary_of_an_empty_set_is_not_an_empty_string() {
+        assert_eq!(DriveGrantedScopes::default().summary(), "(none)");
+    }
+
+    /// `summary` and `as_str` must always describe the same set — the short
+    /// form is a rendering of the wire form, not a second source of truth.
+    #[test]
+    fn summary_and_as_str_agree_on_which_scopes_are_present() {
+        for bits in 0..16u8 {
+            let scope = DriveGrantedScopes {
+                readonly: bits & 1 != 0,
+                metadata: bits & 2 != 0,
+                file: bits & 4 != 0,
+                full: bits & 8 != 0,
+            };
+            let wire_count = scope.as_str().split_whitespace().count();
+            let short_count = if scope.summary() == "(none)" {
+                0
+            } else {
+                scope.summary().split(", ").count()
+            };
+            assert_eq!(wire_count, short_count, "bits {bits}");
+        }
     }
 
     #[test]

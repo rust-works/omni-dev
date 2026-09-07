@@ -352,14 +352,11 @@ async fn run_auth_status_for(
     let email = about.user.email_address.unwrap_or_default();
 
     out.push_str(&format!("Authenticated as: {email}\n"));
-    out.push_str(&format!(
-        "Granted scope: {}\n",
-        if scope.allows_write() {
-            "drive.readonly, drive.metadata"
-        } else {
-            "drive.readonly"
-        }
-    ));
+    // Rendered from the granted flags, never from a write/no-write branch:
+    // `DriveGrantedScopes` is four independent bits since ADR-0071 §1, so a
+    // binary branch both hides scopes the account holds and names ones it
+    // does not (issue #1645).
+    out.push_str(&format!("Granted scope: {}\n", scope.summary()));
 
     if let (Some(name), false) = (account_name, email.is_empty()) {
         // Best-effort cache backfill: if two accounts in the same --all run
