@@ -50,6 +50,7 @@ impl OmniDevServer {
             + Self::datadog_tool_router()
             + Self::gmail_tool_router()
             + Self::drive_tool_router()
+            + Self::drive_sheets_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
             + Self::coverage_tool_router()
@@ -404,6 +405,8 @@ mod tests {
             "drive_file_read",
             "drive_account_list",
             "drive_dedupe",
+            "drive_sheets_info",
+            "drive_sheets_read",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

@@ -49,7 +49,9 @@ use super::server::OmniDevServer;
 // ── Parameter structs ───────────────────────────────────────────────
 
 /// Doc comment shared by every `account` parameter below (mirrors Gmail's
-/// issue #1500) — kept as one string so the copies can't drift.
+/// issue #1500) — kept as one string so the copies can't drift. Re-exported
+/// at crate visibility just below so `drive_sheets_tools.rs` can reuse it
+/// rather than forking the string.
 macro_rules! account_param_doc {
     () => {
         "Selects a named Drive account instead of the ambient \
@@ -58,6 +60,7 @@ macro_rules! account_param_doc {
          accounts are configured). Call `drive_account_list` to discover configured names."
     };
 }
+pub(crate) use account_param_doc;
 
 /// Parameters for `drive_auth_status`.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
