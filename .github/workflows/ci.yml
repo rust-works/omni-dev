@@ -216,7 +216,7 @@ jobs:
     # Pull a prebuilt cargo-audit binary instead of `cargo install` (which
     # compiles from source every run — rust-cache can't help since it doesn't
     # cache ~/.cargo/bin). Mirrors the prebuilt cargo-deny-action below.
-    - uses: taiki-e/install-action@v2.86.5
+    - uses: taiki-e/install-action@v2.87.5
       with:
         tool: cargo-audit
     - name: Run cargo-audit
