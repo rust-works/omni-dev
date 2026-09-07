@@ -18,7 +18,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
+use crate::cli::drive::format::{write_items_jsonl, JsonlSerialize};
 use crate::drive::docs::api::{DocsApi, SuggestionsViewMode};
 use crate::drive::docs::structure::{flatten, DocElement};
 
@@ -73,24 +73,55 @@ pub struct ReadOutcome {
     pub tabs: Vec<TabContent>,
 }
 
+/// One element, with the document and tab identity denormalised onto it.
+///
+/// The `-o jsonl` record. A document's element list *is* a record stream,
+/// unlike a sheet's rows, so each line is one element rather than one line
+/// per document. The repetition of `document_id`/`revision_id`/`tab_id` on
+/// every line is the point — it is what makes a single line self-describing
+/// to `jq`, which is the whole reason to reach for `jsonl` over `json`.
+///
+/// The element's own fields are `flatten`ed to the top level rather than
+/// nested under a key, so the natural filter is `jq -r '.text'` and every
+/// field name matches the one `-o json` uses at its own depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlatElement<'a> {
+    /// The document these elements came from.
+    pub document_id: &'a str,
+    /// The revision they were read at, when the caller has edit access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<&'a str>,
+    /// The holding tab's id, absent for a legacy single-body document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<&'a str>,
+    /// The element itself, inlined.
+    #[serde(flatten)]
+    pub element: &'a DocElement,
+}
+
 impl JsonlSerialize for ReadOutcome {
     fn write_jsonl(&self, out: &mut dyn std::io::Write) -> Result<()> {
-        write_scalar_jsonl(self, out)
+        write_items_jsonl(self.flat_elements().iter(), out)
     }
 }
 
 impl ReadOutcome {
-    /// Every element across every tab, paired with the tab that holds it.
+    /// Every element across every tab, carrying the identity of the document
+    /// and tab that hold it.
     ///
-    /// The `-o jsonl` shape: a document's element list *is* a record stream,
-    /// unlike a sheet's rows, so each line is one element with the document
-    /// and tab identity denormalised onto it. That redundancy is the point —
-    /// it is what makes a single line self-describing to `jq`.
+    /// This is the `-o jsonl` projection; see [`FlatElement`].
     #[must_use]
-    pub fn flat_elements(&self) -> Vec<(&TabContent, &DocElement)> {
+    pub fn flat_elements(&self) -> Vec<FlatElement<'_>> {
         self.tabs
             .iter()
-            .flat_map(|tab| tab.elements.iter().map(move |el| (tab, el)))
+            .flat_map(|tab| {
+                tab.elements.iter().map(move |element| FlatElement {
+                    document_id: &self.document_id,
+                    revision_id: self.revision_id.as_deref(),
+                    tab_id: tab.tab_id.as_deref(),
+                    element,
+                })
+            })
             .collect()
     }
 }
@@ -461,13 +492,13 @@ mod tests {
         assert!(json["tabs"][0].get("tab_id").is_none());
     }
 
-    /// The `-o jsonl` shape: one record per element, not one per document.
-    #[tokio::test]
-    async fn flat_elements_streams_every_element_across_every_tab() {
-        let server = MockServer::start().await;
-        let client = docs_client(&server).await;
+    /// A two-tab document whose `-o jsonl` rendering the next few tests
+    /// assert against.
+    async fn two_tab_outcome(server: &MockServer) -> ReadOutcome {
+        let client = docs_client(server).await;
         mount_document(serde_json::json!({
             "documentId": "d1",
+            "revisionId": "rev-1",
             "tabs": [
                 {
                     "tabProperties": {"tabId": "t.0"},
@@ -480,14 +511,118 @@ mod tests {
                 },
             ],
         }))
+        .mount(server)
+        .await;
+
+        read(&DocsApi::new(&client), &opts(None)).await.unwrap()
+    }
+
+    /// Renders `outcome` the way `-o jsonl` does, as the bytes a caller pipes
+    /// into `jq`.
+    ///
+    /// Asserting on the rendered output rather than on `flat_elements()` is
+    /// deliberate: the helper existed and was correct while `write_jsonl`
+    /// still emitted one line for the whole document, so a test of the
+    /// projection alone cannot see the bug that mattered.
+    fn render_jsonl(outcome: &ReadOutcome) -> String {
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The `-o jsonl` shape: one record per element, not one per document.
+    #[tokio::test]
+    async fn jsonl_emits_one_line_per_element_across_every_tab() {
+        let server = MockServer::start().await;
+        let outcome = two_tab_outcome(&server).await;
+
+        let rendered = render_jsonl(&outcome);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["text"].to_string()
+            })
+            .collect();
+        assert_eq!(texts, vec!["\"a\"", "\"b\"", "\"c\""]);
+    }
+
+    /// Each line carries the document and tab identity, which is what makes
+    /// it self-describing once it is separated from its siblings.
+    #[tokio::test]
+    async fn jsonl_denormalises_document_and_tab_identity_onto_every_line() {
+        let server = MockServer::start().await;
+        let outcome = two_tab_outcome(&server).await;
+        let rendered = render_jsonl(&outcome);
+
+        let lines: Vec<serde_json::Value> = rendered
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        for line in &lines {
+            assert_eq!(line["document_id"], "d1");
+            assert_eq!(line["revision_id"], "rev-1");
+        }
+        assert_eq!(lines[0]["tab_id"], "t.0");
+        assert_eq!(lines[1]["tab_id"], "t.0");
+        assert_eq!(lines[2]["tab_id"], "t.1");
+    }
+
+    /// The element's own fields sit at the top level, not nested under a
+    /// key — `jq -r '.text'` is the documented filter, and a wrapper object
+    /// would silently make it yield `null`.
+    #[tokio::test]
+    async fn jsonl_flattens_element_fields_to_the_top_level() {
+        let server = MockServer::start().await;
+        let outcome = two_tab_outcome(&server).await;
+        let rendered = render_jsonl(&outcome);
+
+        let first: serde_json::Value =
+            serde_json::from_str(rendered.lines().next().unwrap()).unwrap();
+        assert_eq!(first["text"], "a");
+        assert_eq!(first["kind"], "paragraph");
+        assert_eq!(first["start_index"], 1);
+        assert_eq!(first["end_index"], 5);
+        assert!(first.get("element").is_none());
+    }
+
+    /// A read-only caller has no `revisionId`, and the field is omitted
+    /// rather than rendered as `null` — the same contract `-o json` keeps.
+    #[tokio::test]
+    async fn jsonl_omits_revision_and_tab_when_absent() {
+        let server = MockServer::start().await;
+        let client = docs_client(&server).await;
+        mount_document(serde_json::json!({
+            "documentId": "d1",
+            "body": {"content": [paragraph(1, 5, "a\n")]},
+        }))
         .mount(&server)
         .await;
 
         let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
-        let flat = outcome.flat_elements();
-        assert_eq!(flat.len(), 3);
-        assert_eq!(flat[0].0.tab_id.as_deref(), Some("t.0"));
-        assert_eq!(flat[2].0.tab_id.as_deref(), Some("t.1"));
-        assert_eq!(flat[2].1.text, "c");
+        let rendered = render_jsonl(&outcome);
+        let line: serde_json::Value =
+            serde_json::from_str(rendered.lines().next().unwrap()).unwrap();
+
+        assert_eq!(line["document_id"], "d1");
+        assert!(line.get("revision_id").is_none());
+        assert!(line.get("tab_id").is_none());
+    }
+
+    /// An empty document renders no lines at all, rather than one line
+    /// describing a document with nothing in it.
+    #[tokio::test]
+    async fn jsonl_emits_nothing_for_a_document_with_no_elements() {
+        let server = MockServer::start().await;
+        let client = docs_client(&server).await;
+        mount_document(serde_json::json!({"documentId": "d1", "body": {"content": []}}))
+            .mount(&server)
+            .await;
+
+        let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
+        assert_eq!(render_jsonl(&outcome), "");
     }
 }
