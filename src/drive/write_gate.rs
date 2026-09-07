@@ -89,7 +89,12 @@ pub enum DriveOperation {
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
-    /// renaming and inserting rows or columns.
+    /// renaming and inserting rows or columns; and, since issue #1643
+    /// ([ADR-0078](../../docs/adrs/adr-0078.md)), cell/border formatting,
+    /// merging, auto-resize, column width/row height, data validation,
+    /// `duplicateSheet`, and sheet reorder/hide. None of that later set
+    /// destroys data either, which is what earns it the same operation as
+    /// the original three rather than one of its own.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
@@ -100,10 +105,12 @@ pub enum DriveOperation {
     ///
     /// The same argument binds future work: row and sheet **deletion** must
     /// not later join this variant either, or granting it today would silently
-    /// become consent to destroy data tomorrow.
+    /// become consent to destroy data tomorrow. Nor may a *permission*
+    /// change — see [`Self::SheetsProtection`], carved out of this same
+    /// deferred set for exactly that reason.
     SheetsStructure,
     /// Destructively edit an existing Google Sheet via `spreadsheets.batchUpdate`
-    /// (issue #1623, [ADR-0077](../../docs/adrs/adr-0077.md)) — deleting a
+    /// (issue #1623, [ADR-0077](../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)) — deleting a
     /// sheet, a row/column range, or an arbitrary cell range.
     ///
     /// Deliberately **not** folded into [`Self::SheetsStructure`], per the
@@ -115,6 +122,28 @@ pub enum DriveOperation {
     /// The same argument binds future work: no other operation should later
     /// join this variant without the same re-consent reasoning.
     SheetsDelete,
+    /// Add, change or remove a protected range on an existing Google Sheet
+    /// via `spreadsheets.batchUpdate` (issue #1643,
+    /// [ADR-0078](../../docs/adrs/adr-0078.md)).
+    ///
+    /// Deliberately **not** folded into [`Self::SheetsStructure`], and the
+    /// reason is different in kind from every other split on this enum: a
+    /// protected range is *who may edit*, not *what the sheet contains*.
+    /// `updateProtectedRange` can widen the set of editors and
+    /// `deleteProtectedRange` removes a guard someone deliberately placed —
+    /// both are permission changes inside the document, closer in spirit to
+    /// `drive permissions` than to any cell or structural write this tool
+    /// makes. Folding it into `sheets-structure` would let a grant issued
+    /// for "may reformat/validate/restructure this workbook" silently
+    /// double as "may also change who can edit it" — a widening in kind,
+    /// not merely in scope, which is why this earns its own operation
+    /// rather than joining the set `sheets-structure`'s own doc comment
+    /// just absorbed.
+    ///
+    /// This binds future work too: nothing reachable under this operation
+    /// may ever touch a *file-level* Drive permission (`drive permissions`
+    /// is that surface, and stays the only one).
+    SheetsProtection,
     /// Replace or append *text* in an existing Google Doc via the Docs API
     /// (issue #1615, [ADR-0076](../../docs/adrs/adr-0076.md) §2).
     ///
@@ -146,6 +175,7 @@ impl std::fmt::Display for DriveOperation {
             Self::SheetsWrite => "sheets-write",
             Self::SheetsStructure => "sheets-structure",
             Self::SheetsDelete => "sheets-delete",
+            Self::SheetsProtection => "sheets-protection",
             Self::DocsWrite => "docs-write",
         };
         write!(f, "{s}")
@@ -167,6 +197,7 @@ impl DriveOperation {
             | Self::SheetsWrite
             | Self::SheetsStructure
             | Self::SheetsDelete
+            | Self::SheetsProtection
             | Self::DocsWrite => Verdict::Deny,
         }
     }

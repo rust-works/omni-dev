@@ -91,20 +91,48 @@ types, so the log is a complete invocation history, not just an HTTP history:
 
   Destructive edits (issue
   [#1623](https://github.com/rust-works/omni-dev/issues/1623),
-  [ADR-0077](adrs/adr-0077.md)) use the same kind again, with `operation` of
-  `sheets-delete-sheet`/`sheets-delete-rows`/`sheets-delete-columns`/
-  `sheets-delete-range` — same one-record-per-verb-and-per-request shape as
-  the structural edits above, and the same four structural context keys
-  (`sheet_id`, `sheet_title`, `dimension_range` for the two dimension-delete
-  verbs). They add one more omit-if-absent context key: `grid_range` (e.g.
-  `"rows 2-4, columns 2-3"`, 1-based inclusive like the CLI's `--start-row`/
-  `--end-row`/`--start-column`/`--end-column`) — the `deleteRange` analogue
-  of `dimension_range`, which only ever spans one axis and so cannot record
-  a rectangle. `delete-sheet` sets neither `dimension_range` nor
-  `grid_range`. Every `--dry-run`, additive or destructive, is unlogged —
-  `record_attempt` only ever runs for a real mutation attempt — and a
-  destructive one stays structural-only besides: no cell content is ever
-  read or logged for any structural verb, delete included.
+  [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md)) use the same
+  kind again, with `operation` of `sheets-delete-sheet`/`sheets-delete-rows`/
+  `sheets-delete-columns`/`sheets-delete-range` — same
+  one-record-per-verb-and-per-request shape as the structural edits above,
+  and the same four structural context keys (`sheet_id`, `sheet_title`,
+  `dimension_range` for the two dimension-delete verbs). They add one more
+  omit-if-absent context key: `grid_range` (e.g. `"rows 2-4, columns 2-3"`,
+  1-based inclusive like the CLI's `--start-row`/`--end-row`/
+  `--start-column`/`--end-column`) — the `deleteRange` analogue of
+  `dimension_range`, which only ever spans one axis and so cannot record a
+  rectangle. `delete-sheet` sets neither `dimension_range` nor `grid_range`.
+  Every `--dry-run`, additive or destructive, is unlogged — `record_attempt`
+  only ever runs for a real mutation attempt — and a destructive one stays
+  structural-only besides: no cell content is ever read or logged for any
+  structural verb, delete included.
+
+  Formatting, data validation and protected ranges (issue
+  [#1643](https://github.com/rust-works/omni-dev/issues/1643),
+  [ADR-0078](adrs/adr-0078.md)) use the same kind again, still **one record
+  per verb**: `update-borders` can set up to four `Border` sides in a single
+  request, which is the first case where one request carries more than one
+  independently-toggleable effect, but it is still one request, so the
+  one-record-per-verb-per-request equivalence ADR-0075 §7 established holds.
+  New `operation` values: `sheets-format-cells`, `sheets-update-borders`,
+  `sheets-merge-cells`, `sheets-unmerge-cells`,
+  `sheets-auto-resize-dimension`, `sheets-update-dimension-properties`,
+  `sheets-duplicate-sheet`, `sheets-reorder-sheet`, `sheets-hide-sheet`,
+  `sheets-show-sheet`, `sheets-set-data-validation`,
+  `sheets-clear-data-validation`, `sheets-protect-range`,
+  `sheets-update-protection`, `sheets-unprotect-range`. Six more
+  omit-if-absent context keys: `fields_changed` (a human-readable summary of
+  which `CellFormat`/border/dimension-property fields a verb set — the
+  formatting analogue of `dimension_range`, needed because a single request
+  here can carry more than one named effect), `discarded_cells`
+  (`merge-cells` only — the non-top-left, non-blank cells a merge
+  discarded, as `"A1: value"` strings, so the one formatting request that
+  destroys data has a record saying exactly what was lost),
+  `validation_type` (the condition type a `set-data-validation` applied, or
+  `"cleared"`), `protected_range_id` (the stable numeric id of a protected
+  range a protection verb acted on — server-assigned for `protect-range`,
+  otherwise the one resolved against), and `protection_editors_added`/
+  `protection_editors_removed` (comma-separated).
 
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),

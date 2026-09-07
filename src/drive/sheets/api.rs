@@ -24,6 +24,16 @@ use crate::drive::sheets::types::{
 const SPREADSHEET_FIELDS: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount))";
 
+/// `fields` mask for `spreadsheets.get` when protected ranges are needed
+/// too (issue #1643's `list-protections`/`update-protection`/
+/// `unprotect-range`, which must resolve an *existing* protection before
+/// they can act on it). A superset of [`SPREADSHEET_FIELDS`], kept separate
+/// so every other caller — `sheets info`, `structure.rs`, `format.rs`,
+/// `validation.rs` — never pays for data it doesn't use.
+const SPREADSHEET_FIELDS_WITH_PROTECTIONS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.protectedRanges(protectedRangeId,range,description,warningOnly,editors.users)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -120,6 +130,24 @@ impl<'a> SheetsApi<'a> {
         self.client
             .transport()
             .get_parsed(url.as_str(), "Failed to parse Sheets spreadsheet metadata")
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including protected ranges** —
+    /// the one read the protection verbs need that no other caller does.
+    /// See [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`].
+    pub async fn get_spreadsheet_with_protections(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url =
+            build_spreadsheet_get_with_protections_url(self.client.base_url(), spreadsheet_id)?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with protections)",
+            )
             .await
     }
 
@@ -259,6 +287,15 @@ fn build_spreadsheet_get_url(base_url: &str, spreadsheet_id: &str) -> Result<Url
     GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS);
+    Ok(url)
+}
+
+fn build_spreadsheet_get_with_protections_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_PROTECTIONS);
     Ok(url)
 }
 

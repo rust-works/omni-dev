@@ -1,8 +1,10 @@
 //! CLI commands for `omni-dev drive sheets add-sheet`/`rename-sheet`/
-//! `insert-rows`/`insert-columns` (issue #1613) and `delete-sheet`/
-//! `delete-rows`/`delete-columns`/`delete-range` (issue #1623).
+//! `insert-rows`/`insert-columns` (issue #1613), `duplicate-sheet`/
+//! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643), and
+//! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (issue
+//! #1623).
 //!
-//! Eight clap structs over one engine call. They share `run_structure`, so
+//! Twelve clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
 //! for its three verbs. The additive verbs are gated on
@@ -296,6 +298,100 @@ pub struct DeleteRangeCommand {
     pub output: OutputFormat,
 }
 
+/// Copies an existing sheet within the same workbook.
+#[derive(Parser)]
+pub struct DuplicateSheetCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to copy.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// Title for the copy. Omitted takes Sheets' own "Copy of X" default.
+    /// Must not already exist in the workbook (checked against the source's
+    /// own title too — the source keeps its name).
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+
+    /// Zero-based position for the copy. Omitted appends to the end.
+    #[arg(long, value_name = "N")]
+    pub index: Option<i64>,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Moves an existing sheet to a new position among its siblings.
+#[derive(Parser)]
+pub struct ReorderSheetCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to move.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// The new zero-based position among the workbook's existing sheets.
+    #[arg(long, value_name = "N")]
+    pub index: i64,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Hides an existing sheet.
+#[derive(Parser)]
+pub struct HideSheetCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to hide.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Shows an existing hidden sheet.
+#[derive(Parser)]
+pub struct ShowSheetCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to show.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
 impl AddSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -416,6 +512,67 @@ impl DeleteRangeCommand {
                 start_column: self.start_column,
                 end_column: self.end_column,
                 shift: self.shift.into(),
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl DuplicateSheetCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::DuplicateSheet {
+                sheet: self.sheet,
+                title: self.title,
+                index: self.index,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl ReorderSheetCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::ReorderSheet {
+                sheet: self.sheet,
+                index: self.index,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl HideSheetCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::SetSheetVisibility {
+                sheet: self.sheet,
+                hidden: true,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl ShowSheetCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::SetSheetVisibility {
+                sheet: self.sheet,
+                hidden: false,
             },
             dry_run: self.dry_run,
         };

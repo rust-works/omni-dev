@@ -4071,7 +4071,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, docs-write]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, sheets-protection, docs-write]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4170,21 +4170,37 @@ Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
 Usage: sheets <COMMAND>
 
 Commands:
-  info            Shows a spreadsheet's title and the sheets (tabs) it contains
-  read            Reads cell values from one range, or from every sheet
-  write           Overwrites the cells of a range, gated by the write-permission rules (issues #1589, #1612). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
-  append          Appends rows after the last row of a range's table, gated by the write-permission rules (issues #1589, #1612)
-  clear           Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
-  create          Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
-  add-sheet       Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
-  rename-sheet    Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
-  insert-rows     Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
-  insert-columns  Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
-  delete-sheet    Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
-  delete-rows     Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
-  delete-columns  Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
-  delete-range    Deletes a rectangular cell range, shifting the remainder along one axis. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
-  help            Print this message or the help of the given subcommand(s)
+  info                         Shows a spreadsheet's title and the sheets (tabs) it contains
+  read                         Reads cell values from one range, or from every sheet
+  write                        Overwrites the cells of a range, gated by the write-permission rules (issues #1589, #1612). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  append                       Appends rows after the last row of a range's table, gated by the write-permission rules (issues #1589, #1612)
+  clear                        Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
+  create                       Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
+  add-sheet                    Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  rename-sheet                 Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  insert-rows                  Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  insert-columns               Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  delete-sheet                 Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-rows                  Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-columns               Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  delete-range                 Deletes a rectangular cell range, shifting the remainder along one axis. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
+  duplicate-sheet              Copies an existing sheet within the same workbook. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  reorder-sheet                Moves an existing sheet to a new position among its siblings. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  hide-sheet                   Hides an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  show-sheet                   Shows an existing hidden sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  format-cells                 Applies a cell format across a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  update-borders               Sets border lines on a range's edges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  merge-cells                  Merges a range into one cell, discarding every value but the top-left's. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  unmerge-cells                Splits a previously merged range back apart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  auto-resize-dimension        Resizes rows or columns to fit their content. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  update-dimension-properties  Sets an explicit pixel width (columns) or height (rows). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  set-data-validation          Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  clear-data-validation        Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  protect-range                Protects a range or an entire sheet. Gated by the folder write-permission rules' `sheets-protection` operation — distinct from `sheets-structure` (issue #1643)
+  update-protection            Changes an existing protected range's description, warning-only flag, or editor list. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+  unprotect-range              Removes a protected range. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+  list-protections             Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
+  help                         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -4235,6 +4251,27 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets auto-resize-dimension - Resizes rows or columns to fit their content. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Resizes rows or columns to fit their content. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: auto-resize-dimension [OPTIONS] --sheet <NAME> --dimension <DIMENSION> --start <N> --end <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --dimension <DIMENSION>  Rows or columns [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets clear - Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
 
 Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
@@ -4248,6 +4285,25 @@ Options:
       --range <A1>       A1 range to clear, optionally carrying its own `Sheet!` prefix
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or clears the whole tab on its own
       --dry-run          Reports the gate verdict without calling the Sheets API
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets clear-data-validation - Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: clear-data-validation [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to clear validation from, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4354,6 +4410,75 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets duplicate-sheet - Copies an existing sheet within the same workbook. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Copies an existing sheet within the same workbook. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: duplicate-sheet [OPTIONS] --sheet <NAME> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to copy
+      --title <TITLE>    Title for the copy. Omitted takes Sheets' own "Copy of X" default. Must not already exist in the workbook (checked against the source's own title too — the source keeps its name)
+      --index <N>        Zero-based position for the copy. Omitted appends to the end
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets format-cells - Applies a cell format across a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Applies a cell format across a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: format-cells [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>                 A1 range to format, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>               Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --bold <BOOL>                Bold [possible values: true, false]
+      --italic <BOOL>              Italic [possible values: true, false]
+      --strikethrough <BOOL>       Strikethrough [possible values: true, false]
+      --underline <BOOL>           Underline [possible values: true, false]
+      --font-size <N>              Point size
+      --text-color <HEX>           Text color, `#RRGGBB`
+      --background <HEX>           Cell background color, `#RRGGBB`
+      --horizontal-align <ALIGN>   Horizontal alignment [possible values: left, center, right]
+      --vertical-align <ALIGN>     Vertical alignment [possible values: top, middle, bottom]
+      --number-format <PATTERN>    Display number format pattern, e.g. `"#,##0.00"`. Requires `--number-format-type`
+      --number-format-type <TYPE>  The number format's type. Requires `--number-format` [possible values: text, number, percent, currency, date, time, date-time, scientific]
+      --wrap <WRAP>                Text wrap behavior [possible values: overflow, clip, wrap]
+      --dry-run                    Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                       Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets hide-sheet - Hides an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Hides an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: hide-sheet [OPTIONS] --sheet <NAME> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to hide
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets info - Shows a spreadsheet's title and the sheets (tabs) it contains
 
 Shows a spreadsheet's title and the sheets (tabs) it contains
@@ -4410,6 +4535,65 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets list-protections - Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
+
+Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
+
+Usage: list-protections [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets merge-cells - Merges a range into one cell, discarding every value but the top-left's. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Merges a range into one cell, discarding every value but the top-left's. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: merge-cells [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to merge, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --type <TYPE>      How to merge: one cell for the whole range, one per row, or one per column [default: all] [possible values: all, rows, columns]
+      --dry-run          Reports the gate verdict and, critically, every cell value the merge would discard — see `drive sheets merge-cells --help` before running without this flag first
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets protect-range - Protects a range or an entire sheet. Gated by the folder write-permission rules' `sheets-protection` operation — distinct from `sheets-structure` (issue #1643)
+
+Protects a range or an entire sheet. Gated by the folder write-permission rules' `sheets-protection` operation — distinct from `sheets-structure` (issue #1643)
+
+Usage: protect-range [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>          A1 range to protect, optionally carrying its own `Sheet!` prefix. Mutually exclusive with `--whole-sheet`
+      --sheet <NAME>        Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
+      --whole-sheet         Protect the entire sheet named by `--sheet`, rather than a range within it
+      --description <TEXT>  A human-readable note about why the range is protected
+      --warning-only        Only warn on an edit rather than blocking it outright
+      --editor <EMAIL>      An editor exempted from the protection. Repeatable
+      --dry-run             Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets read - Reads cell values from one range, or from every sheet
 
 Reads cell values from one range, or from every sheet
@@ -4444,6 +4628,177 @@ Options:
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets reorder-sheet - Moves an existing sheet to a new position among its siblings. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Moves an existing sheet to a new position among its siblings. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: reorder-sheet [OPTIONS] --sheet <NAME> --index <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to move
+      --index <N>        The new zero-based position among the workbook's existing sheets
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets set-data-validation - Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: set-data-validation [OPTIONS] <--one-of-list <A,B,C>|--number-between <MIN> <MAX>|--checkbox|--custom-formula <FORMULA>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>                  A1 range to validate, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>                Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --one-of-list <A,B,C>         Restrict entries to this comma-separated list (renders as a dropdown)
+      --number-between <MIN> <MAX>  Restrict entries to a number in this inclusive range
+      --checkbox                    Restrict entries to `TRUE`/`FALSE`, rendered as a checkbox
+      --custom-formula <FORMULA>    Restrict entries to ones for which this formula evaluates truthy
+      --input-message <TEXT>        Tooltip text shown on the cell
+      --show-warning                Allow an invalid entry through with a warning, instead of rejecting it outright
+      --dry-run                     Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>             Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                        Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets show-sheet - Shows an existing hidden sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Shows an existing hidden sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: show-sheet [OPTIONS] --sheet <NAME> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to show
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets unmerge-cells - Splits a previously merged range back apart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Splits a previously merged range back apart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: unmerge-cells [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to unmerge, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets unprotect-range - Removes a protected range. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+
+Removes a protected range. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+
+Usage: unprotect-range [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range identifying the protection to remove, optionally carrying its own `Sheet!` prefix. Must match exactly
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-borders - Sets border lines on a range's edges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Sets border lines on a range's edges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: update-borders [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>       A1 range to border, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --top              Set the top edge
+      --bottom           Set the bottom edge
+      --left             Set the left edge
+      --right            Set the right edge
+      --all              Set all four edges. Equivalent to passing all of `--top`/`--bottom`/`--left`/`--right`
+      --style <STYLE>    Line style, shared by every edge this call sets [default: solid] [possible values: solid, solid-medium, solid-thick, dashed, dotted, double]
+      --color <HEX>      Line color, `#RRGGBB`. Omitted takes solid black
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-dimension-properties - Sets an explicit pixel width (columns) or height (rows). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Sets an explicit pixel width (columns) or height (rows). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+
+Usage: update-dimension-properties [OPTIONS] --sheet <NAME> --dimension <DIMENSION> --start <N> --end <N> --pixel-size <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --dimension <DIMENSION>  Rows or columns [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+      --pixel-size <N>         The new size, in pixels
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-protection - Changes an existing protected range's description, warning-only flag, or editor list. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+
+Changes an existing protected range's description, warning-only flag, or editor list. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
+
+Usage: update-protection [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --range <A1>             A1 range identifying the existing protection, optionally carrying its own `Sheet!` prefix. Must match exactly — see `drive sheets list-protections`
+      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --description <TEXT>     The new description
+      --warning-only <BOOL>    The new warning-only flag [possible values: true, false]
+      --add-editor <EMAIL>     An editor to add. Repeatable
+      --remove-editor <EMAIL>  An editor to remove. Repeatable
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================
