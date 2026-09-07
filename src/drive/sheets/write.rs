@@ -501,6 +501,106 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Every `describe` arm renders to exactly one line, for every verb.
+    ///
+    /// Load-bearing rather than cosmetic. `describe` interpolates a
+    /// Drive-supplied file name, a server-supplied range and the deciding
+    /// rule's id, and its CLI caller sanitizes the **whole rendered line**
+    /// rather than each interpolation — which it can only do because no arm
+    /// emits a newline of its own. `sanitize_for_terminal` strips control
+    /// characters, so a multi-line arm added later would be silently
+    /// flattened into one run-on line rather than failing anything.
+    ///
+    /// The exhaustive `match` in `every_write_result` is the other half: a
+    /// new `WriteResult` variant will not compile until it is listed there,
+    /// so it cannot reach the terminal without passing through this check.
+    #[test]
+    fn every_describe_arm_renders_a_single_line() {
+        for verb in [WriteVerb::Write, WriteVerb::Append, WriteVerb::Clear] {
+            for result in every_write_result() {
+                let outcome = WriteOutcome {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    file_name: Some("Quarterly Plan".to_string()),
+                    range: Some("Sheet1!A1:B2".to_string()),
+                    resolved_folder_id: None,
+                    result,
+                };
+                let rendered = describe(&outcome, verb);
+                assert_eq!(
+                    rendered.lines().count(),
+                    1,
+                    "describe emitted {} lines for {:?}/{verb:?}: {rendered:?}",
+                    rendered.lines().count(),
+                    outcome.result
+                );
+                assert!(
+                    !rendered.chars().any(char::is_control),
+                    "describe emitted a control character for {:?}/{verb:?}: {rendered:?}",
+                    outcome.result
+                );
+            }
+        }
+    }
+
+    /// One of every `WriteResult` variant.
+    ///
+    /// The `match` is exhaustive and wildcard-free on purpose: adding a
+    /// variant breaks this build, which is what forces the new arm through
+    /// `every_describe_arm_renders_a_single_line`.
+    fn every_write_result() -> Vec<WriteResult> {
+        let all = vec![
+            WriteResult::WouldWrite {
+                rows: 2,
+                columns: 3,
+            },
+            WriteResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            WriteResult::RefusedShortcut,
+            WriteResult::RefusedNoVisibleParents,
+            WriteResult::Blocked { decided_by: None },
+            WriteResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+            WriteResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "sheet-1".to_string(),
+                }),
+            },
+            WriteResult::Written {
+                updated_range: Some("Sheet1!A1:B2".to_string()),
+                updated_rows: Some(2),
+                updated_columns: Some(2),
+                updated_cells: Some(4),
+            },
+            WriteResult::Written {
+                updated_range: None,
+                updated_rows: None,
+                updated_columns: None,
+                updated_cells: None,
+            },
+            WriteResult::Failed {
+                detail: "the API said no".to_string(),
+            },
+        ];
+        for result in &all {
+            match result {
+                WriteResult::WouldWrite { .. }
+                | WriteResult::RefusedNotASpreadsheet { .. }
+                | WriteResult::RefusedShortcut
+                | WriteResult::RefusedNoVisibleParents
+                | WriteResult::Blocked { .. }
+                | WriteResult::Written { .. }
+                | WriteResult::Failed { .. } => (),
+            }
+        }
+        all
+    }
+
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::drive::write_gate::Verdict;

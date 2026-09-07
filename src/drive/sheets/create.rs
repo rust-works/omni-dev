@@ -353,6 +353,91 @@ pub fn describe(outcome: &CreateOutcome) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Every `describe` arm renders to exactly one line.
+    ///
+    /// The `sheets write` twin of this test carries the full reasoning: the
+    /// CLI caller sanitizes the whole rendered line rather than each
+    /// interpolation, so an arm that emitted a newline would be silently
+    /// flattened by `sanitize_for_terminal` instead of failing anything.
+    #[test]
+    fn every_describe_arm_renders_a_single_line() {
+        for result in every_create_result() {
+            let outcome = CreateOutcome {
+                name: "Quarterly Plan".to_string(),
+                parent_folder_id: "folder-1".to_string(),
+                result,
+            };
+            let rendered = describe(&outcome);
+            assert_eq!(
+                rendered.lines().count(),
+                1,
+                "describe emitted {} lines for {:?}: {rendered:?}",
+                rendered.lines().count(),
+                outcome.result
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "describe emitted a control character for {:?}: {rendered:?}",
+                outcome.result
+            );
+        }
+    }
+
+    /// One of every `CreateResult` variant.
+    ///
+    /// Exhaustive and wildcard-free, so a new variant breaks the build until
+    /// it is covered by `every_describe_arm_renders_a_single_line`.
+    fn every_create_result() -> Vec<CreateResult> {
+        let all = vec![
+            CreateResult::WouldCreate {
+                rows: 0,
+                columns: 0,
+            },
+            CreateResult::WouldCreate {
+                rows: 2,
+                columns: 3,
+            },
+            CreateResult::Blocked { decided_by: None },
+            CreateResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 0,
+                }),
+            },
+            CreateResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "sheet-1".to_string(),
+                }),
+            },
+            CreateResult::Created {
+                file_id: "sheet-1".to_string(),
+                seeded_cells: Some(6),
+            },
+            CreateResult::Created {
+                file_id: "sheet-1".to_string(),
+                seeded_cells: None,
+            },
+            CreateResult::CreatedValuesFailed {
+                file_id: "sheet-1".to_string(),
+                detail: "the API said no".to_string(),
+            },
+            CreateResult::Failed {
+                detail: "the API said no".to_string(),
+            },
+        ];
+        for result in &all {
+            match result {
+                CreateResult::WouldCreate { .. }
+                | CreateResult::Blocked { .. }
+                | CreateResult::Created { .. }
+                | CreateResult::CreatedValuesFailed { .. }
+                | CreateResult::Failed { .. } => (),
+            }
+        }
+        all
+    }
+
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::test_support::env::MapEnv;
