@@ -2164,6 +2164,117 @@ mod tests {
         assert!(!names.contains(&"sheets-write"));
     }
 
+    /// One of every [`StructureResult`] variant.
+    ///
+    /// Exhaustive and wildcard-free on purpose, mirroring `write.rs`'s
+    /// `every_write_result`: adding a variant breaks this build, which is
+    /// what forces the new arm through the newline check below.
+    fn every_structure_result() -> Vec<StructureResult> {
+        let all = vec![
+            StructureResult::WouldChange {
+                sheet: Some(SheetSnapshot {
+                    sheet_id: Some(7),
+                    title: "Q2".to_string(),
+                    row_count: Some(500),
+                    column_count: Some(26),
+                }),
+                sheet_count: 2,
+            },
+            StructureResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            StructureResult::RefusedShortcut,
+            StructureResult::RefusedNoVisibleParents,
+            StructureResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec!["Q1".to_string(), "Q2".to_string()],
+            },
+            StructureResult::RefusedSheetExists {
+                title: "Q1".to_string(),
+            },
+            StructureResult::RefusedInvalidRange {
+                detail: "--count must be at least 1, got 0".to_string(),
+            },
+            StructureResult::Blocked { decided_by: None },
+            StructureResult::Changed {
+                sheet: Some(SheetSnapshot {
+                    sheet_id: Some(7),
+                    title: "Q2".to_string(),
+                    row_count: Some(500),
+                    column_count: Some(26),
+                }),
+                sheet_id: Some(7),
+            },
+            StructureResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ];
+        // Compile-time exhaustiveness: a new variant fails to match here.
+        for result in &all {
+            match result {
+                StructureResult::WouldChange { .. }
+                | StructureResult::RefusedNotASpreadsheet { .. }
+                | StructureResult::RefusedShortcut
+                | StructureResult::RefusedNoVisibleParents
+                | StructureResult::RefusedSheetNotFound { .. }
+                | StructureResult::RefusedSheetExists { .. }
+                | StructureResult::RefusedInvalidRange { .. }
+                | StructureResult::Blocked { .. }
+                | StructureResult::Changed { .. }
+                | StructureResult::Failed { .. } => {}
+            }
+        }
+        all
+    }
+
+    /// The insert preview is the **only** arm that may emit a newline, and
+    /// it may emit exactly one.
+    ///
+    /// This module diverges deliberately from `write.rs`/`create.rs`, whose
+    /// `every_describe_arm_renders_a_single_line` lets their CLI callers
+    /// sanitize the whole rendered string in one pass. A structural insert's
+    /// second line *is* the substance of its dry run (ADR-0075 §6), so
+    /// `cli::drive::sheets::structure::sanitize_rendered` filters per line
+    /// instead — and that is only sound while the newlines it preserves are
+    /// ones this module emitted. Every other arm interpolating a title, a
+    /// rule id or an API error detail must stay single-line, or a newline
+    /// arriving inside one of those values would become indistinguishable
+    /// from a real one.
+    #[test]
+    fn only_the_insert_preview_renders_more_than_one_line() {
+        let verbs = [add_sheet(), rename(), insert_rows()];
+        for verb in verbs {
+            let is_insert = verb.dimension().is_some();
+            for result in every_structure_result() {
+                let previews_an_insert =
+                    is_insert && matches!(result, StructureResult::WouldChange { .. });
+                let outcome = StructureOutcome {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    file_name: Some("Budget".to_string()),
+                    resolved_folder_id: None,
+                    verb: verb.clone(),
+                    result,
+                };
+                let rendered = describe(&outcome);
+                let expected = usize::from(previews_an_insert) + 1;
+                assert_eq!(
+                    rendered.lines().count(),
+                    expected,
+                    "unexpected line count for {:?}/{:?}: {rendered:?}",
+                    outcome.verb,
+                    outcome.result
+                );
+                assert!(
+                    !rendered.chars().any(|c| c.is_control() && c != '\n'),
+                    "describe emitted a control character other than a newline for \
+                     {:?}/{:?}: {rendered:?}",
+                    outcome.verb,
+                    outcome.result
+                );
+            }
+        }
+    }
+
     #[test]
     fn log_status_covers_every_variant() {
         let statuses = [
