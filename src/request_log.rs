@@ -937,7 +937,7 @@ pub struct DriveMutationOutcome {
     /// Recorded so a `stale-revision` refusal is as auditable as a success.
     /// An opaque, per-user, short-lived id — not a secret, and not user
     /// content. The searched, replacement and inserted **text** are
-    /// deliberately never recorded; see [`docs/log.md`].
+    /// deliberately never recorded; `docs/log.md` documents what is.
     pub required_revision_id: Option<String>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
