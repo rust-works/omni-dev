@@ -106,7 +106,6 @@ impl DocsClient {
     }
 
     /// The shared transport, for the `DocsApi` façade's requests.
-    #[allow(dead_code)] // The `DocsApi` façade lands in the next commit.
     pub(in crate::drive) fn transport(&self) -> &GoogleApiClient {
         &self.inner
     }
