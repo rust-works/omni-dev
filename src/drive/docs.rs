@@ -23,6 +23,7 @@
 //! true by construction rather than by convention. A sibling top-level module
 //! could not call them without widening that fence.
 
+pub mod api;
 pub mod client;
 pub mod structure;
 pub mod types;
