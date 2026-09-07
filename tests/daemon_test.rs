@@ -12,15 +12,32 @@ use std::time::Duration;
 use omni_dev::daemon::client::DaemonClient;
 
 /// Polls `f` until it returns `true` or the deadline passes.
+///
+/// Every caller waits for a **process to exit** after a graceful shutdown
+/// (readiness has its own loops), so the deadline is generous on purpose:
+/// a daemon hosting four services routinely drains for longer than a few
+/// seconds — 9.6s was measured by hand on a developer machine — and the
+/// old 5s budget failed the two lifecycle tests on real machines while CI
+/// stayed green (#1632).
+///
+/// The asymmetry is what makes a large value free: this returns as soon as
+/// `f` is true, so raising the ceiling costs nothing when the daemon exits
+/// promptly and only extends the *failing* path. These tests assert that
+/// shutdown is graceful, not that it is fast; no requirement anywhere binds
+/// it to a deadline, so the bound exists purely to stop a hung daemon
+/// hanging the suite forever.
 async fn wait_for<F>(mut f: F) -> bool
 where
     F: FnMut() -> bool,
 {
-    for _ in 0..200 {
+    let deadline = Duration::from_secs(30);
+    let interval = Duration::from_millis(25);
+    let attempts = deadline.as_millis() / interval.as_millis();
+    for _ in 0..attempts {
         if f() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(interval).await;
     }
     false
 }
