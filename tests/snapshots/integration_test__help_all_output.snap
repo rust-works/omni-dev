@@ -3895,12 +3895,33 @@ Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
 Usage: docs <COMMAND>
 
 Commands:
-  info  Shows a document's title, revision id and structural outline
-  read  Reads a document's structural elements with their index ranges
-  help  Print this message or the help of the given subcommand(s)
+  info     Shows a document's title, revision id and structural outline
+  read     Reads a document's structural elements with their index ranges
+  replace  Replaces every occurrence of some text, gated by the write-permission rules (issue #1615). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+  append   Appends text to the end of a document, gated by the write-permission rules (issue #1615)
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive docs append - Appends text to the end of a document, gated by the write-permission rules (issue #1615)
+
+Appends text to the end of a document, gated by the write-permission rules (issue #1615)
+
+Usage: append [OPTIONS] <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Document id (the `/d/<ID>/` segment of a Docs URL)
+
+Options:
+      --text <TEXT>       The text to append
+      --text-file <PATH>  Read the text to append from a file, or `-` for stdin
+      --dry-run           Report what would change without sending anything
+  -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help              Print help (see more with '--help')
 
 
 ================================================================================
@@ -3939,6 +3960,26 @@ Options:
           Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help
           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs replace - Replaces every occurrence of some text, gated by the write-permission rules (issue #1615). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Replaces every occurrence of some text, gated by the write-permission rules (issue #1615). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
+
+Usage: replace [OPTIONS] --search <SEARCH> --replace <REPLACE> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Document id (the `/d/<ID>/` segment of a Docs URL)
+
+Options:
+      --search <SEARCH>    The literal text to find. Not a regular expression
+      --replace <REPLACE>  What to put in its place. May be empty, which deletes the match
+      --ignore-case        Match case-insensitively
+      --dry-run            Report what would change without sending anything
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================

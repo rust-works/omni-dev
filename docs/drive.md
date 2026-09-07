@@ -1239,6 +1239,75 @@ self-describing to `jq`.
 footnotes live in their own index segments and do not appear — the Docs
 counterpart of "export gives you the first sheet only".
 
+### Editing a document
+
+`drive docs replace` and `drive docs append` mutate text, gated by the
+`docs-write` permission (see [Write permissions](#write-permissions)) and
+requiring `--write-file` or `--write-full`.
+
+```bash
+# Preview first — reports the occurrence count without sending anything
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4 --dry-run
+Would replace: 7 occurrence(s) in 'Roadmap' (counted from the copy just read)
+
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4
+Replaced: 7 occurrence(s) in 'Roadmap'
+
+$ omni-dev drive docs append 1AbC… --text $'\nAppended by omni-dev.'
+Appended: 22 char(s) / 22 byte(s) to 'Roadmap'
+```
+
+`append` also takes `--text-file <PATH>`, or `--text-file -` for stdin.
+
+#### Every edit is leased against a revision
+
+This is the part worth understanding. `documents.batchUpdate` is addressed
+by *index*, and the indices an edit is computed from come from a read that
+has already returned. If someone edits the document in between, those
+indices still resolve — just against different text. Nothing errors; the
+edit simply lands in the wrong place.
+
+So every edit presents the `revisionId` from the read that computed it, and
+Google refuses the write if the document has moved:
+
+```
+Refused: 'Roadmap' changed since it was read (revision lease ALm37BXk3nQ no
+longer current) — nothing was written. Re-run to apply against the current
+version.
+```
+
+Nothing was written — the batch is atomic. **Re-running is the fix**, and it
+is the only one: there is deliberately no flag to force the write through,
+because the alternative the API offers rebases your edit over the other
+person's changes and reports success on a document nobody has looked at.
+See [ADR-0076](adrs/adr-0076.md) §3.
+
+If the account has only read access Google withholds the revision id
+entirely, and the edit is refused up front rather than attempted unleased.
+
+#### Things to know
+
+- **`--search` is a literal substring, never a regex**, and matching is
+  **case-sensitive by default** — which inverts the API's own default. Under
+  Google's default, `--search it` also rewrites `It` and `IT`, in a verb with
+  no undo. Use `--ignore-case` when you want that.
+- **`--dry-run`'s occurrence count is an estimate.** It is counted over the
+  body text this command read, while the server matches over its own view —
+  a match can span a styling boundary, or sit in a header or footnote that
+  is not fetched. The count never decides anything: a count of zero still
+  sends the request, because reporting "nothing to do" from an estimate
+  would be wrong exactly when the estimate is. The real run reports the
+  server's own number.
+- **`replace` spans every tab; `append` lands in the first.** That asymmetry
+  is the Docs API's, confirmed against it directly, and it is why the preview
+  counts across all tabs.
+- **`append` adds no separator.** Appending `hello` to a document ending
+  `world` gives `worldhello`. Include a leading newline if you want one.
+- **Deletion is not supported**, and not merely unimplemented: no delete
+  request is constructible anywhere in this codebase, enforced by a test.
+  Replacing text *with nothing* (`--replace ""`) is the supported way to
+  remove it.
+
 ## Rate limits and retry behaviour
 
 Drive signals quota exhaustion two ways: a plain **HTTP 429**, and **HTTP

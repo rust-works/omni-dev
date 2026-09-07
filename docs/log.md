@@ -70,6 +70,21 @@ types, so the log is a complete invocation history, not just an HTTP history:
   what makes `omni-dev log --query kind:drivemutation` able to answer "how
   much did that write touch", not just "a write happened".
 
+  Text writes through the Docs API (issue
+  [#1615](https://github.com/rust-works/omni-dev/issues/1615),
+  [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
+  `docs-replace`/`docs-append`, and add three more omit-if-absent context
+  keys: `occurrences_changed` (what the *server* reported changing, which
+  can differ from the client-side `--dry-run` estimate), `inserted_chars`,
+  and `required_revision_id` (the revision lease presented, recorded so a
+  `stale-revision` refusal is as auditable as a success — an opaque,
+  short-lived id, not a secret).
+
+  **The searched, replacement and appended text are never recorded.** They
+  are user prose, and often the most sensitive thing in the invocation —
+  sharper than the Sheets case, where an A1 range is metadata rather than
+  content. Only counts and the opaque revision id go in.
+
 Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and
 all of its requests with a single `--id`.

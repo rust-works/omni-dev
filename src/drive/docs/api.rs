@@ -137,10 +137,6 @@ impl<'a> DocsApi<'a> {
     ///   `FilesApi::create` and `SheetsApi::values_update`, so nothing
     ///   outside `crate::drive` — where every engine runs the gate first —
     ///   can even compile a call to it.
-    // No caller yet, by design: ADR-0076 §3's "no escape hatch" guarantee is
-    // landed and reviewed on a diff that is purely about the lease, before
-    // the verbs that depend on it exist. The engines land in the next commit.
-    #[allow(dead_code)]
     pub(in crate::drive) async fn batch_update(
         &self,
         document_id: &str,
@@ -182,7 +178,6 @@ impl<'a> DocsApi<'a> {
 /// verbatim; nothing was written on either path, because a one-request
 /// `batchUpdate` is atomic. There is no input for which this returns `true`
 /// and a write has happened.
-#[allow(dead_code)] // Caller lands with the write engines; see `batch_update`.
 pub(in crate::drive) fn is_stale_revision(err: &anyhow::Error) -> bool {
     /// The distinctive part of Google's message, lowercased for comparison.
     const STALE_MARKER: &str = "does not match the latest revision";
@@ -239,7 +234,6 @@ fn build_document_get_url(
 /// `:batchUpdate` is a suffix on the id path segment, so it is appended to
 /// the id *before* the segment is pushed — pushing it separately would
 /// percent-encode the `:` into its own segment.
-#[allow(dead_code)] // Reached via `batch_update`; see its note.
 fn build_batch_update_url(base_url: &str, document_id: &str) -> Result<Url> {
     let mut url =
         GoogleApiClient::api_url(base_url, "/v1/documents").context("Invalid Docs base URL")?;

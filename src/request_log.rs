@@ -922,6 +922,23 @@ pub struct DriveMutationOutcome {
     /// Cells the Sheets API reported writing — the number that answers "how
     /// much did that write actually touch".
     pub updated_cells: Option<i64>,
+    /// Occurrences the Docs API reported changing (issue #1615). `None` for
+    /// every verb but `docs replace`.
+    ///
+    /// The *server's* count, not the client-side estimate `--dry-run`
+    /// previews — the two can differ, and only this one says what actually
+    /// happened.
+    pub occurrences_changed: Option<i64>,
+    /// Characters inserted by a `docs append` or a `docs create --text`.
+    pub inserted_chars: Option<i64>,
+    /// The revision lease presented on a `documents.batchUpdate` (issue
+    /// #1615).
+    ///
+    /// Recorded so a `stale-revision` refusal is as auditable as a success.
+    /// An opaque, per-user, short-lived id — not a secret, and not user
+    /// content. The searched, replacement and inserted **text** are
+    /// deliberately never recorded; see [`docs/log.md`].
+    pub required_revision_id: Option<String>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1007,6 +1024,15 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(cells) = outcome.updated_cells {
         context.insert("updated_cells".to_string(), cells.to_string());
+    }
+    if let Some(occurrences) = outcome.occurrences_changed {
+        context.insert("occurrences_changed".to_string(), occurrences.to_string());
+    }
+    if let Some(chars) = outcome.inserted_chars {
+        context.insert("inserted_chars".to_string(), chars.to_string());
+    }
+    if let Some(revision) = outcome.required_revision_id {
+        context.insert("required_revision_id".to_string(), revision);
     }
     rec.context = context;
     rec
