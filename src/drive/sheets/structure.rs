@@ -38,16 +38,15 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
-use crate::drive::files_api::FilesApi;
-use crate::drive::folder_ancestry;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, Dimension, DimensionRange,
     GridProperties, InsertDimensionRequest, NewSheetProperties, SheetProperties,
     SheetPropertiesUpdate, Spreadsheet, UpdateSheetPropertiesRequest,
 };
-use crate::drive::types::{GOOGLE_SHEET_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
+use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
@@ -226,12 +225,24 @@ pub enum StructureResult {
         /// The titles that do exist, so the message can be actionable.
         available: Vec<String>,
     },
-    /// `add-sheet` was given a title the workbook already uses. Sheets
-    /// rejects a duplicate title, and catching it here keeps the dry run
-    /// truthful.
+    /// `add-sheet` was given a title the workbook already uses, or
+    /// `rename-sheet`'s new title collides with a *different* existing
+    /// sheet. Sheets rejects a duplicate title, and catching it here keeps
+    /// the dry run truthful.
     RefusedSheetExists {
         /// The colliding title.
         title: String,
+    },
+    /// A numeric argument (`--at`, `--count`, `--rows`, `--columns`,
+    /// `--index`) is out of range for what the workbook actually contains —
+    /// checked against the same `spreadsheets.get` response already fetched
+    /// for the dry run, so this costs nothing extra and is exactly as
+    /// correct as the server's own eventual rejection would be (ADR-0075
+    /// §6's reasoning for the sheet-existence/duplicate-title checks,
+    /// applied to a numeric bound instead of a title).
+    RefusedInvalidRange {
+        /// What was wrong and why.
+        detail: String,
     },
     /// The folder write-permission gate refused it.
     Blocked {
@@ -270,6 +281,7 @@ impl StructureResult {
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedSheetExists { .. } => "refused-sheet-exists",
+            Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::Blocked { .. } => "blocked",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
@@ -350,65 +362,53 @@ async fn structure_inner(
         result,
     };
 
-    let files_api = FilesApi::new(drive);
-    let target = match files_api.get_metadata(&opts.spreadsheet_id).await {
-        Ok(target) => target,
-        Err(err) => {
-            return bare(StructureResult::Failed {
-                detail: err.to_string(),
-            })
-        }
-    };
-
-    let with_target = |result| StructureOutcome {
-        spreadsheet_id: opts.spreadsheet_id.clone(),
-        file_name: Some(target.name.clone()),
-        resolved_folder_id: None,
-        result,
-    };
-
-    // ── Refusals that precede the gate ─────────────────────────────────
-    if target.mime_type == GOOGLE_SHORTCUT_MIME_TYPE {
-        return with_target(StructureResult::RefusedShortcut);
-    }
-    if target.mime_type != GOOGLE_SHEET_MIME_TYPE {
-        return with_target(StructureResult::RefusedNotASpreadsheet {
-            mime_type: target.mime_type.clone(),
-        });
-    }
-    // ── The gate ───────────────────────────────────────────────────────
-    // A `file_id` rule is consulted *before* the parents are looked at, so
-    // a Sheet with no visible parent can still be granted (issue #1612).
-    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
-        &files_api,
-        &target,
+    // ── Target resolution, pre-gate refusals, and the gate itself ──────
+    // Shared with `write.rs` via `target_gate::resolve`, so this whole
+    // shape — the metadata fetch, the shortcut/non-spreadsheet checks, and
+    // the file-id-then-ancestor-chain gate lookup — can't quietly drift
+    // between the two engines.
+    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+        drive,
+        &opts.spreadsheet_id,
         DriveOperation::SheetsStructure,
         rules,
     )
     .await
     {
-        Ok(evaluated) => evaluated,
+        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
+            return bare(StructureResult::Failed { detail })
+        }
+        target_gate::TargetGateOutcome::Refused { target, refusal } => {
+            let result = match refusal {
+                SheetTargetRefusal::Shortcut => StructureResult::RefusedShortcut,
+                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                    StructureResult::RefusedNotASpreadsheet { mime_type }
+                }
+                SheetTargetRefusal::NoVisibleParents => StructureResult::RefusedNoVisibleParents,
+            };
+            return StructureOutcome {
+                spreadsheet_id: opts.spreadsheet_id.clone(),
+                file_name: Some(target.name),
+                resolved_folder_id: None,
+                result,
+            };
+        }
         // A chain that could not be resolved is a refusal, never a silent
         // allow — ADR-0071 §3's highest-priority invariant.
-        Err(err) => {
-            return with_target(StructureResult::Failed {
-                detail: err.to_string(),
-            })
+        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
+            return StructureOutcome {
+                spreadsheet_id: opts.spreadsheet_id.clone(),
+                file_name: Some(target.name),
+                resolved_folder_id: None,
+                result: StructureResult::Failed { detail },
+            };
         }
+        target_gate::TargetGateOutcome::Gated {
+            target,
+            decision,
+            resolved_folder_id,
+        } => (target, decision, resolved_folder_id),
     };
-
-    // Only *after* the file-rule lookup has come up empty is "no visible
-    // parents" the real story; reporting it sooner would refuse a target
-    // an explicit `file_id` rule had already granted.
-    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
-        return with_target(StructureResult::RefusedNoVisibleParents);
-    }
-
-    let folder_ancestry::FileTargetDecision {
-        decision,
-        resolved_folder_id,
-        ..
-    } = evaluated;
 
     let gated = |result| StructureOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
@@ -444,11 +444,15 @@ async fn structure_inner(
     };
     let sheet_count = workbook.sheets.len();
 
+    if let Err(result) = validate_verb_args(&workbook, &opts.verb, sheet.as_ref()) {
+        return gated(result);
+    }
+
     if opts.dry_run {
-        return gated(StructureResult::WouldChange {
-            sheet: sheet.clone(),
-            sheet_count,
-        });
+        // A move, not a clone: this branch always returns, so `sheet` is
+        // never read again on it — the later uses below are only reachable
+        // on the disjoint non-dry-run path.
+        return gated(StructureResult::WouldChange { sheet, sheet_count });
     }
 
     // ── The mutation ───────────────────────────────────────────────────
@@ -472,6 +476,12 @@ async fn structure_inner(
 ///
 /// `add-sheet` inverts the check: it needs the title *not* to exist, and
 /// returns `Ok(None)` because there is no existing sheet to snapshot.
+/// `rename-sheet` checks both directions: the *current* title must exist,
+/// and the *new* title must not already belong to some other sheet — the
+/// same duplicate-title refusal `add-sheet` gets, since Sheets rejects a
+/// duplicate title regardless of which verb produced it. Renaming a sheet
+/// to the title it already has is not a collision (it names itself, not a
+/// different sheet) and is allowed through as a no-op mutation.
 fn resolve_sheet(
     workbook: &Spreadsheet,
     verb: &StructureVerb,
@@ -490,6 +500,26 @@ fn resolve_sheet(
             }),
             None => Ok(None),
         },
+        StructureVerb::RenameSheet { new_title, .. } => match found {
+            Some(props) => {
+                let collides = new_title != wanted
+                    && workbook
+                        .sheets
+                        .iter()
+                        .filter_map(|sheet| sheet.properties.as_ref())
+                        .any(|other| other.title == *new_title);
+                if collides {
+                    return Err(StructureResult::RefusedSheetExists {
+                        title: new_title.clone(),
+                    });
+                }
+                Ok(Some(SheetSnapshot::from_properties(props)))
+            }
+            None => Err(StructureResult::RefusedSheetNotFound {
+                title: wanted.to_string(),
+                available: workbook.sheet_titles(),
+            }),
+        },
         _ => match found {
             Some(props) => Ok(Some(SheetSnapshot::from_properties(props))),
             None => Err(StructureResult::RefusedSheetNotFound {
@@ -498,6 +528,93 @@ fn resolve_sheet(
             }),
         },
     }
+}
+
+/// Validates the numeric arguments a verb carries against the workbook's
+/// actual state, so a dry run can never promise a change the real run then
+/// rejects. Runs after [`resolve_sheet`] (which is why it can read the
+/// target sheet's real dimensions) and before the `--dry-run` early return,
+/// so both share this classification exactly like the gate above it.
+fn validate_verb_args(
+    workbook: &Spreadsheet,
+    verb: &StructureVerb,
+    sheet: Option<&SheetSnapshot>,
+) -> Result<(), StructureResult> {
+    let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
+
+    match verb {
+        StructureVerb::AddSheet {
+            index,
+            rows,
+            columns,
+            ..
+        } => {
+            if let Some(rows) = rows {
+                if *rows < 1 {
+                    return invalid(format!("--rows must be at least 1, got {rows}"));
+                }
+            }
+            if let Some(columns) = columns {
+                if *columns < 1 {
+                    return invalid(format!("--columns must be at least 1, got {columns}"));
+                }
+            }
+            if let Some(index) = index {
+                let max = workbook.sheets.len() as i64;
+                if *index < 0 || *index > max {
+                    return invalid(format!(
+                        "--index must be between 0 and {max} inclusive (the workbook has \
+                         {max} sheet(s)), got {index}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        StructureVerb::RenameSheet { .. } => Ok(()),
+        StructureVerb::InsertRows { at, count, .. } => {
+            validate_insert_bounds(Dimension::Rows, *at, *count, sheet)
+        }
+        StructureVerb::InsertColumns { at, count, .. } => {
+            validate_insert_bounds(Dimension::Columns, *at, *count, sheet)
+        }
+    }
+}
+
+/// The `InsertRows`/`InsertColumns` half of [`validate_verb_args`], split
+/// out so each caller supplies its own [`Dimension`] directly rather than
+/// recovering it from the verb.
+fn validate_insert_bounds(
+    dimension: Dimension,
+    at: i64,
+    count: i64,
+    sheet: Option<&SheetSnapshot>,
+) -> Result<(), StructureResult> {
+    let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
+
+    if count < 1 {
+        return invalid(format!("--count must be at least 1, got {count}"));
+    }
+    if at < 1 {
+        return invalid(format!("--at must be at least 1, got {at}"));
+    }
+    let current = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    };
+    if let Some(current) = current {
+        // `at == current + 1` is a legal append (insert after the last
+        // row/column); anything past that names a position that does not
+        // exist and is not immediately after one that does.
+        let max_at = current + 1;
+        if at > max_at {
+            return invalid(format!(
+                "--at {at} is past the end of the sheet, which has {current} {noun}(s); \
+                 the furthest valid position is {max_at}",
+                noun = dimension.noun(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Builds the single `batchUpdate` request a verb sends.
@@ -685,6 +802,7 @@ pub fn describe(outcome: &StructureOutcome, verb: &StructureVerb) -> String {
         StructureResult::RefusedSheetExists { title } => {
             format!("Refused: {book} already has a sheet titled '{title}'")
         }
+        StructureResult::RefusedInvalidRange { detail } => format!("Refused: {detail}"),
         StructureResult::Blocked { decided_by } => match decided_by {
             Some(rule) => format!(
                 "Blocked: structural edits to {book} refused by rule on {} {}{}",
@@ -761,6 +879,11 @@ fn describe_would_change(
 /// This is where a structural dry run earns its keep: it names the resulting
 /// dimension *and* the shift, which is the part of the effect no bounded
 /// range could express and the reason ADR-0073 §12 called this out.
+// One parameter per fact the message needs (dimension, the two labels
+// already formatted by the caller, the insert's own `at`/`count`, the
+// target's dimensions, and the workbook name) — bundling them into a struct
+// would just move the same fields one level out for a private helper with a
+// single call site.
 #[allow(clippy::too_many_arguments)]
 fn describe_would_insert(
     dimension: Dimension,
@@ -776,14 +899,29 @@ fn describe_would_insert(
         Dimension::Columns => sheet.and_then(|s| s.column_count),
     };
     let shift = before.map_or_else(String::new, |before| {
+        // `at > before` only at the append boundary (`at == before + 1`,
+        // enforced by `validate_verb_args`): there is nothing after the
+        // last row/column to shift, so "existing N-M shift" would print an
+        // inverted, self-contradictory range instead of the truth.
+        let existing = if at <= before {
+            format!(
+                "; existing {plural} {at}-{before} shift {direction}",
+                plural = plural(dimension),
+                direction = match dimension {
+                    Dimension::Rows => "down",
+                    Dimension::Columns => "right",
+                },
+            )
+        } else {
+            format!(
+                "; appended at the end, no existing {plural} shift",
+                plural = plural(dimension)
+            )
+        };
         format!(
-            "\n  ({before} {plural} -> {}; existing {plural} {at}-{before} shift {direction})",
+            "\n  ({before} {plural} -> {}{existing})",
             before + count,
             plural = plural(dimension),
-            direction = match dimension {
-                Dimension::Rows => "down",
-                Dimension::Columns => "right",
-            },
         )
     });
     format!(
@@ -823,6 +961,8 @@ fn describe_changed(
 }
 
 /// The insert arms of [`describe_changed`].
+// Same shape as `describe_would_insert`, for the same reason: one parameter
+// per fact the message needs, with a single call site.
 #[allow(clippy::too_many_arguments)]
 fn describe_inserted(
     dimension: Dimension,
@@ -859,6 +999,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
     use crate::drive::write_gate::Verdict;
     use crate::test_support::env::MapEnv;
     use crate::utils::secret::Secret;
@@ -916,7 +1057,8 @@ mod tests {
 
     fn allow_rule(folder: &str) -> FolderPermissionRule {
         FolderPermissionRule {
-            folder_id: folder.to_string(),
+            folder_id: Some(folder.to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsStructure).collect(),
             deny: HashSet::default(),
@@ -1183,7 +1325,8 @@ mod tests {
         // the gate's unit tests: a folder granted cell writes must not gain
         // the power to restructure the workbook.
         let rules = [FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
@@ -1201,7 +1344,8 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let rules = [FolderPermissionRule {
-            folder_id: "parent-1".to_string(),
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
@@ -1211,8 +1355,9 @@ mod tests {
             panic!("expected Blocked, got {:?}", outcome.result);
         };
         let rule = decided_by.as_ref().expect("an explicit rule decided this");
-        assert_eq!(rule.folder_id, "parent-1");
-        assert_eq!(rule.depth, 0);
+        assert_eq!(rule.kind_label(), "folder");
+        assert_eq!(rule.id(), "parent-1");
+        assert_eq!(rule.depth_suffix(), " (depth 0)");
     }
 
     #[tokio::test]
@@ -1374,6 +1519,295 @@ mod tests {
             StructureResult::RefusedSheetExists { .. }
         ));
         assert!(describe(&outcome, &verb).contains("already has a sheet titled 'Q1'"));
+    }
+
+    /// The rename analogue of the `add-sheet` test above: renaming to a
+    /// title a *different* sheet already has must be caught before
+    /// `batchUpdate`, not left to a dry run that then can't be trusted.
+    #[tokio::test]
+    async fn rename_sheet_refuses_a_title_another_sheet_already_uses() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::RenameSheet {
+            sheet: "Q2".to_string(),
+            new_title: "Q1".to_string(),
+        };
+        // No batchUpdate mock: the refusal must short-circuit the mutation,
+        // and the same must hold for a --dry-run preview of it.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedSheetExists { .. }
+        ));
+        assert!(describe(&outcome, &verb).contains("already has a sheet titled 'Q1'"));
+
+        let dry = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert_eq!(dry.result, outcome.result);
+    }
+
+    /// Renaming a sheet to the title it already has names itself, not a
+    /// different sheet, so it must not be refused as a duplicate.
+    #[tokio::test]
+    async fn rename_sheet_to_its_own_current_title_is_not_a_duplicate() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let verb = StructureVerb::RenameSheet {
+            sheet: "Q2".to_string(),
+            new_title: "Q2".to_string(),
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+    }
+
+    // ── argument validation ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_rows_refuses_a_count_below_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::InsertRows {
+            sheet: "Q2".to_string(),
+            at: 5,
+            count: 0,
+        };
+        // No batchUpdate mock: the refusal must short-circuit the mutation.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--count"), "{detail}");
+        assert!(describe(&outcome, &verb).starts_with("Refused: --count"));
+    }
+
+    #[tokio::test]
+    async fn insert_columns_refuses_an_at_below_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::InsertColumns {
+            sheet: "Q2".to_string(),
+            at: 0,
+            count: 1,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--at"), "{detail}");
+    }
+
+    /// `Q2` has 500 rows (from `mount_workbook`); `--at 502` names a
+    /// position that does not exist and is not immediately after one that
+    /// does, so it must be refused rather than sent to `batchUpdate` or
+    /// promised by a `--dry-run`.
+    #[tokio::test]
+    async fn insert_rows_refuses_an_at_past_the_sheets_end() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::InsertRows {
+            sheet: "Q2".to_string(),
+            at: 502,
+            count: 1,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("500 row(s)"), "{detail}");
+        assert!(detail.contains("501"), "{detail}");
+
+        let dry = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert_eq!(dry.result, outcome.result);
+    }
+
+    /// `--at` equal to `row_count + 1` is a legal append (insert after the
+    /// last row), the one boundary value the check above must not reject —
+    /// and the dry-run message must not print an inverted "existing rows
+    /// 501-500 shift down".
+    #[tokio::test]
+    async fn insert_rows_allows_at_equal_to_row_count_plus_one_as_an_append() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::InsertRows {
+            sheet: "Q2".to_string(),
+            at: 501,
+            count: 2,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::WouldChange { .. }
+        ));
+        let text = describe(&outcome, &verb);
+        assert!(text.contains("500 rows -> 502"), "{text}");
+        assert!(text.contains("appended at the end"), "{text}");
+        assert!(!text.contains("501-500"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn add_sheet_refuses_non_positive_rows_and_columns() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::AddSheet {
+            title: "Q3".to_string(),
+            index: None,
+            rows: Some(0),
+            columns: None,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--rows"), "{detail}");
+    }
+
+    /// `mount_workbook` has 2 sheets, so 0/1/2 are the only valid indices
+    /// (2 means "append", the same as omitting `--index`).
+    #[tokio::test]
+    async fn add_sheet_refuses_an_out_of_range_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::AddSheet {
+            title: "Q3".to_string(),
+            index: Some(3),
+            rows: None,
+            columns: None,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--index"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn add_sheet_allows_an_index_equal_to_the_sheet_count() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = StructureVerb::AddSheet {
+            title: "Q3".to_string(),
+            index: Some(2),
+            rows: None,
+            columns: None,
+        };
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::WouldChange { .. }
+        ));
     }
 
     // ── the mutation ───────────────────────────────────────────────────
@@ -1612,6 +2046,10 @@ mod tests {
                 title: "x".to_string(),
             }
             .log_status(),
+            StructureResult::RefusedInvalidRange {
+                detail: "x".to_string(),
+            }
+            .log_status(),
             StructureResult::Blocked { decided_by: None }.log_status(),
             StructureResult::Changed {
                 sheet: None,
@@ -1660,5 +2098,85 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(added_sheet_id(&added), Some(42));
+    }
+
+    // ── file-id rules (issue #1612) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_file_rule_grants_a_sheet_with_no_visible_parents() {
+        // The case issue #1612 exists for: before file rules there was no
+        // rule an operator could write that would permit this at all.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(rename(), false),
+            &[FolderPermissionRule::file("sheet-1").allowing([DriveOperation::SheetsStructure])],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_rule_denies_even_when_a_parent_folder_would_allow() {
+        // Depth −1 beats depth 0 in the restrictive direction too.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        // No mock for parent-1 and none for any Sheets endpoint: the file
+        // rule must decide before either is reached.
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(rename(), false),
+            &[
+                allow_rule("parent-1"),
+                FolderPermissionRule::file("sheet-1").denying([DriveOperation::SheetsStructure]),
+            ],
+        )
+        .await;
+
+        match &outcome.result {
+            StructureResult::Blocked { decided_by } => {
+                let rule = decided_by.as_ref().expect("a file rule decided this");
+                assert_eq!(rule.kind_label(), "file");
+                assert_eq!(rule.id(), "sheet-1");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        let text = describe(&outcome, &rename());
+        assert!(text.contains("refused by rule on file sheet-1"), "{text}");
+        assert!(!text.contains("depth"), "a file rule has no depth: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_no_visible_parents_message_names_a_file_rule_as_the_fix() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let outcome = structure(&drive, &sheets, &opts(rename(), false), &[]).await;
+        let text = describe(&outcome, &rename());
+        assert!(text.contains("file_id"), "{text}");
+        assert!(text.contains("sheets-structure"), "{text}");
     }
 }

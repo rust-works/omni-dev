@@ -1175,14 +1175,24 @@ omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
 `--at 5` puts the new rows above the current row 5. Column A is 1.
 `--count` defaults to 1.
 
-Two refusals are specific to these verbs, and both are checked before
-anything is written so a `--dry-run` can never promise a change the real run
-then fails:
+Several refusals are specific to these verbs, and all of them are checked
+before anything is written so a `--dry-run` can never promise a change the
+real run then fails:
 
 ```
 Refused: 'Budget' has no sheet titled 'Nope'. Available: 'Q1', 'Q2'
 Refused: 'Budget' already has a sheet titled 'Q1'
+Refused: --at 502 is past the end of the sheet, which has 500 row(s); the furthest valid position is 501
 ```
+
+The duplicate-title refusal applies to `rename-sheet` too — renaming a
+sheet to a title a *different* sheet already has fails the same way
+`add-sheet` does. Renaming a sheet to the title it already has is not a
+collision, since it names itself rather than a different sheet.
+`--at`/`--count` on `insert-rows`/`insert-columns` and `--rows`/`--columns`/
+`--index` on `add-sheet` are checked against the workbook's actual current
+size — `--at` may name one past the sheet's last row/column (that's a valid
+append), never further.
 
 <a id="structural-limits"></a>
 **Structural limits — no deletion, at all.** There is deliberately no
