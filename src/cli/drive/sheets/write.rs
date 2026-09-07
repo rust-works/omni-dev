@@ -248,7 +248,7 @@ async fn run_write(client: &DriveClient, opts: &WriteOptions, output: &OutputFor
     // layer and stays free of the CLI, so the sanitizing happens here —
     // on the whole line, since none of its own literals contain a
     // control character for the filter to eat.
-    println!("{}", sanitize_for_terminal(&describe(&outcome, opts.verb)));
+    println!("{}", sanitize_for_terminal(&describe(&outcome)));
     Ok(())
 }
 

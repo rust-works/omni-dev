@@ -189,6 +189,14 @@ pub struct WriteOutcome {
     /// resolved it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_folder_id: Option<String>,
+    /// Which mutation was attempted.
+    ///
+    /// Not serialised: the caller already knows which verb it invoked, and
+    /// the JSON shape is a stable output contract. It is carried so
+    /// [`describe`] can render an outcome from the outcome alone, rather
+    /// than taking a verb a caller could mismatch against it.
+    #[serde(skip)]
+    pub verb: WriteVerb,
     /// What happened.
     pub result: WriteResult,
 }
@@ -231,6 +239,7 @@ async fn write_inner(
         file_name: None,
         range: None,
         resolved_folder_id: None,
+        verb: opts.verb,
         result,
     };
 
@@ -274,6 +283,7 @@ async fn write_inner(
                 file_name: Some(target.name),
                 range: Some(range),
                 resolved_folder_id: None,
+                verb: opts.verb,
                 result,
             };
         }
@@ -285,6 +295,7 @@ async fn write_inner(
                 file_name: Some(target.name),
                 range: Some(range),
                 resolved_folder_id: None,
+                verb: opts.verb,
                 result: WriteResult::Failed { detail },
             };
         }
@@ -300,6 +311,7 @@ async fn write_inner(
         file_name: Some(target.name.clone()),
         range: Some(range.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
+        verb: opts.verb,
         result,
     };
 
@@ -411,7 +423,8 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
 /// Lives here rather than in the CLI layer so the CLI and a future MCP
 /// caller describe an outcome identically.
 #[must_use]
-pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
+pub fn describe(outcome: &WriteOutcome) -> String {
+    let verb = outcome.verb;
     let name = outcome
         .file_name
         .as_deref()
@@ -512,9 +525,10 @@ mod tests {
                     file_name: Some("Quarterly Plan".to_string()),
                     range: Some("Sheet1!A1:B2".to_string()),
                     resolved_folder_id: None,
+                    verb,
                     result,
                 };
-                let rendered = describe(&outcome, verb);
+                let rendered = describe(&outcome);
                 assert_eq!(
                     rendered.lines().count(),
                     1,
@@ -681,10 +695,12 @@ mod tests {
         // Deliberately no mock for parent-1 (the gate never runs) and none
         // for any Sheets endpoint — proves the refusal short-circuits both,
         // even though the rule set below would otherwise permit the write.
+        // Run as an `append` so the "names the verb the user typed" assertion
+        // below is about a verb this outcome was actually produced by.
         let outcome = write(
             &drive,
             &sheets,
-            &opts(WriteVerb::Write, false),
+            &opts(WriteVerb::Append, false),
             &[allow_rule("parent-1")],
         )
         .await;
@@ -692,7 +708,7 @@ mod tests {
             outcome.result,
             WriteResult::RefusedNotASpreadsheet { .. }
         ));
-        let text = describe(&outcome, WriteVerb::Append);
+        let text = describe(&outcome);
         assert!(text.contains("is not a Google Sheet"), "{text}");
         assert!(text.contains("drive sheets append"), "{text}");
     }
@@ -716,7 +732,7 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome.result, WriteResult::RefusedShortcut));
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(text.contains("is a shortcut"), "{text}");
         assert!(!text.contains("is not a Google Sheet"), "{text}");
     }
@@ -736,7 +752,7 @@ mod tests {
         ));
         // The message must not send the operator off to fix rules that
         // could never apply — it names the one rule shape that works.
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(text.contains("no parent folder visible"), "{text}");
         assert!(text.contains("file_id"), "{text}");
         assert!(text.contains("Adding it to a folder"), "{text}");
@@ -759,7 +775,7 @@ mod tests {
             "{:?}",
             outcome.result
         );
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(
             text.contains("refused by default policy (no matching rule)"),
             "{text}"
@@ -788,7 +804,7 @@ mod tests {
             &[deny_rule],
         )
         .await;
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(
             text.contains("refused by rule on folder parent-1"),
             "{text}"
@@ -870,7 +886,7 @@ mod tests {
                 columns: 3
             }
         );
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(text.contains("2 row(s) x 3 column(s)"), "{text}");
     }
 
@@ -932,7 +948,7 @@ mod tests {
                 updated_cells: Some(2),
             }
         );
-        assert!(describe(&outcome, WriteVerb::Write).starts_with("Wrote 2 cell(s) "));
+        assert!(describe(&outcome).starts_with("Wrote 2 cell(s) "));
     }
 
     #[tokio::test]
@@ -981,7 +997,7 @@ mod tests {
             &[allow_rule("parent-1")],
         )
         .await;
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(!text.contains("Cleared"), "{text}");
         assert!(text.starts_with("Wrote to "), "{text}");
     }
@@ -1002,7 +1018,7 @@ mod tests {
             &[allow_rule("parent-1")],
         )
         .await;
-        let text = describe(&outcome, WriteVerb::Clear);
+        let text = describe(&outcome);
         assert!(!text.contains("row(s)"), "{text}");
         assert_eq!(text, "Would clear: A1:B2 of 'sheet-1'");
     }
@@ -1050,7 +1066,7 @@ mod tests {
             }
         );
         // A successful append must not read identically to an overwrite.
-        assert!(describe(&outcome, WriteVerb::Append).starts_with("Appended 2 cell(s) "));
+        assert!(describe(&outcome).starts_with("Appended 2 cell(s) "));
     }
 
     #[tokio::test]
@@ -1089,7 +1105,7 @@ mod tests {
                 updated_cells: None,
             }
         );
-        assert!(describe(&outcome, WriteVerb::Clear).starts_with("Cleared "));
+        assert!(describe(&outcome).starts_with("Cleared "));
     }
 
     #[tokio::test]
@@ -1237,6 +1253,7 @@ mod tests {
             file_name: Some("Budget".to_string()),
             range: Some("A1:B2".to_string()),
             resolved_folder_id: Some("parent-1".to_string()),
+            verb: WriteVerb::Write,
             result: WriteResult::Written {
                 updated_range: Some("A1:B2".to_string()),
                 updated_rows: Some(1),
@@ -1328,7 +1345,7 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(text.contains("refused by rule on file sheet-1"), "{text}");
         assert!(!text.contains("depth"), "a file rule has no depth: {text}");
     }
@@ -1341,7 +1358,7 @@ mod tests {
             .mount(&server)
             .await;
         let outcome = write(&drive, &sheets, &opts(WriteVerb::Write, false), &[]).await;
-        let text = describe(&outcome, WriteVerb::Write);
+        let text = describe(&outcome);
         assert!(text.contains("file_id"), "{text}");
         assert!(text.contains("sheets-write"), "{text}");
     }
