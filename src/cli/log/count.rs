@@ -76,6 +76,7 @@ enum KindArg {
     Http,
     Gh,
     Worktree,
+    Drivemutation,
 }
 
 impl From<KindArg> for RecordKind {
@@ -85,6 +86,7 @@ impl From<KindArg> for RecordKind {
             KindArg::Http => Self::Http,
             KindArg::Gh => Self::Gh,
             KindArg::Worktree => Self::Worktree,
+            KindArg::Drivemutation => Self::DriveMutation,
         }
     }
 }
@@ -353,6 +355,7 @@ mod tests {
             (KindArg::Http, RecordKind::Http),
             (KindArg::Gh, RecordKind::Gh),
             (KindArg::Worktree, RecordKind::Worktree),
+            (KindArg::Drivemutation, RecordKind::DriveMutation),
         ] {
             assert_eq!(RecordKind::from(arg), kind);
         }
@@ -537,5 +540,10 @@ mod tests {
         );
         assert_eq!(RecordKind::from(KindArg::Http), RecordKind::Http);
         assert_eq!(RecordKind::from(KindArg::Gh), RecordKind::Gh);
+        assert_eq!(RecordKind::from(KindArg::Worktree), RecordKind::Worktree);
+        assert_eq!(
+            RecordKind::from(KindArg::Drivemutation),
+            RecordKind::DriveMutation
+        );
     }
 }

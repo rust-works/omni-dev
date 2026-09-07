@@ -184,11 +184,18 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
   `hostname` (alias `host`), `system_user` (alias `user`), `cwd`, and
   `auth_principal` (alias `principal`). Field matching is shared with the flags,
   so `--status 5xx` and `status:5xx` behave identically.
+- **`status` is kind-aware:** for every kind but `drivemutation` it matches the
+  HTTP `status_code` (class or comparator syntax, below). A `drivemutation`
+  record has no `status_code` — its domain status (`blocked`, `written`,
+  `stale-revision`, ...) lives in the `context` map instead, so `status:` there
+  matches `context["status"]` by exact case-insensitive equality, e.g.
+  `kind:drivemutation status:blocked`.
 - **Numeric comparisons:** numeric fields (`exit_code`, `duration_ms`,
   `elapsed_ms`, and `status`) accept a leading comparator — `>`, `>=`, `<`,
   `<=`, or bare `=`/`N` for equality — so slow requests and failed runs are
   expressible directly (`elapsed:>1000`, `exit_code:>0`). `status` still also
-  accepts its class syntax (`5xx`).
+  accepts its class syntax (`5xx`). Comparator/class syntax applies only to the
+  HTTP `status_code` path, not the `drivemutation` case above.
 - **Text fields** (`url`, `hostname`, `system_user`, `cwd`, `auth_principal`)
   match a case-insensitive substring.
 - **Context fields:** any other field name falls back to the record's free-form
@@ -265,7 +272,7 @@ omni-dev log count [--since <DUR_OR_TS>] [--until <DUR_OR_TS>] [--source <SOURCE
 | `--since <DUR_OR_TS>` | Lower time bound — same forms as `omni-dev log --since` (`1h`, `2026-07-01`, RFC3339). |
 | `--until <DUR_OR_TS>` | Upper time bound (a relative value means that long ago). |
 | `--source <SOURCE>` | Restrict to `cli`, `daemon`, or `mcp`. |
-| `--kind <KIND>` | Restrict to `invocation`, `http`, `gh`, or `worktree`. `gh` unlocks the GitHub breakdown (below). |
+| `--kind <KIND>` | Restrict to `invocation`, `http`, `gh`, `worktree`, or `drivemutation`. `gh` unlocks the GitHub breakdown (below). |
 | `--json` | Emit JSON (string map keys, composes with `jq`) instead of the table. |
 
 With no `--kind` it reports the total and the split by kind and source:
