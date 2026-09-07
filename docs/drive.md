@@ -1189,10 +1189,14 @@ The duplicate-title refusal applies to `rename-sheet` too — renaming a
 sheet to a title a *different* sheet already has fails the same way
 `add-sheet` does. Renaming a sheet to the title it already has is not a
 collision, since it names itself rather than a different sheet.
-`--at`/`--count` on `insert-rows`/`insert-columns` and `--rows`/`--columns`/
-`--index` on `add-sheet` are checked against the workbook's actual current
-size — `--at` may name one past the sheet's last row/column (that's a valid
-append), never further.
+The *positions* — `--at` on `insert-rows`/`insert-columns` and `--index` on
+`add-sheet` — are checked against the workbook's actual current size. `--at`
+may name one past the sheet's last row/column (that's a valid append), never
+further. The *counts* — `--count`, `--rows`, `--columns` — are checked only
+for being positive: the workbook's state implies no upper bound on how much
+you may add, so `omni-dev` doesn't invent one, and Sheets remains the
+authority on how large a sheet may actually get. A count large enough to
+overflow the row/column index space is refused rather than sent.
 
 <a id="structural-limits"></a>
 **Structural limits — no deletion, at all.** There is deliberately no
