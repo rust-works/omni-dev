@@ -930,6 +930,11 @@ pub struct DriveMutationOutcome {
     /// The sheet's title at the time of the attempt — for `add-sheet`, the
     /// title being created.
     pub sheet_title: Option<String>,
+    /// The title a `rename-sheet` moved the sheet *to*. Set by that verb
+    /// alone: it is the only structural verb whose effect a record could not
+    /// otherwise reconstruct, since [`Self::sheet_title`] necessarily holds
+    /// the title the sheet had before. `None` everywhere else.
+    pub sheet_new_title: Option<String>,
     /// The rows or columns a structural verb spanned, e.g. `"ROWS 5:7"`,
     /// 1-based and inclusive like the CLI's `--at`. The structural analogue
     /// of [`Self::range`], for effects A1 notation cannot express; absent
@@ -1043,6 +1048,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(sheet_title) = outcome.sheet_title {
         context.insert("sheet_title".to_string(), sheet_title);
+    }
+    if let Some(sheet_new_title) = outcome.sheet_new_title {
+        context.insert("sheet_new_title".to_string(), sheet_new_title);
     }
     if let Some(dimension_range) = outcome.dimension_range {
         context.insert("dimension_range".to_string(), dimension_range);
@@ -1819,6 +1827,38 @@ mod tests {
         // those keys stay absent rather than being written as empty.
         assert_eq!(rec.context.get("range"), None);
         assert_eq!(rec.context.get("updated_cells"), None);
+        // An insert renames nothing.
+        assert_eq!(rec.context.get("sheet_new_title"), None);
+    }
+
+    #[test]
+    fn build_drive_mutation_record_records_both_titles_for_a_rename() {
+        // The one structural verb whose effect is otherwise unrecoverable
+        // from its record: `sheet_title` necessarily holds the *old* title.
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-rename-sheet",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "changed".to_string(),
+                sheet_id: Some(118_293),
+                sheet_title: Some("Q2".to_string()),
+                sheet_new_title: Some("Q2 (final)".to_string()),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("sheet_title").map(String::as_str),
+            Some("Q2")
+        );
+        assert_eq!(
+            rec.context.get("sheet_new_title").map(String::as_str),
+            Some("Q2 (final)")
+        );
+        // A rename spans no dimension.
+        assert_eq!(rec.context.get("dimension_range"), None);
     }
 
     #[test]
@@ -1837,6 +1877,7 @@ mod tests {
         );
         assert_eq!(rec.context.get("sheet_id"), None);
         assert_eq!(rec.context.get("sheet_title"), None);
+        assert_eq!(rec.context.get("sheet_new_title"), None);
         assert_eq!(rec.context.get("dimension_range"), None);
     }
 

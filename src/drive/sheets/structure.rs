@@ -135,6 +135,20 @@ impl StructureVerb {
         }
     }
 
+    /// The title this verb moves the sheet *to*, or `None` for every verb
+    /// that renames nothing.
+    ///
+    /// The companion to [`Self::sheet_title`], which necessarily reports the
+    /// title a rename started from — without this the request log could say
+    /// which tab was renamed but not to what, the one structural effect a
+    /// record could not otherwise reconstruct.
+    const fn new_sheet_title(&self) -> Option<&String> {
+        match self {
+            Self::RenameSheet { new_title, .. } => Some(new_title),
+            Self::AddSheet { .. } | Self::InsertRows { .. } | Self::InsertColumns { .. } => None,
+        }
+    }
+
     /// The axis an insert runs along, or `None` for the non-insert verbs.
     const fn dimension(&self) -> Option<Dimension> {
         match self {
@@ -597,6 +611,23 @@ fn validate_insert_bounds(
     if at < 1 {
         return invalid(format!("--at must be at least 1, got {at}"));
     }
+    // Keeps `dimension_range`'s `at - 1 + count` total, so the one pure
+    // conversion stays infallible and every value that reaches it is already
+    // known to fit. Deliberately an *arithmetic* bound and not a ceiling on
+    // how many rows may be added: the workbook's own state implies no upper
+    // bound on `--count`, so inventing one would be the client-side
+    // validation ADR-0073 §7 rejects, with Sheets the authority on how large
+    // a sheet may actually get.
+    if at
+        .checked_sub(1)
+        .and_then(|start| start.checked_add(count))
+        .is_none()
+    {
+        return invalid(format!(
+            "--at {at} with --count {count} overflows the {noun} index space",
+            noun = dimension.noun(),
+        ));
+    }
     let current = match dimension {
         Dimension::Rows => sheet.and_then(|s| s.row_count),
         Dimension::Columns => sheet.and_then(|s| s.column_count),
@@ -701,6 +732,15 @@ fn added_sheet_id(response: &BatchUpdateResponse) -> Option<i64> {
 /// The `dimension_range` context value the request log records, e.g.
 /// `"ROWS 5:7"` — the structural analogue of a cell verb's A1 `range`, for
 /// effects A1 cannot express. 1-based inclusive, matching the CLI's `--at`.
+///
+/// Total over every `--at`/`--count` the CLI can parse, which is load-bearing
+/// rather than defensive: [`record_attempt`] logs *attempts*, so this runs on
+/// the refusal path too — with exactly the values
+/// [`validate_insert_bounds`] just rejected. Arithmetic that only holds for
+/// validated input would panic while recording the refusal of the input that
+/// broke it. A span that cannot be computed is omitted (the log key is
+/// omit-if-absent) rather than recorded inverted; the `refused-invalid-range`
+/// status and its `detail` already carry the numbers the user typed.
 fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
     let dimension = verb.dimension()?;
     let (at, count) = match verb {
@@ -708,7 +748,16 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
         | StructureVerb::InsertColumns { at, count, .. } => (*at, *count),
         _ => return None,
     };
-    Some(format!("{} {at}:{}", dimension.as_str(), at + count - 1))
+    // A span is only meaningful for a positive count. `count < 1` is a
+    // refusal `validate_insert_bounds` has already classified, and
+    // `at + count - 1` computes cleanly for it while meaning nothing — an
+    // *inverted* span, which is the misleading answer rather than the
+    // missing one.
+    if count < 1 {
+        return None;
+    }
+    let end = at.checked_add(count).and_then(|end| end.checked_sub(1))?;
+    Some(format!("{} {at}:{end}", dimension.as_str()))
 }
 
 /// Emits the `kind: "drivemutation"` record.
@@ -743,6 +792,7 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         decided_by_file_id: decided_by.file_id,
         sheet_id,
         sheet_title: Some(opts.verb.sheet_title().to_string()),
+        sheet_new_title: opts.verb.new_sheet_title().map(ToString::to_string),
         dimension_range: dimension_range_label(&opts.verb),
         error,
         duration,
@@ -1222,6 +1272,26 @@ mod tests {
         assert_eq!(dimension_range_label(&add_sheet()), None);
     }
 
+    #[test]
+    fn dimension_range_label_omits_a_span_it_cannot_compute() {
+        // `record_attempt` logs attempts, refused ones included, so this is
+        // reached with arguments no validation let through. An uncomputable
+        // span is omitted rather than recorded inverted — the omit-if-absent
+        // log key already expresses "no span", and the refusal's own detail
+        // carries the numbers.
+        for (at, count) in [(i64::MAX, 5), (1, i64::MIN), (-1, i64::MIN)] {
+            assert_eq!(
+                dimension_range_label(&StructureVerb::InsertRows {
+                    sheet: "Q2".to_string(),
+                    at,
+                    count,
+                }),
+                None,
+                "--at {at} --count {count} must not produce a span"
+            );
+        }
+    }
+
     // ── refusals that must precede the gate and the network ────────────
 
     #[tokio::test]
@@ -1687,6 +1757,64 @@ mod tests {
         )
         .await;
         assert_eq!(dry.result, outcome.result);
+    }
+
+    #[test]
+    fn an_at_and_count_that_would_overflow_the_index_space_are_refused() {
+        let sheet = SheetSnapshot {
+            sheet_id: Some(1),
+            title: "Q2".to_string(),
+            row_count: Some(500),
+            column_count: Some(26),
+        };
+        // Both halves of `at - 1 + count`, since either can be the one that
+        // overflows: a huge `--at` (refused for being past the end too, but
+        // only *after* this check) and a huge `--count` at a legal `--at`
+        // (which nothing else bounds — see the comment on the guard).
+        for (at, count) in [(i64::MAX, 5), (500, i64::MAX)] {
+            let Err(StructureResult::RefusedInvalidRange { detail }) =
+                validate_insert_bounds(Dimension::Rows, at, count, Some(&sheet))
+            else {
+                panic!("expected RefusedInvalidRange for --at {at} --count {count}");
+            };
+            assert!(detail.contains("overflows the row index space"), "{detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_out_of_range_insert_still_records_without_panicking() {
+        // The regression that matters for `dimension_range_label`: this runs
+        // with `dry_run: false`, so `record_attempt` builds a log record from
+        // the very arguments `validate_insert_bounds` just rejected. Computing
+        // the span with plain arithmetic panics here rather than in the
+        // mutation it refused to make.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::InsertRows {
+                    sheet: "Q2".to_string(),
+                    at: i64::MAX,
+                    count: 5,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
     }
 
     /// `--at` equal to `row_count + 1` is a legal append (insert after the

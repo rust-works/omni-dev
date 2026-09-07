@@ -77,13 +77,17 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `sheets-add-sheet`/`sheets-rename-sheet`/`sheets-insert-rows`/
   `sheets-insert-columns` — **one record per verb**, which is also one per
   `spreadsheets.batchUpdate` request, since each verb sends a batch of
-  exactly one. They add three more omit-if-absent context keys: `sheet_id`
+  exactly one. They add four more omit-if-absent context keys: `sheet_id`
   (the stable numeric id the API addresses, which survives a later rename
   and so is the only durable answer to "which tab was this"), `sheet_title`
-  (its title at the time), and `dimension_range` (e.g. `"ROWS 5:7"`,
-  1-based inclusive like the CLI's `--at`). `dimension_range` is the
-  structural analogue of `range`, for effects A1 notation cannot express; a
-  structural verb sets no `range` and no cell counts.
+  (its title at the time), `sheet_new_title` (the title a `rename-sheet`
+  moved it *to* — set by that verb alone, since `sheet_title` necessarily
+  holds the title the sheet had before, and without it a record could say
+  which tab was renamed but not to what), and `dimension_range` (e.g.
+  `"ROWS 5:7"`, 1-based inclusive like the CLI's `--at`). `dimension_range`
+  is the structural analogue of `range`, for effects A1 notation cannot
+  express, and is omitted for a span that spans nothing; a structural verb
+  sets no `range` and no cell counts.
 
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
