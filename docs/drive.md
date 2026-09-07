@@ -1554,6 +1554,48 @@ for a shared binary file.
 If you would rather not grant by id, the alternative still works: add the
 file to a folder in your own Drive and grant that folder.
 
+### `Refused: … changed since it was read (revision lease … no longer current)`
+
+```bash
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4
+Refused: 'Roadmap' changed since it was read (revision lease ALm37BXk3nQ no
+longer current) — nothing was written. Re-run to apply against the current
+version.
+```
+
+Someone edited the document between the read that computed this edit and the
+write that would have applied it. **Nothing was written** — the request is
+atomic, so the document is exactly as the other person left it.
+
+**Re-running is the fix**, and it is the only one. There is deliberately no
+flag to force the write through: the Docs API's alternative rebases your edit
+on top of the other person's changes and reports success, which would mean
+`omni-dev` editing a document nobody had looked at. See
+[ADR-0076](adrs/adr-0076.md) §3 and [Every edit is leased against a
+revision](#every-edit-is-leased-against-a-revision).
+
+If it happens repeatedly, the document is being actively edited; `--dry-run`
+first to see what your change would touch.
+
+### `Refused: … returned no revision id`
+
+```bash
+$ omni-dev drive docs replace 1AbC… --search Q3 --replace Q4
+Refused: 'Roadmap' returned no revision id, which Google sends only to
+callers with edit access — so this write cannot be leased against a known
+version. Request edit access, or check the account in use.
+```
+
+The account can *read* the document but not edit it. Google signals that by
+omitting the revision id, and rather than attempt a write that would fail
+anyway — or worse, write without a lease — the edit is refused up front.
+
+Two things to check: whether the account actually has edit access to the
+document, and whether `--account` is selecting the account you meant (see
+[Multiple accounts](#multiple-accounts)). Note this is distinct from a
+`Blocked`, which is *omni-dev's* own gate refusing, and from an
+`insufficientPermissions` error, which is the OAuth scope being too narrow.
+
 ### No default export format for a Google-native file
 
 ```
