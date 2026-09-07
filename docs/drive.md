@@ -611,6 +611,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`       | deny    | `upload`                                        |
 | `edit`         | deny    | `edit` — raw file content only                  |
 | `sheets-write` | deny    | `sheets write`, `sheets append`, `sheets clear` |
+| `docs-write`   | deny    | `docs replace`, `docs append`                   |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -624,6 +625,16 @@ would have retroactively turned those rules into cell-write permission with
 no config change and no re-consent. If you want a folder's existing `edit`
 grant to cover Sheets too, add `sheets-write` to it explicitly. See
 [ADR-0073](adrs/adr-0073.md) §3.
+
+**`docs-write` is separate from both**, and the same argument runs twice. An
+`allow: ["edit"]` rule predates Docs being reachable through this tool at
+all; an `allow: ["sheets-write"]` rule was written when the same was true,
+and that operation is about *cells*, so letting it govern prose would make
+the config vocabulary say something untrue. Grant `docs-write` explicitly.
+See [ADR-0076](adrs/adr-0076.md) §2.
+
+Each write operation is independent in both directions: `docs-write` confers
+no cell writes and no raw-content edits either.
 
 Rules live per Drive account, since a folder id only means something inside
 the one Drive it came from. A rule keys on **either** a `folder_id` or a

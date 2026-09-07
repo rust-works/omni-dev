@@ -79,8 +79,9 @@ pub enum DriveSubcommands {
     /// the `drive.metadata` scope (`drive auth login --write`).
     Move(move_file::MoveCommand),
     /// Inspects the write-permission rules gating `drive
-    /// create`/`upload`/`edit` and `drive sheets
-    /// write`/`append`/`clear`/`create` (issues #1574, #1589, #1612).
+    /// create`/`upload`/`edit`, `drive sheets
+    /// write`/`append`/`clear`/`create` and `drive docs
+    /// replace`/`append`/`create` (issues #1574, #1589, #1612, #1615).
     Permissions(permissions::PermissionsCommand),
     /// Reads the structure and text of a Google Doc via the Docs v1 API
     /// (issue #1615).

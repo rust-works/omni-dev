@@ -3738,7 +3738,7 @@ Commands:
   edit         Replaces an existing file's content, gated by the write-permission rules (issues #1574, #1612). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
-  permissions  Inspects the write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589, #1612)
+  permissions  Inspects the write-permission rules gating `drive create`/`upload`/`edit`, `drive sheets write`/`append`/`clear`/`create` and `drive docs replace`/`append`/`create` (issues #1574, #1589, #1612, #1615)
   docs         Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
   sheets       Reads and writes the cells of a Google Sheet via the Sheets v4 API (issue #1589)
   help         Print this message or the help of the given subcommand(s)
@@ -3983,9 +3983,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive permissions - Inspects the write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589, #1612)
+omni-dev drive permissions - Inspects the write-permission rules gating `drive create`/`upload`/`edit`, `drive sheets write`/`append`/`clear`/`create` and `drive docs replace`/`append`/`create` (issues #1574, #1589, #1612, #1615)
 
-Inspects the write-permission rules gating `drive create`/`upload`/`edit` and `drive sheets write`/`append`/`clear`/`create` (issues #1574, #1589, #1612)
+Inspects the write-permission rules gating `drive create`/`upload`/`edit`, `drive sheets write`/`append`/`clear`/`create` and `drive docs replace`/`append`/`create` (issues #1574, #1589, #1612, #1615)
 
 Usage: permissions <COMMAND>
 
@@ -4011,7 +4011,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, docs-write]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
