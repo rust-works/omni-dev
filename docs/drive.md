@@ -1089,10 +1089,13 @@ it deliberately.
   spreadsheet's id and use that.
 - *no parent folder visible to this account* — the Sheet was shared with you
   by link or email and is not in a folder you can see, so it has no ancestor
-  chain and **no rule you could write would grant it**. Add it to a folder in
-  your own Drive (`drive move`), then grant that folder `sheets-write`.
-  Granting a rule against a file id directly is a
-  [known gap](adrs/adr-0073.md), not currently supported.
+  chain and no `folder_id` rule could ever grant it. Grant it directly with a
+  `file_id` rule instead — see
+  ["Granting a file shared with you"](#granting-a-file-shared-with-you). A
+  `file_id` rule only satisfies the local gate, though: writing to a Sheet
+  `omni-dev` didn't create also needs the `--write-full` scope, since
+  `--write-file` (`drive.file`) only reaches files `omni-dev` itself
+  created.
 
 Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
 the output, not `$?`.
