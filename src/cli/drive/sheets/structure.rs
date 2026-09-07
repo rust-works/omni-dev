@@ -20,7 +20,7 @@ use crate::cli::drive::helpers;
 use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::structure::{describe, structure, StructureOptions, StructureVerb};
+use crate::drive::sheets::structure::{describe_lines, structure, StructureOptions, StructureVerb};
 
 /// Adds a new sheet to a spreadsheet.
 #[derive(Parser)]
@@ -215,35 +215,34 @@ async fn run_structure(
     if output_as(&outcome, output)? {
         return Ok(());
     }
-    println!("{}", sanitize_rendered(&describe(&outcome)));
+    println!("{}", sanitize_rendered(&describe_lines(&outcome)));
     Ok(())
 }
 
-/// Strips terminal control sequences from a rendered outcome, as `sheets
-/// write` and `sheets create` do to theirs.
+/// Strips terminal control sequences from a rendered outcome, then joins it,
+/// as `sheets write` and `sheets create` do to theirs.
 ///
-/// The line interpolates a Drive-supplied file name, sheet titles read out of
-/// the workbook (including the whole `available` list on a not-found refusal)
-/// and raw API error details, so it is exactly as untrusted as theirs.
+/// Every line interpolates a Drive-supplied file name, sheet titles read out
+/// of the workbook (including the whole `available` list on a not-found
+/// refusal) and raw API error details, so it is exactly as untrusted as
+/// theirs.
 ///
-/// It filters **per line** rather than over the whole string, which is the one
-/// difference from the siblings: their rendered form is a single line
-/// containing no control character for the filter to eat, whereas an insert
-/// preview is deliberately two — the second line is the shift, and
-/// `sanitize_for_terminal` would eat the newline that separates them along
-/// with the escapes it is there to remove.
-///
-/// So this removes every escape, cursor-movement and bidi-override sequence an
-/// injected title could carry. What it cannot distinguish is a newline that
-/// arrived inside one of those values from a newline `describe` emitted
-/// itself, so a title containing one still costs a spurious line break — a
-/// visibly odd, entirely unstyled one that cannot forge the leading summary
-/// line, and the narrowest residual available without moving `describe` out of
-/// the engine layer.
-fn sanitize_rendered(rendered: &str) -> String {
-    rendered
-        .lines()
-        .map(sanitize_for_terminal)
+/// The one difference from the siblings is that this takes the **lines**
+/// rather than a finished string. Their rendered form is a single line
+/// containing no control character of its own, so filtering it whole is
+/// equivalent to filtering each interpolation. A structural insert preview
+/// is deliberately two lines — the second is the shift, and it is the
+/// substance of the dry run (ADR-0075 §6) — so filtering the joined string
+/// would eat the separator along with the escapes it is there to remove,
+/// while filtering per line after joining could not tell that separator from
+/// a newline that arrived inside a sheet title. Taking the parts and
+/// supplying the separators here removes the ambiguity rather than
+/// documenting it: every newline in the output is one this function wrote,
+/// and every newline in the input is stripped as the control character it is.
+fn sanitize_rendered(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| sanitize_for_terminal(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -253,10 +252,15 @@ fn sanitize_rendered(rendered: &str) -> String {
 mod tests {
     use super::*;
 
+    fn line(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+
     #[test]
     fn sanitize_rendered_strips_escapes_from_an_injected_sheet_title() {
-        let rendered = "Refused: 'Budget' has no sheet titled 'Q9'. Available: '\u{1b}[31mQ1\u{7}'";
-        let clean = sanitize_rendered(rendered);
+        let clean = sanitize_rendered(&line(
+            "Refused: 'Budget' has no sheet titled 'Q9'. Available: '\u{1b}[31mQ1\u{7}'",
+        ));
         assert!(!clean.contains('\u{1b}'), "{clean}");
         assert!(!clean.contains('\u{7}'), "{clean}");
         assert!(clean.contains("Available: '[31mQ1'"), "{clean}");
@@ -264,19 +268,32 @@ mod tests {
 
     #[test]
     fn sanitize_rendered_keeps_the_inserts_own_second_line() {
-        // The whole reason this filters per line: the shift is the substance
-        // of a structural dry run, and a whole-string filter would eat the
-        // newline that separates it from the summary.
-        let rendered = "Would insert 3 row(s) before row 5 of 'Q2' in 'Budget'\n  \
-                        (500 rows -> 503; existing rows 5-500 shift down)";
-        let clean = sanitize_rendered(rendered);
+        // The separator between these two is supplied here rather than
+        // carried in the text: the shift is the substance of a structural dry
+        // run, and a whole-string filter would eat the newline joining them.
+        let clean = sanitize_rendered(&[
+            "Would insert 3 row(s) before row 5 of 'Q2' in 'Budget'".to_string(),
+            "  (500 rows -> 503; existing rows 5-500 shift down)".to_string(),
+        ]);
         assert_eq!(clean.lines().count(), 2, "{clean}");
         assert!(clean.contains("500 rows -> 503"), "{clean}");
     }
 
     #[test]
+    fn a_newline_inside_a_line_cannot_forge_a_second_line() {
+        // The residual the line-list signature exists to remove: a sheet
+        // title (or Drive file name) carrying a newline plus a plausible
+        // shift line must not be able to add one to a single-line preview.
+        let clean = sanitize_rendered(&line(
+            "Would rename sheet 'Q2\n  (500 rows -> 500; nothing shifts)' to 'Q3' in 'Budget'",
+        ));
+        assert_eq!(clean.lines().count(), 1, "{clean}");
+        assert!(!clean.contains('\n'), "{clean}");
+    }
+
+    #[test]
     fn sanitize_rendered_strips_bidi_overrides() {
-        let clean = sanitize_rendered("Renamed sheet 'a\u{202E}b' to 'c' in 'Budget'");
+        let clean = sanitize_rendered(&line("Renamed sheet 'a\u{202E}b' to 'c' in 'Budget'"));
         assert!(!clean.contains('\u{202E}'), "{clean}");
     }
 }

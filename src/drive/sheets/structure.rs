@@ -812,7 +812,17 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
     });
 }
 
-/// Renders an outcome as a single human-readable line.
+/// Renders an outcome as human-readable text.
+///
+/// Joins [`describe_lines`]; see it for why the line structure, and not just
+/// the finished string, is what this module produces.
+#[must_use]
+pub fn describe(outcome: &StructureOutcome) -> String {
+    describe_lines(outcome).join("\n")
+}
+
+/// Renders an outcome as its individual lines, **none of which contains a
+/// newline**.
 ///
 /// Lives here rather than in the CLI layer so the CLI and a future MCP
 /// caller describe an outcome identically.
@@ -820,9 +830,19 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
 /// The `WouldChange` arms are the substance of this module's answer to "what
 /// does `--dry-run` show for an effect that isn't a range": the sheet's real
 /// current dimensions, the resulting ones, and — for an insert — the shift
-/// that no bounded range could express.
+/// that no bounded range could express. That shift is a second line, which
+/// is why this is the line list and `describe` the convenience over it.
+///
+/// Returning the lines rather than one pre-joined string is what lets the
+/// CLI sanitize each one and then supply the separators itself. Every line
+/// here interpolates untrusted text — a Drive-supplied file name, sheet
+/// titles read out of the workbook, raw API error details — so a newline
+/// arriving inside one of those values must not be able to pass for a line
+/// break this module chose. Filtering a joined string cannot tell the two
+/// apart; filtering the parts before joining them cannot confuse them.
+/// `no_describe_line_contains_a_newline` pins the guarantee.
 #[must_use]
-pub fn describe(outcome: &StructureOutcome) -> String {
+pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
     let verb = &outcome.verb;
     let book = outcome.file_name.as_deref().map_or_else(
         || format!("'{}'", outcome.spreadsheet_id),
@@ -833,23 +853,23 @@ pub fn describe(outcome: &StructureOutcome) -> String {
         StructureResult::WouldChange { sheet, sheet_count } => {
             describe_would_change(verb, sheet.as_ref(), *sheet_count, &book)
         }
-        StructureResult::RefusedNotASpreadsheet { mime_type } => format!(
+        StructureResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type}); \
              `drive sheets {}` only works on spreadsheets",
             verb.label()
-        ),
-        StructureResult::RefusedShortcut => format!(
+        )],
+        StructureResult::RefusedShortcut => vec![format!(
             "Refused: {book} is a shortcut; `drive sheets {}` doesn't follow shortcuts — \
              resolve the target spreadsheet's id and use that instead",
             verb.label()
-        ),
-        StructureResult::RefusedNoVisibleParents => format!(
+        )],
+        StructureResult::RefusedNoVisibleParents => vec![format!(
             "Refused: {book} has no parent folder visible to this account, so no folder \
              rule can apply to it. This is normal for a Sheet shared by link or email. \
              Grant it by id instead: add {{\"file_id\": \"<spreadsheet id>\", \"allow\": \
              [\"sheets-structure\"]}} to write_permissions.rules. (Adding it to a folder in \
              your own Drive and granting that folder `sheets-structure` also works.)"
-        ),
+        )],
         StructureResult::RefusedSheetNotFound { title, available } => {
             let list = if available.is_empty() {
                 "none".to_string()
@@ -860,13 +880,17 @@ pub fn describe(outcome: &StructureOutcome) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            format!("Refused: {book} has no sheet titled '{title}'. Available: {list}")
+            vec![format!(
+                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
+            )]
         }
         StructureResult::RefusedSheetExists { title } => {
-            format!("Refused: {book} already has a sheet titled '{title}'")
+            vec![format!(
+                "Refused: {book} already has a sheet titled '{title}'"
+            )]
         }
-        StructureResult::RefusedInvalidRange { detail } => format!("Refused: {detail}"),
-        StructureResult::Blocked { decided_by } => match decided_by {
+        StructureResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
+        StructureResult::Blocked { decided_by } => vec![match decided_by {
             Some(rule) => format!(
                 "Blocked: structural edits to {book} refused by rule on {} {}{}",
                 rule.kind_label(),
@@ -877,11 +901,11 @@ pub fn describe(outcome: &StructureOutcome) -> String {
                 "Blocked: structural edits to {book} refused by default policy (no matching \
                  rule for sheets-structure)"
             ),
-        },
+        }],
         StructureResult::Changed { sheet, sheet_id } => {
-            describe_changed(verb, sheet.as_ref(), *sheet_id, &book)
+            vec![describe_changed(verb, sheet.as_ref(), *sheet_id, &book)]
         }
-        StructureResult::Failed { detail } => format!("Failed: {detail}"),
+        StructureResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
 
@@ -890,7 +914,7 @@ fn describe_would_change(
     sheet: Option<&SheetSnapshot>,
     sheet_count: usize,
     book: &str,
-) -> String {
+) -> Vec<String> {
     let id = sheet
         .and_then(|s| s.sheet_id)
         .map_or_else(String::new, |id| format!(" (sheetId {id})"));
@@ -912,17 +936,19 @@ fn describe_would_change(
                 || " at the end".to_string(),
                 |index| format!(" at index {index}"),
             );
-            format!(
+            vec![format!(
                 "Would add sheet '{title}'{size}{position} of {book} \
                  ({sheet_count} sheet(s) -> {})",
                 sheet_count + 1
-            )
+            )]
         }
         StructureVerb::RenameSheet {
             sheet: from,
             new_title,
         } => {
-            format!("Would rename sheet '{from}'{id} to '{new_title}' in {book}")
+            vec![format!(
+                "Would rename sheet '{from}'{id} to '{new_title}' in {book}"
+            )]
         }
         StructureVerb::InsertRows {
             sheet: from,
@@ -956,41 +982,51 @@ fn describe_would_insert(
     count: i64,
     sheet: Option<&SheetSnapshot>,
     book: &str,
-) -> String {
+) -> Vec<String> {
+    let summary = format!(
+        "Would insert {count} {noun}(s) before {noun} {at} of '{from}'{id} in {book}",
+        noun = dimension.noun(),
+    );
     let before = match dimension {
         Dimension::Rows => sheet.and_then(|s| s.row_count),
         Dimension::Columns => sheet.and_then(|s| s.column_count),
     };
-    let shift = before.map_or_else(String::new, |before| {
-        // `at > before` only at the append boundary (`at == before + 1`,
-        // enforced by `validate_verb_args`): there is nothing after the
-        // last row/column to shift, so "existing N-M shift" would print an
-        // inverted, self-contradictory range instead of the truth.
-        let existing = if at <= before {
-            format!(
-                "; existing {plural} {at}-{before} shift {direction}",
-                plural = plural(dimension),
-                direction = match dimension {
-                    Dimension::Rows => "down",
-                    Dimension::Columns => "right",
-                },
-            )
-        } else {
-            format!(
-                "; appended at the end, no existing {plural} shift",
-                plural = plural(dimension)
-            )
-        };
+    // The shift line is the trustworthy half of a structural preview, so it
+    // is omitted outright when it cannot be stated — an unknown current size,
+    // or a resulting size that does not fit. A wrong number here would be
+    // worse than a missing one.
+    let Some(before) = before else {
+        return vec![summary];
+    };
+    let Some(after) = before.checked_add(count) else {
+        return vec![summary];
+    };
+    // `at > before` only at the append boundary (`at == before + 1`,
+    // enforced by `validate_verb_args`): there is nothing after the last
+    // row/column to shift, so "existing N-M shift" would print an inverted,
+    // self-contradictory range instead of the truth.
+    let existing = if at <= before {
         format!(
-            "\n  ({before} {plural} -> {}{existing})",
-            before + count,
+            "; existing {plural} {at}-{before} shift {direction}",
             plural = plural(dimension),
+            direction = match dimension {
+                Dimension::Rows => "down",
+                Dimension::Columns => "right",
+            },
         )
-    });
-    format!(
-        "Would insert {count} {noun}(s) before {noun} {at} of '{from}'{id} in {book}{shift}",
-        noun = dimension.noun(),
-    )
+    } else {
+        format!(
+            "; appended at the end, no existing {plural} shift",
+            plural = plural(dimension)
+        )
+    };
+    vec![
+        summary,
+        format!(
+            "  ({before} {plural} -> {after}{existing})",
+            plural = plural(dimension),
+        ),
+    ]
 }
 
 fn describe_changed(
@@ -1040,8 +1076,9 @@ fn describe_inserted(
         Dimension::Rows => sheet.and_then(|s| s.row_count),
         Dimension::Columns => sheet.and_then(|s| s.column_count),
     }
-    .map_or_else(String::new, |before| {
-        format!(" ({} {} now)", before + count, plural(dimension))
+    .and_then(|before| before.checked_add(count))
+    .map_or_else(String::new, |after| {
+        format!(" ({after} {} now)", plural(dimension))
     });
     format!(
         "Inserted {count} {noun}(s) before {noun} {at} of '{from}'{id} in {book}{now}",
@@ -2227,23 +2264,29 @@ mod tests {
         all
     }
 
-    /// The insert preview is the **only** arm that may emit a newline, and
-    /// it may emit exactly one.
+    /// No `describe_lines` line ever contains a newline, and the insert
+    /// preview is the only arm that emits a second line.
     ///
-    /// This module diverges deliberately from `write.rs`/`create.rs`, whose
-    /// `every_describe_arm_renders_a_single_line` lets their CLI callers
-    /// sanitize the whole rendered string in one pass. A structural insert's
-    /// second line *is* the substance of its dry run (ADR-0075 §6), so
-    /// `cli::drive::sheets::structure::sanitize_rendered` filters per line
-    /// instead — and that is only sound while the newlines it preserves are
-    /// ones this module emitted. Every other arm interpolating a title, a
-    /// rule id or an API error detail must stay single-line, or a newline
-    /// arriving inside one of those values would become indistinguishable
-    /// from a real one.
+    /// Both halves are load-bearing, and they are different claims. The
+    /// second is presentation: `write.rs`/`create.rs` pin every arm to one
+    /// line, and a structural insert earns its extra one because the shift is
+    /// the substance of the dry run (ADR-0075 §6).
+    ///
+    /// The first is what makes `cli::drive::sheets::structure`'s sanitizing
+    /// sound. Every line here interpolates untrusted text — a Drive-supplied
+    /// file name, workbook sheet titles, raw API error details — and the CLI
+    /// strips control characters from each line before supplying the
+    /// separators itself. That is only equivalent to filtering each
+    /// interpolation while this module contributes no newline of its own: a
+    /// line built with an embedded `\n` would smuggle a separator past the
+    /// filter and let an injected one pass for a real one.
+    ///
+    /// The wildcard-free `every_structure_result` is the other half — a new
+    /// variant will not compile until it is listed there, so it cannot reach
+    /// the terminal without passing through this check.
     #[test]
-    fn only_the_insert_preview_renders_more_than_one_line() {
-        let verbs = [add_sheet(), rename(), insert_rows()];
-        for verb in verbs {
+    fn no_describe_line_contains_a_newline() {
+        for verb in [add_sheet(), rename(), insert_rows()] {
             let is_insert = verb.dimension().is_some();
             for result in every_structure_result() {
                 let previews_an_insert =
@@ -2255,22 +2298,26 @@ mod tests {
                     verb: verb.clone(),
                     result,
                 };
-                let rendered = describe(&outcome);
-                let expected = usize::from(previews_an_insert) + 1;
+                let lines = describe_lines(&outcome);
                 assert_eq!(
-                    rendered.lines().count(),
-                    expected,
-                    "unexpected line count for {:?}/{:?}: {rendered:?}",
+                    lines.len(),
+                    usize::from(previews_an_insert) + 1,
+                    "unexpected line count for {:?}/{:?}: {lines:?}",
                     outcome.verb,
                     outcome.result
                 );
-                assert!(
-                    !rendered.chars().any(|c| c.is_control() && c != '\n'),
-                    "describe emitted a control character other than a newline for \
-                     {:?}/{:?}: {rendered:?}",
-                    outcome.verb,
-                    outcome.result
-                );
+                for rendered in &lines {
+                    assert!(
+                        !rendered.chars().any(char::is_control),
+                        "describe_lines emitted a control character for {:?}/{:?}: \
+                         {rendered:?}",
+                        outcome.verb,
+                        outcome.result
+                    );
+                }
+                // `describe` is the join, so it reconstructs exactly the
+                // separators the CLI would supply and nothing else.
+                assert_eq!(describe(&outcome), lines.join("\n"));
             }
         }
     }
