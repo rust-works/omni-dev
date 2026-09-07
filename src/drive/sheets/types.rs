@@ -253,11 +253,14 @@ pub struct ClearValuesResponse {
 /// One `spreadsheets.batchUpdate` request.
 ///
 /// **Externally tagged**, which is exactly Sheets' own wire shape:
-/// `{"addSheet": {...}}`. That is also why this type is the enforcement
-/// point for issue #1613's central safety property — the destructive
-/// requests (`deleteSheet`, `deleteDimension`, `deleteRange`) have no
-/// variant here, so no caller anywhere in the crate can construct one. See
-/// `structure.rs`'s `no_destructive_request_is_reachable` guard.
+/// `{"addSheet": {...}}`. Every variant here is reachable only through
+/// `structure.rs`'s gated engine: the additive verbs behind
+/// `DriveOperation::SheetsStructure` (issue #1613,
+/// [ADR-0075](../../../docs/adrs/adr-0075.md)), the destructive ones behind
+/// `DriveOperation::SheetsDelete` (issue #1623,
+/// [ADR-0077](../../../docs/adrs/adr-0077.md)) — there is still no raw
+/// `--requests` passthrough that could construct one of these outside that
+/// gate.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BatchUpdateRequestItem {
@@ -267,6 +270,13 @@ pub enum BatchUpdateRequestItem {
     UpdateSheetProperties(UpdateSheetPropertiesRequest),
     /// Insert empty rows or columns, shifting existing ones.
     InsertDimension(InsertDimensionRequest),
+    /// Delete an entire sheet from the workbook.
+    DeleteSheet(DeleteSheetRequest),
+    /// Delete whole rows or columns, shifting the remainder to close the gap.
+    DeleteDimension(DeleteDimensionRequest),
+    /// Delete a rectangular cell range, shifting the remainder to close the
+    /// gap along one axis.
+    DeleteRange(DeleteRangeRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -393,6 +403,85 @@ pub struct InsertDimensionRequest {
     /// `false` is the only value that works for every legal `--at`.
     #[serde(rename = "inheritFromBefore")]
     pub inherit_from_before: bool,
+}
+
+/// `DeleteSheetRequest` — names the sheet to remove entirely.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteSheetRequest {
+    /// The sheet to delete.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+}
+
+/// `DeleteDimensionRequest` — deletes the rows or columns spanned by `range`.
+///
+/// Shifts the remainder to close the gap. Reuses [`DimensionRange`] as-is:
+/// the request shape is identical to [`InsertDimensionRequest`]'s `range`,
+/// just interpreted as removal instead of insertion.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteDimensionRequest {
+    /// The rows or columns to delete.
+    pub range: DimensionRange,
+}
+
+/// Which axis a [`DeleteRangeRequest`] shifts remaining cells along to fill
+/// the gap left by a deleted rectangular range.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum ShiftDimension {
+    /// Cells below the deleted range shift up.
+    #[serde(rename = "ROWS")]
+    Rows,
+    /// Cells to the right of the deleted range shift left.
+    #[serde(rename = "COLUMNS")]
+    Columns,
+}
+
+impl ShiftDimension {
+    /// The wire spelling, also used in human-readable output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "ROWS",
+            Self::Columns => "COLUMNS",
+        }
+    }
+}
+
+/// A rectangular, **zero-based** cell range on a single sheet.
+///
+/// Unlike [`DimensionRange`], every bound is a full row/column pair: this
+/// crate only ever sends a fully-bounded `GridRange` (all four indices
+/// present), never an open-ended one. An open-ended range on one axis would
+/// degenerate into [`DeleteDimensionRequest`] semantics and is out of scope
+/// — `structure.rs` never builds one.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GridRange {
+    /// The sheet the range belongs to.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// First row, inclusive, zero-based.
+    #[serde(rename = "startRowIndex")]
+    pub start_row_index: i64,
+    /// Last row, **exclusive**, zero-based.
+    #[serde(rename = "endRowIndex")]
+    pub end_row_index: i64,
+    /// First column, inclusive, zero-based.
+    #[serde(rename = "startColumnIndex")]
+    pub start_column_index: i64,
+    /// Last column, **exclusive**, zero-based.
+    #[serde(rename = "endColumnIndex")]
+    pub end_column_index: i64,
+}
+
+/// `DeleteRangeRequest` — deletes the cells in `range`, shifting the
+/// remainder along `shift_dimension` to close the gap.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteRangeRequest {
+    /// The cells to delete.
+    pub range: GridRange,
+    /// Which way to shift the remaining cells afterward.
+    #[serde(rename = "shiftDimension")]
+    pub shift_dimension: ShiftDimension,
 }
 
 /// Response to `spreadsheets.batchUpdate`.

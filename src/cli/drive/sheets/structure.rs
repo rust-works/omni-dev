@@ -1,16 +1,19 @@
 //! CLI commands for `omni-dev drive sheets add-sheet`/`rename-sheet`/
-//! `insert-rows`/`insert-columns` (issue #1613).
+//! `insert-rows`/`insert-columns` (issue #1613) and `delete-sheet`/
+//! `delete-rows`/`delete-columns`/`delete-range` (issue #1623).
 //!
-//! Four clap structs over one engine call. They share `run_structure`, so
+//! Eight clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
-//! for its three verbs.
+//! for its three verbs. The additive verbs are gated on
+//! `DriveOperation::SheetsStructure`; the destructive ones on
+//! `DriveOperation::SheetsDelete` — `StructureVerb::gate_operation` decides
+//! which, not this layer.
 //!
 //! There is deliberately **no** command that takes a raw
-//! `spreadsheets.batchUpdate` request array. Each verb names its effect in
-//! typed arguments, which is what lets `--dry-run` describe the change and
-//! what keeps the destructive requests unreachable; see
-//! `crate::drive::sheets::structure`.
+//! `spreadsheets.batchUpdate` request array, additive or destructive. Each
+//! verb names its effect in typed arguments, which is what lets `--dry-run`
+//! describe the change; see `crate::drive::sheets::structure`.
 
 use anyhow::Result;
 use clap::Parser;
@@ -135,6 +138,164 @@ pub struct InsertColumnsCommand {
     pub output: OutputFormat,
 }
 
+/// Deletes an entire sheet from a spreadsheet.
+///
+/// Gated by the folder write-permission rules' `sheets-delete` operation
+/// (issue #1623) — distinct from `sheets-structure`, so an existing
+/// `allow: ["sheets-structure"]` rule does not also grant this. This cannot
+/// be undone through omni-dev; Google Drive's own version history is the
+/// only recovery path.
+#[derive(Parser)]
+pub struct DeleteSheetCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to delete.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Deletes whole rows, shifting the remainder up to close the gap.
+///
+/// Gated by `sheets-delete` (issue #1623); see [`DeleteSheetCommand`]'s doc
+/// comment.
+#[derive(Parser)]
+pub struct DeleteRowsCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First row to delete, 1-based inclusive — the row number the
+    /// spreadsheet itself shows.
+    #[arg(long, value_name = "ROW")]
+    pub at: i64,
+
+    /// How many rows to delete.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub count: i64,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Deletes whole columns, shifting the remainder left to close the gap.
+///
+/// Gated by `sheets-delete` (issue #1623); see [`DeleteSheetCommand`]'s doc
+/// comment.
+#[derive(Parser)]
+pub struct DeleteColumnsCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First column to delete, 1-based inclusive (column A is 1).
+    #[arg(long, value_name = "COLUMN")]
+    pub at: i64,
+
+    /// How many columns to delete.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub count: i64,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Which way [`DeleteRangeCommand`] shifts the cells remaining after a
+/// delete, mirroring [`crate::drive::sheets::types::ShiftDimension`].
+///
+/// A CLI-facing copy for the same reason
+/// [`crate::cli::drive::permissions::check::OperationArg`] mirrors
+/// `DriveOperation`: the pure engine module stays free of `clap`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ShiftArg {
+    /// Cells below the deleted range shift up.
+    Rows,
+    /// Cells to the right of the deleted range shift left.
+    Columns,
+}
+
+impl From<ShiftArg> for crate::drive::sheets::types::ShiftDimension {
+    fn from(arg: ShiftArg) -> Self {
+        match arg {
+            ShiftArg::Rows => Self::Rows,
+            ShiftArg::Columns => Self::Columns,
+        }
+    }
+}
+
+/// Deletes a rectangular cell range, shifting the remainder along one axis
+/// to close the gap.
+///
+/// Gated by `sheets-delete` (issue #1623); see [`DeleteSheetCommand`]'s doc
+/// comment. All four bounds are required together — a rectangle, not an
+/// open-ended span; `delete-rows`/`delete-columns` cover the whole-dimension
+/// case.
+#[derive(Parser)]
+pub struct DeleteRangeCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First row of the range, 1-based inclusive.
+    #[arg(long, value_name = "ROW")]
+    pub start_row: i64,
+
+    /// Last row of the range, 1-based inclusive.
+    #[arg(long, value_name = "ROW")]
+    pub end_row: i64,
+
+    /// First column of the range, 1-based inclusive.
+    #[arg(long, value_name = "COLUMN")]
+    pub start_column: i64,
+
+    /// Last column of the range, 1-based inclusive.
+    #[arg(long, value_name = "COLUMN")]
+    pub end_column: i64,
+
+    /// Which way to shift the remaining cells afterward.
+    #[arg(long, value_enum)]
+    pub shift: ShiftArg,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
 impl AddSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -192,6 +353,69 @@ impl InsertColumnsCommand {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl DeleteSheetCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::DeleteSheet { sheet: self.sheet },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl DeleteRowsCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::DeleteRows {
+                sheet: self.sheet,
+                at: self.at,
+                count: self.count,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl DeleteColumnsCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::DeleteColumns {
+                sheet: self.sheet,
+                at: self.at,
+                count: self.count,
+            },
+            dry_run: self.dry_run,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl DeleteRangeCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::DeleteRange {
+                sheet: self.sheet,
+                start_row: self.start_row,
+                end_row: self.end_row,
+                start_column: self.start_column,
+                end_column: self.end_column,
+                shift: self.shift.into(),
             },
             dry_run: self.dry_run,
         };

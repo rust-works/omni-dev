@@ -102,6 +102,19 @@ pub enum DriveOperation {
     /// not later join this variant either, or granting it today would silently
     /// become consent to destroy data tomorrow.
     SheetsStructure,
+    /// Destructively edit an existing Google Sheet via `spreadsheets.batchUpdate`
+    /// (issue #1623, [ADR-0077](../../docs/adrs/adr-0077.md)) — deleting a
+    /// sheet, a row/column range, or an arbitrary cell range.
+    ///
+    /// Deliberately **not** folded into [`Self::SheetsStructure`], per the
+    /// binding clause on that variant: every existing `allow:
+    /// ["sheets-structure"]` rule was written when deletion was impossible,
+    /// so reusing it here would retroactively upgrade those rules into
+    /// permission to destroy data with no config change and no re-consent.
+    ///
+    /// The same argument binds future work: no other operation should later
+    /// join this variant without the same re-consent reasoning.
+    SheetsDelete,
     /// Replace or append *text* in an existing Google Doc via the Docs API
     /// (issue #1615, [ADR-0076](../../docs/adrs/adr-0076.md) §2).
     ///
@@ -132,6 +145,7 @@ impl std::fmt::Display for DriveOperation {
             Self::Edit => "edit",
             Self::SheetsWrite => "sheets-write",
             Self::SheetsStructure => "sheets-structure",
+            Self::SheetsDelete => "sheets-delete",
             Self::DocsWrite => "docs-write",
         };
         write!(f, "{s}")
@@ -152,6 +166,7 @@ impl DriveOperation {
             | Self::Edit
             | Self::SheetsWrite
             | Self::SheetsStructure
+            | Self::SheetsDelete
             | Self::DocsWrite => Verdict::Deny,
         }
     }

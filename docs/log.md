@@ -89,6 +89,23 @@ types, so the log is a complete invocation history, not just an HTTP history:
   express, and is omitted for a span that spans nothing; a structural verb
   sets no `range` and no cell counts.
 
+  Destructive edits (issue
+  [#1623](https://github.com/rust-works/omni-dev/issues/1623),
+  [ADR-0077](adrs/adr-0077.md)) use the same kind again, with `operation` of
+  `sheets-delete-sheet`/`sheets-delete-rows`/`sheets-delete-columns`/
+  `sheets-delete-range` — same one-record-per-verb-and-per-request shape as
+  the structural edits above, and the same four structural context keys
+  (`sheet_id`, `sheet_title`, `dimension_range` for the two dimension-delete
+  verbs). They add one more omit-if-absent context key: `grid_range` (e.g.
+  `"rows 2-4, columns 2-3"`, 1-based inclusive like the CLI's `--start-row`/
+  `--end-row`/`--start-column`/`--end-column`) — the `deleteRange` analogue
+  of `dimension_range`, which only ever spans one axis and so cannot record
+  a rectangle. `delete-sheet` sets neither `dimension_range` nor
+  `grid_range`. Every `--dry-run`, additive or destructive, is unlogged —
+  `record_attempt` only ever runs for a real mutation attempt — and a
+  destructive one stays structural-only besides: no cell content is ever
+  read or logged for any structural verb, delete included.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
