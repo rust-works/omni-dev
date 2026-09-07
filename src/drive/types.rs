@@ -59,6 +59,51 @@ pub(crate) const GOOGLE_SLIDES_MIME_TYPE: &str = "application/vnd.google-apps.pr
 /// `drive read --content`'s existing behaviour.
 pub(crate) const GOOGLE_SHORTCUT_MIME_TYPE: &str = "application/vnd.google-apps.shortcut";
 
+/// The refusals every Sheets-mutating engine (`drive sheets
+/// write`/`append`/`clear`, and `drive sheets add-sheet`/`rename-sheet`/
+/// `insert-rows`/`insert-columns`) can reach for a target: two classified
+/// **before** the write-permission gate ever runs (a shortcut, a
+/// non-spreadsheet), and one — [`Self::NoVisibleParents`] — that the gate
+/// itself reports, since a `file_id` rule must be consulted before "no
+/// visible parent" can be the real story (issue #1612).
+///
+/// Shared via [`classify_sheet_target`] so the two pre-gate checks and
+/// their order are written once rather than copied by hand into each
+/// engine, where they would otherwise be free to quietly drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SheetTargetRefusal {
+    /// The target is a shortcut, which no Sheets engine follows.
+    Shortcut,
+    /// The target is not a Google Sheet at all.
+    NotASpreadsheet {
+        /// The target's actual MIME type.
+        mime_type: String,
+    },
+    /// The target has no parents this account can see **and** no `file_id`
+    /// rule named it, so no rule the operator could write would ever grant
+    /// it. Not produced by [`classify_sheet_target`] — an empty
+    /// `parents` list alone is not conclusive, since a `file_id` rule
+    /// sitting at depth −1 could still grant the target; only the gate
+    /// step (which checks that rule first) can tell the two apart.
+    NoVisibleParents,
+}
+
+/// Classifies `target` against the two pre-gate checks above. `Ok(())`
+/// means neither applies and the caller should proceed to the
+/// write-permission gate next — which may still report
+/// [`SheetTargetRefusal::NoVisibleParents`] itself.
+pub(crate) fn classify_sheet_target(target: &DriveFile) -> Result<(), SheetTargetRefusal> {
+    if target.mime_type == GOOGLE_SHORTCUT_MIME_TYPE {
+        return Err(SheetTargetRefusal::Shortcut);
+    }
+    if target.mime_type != GOOGLE_SHEET_MIME_TYPE {
+        return Err(SheetTargetRefusal::NotASpreadsheet {
+            mime_type: target.mime_type.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// An owner of a Drive file, as embedded in `files.list`/`files.get`'s
 /// `owners[]` field (requested via the `fields` param's
 /// `owners(displayName,emailAddress)` sub-selector — see `files_api.rs`).
@@ -381,5 +426,53 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(text.contains("f1"));
+    }
+
+    // ── classify_sheet_target ───────────────────────────────────────────
+
+    fn sheet_target(parents: &[&str]) -> DriveFile {
+        DriveFile {
+            id: "sheet-1".to_string(),
+            name: "Budget".to_string(),
+            mime_type: GOOGLE_SHEET_MIME_TYPE.to_string(),
+            parents: parents.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_sheet_target_allows_a_spreadsheet_with_a_visible_parent() {
+        assert_eq!(classify_sheet_target(&sheet_target(&["parent-1"])), Ok(()));
+    }
+
+    #[test]
+    fn classify_sheet_target_refuses_a_shortcut_even_to_a_spreadsheet() {
+        let mut target = sheet_target(&["parent-1"]);
+        target.mime_type = GOOGLE_SHORTCUT_MIME_TYPE.to_string();
+        assert_eq!(
+            classify_sheet_target(&target),
+            Err(SheetTargetRefusal::Shortcut)
+        );
+    }
+
+    #[test]
+    fn classify_sheet_target_refuses_a_non_spreadsheet() {
+        let mut target = sheet_target(&["parent-1"]);
+        target.mime_type = "application/pdf".to_string();
+        assert_eq!(
+            classify_sheet_target(&target),
+            Err(SheetTargetRefusal::NotASpreadsheet {
+                mime_type: "application/pdf".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn classify_sheet_target_allows_a_spreadsheet_with_no_visible_parents() {
+        // `NoVisibleParents` is now reported by the gate step, not here —
+        // an empty `parents` list alone isn't conclusive, since a
+        // `file_id` rule could still grant the target (issue #1612). See
+        // `target_gate.rs`'s tests for that decision.
+        assert_eq!(classify_sheet_target(&sheet_target(&[])), Ok(()));
     }
 }

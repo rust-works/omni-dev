@@ -24,5 +24,6 @@ pub mod client;
 pub mod create;
 pub mod read;
 pub mod structure;
+mod target_gate;
 pub mod types;
 pub mod write;

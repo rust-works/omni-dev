@@ -25,13 +25,12 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
-use crate::drive::files_api::FilesApi;
-use crate::drive::folder_ancestry;
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueInputOption};
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::UpdateValuesResponse;
-use crate::drive::types::{GOOGLE_SHEET_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
+use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
@@ -246,66 +245,55 @@ async fn write_inner(
         }
     };
 
-    let files_api = FilesApi::new(drive);
-    let target = match files_api.get_metadata(&opts.spreadsheet_id).await {
-        Ok(target) => target,
-        Err(err) => {
-            return bare(WriteResult::Failed {
-                detail: err.to_string(),
-            })
-        }
-    };
-
-    let with_target = |result| WriteOutcome {
-        spreadsheet_id: opts.spreadsheet_id.clone(),
-        file_name: Some(target.name.clone()),
-        range: Some(range.clone()),
-        resolved_folder_id: None,
-        result,
-    };
-
-    // ── Refusals that precede the gate ─────────────────────────────────
-    if target.mime_type == GOOGLE_SHORTCUT_MIME_TYPE {
-        return with_target(WriteResult::RefusedShortcut);
-    }
-    if target.mime_type != GOOGLE_SHEET_MIME_TYPE {
-        return with_target(WriteResult::RefusedNotASpreadsheet {
-            mime_type: target.mime_type.clone(),
-        });
-    }
-    // ── The gate ───────────────────────────────────────────────────────
-    // A `file_id` rule is consulted *before* the parents are looked at, so
-    // a Sheet with no visible parent can still be granted (issue #1612).
-    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
-        &files_api,
-        &target,
+    // ── Target resolution, pre-gate refusals, and the gate itself ──────
+    // Shared with `structure.rs` via `target_gate::resolve`, so this whole
+    // shape — the metadata fetch, the shortcut/non-spreadsheet checks, and
+    // the file-id-then-ancestor-chain gate lookup — can't quietly drift
+    // between the two engines.
+    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+        drive,
+        &opts.spreadsheet_id,
         DriveOperation::SheetsWrite,
         rules,
     )
     .await
     {
-        Ok(evaluated) => evaluated,
-        // A chain that could not be resolved is a refusal, never a silent
-        // allow — ADR-0071 §3's highest-priority invariant.
-        Err(err) => {
-            return with_target(WriteResult::Failed {
-                detail: err.to_string(),
-            })
+        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
+            return bare(WriteResult::Failed { detail })
         }
+        target_gate::TargetGateOutcome::Refused { target, refusal } => {
+            let result = match refusal {
+                SheetTargetRefusal::Shortcut => WriteResult::RefusedShortcut,
+                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                    WriteResult::RefusedNotASpreadsheet { mime_type }
+                }
+                SheetTargetRefusal::NoVisibleParents => WriteResult::RefusedNoVisibleParents,
+            };
+            return WriteOutcome {
+                spreadsheet_id: opts.spreadsheet_id.clone(),
+                file_name: Some(target.name),
+                range: Some(range),
+                resolved_folder_id: None,
+                result,
+            };
+        }
+        // A chain that could not be resolved is a refusal, never a
+        // silent allow — ADR-0071 §3's highest-priority invariant.
+        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
+            return WriteOutcome {
+                spreadsheet_id: opts.spreadsheet_id.clone(),
+                file_name: Some(target.name),
+                range: Some(range),
+                resolved_folder_id: None,
+                result: WriteResult::Failed { detail },
+            };
+        }
+        target_gate::TargetGateOutcome::Gated {
+            target,
+            decision,
+            resolved_folder_id,
+        } => (target, decision, resolved_folder_id),
     };
-
-    // Only *after* the file-rule lookup has come up empty is "no visible
-    // parents" the real story; reporting it sooner would refuse a target
-    // an explicit `file_id` rule had already granted.
-    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
-        return with_target(WriteResult::RefusedNoVisibleParents);
-    }
-
-    let folder_ancestry::FileTargetDecision {
-        decision,
-        resolved_folder_id,
-        ..
-    } = evaluated;
 
     let gated = |result| WriteOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
@@ -603,6 +591,7 @@ mod tests {
 
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
     use crate::drive::write_gate::Verdict;
     use crate::test_support::env::MapEnv;
     use crate::utils::secret::Secret;
