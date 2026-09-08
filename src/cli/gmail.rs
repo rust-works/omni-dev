@@ -5,10 +5,12 @@ pub(crate) mod auth;
 pub(crate) mod extract_attachments;
 pub(crate) mod format;
 pub(crate) mod helpers;
+pub(crate) mod insert;
 pub(crate) mod label;
 pub(crate) mod read;
 pub(crate) mod render;
 pub(crate) mod search;
+pub(crate) mod selection;
 pub(crate) mod sync;
 pub(crate) mod sync_all;
 pub(crate) mod thread;
@@ -71,6 +73,9 @@ pub enum GmailSubcommands {
     /// (CLI-only; no MCP equivalent; purely local, no client/credentials
     /// needed; #1513).
     Render(render::RenderCommand),
+    /// Restores archived `.eml` messages into a mailbox (CLI-only; no MCP
+    /// equivalent; #1655).
+    Insert(insert::InsertCommand),
 }
 
 impl GmailCommand {
@@ -175,6 +180,7 @@ impl GmailSubcommands {
             Self::Thread(cmd) => cmd.execute(client).await,
             Self::Label(cmd) => cmd.execute(client).await,
             Self::Sync(cmd) => cmd.execute(client).await,
+            Self::Insert(cmd) => cmd.execute(client).await,
         }
     }
 }
