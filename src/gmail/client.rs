@@ -183,6 +183,34 @@ impl GmailClient {
         .await
     }
 
+    /// Sends an authenticated POST request with a raw byte body and returns
+    /// the raw response — `messages.insert`'s `uploadType=multipart` media
+    /// endpoint (`crate::gmail::messages_api::MessagesApi::insert`), which
+    /// needs a hand-assembled `multipart/related` body rather than a JSON
+    /// one. Mirrors [`crate::drive::client::DriveClient::post_bytes`].
+    ///
+    /// The closure passed to [`Self::send_authorized`] captures `body` by
+    /// reference and calls `.to_vec()` inside itself, so a retried or
+    /// 401-refreshed attempt re-materialises the body rather than sending a
+    /// second, empty request against an already-consumed `reqwest::Body` —
+    /// see [`Self::send_authorized`]'s doc comment for why a retry rebuilds
+    /// the request from scratch.
+    pub(crate) async fn post_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> Result<Response> {
+        self.send_authorized(url, "POST", |client, token| {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("Content-Type", content_type)
+                .body(body.to_vec())
+        })
+        .await
+    }
+
     /// Sends a request built by `build`, retrying exactly once on HTTP 401.
     ///
     /// [`GmailSession::access_token`] already refreshes proactively when the
@@ -494,6 +522,123 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    // ── post_bytes ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn post_bytes_sends_body_and_content_type_and_bearer_auth() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .and(wiremock::matchers::header(
+                "Content-Type",
+                "multipart/related; boundary=B",
+            ))
+            .and(wiremock::matchers::body_bytes(b"raw-body".to_vec()))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .post_bytes(
+                &format!("{}/test", server.uri()),
+                b"raw-body",
+                "multipart/related; boundary=B",
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn post_bytes_replays_the_full_body_across_a_429_retry() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // Both the throttled first attempt and the successful retry must
+        // see the same non-empty body — a consumed-body regression would
+        // silently send an empty second request instead.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::body_bytes(b"raw-body".to_vec()))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::body_bytes(b"raw-body".to_vec()))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .post_bytes(
+                &format!("{}/test", server.uri()),
+                b"raw-body",
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn post_bytes_refreshes_and_retries_once_on_401() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "refreshed-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer bootstrap-token",
+            ))
+            .and(wiremock::matchers::body_bytes(b"raw-body".to_vec()))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer refreshed-token",
+            ))
+            .and(wiremock::matchers::body_bytes(b"raw-body".to_vec()))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .post_bytes(
+                &format!("{}/test", server.uri()),
+                b"raw-body",
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
     }
 
     #[tokio::test]

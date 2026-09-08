@@ -54,6 +54,36 @@ pub(crate) fn build_related_body(
     body
 }
 
+/// A `multipart/related` boundary guaranteed not to appear as a substring of
+/// `content`.
+///
+/// [`generate_boundary`]'s 128 random bits make a collision astronomically
+/// unlikely, but not impossible — and a collision is not an error: the
+/// receiving parser splits the part at the first boundary-like line it
+/// meets, silently storing a **truncated** object rather than failing the
+/// request. For Drive's simple upload that risk is currently accepted
+/// (`generate_boundary` alone), but an archived `.eml` handed to `gmail
+/// insert` is arbitrary third-party bytes from years-old mail — attacker- or
+/// mail-client-influenced content, not something omni-dev generated — so one
+/// substring scan here buys certainty instead of probability.
+pub(crate) fn generate_boundary_absent_from(content: &[u8]) -> String {
+    loop {
+        let candidate = generate_boundary();
+        if !contains_subslice(content, candidate.as_bytes()) {
+            return candidate;
+        }
+    }
+}
+
+/// Whether `haystack` contains `needle` as a contiguous byte sequence.
+///
+/// A plain `windows().any()` scan — content sizes here (individual emails)
+/// are small enough that this needs no smarter algorithm, and correctness
+/// under arbitrary binary input matters more than asymptotic speed.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -120,5 +150,30 @@ mod tests {
         let b = generate_boundary();
         assert_ne!(a, b);
         assert!(a.starts_with("omnidev-"));
+    }
+
+    // ── generate_boundary_absent_from / contains_subslice ─────────────
+
+    #[test]
+    fn generate_boundary_absent_from_never_collides_with_content() {
+        let content = b"ordinary .eml bytes, nothing boundary-like here";
+        let boundary = generate_boundary_absent_from(content);
+        assert!(!contains_subslice(content, boundary.as_bytes()));
+    }
+
+    #[test]
+    fn contains_subslice_finds_needle_at_any_position() {
+        assert!(contains_subslice(b"abcdef", b"cd"));
+        assert!(contains_subslice(b"abcdef", b"abc"));
+        assert!(contains_subslice(b"abcdef", b"def"));
+        assert!(!contains_subslice(b"abcdef", b"xyz"));
+    }
+
+    #[test]
+    fn contains_subslice_empty_needle_is_never_contained() {
+        // An empty boundary can never occur in practice, but the predicate
+        // must not treat it as trivially present (which `windows(0)` would,
+        // since every position "matches" a zero-length slice).
+        assert!(!contains_subslice(b"abc", b""));
     }
 }

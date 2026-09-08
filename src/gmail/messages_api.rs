@@ -20,6 +20,7 @@ use url::Url;
 
 use crate::gmail::client::GmailClient;
 use crate::gmail::types::{Message, MessageListResponse};
+use crate::utils::multipart;
 use crate::utils::rate_limit::TokenBucket;
 
 /// Maximum page size accepted by `GET /gmail/v1/users/{userId}/messages`.
@@ -52,6 +53,16 @@ pub const MESSAGES_GET_COST_UNITS: u32 = 5;
 
 /// Quota-unit cost of one `messages.list` page request.
 pub const MESSAGES_LIST_COST_UNITS: u32 = 5;
+
+/// Quota-unit cost of one `messages.insert` call — 5× a read, since insert
+/// bypasses Gmail's spam/classification pipeline a normally-delivered
+/// message goes through (`gmail insert`, #1655).
+pub const MESSAGES_INSERT_COST_UNITS: u32 = 25;
+
+/// Refuses to insert content larger than this before ever building the
+/// request body — Gmail's own documented ceiling on a single message's total
+/// size, including attachments.
+pub const MAX_INSERT_BYTES: u64 = 35 * 1024 * 1024;
 
 /// Default `limit` for a search when the caller doesn't specify one.
 ///
@@ -433,6 +444,56 @@ impl<'a> MessagesApi<'a> {
         }
         Ok(())
     }
+
+    /// Inserts a raw RFC 2822 message directly into the mailbox
+    /// (`messages.insert?uploadType=multipart&internalDateSource=dateHeader`),
+    /// bypassing the scanning/classification pipeline a normal
+    /// SMTP-delivered message goes through — the entire reason `gmail
+    /// insert` (#1655) uses `insert` rather than `import`: reclassifying
+    /// years-old archived mail against today's spam filters is actively
+    /// wrong.
+    ///
+    /// `internalDateSource=dateHeader` is not a default-preserving choice,
+    /// it's load-bearing: Gmail sorts by internal date, and the API default
+    /// (`receivedTime`) would stamp every inserted message with the moment
+    /// of insertion, collapsing an entire restored archive's chronology to
+    /// one timestamp.
+    ///
+    /// `raw_eml` is spliced into the multipart body **verbatim** — no
+    /// re-encoding, no line-ending normalisation — via
+    /// [`multipart::build_related_body`], with a boundary
+    /// ([`multipart::generate_boundary_absent_from`]) checked not to appear
+    /// in the message itself. Never sends `threadId`: the source mailbox's
+    /// thread ids are foreign to the destination mailbox, and Gmail
+    /// reconstructs threading from the `In-Reply-To`/`References` headers
+    /// already present in `raw_eml`.
+    ///
+    /// Requires the `gmail.modify` scope. No client-side scope gating is
+    /// performed, matching [`Self::batch_modify`]'s posture: a
+    /// `gmail.readonly`-only token simply gets a 403 back from Google.
+    pub async fn insert(&self, raw_eml: &[u8], label_ids: &[&str]) -> Result<Message> {
+        anyhow::ensure!(
+            raw_eml.len() as u64 <= MAX_INSERT_BYTES,
+            "refusing to insert {} bytes (limit: {MAX_INSERT_BYTES} bytes); this exceeds \
+             Gmail's documented per-message size limit",
+            raw_eml.len()
+        );
+        let boundary = multipart::generate_boundary_absent_from(raw_eml);
+        let metadata = serde_json::json!({ "labelIds": label_ids });
+        let body = multipart::build_related_body(&metadata, raw_eml, "message/rfc822", &boundary);
+        let url = build_message_insert_url(self.client.base_url())?;
+        let response = self
+            .client
+            .post_bytes(
+                url.as_str(),
+                &body,
+                &format!("multipart/related; boundary={boundary}"),
+            )
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse messages.insert response")
+            .await
+    }
 }
 
 fn build_messages_list_url(
@@ -478,6 +539,20 @@ fn build_message_get_url(
         for header in metadata_headers {
             pairs.append_pair("metadataHeaders", header);
         }
+    }
+    Ok(url)
+}
+
+/// `messages.insert` URL, on Gmail's `/upload/` path prefix
+/// (`uploadType=multipart`, `internalDateSource=dateHeader` — see
+/// [`MessagesApi::insert`]'s doc comment for why the latter is mandatory,
+/// not a default).
+fn build_message_insert_url(base_url: &str) -> Result<Url> {
+    let mut url = GmailClient::api_url(base_url, "/upload/gmail/v1/users/me/messages")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("uploadType", "multipart");
+        pairs.append_pair("internalDateSource", "dateHeader");
     }
     Ok(url)
 }
@@ -1327,6 +1402,157 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Invalid Gmail base URL"));
+    }
+
+    // ── build_message_insert_url ─────────────────────────────────────
+
+    #[test]
+    fn build_message_insert_url_targets_upload_path_with_both_query_params() {
+        let url = build_message_insert_url("https://gmail.googleapis.com").unwrap();
+        assert!(url.path().ends_with("/upload/gmail/v1/users/me/messages"));
+        let query: Vec<_> = url.query_pairs().collect();
+        assert!(query.contains(&("uploadType".into(), "multipart".into())));
+        assert!(query.contains(&("internalDateSource".into(), "dateHeader".into())));
+    }
+
+    #[test]
+    fn build_message_insert_url_rejects_invalid_base_url() {
+        assert!(build_message_insert_url("not a url").is_err());
+    }
+
+    // ── insert ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_posts_a_well_formed_two_part_body_with_the_eml_byte_identical() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let raw_eml = b"From: a@example.com\r\nSubject: Hi\r\n\r\nbody";
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .and(wiremock::matchers::query_param("uploadType", "multipart"))
+            .and(wiremock::matchers::query_param(
+                "internalDateSource",
+                "dateHeader",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "new-id", "labelIds": ["INBOX"],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let message = MessagesApi::new(&client)
+            .insert(raw_eml, &["INBOX"])
+            .await
+            .unwrap();
+        assert_eq!(message.id, "new-id");
+
+        let requests = server.received_requests().await.unwrap();
+        // `received_requests` also captures the `/token` bootstrap POST
+        // `client_with_bootstrapped_token` mounted, so filter to the
+        // `insert` call itself rather than assuming index 0.
+        let insert_request = requests
+            .iter()
+            .find(|r| r.url.path() == "/upload/gmail/v1/users/me/messages")
+            .unwrap();
+        let body = &insert_request.body;
+        // The `.eml` bytes must appear byte-identical inside the multipart
+        // body — no re-encoding, no line-ending normalisation.
+        assert!(body.windows(raw_eml.len()).any(|w| w == raw_eml.as_slice()));
+        let body_str = String::from_utf8_lossy(body);
+        assert!(body_str.contains("Content-Type: message/rfc822"));
+        assert!(body_str.contains("\"labelIds\":[\"INBOX\"]"));
+    }
+
+    #[tokio::test]
+    async fn insert_never_sends_thread_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "x"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        MessagesApi::new(&client)
+            .insert(b"From: a@example.com\r\n\r\nbody", &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let insert_request = requests
+            .iter()
+            .find(|r| r.url.path() == "/upload/gmail/v1/users/me/messages")
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&insert_request.body);
+        assert!(!body_str.contains("threadId"));
+    }
+
+    #[tokio::test]
+    async fn insert_refuses_oversized_content_with_no_network_call() {
+        let client = dead_client();
+        let oversized = vec![0u8; (MAX_INSERT_BYTES + 1) as usize];
+        let err = MessagesApi::new(&client)
+            .insert(&oversized, &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to insert"));
+    }
+
+    #[tokio::test]
+    async fn insert_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+
+        let err = MessagesApi::new(&client)
+            .insert(b"From: a@example.com\r\n\r\nbody", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn insert_surfaces_insufficient_scope_403_with_reason() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = MessagesApi::new(&client)
+            .insert(b"From: a@example.com\r\n\r\nbody", &[])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Insufficient Permission"));
+        assert!(msg.contains("insufficientPermissions"));
     }
 
     #[tokio::test]
