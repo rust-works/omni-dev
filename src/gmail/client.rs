@@ -7,6 +7,8 @@
 //! [`crate::datadog::client::DatadogClient`]; the difference is Bearer-token
 //! auth with in-process refresh instead of two static API keys.
 
+use std::sync::{Arc, PoisonError, RwLock};
+
 use anyhow::{Context, Result};
 use reqwest::{Client, Response};
 use url::Url;
@@ -15,13 +17,19 @@ use crate::gmail::auth::{GmailCredentials, GmailSession};
 use crate::gmail::error::GmailError;
 use crate::request_log;
 use crate::utils::env::{EnvSource, SystemEnv};
-use crate::utils::http::{connect_timeout, read_timeout, retry_if};
+use crate::utils::http::{connect_timeout, read_timeout, retry_if, RetryNotifyFn};
 
 /// HTTP client for the Gmail v1 REST API.
 pub struct GmailClient {
     client: Client,
     base_url: String,
     session: GmailSession,
+    /// Set via [`Self::set_retry_notify`] to route rate-limit retry notices
+    /// to a caller's progress display (#1651) instead of `retry_if`'s
+    /// default `eprintln!`. An `RwLock` (rather than a plain field) because
+    /// a caller may only hold `&GmailClient` by the time it has a progress
+    /// channel to attach — see `sync.rs::run_sync_command`.
+    retry_notify: RwLock<Option<Arc<RetryNotifyFn>>>,
 }
 
 impl std::fmt::Debug for GmailClient {
@@ -60,7 +68,23 @@ impl GmailClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             session,
+            retry_notify: RwLock::new(None),
         })
+    }
+
+    /// Registers `notify` to receive rate-limit retry notices (#1651)
+    /// instead of the shared retry driver's default `eprintln!`.
+    ///
+    /// Takes `&self` (writing through the interior `RwLock`) rather than
+    /// `&mut self` so it can be attached after construction through a
+    /// shared reference — the account label/progress channel a caller
+    /// wants to attribute the notice with often isn't available until
+    /// after the client already exists.
+    pub(crate) fn set_retry_notify(&self, notify: Arc<RetryNotifyFn>) {
+        *self
+            .retry_notify
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(notify);
     }
 
     /// Creates a client from stored credentials against the real Gmail API
@@ -209,12 +233,18 @@ impl GmailClient {
     where
         F: Fn(&Client, &str) -> reqwest::RequestBuilder + Send + Sync,
     {
+        let notify = self
+            .retry_notify
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         retry_if(
             || build(&self.client, token),
             |started, result| {
                 request_log::record_http_result("gmail", method, url, started, result);
             },
             |status, body| status == 429 || is_gmail_quota_exceeded(status, body),
+            notify.as_deref(),
         )
         .await
         .with_context(|| format!("Failed to send {method} request to Gmail API"))
@@ -489,6 +519,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    // ── set_retry_notify (#1651) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_retry_notify_receives_rate_limit_notices_instead_of_eprintln() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        client.set_retry_notify(std::sync::Arc::new(move |status, delay, attempt| {
+            recorded.lock().unwrap().push((status, delay, attempt));
+        }));
+
+        let resp = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(*calls.lock().unwrap(), vec![(429, 0, 1)]);
     }
 
     #[tokio::test]
