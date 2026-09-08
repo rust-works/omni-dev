@@ -31,7 +31,7 @@ use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, BooleanCondition, ConditionValue, DataValidationRule, GridRange,
-    SetDataValidationRequest, Spreadsheet,
+    SetDataValidationRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -356,8 +356,13 @@ async fn validation_inner(
         }
     };
 
-    let grid = match resolve_grid_range(&workbook, &composed_range) {
-        Ok(grid) => grid,
+    let grid = match grid_range::resolve_grid_range(
+        &workbook,
+        &composed_range,
+        |detail| ValidationResult::RefusedInvalidRange { detail },
+        |title, available| ValidationResult::RefusedSheetNotFound { title, available },
+    ) {
+        Ok((_, grid)) => grid,
         Err(result) => return gated(result),
     };
 
@@ -376,44 +381,36 @@ async fn validation_inner(
     }
 }
 
-fn resolve_grid_range(
-    workbook: &Spreadsheet,
-    composed_range: &str,
-) -> Result<GridRange, ValidationResult> {
-    let Some((title, bare_range)) = a1::split_sheet_prefix(composed_range) else {
-        return Err(ValidationResult::RefusedInvalidRange {
-            detail: format!(
-                "'{composed_range}' does not name a sheet; pass --sheet, or a --range \
-                 carrying its own 'Sheet!' prefix"
-            ),
-        });
-    };
-    let sheet_id = workbook
-        .sheets
-        .iter()
-        .filter_map(|sheet| sheet.properties.as_ref())
-        .find(|props| props.title == title)
-        .and_then(|props| props.sheet_id)
-        .ok_or_else(|| ValidationResult::RefusedSheetNotFound {
-            title: title.clone(),
-            available: workbook.sheet_titles(),
-        })?;
-    grid_range::parse_grid_range(sheet_id, bare_range)
-        .map_err(|detail| ValidationResult::RefusedInvalidRange { detail })
-}
-
 fn validate_condition(condition: &Condition) -> Result<(), String> {
+    // Exhaustive over `Condition`: a new variant forces a new arm here at
+    // compile time, rather than silently falling through unvalidated.
     match condition {
-        Condition::OneOfList(items) if items.is_empty() => {
-            Err("--one-of-list needs at least one value".to_string())
+        Condition::OneOfList(items) => {
+            if items.is_empty() {
+                Err("--one-of-list needs at least one value".to_string())
+            } else {
+                Ok(())
+            }
         }
-        Condition::NumberBetween(min, max) if min > max => Err(format!(
-            "--number-between's first value ({min}) must not exceed the second ({max})"
-        )),
-        Condition::CustomFormula(formula) if formula.trim().is_empty() => {
-            Err("--custom-formula must not be empty".to_string())
+        Condition::NumberBetween(min, max) => {
+            // `NaN > x` and `x > NaN` are both `false`, so a NaN bound must
+            // be checked explicitly or it silently reaches the API.
+            if min.is_nan() || max.is_nan() || min > max {
+                Err(format!(
+                    "--number-between's first value ({min}) must not exceed the second ({max})"
+                ))
+            } else {
+                Ok(())
+            }
         }
-        _ => Ok(()),
+        Condition::Checkbox => Ok(()),
+        Condition::CustomFormula(formula) => {
+            if formula.trim().is_empty() {
+                Err("--custom-formula must not be empty".to_string())
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -599,6 +596,16 @@ mod tests {
     #[test]
     fn validate_condition_rejects_a_reversed_number_between() {
         let err = validate_condition(&Condition::NumberBetween(10.0, 1.0)).unwrap_err();
+        assert!(err.contains("must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_nan_bound() {
+        // `NaN > x` and `x > NaN` are both `false`, so a plain `min > max`
+        // guard lets this through uncaught.
+        let err = validate_condition(&Condition::NumberBetween(f64::NAN, 5.0)).unwrap_err();
+        assert!(err.contains("must not exceed"), "{err}");
+        let err = validate_condition(&Condition::NumberBetween(1.0, f64::NAN)).unwrap_err();
         assert!(err.contains("must not exceed"), "{err}");
     }
 

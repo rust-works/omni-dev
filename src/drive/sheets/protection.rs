@@ -71,11 +71,17 @@ pub enum ProtectionVerb {
     /// Change an existing protected range's description, warning-only
     /// flag, or editor list.
     UpdateProtection {
-        /// A sheet title, supplying a prefix for a bare `range`.
+        /// A sheet title, supplying a prefix for a bare `range`. Also the
+        /// target sheet directly when `whole_sheet` is set.
         sheet: Option<String>,
         /// An explicit A1 range identifying the *existing* protection to
-        /// change, by exact match.
+        /// change, by exact match. Mutually exclusive with `whole_sheet`.
         range: Option<String>,
+        /// Target the whole-sheet protection on `sheet`, rather than one
+        /// covering a range within it — the only way to address a
+        /// protection `protect-range --whole-sheet` created, since it has
+        /// no range of its own to match against.
+        whole_sheet: bool,
         /// The new description, when changing it.
         description: Option<String>,
         /// The new warning-only flag, when changing it.
@@ -87,11 +93,15 @@ pub enum ProtectionVerb {
     },
     /// Remove a protected range.
     UnprotectRange {
-        /// A sheet title, supplying a prefix for a bare `range`.
+        /// A sheet title, supplying a prefix for a bare `range`. Also the
+        /// target sheet directly when `whole_sheet` is set.
         sheet: Option<String>,
         /// An explicit A1 range identifying the protection to remove, by
-        /// exact match.
+        /// exact match. Mutually exclusive with `whole_sheet`.
         range: Option<String>,
+        /// Target the whole-sheet protection on `sheet` — see
+        /// [`Self::UpdateProtection::whole_sheet`].
+        whole_sheet: bool,
     },
 }
 
@@ -112,11 +122,28 @@ impl ProtectionVerb {
         }
     }
 
-    fn sheet_and_range(&self) -> (Option<&str>, Option<&str>) {
+    /// `--sheet`, `--range`, and whether `--whole-sheet` was given — every
+    /// verb has all three, just not always under that name (`ProtectRange`
+    /// calls it the same thing).
+    fn sheet_range_whole(&self) -> (Option<&str>, Option<&str>, bool) {
         match self {
-            Self::ProtectRange { sheet, range, .. }
-            | Self::UpdateProtection { sheet, range, .. }
-            | Self::UnprotectRange { sheet, range } => (sheet.as_deref(), range.as_deref()),
+            Self::ProtectRange {
+                sheet,
+                range,
+                whole_sheet,
+                ..
+            }
+            | Self::UpdateProtection {
+                sheet,
+                range,
+                whole_sheet,
+                ..
+            }
+            | Self::UnprotectRange {
+                sheet,
+                range,
+                whole_sheet,
+            } => (sheet.as_deref(), range.as_deref(), *whole_sheet),
         }
     }
 }
@@ -347,14 +374,36 @@ async fn protection_inner(
         Err(result) => return gated(result),
     };
 
-    let request = match &opts.verb {
+    // `update-protection`/`unprotect-range` resolve their target by exact
+    // match against the workbook's current protections — done once, here,
+    // before the dry-run check, so a preview refuses a nonexistent or
+    // ambiguous target exactly like a real attempt would.
+    let existing = match &opts.verb {
+        ProtectionVerb::ProtectRange { .. } => None,
+        ProtectionVerb::UpdateProtection { .. } | ProtectionVerb::UnprotectRange { .. } => {
+            match find_existing_protection(&workbook, grid) {
+                Ok(existing) => Some(existing),
+                Err(result) => return gated(result),
+            }
+        }
+    };
+
+    let summary = describe_effect(&opts.verb);
+
+    if opts.dry_run {
+        return gated(ProtectionResult::WouldChange { summary });
+    }
+
+    // Only past the dry-run return does building the actual request (in
+    // particular `update-protection`'s editor-list merge) do any work.
+    let (request, existing_id) = match &opts.verb {
         ProtectionVerb::ProtectRange {
             description,
             warning_only,
             editors,
             ..
-        } => Ok(BatchUpdateRequestItem::AddProtectedRange(
-            AddProtectedRangeRequest {
+        } => (
+            BatchUpdateRequestItem::AddProtectedRange(AddProtectedRangeRequest {
                 protected_range: ProtectedRange {
                     protected_range_id: None,
                     range: Some(grid),
@@ -364,55 +413,44 @@ async fn protection_inner(
                         users: editors.clone(),
                     }),
                 },
-            },
-        )),
+            }),
+            None,
+        ),
         ProtectionVerb::UpdateProtection {
             description,
             warning_only,
             add_editors,
             remove_editors,
             ..
-        } => match find_existing_protection(&workbook, grid) {
-            Ok(existing) => {
-                let update = build_update(
-                    existing,
-                    description,
-                    *warning_only,
-                    add_editors,
-                    remove_editors,
-                );
-                Ok(BatchUpdateRequestItem::UpdateProtectedRange(update))
-            }
-            Err(result) => Err(result),
-        },
-        ProtectionVerb::UnprotectRange { .. } => match find_existing_protection(&workbook, grid) {
-            Ok(existing) => Ok(BatchUpdateRequestItem::DeleteProtectedRange(
-                DeleteProtectedRangeRequest {
-                    protected_range_id: existing.protected_range_id.unwrap_or_default(),
-                },
-            )),
-            Err(result) => Err(result),
-        },
-    };
-    let request = match request {
-        Ok(request) => request,
-        Err(result) => return gated(result),
-    };
-
-    let existing_id = match &opts.verb {
-        ProtectionVerb::UpdateProtection { .. } | ProtectionVerb::UnprotectRange { .. } => {
-            find_existing_protection(&workbook, grid)
-                .ok()
-                .and_then(|p| p.protected_range_id)
+        } => {
+            let Some(existing) = existing else {
+                unreachable!("existing is resolved for UpdateProtection above")
+            };
+            let update = build_update(
+                existing,
+                description,
+                *warning_only,
+                add_editors,
+                remove_editors,
+            );
+            (
+                BatchUpdateRequestItem::UpdateProtectedRange(update),
+                existing.protected_range_id,
+            )
         }
-        ProtectionVerb::ProtectRange { .. } => None,
+        ProtectionVerb::UnprotectRange { .. } => {
+            let Some(existing) = existing else {
+                unreachable!("existing is resolved for UnprotectRange above")
+            };
+            let id = existing.protected_range_id;
+            (
+                BatchUpdateRequestItem::DeleteProtectedRange(DeleteProtectedRangeRequest {
+                    protected_range_id: id.unwrap_or_default(),
+                }),
+                id,
+            )
+        }
     };
-
-    let summary = describe_effect(&opts.verb);
-
-    if opts.dry_run {
-        return gated(ProtectionResult::WouldChange { summary });
-    }
 
     match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
@@ -432,14 +470,14 @@ async fn protection_inner(
 /// `format.rs`/`validation.rs` — except for `--whole-sheet`, which names a
 /// sheet directly and needs no range composition at all. Returns `None`
 /// only for that case; [`resolve_grid`] is what actually interprets it.
+///
+/// Shared across all three verbs: `update-protection`/`unprotect-range`
+/// need `--whole-sheet` exactly as much as `protect-range` does, since it's
+/// the only way to address a protection that `protect-range --whole-sheet`
+/// created — such a protection has no range of its own to name.
 fn compose_target(verb: &ProtectionVerb) -> Result<Option<String>, String> {
-    if let ProtectionVerb::ProtectRange {
-        sheet,
-        range,
-        whole_sheet: true,
-        ..
-    } = verb
-    {
+    let (sheet, range, whole_sheet) = verb.sheet_range_whole();
+    if whole_sheet {
         if range.is_some() {
             return Err("--whole-sheet and --range are mutually exclusive".to_string());
         }
@@ -448,7 +486,6 @@ fn compose_target(verb: &ProtectionVerb) -> Result<Option<String>, String> {
         }
         return Ok(None);
     }
-    let (sheet, range) = verb.sheet_and_range();
     a1::compose(sheet, range)
         .map(Some)
         .map_err(|err| err.to_string())
@@ -462,12 +499,13 @@ fn resolve_grid(
     // `--whole-sheet` names its sheet directly — `compose_target` returns
     // `None` for it precisely so this branch handles it without a range to
     // parse at all.
-    if let ProtectionVerb::ProtectRange {
-        sheet: Some(sheet),
-        whole_sheet: true,
-        ..
-    } = verb
-    {
+    let (sheet, _range, whole_sheet) = verb.sheet_range_whole();
+    if whole_sheet {
+        let Some(sheet) = sheet else {
+            return Err(ProtectionResult::RefusedInvalidRange {
+                detail: "--whole-sheet needs --sheet to name the sheet to protect".to_string(),
+            });
+        };
         let sheet_id = find_sheet_id(workbook, sheet)?;
         return Ok(GridRange {
             sheet_id,
@@ -475,30 +513,19 @@ fn resolve_grid(
         });
     }
     let composed = composed.unwrap_or_default();
-    let Some((title, bare_range)) = a1::split_sheet_prefix(composed) else {
-        return Err(ProtectionResult::RefusedInvalidRange {
-            detail: format!(
-                "'{composed}' does not name a sheet; pass --sheet, or a --range carrying its \
-                 own 'Sheet!' prefix"
-            ),
-        });
-    };
-    let sheet_id = find_sheet_id(workbook, &title)?;
-    grid_range::parse_grid_range(sheet_id, bare_range)
-        .map_err(|detail| ProtectionResult::RefusedInvalidRange { detail })
+    let (_, grid) = grid_range::resolve_grid_range(
+        workbook,
+        composed,
+        |detail| ProtectionResult::RefusedInvalidRange { detail },
+        |title, available| ProtectionResult::RefusedSheetNotFound { title, available },
+    )?;
+    Ok(grid)
 }
 
 fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, ProtectionResult> {
-    workbook
-        .sheets
-        .iter()
-        .filter_map(|sheet| sheet.properties.as_ref())
-        .find(|props| props.title == title)
-        .and_then(|props| props.sheet_id)
-        .ok_or_else(|| ProtectionResult::RefusedSheetNotFound {
-            title: title.to_string(),
-            available: workbook.sheet_titles(),
-        })
+    grid_range::find_sheet_id(workbook, title, |title, available| {
+        ProtectionResult::RefusedSheetNotFound { title, available }
+    })
 }
 
 /// Finds the one existing protected range whose `range` exactly matches
@@ -636,20 +663,27 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
-    let protected_range_id = match &outcome.result {
+    // Editor changes are only real once the outcome is `Changed` — a
+    // `Blocked`/`Failed`/refused attempt granted or revoked nothing, so
+    // logging the *requested* editors there (as opposed to what the verb
+    // carries) would misrepresent the audit trail for a permission surface
+    // where that record matters.
+    let (protected_range_id, editors_added, editors_removed) = match &outcome.result {
         ProtectionResult::Changed {
             protected_range_id, ..
-        } => *protected_range_id,
-        _ => None,
-    };
-    let (editors_added, editors_removed) = match &opts.verb {
-        ProtectionVerb::ProtectRange { editors, .. } => (editors.clone(), Vec::new()),
-        ProtectionVerb::UpdateProtection {
-            add_editors,
-            remove_editors,
-            ..
-        } => (add_editors.clone(), remove_editors.clone()),
-        ProtectionVerb::UnprotectRange { .. } => (Vec::new(), Vec::new()),
+        } => {
+            let (added, removed) = match &opts.verb {
+                ProtectionVerb::ProtectRange { editors, .. } => (editors.clone(), Vec::new()),
+                ProtectionVerb::UpdateProtection {
+                    add_editors,
+                    remove_editors,
+                    ..
+                } => (add_editors.clone(), remove_editors.clone()),
+                ProtectionVerb::UnprotectRange { .. } => (Vec::new(), Vec::new()),
+            };
+            (*protected_range_id, added, removed)
+        }
+        _ => (None, Vec::new(), Vec::new()),
     };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -1024,6 +1058,7 @@ mod tests {
             verb: ProtectionVerb::UnprotectRange {
                 sheet: Some("Q1".to_string()),
                 range: Some("A1:A5".to_string()),
+                whole_sheet: false,
             },
             dry_run: false,
         };
@@ -1032,5 +1067,56 @@ mod tests {
             outcome.result,
             ProtectionResult::RefusedProtectionNotFound { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn unprotect_range_whole_sheet_finds_a_whole_sheet_protection() {
+        // A whole-sheet protection has no range of its own — `--whole-sheet`
+        // on `unprotect-range` is the only way to target it at all (issue
+        // #1643 follow-up: previously unreachable once created).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 42,
+            "range": {"sheetId": 0},
+        }]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::UnprotectRange {
+                sheet: Some("Q1".to_string()),
+                range: None,
+                whole_sheet: true,
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::Changed {
+                protected_range_id, ..
+            } => assert_eq!(protected_range_id, Some(42)),
+            other => panic!("expected Changed, got {other:?}"),
+        }
     }
 }

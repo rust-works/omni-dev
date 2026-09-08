@@ -27,7 +27,8 @@
 //! verb's `--sheet` flag: the range string itself never carries a sheet
 //! prefix here.
 
-use crate::drive::sheets::types::GridRange;
+use crate::drive::sheets::a1;
+use crate::drive::sheets::types::{GridRange, Spreadsheet};
 
 /// What one `:`-delimited token names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,74 @@ fn column_letters_to_index(letters: &str) -> Option<i64> {
         index = index.checked_mul(26)?.checked_add(digit)?;
     }
     Some(index - 1)
+}
+
+/// Zero-based column index → A1 letters (`0` → `"A"`, `26` → `"AA"`) — the
+/// inverse of [`column_letters_to_index`], colocated with it so both
+/// directions of the conversion share one tested implementation.
+pub(crate) fn column_index_to_letters(mut index: i64) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push((b'A' + (index % 26) as u8) as char);
+        index = index / 26 - 1;
+        if index < 0 {
+            break;
+        }
+    }
+    letters.iter().rev().collect()
+}
+
+/// Whether every bound of `grid` is set — i.e. it names a fixed rectangle
+/// rather than an open-ended column/row span (`A:A`, `5:5`).
+pub(crate) fn is_bounded(grid: &GridRange) -> bool {
+    grid.start_row_index.is_some()
+        && grid.end_row_index.is_some()
+        && grid.start_column_index.is_some()
+        && grid.end_column_index.is_some()
+}
+
+/// Finds a sheet's numeric id by title. Shared by every verb that resolves
+/// a `--sheet` name (or a range's sheet prefix) against a freshly-fetched
+/// workbook — `not_found` builds the caller's own "sheet not found" error
+/// variant.
+pub(crate) fn find_sheet_id<E>(
+    workbook: &Spreadsheet,
+    title: &str,
+    not_found: impl FnOnce(String, Vec<String>) -> E,
+) -> Result<i64, E> {
+    workbook
+        .sheets
+        .iter()
+        .filter_map(|sheet| sheet.properties.as_ref())
+        .find(|props| props.title == title)
+        .and_then(|props| props.sheet_id)
+        .ok_or_else(|| not_found(title.to_string(), workbook.sheet_titles()))
+}
+
+/// Resolves an already-composed `--sheet`/`--range` string into a numeric
+/// [`GridRange`]: the shared "split off the sheet prefix, find its id,
+/// parse the bare range" pipeline every range-targeted verb in
+/// `format.rs`/`protection.rs`/`validation.rs` needs. `invalid_range` and
+/// `not_found` build the caller's own error variants, so this stays usable
+/// across their differently-shaped result enums.
+///
+/// Returns the sheet's title alongside the range, since some callers (e.g.
+/// `format.rs`'s merge-cells preview) need it again afterward.
+pub(crate) fn resolve_grid_range<E>(
+    workbook: &Spreadsheet,
+    composed: &str,
+    invalid_range: impl Fn(String) -> E,
+    not_found: impl FnOnce(String, Vec<String>) -> E,
+) -> Result<(String, GridRange), E> {
+    let Some((title, bare_range)) = a1::split_sheet_prefix(composed) else {
+        return Err(invalid_range(format!(
+            "'{composed}' does not name a sheet; pass --sheet, or a --range carrying its own \
+             'Sheet!' prefix"
+        )));
+    };
+    let sheet_id = find_sheet_id(workbook, &title, not_found)?;
+    let grid = parse_grid_range(sheet_id, bare_range).map_err(invalid_range)?;
+    Ok((title, grid))
 }
 
 /// Parses one token (one side of a `:`, or a whole single-cell range) into
@@ -274,5 +343,21 @@ mod tests {
     fn whitespace_is_trimmed() {
         let g = parse_grid_range(1, "  A1:B2  ").unwrap();
         assert_eq!(g.start_row_index, Some(0));
+    }
+
+    #[test]
+    fn column_index_to_letters_round_trips_column_letters_to_index() {
+        for (index, letters) in [(0, "A"), (25, "Z"), (26, "AA"), (51, "AZ"), (52, "BA")] {
+            assert_eq!(column_index_to_letters(index), letters);
+            assert_eq!(column_letters_to_index(letters), Some(index));
+        }
+    }
+
+    #[test]
+    fn is_bounded_requires_all_four_indices() {
+        let bounded = parse_grid_range(1, "A1:B2").unwrap();
+        assert!(is_bounded(&bounded));
+        let open_column = parse_grid_range(1, "A:A").unwrap();
+        assert!(!is_bounded(&open_column));
     }
 }
