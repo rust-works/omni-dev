@@ -1204,8 +1204,10 @@ omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
 
 ```bash
 # Copy a sheet. --title omitted takes Sheets' own "Copy of X" default;
-# --index omitted appends. A given --title must not already be in use,
-# including by the source sheet itself.
+# --index omitted takes Sheets' own default position — confirmed against
+# the live API to be the front of the workbook (index 0), not the end,
+# unlike add-sheet. A given --title must not already be in use, including
+# by the source sheet itself.
 omni-dev drive sheets duplicate-sheet <ID> --sheet Q2 --title 'Q2 (copy)'
 
 # Move a sheet to a new zero-based position among its siblings.

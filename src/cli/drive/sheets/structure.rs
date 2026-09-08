@@ -314,7 +314,10 @@ pub struct DuplicateSheetCommand {
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
 
-    /// Zero-based position for the copy. Omitted appends to the end.
+    /// Zero-based position for the copy. Omitted takes Sheets' own default
+    /// — confirmed against the live API to be the *front* of the workbook
+    /// (index 0), not the end: unlike `add-sheet`, `duplicateSheetRequest`
+    /// does not default to appending.
     #[arg(long, value_name = "N")]
     pub index: Option<i64>,
 

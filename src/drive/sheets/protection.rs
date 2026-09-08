@@ -299,6 +299,10 @@ async fn protection_inner(
         Err(detail) => return bare(ProtectionResult::RefusedInvalidRange { detail }),
     };
 
+    if let Err(detail) = validate_verb(&opts.verb) {
+        return bare(ProtectionResult::RefusedInvalidRange { detail });
+    }
+
     let (target, decision, resolved_folder_id) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
@@ -396,13 +400,13 @@ async fn protection_inner(
 
     // Only past the dry-run return does building the actual request (in
     // particular `update-protection`'s editor-list merge) do any work.
-    let (request, existing_id) = match &opts.verb {
+    let built = match &opts.verb {
         ProtectionVerb::ProtectRange {
             description,
             warning_only,
             editors,
             ..
-        } => (
+        } => Ok((
             BatchUpdateRequestItem::AddProtectedRange(AddProtectedRangeRequest {
                 protected_range: ProtectedRange {
                     protected_range_id: None,
@@ -415,7 +419,7 @@ async fn protection_inner(
                 },
             }),
             None,
-        ),
+        )),
         ProtectionVerb::UpdateProtection {
             description,
             warning_only,
@@ -426,30 +430,36 @@ async fn protection_inner(
             let Some(existing) = existing else {
                 unreachable!("existing is resolved for UpdateProtection above")
             };
-            let update = build_update(
+            build_update(
                 existing,
                 description,
                 *warning_only,
                 add_editors,
                 remove_editors,
-            );
-            (
-                BatchUpdateRequestItem::UpdateProtectedRange(update),
-                existing.protected_range_id,
             )
+            .map(|update| {
+                (
+                    BatchUpdateRequestItem::UpdateProtectedRange(update),
+                    existing.protected_range_id,
+                )
+            })
         }
         ProtectionVerb::UnprotectRange { .. } => {
             let Some(existing) = existing else {
                 unreachable!("existing is resolved for UnprotectRange above")
             };
             let id = existing.protected_range_id;
-            (
+            Ok((
                 BatchUpdateRequestItem::DeleteProtectedRange(DeleteProtectedRangeRequest {
                     protected_range_id: id.unwrap_or_default(),
                 }),
                 id,
-            )
+            ))
         }
+    };
+    let (request, existing_id) = match built {
+        Ok(built) => built,
+        Err(detail) => return gated(ProtectionResult::RefusedInvalidRange { detail }),
     };
 
     match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
@@ -489,6 +499,31 @@ fn compose_target(verb: &ProtectionVerb) -> Result<Option<String>, String> {
     a1::compose(sheet, range)
         .map(Some)
         .map_err(|err| err.to_string())
+}
+
+/// Rejects a verb whose own arguments are internally inconsistent —
+/// confirmed against the live API, not guessed at: `protect-range
+/// --warning-only --editor` is rejected server-side with "ProtectedRange is
+/// warningOnly. Editors cannot be set on it." (a warning-only protection
+/// never blocks an edit, so there is no "who may bypass the block" to
+/// name). Checked here, before the gate, so the refusal is as cheap as
+/// every other `RefusedInvalidRange`.
+fn validate_verb(verb: &ProtectionVerb) -> Result<(), String> {
+    if let ProtectionVerb::ProtectRange {
+        warning_only: true,
+        editors,
+        ..
+    } = verb
+    {
+        if !editors.is_empty() {
+            return Err(
+                "--warning-only and --editor are mutually exclusive: a warning-only \
+                 protection never blocks an edit, so there is no one to exempt from it"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_grid(
@@ -564,7 +599,7 @@ fn build_update(
     warning_only: Option<bool>,
     add_editors: &[String],
     remove_editors: &[String],
-) -> UpdateProtectedRangeRequest {
+) -> Result<UpdateProtectedRangeRequest, String> {
     let mut fields = Vec::new();
     let mut update = ProtectedRangeUpdate {
         protected_range_id: existing.protected_range_id.unwrap_or_default(),
@@ -578,12 +613,12 @@ fn build_update(
         update.warning_only = Some(warning_only);
         fields.push("warningOnly");
     }
+    let mut resulting_editors: Vec<String> = existing
+        .editors
+        .as_ref()
+        .map(|e| e.users.clone())
+        .unwrap_or_default();
     if !add_editors.is_empty() || !remove_editors.is_empty() {
-        let mut resulting_editors: Vec<String> = existing
-            .editors
-            .as_ref()
-            .map(|e| e.users.clone())
-            .unwrap_or_default();
         for editor in add_editors {
             if !resulting_editors.contains(editor) {
                 resulting_editors.push(editor.clone());
@@ -591,14 +626,31 @@ fn build_update(
         }
         resulting_editors.retain(|e| !remove_editors.contains(e));
         update.editors = Some(ProtectedRangeEditors {
-            users: resulting_editors,
+            users: resulting_editors.clone(),
         });
         fields.push("editors");
     }
-    UpdateProtectedRangeRequest {
+    // The same server constraint `validate_verb` checks for `protect-range`
+    // — confirmed against the live API — applies here too, except the
+    // *resulting* state can come from either side: a target already
+    // warning-only that gains an editor, or a strict target whose editors
+    // survive a switch to warning-only. Both combine `existing`'s state
+    // with this call's overrides, which is why this check lives here
+    // rather than in `validate_verb`, which only ever sees the request.
+    let resulting_warning_only =
+        warning_only.unwrap_or_else(|| existing.warning_only.unwrap_or(false));
+    if resulting_warning_only && !resulting_editors.is_empty() {
+        return Err(
+            "this would leave the protection warning-only with editors set, which Sheets \
+             rejects: a warning-only protection never blocks an edit, so there is no one to \
+             exempt from it — drop --warning-only or remove every editor first"
+                .to_string(),
+        );
+    }
+    Ok(UpdateProtectedRangeRequest {
         protected_range: update,
         fields: fields.join(","),
-    }
+    })
 }
 
 fn added_protected_range_id(
@@ -873,7 +925,8 @@ mod tests {
             None,
             &["c@example.com".to_string()],
             &["a@example.com".to_string()],
-        );
+        )
+        .unwrap();
         let mut users = request.protected_range.editors.unwrap().users;
         users.sort();
         assert_eq!(users, vec!["b@example.com", "c@example.com"]);
@@ -889,9 +942,43 @@ mod tests {
             }),
             ..Default::default()
         };
-        let request = build_update(&existing, &Some("note".to_string()), None, &[], &[]);
+        let request = build_update(&existing, &Some("note".to_string()), None, &[], &[]).unwrap();
         assert!(request.protected_range.editors.is_none());
         assert_eq!(request.fields, "description");
+    }
+
+    #[test]
+    fn build_update_refuses_warning_only_with_editors_from_either_side() {
+        // The existing protection already carries an editor; switching it
+        // to warning-only must be refused rather than sent to a server that
+        // will reject it anyway.
+        let existing = ProtectedRange {
+            protected_range_id: Some(1),
+            editors: Some(ProtectedRangeEditors {
+                users: vec!["a@example.com".to_string()],
+            }),
+            ..Default::default()
+        };
+        let err = build_update(&existing, &None, Some(true), &[], &[]).unwrap_err();
+        assert!(err.contains("warning-only"), "{err}");
+
+        // The existing protection is already warning-only; adding an
+        // editor must be refused the same way, even with `warning_only`
+        // left untouched by this call.
+        let existing_warning_only = ProtectedRange {
+            protected_range_id: Some(1),
+            warning_only: Some(true),
+            ..Default::default()
+        };
+        let err = build_update(
+            &existing_warning_only,
+            &None,
+            None,
+            &["a@example.com".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("warning-only"), "{err}");
     }
 
     fn test_credentials() -> DriveCredentials {

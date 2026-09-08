@@ -4422,7 +4422,7 @@ Arguments:
 Options:
       --sheet <NAME>     Title of the sheet to copy
       --title <TITLE>    Title for the copy. Omitted takes Sheets' own "Copy of X" default. Must not already exist in the workbook (checked against the source's own title too — the source keeps its name)
-      --index <N>        Zero-based position for the copy. Omitted appends to the end
+      --index <N>        Zero-based position for the copy. Omitted takes Sheets' own default — confirmed against the live API to be the *front* of the workbook (index 0), not the end: unlike `add-sheet`, `duplicateSheetRequest` does not default to appending
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
