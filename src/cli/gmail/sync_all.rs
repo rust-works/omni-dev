@@ -395,6 +395,20 @@ async fn run_one_account(
 ) -> Result<SyncReport> {
     let client = client_for(account)
         .with_context(|| format!("account '{account}': failed to build a Gmail client"))?;
+    // Route rate-limit retry notices onto this account's own progress-bar
+    // message (#1651) instead of `retry_if`'s default `eprintln!`, which
+    // would tear the shared `MultiProgress` render and carry no account
+    // attribution.
+    if let Some(tx) = progress {
+        let tx = tx.clone();
+        client.set_retry_notify(Arc::new(move |status, delay_secs, attempt| {
+            let _ = tx.send(SyncProgressEvent::RateLimited {
+                status,
+                delay_secs,
+                attempt,
+            });
+        }));
+    }
     engine::run_sync_with_progress(&client, opts, progress)
         .await
         .with_context(|| format!("account '{account}': sync failed"))
@@ -952,6 +966,63 @@ accounts:
         )
         .await
         .unwrap();
+    }
+
+    // ── run_one_account wires progress into GmailClient's retry notify
+    //    (#1651) ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_one_account_routes_rate_limit_retries_through_the_progress_channel() {
+        let server = wiremock::MockServer::start().await;
+        mount_token(&server).await;
+        // First profile fetch is rate-limited; the retry succeeds.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_profile(&server).await;
+        mount_message_list(&server, &[]).await;
+
+        let client = bootstrapped_client(&server);
+        let dir = tempfile::tempdir().unwrap();
+        let opts = SyncOptions {
+            output_dir: dir.path().join("acct"),
+            query: None,
+            full: false,
+            concurrency: DEFAULT_SYNC_CONCURRENCY,
+            dry_run: false,
+            extract_attachments: false,
+            shared_pool: None,
+        };
+
+        let client = Mutex::new(Some(client));
+        let client_for: ClientFor = std::sync::Arc::new(move |_: &str| {
+            client
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("client used twice"))
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_one_account("acct-a", &opts, client_for.as_ref(), Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SyncProgressEvent::RateLimited { status: 429, .. })),
+            "expected a RateLimited event for the retried profile fetch, got {events:?}"
+        );
     }
 
     // ── SyncAllReportOutput::write_jsonl ──────────────────────────────────

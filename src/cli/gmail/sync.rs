@@ -16,6 +16,7 @@ pub(crate) mod state;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -26,7 +27,7 @@ use crate::cli::gmail::format::{output_as, write_scalar_jsonl, JsonlSerialize, O
 use crate::gmail::client::GmailClient;
 
 use engine::SyncOptions;
-use progress::SyncProgressBars;
+use progress::{SyncProgressBars, SyncProgressEvent};
 use report::{SyncAction, SyncError, SyncReport, SyncSummary};
 
 /// Default `--concurrency`: an in-flight-request cap layered under the
@@ -137,6 +138,17 @@ async fn run_sync_command(
         let (tx, rx) = mpsc::unbounded_channel();
         let bars = SyncProgressBars::new();
         let render_task = tokio::spawn(bars.drain(rx));
+        // Route rate-limit retry notices onto the fetch bar's own message
+        // (#1651) instead of `retry_if`'s default `eprintln!`, which would
+        // tear this live render.
+        let notify_tx = tx.clone();
+        client.set_retry_notify(Arc::new(move |status, delay_secs, attempt| {
+            let _ = notify_tx.send(SyncProgressEvent::RateLimited {
+                status,
+                delay_secs,
+                attempt,
+            });
+        }));
         let result = engine::run_sync_with_progress(client, &opts, Some(&tx)).await;
         // Dropping `tx` (rather than waiting for `run_sync_with_progress`'s
         // return to go out of scope) is what lets the renderer's

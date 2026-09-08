@@ -28,6 +28,17 @@ pub(crate) enum SyncProgressEvent {
     /// One fetch finished (success or failure) — advances the fetch bar's
     /// position by one.
     FetchCompleted { failed: bool },
+    /// A rate-limit-retryable response (Gmail's 429 or 403 quota-exhaustion
+    /// signal) is about to wait before retrying (#1651). Rendered as a
+    /// transient message on the account's own fetch bar — already prefixed
+    /// with the account label in `gmail sync-all` — instead of the shared
+    /// retry driver's default raw `eprintln!`, which would tear a live
+    /// `MultiProgress` render and carry no account attribution.
+    RateLimited {
+        status: u16,
+        delay_secs: u64,
+        attempt: u32,
+    },
 }
 
 /// The two live `indicatif` bars for a `gmail sync` run (listing spinner,
@@ -101,9 +112,25 @@ impl SyncProgressBars {
                 SyncProgressEvent::FetchCompleted { failed } => {
                     if failed {
                         errors += 1;
-                        self.fetch.set_message(format!("({errors} errors)"));
                     }
+                    // Always reset the message from the running error count
+                    // on completion — clears a transient `RateLimited`
+                    // notice left over from a retry that has since resolved.
+                    self.fetch.set_message(if errors > 0 {
+                        format!("({errors} errors)")
+                    } else {
+                        String::new()
+                    });
                     self.fetch.inc(1);
+                }
+                SyncProgressEvent::RateLimited {
+                    status,
+                    delay_secs,
+                    attempt,
+                } => {
+                    self.fetch.set_message(format!(
+                        "rate limited ({status}), retrying in {delay_secs}s (attempt {attempt})"
+                    ));
                 }
             }
         }
@@ -246,6 +273,50 @@ mod tests {
 
         assert!(listing.is_finished());
         assert!(fetch.is_finished());
+    }
+
+    // ── RateLimited (#1651) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rate_limited_event_sets_the_fetch_bar_message() {
+        let bars = SyncProgressBars::new();
+        let fetch = bars.fetch.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(SyncProgressEvent::RateLimited {
+            status: 429,
+            delay_secs: 2,
+            attempt: 1,
+        })
+        .unwrap();
+        drop(tx);
+        bars.drain(rx).await;
+
+        assert_eq!(
+            fetch.message(),
+            "rate limited (429), retrying in 2s (attempt 1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_completed_after_rate_limited_clears_the_message() {
+        let bars = SyncProgressBars::new();
+        let fetch = bars.fetch.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx.send(SyncProgressEvent::RateLimited {
+            status: 403,
+            delay_secs: 4,
+            attempt: 1,
+        })
+        .unwrap();
+        tx.send(SyncProgressEvent::FetchCompleted { failed: false })
+            .unwrap();
+        drop(tx);
+        bars.drain(rx).await;
+
+        assert_eq!(fetch.message(), "");
     }
 
     // ── new_in (#1504, ADR-0068's Decision 4 follow-up) ──────────────────

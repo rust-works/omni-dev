@@ -367,6 +367,7 @@ impl GoogleApiClient {
                 request_log::record_http_result(self.service, method, url, started, result);
             },
             |status, body| status == 429 || is_quota_exceeded(status, body),
+            None,
         )
         .await
         .with_context(|| format!("Failed to send {method} request to Drive API"))
