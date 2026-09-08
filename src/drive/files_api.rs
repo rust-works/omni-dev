@@ -7,13 +7,12 @@
 //! sibling concept has nothing to mirror here).
 
 use anyhow::{Context, Result};
-use base64::Engine;
-use rand::Rng;
 use url::Url;
 
 use crate::drive::client::DriveClient;
 use crate::drive::error::DriveError;
 use crate::drive::types::{DriveFile, FileListResponse};
+use crate::utils::multipart;
 
 /// Maximum `pageSize` accepted by `GET /drive/v3/files`.
 ///
@@ -265,12 +264,12 @@ impl<'a> FilesApi<'a> {
     ) -> Result<DriveFile> {
         check_upload_size(content.len() as u64)?;
         check_content_type(content_type)?;
-        let boundary = generate_multipart_boundary();
+        let boundary = multipart::generate_boundary();
         let metadata = serde_json::json!({
             "name": name,
             "parents": [parent_folder_id],
         });
-        let body = build_multipart_related_body(&metadata, content, content_type, &boundary);
+        let body = multipart::build_related_body(&metadata, content, content_type, &boundary);
         let url = build_file_upload_url(self.client.base_url())?;
         let response = self
             .client
@@ -369,7 +368,7 @@ pub(crate) fn check_upload_size(len: u64) -> Result<()> {
 ///
 /// [`FilesApi::upload`] splices `content_type` directly into a
 /// hand-assembled `multipart/related` body header line
-/// ([`build_multipart_related_body`]), which bypasses the CRLF rejection
+/// ([`multipart::build_related_body`]), which bypasses the CRLF rejection
 /// `reqwest`'s own `header()` already applies to a real HTTP header value
 /// (the mechanism protecting [`FilesApi::edit_content`]'s plain
 /// `Content-Type` header) — an unchecked value here could inject an extra
@@ -458,46 +457,6 @@ fn build_file_edit_content_url(base_url: &str, file_id: &str) -> Result<Url> {
         pairs.append_pair("supportsAllDrives", "true");
     }
     Ok(url)
-}
-
-/// A fresh, random `multipart/related` boundary — unlikely to collide with
-/// arbitrary binary content, unlike a fixed string would risk.
-fn generate_multipart_boundary() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    format!(
-        "omnidev-{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    )
-}
-
-/// Hand-assembles a `multipart/related` (RFC 2387) body for Drive's simple
-/// multipart upload endpoint.
-///
-/// Drive's upload endpoint requires exactly this format — two parts, a
-/// JSON metadata part followed by the raw content part — and rejects the
-/// `multipart/form-data` `reqwest::multipart::Form` would produce, so this
-/// can't just call into `reqwest`'s own multipart support. Pure and
-/// unit-tested at the byte level, since Drive is strict about this shape
-/// (exact `\r\n` placement, no trailing content after the closing
-/// boundary).
-fn build_multipart_related_body(
-    metadata: &serde_json::Value,
-    content: &[u8],
-    content_type: &str,
-    boundary: &str,
-) -> Vec<u8> {
-    let mut body = Vec::with_capacity(content.len() + 256);
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
-    body.extend_from_slice(metadata.to_string().as_bytes());
-    body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
-    body.extend_from_slice(content);
-    body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(format!("--{boundary}--").as_bytes());
-    body
 }
 
 fn build_export_url(base_url: &str, file_id: &str, mime_type: &str) -> Result<Url> {
@@ -1671,60 +1630,9 @@ mod tests {
         assert!(check_upload_size(MAX_UPLOAD_BYTES).is_ok());
     }
 
-    // ── build_multipart_related_body ────────────────────────────────
-
-    #[test]
-    fn multipart_body_has_two_parts_separated_by_the_boundary() {
-        let metadata = serde_json::json!({"name": "photo.jpg", "parents": ["p1"]});
-        let body = build_multipart_related_body(&metadata, b"JPEGDATA", "image/jpeg", "BOUNDARY");
-        let body_str = String::from_utf8(body).unwrap();
-        assert_eq!(
-            body_str,
-            "--BOUNDARY\r\n\
-             Content-Type: application/json; charset=UTF-8\r\n\r\n\
-             {\"name\":\"photo.jpg\",\"parents\":[\"p1\"]}\r\n\
-             --BOUNDARY\r\n\
-             Content-Type: image/jpeg\r\n\r\n\
-             JPEGDATA\r\n\
-             --BOUNDARY--"
-        );
-    }
-
-    #[test]
-    fn multipart_body_preserves_binary_content_byte_for_byte() {
-        let metadata = serde_json::json!({"name": "bin"});
-        let binary_content: Vec<u8> = vec![0x00, 0xFF, 0x0D, 0x0A, 0x2D, 0x2D, 0x01];
-        let body = build_multipart_related_body(
-            &metadata,
-            &binary_content,
-            "application/octet-stream",
-            "B",
-        );
-        // The exact byte sequence must appear intact, unmangled by any
-        // text-mode transformation.
-        let needle_pos = body
-            .windows(binary_content.len())
-            .position(|w| w == binary_content.as_slice());
-        assert!(
-            needle_pos.is_some(),
-            "binary content not found intact in body"
-        );
-    }
-
-    #[test]
-    fn multipart_body_ends_with_the_closing_boundary_no_trailing_bytes() {
-        let metadata = serde_json::json!({});
-        let body = build_multipart_related_body(&metadata, b"x", "text/plain", "B");
-        assert!(body.ends_with(b"--B--"));
-    }
-
-    #[test]
-    fn generate_multipart_boundary_produces_distinct_values() {
-        let a = generate_multipart_boundary();
-        let b = generate_multipart_boundary();
-        assert_ne!(a, b);
-        assert!(a.starts_with("omnidev-"));
-    }
+    // `build_related_body` / `generate_boundary` moved to
+    // `crate::utils::multipart` (shared with `gmail insert`); their
+    // byte-level tests moved with them.
 
     // ── build_file_upload_url ───────────────────────────────────────
 

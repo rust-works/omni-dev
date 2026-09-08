@@ -4,6 +4,7 @@ pub mod ai_scratch;
 pub(crate) mod browser_command;
 pub mod env;
 pub(crate) mod http;
+pub(crate) mod multipart;
 pub(crate) mod path;
 pub mod preflight;
 pub(crate) mod rate_limit;
