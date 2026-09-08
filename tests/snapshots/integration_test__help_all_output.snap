@@ -5248,6 +5248,7 @@ Commands:
   sync-all             Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
   extract-attachments  Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
   render               Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
+  insert               Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
   help                 Print this message or the help of the given subcommand(s)
 
 Options:
@@ -5401,6 +5402,33 @@ Options:
       --quiet               Only shows errors, suppresses the per-message action lines
   -o, --output <OUTPUT>     Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail insert - Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
+
+Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
+
+Usage: insert [OPTIONS] --archive-dir <PATH>
+
+Options:
+      --archive-dir <PATH>         Archive directory previously populated by `gmail sync`/`sync-all`
+      --all                        Selects every non-deleted archived message
+      --since <DATE>               Selects messages with an internal date on or after this UTC date (`YYYY-MM-DD`)
+      --until <DATE>               Selects messages with an internal date on or before this UTC date (`YYYY-MM-DD`), inclusive of the whole day
+      --id <ID>                    Selects one specific archived message id. Repeatable
+      --ids-from <FILE>            Selects message ids listed one per line in FILE (`-` for stdin); blank lines and `#`-prefixed comments are skipped — the same shape a `--dry-run` report's ids can be piped back through
+      --source-label <LABEL_ID>    Selects messages carrying this Gmail label id in the archived manifest (a raw label id, e.g. `Label_1` — not the destination `--label` tag `gmail insert` itself applies)
+      --limit <LIMIT>              Caps how many selected messages are inserted, applied after selection to the oldest-first plan. `0` means no limit [default: 0]
+      --label <NAME>               Tags every inserted message with this label, resolved by name against the destination mailbox's existing labels. Never auto-created — since inserted mail's raw headers still name the *original* recipient, `to:` searches won't match it, making this tag the only reliable handle for "what came from the archive"
+      --drop-label <LABEL_ID>      Drops this label id from a message's replayed system-label set (applied after the system-label filter). Repeatable — e.g. `--drop-label INBOX --drop-label UNREAD` restores mail as already-read and archived rather than dumping it into a live Inbox
+      --concurrency <CONCURRENCY>  Bounds concurrent inserts. Clamped to `1..=gmail::messages_api::MAX_CONCURRENCY` [default: 4]
+      --verify-remote              Before inserting, probes the destination for a message already carrying the same `Message-ID` (`rfc822msgid:` search) and skips it on a hit. A supplement to the local ledger, not a substitute — the probe costs quota and a round-trip per message and can lag a recent insert by seconds to minutes; useful mainly for a first run into a mailbox that may already hold some of this mail, or as a recovery probe after losing the ledger
+      --dry-run                    Reports what would be inserted without making any `messages.insert` call or writing the ledger
+      --quiet                      Only shows errors, suppresses per-message action lines and the live progress bar
+  -o, --output <OUTPUT>            Report format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================
