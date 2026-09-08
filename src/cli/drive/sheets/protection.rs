@@ -301,3 +301,131 @@ async fn run_protection(
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::sheets::types::GridRange;
+    use crate::utils::secret::Secret;
+
+    #[test]
+    fn render_grid_range_whole_sheet_when_all_bounds_none() {
+        let range = GridRange {
+            sheet_id: 0,
+            ..Default::default()
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0 (whole sheet)");
+    }
+
+    #[test]
+    fn render_grid_range_rows_only() {
+        let range = GridRange {
+            sheet_id: 0,
+            start_row_index: Some(0),
+            end_row_index: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0, rows 1-5");
+    }
+
+    #[test]
+    fn render_grid_range_cols_only() {
+        let range = GridRange {
+            sheet_id: 0,
+            start_column_index: Some(0),
+            end_column_index: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0, cols 1-2");
+    }
+
+    #[test]
+    fn render_grid_range_rows_and_cols() {
+        let range = GridRange {
+            sheet_id: 3,
+            start_row_index: Some(0),
+            end_row_index: Some(5),
+            start_column_index: Some(0),
+            end_column_index: Some(2),
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 3, rows 1-5, cols 1-2");
+    }
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    #[tokio::test]
+    async fn list_protections_prints_every_protected_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Sheet1"},
+                        "protectedRanges": [
+                            {
+                                "protectedRangeId": 1,
+                                "range": {
+                                    "sheetId": 0,
+                                    "startRowIndex": 0,
+                                    "endRowIndex": 5,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 2,
+                                },
+                                "description": "locked",
+                                "warningOnly": true,
+                                "editors": {"users": ["a@example.com", "b@example.com"]},
+                            },
+                            {"protectedRangeId": 2},
+                        ],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListProtectionsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+}

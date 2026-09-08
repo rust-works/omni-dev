@@ -588,6 +588,89 @@ mod tests {
     }
 
     #[test]
+    fn custom_formula_builds_a_single_value() {
+        let condition = Condition::CustomFormula("=A1>0".to_string());
+        let built = condition.into_boolean_condition();
+        assert_eq!(built.condition_type, "CUSTOM_FORMULA");
+        assert_eq!(built.values.len(), 1);
+        assert_eq!(built.values[0].user_entered_value, "=A1>0");
+    }
+
+    #[test]
+    fn log_type_covers_every_condition() {
+        let types = [
+            Condition::OneOfList(vec!["a".to_string()]).log_type(),
+            Condition::NumberBetween(1.0, 2.0).log_type(),
+            Condition::Checkbox.log_type(),
+            Condition::CustomFormula("=TRUE".to_string()).log_type(),
+        ];
+        let unique: HashSet<&&str> = types.iter().collect();
+        assert_eq!(unique.len(), types.len());
+    }
+
+    fn set_verb(condition: Condition, show_warning: bool) -> ValidationVerb {
+        ValidationVerb::SetDataValidation {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A10".to_string()),
+            condition,
+            input_message: None,
+            show_warning,
+        }
+    }
+
+    fn clear_verb() -> ValidationVerb {
+        ValidationVerb::ClearDataValidation {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A10".to_string()),
+        }
+    }
+
+    #[test]
+    fn log_operation_and_label_cover_every_verb() {
+        let set = set_verb(Condition::Checkbox, false);
+        let clear = clear_verb();
+        assert_eq!(set.log_operation(), "sheets-set-data-validation");
+        assert_eq!(clear.log_operation(), "sheets-clear-data-validation");
+        assert_eq!(set.label(), "set-data-validation");
+        assert_eq!(clear.label(), "clear-data-validation");
+    }
+
+    #[test]
+    fn describe_effect_covers_every_condition_and_strictness() {
+        let reject = describe_effect(&set_verb(
+            Condition::OneOfList(vec!["a".to_string()]),
+            false,
+        ));
+        assert!(reject.contains("reject invalid entries"), "{reject}");
+        assert!(reject.contains("one of list"), "{reject}");
+
+        let warn = describe_effect(&set_verb(Condition::NumberBetween(1.0, 10.0), true));
+        assert!(warn.contains("warn only"), "{warn}");
+        assert!(warn.contains("number between"), "{warn}");
+
+        let checkbox = describe_effect(&set_verb(Condition::Checkbox, false));
+        assert!(checkbox.contains("boolean"), "{checkbox}");
+
+        let formula = describe_effect(&set_verb(
+            Condition::CustomFormula("=A1>0".to_string()),
+            false,
+        ));
+        assert!(formula.contains("custom formula"), "{formula}");
+
+        assert_eq!(describe_effect(&clear_verb()), "clear data validation");
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_valid_number_between() {
+        validate_condition(&Condition::NumberBetween(1.0, 10.0)).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_non_empty_custom_formula() {
+        validate_condition(&Condition::CustomFormula("=A1>0".to_string())).unwrap();
+    }
+
+    #[test]
     fn validate_condition_rejects_an_empty_one_of_list() {
         let err = validate_condition(&Condition::OneOfList(Vec::new())).unwrap_err();
         assert!(err.contains("at least one value"), "{err}");
@@ -778,5 +861,458 @@ mod tests {
         let rule = &body["requests"][0]["setDataValidation"]["rule"];
         assert_eq!(rule["condition"]["type"], "ONE_OF_LIST");
         assert_eq!(rule["strict"], true);
+    }
+
+    #[tokio::test]
+    async fn clear_data_validation_full_apply_flow() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: clear_verb(),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        assert!(body["requests"][0]["setDataValidation"]["rule"].is_null());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_would_change_without_calling_batch_update() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: true,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ValidationResult::WouldChange { .. }
+        ));
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn compose_error_returns_refused_invalid_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: None,
+                range: None,
+                condition: Condition::Checkbox,
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("a range is required"), "{detail}");
+        assert!(outcome.file_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_condition_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::NumberBetween(10.0, 1.0), false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("must not exceed"), "{detail}");
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path().starts_with("/drive/v3/files")));
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(outcome.result, ValidationResult::Failed { .. }));
+        assert!(outcome.file_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn shortcut_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(outcome.result, ValidationResult::RefusedShortcut));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn not_a_spreadsheet_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "application/pdf", &["folder-1"])
+            .mount(&server)
+            .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(
+            outcome.result,
+            ValidationResult::RefusedNotASpreadsheet { ref mime_type } if mime_type == "application/pdf"
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(
+            outcome.result,
+            ValidationResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn gate_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(outcome.result, ValidationResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn workbook_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn sheet_not_found_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Nope".to_string()),
+                range: Some("A1:A10".to_string()),
+                condition: Condition::Checkbox,
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        let ValidationResult::RefusedSheetNotFound { title, available } = &outcome.result else {
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result);
+        };
+        assert_eq!(title, "Nope");
+        assert_eq!(available, &["Q1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invalid_grid_range_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Q1".to_string()),
+                range: Some("??".to_string()),
+                condition: Condition::Checkbox,
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ValidationResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_update_failure_is_reported_as_failed_not_changed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "code": 403,
+                        "message": "The caller does not have permission",
+                        "status": "PERMISSION_DENIED",
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Failed { .. }));
+    }
+
+    fn every_validation_result() -> Vec<ValidationResult> {
+        let all = vec![
+            ValidationResult::WouldChange {
+                summary: "set data validation".to_string(),
+            },
+            ValidationResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            ValidationResult::RefusedShortcut,
+            ValidationResult::RefusedNoVisibleParents,
+            ValidationResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec!["Q1".to_string(), "Q2".to_string()],
+            },
+            ValidationResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: Vec::new(),
+            },
+            ValidationResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+            ValidationResult::Blocked { decided_by: None },
+            ValidationResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+            ValidationResult::Changed {
+                summary: "set data validation".to_string(),
+            },
+            ValidationResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ];
+        // Compile-time exhaustiveness: a new variant fails to match here.
+        for result in &all {
+            match result {
+                ValidationResult::WouldChange { .. }
+                | ValidationResult::RefusedNotASpreadsheet { .. }
+                | ValidationResult::RefusedShortcut
+                | ValidationResult::RefusedNoVisibleParents
+                | ValidationResult::RefusedSheetNotFound { .. }
+                | ValidationResult::RefusedInvalidRange { .. }
+                | ValidationResult::Blocked { .. }
+                | ValidationResult::Changed { .. }
+                | ValidationResult::Failed { .. } => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn describe_lines_covers_every_result_for_every_verb() {
+        for verb in [clear_verb(), set_verb(Condition::Checkbox, false)] {
+            for result in every_validation_result() {
+                let outcome = ValidationOutcome {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    file_name: Some("Budget".to_string()),
+                    resolved_folder_id: None,
+                    verb: verb.clone(),
+                    result,
+                };
+                let lines = describe_lines(&outcome);
+                assert_eq!(lines.len(), 1, "{:?}", outcome.result);
+                assert_eq!(describe(&outcome), lines.join("\n"));
+                for rendered in &lines {
+                    assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_status_covers_every_variant() {
+        let statuses: HashSet<&'static str> = every_validation_result()
+            .iter()
+            .map(ValidationResult::log_status)
+            .collect();
+        // 9 `ValidationResult` variants; `every_validation_result` lists 11
+        // entries so it can also exercise `RefusedSheetNotFound`'s and
+        // `Blocked`'s two shapes each, which share a `log_status`.
+        assert_eq!(statuses.len(), 9);
+        assert!(statuses.iter().all(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = ValidationOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: clear_verb(),
+            result: ValidationResult::Changed {
+                summary: "clear data validation".to_string(),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
     }
 }

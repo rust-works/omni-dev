@@ -1932,6 +1932,81 @@ mod tests {
     }
 
     #[test]
+    fn build_drive_mutation_record_includes_the_formatting_validation_and_protection_keys() {
+        // issue #1643: the formatting/validation/protection verbs' new
+        // context keys, including the three collection fields that only
+        // write a key when non-empty (`discarded_cells`,
+        // `protection_editors_added`, `protection_editors_removed`).
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-merge-cells",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "changed".to_string(),
+                fields_changed: Some("merged A1:B2".to_string()),
+                discarded_cells: vec!["B1: gone".to_string()],
+                validation_type: Some("ONE_OF_LIST".to_string()),
+                protected_range_id: Some(42),
+                protection_editors_added: vec!["alice@example.com".to_string()],
+                protection_editors_removed: vec!["bob@example.com".to_string()],
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("fields_changed").map(String::as_str),
+            Some("merged A1:B2")
+        );
+        assert_eq!(
+            rec.context.get("discarded_cells").map(String::as_str),
+            Some("B1: gone")
+        );
+        assert_eq!(
+            rec.context.get("validation_type").map(String::as_str),
+            Some("ONE_OF_LIST")
+        );
+        assert_eq!(
+            rec.context.get("protected_range_id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            rec.context
+                .get("protection_editors_added")
+                .map(String::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            rec.context
+                .get("protection_editors_removed")
+                .map(String::as_str),
+            Some("bob@example.com")
+        );
+    }
+
+    #[test]
+    fn build_drive_mutation_record_omits_the_formatting_validation_and_protection_keys_when_unset()
+    {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-write",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "written".to_string(),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.context.get("fields_changed"), None);
+        assert_eq!(rec.context.get("discarded_cells"), None);
+        assert_eq!(rec.context.get("validation_type"), None);
+        assert_eq!(rec.context.get("protected_range_id"), None);
+        assert_eq!(rec.context.get("protection_editors_added"), None);
+        assert_eq!(rec.context.get("protection_editors_removed"), None);
+    }
+
+    #[test]
     fn build_drive_mutation_record_records_both_titles_for_a_rename() {
         // The one structural verb whose effect is otherwise unrecoverable
         // from its record: `sheet_title` necessarily holds the *old* title.

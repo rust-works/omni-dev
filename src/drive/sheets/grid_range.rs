@@ -229,6 +229,7 @@ pub(crate) fn parse_grid_range(sheet_id: i64, range: &str) -> Result<GridRange, 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::drive::sheets::types::{Sheet, SheetProperties};
 
     #[test]
     fn column_letters_to_index_single_and_double_letters() {
@@ -359,5 +360,56 @@ mod tests {
         assert!(is_bounded(&bounded));
         let open_column = parse_grid_range(1, "A:A").unwrap();
         assert!(!is_bounded(&open_column));
+    }
+
+    #[test]
+    fn a_bare_column_letter_with_no_colon() {
+        let g = parse_grid_range(1, "C").unwrap();
+        assert_eq!(g.start_column_index, Some(2));
+        assert_eq!(g.end_column_index, Some(3));
+        assert_eq!(g.start_row_index, None);
+        assert_eq!(g.end_row_index, None);
+    }
+
+    #[test]
+    fn a_bare_row_number_with_no_colon() {
+        let g = parse_grid_range(1, "5").unwrap();
+        assert_eq!(g.start_row_index, Some(4));
+        assert_eq!(g.end_row_index, Some(5));
+        assert_eq!(g.start_column_index, None);
+        assert_eq!(g.end_column_index, None);
+    }
+
+    #[test]
+    fn a_range_with_one_unparseable_side_is_rejected() {
+        let err = parse_grid_range(1, "A1:!!!").unwrap_err();
+        assert!(err.contains("not a recognised A1 range"), "{err}");
+    }
+
+    fn workbook_with_sheet(sheet_id: i64, title: &str) -> Spreadsheet {
+        Spreadsheet {
+            sheets: vec![Sheet {
+                properties: Some(SheetProperties {
+                    sheet_id: Some(sheet_id),
+                    title: title.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_grid_range_rejects_a_range_with_no_sheet_prefix() {
+        let workbook = workbook_with_sheet(0, "Q1");
+        let err = resolve_grid_range(
+            &workbook,
+            "A1:B2",
+            |detail| detail,
+            |t, a| format!("{t} {a:?}"),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not name a sheet"), "{err}");
     }
 }
