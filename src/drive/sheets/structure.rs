@@ -1455,7 +1455,10 @@ fn describe_would_change(
                 |title| format!(" as '{title}'"),
             );
             let position = index.map_or_else(
-                || " at the end".to_string(),
+                // Confirmed against the live API: unlike `add-sheet`,
+                // `duplicateSheetRequest` does not default to appending —
+                // an omitted index lands the copy at the *front* (index 0).
+                || " at the front (Sheets' default; not the end)".to_string(),
                 |index| format!(" at index {index}"),
             );
             vec![format!(

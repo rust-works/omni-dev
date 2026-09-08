@@ -411,7 +411,10 @@ pub struct DuplicateSheetRequest {
     /// The sheet to copy.
     #[serde(rename = "sourceSheetId")]
     pub source_sheet_id: i64,
-    /// Where the copy lands. `None` appends, matching [`NewSheetProperties::index`].
+    /// Where the copy lands. `None` takes Sheets' own default — confirmed
+    /// against the live API to be the *front* of the workbook (index 0),
+    /// unlike [`NewSheetProperties::index`], whose `None` really does
+    /// append.
     #[serde(skip_serializing_if = "Option::is_none", rename = "insertSheetIndex")]
     pub insert_sheet_index: Option<i64>,
     /// The copy's title. `None` takes Sheets' own "Copy of X" default.
