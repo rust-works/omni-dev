@@ -519,6 +519,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shift_dimension_as_str_matches_the_wire_spelling() {
+        assert_eq!(ShiftDimension::Rows.as_str(), "ROWS");
+        assert_eq!(ShiftDimension::Columns.as_str(), "COLUMNS");
+    }
+
+    #[test]
     fn spreadsheet_parses_a_realistic_fields_masked_response() {
         let json = serde_json::json!({
             "spreadsheetId": "sheet-1",

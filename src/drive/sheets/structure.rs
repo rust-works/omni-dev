@@ -1756,6 +1756,14 @@ mod tests {
         }
     }
 
+    fn delete_columns() -> StructureVerb {
+        StructureVerb::DeleteColumns {
+            sheet: "Q2".to_string(),
+            at: 3,
+            count: 2,
+        }
+    }
+
     fn delete_range() -> StructureVerb {
         StructureVerb::DeleteRange {
             sheet: "Q2".to_string(),
@@ -1764,6 +1772,20 @@ mod tests {
             start_column: 2,
             end_column: 3,
             shift: ShiftDimension::Rows,
+        }
+    }
+
+    /// [`delete_range`]'s twin with the other shift axis, so the `COLUMNS`
+    /// wire value and "shift ... left" wording get exercised too — `Rows` is
+    /// otherwise the only [`ShiftDimension`] any test ever names.
+    fn delete_range_columns_shift() -> StructureVerb {
+        StructureVerb::DeleteRange {
+            sheet: "Q2".to_string(),
+            start_row: 2,
+            end_row: 4,
+            start_column: 2,
+            end_column: 3,
+            shift: ShiftDimension::Columns,
         }
     }
 
@@ -2875,6 +2897,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_columns_sends_a_zero_based_half_open_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_columns(), false),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(describe(&outcome).contains("Deleted 2 column(s) 3-4"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let delete = &body["requests"][0]["deleteDimension"];
+        assert_eq!(delete["range"]["dimension"], "COLUMNS");
+        assert_eq!(delete["range"]["sheetId"], 118_293);
+        // `--at 3 --count 2` on the wire, 1-based inclusive to 0-based
+        // half-open.
+        assert_eq!(delete["range"]["startIndex"], 2);
+        assert_eq!(delete["range"]["endIndex"], 4);
+    }
+
+    #[tokio::test]
     async fn delete_range_sends_a_zero_based_half_open_grid_range() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -2910,6 +2969,40 @@ mod tests {
         assert_eq!(delete["range"]["startColumnIndex"], 1);
         assert_eq!(delete["range"]["endColumnIndex"], 3);
         assert_eq!(delete["shiftDimension"], "ROWS");
+    }
+
+    #[tokio::test]
+    async fn delete_range_with_columns_shift_sends_the_column_direction() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(delete_range_columns_shift(), false),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(describe(&outcome).contains("shifted remaining cells left"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        assert_eq!(
+            body["requests"][0]["deleteRange"]["shiftDimension"],
+            "COLUMNS"
+        );
     }
 
     #[tokio::test]
@@ -2972,6 +3065,273 @@ mod tests {
             outcome.result,
             StructureResult::RefusedInvalidRange { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn delete_dimension_refuses_a_non_positive_count() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRows {
+                    sheet: "Q2".to_string(),
+                    at: 1,
+                    count: 0,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--count must be at least 1"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn delete_dimension_refuses_an_at_below_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteColumns {
+                    sheet: "Q2".to_string(),
+                    at: 0,
+                    count: 1,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--at must be at least 1"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn delete_dimension_refuses_an_at_and_count_that_overflow_the_index_space() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRows {
+                    sheet: "Q2".to_string(),
+                    at: i64::MAX,
+                    count: 2,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("overflows the row index space"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn delete_range_refuses_a_start_row_below_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 0,
+                    end_row: 2,
+                    start_column: 1,
+                    end_column: 2,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--start-row must be at least 1"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_range_refuses_a_start_column_below_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 1,
+                    end_row: 2,
+                    start_column: 0,
+                    end_column: 2,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--start-column must be at least 1"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_range_refuses_an_end_column_before_start_column() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Rows are well-ordered on their own; only the columns are inverted,
+        // so this is refused for a different reason than
+        // `delete_range_with_end_before_start_is_refused`.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 1,
+                    end_row: 2,
+                    start_column: 5,
+                    end_column: 2,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--end-column (2) must be at or after --start-column (5)"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_range_refuses_an_end_row_past_the_end_of_the_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Q2 has 500 rows.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 1,
+                    end_row: 501,
+                    start_column: 1,
+                    end_column: 2,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--end-row 501 is past the end of the sheet"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_range_refuses_an_end_column_past_the_end_of_the_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Q2 has 10 columns.
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DeleteRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 1,
+                    end_row: 2,
+                    start_column: 1,
+                    end_column: 11,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[delete_allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--end-column 11 is past the end of the sheet"),
+            "{detail}"
+        );
     }
 
     #[tokio::test]
@@ -3211,9 +3571,16 @@ mod tests {
             add_sheet(),
             rename(),
             insert_rows(),
+            StructureVerb::InsertColumns {
+                sheet: "Q2".to_string(),
+                at: 2,
+                count: 1,
+            },
             delete_sheet(),
             delete_rows(),
+            delete_columns(),
             delete_range(),
+            delete_range_columns_shift(),
         ] {
             // A verb with a single axis (insert or delete-dimension) earns a
             // second `WouldChange` line for the shift; every other verb,
@@ -3251,6 +3618,91 @@ mod tests {
                 assert_eq!(describe(&outcome), lines.join("\n"));
             }
         }
+    }
+
+    /// [`describe_would_delete_dimension`]'s own defensive branches, reached
+    /// with arguments `validate_verb_args` would already have refused (an
+    /// overflowing `--at`/`--count`) or a workbook snapshot the real pipeline
+    /// never hands it (`sheet: None`, or a size too small to subtract
+    /// `count` from) — the `describe_lines(&outcome)` bypass used above lets
+    /// a test construct exactly that, the same way
+    /// `dimension_range_label_omits_a_span_it_cannot_compute` does for
+    /// `record_attempt`'s logging path.
+    #[test]
+    fn describe_would_delete_dimension_handles_unvalidated_edge_cases() {
+        let would_change = |verb: StructureVerb, sheet: Option<SheetSnapshot>| StructureOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb,
+            result: StructureResult::WouldChange {
+                sheet,
+                sheet_count: 2,
+            },
+        };
+        // `sheet_id: None` keeps every expected string free of the
+        // `(sheetId N)` suffix, which is orthogonal to what this test checks.
+        let sheet_with_columns = |column_count| SheetSnapshot {
+            sheet_id: None,
+            title: "Q2".to_string(),
+            row_count: None,
+            column_count: Some(column_count),
+        };
+
+        // `--at`/`--count` overflowing the `last` computation: no dash-range
+        // or shift line, just the plain summary.
+        let overflow = describe(&would_change(
+            StructureVerb::DeleteColumns {
+                sheet: "Q2".to_string(),
+                at: i64::MAX,
+                count: 2,
+            },
+            Some(sheet_with_columns(26)),
+        ));
+        assert!(
+            overflow.contains("Would delete 2 column(s) from column"),
+            "{overflow}"
+        );
+        assert!(!overflow.contains('-'), "{overflow}");
+
+        // No sheet snapshot at all: the shift line needs a real "before"
+        // size, so it is omitted rather than guessed.
+        let no_sheet = describe(&would_change(delete_columns(), None));
+        assert_eq!(no_sheet, "Would delete 2 column(s) 3-4 of 'Q2' in 'Budget'");
+
+        // A `before` too small for `count` to subtract from without
+        // underflowing `i64::MIN`: also omitted rather than reported wrong.
+        let after_underflows = describe(&would_change(
+            StructureVerb::DeleteColumns {
+                sheet: "Q2".to_string(),
+                at: 0,
+                count: i64::MAX,
+            },
+            Some(sheet_with_columns(-2)),
+        ));
+        assert_eq!(
+            after_underflows,
+            format!(
+                "Would delete {} column(s) 0-{} of 'Q2' in 'Budget'",
+                i64::MAX,
+                i64::MAX - 1
+            )
+        );
+
+        // Deleting exactly through the sheet's last column: "nothing
+        // remains", not an inverted "existing N-M shift".
+        let to_the_end = describe(&would_change(
+            StructureVerb::DeleteColumns {
+                sheet: "Q2".to_string(),
+                at: 25,
+                count: 2,
+            },
+            Some(sheet_with_columns(26)),
+        ));
+        assert!(
+            to_the_end.contains("nothing remains after the deleted columns"),
+            "{to_the_end}"
+        );
     }
 
     #[test]

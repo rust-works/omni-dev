@@ -481,6 +481,18 @@ mod tests {
     }
 
     #[test]
+    fn shift_arg_maps_onto_the_engine_dimension() {
+        assert_eq!(
+            crate::drive::sheets::types::ShiftDimension::from(ShiftArg::Rows),
+            crate::drive::sheets::types::ShiftDimension::Rows
+        );
+        assert_eq!(
+            crate::drive::sheets::types::ShiftDimension::from(ShiftArg::Columns),
+            crate::drive::sheets::types::ShiftDimension::Columns
+        );
+    }
+
+    #[test]
     fn sanitize_rendered_strips_escapes_from_an_injected_sheet_title() {
         let clean = sanitize_rendered(&line(
             "Refused: 'Budget' has no sheet titled 'Q9'. Available: '\u{1b}[31mQ1\u{7}'",
