@@ -90,13 +90,22 @@ pub struct UpdateProtectionCommand {
 
     /// A1 range identifying the existing protection, optionally carrying
     /// its own `Sheet!` prefix. Must match exactly — see
-    /// `drive sheets list-protections`.
+    /// `drive sheets list-protections`. Mutually exclusive with
+    /// `--whole-sheet`.
     #[arg(long, value_name = "A1")]
     pub range: Option<String>,
 
-    /// Sheet (tab) title. Supplies the prefix for a bare `--range`.
+    /// Sheet (tab) title. Supplies the prefix for a bare `--range`, or the
+    /// target sheet directly with `--whole-sheet`.
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
+
+    /// Target the whole-sheet protection on `--sheet`, rather than one
+    /// covering a range within it — the only way to reach a protection
+    /// created with `protect-range --whole-sheet`, which has no range of
+    /// its own to match against.
+    #[arg(long)]
+    pub whole_sheet: bool,
 
     /// The new description.
     #[arg(long, value_name = "TEXT")]
@@ -132,6 +141,7 @@ impl UpdateProtectionCommand {
             verb: ProtectionVerb::UpdateProtection {
                 sheet: self.sheet,
                 range: self.range,
+                whole_sheet: self.whole_sheet,
                 description: self.description,
                 warning_only: self.warning_only,
                 add_editors: self.add_editors,
@@ -151,13 +161,22 @@ pub struct UnprotectRangeCommand {
     pub spreadsheet_id: String,
 
     /// A1 range identifying the protection to remove, optionally carrying
-    /// its own `Sheet!` prefix. Must match exactly.
+    /// its own `Sheet!` prefix. Must match exactly. Mutually exclusive with
+    /// `--whole-sheet`.
     #[arg(long, value_name = "A1")]
     pub range: Option<String>,
 
-    /// Sheet (tab) title. Supplies the prefix for a bare `--range`.
+    /// Sheet (tab) title. Supplies the prefix for a bare `--range`, or the
+    /// target sheet directly with `--whole-sheet`.
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
+
+    /// Target the whole-sheet protection on `--sheet`, rather than one
+    /// covering a range within it — the only way to reach a protection
+    /// created with `protect-range --whole-sheet`, which has no range of
+    /// its own to match against.
+    #[arg(long)]
+    pub whole_sheet: bool,
 
     /// Reports the gate verdict and the change that would be made, without
     /// calling `spreadsheets.batchUpdate`.
@@ -177,6 +196,7 @@ impl UnprotectRangeCommand {
             verb: ProtectionVerb::UnprotectRange {
                 sheet: self.sheet,
                 range: self.range,
+                whole_sheet: self.whole_sheet,
             },
             dry_run: self.dry_run,
         };

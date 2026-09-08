@@ -4723,8 +4723,9 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>       A1 range identifying the protection to remove, optionally carrying its own `Sheet!` prefix. Must match exactly
-      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>       A1 range identifying the protection to remove, optionally carrying its own `Sheet!` prefix. Must match exactly. Mutually exclusive with `--whole-sheet`
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
+      --whole-sheet      Target the whole-sheet protection on `--sheet`, rather than one covering a range within it — the only way to reach a protection created with `protect-range --whole-sheet`, which has no range of its own to match against
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
@@ -4790,8 +4791,9 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>             A1 range identifying the existing protection, optionally carrying its own `Sheet!` prefix. Must match exactly — see `drive sheets list-protections`
-      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>             A1 range identifying the existing protection, optionally carrying its own `Sheet!` prefix. Must match exactly — see `drive sheets list-protections`. Mutually exclusive with `--whole-sheet`
+      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
+      --whole-sheet            Target the whole-sheet protection on `--sheet`, rather than one covering a range within it — the only way to reach a protection created with `protect-range --whole-sheet`, which has no range of its own to match against
       --description <TEXT>     The new description
       --warning-only <BOOL>    The new warning-only flag [possible values: true, false]
       --add-editor <EMAIL>     An editor to add. Repeatable

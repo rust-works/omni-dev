@@ -645,17 +645,26 @@ fn resolve_target(
         | FormatVerb::MergeCells { .. }
         | FormatVerb::UnmergeCells { .. } => {
             let composed = composed_range.unwrap_or_default();
-            let Some((title, bare_range)) = a1::split_sheet_prefix(composed) else {
+            let (title, grid) = grid_range::resolve_grid_range(
+                workbook,
+                composed,
+                |detail| FormatResult::RefusedInvalidRange { detail },
+                |title, available| FormatResult::RefusedSheetNotFound { title, available },
+            )?;
+            // Merging needs a fixed extent: its preview (and the request
+            // log) must name exactly which cells would be discarded, and an
+            // open-ended column/row range (`A:A`) has no fixed extent to
+            // check that against.
+            if matches!(verb, FormatVerb::MergeCells { .. }) && !grid_range::is_bounded(&grid) {
                 return Err(FormatResult::RefusedInvalidRange {
                     detail: format!(
-                        "'{composed}' does not name a sheet; pass --sheet, or a --range \
-                         carrying its own 'Sheet!' prefix"
+                        "'{}' is open-ended; merge-cells needs a fully bounded range (e.g. \
+                         A1:D20) so its preview can name exactly what would be discarded",
+                        a1::split_sheet_prefix(composed)
+                            .map_or(composed, |(_, bare_range)| bare_range)
                     ),
                 });
-            };
-            let sheet_id = find_sheet_id(workbook, &title)?;
-            let grid = grid_range::parse_grid_range(sheet_id, bare_range)
-                .map_err(|detail| FormatResult::RefusedInvalidRange { detail })?;
+            }
             Ok(ResolvedTarget::Range {
                 sheet_title: title,
                 grid,
@@ -665,16 +674,9 @@ fn resolve_target(
 }
 
 fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, FormatResult> {
-    workbook
-        .sheets
-        .iter()
-        .filter_map(|sheet| sheet.properties.as_ref())
-        .find(|props| props.title == title)
-        .and_then(|props| props.sheet_id)
-        .ok_or_else(|| FormatResult::RefusedSheetNotFound {
-            title: title.to_string(),
-            available: workbook.sheet_titles(),
-        })
+    grid_range::find_sheet_id(workbook, title, |title, available| {
+        FormatResult::RefusedSheetNotFound { title, available }
+    })
 }
 
 /// Reads the current values of a `merge-cells` target range, returning
@@ -710,12 +712,20 @@ async fn read_discarded_cells(
         .values_get(spreadsheet_id, &a1_range, ValueRenderOption::Formatted)
         .await
         .map_err(|err| format!("{err:#}"))?;
-    Ok(discarded_from_values(&values))
+    // `values.get` indexes its result relative to the range it was asked
+    // for, not the sheet — the discarded-cell addresses must add the
+    // range's own start row/column back on.
+    Ok(discarded_from_values(
+        &values,
+        grid.start_row_index.unwrap_or(0),
+        grid.start_column_index.unwrap_or(0),
+    ))
 }
 
-/// Renders a numeric [`GridRange`] (already known to be fully bounded — the
-/// only shape `merge-cells` ever resolves to, since an unbounded merge
-/// target is refused earlier) back to an A1 string for a `values.get` read.
+/// Renders a numeric [`GridRange`] back to an A1 string for a `values.get`
+/// read. Only ever called on a target `resolve_target` has already refused
+/// unless fully bounded (see the `MergeCells` check there) — an unbounded
+/// range has no fixed extent this could name.
 fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
     let (Some(r0), Some(r1), Some(c0), Some(c1)) = (
         grid.start_row_index,
@@ -723,34 +733,17 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
         grid.start_column_index,
         grid.end_column_index,
     ) else {
-        // An unbounded merge target (`A:A`, `5:5`) has no fixed extent to
-        // name as an A1 span, so this reads the whole sheet instead — a
-        // superset of the true target, which is the safe direction for a
-        // "what would be discarded" preview to err in.
-        return a1::compose(Some(sheet_title), None).unwrap_or_default();
+        unreachable!("merge-cells targets are refused earlier unless fully bounded")
     };
-    let start = format!("{}{}", column_index_to_letters(c0), r0 + 1);
-    let end = format!("{}{}", column_index_to_letters(c1 - 1), r1);
+    let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
+    let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
     a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))).unwrap_or_default()
 }
 
-/// Zero-based column index → A1 letters (`0` → `"A"`, `26` → `"AA"`) — the
-/// inverse of `grid_range.rs::column_letters_to_index`, needed here (rather
-/// than shared with it) because that direction has no other caller in this
-/// codebase yet.
-fn column_index_to_letters(mut index: i64) -> String {
-    let mut letters = Vec::new();
-    loop {
-        letters.push((b'A' + (index % 26) as u8) as char);
-        index = index / 26 - 1;
-        if index < 0 {
-            break;
-        }
-    }
-    letters.iter().rev().collect()
-}
-
-fn discarded_from_values(values: &ValueRange) -> Vec<String> {
+/// `row_offset`/`col_offset` are the target range's own start row/column —
+/// `values.get`'s response is indexed relative to the range it read, not
+/// the sheet, so they must be added back to get the true A1 address.
+fn discarded_from_values(values: &ValueRange, row_offset: i64, col_offset: i64) -> Vec<String> {
     let mut discarded = Vec::new();
     for (row_idx, row) in values.values.iter().enumerate() {
         for (col_idx, cell) in row.iter().enumerate() {
@@ -761,7 +754,11 @@ fn discarded_from_values(values: &ValueRange) -> Vec<String> {
             if is_blank {
                 continue;
             }
-            let address = format!("{}{}", column_index_to_letters(col_idx as i64), row_idx + 1);
+            let address = format!(
+                "{}{}",
+                grid_range::column_index_to_letters(col_idx as i64 + col_offset),
+                row_idx as i64 + row_offset + 1
+            );
             let display = cell
                 .as_str()
                 .map_or_else(|| cell.to_string(), str::to_string);
@@ -830,8 +827,17 @@ fn build_request(
     verb: &FormatVerb,
     resolved: &ResolvedTarget,
 ) -> Result<BatchUpdateRequestItem, String> {
-    match (verb, resolved) {
-        (FormatVerb::FormatCells { format, .. }, ResolvedTarget::Range { grid, .. }) => {
+    // Exhaustive over `FormatVerb`, not `(FormatVerb, ResolvedTarget)`: a
+    // new verb forces a new arm here at compile time, the same guarantee
+    // `resolve_target` gets. Each arm's `resolved` shape is guaranteed by
+    // `resolve_target`, which picks it from the verb itself — an
+    // `unreachable!` names that invariant instead of a runtime `Err` that
+    // would only fire if `resolve_target` and this fell out of sync.
+    match verb {
+        FormatVerb::FormatCells { format, .. } => {
+            let ResolvedTarget::Range { grid, .. } = resolved else {
+                unreachable!("resolve_target always resolves FormatCells to a Range")
+            };
             let (cell_format, fields) = build_cell_format(format)?;
             Ok(BatchUpdateRequestItem::RepeatCell(RepeatCellRequest {
                 range: *grid,
@@ -841,15 +847,15 @@ fn build_request(
                 fields,
             }))
         }
-        (
-            FormatVerb::UpdateBorders {
-                sides,
-                style,
-                color,
-                ..
-            },
-            ResolvedTarget::Range { grid, .. },
-        ) => {
+        FormatVerb::UpdateBorders {
+            sides,
+            style,
+            color,
+            ..
+        } => {
+            let ResolvedTarget::Range { grid, .. } = resolved else {
+                unreachable!("resolve_target always resolves UpdateBorders to a Range")
+            };
             let color = match color {
                 Some(hex) => parse_hex_color(hex)?,
                 None => crate::drive::sheets::types::Color::default(),
@@ -876,38 +882,49 @@ fn build_request(
             }
             Ok(BatchUpdateRequestItem::UpdateBorders(request))
         }
-        (FormatVerb::MergeCells { merge_type, .. }, ResolvedTarget::Range { grid, .. }) => {
+        FormatVerb::MergeCells { merge_type, .. } => {
+            let ResolvedTarget::Range { grid, .. } = resolved else {
+                unreachable!("resolve_target always resolves MergeCells to a Range")
+            };
             Ok(BatchUpdateRequestItem::MergeCells(MergeCellsRequest {
                 range: *grid,
                 merge_type: merge_type.clone(),
             }))
         }
-        (FormatVerb::UnmergeCells { .. }, ResolvedTarget::Range { grid, .. }) => {
+        FormatVerb::UnmergeCells { .. } => {
+            let ResolvedTarget::Range { grid, .. } = resolved else {
+                unreachable!("resolve_target always resolves UnmergeCells to a Range")
+            };
             Ok(BatchUpdateRequestItem::UnmergeCells(UnmergeCellsRequest {
                 range: *grid,
             }))
         }
-        (FormatVerb::AutoResizeDimension { .. }, ResolvedTarget::Dimension { range, .. }) => Ok(
-            BatchUpdateRequestItem::AutoResizeDimensions(AutoResizeDimensionsRequest {
-                dimensions: range.clone(),
-            }),
-        ),
-        (
-            FormatVerb::UpdateDimensionProperties { pixel_size, .. },
-            ResolvedTarget::Dimension { range, .. },
-        ) => Ok(BatchUpdateRequestItem::UpdateDimensionProperties(
-            UpdateDimensionPropertiesRequest {
-                range: range.clone(),
-                properties: DimensionProperties {
-                    pixel_size: *pixel_size,
+        FormatVerb::AutoResizeDimension { .. } => {
+            let ResolvedTarget::Dimension { range } = resolved else {
+                unreachable!("resolve_target always resolves AutoResizeDimension to a Dimension")
+            };
+            Ok(BatchUpdateRequestItem::AutoResizeDimensions(
+                AutoResizeDimensionsRequest {
+                    dimensions: range.clone(),
                 },
-                fields: "pixelSize".to_string(),
-            },
-        )),
-        // Every other pairing is a verb/target mismatch `resolve_target`
-        // cannot actually produce — `resolve_target` picks the target shape
-        // from the verb itself, so this arm is unreachable in practice.
-        _ => Err("internal error: verb/target shape mismatch".to_string()),
+            ))
+        }
+        FormatVerb::UpdateDimensionProperties { pixel_size, .. } => {
+            let ResolvedTarget::Dimension { range } = resolved else {
+                unreachable!(
+                    "resolve_target always resolves UpdateDimensionProperties to a Dimension"
+                )
+            };
+            Ok(BatchUpdateRequestItem::UpdateDimensionProperties(
+                UpdateDimensionPropertiesRequest {
+                    range: range.clone(),
+                    properties: DimensionProperties {
+                        pixel_size: *pixel_size,
+                    },
+                    fields: "pixelSize".to_string(),
+                },
+            ))
+        }
     }
 }
 
@@ -1320,8 +1337,57 @@ mod tests {
             "values": [["keep", "b1", ""], ["a2", null, "c2"]]
         }))
         .unwrap();
-        let discarded = discarded_from_values(&values);
+        let discarded = discarded_from_values(&values, 0, 0);
         assert_eq!(discarded, vec!["B1: b1", "A2: a2", "C2: c2"]);
+    }
+
+    #[test]
+    fn discarded_from_values_offsets_addresses_by_the_ranges_own_start() {
+        // A read of 'Q1'!C5:D10 is 0-indexed within that range, so an
+        // address computed with no offset would misreport D5 as B1.
+        let values: ValueRange = serde_json::from_value(serde_json::json!({
+            "values": [["keep", "d5"]]
+        }))
+        .unwrap();
+        let discarded = discarded_from_values(&values, 4, 2);
+        assert_eq!(discarded, vec!["D5: d5"]);
+    }
+
+    #[tokio::test]
+    async fn merge_cells_refuses_an_open_ended_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = FormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FormatVerb::MergeCells {
+                sheet: Some("Q1".to_string()),
+                range: Some("A:A".to_string()),
+                merge_type: "MERGE_ALL".to_string(),
+            },
+            dry_run: true,
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("open-ended"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        // No values.get mock is mounted, so a stray read would 404 and the
+        // outcome would be `Failed` instead — the absence of that failure
+        // is itself the assertion that the refusal happened before any
+        // read of the (unbounded) target's values.
     }
 
     #[test]
