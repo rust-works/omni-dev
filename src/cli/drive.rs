@@ -657,6 +657,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_delete_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteSheet(
+                sheets::structure::DeleteSheetCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        // Reaches the engine, which never returns `Err` — every failure is a
+        // `StructureResult` variant (ADR-0073 §13, ADR-0077).
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_rows() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteRows(sheets::structure::DeleteRowsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q2".to_string(),
+                at: 5,
+                count: 3,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_columns() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteColumns(
+                sheets::structure::DeleteColumnsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    at: 2,
+                    count: 1,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteRange(
+                sheets::structure::DeleteRangeCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    start_row: 2,
+                    end_row: 4,
+                    start_column: 2,
+                    end_column: 3,
+                    shift: sheets::structure::ShiftArg::Rows,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),
