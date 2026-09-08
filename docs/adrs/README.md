@@ -102,3 +102,4 @@ by Michael Nygard.
 | [ADR-0076](adr-0076.md)                                 | ✅ Accepted                              | 2026-09-07 | Google Docs Text Mutation Behind a Revision Lease                                           |
 | [ADR-0077](adr-0077-sheets-deletion-via-batchupdate.md) | ✅ Accepted                              | 2026-09-08 | Sheet, Row, Column and Range Deletion via `spreadsheets.batchUpdate`                        |
 | [ADR-0078](adr-0078.md)                                 | ✅ Accepted                              | 2026-09-08 | Sheet Formatting, Data Validation and Protected Ranges via `spreadsheets.batchUpdate`       |
+| [ADR-0079](adr-0079.md)                                 | ✅ Accepted                              | 2026-09-08 | Restoring an Archive into a Mailbox via `messages.insert`                                   |
