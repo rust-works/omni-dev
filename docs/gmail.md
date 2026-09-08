@@ -58,6 +58,19 @@ need to be re-run weekly until you push the project to **In production**
 self-scoped read/label-modify request). See
 [Troubleshooting](#invalid_grant) for the error this produces.
 
+To go to **In production**: OAuth consent screen → **Publish App**. This
+by itself does not trigger a verification review — the next time you (or
+any of your up-to-100 test users) sign in, Google shows an "unverified
+app" interstitial; click **Advanced → Go to `<your project>` (unsafe)**
+to proceed. That warning is expected and permanent for a project like
+this one — it's not a sign anything is misconfigured, and it's the
+tradeoff for not taking on CASA. **Don't upload a logo** on the Branding
+page: Google requires a full verification review (including CASA for
+restricted scopes like this one) before it will display a logo, so
+uploading one moves your project onto that track even though you never
+asked for a review. Branding fields otherwise (app name, support email)
+don't trigger it.
+
 [Google Cloud console]: https://console.cloud.google.com/
 
 ## Authentication
