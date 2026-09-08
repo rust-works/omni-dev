@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>omni-dev Privacy Policy</title>
+  <style>
+    :root {
+      --bg: #fafbfc;
+      --fg: #24292f;
+      --muted: #57606a;
+      --accent: #0969da;
+      --border: #d0d7de;
+      --code-bg: #f6f8fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      line-height: 1.55;
+    }
+    header {
+      padding: 32px 40px 16px;
+      border-bottom: 1px solid var(--border);
+      background: white;
+    }
+    header h1 { margin: 0 0 8px; font-size: 24px; }
+    header p { margin: 0; color: var(--muted); }
+    .container { max-width: 760px; margin: 0 auto; padding: 32px 40px 80px; }
+    h2 { margin-top: 32px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    a { color: var(--accent); }
+    code {
+      font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    ul { padding-left: 22px; }
+    li { margin: 6px 0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>omni-dev — Privacy Policy</h1>
+  <p>How the Drive/Gmail OAuth integration accesses and stores your data.</p>
+</header>
+
+<div class="container">
+
+<p>omni-dev is an open-source, locally-run command-line tool. This policy
+covers the Google APIs (Drive and Gmail) it can access on your behalf via
+OAuth.</p>
+
+<h2>What this is</h2>
+<p>omni-dev runs entirely on your own machine as a CLI binary. There is no
+omni-dev server: when you run <code>omni-dev drive ...</code> or
+<code>omni-dev gmail ...</code>, the tool talks directly from your machine
+to Google's APIs using your own Google account credentials. No Drive or
+Gmail data passes through, or is visible to, the project maintainers or
+any third party.</p>
+
+<h2>What data is accessed</h2>
+<p>Depending on the scopes you grant during <code>omni-dev drive auth
+login</code> / <code>omni-dev gmail auth login</code>, the tool can read
+and, for scopes you opt into, write Drive file content/metadata and Gmail
+messages &mdash; see the
+<a href="https://github.com/rust-works/omni-dev/blob/main/docs/drive.md">Drive</a>
+and
+<a href="https://github.com/rust-works/omni-dev/blob/main/docs/gmail.md">Gmail</a>
+docs for exactly what each command and scope does. Data is used only to
+carry out the command you invoked (e.g. searching Drive, reading a
+message, syncing mail to local <code>.eml</code> files) and is not
+collected, aggregated, or transmitted anywhere by omni-dev itself.</p>
+
+<h2>What is stored, and where</h2>
+<ul>
+  <li><strong>OAuth refresh tokens</strong> for Drive/Gmail are saved
+  locally at <code>~/.omni-dev/settings.json</code>, written with file
+  permissions restricted to your own user account (<code>0600</code>).
+  Access tokens are never written to disk &mdash; only the refresh token
+  persists, and it's used to mint short-lived access tokens on demand.</li>
+  <li><strong>Gmail message content</strong>, if you use
+  <code>gmail sync</code>, is written as <code>.eml</code> files to a
+  local directory you choose. No other command persists message or file
+  content beyond the current run.</li>
+  <li><strong>A local request log</strong> records that a request happened
+  (endpoint, timing, status) for debugging your own runs. It never logs
+  auth tokens/headers, and request/response bodies are only recorded if
+  you explicitly opt in (<code>OMNI_DEV_LOG_BODIES=1</code>), which is
+  off by default.</li>
+</ul>
+<p>Nothing above is sent to the project maintainers, an analytics
+service, or any server other than Google's own APIs.</p>
+
+<h2>Third-party AI access</h2>
+<p>omni-dev optionally exposes Drive/Gmail commands to an AI assistant
+(e.g. Claude) via a local MCP server (<code>omni-dev-mcp</code>, see the
+<a href="https://github.com/rust-works/omni-dev/blob/main/docs/mcp.md">MCP docs</a>).
+This only runs if you explicitly configure your AI client to launch it,
+and it communicates over local stdio &mdash; it is your own local
+integration, not a channel omni-dev opens on your behalf.</p>
+
+<h2>Revoking access</h2>
+<p>You can revoke omni-dev's access at any time from your Google
+Account's
+<a href="https://myaccount.google.com/permissions">Third-party apps &amp; services</a>
+page, and delete the locally stored refresh token by removing the
+corresponding entry from <code>~/.omni-dev/settings.json</code>.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy or the project's handling of data can be
+raised via
+<a href="https://github.com/rust-works/omni-dev/issues">GitHub Issues</a>
+on this repository.</p>
+
+</div>
+</body>
+</html>
