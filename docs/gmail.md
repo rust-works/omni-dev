@@ -25,9 +25,10 @@ walkthrough — this page is the topic-by-topic reference.
 10. [Sync all accounts](#sync-all-accounts)
 11. [Extract attachments](#extract-attachments)
 12. [Render](#render)
-13. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-14. [Troubleshooting](#troubleshooting)
-15. [See also](#see-also)
+13. [Insert](#insert)
+14. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+15. [Troubleshooting](#troubleshooting)
+16. [See also](#see-also)
 
 ## Prerequisites
 
@@ -523,6 +524,7 @@ would just be a second, redundant dump.
                                 #   deleted_at (soft-deleted messages only)
   messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
   messages/<year>/<month>/<day>/<id>/attachments/<filename>  # only with --extract-attachments
+  insert-ledger.jsonl          # only after `gmail insert` has run — see Insert below
 ```
 
 `.eml` files are **immutable** once written — Gmail labels aren't part of
@@ -833,6 +835,133 @@ rendering function.
 
 No MCP equivalent — same reasoning as
 [Extract attachments](#extract-attachments).
+
+## Insert
+
+```bash
+$ omni-dev gmail insert --archive-dir ~/mail-archive --all --label RESTORED --dry-run
+$ omni-dev gmail insert --archive-dir ~/mail-archive --all --label RESTORED
+$ omni-dev gmail insert --archive-dir ~/mail-archive --since 2020-01-01 --until 2020-12-31 --label RESTORED
+$ omni-dev gmail insert --archive-dir ~/mail-archive --all --label RESTORED --drop-label INBOX --drop-label UNREAD
+$ omni-dev gmail insert --archive-dir ~/mail-archive --all --label RESTORED --verify-remote
+```
+
+Restores archived `.eml` messages into a mailbox via `messages.insert`,
+closing the loop the rest of this page describes: [`sync`](#sync)/
+[`sync-all`](#sync-all-accounts) capture, [`render`](#render)/
+[`extract-attachments`](#extract-attachments) read the archive back, and
+`insert` restores it — making the archive a genuine backup rather than a
+read-only copy. Unlike `extract-attachments`/`render`, this contacts Gmail
+and needs a client, so `--account` works normally.
+
+Uses `messages.insert`, not `messages.import` — `import` runs a message
+through Gmail's normal spam/classification pipeline, which is actively
+wrong for mail that may be years old (it can land in spam, or be caught by
+filters written long after the mail actually arrived). `insert` places the
+message exactly where instructed, with `internalDateSource=dateHeader` (not
+Gmail's default) so the archived `Date:` header — not the moment of
+insertion — sets Gmail's sort order. No additional OAuth scope is needed;
+`gmail.modify` already covers it.
+
+**Selection** — one of `--all`, `--since DATE`/`--until DATE`
+(`YYYY-MM-DD`, inclusive), `--id ID` (repeatable), `--ids-from FILE` (one id
+per line, `-` for stdin, blank lines and `#` comments skipped — the same
+shape a `--dry-run` report's ids can be piped back into), or
+`--source-label LABEL_ID` (a raw archived label id, distinct from the
+destination `--label` below) is required — a bare `gmail insert
+--archive-dir DIR` is rejected rather than silently restoring the whole
+archive. Combining selectors narrows rather than widens the match set
+(`--id` plus `--since` requires both); `--all` combined with anything else
+is rejected outright, since it already means "everything." This selection
+logic is local-only, filtering the already-synced `manifest.jsonl` — it is
+**not** Gmail's search query syntax.
+
+**`--label NAME`** tags every inserted message with an existing destination
+label, resolved by name — never auto-created, so a typo fails before any
+write rather than silently creating a stray label. It matters more here
+than it might sound: inserted mail's raw headers still name the *original*
+recipient, so `to:` searches on the destination account won't match it, and
+this tag becomes the only reliable handle for "what came from the archive."
+
+**Label replay:** an archived message's Gmail system labels
+(`INBOX`/`SENT`/`UNREAD`/`STARRED`/`IMPORTANT`/`SPAM`/`TRASH`/`CATEGORY_*`)
+replay onto the inserted copy automatically — this is what preserves
+**sent mail** for free: `messages.batchModify` ([Labels](#labels)) forbids
+adding `SENT`, so `insert` is the only mechanism able to restore mail the
+source mailbox sent rather than received. `DRAFT` never replays (it would
+create a Drafts row with no backing Draft resource), and any *user* label
+from the source mailbox is dropped (it's foreign to the destination, or
+worse, collides with an unrelated label there). `--drop-label LABEL_ID`
+(repeatable) strips a label after that filter — most commonly
+`--drop-label INBOX --drop-label UNREAD`, which restores mail as
+already-read and archived instead of dumping it into a live Inbox. Before
+the first request (including under `--dry-run`), the run reports how many
+selected messages will land in INBOX/UNREAD, and separately how many will
+land in TRASH/SPAM — Gmail auto-purges Trash after 30 days, so a "restore"
+that silently lands 400 messages there quietly destroys them a month later.
+
+**Idempotency:** a local `insert-ledger.jsonl` (a sibling of
+`manifest.jsonl` — see [Sync](#sync)'s Archive layout) records every
+message this command has already accounted for against a destination
+mailbox, keyed by **(destination address, archived Message-ID)** — Gmail
+assigns a brand-new id on every insert, so unlike `sync`/
+`extract-attachments`, the source manifest's own id can't serve as the
+presence check. The destination address is part of the key, not incidental
+metadata: consolidating a legacy mailbox into a *different* current one is
+the primary use case, and a ledger scoped only by Message-ID would make a
+completed restore into account A silently suppress every insert into
+account B. Re-running the same selection inserts nothing the second time;
+an interrupted run resumes and only inserts what the ledger doesn't already
+have. **`--verify-remote`** adds a pre-insert `rfc822msgid:` probe against
+the destination itself — useful for a first run into a mailbox that may
+already hold some of this mail, or as a recovery path after losing the
+ledger — but is a supplement to the ledger, not a substitute: the probe
+costs extra quota and a round-trip per message, and Gmail's search index
+can lag a real insert by seconds to minutes.
+
+**`--dry-run`** does two read-only preflight calls (destination identity,
+label resolution) and reports exactly what would be inserted, with the
+INBOX/TRASH counts above — no `messages.insert` call is made and no ledger
+file is written.
+
+**Concurrency and rate limits:** default `--concurrency` is **4**, well
+below `sync`'s default of 20 — `messages.insert` costs 5x a `messages.get`
+against the same quota bucket, so a wider fan-out buys no extra throughput
+here and only widens how many messages could be inserted-but-unledgered if
+the process crashes mid-run (see the note below). See
+[Rate limits and retry behaviour](#rate-limits-and-retry-behaviour) for the
+shared retry/backoff mechanics.
+
+**Report summary:** mirrors [Sync](#sync)'s — a trailing `N inserted, N
+skipped, N errors` tally in text output (`N would insert` under
+`--dry-run`), or a `summary` field in the structured formats, with the full
+per-action listing (including informational `Note`s) always included in
+`-o json`/`-o yaml`/`-o yamls`/`-o jsonl`. A per-message failure (a
+malformed `.eml`, a transient API error) is recorded and the run continues
+with the rest of the batch; the command exits non-zero if any message
+failed.
+
+**Known limitation:** the ledger is written only after each message's
+successful response, so a crash mid-batch can leave a handful of messages
+inserted on Gmail's side but not yet recorded locally — a following run
+would then insert them again. The alternative (recording *before* sending)
+trades a rare, visible, deletable duplicate for a silent, undetectable gap
+in restored mail, which is strictly worse for a backup-restore tool.
+Recovery is re-running with `--verify-remote`.
+
+**Cleaning up a test/live-verification pass:** the ledger's `inserted_id`
+field doubles as an undo list — since `messages.batchModify` has no
+client-side scope guard and `TRASH` is addable (only `SENT`/`DRAFT` are
+rejected by the API), the *existing* [`gmail label add`](#labels) command
+is enough to trash everything a run inserted into a given destination:
+
+```bash
+$ jq -r 'select(.destination=="throwaway@example.com") | .inserted_id' \
+    ~/mail-archive/insert-ledger.jsonl | xargs omni-dev gmail label add --label TRASH
+```
+
+No MCP equivalent — a bulk, mutating, potentially long-running operation is
+as poor a fit here as it is for `sync`/`extract-attachments`.
 
 ## Rate limits and retry behaviour
 
