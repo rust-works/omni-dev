@@ -845,7 +845,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
-    use crate::drive::sheets::types::Sheet;
+    use crate::drive::sheets::types::{Sheet, SheetProperties};
     use crate::test_support::env::MapEnv;
     use crate::utils::secret::Secret;
     use std::collections::HashSet;
@@ -1205,5 +1205,923 @@ mod tests {
             } => assert_eq!(protected_range_id, Some(42)),
             other => panic!("expected Changed, got {other:?}"),
         }
+    }
+
+    fn protect_verb() -> ProtectionVerb {
+        ProtectionVerb::ProtectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: false,
+            editors: Vec::new(),
+        }
+    }
+
+    fn update_verb() -> ProtectionVerb {
+        ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: None,
+            add_editors: Vec::new(),
+            remove_editors: Vec::new(),
+        }
+    }
+
+    fn unprotect_verb() -> ProtectionVerb {
+        ProtectionVerb::UnprotectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+        }
+    }
+
+    #[test]
+    fn protection_verb_label_and_log_operation_name_every_variant() {
+        assert_eq!(protect_verb().label(), "protect-range");
+        assert_eq!(update_verb().label(), "update-protection");
+        assert_eq!(unprotect_verb().label(), "unprotect-range");
+        assert_eq!(protect_verb().log_operation(), "sheets-protect-range");
+        assert_eq!(update_verb().log_operation(), "sheets-update-protection");
+        assert_eq!(unprotect_verb().log_operation(), "sheets-unprotect-range");
+    }
+
+    #[test]
+    fn sheet_range_whole_reads_update_protections_fields() {
+        let verb = ProtectionVerb::UpdateProtection {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+            description: None,
+            warning_only: None,
+            add_editors: Vec::new(),
+            remove_editors: Vec::new(),
+        };
+        assert_eq!(verb.sheet_range_whole(), (Some("Q1"), Some("A1:A5"), false));
+    }
+
+    #[test]
+    fn protection_result_log_status_names_every_variant() {
+        assert_eq!(
+            ProtectionResult::WouldChange {
+                summary: String::new()
+            }
+            .log_status(),
+            "would-change"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedNotASpreadsheet {
+                mime_type: String::new()
+            }
+            .log_status(),
+            "refused-not-a-spreadsheet"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedShortcut.log_status(),
+            "refused-shortcut"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedNoVisibleParents.log_status(),
+            "refused-no-visible-parents"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedSheetNotFound {
+                title: String::new(),
+                available: Vec::new()
+            }
+            .log_status(),
+            "refused-sheet-not-found"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedInvalidRange {
+                detail: String::new()
+            }
+            .log_status(),
+            "refused-invalid-range"
+        );
+        assert_eq!(
+            ProtectionResult::RefusedAmbiguousProtection {
+                candidates: Vec::new()
+            }
+            .log_status(),
+            "refused-ambiguous-protection"
+        );
+        assert_eq!(
+            ProtectionResult::Failed {
+                detail: String::new()
+            }
+            .log_status(),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = ProtectionOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: unprotect_verb(),
+            result: ProtectionResult::Changed {
+                summary: "remove protection".to_string(),
+                protected_range_id: Some(1),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
+    }
+
+    #[test]
+    fn compose_target_rejects_whole_sheet_with_range() {
+        let verb = ProtectionVerb::ProtectRange {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: true,
+            description: None,
+            warning_only: false,
+            editors: Vec::new(),
+        };
+        let err = compose_target(&verb).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn compose_target_rejects_whole_sheet_without_a_sheet() {
+        let verb = ProtectionVerb::ProtectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: true,
+            description: None,
+            warning_only: false,
+            editors: Vec::new(),
+        };
+        let err = compose_target(&verb).unwrap_err();
+        assert!(err.contains("needs --sheet"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_warning_only_protect_range_with_editors() {
+        let verb = ProtectionVerb::ProtectRange {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+            description: None,
+            warning_only: true,
+            editors: vec!["a@example.com".to_string()],
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn resolve_grid_whole_sheet_without_a_sheet_name_is_refused() {
+        let workbook = workbook_with(Vec::new());
+        let verb = ProtectionVerb::UnprotectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: true,
+        };
+        let err = resolve_grid(&workbook, &verb, None).unwrap_err();
+        assert!(matches!(err, ProtectionResult::RefusedInvalidRange { .. }));
+    }
+
+    #[test]
+    fn resolve_grid_reports_a_sheet_not_found() {
+        let workbook = workbook_with(Vec::new());
+        let err = resolve_grid(&workbook, &protect_verb(), Some("Missing!A1")).unwrap_err();
+        assert!(matches!(err, ProtectionResult::RefusedSheetNotFound { .. }));
+    }
+
+    #[test]
+    fn resolve_grid_reports_an_invalid_range() {
+        let workbook = Spreadsheet {
+            sheets: vec![Sheet {
+                properties: Some(SheetProperties {
+                    sheet_id: Some(0),
+                    title: "Q1".to_string(),
+                    ..Default::default()
+                }),
+                protected_ranges: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let err = resolve_grid(&workbook, &protect_verb(), Some("Q1!!!!")).unwrap_err();
+        assert!(matches!(err, ProtectionResult::RefusedInvalidRange { .. }));
+    }
+
+    #[test]
+    fn describe_effect_protect_range_reports_strictness_and_editors() {
+        let blocking = ProtectionVerb::ProtectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: false,
+            editors: vec!["a@example.com".to_string()],
+        };
+        assert_eq!(
+            describe_effect(&blocking),
+            "protect (block edits, editors exempted: a@example.com)"
+        );
+
+        let warn_only = ProtectionVerb::ProtectRange {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: true,
+            editors: Vec::new(),
+        };
+        assert_eq!(describe_effect(&warn_only), "protect (warn only)");
+    }
+
+    #[test]
+    fn describe_effect_update_protection_reports_editor_deltas() {
+        assert_eq!(describe_effect(&update_verb()), "update protection");
+
+        let both = ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: None,
+            add_editors: vec!["a@example.com".to_string()],
+            remove_editors: vec!["b@example.com".to_string()],
+        };
+        assert_eq!(
+            describe_effect(&both),
+            "update protection (+a@example.com -b@example.com)"
+        );
+    }
+
+    fn outcome_with(
+        verb: ProtectionVerb,
+        file_name: Option<&str>,
+        result: ProtectionResult,
+    ) -> ProtectionOutcome {
+        ProtectionOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            verb,
+            result,
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change() {
+        let out = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::WouldChange {
+                summary: "protect (block edits)".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Would protect (block edits) in 'Budget'");
+    }
+
+    #[test]
+    fn describe_lines_renders_not_a_spreadsheet_with_no_file_name() {
+        let out = outcome_with(
+            protect_verb(),
+            None,
+            ProtectionResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1'"), "{text}");
+        assert!(text.contains("protect-range"), "{text}");
+        assert!(text.contains("text/plain"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_shortcut() {
+        let out = outcome_with(
+            unprotect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedShortcut,
+        );
+        let text = describe(&out);
+        assert!(text.contains("shortcut"), "{text}");
+        assert!(text.contains("unprotect-range"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_no_visible_parents() {
+        let out = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedNoVisibleParents,
+        );
+        assert!(describe(&out).contains("sheets-protection"));
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: Vec::new(),
+            },
+        );
+        assert!(describe(&none).contains("Available: none"));
+
+        let some = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: vec!["Q1".to_string(), "Q3".to_string()],
+            },
+        );
+        let text = describe(&some);
+        assert!(text.contains("'Q1', 'Q3'"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_and_protection_not_found() {
+        let invalid = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+        );
+        assert_eq!(describe(&invalid), "Refused: bad range");
+
+        let not_found = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedProtectionNotFound {
+                detail: "no match".to_string(),
+            },
+        );
+        assert_eq!(describe(&not_found), "Refused: no match");
+    }
+
+    #[test]
+    fn describe_lines_renders_ambiguous_protection() {
+        let out = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedAmbiguousProtection {
+                candidates: vec![10, 11],
+            },
+        );
+        assert!(describe(&out).contains("ids: 10, 11"));
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let folder_rule = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            ProtectionResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&folder_rule);
+        assert!(text.contains("update-protection"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
+
+        let default_policy = outcome_with(
+            unprotect_verb(),
+            Some("Budget"),
+            ProtectionResult::Blocked { decided_by: None },
+        );
+        assert!(describe(&default_policy).contains("default policy"));
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_with_and_without_an_id() {
+        let with_id = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::Changed {
+                summary: "protect (block edits)".to_string(),
+                protected_range_id: Some(7),
+            },
+        );
+        assert!(describe(&with_id).contains("(id 7)"));
+
+        let without_id = outcome_with(
+            unprotect_verb(),
+            Some("Budget"),
+            ProtectionResult::Changed {
+                summary: "remove protection".to_string(),
+                protected_range_id: None,
+            },
+        );
+        assert!(!describe(&without_id).contains("(id"));
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let out = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::RefusedShortcut));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedNotASpreadsheet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn protect_range_rejects_whole_sheet_and_range_together() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: true,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("mutually exclusive"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn protect_range_rejects_warning_only_with_editors() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: true,
+                editors: vec!["a@example.com".to_string()],
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("mutually exclusive"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn protect_range_refuses_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Missing".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_would_change_without_calling_batch_update() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        // Deliberately no batchUpdate mock: proves a dry run never calls it.
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: true,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::WouldChange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn protect_range_with_editors_sends_an_editor_list() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addProtectedRange": {"protectedRange": {"protectedRangeId": 5}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: vec!["a@example.com".to_string()],
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Changed { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_protection_changes_description_and_editors() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 20,
+            "range": {
+                "sheetId": 0,
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+            "editors": {"users": ["a@example.com"]},
+        }]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::UpdateProtection {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: Some("new note".to_string()),
+                warning_only: None,
+                add_editors: vec!["b@example.com".to_string()],
+                remove_editors: vec!["a@example.com".to_string()],
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::Changed {
+                protected_range_id, ..
+            } => assert_eq!(protected_range_id, Some(20)),
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_protection_refuses_a_result_that_is_warning_only_with_editors() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 30,
+            "range": {
+                "sheetId": 0,
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+            "warningOnly": true,
+        }]))
+        .mount(&server)
+        .await;
+        // Deliberately no batchUpdate mock: proves the invalid combination
+        // is refused before any request is sent.
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::UpdateProtection {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: None,
+                add_editors: vec!["a@example.com".to_string()],
+                remove_editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("warning-only"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
     }
 }

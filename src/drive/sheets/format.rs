@@ -1401,4 +1401,1122 @@ mod tests {
         };
         assert_eq!(grid_range_to_a1("Q1", &grid), "'Q1'!A1:B3");
     }
+
+    #[test]
+    #[should_panic(expected = "merge-cells targets are refused earlier unless fully bounded")]
+    fn grid_range_to_a1_panics_on_an_unbounded_range() {
+        let grid = GridRange {
+            sheet_id: 1,
+            start_row_index: None,
+            end_row_index: Some(3),
+            start_column_index: Some(0),
+            end_column_index: Some(2),
+        };
+        let _ = grid_range_to_a1("Q1", &grid);
+    }
+
+    // ── Verb helpers ─────────────────────────────────────────────────
+
+    fn opts(verb: FormatVerb, dry_run: bool) -> FormatOptions {
+        FormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run,
+        }
+    }
+
+    fn update_borders_verb(sides: BorderSides, style: &str, color: Option<&str>) -> FormatVerb {
+        FormatVerb::UpdateBorders {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:B2".to_string()),
+            sides,
+            style: style.to_string(),
+            color: color.map(str::to_string),
+        }
+    }
+
+    fn merge_cells_verb(range: &str) -> FormatVerb {
+        FormatVerb::MergeCells {
+            sheet: Some("Q1".to_string()),
+            range: Some(range.to_string()),
+            merge_type: "MERGE_ALL".to_string(),
+        }
+    }
+
+    fn unmerge_cells_verb() -> FormatVerb {
+        FormatVerb::UnmergeCells {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:B2".to_string()),
+        }
+    }
+
+    fn auto_resize_verb(sheet: &str, start: i64, end: i64) -> FormatVerb {
+        FormatVerb::AutoResizeDimension {
+            sheet: sheet.to_string(),
+            dimension: Dimension::Rows,
+            start,
+            end,
+        }
+    }
+
+    fn update_dimension_verb(sheet: &str, start: i64, end: i64, pixel_size: i64) -> FormatVerb {
+        FormatVerb::UpdateDimensionProperties {
+            sheet: sheet.to_string(),
+            dimension: Dimension::Columns,
+            start,
+            end,
+            pixel_size,
+        }
+    }
+
+    fn find_batch_update(requests: &[wiremock::Request]) -> serde_json::Value {
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .expect("no batchUpdate request was sent");
+        serde_json::from_slice(&batch.body).unwrap()
+    }
+
+    // ── FormatVerb / BorderSides pure-function coverage ─────────────────
+
+    #[test]
+    fn border_sides_any_is_true_iff_at_least_one_side_is_set() {
+        assert!(!BorderSides::default().any());
+        assert!(BorderSides {
+            top: true,
+            ..Default::default()
+        }
+        .any());
+        assert!(BorderSides {
+            bottom: true,
+            ..Default::default()
+        }
+        .any());
+        assert!(BorderSides {
+            left: true,
+            ..Default::default()
+        }
+        .any());
+        assert!(BorderSides {
+            right: true,
+            ..Default::default()
+        }
+        .any());
+    }
+
+    #[test]
+    fn log_operation_and_label_are_distinct_for_every_verb() {
+        let verbs = [
+            format_cells_opts(false).verb,
+            update_borders_verb(BorderSides::default(), "SOLID", None),
+            merge_cells_verb("A1:B2"),
+            unmerge_cells_verb(),
+            auto_resize_verb("Q1", 1, 2),
+            update_dimension_verb("Q1", 1, 2, 10),
+        ];
+        let ops: HashSet<&str> = verbs.iter().map(FormatVerb::log_operation).collect();
+        assert_eq!(ops.len(), verbs.len());
+        let labels: HashSet<&str> = verbs.iter().map(FormatVerb::label).collect();
+        assert_eq!(labels.len(), verbs.len());
+    }
+
+    #[test]
+    fn sheet_and_range_is_none_only_for_the_dimension_span_verbs() {
+        assert_eq!(
+            merge_cells_verb("A1:B2").sheet_and_range(),
+            Some((Some("Q1"), Some("A1:B2")))
+        );
+        assert!(auto_resize_verb("Q1", 1, 2).sheet_and_range().is_none());
+        assert!(update_dimension_verb("Q1", 1, 2, 10)
+            .sheet_and_range()
+            .is_none());
+    }
+
+    #[test]
+    fn log_status_is_distinct_for_every_variant() {
+        let statuses = [
+            FormatResult::WouldChange {
+                summary: "x".to_string(),
+                discarded_cells: Vec::new(),
+            }
+            .log_status(),
+            FormatResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            }
+            .log_status(),
+            FormatResult::RefusedShortcut.log_status(),
+            FormatResult::RefusedNoVisibleParents.log_status(),
+            FormatResult::RefusedSheetNotFound {
+                title: "x".to_string(),
+                available: Vec::new(),
+            }
+            .log_status(),
+            FormatResult::RefusedInvalidRange {
+                detail: "x".to_string(),
+            }
+            .log_status(),
+            FormatResult::Blocked { decided_by: None }.log_status(),
+            FormatResult::Changed {
+                summary: "x".to_string(),
+                discarded_cells: Vec::new(),
+            }
+            .log_status(),
+            FormatResult::Failed {
+                detail: "x".to_string(),
+            }
+            .log_status(),
+        ];
+        let unique: HashSet<&str> = statuses.iter().copied().collect();
+        assert_eq!(unique.len(), statuses.len());
+        assert!(statuses.iter().all(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn record_attempt_handles_a_would_change_outcome_without_panicking() {
+        // `record_attempt` is only ever called for `!dry_run`, and
+        // `WouldChange` only ever occurs when `dry_run` is true, so the real
+        // pipeline never exercises this combination — call it directly, the
+        // same bypass `structure.rs`'s `record_attempt` edge-case tests use.
+        let opts = format_cells_opts(false);
+        let outcome = FormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: opts.verb.clone(),
+            result: FormatResult::WouldChange {
+                summary: "set bold".to_string(),
+                discarded_cells: vec!["B1: gone".to_string()],
+            },
+        };
+        record_attempt(&outcome, &opts, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn write_jsonl_serializes_the_outcome_as_one_json_line() {
+        let outcome = FormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: format_cells_opts(false).verb,
+            result: FormatResult::Changed {
+                summary: "set bold".to_string(),
+                discarded_cells: Vec::new(),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(value["spreadsheet_id"], "sheet-1");
+        assert_eq!(value["result"]["status"], "changed");
+    }
+
+    // ── build_cell_format: remaining flags ───────────────────────────────
+
+    #[test]
+    fn build_cell_format_covers_every_remaining_flag() {
+        let flags = CellFormatFlags {
+            italic: Some(true),
+            strikethrough: Some(true),
+            underline: Some(true),
+            font_size: Some(14),
+            text_color: Some("#112233".to_string()),
+            horizontal_align: Some("CENTER".to_string()),
+            vertical_align: Some("MIDDLE".to_string()),
+            number_format_pattern: Some("0.00".to_string()),
+            number_format_type: Some("NUMBER".to_string()),
+            wrap: Some("WRAP".to_string()),
+            ..Default::default()
+        };
+        let (format, fields) = build_cell_format(&flags).unwrap();
+        let text_format = format.text_format.unwrap();
+        assert_eq!(text_format.italic, Some(true));
+        assert_eq!(text_format.strikethrough, Some(true));
+        assert_eq!(text_format.underline, Some(true));
+        assert_eq!(text_format.font_size, Some(14));
+        assert!(text_format.foreground_color_style.is_some());
+        assert_eq!(format.horizontal_alignment.as_deref(), Some("CENTER"));
+        assert_eq!(format.vertical_alignment.as_deref(), Some("MIDDLE"));
+        assert!(format.number_format.is_some());
+        assert_eq!(format.wrap_strategy.as_deref(), Some("WRAP"));
+        for expected in [
+            "userEnteredFormat.textFormat.italic",
+            "userEnteredFormat.textFormat.strikethrough",
+            "userEnteredFormat.textFormat.underline",
+            "userEnteredFormat.textFormat.fontSize",
+            "userEnteredFormat.textFormat.foregroundColorStyle",
+            "userEnteredFormat.horizontalAlignment",
+            "userEnteredFormat.verticalAlignment",
+            "userEnteredFormat.numberFormat",
+            "userEnteredFormat.wrapStrategy",
+        ] {
+            assert!(fields.contains(expected), "{fields} missing {expected}");
+        }
+    }
+
+    // ── build_request: defensive unreachable branches ────────────────────
+
+    #[test]
+    #[should_panic(expected = "FormatCells to a Range")]
+    fn build_request_panics_if_format_cells_resolves_to_a_dimension() {
+        let verb = format_cells_opts(false).verb;
+        let resolved = ResolvedTarget::Dimension {
+            range: DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Rows,
+                start_index: 0,
+                end_index: 1,
+            },
+        };
+        let _ = build_request(&verb, &resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "UpdateBorders to a Range")]
+    fn build_request_panics_if_update_borders_resolves_to_a_dimension() {
+        let verb = update_borders_verb(
+            BorderSides {
+                top: true,
+                ..Default::default()
+            },
+            "SOLID",
+            None,
+        );
+        let resolved = ResolvedTarget::Dimension {
+            range: DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Rows,
+                start_index: 0,
+                end_index: 1,
+            },
+        };
+        let _ = build_request(&verb, &resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "MergeCells to a Range")]
+    fn build_request_panics_if_merge_cells_resolves_to_a_dimension() {
+        let resolved = ResolvedTarget::Dimension {
+            range: DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Rows,
+                start_index: 0,
+                end_index: 1,
+            },
+        };
+        let _ = build_request(&merge_cells_verb("A1:B2"), &resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnmergeCells to a Range")]
+    fn build_request_panics_if_unmerge_cells_resolves_to_a_dimension() {
+        let resolved = ResolvedTarget::Dimension {
+            range: DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Rows,
+                start_index: 0,
+                end_index: 1,
+            },
+        };
+        let _ = build_request(&unmerge_cells_verb(), &resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "AutoResizeDimension to a Dimension")]
+    fn build_request_panics_if_auto_resize_resolves_to_a_range() {
+        let resolved = ResolvedTarget::Range {
+            sheet_title: "Q1".to_string(),
+            grid: GridRange::default(),
+        };
+        let _ = build_request(&auto_resize_verb("Q1", 1, 2), &resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "UpdateDimensionProperties to a Dimension")]
+    fn build_request_panics_if_update_dimension_properties_resolves_to_a_range() {
+        let resolved = ResolvedTarget::Range {
+            sheet_title: "Q1".to_string(),
+            grid: GridRange::default(),
+        };
+        let _ = build_request(&update_dimension_verb("Q1", 1, 2, 10), &resolved);
+    }
+
+    // ── read_discarded_cells: direct-call edge cases ─────────────────────
+
+    #[tokio::test]
+    async fn read_discarded_cells_returns_empty_for_a_non_range_target() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        let resolved = ResolvedTarget::Dimension {
+            range: DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Rows,
+                start_index: 0,
+                end_index: 1,
+            },
+        };
+        let cells = read_discarded_cells(&api, "sheet-1", &resolved)
+            .await
+            .unwrap();
+        assert!(cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_discarded_cells_skips_the_read_for_a_single_cell_range() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        // No values.get mock mounted: a stray call would 404.
+        let resolved = ResolvedTarget::Range {
+            sheet_title: "Q1".to_string(),
+            grid: GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(1),
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+            },
+        };
+        let cells = read_discarded_cells(&api, "sheet-1", &resolved)
+            .await
+            .unwrap();
+        assert!(cells.is_empty());
+    }
+
+    // ── format_inner: paths before the workbook fetch ────────────────────
+
+    #[tokio::test]
+    async fn a_conflicting_sheet_and_range_is_refused_before_any_drive_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No file/workbook mock at all: proves the refusal happens first.
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let verb = FormatVerb::FormatCells {
+            sheet: Some("Other".to_string()),
+            range: Some("Sheet1!A1:B2".to_string()),
+            format: CellFormatFlags {
+                bold: Some(true),
+                ..Default::default()
+            },
+        };
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("already names a sheet"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        assert!(outcome.file_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+        assert!(outcome.file_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused_by_mime_type() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "application/pdf", &["folder-1"])
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedNotASpreadsheet { mime_type } => {
+                assert_eq!(mime_type, "application/pdf");
+            }
+            other => panic!("expected RefusedNotASpreadsheet, got {other:?}"),
+        }
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::RefusedShortcut));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FormatResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+    }
+
+    // ── format_inner: target-resolution errors ───────────────────────────
+
+    #[tokio::test]
+    async fn format_cells_reports_sheet_not_found_for_a_range_target() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = FormatVerb::FormatCells {
+            sheet: Some("Nope".to_string()),
+            range: Some("A1:B2".to_string()),
+            format: CellFormatFlags {
+                bold: Some(true),
+                ..Default::default()
+            },
+        };
+
+        let outcome = format(&drive, &sheets, &opts(verb, true), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedSheetNotFound { title, available } => {
+                assert_eq!(title, "Nope");
+                assert_eq!(available, vec!["Q1".to_string()]);
+            }
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn format_cells_reports_an_invalid_a1_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = FormatVerb::FormatCells {
+            sheet: Some("Q1".to_string()),
+            range: Some("definitely bogus".to_string()),
+            format: CellFormatFlags {
+                bold: Some(true),
+                ..Default::default()
+            },
+        };
+
+        let outcome = format(&drive, &sheets, &opts(verb, true), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("not a recognised A1 range"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dimension_verb_reports_sheet_not_found() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(auto_resize_verb("Nope", 1, 2), true),
+            &rules,
+        )
+        .await;
+        match outcome.result {
+            FormatResult::RefusedSheetNotFound { title, available } => {
+                assert_eq!(title, "Nope");
+                assert_eq!(available, vec!["Q1".to_string()]);
+            }
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dimension_verbs_reject_an_invalid_start_end_span() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+
+        for verb in [
+            auto_resize_verb("Q1", 0, 5),
+            update_dimension_verb("Q1", 5, 3, 10),
+        ] {
+            let outcome = format(&drive, &sheets, &opts(verb, true), &rules).await;
+            match outcome.result {
+                FormatResult::RefusedInvalidRange { detail } => {
+                    assert!(detail.contains("--start"), "{detail}");
+                }
+                other => panic!("expected RefusedInvalidRange, got {other:?}"),
+            }
+        }
+    }
+
+    // ── format_inner: merge-cells discarded-values read ──────────────────
+
+    #[tokio::test]
+    async fn merge_cells_reports_a_values_read_failure_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(merge_cells_verb("A1:B2"), true),
+            &rules,
+        )
+        .await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn merge_cells_single_cell_range_has_no_discards_and_skips_the_values_read() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No values.get mock mounted: a stray call would 404.
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(merge_cells_verb("A1:A1"), true),
+            &rules,
+        )
+        .await;
+        match outcome.result {
+            FormatResult::WouldChange {
+                summary,
+                discarded_cells,
+            } => {
+                assert!(discarded_cells.is_empty());
+                assert_eq!(summary, "merge (MERGE_ALL)");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    // ── format_inner: describe_effect / build_request errors ─────────────
+
+    #[tokio::test]
+    async fn update_borders_refuses_when_no_side_is_selected() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = update_borders_verb(BorderSides::default(), "SOLID", None);
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("at least one side"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_borders_rejects_a_malformed_color_at_request_build_time() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock mounted: `describe_effect` doesn't validate
+        // the color (only `sides.any()`), so this proves the request-build
+        // step's own `parse_hex_color` call is the one that catches it.
+        let rules = vec![allow_rule("folder-1")];
+        let sides = BorderSides {
+            top: true,
+            ..Default::default()
+        };
+        let verb = update_borders_verb(sides, "SOLID", Some("ZZZZZZ"));
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("not a color"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    // ── format_inner: full non-dry-run round trips per verb ───────────────
+
+    #[tokio::test]
+    async fn update_borders_sets_every_selected_side() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let sides = BorderSides {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
+        };
+        let verb = update_borders_verb(sides, "DASHED", Some("00FF00"));
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match &outcome.result {
+            FormatResult::Changed { summary, .. } => {
+                assert!(summary.contains("top, bottom, left, right"), "{summary}");
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        let update_borders = &body["requests"][0]["updateBorders"];
+        for side in ["top", "bottom", "left", "right"] {
+            assert_eq!(update_borders[side]["style"], "DASHED", "{update_borders}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_borders_defaults_to_black_when_no_color_is_given() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let sides = BorderSides {
+            top: true,
+            ..Default::default()
+        };
+        let verb = update_borders_verb(sides, "SOLID", None);
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        let color = &body["requests"][0]["updateBorders"]["top"]["colorStyle"]["rgbColor"];
+        assert_eq!(color["red"], 0.0);
+        assert_eq!(color["green"], 0.0);
+        assert_eq!(color["blue"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn merge_cells_real_run_sends_merge_type_and_discards_are_still_reported() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep", "gone"]]
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(merge_cells_verb("A1:B2"), false),
+            &rules,
+        )
+        .await;
+        match &outcome.result {
+            FormatResult::Changed {
+                summary,
+                discarded_cells,
+            } => {
+                assert_eq!(discarded_cells, &vec!["B1: gone".to_string()]);
+                assert!(summary.contains("discarding 1 cell"), "{summary}");
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        assert_eq!(body["requests"][0]["mergeCells"]["mergeType"], "MERGE_ALL");
+    }
+
+    #[tokio::test]
+    async fn unmerge_cells_sends_the_composed_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &opts(unmerge_cells_verb(), false), &rules).await;
+        match &outcome.result {
+            FormatResult::Changed { summary, .. } => assert_eq!(summary, "unmerge"),
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        assert!(body["requests"][0].get("unmergeCells").is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_resize_dimension_sends_the_resolved_sheet_id_and_span() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(auto_resize_verb("Q1", 2, 5), false),
+            &rules,
+        )
+        .await;
+        match &outcome.result {
+            FormatResult::Changed { summary, .. } => {
+                assert!(summary.contains("row(s)"), "{summary}");
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        let dims = &body["requests"][0]["autoResizeDimensions"]["dimensions"];
+        assert_eq!(dims["sheetId"], 0);
+        assert_eq!(dims["startIndex"], 1);
+        assert_eq!(dims["endIndex"], 5);
+    }
+
+    #[tokio::test]
+    async fn update_dimension_properties_sends_the_pixel_size() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(
+            &drive,
+            &sheets,
+            &opts(update_dimension_verb("Q1", 1, 3, 120), false),
+            &rules,
+        )
+        .await;
+        match &outcome.result {
+            FormatResult::Changed { summary, .. } => assert!(summary.contains("120"), "{summary}"),
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        let request = &body["requests"][0]["updateDimensionProperties"];
+        assert_eq!(request["properties"]["pixelSize"], 120);
+        assert_eq!(request["fields"], "pixelSize");
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+    }
+
+    // ── describe_lines ────────────────────────────────────────────────
+
+    fn every_format_result() -> Vec<FormatResult> {
+        vec![
+            FormatResult::WouldChange {
+                summary: "set bold".to_string(),
+                discarded_cells: vec!["B1: gone".to_string()],
+            },
+            FormatResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            FormatResult::RefusedShortcut,
+            FormatResult::RefusedNoVisibleParents,
+            FormatResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: vec!["Q1".to_string()],
+            },
+            FormatResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: Vec::new(),
+            },
+            FormatResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+            FormatResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 0,
+                }),
+            },
+            FormatResult::Blocked { decided_by: None },
+            FormatResult::Changed {
+                summary: "set bold".to_string(),
+                discarded_cells: Vec::new(),
+            },
+            FormatResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn describe_lines_covers_every_result_with_no_control_characters() {
+        for file_name in [Some("Budget".to_string()), None] {
+            for result in every_format_result() {
+                // Compile-time exhaustiveness: a new variant fails to match.
+                match &result {
+                    FormatResult::WouldChange { .. }
+                    | FormatResult::RefusedNotASpreadsheet { .. }
+                    | FormatResult::RefusedShortcut
+                    | FormatResult::RefusedNoVisibleParents
+                    | FormatResult::RefusedSheetNotFound { .. }
+                    | FormatResult::RefusedInvalidRange { .. }
+                    | FormatResult::Blocked { .. }
+                    | FormatResult::Changed { .. }
+                    | FormatResult::Failed { .. } => {}
+                }
+                let outcome = FormatOutcome {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    file_name: file_name.clone(),
+                    resolved_folder_id: None,
+                    verb: format_cells_opts(false).verb,
+                    result,
+                };
+                let lines = describe_lines(&outcome);
+                assert_eq!(lines.len(), 1, "{:?}", outcome.result);
+                for line in &lines {
+                    assert!(
+                        !line.chars().any(char::is_control),
+                        "{line:?} for {:?}",
+                        outcome.result
+                    );
+                }
+                assert_eq!(describe(&outcome), lines.join("\n"));
+            }
+        }
+    }
 }

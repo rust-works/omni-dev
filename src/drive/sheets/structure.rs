@@ -1996,6 +1996,43 @@ mod tests {
         }
     }
 
+    fn duplicate_sheet() -> StructureVerb {
+        StructureVerb::DuplicateSheet {
+            sheet: "Q2".to_string(),
+            title: Some("Q2 Copy".to_string()),
+            index: Some(1),
+        }
+    }
+
+    fn duplicate_sheet_default() -> StructureVerb {
+        StructureVerb::DuplicateSheet {
+            sheet: "Q2".to_string(),
+            title: None,
+            index: None,
+        }
+    }
+
+    fn reorder_sheet() -> StructureVerb {
+        StructureVerb::ReorderSheet {
+            sheet: "Q2".to_string(),
+            index: 0,
+        }
+    }
+
+    fn hide_sheet() -> StructureVerb {
+        StructureVerb::SetSheetVisibility {
+            sheet: "Q2".to_string(),
+            hidden: true,
+        }
+    }
+
+    fn show_sheet() -> StructureVerb {
+        StructureVerb::SetSheetVisibility {
+            sheet: "Q2".to_string(),
+            hidden: false,
+        }
+    }
+
     fn delete_allow_rule(folder: &str) -> FolderPermissionRule {
         FolderPermissionRule {
             folder_id: Some(folder.to_string()),
@@ -3659,6 +3696,440 @@ mod tests {
         assert!(detail.contains("drive auth login"), "{detail}");
     }
 
+    // ── duplicate-sheet / reorder-sheet / hide-show-sheet (issue #1643) ─
+
+    #[tokio::test]
+    async fn duplicate_sheet_apply_sends_source_title_and_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(duplicate_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let dup = &body["requests"][0]["duplicateSheet"];
+        assert_eq!(dup["sourceSheetId"], 118_293);
+        assert_eq!(dup["insertSheetIndex"], 1);
+        assert_eq!(dup["newSheetName"], "Q2 Copy");
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_apply_with_default_title_and_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(duplicate_sheet_default(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let dup = &body["requests"][0]["duplicateSheet"];
+        assert!(dup.get("insertSheetIndex").is_none());
+        assert!(dup.get("newSheetName").is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_dry_run_names_title_and_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(duplicate_sheet(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would duplicate sheet 'Q2'"), "{text}");
+        assert!(text.contains("as 'Q2 Copy'"), "{text}");
+        assert!(text.contains("at index 1"), "{text}");
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_dry_run_uses_defaults_when_omitted() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(duplicate_sheet_default(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(
+            text.contains("as a copy Sheets names automatically"),
+            "{text}"
+        );
+        assert!(text.contains("at the front"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_refuses_a_missing_source_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DuplicateSheet {
+                    sheet: "Nope".to_string(),
+                    title: None,
+                    index: None,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_refuses_a_colliding_new_title() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DuplicateSheet {
+                    sheet: "Q2".to_string(),
+                    title: Some("Q1".to_string()),
+                    index: None,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedSheetExists { ref title } if title == "Q1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_sheet_refuses_an_out_of_range_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::DuplicateSheet {
+                    sheet: "Q2".to_string(),
+                    title: None,
+                    index: Some(99),
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--index must be between 0 and 2"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_sheet_apply_sends_index_masked_update() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(reorder_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(update["properties"]["sheetId"], 118_293);
+        assert_eq!(update["properties"]["index"], 0);
+        assert_eq!(update["fields"], "index");
+    }
+
+    #[tokio::test]
+    async fn reorder_sheet_dry_run_names_the_target_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(reorder_sheet(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would move sheet 'Q2'"), "{text}");
+        assert!(text.contains("to index 0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn reorder_sheet_refuses_an_out_of_range_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::ReorderSheet {
+                    sheet: "Q2".to_string(),
+                    index: 5,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--index must be between 0 and 1"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hide_sheet_apply_sends_hidden_true() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(hide_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(update["properties"]["sheetId"], 118_293);
+        assert_eq!(update["properties"]["hidden"], true);
+        assert_eq!(update["fields"], "hidden");
+    }
+
+    #[tokio::test]
+    async fn show_sheet_apply_sends_hidden_false() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(show_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(update["properties"]["hidden"], false);
+    }
+
+    #[tokio::test]
+    async fn hide_sheet_dry_run_names_the_hide() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(hide_sheet(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would hide sheet 'Q2'"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn show_sheet_dry_run_names_the_show() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(show_sheet(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("Would show sheet 'Q2'"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn hide_sheet_refuses_leaving_no_visible_sheets() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0, "hidden": true}},
+                        {"properties": {"sheetId": 118_293, "title": "Q2", "index": 1}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(hide_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("would leave the workbook with no visible sheets"),
+            "{detail}"
+        );
+    }
+
     // ── plumbing ───────────────────────────────────────────────────────
 
     #[test]
@@ -3680,6 +4151,10 @@ mod tests {
                 count: 1,
             },
             delete_range(),
+            duplicate_sheet(),
+            reorder_sheet(),
+            hide_sheet(),
+            show_sheet(),
         ];
         let names: Vec<&str> = verbs.iter().map(StructureVerb::log_operation).collect();
         assert_eq!(
@@ -3693,6 +4168,10 @@ mod tests {
                 "sheets-delete-rows",
                 "sheets-delete-columns",
                 "sheets-delete-range",
+                "sheets-duplicate-sheet",
+                "sheets-reorder-sheet",
+                "sheets-hide-sheet",
+                "sheets-show-sheet",
             ]
         );
         // One record per user-visible verb means the operations must not
@@ -3801,6 +4280,11 @@ mod tests {
             delete_columns(),
             delete_range(),
             delete_range_columns_shift(),
+            duplicate_sheet(),
+            duplicate_sheet_default(),
+            reorder_sheet(),
+            hide_sheet(),
+            show_sheet(),
         ] {
             // A verb with a single axis (insert or delete-dimension) earns a
             // second `WouldChange` line for the shift; every other verb,

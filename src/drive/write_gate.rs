@@ -790,6 +790,7 @@ mod tests {
             DriveOperation::Edit,
             DriveOperation::SheetsWrite,
             DriveOperation::SheetsStructure,
+            DriveOperation::SheetsProtection,
             DriveOperation::DocsWrite,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
@@ -809,6 +810,10 @@ mod tests {
         assert_eq!(
             DriveOperation::SheetsStructure.to_string(),
             "sheets-structure"
+        );
+        assert_eq!(
+            DriveOperation::SheetsProtection.to_string(),
+            "sheets-protection"
         );
         assert_eq!(DriveOperation::DocsWrite.to_string(), "docs-write");
     }

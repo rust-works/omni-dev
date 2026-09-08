@@ -742,6 +742,340 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_duplicate_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DuplicateSheet(
+                sheets::structure::DuplicateSheetCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    title: Some("Q2 copy".to_string()),
+                    index: None,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_reorder_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ReorderSheet(
+                sheets::structure::ReorderSheetCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    index: 0,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_hide_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::HideSheet(sheets::structure::HideSheetCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q2".to_string(),
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_show_sheet() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ShowSheet(sheets::structure::ShowSheetCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q2".to_string(),
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_format_cells() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::FormatCells(sheets::format::FormatCellsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                range: Some("A1:B2".to_string()),
+                sheet: None,
+                bold: Some(true),
+                italic: None,
+                strikethrough: None,
+                underline: None,
+                font_size: None,
+                text_color: None,
+                background: None,
+                horizontal_align: Some(sheets::format::HorizontalAlign::Center),
+                vertical_align: Some(sheets::format::VerticalAlign::Middle),
+                number_format: Some("#,##0.00".to_string()),
+                number_format_type: Some(sheets::format::NumberFormatType::Currency),
+                wrap: Some(sheets::format::WrapStrategy::Wrap),
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_update_borders() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateBorders(
+                sheets::format::UpdateBordersCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:B2".to_string()),
+                    sheet: None,
+                    top: true,
+                    bottom: false,
+                    left: false,
+                    right: false,
+                    all: false,
+                    style: sheets::format::BorderStyle::Dashed,
+                    color: Some("#FF0000".to_string()),
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_merge_cells() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::MergeCells(sheets::format::MergeCellsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                range: Some("A1:B2".to_string()),
+                sheet: None,
+                r#type: sheets::format::MergeType::Rows,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_unmerge_cells() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UnmergeCells(sheets::format::UnmergeCellsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                range: Some("A1:B2".to_string()),
+                sheet: None,
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_auto_resize_dimension() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::AutoResizeDimension(
+                sheets::format::AutoResizeDimensionCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    dimension: sheets::format::DimensionArg::Columns,
+                    start: 1,
+                    end: 3,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_update_dimension_properties() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateDimensionProperties(
+                sheets::format::UpdateDimensionPropertiesCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    dimension: sheets::format::DimensionArg::Rows,
+                    start: 1,
+                    end: 3,
+                    pixel_size: 42,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_set_data_validation() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::SetDataValidation(
+                sheets::validation::SetDataValidationCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:A10".to_string()),
+                    sheet: None,
+                    one_of_list: Some(vec!["yes".to_string(), "no".to_string()]),
+                    number_between: None,
+                    checkbox: false,
+                    custom_formula: None,
+                    input_message: Some("Pick one".to_string()),
+                    show_warning: false,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_clear_data_validation() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ClearDataValidation(
+                sheets::validation::ClearDataValidationCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:A10".to_string()),
+                    sheet: None,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_protect_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ProtectRange(
+                sheets::protection::ProtectRangeCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:B2".to_string()),
+                    sheet: None,
+                    whole_sheet: false,
+                    description: Some("locked".to_string()),
+                    warning_only: false,
+                    editors: vec!["alice@example.com".to_string()],
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_update_protection() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateProtection(
+                sheets::protection::UpdateProtectionCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:B2".to_string()),
+                    sheet: None,
+                    whole_sheet: false,
+                    description: Some("still locked".to_string()),
+                    warning_only: Some(true),
+                    add_editors: vec!["bob@example.com".to_string()],
+                    remove_editors: vec!["alice@example.com".to_string()],
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_unprotect_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UnprotectRange(
+                sheets::protection::UnprotectRangeCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    range: Some("A1:B2".to_string()),
+                    sheet: None,
+                    whole_sheet: false,
+                    dry_run: false,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_list_protections() {
+        // Read-only and ungated, like `sheets info` — needs the host
+        // redirect so it fails fast against a dead port instead of trying
+        // the real Sheets API.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ListProtections(
+                sheets::protection::ListProtectionsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),

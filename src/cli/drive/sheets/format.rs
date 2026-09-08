@@ -561,3 +561,82 @@ async fn run_format(
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn horizontal_align_wire_maps_every_variant() {
+        assert_eq!(HorizontalAlign::Left.wire(), "LEFT");
+        assert_eq!(HorizontalAlign::Center.wire(), "CENTER");
+        assert_eq!(HorizontalAlign::Right.wire(), "RIGHT");
+    }
+
+    #[test]
+    fn vertical_align_wire_maps_every_variant() {
+        assert_eq!(VerticalAlign::Top.wire(), "TOP");
+        assert_eq!(VerticalAlign::Middle.wire(), "MIDDLE");
+        assert_eq!(VerticalAlign::Bottom.wire(), "BOTTOM");
+    }
+
+    #[test]
+    fn wrap_strategy_wire_maps_every_variant() {
+        assert_eq!(WrapStrategy::Overflow.wire(), "OVERFLOW_CELL");
+        assert_eq!(WrapStrategy::Clip.wire(), "CLIP");
+        assert_eq!(WrapStrategy::Wrap.wire(), "WRAP");
+    }
+
+    #[test]
+    fn number_format_type_wire_maps_every_variant() {
+        assert_eq!(NumberFormatType::Text.wire(), "TEXT");
+        assert_eq!(NumberFormatType::Number.wire(), "NUMBER");
+        assert_eq!(NumberFormatType::Percent.wire(), "PERCENT");
+        assert_eq!(NumberFormatType::Currency.wire(), "CURRENCY");
+        assert_eq!(NumberFormatType::Date.wire(), "DATE");
+        assert_eq!(NumberFormatType::Time.wire(), "TIME");
+        assert_eq!(NumberFormatType::DateTime.wire(), "DATE_TIME");
+        assert_eq!(NumberFormatType::Scientific.wire(), "SCIENTIFIC");
+    }
+
+    #[test]
+    fn border_style_wire_maps_every_variant() {
+        assert_eq!(BorderStyle::Solid.wire(), "SOLID");
+        assert_eq!(BorderStyle::SolidMedium.wire(), "SOLID_MEDIUM");
+        assert_eq!(BorderStyle::SolidThick.wire(), "SOLID_THICK");
+        assert_eq!(BorderStyle::Dashed.wire(), "DASHED");
+        assert_eq!(BorderStyle::Dotted.wire(), "DOTTED");
+        assert_eq!(BorderStyle::Double.wire(), "DOUBLE");
+    }
+
+    #[test]
+    fn border_style_display_is_lowercase_hyphenated() {
+        assert_eq!(BorderStyle::Solid.to_string(), "solid");
+        assert_eq!(BorderStyle::SolidMedium.to_string(), "solid-medium");
+        assert_eq!(BorderStyle::SolidThick.to_string(), "solid-thick");
+        assert_eq!(BorderStyle::Dashed.to_string(), "dashed");
+        assert_eq!(BorderStyle::Dotted.to_string(), "dotted");
+        assert_eq!(BorderStyle::Double.to_string(), "double");
+    }
+
+    #[test]
+    fn merge_type_wire_maps_every_variant() {
+        assert_eq!(MergeType::All.wire(), "MERGE_ALL");
+        assert_eq!(MergeType::Rows.wire(), "MERGE_ROWS");
+        assert_eq!(MergeType::Columns.wire(), "MERGE_COLUMNS");
+    }
+
+    #[test]
+    fn merge_type_display_is_lowercase_hyphenated() {
+        assert_eq!(MergeType::All.to_string(), "merge-all");
+        assert_eq!(MergeType::Rows.to_string(), "merge-rows");
+        assert_eq!(MergeType::Columns.to_string(), "merge-columns");
+    }
+
+    #[test]
+    fn dimension_arg_engine_maps_every_variant() {
+        assert_eq!(DimensionArg::Rows.engine(), Dimension::Rows);
+        assert_eq!(DimensionArg::Columns.engine(), Dimension::Columns);
+    }
+}

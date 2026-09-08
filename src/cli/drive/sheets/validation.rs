@@ -155,3 +155,76 @@ async fn run_validation(
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::utils::secret::Secret;
+
+    fn dead_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client".to_string(),
+            client_secret: Secret::new("secret"),
+            refresh_token: Secret::new("refresh"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    fn dead_client() -> DriveClient {
+        DriveClient::new("http://127.0.0.1:1", &dead_credentials()).unwrap()
+    }
+
+    fn base_cmd() -> SetDataValidationCommand {
+        SetDataValidationCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            range: Some("A1:A10".to_string()),
+            sheet: None,
+            one_of_list: None,
+            number_between: None,
+            checkbox: false,
+            custom_formula: None,
+            input_message: None,
+            show_warning: false,
+            dry_run: false,
+            output: crate::cli::drive::format::OutputFormat::Table,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_selects_number_between_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            number_between: Some(vec![1.0, 10.0]),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_checkbox_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            checkbox: true,
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_custom_formula_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            custom_formula: Some("=A1>0".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+}
