@@ -354,6 +354,14 @@ mod tests {
                     id: "m2".to_string(),
                     reason: SkipReason::AlreadyInserted,
                 },
+                InsertAction::WouldInsert {
+                    id: "m4".to_string(),
+                    label_ids: vec!["INBOX".to_string()],
+                },
+                InsertAction::Skipped {
+                    id: "m5".to_string(),
+                    reason: SkipReason::FoundRemote,
+                },
             ],
             errors: vec![InsertError {
                 id: "m3".to_string(),
@@ -365,8 +373,10 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Inserted m1 -> new1"));
         assert!(text.contains("Skipped m2 (already inserted)"));
+        assert!(text.contains("Would insert m4 (INBOX)"));
+        assert!(text.contains("Skipped m5 (found on destination)"));
         assert!(text.contains("Error: m3 failed: boom"));
-        assert!(text.contains("1 inserted, 1 skipped, 1 errors"));
+        assert!(text.contains("1 inserted, 1 would insert, 2 skipped, 1 errors"));
     }
 
     #[test]
@@ -483,5 +493,80 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("1 message(s) failed to insert"));
+    }
+
+    #[tokio::test]
+    async fn run_insert_command_writes_jsonl_report() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "dest@example.com", "messagesTotal": 0, "threadsTotal": 0, "historyId": "1"
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(&archive_dir, "m1");
+
+        let selection = Selection::from_args(&SelectionArgs {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        run_insert_command(
+            &client,
+            InsertOptions {
+                archive_dir,
+                selection,
+                limit: 0,
+                label: None,
+                drop_label_ids: Vec::new(),
+                concurrency: DEFAULT_INSERT_CONCURRENCY,
+                verify_remote: false,
+                dry_run: true,
+            },
+            true,
+            &OutputFormat::Jsonl,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_passes_flags_through() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "dest@example.com", "messagesTotal": 0, "threadsTotal": 0, "historyId": "1"
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(&archive_dir, "m1");
+
+        let cmd = InsertCommand {
+            archive_dir,
+            selection: SelectionArgs {
+                all: true,
+                ..Default::default()
+            },
+            limit: 0,
+            label: None,
+            drop_label: Vec::new(),
+            concurrency: DEFAULT_INSERT_CONCURRENCY,
+            verify_remote: false,
+            dry_run: true,
+            quiet: true,
+            output: OutputFormat::Json,
+        };
+        cmd.execute(&client).await.unwrap();
     }
 }

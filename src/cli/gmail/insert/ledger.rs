@@ -278,6 +278,31 @@ mod tests {
     }
 
     #[test]
+    fn load_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("insert-ledger.jsonl");
+        let record = sample_record("a@example.com", "k1");
+        std::fs::write(
+            &path,
+            format!("\n{}\n\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+        let ledger = InsertLedger::load(&path).unwrap();
+        assert!(ledger.contains("a@example.com", "k1"));
+    }
+
+    #[test]
+    fn load_surfaces_a_non_not_found_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the ledger's path fails to read for a reason other
+        // than NotFound, unlike a simply-absent file.
+        let path = dir.path().join("insert-ledger.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let err = InsertLedger::load(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to read insert ledger"));
+    }
+
+    #[test]
     fn save_then_load_round_trips_a_record() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("insert-ledger.jsonl");

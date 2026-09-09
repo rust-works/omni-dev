@@ -466,6 +466,26 @@ mod tests {
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
+    #[tokio::test]
+    async fn dispatch_routes_insert() {
+        let cmd = GmailSubcommands::Insert(insert::InsertCommand {
+            archive_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            selection: selection::SelectionArgs {
+                all: true,
+                ..Default::default()
+            },
+            limit: 0,
+            label: None,
+            drop_label: Vec::new(),
+            concurrency: 4,
+            verify_remote: false,
+            dry_run: true,
+            quiet: true,
+            output: OutputFormat::Table,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
     fn sync_all_command() -> sync_all::SyncAllCommand {
         sync_all::SyncAllCommand {
             context_dir: None,
