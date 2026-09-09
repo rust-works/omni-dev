@@ -147,4 +147,19 @@ mod tests {
     fn summary_of_empty_report_is_all_zero() {
         assert_eq!(InsertReport::default().summary(), InsertSummary::default());
     }
+
+    #[test]
+    fn write_jsonl_emits_one_compact_line_for_the_whole_report() {
+        let report = InsertReport {
+            actions: vec![InsertAction::Note {
+                message: "note".to_string(),
+            }],
+            errors: vec![],
+        };
+        let mut buf = Vec::new();
+        report.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("\"note\""));
+    }
 }

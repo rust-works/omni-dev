@@ -364,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn matches_date_range_excludes_a_record_older_than_since() {
+        let args = SelectionArgs {
+            since: Some("2026-01-02".to_string()),
+            ..SelectionArgs::default()
+        };
+        let selection = Selection::from_args(&args).unwrap();
+        let jan1_start = NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_time(NaiveTime::MIN)
+            .and_utc()
+            .timestamp_millis();
+        assert!(!selection.matches(&dated_record("m1", jan1_start)));
+    }
+
+    #[test]
     fn matches_date_range_excludes_records_with_no_parseable_date() {
         let args = SelectionArgs {
             since: Some("2026-01-01".to_string()),

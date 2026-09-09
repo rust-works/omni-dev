@@ -917,4 +917,276 @@ mod tests {
         ));
         assert!(!date_header_present(b"From: a@example.com\r\n\r\nbody"));
     }
+
+    // ── --limit ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn limit_truncates_the_oldest_first_plan() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "older",
+            Some("<older@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+        write_archived_message(
+            &archive_dir,
+            "newer",
+            Some("<newer@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+        // Post-dates "older"'s manifest entry so sorting is deterministic.
+        let mut manifest = Manifest::load(&manifest_path(&archive_dir)).unwrap();
+        let mut newer = manifest.get("newer").unwrap().clone();
+        newer.internal_date = Some("1800000000000".to_string());
+        manifest.upsert(newer);
+        manifest.save(&manifest_path(&archive_dir)).unwrap();
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                limit: 1,
+                dry_run: true,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.summary().would_insert, 1);
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, InsertAction::WouldInsert { id, .. } if id == "older")));
+    }
+
+    // ── --label ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn label_option_resolves_by_name_and_is_unioned_into_the_wire_labels() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/labels"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "labels": [{"id": "Label_restore", "name": "Restored", "type": "user"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_insert_success(&server, "new1").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+
+        run_insert(
+            &client,
+            &InsertOptions {
+                label: Some("Restored".to_string()),
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let insert_request = requests
+            .iter()
+            .find(|r| r.url.path() == "/upload/gmail/v1/users/me/messages")
+            .unwrap();
+        let body = String::from_utf8_lossy(&insert_request.body);
+        assert!(body.contains("Label_restore"));
+    }
+
+    // ── TRASH/SPAM note ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn messages_landing_in_trash_or_spam_emit_a_note() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["TRASH"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                dry_run: true,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(report.actions.iter().any(|a| matches!(
+            a,
+            InsertAction::Note { message } if message.contains("TRASH/SPAM")
+        )));
+    }
+
+    // ── progress events ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn progress_reports_started_and_completed_events() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        mount_insert_success(&server, "new1").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_insert_with_progress(&client, &base_opts(archive_dir), Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InsertProgressEvent::Started { total: 1 })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InsertProgressEvent::Completed { failed: false })));
+    }
+
+    // ── unreadable .eml file ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_missing_eml_file_is_reported_as_a_per_message_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+        // The manifest still names it, but the archived .eml itself is gone
+        // — e.g. a partially-corrupted archive.
+        std::fs::remove_file(archive_dir.join("messages/m1.eml")).unwrap();
+
+        let report = run_insert(&client, &base_opts(archive_dir)).await.unwrap();
+
+        assert_eq!(report.summary().errors, 1);
+        assert_eq!(report.errors[0].id, "m1");
+        assert!(report.errors[0].reason.contains("Failed to read"));
+    }
+
+    // ── --verify-remote probe failure ───────────────────────────────────
+
+    #[tokio::test]
+    async fn a_verify_remote_probe_failure_is_reported_as_a_per_message_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                verify_remote: true,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.summary().errors, 1);
+        assert_eq!(report.errors[0].id, "m1");
+    }
+
+    // ── ledger checkpointing ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_ledger_is_checkpointed_mid_batch_past_the_interval() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        mount_insert_success(&server, "new-any").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        let count = INSERT_LEDGER_CHECKPOINT_INTERVAL + 1;
+        for i in 0..count {
+            let id = format!("m{i}");
+            write_archived_message(
+                &archive_dir,
+                &id,
+                Some(&format!("<{id}@example.com>")),
+                &["INBOX"],
+                &format!("From: a@example.com\r\n\r\nbody {i}"),
+            );
+        }
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                concurrency: 1,
+                ..base_opts(archive_dir.clone())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.summary().inserted, count);
+        let ledger = InsertLedger::load(&ledger_path(&archive_dir)).unwrap();
+        for i in 0..count {
+            assert!(ledger.contains("dest@example.com", &format!("m{i}@example.com")));
+        }
+    }
 }
