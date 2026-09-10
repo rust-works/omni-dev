@@ -10,7 +10,7 @@ mod prune;
 mod query;
 mod stream;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::request_log;
@@ -114,6 +114,22 @@ impl LogCommand {
     /// Executes the `omni-dev log` command.
     pub fn execute(mut self) -> Result<()> {
         if let Some(action) = self.action {
+            // `self.audit` only affects the bare search below — a subcommand
+            // never sees it, so silently proceeding here would make `--audit`
+            // placed before the subcommand name a silent no-op instead of the
+            // explicit refusal ADR-0080 §11 calls for. `prune` has its own
+            // `--audit` (placed *after* the subcommand) that refuses loudly;
+            // `count` has none yet.
+            if self.audit {
+                let sub = match &action {
+                    LogAction::Count(_) => "count",
+                    LogAction::Prune(_) => "prune",
+                };
+                bail!(
+                    "--audit has no effect here: it must follow the subcommand, e.g. \
+                     `omni-dev log {sub} --audit`, not `omni-dev log --audit {sub}`"
+                );
+            }
             return match action {
                 LogAction::Count(cmd) => cmd.execute(),
                 LogAction::Prune(cmd) => cmd.execute(),
@@ -275,6 +291,27 @@ mod tests {
         );
 
         std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+    }
+
+    #[test]
+    fn top_level_audit_before_a_subcommand_is_refused_not_silently_dropped() {
+        // `--audit` only wires into the bare-search path; placed before a
+        // subcommand it must never be a silent no-op (it used to be, since
+        // `execute` returned out of the subcommand match before checking
+        // `self.audit` at all).
+        let err = parse(&["--audit", "prune", "--older-than", "7d"])
+            .execute()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("omni-dev log prune --audit"),
+            "{err}"
+        );
+
+        let err = parse(&["--audit", "count"]).execute().unwrap_err();
+        assert!(
+            format!("{err}").contains("omni-dev log count --audit"),
+            "{err}"
+        );
     }
 
     #[test]

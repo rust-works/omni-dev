@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 const LOG_FILE_NAME: &str = "log.jsonl";
 
 /// Default audit log file name under the runtime directory — a sibling of
-/// [`LOG_FILE_NAME`], never the same file ([ADR-0080](../docs/adrs/adr-0080.md) §11).
+/// [`LOG_FILE_NAME`] ([ADR-0080](../docs/adrs/adr-0080.md) §11). Distinctness
+/// from the default `log.jsonl` path is enforced at write time by
+/// [`record_audit`], not merely implied by having a different constant.
 const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Number of rotated log files kept by default when
@@ -358,32 +360,36 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
-/// Resolves the log file path: `OMNI_DEV_LOG_FILE` override, else
-/// `state_dir` (falling back to `data_dir`) joined with `omni-dev/log.jsonl`.
-pub fn log_file_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OMNI_DEV_LOG_FILE") {
+/// Resolves a runtime log path: `env_var` override if set and non-empty,
+/// else `state_dir` (falling back to `data_dir`) joined with
+/// `omni-dev/<file_name>`. Shared by [`log_file_path`] and
+/// [`audit_file_path`] so the two sinks' resolution policy can't drift apart.
+fn resolve_runtime_log_path(env_var: &str, file_name: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(env_var) {
         if !path.is_empty() {
             return Some(PathBuf::from(path));
         }
     }
     let base = dirs::state_dir().or_else(dirs::data_dir)?;
-    Some(base.join("omni-dev").join(LOG_FILE_NAME))
+    Some(base.join("omni-dev").join(file_name))
+}
+
+/// Resolves the log file path: `OMNI_DEV_LOG_FILE` override, else
+/// `state_dir` (falling back to `data_dir`) joined with `omni-dev/log.jsonl`.
+pub fn log_file_path() -> Option<PathBuf> {
+    resolve_runtime_log_path("OMNI_DEV_LOG_FILE", LOG_FILE_NAME)
 }
 
 /// Resolves the audit log file path.
 ///
 /// `OMNI_DEV_AUDIT_LOG_FILE` override, else `state_dir` (falling back to
-/// `data_dir`) joined with `omni-dev/audit.jsonl` — deliberately a sibling
-/// of, and never derived from, [`log_file_path`]'s result, so the two can
-/// never resolve to the same file by construction.
+/// `data_dir`) joined with `omni-dev/audit.jsonl` — a sibling of
+/// [`log_file_path`]'s default, but since either resolver can be redirected
+/// independently via its own env override, nothing here *guarantees* the two
+/// stay distinct; [`record_audit`] checks that at write time instead of
+/// merely assuming it.
 pub fn audit_file_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OMNI_DEV_AUDIT_LOG_FILE") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    let base = dirs::state_dir().or_else(dirs::data_dir)?;
-    Some(base.join("omni-dev").join(AUDIT_FILE_NAME))
+    resolve_runtime_log_path("OMNI_DEV_AUDIT_LOG_FILE", AUDIT_FILE_NAME)
 }
 
 /// Appends one record. Best effort: every error is swallowed (logged at
@@ -398,9 +404,18 @@ pub fn record(entry: &LogRecord) {
 }
 
 /// The fallible append used by [`record`]; all errors flow back to be swallowed.
+///
+/// Refuses a [`RecordKind::Audit`] entry outright: that kind belongs to the
+/// fail-closed sink only ([`record_audit`]), and routing it through this
+/// best-effort path would silently subject a forensic record to
+/// `OMNI_DEV_LOG_DISABLE`, rotation and `prune`.
 fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::Context;
+    use anyhow::{ensure, Context};
 
+    ensure!(
+        entry.kind != RecordKind::Audit,
+        "an audit-kind record must go through record_audit(), not record()"
+    );
     let path = log_file_path().context("could not resolve the log file path")?;
     append_record_to(&path, entry, append_line)
 }
@@ -418,10 +433,28 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// means for this sink; see `record`'s own doc comment for the contrasting,
 /// deliberately best-effort contract every other record in this module
 /// keeps.
+///
+/// Refuses outright if `entry.kind` isn't [`RecordKind::Audit`], or if
+/// [`audit_file_path`] resolves to the same path as [`log_file_path`] (an env
+/// override misconfiguration that would otherwise silently blend the
+/// fail-closed sink into the best-effort, prunable one).
 pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::Context;
+    use anyhow::{ensure, Context};
 
+    ensure!(
+        entry.kind == RecordKind::Audit,
+        "record_audit() requires a RecordKind::Audit entry, got {:?}",
+        entry.kind
+    );
     let path = audit_file_path().context("could not resolve the audit log file path")?;
+    if let Some(log_path) = log_file_path() {
+        ensure!(
+            path != log_path,
+            "the audit log path resolves to the same file as the request log ({}); set \
+             OMNI_DEV_AUDIT_LOG_FILE and/or OMNI_DEV_LOG_FILE to distinct paths",
+            path.display()
+        );
+    }
     append_record_to(&path, entry, append_line_no_rotation)
 }
 
@@ -2375,6 +2408,66 @@ mod tests {
 
         result.unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn try_record_refuses_an_audit_kind_entry() {
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let err = try_record(&rec).unwrap_err();
+        assert!(err.to_string().contains("record_audit()"), "{err}");
+    }
+
+    #[test]
+    fn record_audit_refuses_a_non_audit_kind_entry() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.path().join("audit.jsonl"));
+
+        let rec = LogRecord {
+            kind: RecordKind::Invocation,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let err = record_audit(&rec).unwrap_err();
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        assert!(err.to_string().contains("RecordKind::Audit"), "{err}");
+    }
+
+    #[test]
+    fn record_audit_refuses_when_the_audit_path_collides_with_the_log_path() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared.jsonl");
+        std::env::set_var("OMNI_DEV_LOG_FILE", &shared);
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &shared);
+
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let err = record_audit(&rec).unwrap_err();
+
+        std::env::remove_var("OMNI_DEV_LOG_FILE");
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+
+        assert!(
+            err.to_string().contains("same file as the request log"),
+            "{err}"
+        );
+        assert!(!shared.exists());
     }
 
     #[test]
