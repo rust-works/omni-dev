@@ -21,6 +21,18 @@
 /// own independent mutex) in issue #1465.
 pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Process-wide mutex serialising every test that mutates
+/// `OMNI_DEV_LOG_FILE`, `OMNI_DEV_AUDIT_LOG_FILE` or `OMNI_DEV_LOG_DISABLE` —
+/// `crate::request_log`'s own path-resolution and fail-closed-audit tests,
+/// and `crate::cli::log`'s `--audit` flag-selection test. Same rationale as
+/// [`HOME_ENV_MUTEX`]: these are shared, process-wide env vars, so two tests
+/// mutating them under independent locks (or no lock) can still interleave
+/// and race. Does **not** cover every existing `OMNI_DEV_LOG_FILE` mutation
+/// in the crate (e.g. `daemon::services::worktrees`'s poller tests predate
+/// this lock) — new tests should take it; retrofitting older ones is a
+/// follow-up, not a blocker.
+pub(crate) static REQUEST_LOG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) mod failing_io {
     //! Writer fixture that always returns `ErrorKind::Other` from
     //! `write` and `flush`. Used to drive `?`-propagation Err branches

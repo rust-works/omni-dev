@@ -34,6 +34,10 @@ use serde::{Deserialize, Serialize};
 /// Default log file name under the runtime directory.
 const LOG_FILE_NAME: &str = "log.jsonl";
 
+/// Default audit log file name under the runtime directory — a sibling of
+/// [`LOG_FILE_NAME`], never the same file ([ADR-0080](../docs/adrs/adr-0080.md) §11).
+const AUDIT_FILE_NAME: &str = "audit.jsonl";
+
 /// Number of rotated log files kept by default when
 /// [`OMNI_DEV_LOG_MAX_SIZE`](rotation_config) enables rotation but
 /// `OMNI_DEV_LOG_KEEP_FILES` is unset. (Rotation on write is unix-only.)
@@ -58,13 +62,23 @@ pub enum RecordKind {
     /// recovery-relevant metadata (path/branch/commit) in `context`.
     /// See `crate::cli::git` worktree subcommands.
     Worktree,
-    /// One per `drive rename`/`drive move` mutation attempt, including a
-    /// refused `Blocked` move — no `files.update` call happens for those,
-    /// but the refusal is itself the security-relevant event. Covers both
-    /// operations via `command`/`context`, mirroring how
-    /// [`RecordKind::Worktree`] covers multiple verbs rather than one kind
-    /// per verb. See `crate::drive::{rename,file_move}`.
+    /// One per Drive/Sheets/Docs content-mutating attempt — `create`,
+    /// `upload`, `edit`, `rename`, `move`, and every Sheets/Docs write,
+    /// structural, delete or protection verb — including a refused
+    /// `Blocked` attempt for any of them, where the refusal itself is the
+    /// security-relevant event. Covers every operation via `command`/
+    /// `context`, mirroring how [`RecordKind::Worktree`] covers multiple
+    /// verbs rather than one kind per verb. See `crate::drive`.
     DriveMutation,
+    /// One per leased-write lifecycle event — lease acquire, a write under
+    /// a lease, expiry/release, restore, and every refusal along the way —
+    /// written to the separate, fail-closed `audit.jsonl` sink rather than
+    /// this log ([ADR-0080](../docs/adrs/adr-0080.md) §11). Distinct from
+    /// [`RecordKind::DriveMutation`], which stays the best-effort record
+    /// written here for the same underlying API call: a leased write
+    /// produces both, correlated by `invocation_id`. See
+    /// [`record_audit`]/[`audit_file_path`].
+    Audit,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]
     Unknown,
@@ -81,6 +95,7 @@ impl RecordKind {
             Self::Gh => "gh",
             Self::Worktree => "worktree",
             Self::DriveMutation => "drivemutation",
+            Self::Audit => "audit",
             Self::Unknown => "unknown",
         }
     }
@@ -355,6 +370,22 @@ pub fn log_file_path() -> Option<PathBuf> {
     Some(base.join("omni-dev").join(LOG_FILE_NAME))
 }
 
+/// Resolves the audit log file path.
+///
+/// `OMNI_DEV_AUDIT_LOG_FILE` override, else `state_dir` (falling back to
+/// `data_dir`) joined with `omni-dev/audit.jsonl` — deliberately a sibling
+/// of, and never derived from, [`log_file_path`]'s result, so the two can
+/// never resolve to the same file by construction.
+pub fn audit_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("OMNI_DEV_AUDIT_LOG_FILE") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    let base = dirs::state_dir().or_else(dirs::data_dir)?;
+    Some(base.join("omni-dev").join(AUDIT_FILE_NAME))
+}
+
 /// Appends one record. Best effort: every error is swallowed (logged at
 /// `tracing::debug`) so logging can never affect the caller's exit code.
 pub fn record(entry: &LogRecord) {
@@ -371,6 +402,43 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let path = log_file_path().context("could not resolve the log file path")?;
+    append_record_to(&path, entry, append_line)
+}
+
+/// Appends one record to the fail-closed audit sink (`audit.jsonl`), for a
+/// leased-write lifecycle event or refusal
+/// ([ADR-0080](../docs/adrs/adr-0080.md) §11).
+///
+/// Unlike [`record`], this is **not** best-effort: it is not gated on
+/// [`disabled`] (`OMNI_DEV_LOG_DISABLE` has no effect here — exemption from
+/// that switch is the point of a forensic log), takes no part in rotation or
+/// [`prune`], and returns every error to the caller instead of swallowing
+/// it. A caller whose write-ahead intent record fails to land here must not
+/// perform the mutation it was about to audit — that is what "fail-closed"
+/// means for this sink; see `record`'s own doc comment for the contrasting,
+/// deliberately best-effort contract every other record in this module
+/// keeps.
+pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let path = audit_file_path().context("could not resolve the audit log file path")?;
+    append_record_to(&path, entry, append_line_no_rotation)
+}
+
+/// Serializes `entry` and appends it to `path` via `append`, creating a
+/// missing `0700` parent directory first. Shared by [`try_record`] (passing
+/// [`append_line`], which opts into rotation when configured) and
+/// [`record_audit`] (passing [`append_line_no_rotation`] directly, so the
+/// audit sink can never be rotated regardless of
+/// `OMNI_DEV_LOG_MAX_SIZE`) — the two differ only in path resolution and
+/// which appender they hand in, not in how a line actually gets written.
+fn append_record_to(
+    path: &Path,
+    entry: &LogRecord,
+    append: fn(&Path, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     // Only create and tighten the parent when it's missing — re-`chmod`ing an
     // existing dir (e.g. a user-chosen OMNI_DEV_LOG_FILE location, or a shared
     // temp dir) is both wrong and may fail; the file itself is always 0600.
@@ -381,7 +449,7 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
     }
     let mut line = serde_json::to_string(entry).context("failed to serialize record")?;
     line.push('\n');
-    append_line(&path, &line)?;
+    append(path, &line)?;
     Ok(())
 }
 
@@ -392,15 +460,28 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// When bodies are enabled (lines may exceed the atomic-write size) an advisory
 /// exclusive lock guards the write; the common no-body path relies on
 /// `O_APPEND` single-write atomicity and takes no lock.
+///
+/// `log.jsonl`'s own writer — opts into size-capped rotation
+/// ([`rotation_config`]) when configured. The audit sink deliberately does
+/// **not** call this; see [`append_line_no_rotation`].
 #[cfg(unix)]
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     // Opt-in size-capped rotation takes over the write: it must stat, maybe
     // rotate, then open a fresh file, all under a stable-path lock (#1121).
     if let Some(cfg) = rotation_config() {
         return append_with_rotation(path, line, &cfg);
     }
+    append_line_no_rotation(path, line)
+}
+
+/// The same append as [`append_line`], minus the `OMNI_DEV_LOG_MAX_SIZE`
+/// rotation check — used directly by the audit sink
+/// ([ADR-0080](../docs/adrs/adr-0080.md) §11: exempt from rotation by
+/// design, not merely by leaving `OMNI_DEV_LOG_MAX_SIZE` unset) and by
+/// [`append_line`] itself once rotation is confirmed inactive.
+#[cfg(unix)]
+fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
         .append(true)
@@ -427,9 +508,17 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
 
 /// Non-unix fallback: `O_APPEND | O_CREATE` single write, no advisory lock and
 /// no mode tightening (those are unix concepts). Size-capped rotation is a
-/// unix-only feature and is not applied here.
+/// unix-only feature and is not applied here, so this already matches
+/// [`append_line_no_rotation`]'s contract exactly — there is nothing left to
+/// differ, so the audit sink reuses this same function on non-unix targets.
 #[cfg(not(unix))]
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    append_line_no_rotation(path, line)
+}
+
+/// See [`append_line`]'s doc comment on non-unix targets.
+#[cfg(not(unix))]
+fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -2186,6 +2275,106 @@ mod tests {
         assert_eq!(back.kind, RecordKind::Gh);
         assert_eq!(back.command, argv(&["pr", "list"]));
         assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn record_kind_audit_serializes_as_audit_and_round_trips() {
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(line.contains("\"kind\":\"audit\""), "line was: {line}");
+        assert_eq!(RecordKind::Audit.as_str(), "audit");
+        let back: LogRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.kind, RecordKind::Audit);
+    }
+
+    #[test]
+    fn audit_file_path_honors_env_override() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
+        assert_eq!(
+            audit_file_path(),
+            Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl"))
+        );
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+    }
+
+    #[test]
+    fn record_audit_writes_a_line_that_round_trips() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        record_audit(&rec).unwrap();
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(back.kind, RecordKind::Audit);
+        assert_eq!(back.id, rec.id);
+    }
+
+    #[test]
+    fn record_audit_fails_closed_when_the_write_errors() {
+        // A directory is not a valid target for `OpenOptions::append`, so this
+        // forces the same write failure a permission error or a missing parent
+        // would — the point is that `record_audit`, unlike `record`, hands the
+        // error back rather than swallowing it.
+        let dir = tempfile::tempdir().unwrap();
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let err = append_record_to(dir.path(), &rec, append_line_no_rotation).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn record_audit_is_exempt_from_omni_dev_log_disable() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("OMNI_DEV_LOG_DISABLE").ok();
+        std::env::set_var("OMNI_DEV_LOG_DISABLE", "1");
+        assert!(disabled());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let result = record_audit(&rec);
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        match prior {
+            Some(v) => std::env::set_var("OMNI_DEV_LOG_DISABLE", v),
+            None => std::env::remove_var("OMNI_DEV_LOG_DISABLE"),
+        }
+
+        result.unwrap();
+        assert!(path.exists());
     }
 
     #[test]

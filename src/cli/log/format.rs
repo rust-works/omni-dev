@@ -124,6 +124,27 @@ fn oneline(rec: &LogRecord) -> String {
                 .map_or_else(String::new, |ms| format!(" {ms}ms"));
             format!("{time}  drv   {source:<14} {command}{file_name}{status}{err}{dur}")
         }
+        RecordKind::Audit => {
+            let integration = rec.context.get("integration").map_or("-", String::as_str);
+            let command = if rec.command.is_empty() {
+                "-".to_string()
+            } else {
+                rec.command.join(" ")
+            };
+            let lease_id = rec
+                .context
+                .get("lease_id")
+                .map_or_else(String::new, |id| format!(" lease={id}"));
+            let verdict = rec
+                .context
+                .get("verdict")
+                .map_or_else(String::new, |v| format!(" verdict={v}"));
+            let err = rec
+                .error
+                .as_deref()
+                .map_or_else(String::new, |e| format!("  error={e}"));
+            format!("{time}  aud   {integration:<14} {command}{lease_id}{verdict}{err}")
+        }
         RecordKind::Invocation | RecordKind::Unknown => {
             let source = source_str(rec.source);
             let command = if rec.command.is_empty() {

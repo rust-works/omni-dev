@@ -91,6 +91,14 @@ pub struct LogCommand {
     /// Follow the log, printing new matching records as they are appended.
     #[arg(short = 'f', long)]
     follow: bool,
+    /// Read the fail-closed audit log (`audit.jsonl`) instead of the
+    /// best-effort request log — the leased-write lifecycle and refusal
+    /// trail ([ADR-0080](../../docs/adrs/adr-0080.md) §11), not subject to
+    /// `OMNI_DEV_LOG_DISABLE`, rotation or `prune`. Every filter, the
+    /// `--query` mini-language and all three output formats apply
+    /// unchanged; only the file being read differs.
+    #[arg(long)]
+    audit: bool,
 }
 
 /// A `log` subcommand. Absent = search (the flags on [`LogCommand`]).
@@ -115,7 +123,7 @@ impl LogCommand {
             eprintln!("warning: --format is deprecated; use -o/--output instead");
             self.output = format;
         }
-        let path = request_log::log_file_path().context("could not resolve the log file path")?;
+        let path = self.resolve_path()?;
         let filter = Filter::build(query::FilterInput {
             since: self.since.as_deref(),
             until: self.until.as_deref(),
@@ -130,6 +138,17 @@ impl LogCommand {
             id: self.id.as_deref(),
         })?;
         stream::run(&path, &filter, self.output, self.limit, self.follow)
+    }
+
+    /// Resolves which file this invocation reads: `audit.jsonl` when
+    /// `--audit` is set, else the ordinary `log.jsonl` — the entire effect
+    /// of the flag ([ADR-0080](../../docs/adrs/adr-0080.md) §11).
+    fn resolve_path(&self) -> Result<std::path::PathBuf> {
+        if self.audit {
+            request_log::audit_file_path().context("could not resolve the audit log file path")
+        } else {
+            request_log::log_file_path().context("could not resolve the log file path")
+        }
     }
 }
 
@@ -227,6 +246,35 @@ mod tests {
         assert!(cmd.format.is_none());
         assert!(cmd.limit.is_none());
         assert!(!cmd.follow);
+        assert!(!cmd.audit);
+    }
+
+    #[test]
+    fn audit_flag_parses() {
+        assert!(parse(&["--audit"]).audit);
+    }
+
+    #[test]
+    fn resolve_path_reads_audit_jsonl_only_when_the_flag_is_set() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
+
+        // Without `--audit`, this resolves through `log_file_path` — some
+        // path other than the audit override, whatever this machine's
+        // default (or an `OMNI_DEV_LOG_FILE` set outside this test) happens
+        // to be. With `--audit`, it must be exactly the override above.
+        assert_ne!(
+            parse(&[]).resolve_path().unwrap(),
+            std::path::PathBuf::from("/tmp/omni-dev-test-audit.jsonl")
+        );
+        assert_eq!(
+            parse(&["--audit"]).resolve_path().unwrap(),
+            std::path::PathBuf::from("/tmp/omni-dev-test-audit.jsonl")
+        );
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
     }
 
     #[test]
