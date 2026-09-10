@@ -2385,6 +2385,9 @@ mod tests {
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Simulate a pre-existing value so the restore below exercises the
+        // `Some(v)` arm rather than only ever `remove_var`.
+        std::env::set_var("OMNI_DEV_LOG_DISABLE", "0");
         let prior = std::env::var("OMNI_DEV_LOG_DISABLE").ok();
         std::env::set_var("OMNI_DEV_LOG_DISABLE", "1");
         assert!(disabled());
