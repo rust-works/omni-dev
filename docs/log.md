@@ -149,6 +149,14 @@ types, so the log is a complete invocation history, not just an HTTP history:
   sharper than the Sheets case, where an A1 range is metadata rather than
   content. Only counts and the opaque revision id go in.
 
+- **`kind: "audit"`** — written to the **separate** `audit.jsonl` sink, never
+  to this file — see [Audit log](#audit-log). Every other `kind` above stays
+  exactly as described regardless of the audit log's existence: a leased
+  Drive write (issue [#1664](https://github.com/rust-works/omni-dev/issues/1664),
+  [ADR-0080](adrs/adr-0080.md)) still produces its normal `drivemutation`
+  record here, correlated to its `audit` record by the shared
+  `invocation_id`.
+
 Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and
 all of its requests with a single `--id`.
@@ -181,9 +189,11 @@ The directory is created `0700` and the file `0600`, the same posture as other
 | `OMNI_DEV_LOG_HEADERS=1` | Opt in to recording (redacted) request/response headers. |
 | `OMNI_DEV_LOG_MAX_SIZE` | Enable automatic size-capped rotation on write, e.g. `10mb` (unix only; see [Bounding growth](#bounding-growth)). |
 | `OMNI_DEV_LOG_KEEP_FILES` | Number of rotated files to keep when rotation is enabled (default `3`). |
+| `OMNI_DEV_AUDIT_LOG_FILE` | Override the **audit** log path — see [Audit log](#audit-log); none of the other variables above affect it. |
 
 Logging is **best effort**: a write failure is swallowed (logged only at
-`tracing::debug`) and can never change the command's exit code.
+`tracing::debug`) and can never change the command's exit code. The audit log
+is the deliberate exception — see [Audit log](#audit-log).
 
 ## `omni-dev log`
 
@@ -218,6 +228,7 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 | `-o, --output <oneline\|json\|full>` | `oneline` (default), `json` (NDJSON, byte-identical to the file — composes with `jq`), or `full` (pretty block). |
 | `-n, --limit <N>` | Show at most the N most recent matching records. |
 | `-f, --follow` | Tail the log, printing new matching records as they arrive. |
+| `--audit` | Read `audit.jsonl` instead of `log.jsonl` — see [Audit log](#audit-log). Every filter, the `--query` mini-language, and all three output formats apply unchanged; only the file being read differs. |
 
 ### The `--query` mini-language
 
@@ -417,6 +428,39 @@ requests). A set-but-invalid `OMNI_DEV_LOG_MAX_SIZE` is ignored (logged at
 `tracing::debug`) and leaves rotation off. The `omni-dev log` reader already
 tolerates truncation and rotation, so `-f/--follow` keeps working across a
 rotation (it restarts from the top of the fresh file).
+
+## Audit log
+
+`audit.jsonl` is a **separate** file, a sibling of `log.jsonl` under the same
+runtime directory, reusing the same `LogRecord` schema and the same
+`omni-dev log` reader — pass `--audit` to read it instead of `log.jsonl`; see
+[Filters](#filters)/[Output](#output) above, all of which apply unchanged.
+It exists to serve the opposite guarantee from everything above: where
+`log.jsonl` is best-effort, prunable, and can be disabled outright,
+`audit.jsonl` is **fail-closed** — an operation whose audit record cannot be
+written does not happen — and exempt from every growth bound this page just
+described:
+
+| | `log.jsonl` | `audit.jsonl` |
+|---|---|---|
+| On a write failure | Swallowed; the command's exit code is unaffected | Propagated; the caller aborts the operation it was about to audit |
+| `OMNI_DEV_LOG_DISABLE=1` | Suppresses all writes | No effect |
+| `omni-dev log prune` | Trims by age/size | Refuses `--audit` outright (`log prune does not support --audit`) |
+| `OMNI_DEV_LOG_MAX_SIZE` rotation | Applies | Never applies, regardless of the setting |
+| Path override | `OMNI_DEV_LOG_FILE` | `OMNI_DEV_AUDIT_LOG_FILE` |
+| Location when unset | `<state dir>/omni-dev/log.jsonl` | `<state dir>/omni-dev/audit.jsonl` |
+
+Every record carries `kind: "audit"` and an `integration` context key
+(`"drive"` today, so a later integration's audit trail is additive rather
+than a rename) alongside the usual invocation/HTTP fields. `RecordKind::Audit`
+is the schema landed by issue [#1664](https://github.com/rust-works/omni-dev/issues/1664)
+([ADR-0080](adrs/adr-0080.md) §11); what populates it — the Drive
+leased-write lifecycle (`lease acquire`, a write under a lease, expiry/
+release, restore, and every refusal along the way) — lands in that same
+issue's later phases. A leased write produces records in **both** files,
+correlated by `invocation_id`: its ordinary `drivemutation` record here in
+`log.jsonl` (ADR-0070/0071/0073/0075/0076/0077/0078), and its fail-closed
+`audit` record in `audit.jsonl`.
 
 ## Redaction posture
 

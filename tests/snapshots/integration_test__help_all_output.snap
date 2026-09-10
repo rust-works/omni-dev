@@ -5646,6 +5646,7 @@ Options:
   -o, --output <OUTPUT>    Output format [default: oneline] [possible values: oneline, json, full]
   -n, --limit <N>          Show at most N (most recent) matching records
   -f, --follow             Follow the log, printing new matching records as they are appended
+      --audit              Read the fail-closed audit log (`audit.jsonl`) instead of the best-effort request log — the leased-write lifecycle and refusal trail ([ADR-0080](../../docs/adrs/adr-0080.md) §11), not subject to `OMNI_DEV_LOG_DISABLE`, rotation or `prune`. Every filter, the `--query` mini-language and all three output formats apply unchanged; only the file being read differs
   -h, --help               Print help (see more with '--help')
 
 
@@ -5678,6 +5679,7 @@ Options:
       --older-than <DUR>  Remove records older than this relative window (e.g. `7d`, `24h`, `2w`)
       --max-size <SIZE>   Trim the oldest records until the file is at most this size (e.g. `10mb`, `512kb`, `1048576`); applied after `--older-than`
       --dry-run           Report what would be removed without modifying the log
+      --audit             Refused outright: the audit log (`audit.jsonl`) is exempt from pruning by design ([ADR-0080](../../../docs/adrs/adr-0080.md) §11) — present only so the refusal is explicit rather than a silent no-op or a confusing "no such flag"
   -h, --help              Print help
 
 

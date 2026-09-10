@@ -24,11 +24,23 @@ pub struct PruneCommand {
     /// Report what would be removed without modifying the log.
     #[arg(long)]
     dry_run: bool,
+    /// Refused outright: the audit log (`audit.jsonl`) is exempt from
+    /// pruning by design ([ADR-0080](../../../docs/adrs/adr-0080.md) §11) —
+    /// present only so the refusal is explicit rather than a silent no-op
+    /// or a confusing "no such flag".
+    #[arg(long)]
+    audit: bool,
 }
 
 impl PruneCommand {
     /// Executes the `omni-dev log prune` command.
     pub fn execute(self) -> Result<()> {
+        if self.audit {
+            bail!(
+                "log prune does not support --audit: the audit log is exempt from pruning by \
+                 design, not merely unconfigured"
+            );
+        }
         if self.older_than.is_none() && self.max_size.is_none() {
             bail!("nothing to prune: pass --older-than <DUR> and/or --max-size <SIZE>");
         }
@@ -119,6 +131,20 @@ mod tests {
     #[test]
     fn requires_at_least_one_bound() {
         assert!(parse(&[]).execute().is_err());
+    }
+
+    #[test]
+    fn audit_flag_is_refused_even_with_a_valid_bound() {
+        // ADR-0080 §11: the audit log is exempt from pruning by design, so
+        // `--audit` must fail loudly rather than silently prune `log.jsonl`
+        // or silently do nothing.
+        let err = parse(&["--audit", "--older-than", "7d"])
+            .execute()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("does not support --audit"),
+            "{err}"
+        );
     }
 
     #[test]
