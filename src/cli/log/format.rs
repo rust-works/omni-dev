@@ -349,6 +349,42 @@ mod tests {
     }
 
     #[test]
+    fn oneline_audit_shows_integration_lease_verdict_and_error() {
+        let mut rec = LogRecord {
+            kind: RecordKind::Audit,
+            timestamp: "2026-06-22T12:34:56.789Z".to_string(),
+            command: vec!["drive".to_string(), "upload".to_string()],
+            ..LogRecord::default()
+        };
+        rec.context
+            .insert("integration".to_string(), "drive".to_string());
+        rec.context
+            .insert("lease_id".to_string(), "lease-1".to_string());
+        rec.context
+            .insert("verdict".to_string(), "granted".to_string());
+        let line = render(&rec, "", Format::Oneline);
+        assert!(line.contains("aud"), "line was: {line}");
+        assert!(line.contains("drive"), "line was: {line}");
+        assert!(line.contains("drive upload"), "line was: {line}");
+        assert!(line.contains("lease=lease-1"), "line was: {line}");
+        assert!(line.contains("verdict=granted"), "line was: {line}");
+
+        // A refusal carries an error and no integration/command; both render
+        // their "-"/empty placeholders rather than panicking.
+        let refused = LogRecord {
+            kind: RecordKind::Audit,
+            error: Some("lease expired".to_string()),
+            ..LogRecord::default()
+        };
+        let refused_line = render(&refused, "", Format::Oneline);
+        assert!(refused_line.contains(" -"), "line was: {refused_line}");
+        assert!(
+            refused_line.contains("error=lease expired"),
+            "line was: {refused_line}"
+        );
+    }
+
+    #[test]
     fn oneline_http_flags_daemon_and_handles_unknown_kind() {
         let rec = LogRecord {
             kind: RecordKind::Http,
