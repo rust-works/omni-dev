@@ -450,6 +450,16 @@ described:
 | Path override | `OMNI_DEV_LOG_FILE` | `OMNI_DEV_AUDIT_LOG_FILE` |
 | Location when unset | `<state dir>/omni-dev/log.jsonl` | `<state dir>/omni-dev/audit.jsonl` |
 
+`--audit` is a flag on the bare search form (`omni-dev log --audit ...`) and,
+separately, on `prune` (`omni-dev log prune --audit`, always refused, above);
+placed before a subcommand name instead — `omni-dev log --audit prune ...` —
+it is refused rather than silently ignored, since a subcommand never
+consults it. `record_audit` also refuses to write if `OMNI_DEV_LOG_FILE` and
+`OMNI_DEV_AUDIT_LOG_FILE` are configured to resolve to the same path: the two
+sinks are siblings by default but not otherwise mutually exclusive by
+construction, so misconfiguration is caught at write time instead of
+silently blending the fail-closed sink into the best-effort one.
+
 Every record carries `kind: "audit"` and an `integration` context key
 (`"drive"` today, so a later integration's audit trail is additive rather
 than a rename) alongside the usual invocation/HTTP fields. `RecordKind::Audit`
