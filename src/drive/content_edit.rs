@@ -621,6 +621,68 @@ mod tests {
         );
     }
 
+    /// A responder that makes the ledger's directory read-only the instant
+    /// the media PATCH lands — i.e. after `check_and_lock_lease` has
+    /// already locked and loaded the ledger, but before
+    /// `refresh_lease_after_write` tries to save it. `tempfile::NamedTempFile::new_in`
+    /// then fails to create its temp file, so `LeaseLedger::save` errors.
+    #[cfg(unix)]
+    struct MakeDirReadOnlyThenRespond {
+        dir: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl wiremock::Respond for MakeDirReadOnlyThenRespond {
+        fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-1", "name": "file-1", "version": "2",
+            }))
+        }
+    }
+
+    /// A failed post-write lease refresh (ADR-0080 §5) must never turn an
+    /// already-successful edit into a reported failure — see
+    /// `refresh_lease_after_write`'s own doc comment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_lease_refresh_after_a_successful_write_does_not_fail_the_edit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let ledger_dir = root.path().join("ledger");
+        std::fs::create_dir(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join("lease-ledger.jsonl");
+        let opts = opts_with_lease("file-1", &ledger_path, "1");
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(MakeDirReadOnlyThenRespond {
+                dir: ledger_dir.clone(),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = edit(&client, &opts, &[allow_rule()]).await;
+
+        // Restore write permission before the tempdir is dropped, or its
+        // own cleanup fails to remove a now-read-only directory.
+        std::fs::set_permissions(&ledger_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            matches!(outcome.result, EditResult::Edited),
+            "a refresh failure must not fail the edit itself: {:?}",
+            outcome.result
+        );
+    }
+
     #[tokio::test]
     async fn denied_target_refuses_with_zero_edit_calls() {
         let server = wiremock::MockServer::start().await;
@@ -906,6 +968,31 @@ mod tests {
 
         let opts = EditOptions {
             lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+            ..opts_for("file-1", false)
+        };
+        let outcome = edit(&client, &opts, &[allow_rule()]).await;
+        assert!(matches!(outcome.result, EditResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_when_the_ledger_is_unreadable() {
+        // A directory in place of the ledger file makes `LeaseLedger::load`
+        // fail with something other than a missing-file error — refused as
+        // expired rather than trusting an unreadable ledger (fail-closed,
+        // see `check_and_lock_lease`'s doc comment).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        std::fs::create_dir(&ledger_path).unwrap();
+
+        let opts = EditOptions {
+            lease_token: Some("any-token".to_string()),
             ledger_path,
             ..opts_for("file-1", false)
         };

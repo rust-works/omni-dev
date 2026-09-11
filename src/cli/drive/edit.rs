@@ -314,6 +314,41 @@ mod tests {
             .unwrap();
     }
 
+    /// Exercises `EditCommand::execute` itself (every other test here calls
+    /// `run_edit` directly), specifically to cover the `--dry-run` branch
+    /// that skips `ledger_path()` — see its own doc comment for why a
+    /// dry-run must never resolve a real ledger path.
+    #[tokio::test]
+    async fn execute_dry_run_never_resolves_a_ledger_path() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "mimeType": "text/plain",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let content_dir = tempfile::tempdir().unwrap();
+        let content_path = content_dir.path().join("content.txt");
+        std::fs::write(&content_path, b"new content").unwrap();
+
+        let cmd = EditCommand {
+            file_id: "file-1".to_string(),
+            content: content_path.to_str().unwrap().to_string(),
+            mime_type: None,
+            dry_run: true,
+            lease: None,
+            output: OutputFormat::Table,
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+
     #[tokio::test]
     async fn run_edit_json_path_returns_ok() {
         let server = wiremock::MockServer::start().await;
@@ -376,6 +411,10 @@ mod tests {
             (EditResult::WouldEdit, 1),
             (EditResult::RefusedNativeDocument, 1),
             (EditResult::RefusedNoVisibleParents, 1),
+            (EditResult::RefusedNoLease, 1),
+            (EditResult::RefusedLeaseExpired, 1),
+            (EditResult::RefusedLeaseWrongFile, 1),
+            (EditResult::RefusedLeaseStale, 1),
             (EditResult::Edited, 1),
             (
                 EditResult::Failed {

@@ -339,6 +339,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_metadata_failure_is_reported_as_failed_before_authenticating() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"code": 404, "message": "File not found"}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!("must not authenticate when metadata lookup already failed");
+            }
+        }
+
+        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        assert!(matches!(result, AcquireResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn download_failure_after_authorization_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        assert!(matches!(result, AcquireResult::Failed { .. }));
+        assert!(!root.path().join("backups").exists());
+    }
+
+    #[tokio::test]
+    async fn a_backup_write_collision_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let test_opts = opts(root.path());
+        // Pre-create the exact backup path `write_backup` will try to
+        // `create_new` — the same-second collision its own doc comment
+        // describes — so the `open()` call fails and the `with_context`
+        // closure (otherwise dead in every other test here) actually runs.
+        let expected_path = backup_file_path(&test_opts.backup_dir, "f1", "report.pdf");
+        std::fs::create_dir_all(&test_opts.backup_dir).unwrap();
+        std::fs::write(&expected_path, b"stale").unwrap();
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        let AcquireResult::Failed { detail } = result else {
+            panic!("expected Failed, got {result:?}");
+        };
+        assert!(detail.contains("Failed to create backup file"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_ledger_insert_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let test_opts = opts(root.path());
+        // A directory in place of the ledger file makes `LeaseLedger::load`
+        // fail, which `insert_record` surfaces as an `anyhow::Error`.
+        std::fs::create_dir_all(&test_opts.ledger_path).unwrap();
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        assert!(matches!(result, AcquireResult::Failed { .. }));
+    }
+
+    #[test]
+    fn acquire_result_serializes_to_jsonl() {
+        use crate::cli::drive::format::JsonlSerialize;
+
+        let mut buf = Vec::new();
+        AcquireResult::Acquired {
+            token: "tok-1".to_string(),
+            expires_at: Utc::now(),
+            backup_path: PathBuf::from("/tmp/backup"),
+        }
+        .write_jsonl(&mut buf)
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"status\":\"acquired\""), "{text}");
+        assert!(text.contains("tok-1"), "{text}");
+    }
+
+    #[tokio::test]
     async fn native_document_is_refused_before_authenticating() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))

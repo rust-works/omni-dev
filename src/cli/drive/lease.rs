@@ -158,6 +158,120 @@ fn print_result(result: &AcquireResult) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    /// A native-document target is refused before `acquire` ever calls the
+    /// authenticator (see `acquire::tests::native_document_is_refused_before_authenticating`),
+    /// so this exercises `LeaseCommand::execute`/`AcquireCommand::execute`
+    /// end to end without risking a real Touch ID prompt in a test process.
+    async fn native_document_server() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/vnd.google-apps.document"
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn lease_command_dispatches_acquire_with_a_default_backup_dir() {
+        let server = native_document_server().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let cmd = LeaseCommand {
+            action: LeaseAction::Acquire(AcquireCommand {
+                file_id: "f1".to_string(),
+                backup_dir: None,
+                expiry_minutes: DEFAULT_EXPIRY_MINUTES,
+                biometrics_only: false,
+                output: OutputFormat::Table,
+            }),
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acquire_command_honours_an_explicit_backup_dir_and_biometrics_only() {
+        let server = native_document_server().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let cmd = AcquireCommand {
+            file_id: "f1".to_string(),
+            backup_dir: Some(root.path().join("backups")),
+            expiry_minutes: 10,
+            biometrics_only: true,
+            output: OutputFormat::Json,
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[test]
+    fn default_backup_dir_ends_with_the_expected_suffix() {
+        let dir = default_backup_dir().unwrap();
+        assert!(
+            dir.ends_with(std::path::Path::new("omni-dev").join("drive-backups")),
+            "{}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn print_result_does_not_panic_for_any_variant() {
+        for result in [
+            AcquireResult::Acquired {
+                token: "tok-1".to_string(),
+                expires_at: chrono::Utc::now(),
+                backup_path: std::path::PathBuf::from("/tmp/backup"),
+            },
+            AcquireResult::RefusedNativeDocument,
+            AcquireResult::Denied {
+                detail: "no".to_string(),
+            },
+            AcquireResult::Unavailable {
+                detail: "no authenticator".to_string(),
+            },
+            AcquireResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ] {
+            print_result(&result);
+        }
+    }
 
     #[derive(Parser)]
     struct Wrapper {
