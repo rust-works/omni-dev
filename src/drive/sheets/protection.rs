@@ -1033,6 +1033,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsProtection).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 

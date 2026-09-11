@@ -1885,6 +1885,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsStructure).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 
@@ -2040,6 +2041,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsDelete).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 
@@ -2333,6 +2335,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }];
         let outcome = structure(&drive, &sheets, &opts(rename(), false), &rules).await;
         assert!(matches!(outcome.result, StructureResult::Blocked { .. }));
@@ -2385,6 +2388,7 @@ mod tests {
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            require_lease: true,
         }];
         let outcome = structure(&drive, &sheets, &opts(rename(), false), &rules).await;
         let StructureResult::Blocked { decided_by } = &outcome.result else {

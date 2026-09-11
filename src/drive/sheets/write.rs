@@ -668,6 +668,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 
@@ -796,6 +797,7 @@ mod tests {
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            require_lease: true,
         };
         let outcome = write(
             &drive,
@@ -827,6 +829,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         };
         let outcome = write(
             &drive,

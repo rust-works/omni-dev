@@ -55,9 +55,14 @@ const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType
 
 /// `fields` value for `files.get` — additionally includes `exportLinks` so
 /// `drive read`'s content-export error path can list which MIME types a
-/// Google-native file actually supports exporting to.
+/// Google-native file actually supports exporting to, and `version` for the
+/// Drive write lease's staleness check (ADR-0080 §6). Also requested by
+/// [`FilesApi::edit_content`]'s own response, so a leased binary write
+/// refreshes its ledger row from the write's own reply rather than a
+/// second `files.get`.
 const GET_FIELDS: &str = "id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,\
-    modifiedTime,parents,webViewLink,owners(displayName,emailAddress),driveId,exportLinks";
+    modifiedTime,parents,webViewLink,owners(displayName,emailAddress),driveId,exportLinks,\
+    version";
 
 /// Files API façade.
 #[derive(Debug)]
@@ -642,6 +647,7 @@ mod tests {
                 "text/markdown".to_string(),
                 "https://export.example.com/md".to_string(),
             )])),
+            version: Some("1".to_string()),
         }
     }
 
@@ -661,8 +667,11 @@ mod tests {
     fn list_fields_requests_every_drive_file_field_except_export_links() {
         let json = serde_json::to_value(fully_populated_drive_file()).unwrap();
         for key in json.as_object().unwrap().keys() {
-            if key == "exportLinks" {
-                // Deliberately excluded — see DriveFile::export_links' doc comment.
+            if key == "exportLinks" || key == "version" {
+                // Deliberately excluded — see DriveFile::export_links'/version's
+                // own doc comments. `version` is a lease-staleness concern
+                // (ADR-0080 §6), irrelevant to a search-result table and would
+                // bloat every list response.
                 continue;
             }
             assert!(

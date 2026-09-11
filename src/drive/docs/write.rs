@@ -723,6 +723,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::DocsWrite).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 
@@ -893,6 +894,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::DocsWrite).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }];
         let outcome = write(&drive, &docs, &replace_opts(true), &rules).await;
         assert!(matches!(outcome.result, WriteResult::WouldReplace { .. }));

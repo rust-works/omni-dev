@@ -8,6 +8,7 @@ pub(crate) mod docs;
 pub(crate) mod edit;
 pub(crate) mod format;
 pub(crate) mod helpers;
+pub(crate) mod lease;
 /// `drive move` — named `move_file` (not `move`, a Rust keyword) mirroring
 /// `crate::cli::atlassian::confluence::move_page`'s identical workaround.
 pub(crate) mod move_file;
@@ -72,6 +73,10 @@ pub enum DriveSubcommands {
     /// scope for any pre-existing file (`drive auth login --write-file`
     /// or `--write-full`).
     Edit(edit::EditCommand),
+    /// Backs up a file and mints a Touch ID-authorised lease token,
+    /// required by `drive edit` and (in later phases) every other
+    /// content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md)).
+    Lease(lease::LeaseCommand),
     /// Renames a single Drive file. Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
     Rename(rename::RenameCommand),
@@ -143,6 +148,7 @@ impl DriveSubcommands {
             Self::Create(cmd) => cmd.execute(client).await,
             Self::Upload(cmd) => cmd.execute(client).await,
             Self::Edit(cmd) => cmd.execute(client).await,
+            Self::Lease(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
             Self::Docs(cmd) => cmd.execute(client).await,
@@ -1170,6 +1176,7 @@ mod tests {
             content: content_path.to_str().unwrap().to_string(),
             mime_type: None,
             dry_run: false,
+            lease: None,
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());

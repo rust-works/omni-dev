@@ -266,6 +266,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Upload).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }
     }
 

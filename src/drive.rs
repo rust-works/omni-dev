@@ -22,6 +22,7 @@ pub mod error;
 pub mod file_move;
 pub mod files_api;
 pub mod folder_ancestry;
+pub mod lease;
 pub mod permissions_api;
 pub mod rename;
 pub mod sheets;
