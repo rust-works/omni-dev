@@ -1261,6 +1261,123 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     rec
 }
 
+/// One event for the Drive write-lease audit trail (ADR-0080 §11).
+///
+/// Covers `drive lease acquire` succeeding or refusing, or a leased write's
+/// own intent/outcome pair — a single shape for all of them, the same way
+/// [`DriveMutationOutcome`] is one shape for every mutating verb. The
+/// `verdict` field (kebab-case, mirroring every other `*Result::log_status`
+/// in this codebase) is what distinguishes them, not a separate Rust type
+/// per event kind.
+#[derive(Debug, Clone, Default)]
+pub struct AuditOutcome {
+    /// The audited command, e.g. `["drive", "lease-acquire"]` or `["drive",
+    /// "edit"]` — becomes the record's `command`, mirroring
+    /// [`DriveMutationOutcome::operation`].
+    pub command: Vec<String>,
+    /// Which integration this event belongs to (`"drive"` today; ADR-0080
+    /// §11 names Gmail/Atlassian as later, additive extensions).
+    pub integration: &'static str,
+    /// The Drive file id the lease/write concerns.
+    pub file_id: String,
+    /// The lease token, once one exists. Absent for an acquire attempt that
+    /// never reached minting one (denied/unavailable/refused before a
+    /// token was created).
+    pub lease_id: Option<String>,
+    /// What happened, kebab-case: `"acquired"`, `"refused-native-document"`,
+    /// `"denied"`, `"unavailable"`, `"failed"` for an acquire attempt;
+    /// `"allowed"`, `"refused-no-lease"`, `"refused-lease-expired"`,
+    /// `"refused-lease-wrong-file"`, `"refused-lease-stale"` for a leased
+    /// write. Free-form rather than a closed enum, like every other
+    /// `*Result::log_status` in this codebase — a later integration's
+    /// verdict vocabulary doesn't need a schema change here.
+    pub verdict: String,
+    /// The file's Drive `version` before the event, when relevant.
+    pub version_before: Option<String>,
+    /// The file's Drive `version` after, when relevant (e.g. the version an
+    /// acquire recorded into the ledger, or a leased write's post-write
+    /// version).
+    pub version_after: Option<String>,
+    /// `modifiedTime` paired with [`Self::version_before`].
+    pub modified_time_before: Option<String>,
+    /// `modifiedTime` paired with [`Self::version_after`].
+    pub modified_time_after: Option<String>,
+    /// Where an acquire's backup landed: a local path for a byte backup, or
+    /// the backup copy's own file id for a native-document backup.
+    pub backup_location: Option<String>,
+    /// SHA-256 of a byte backup, for later integrity verification. `None`
+    /// for a native-document backup (verified by Drive's own copy
+    /// semantics instead) and for anything that isn't an acquire.
+    pub backup_sha256: Option<String>,
+    /// Size in bytes of a byte backup.
+    pub backup_size: Option<u64>,
+    /// Which authentication policy (ADR-0080 §7) an acquire satisfied —
+    /// `"device-owner"` or `"biometrics-only"`.
+    pub auth_policy: Option<String>,
+    /// The error, when the event itself failed (an API/filesystem/ledger
+    /// error — distinct from an ordinary refusal, which is a `verdict`, not
+    /// an `error`).
+    pub error: Option<String>,
+}
+
+/// Appends one `kind: "audit"` record for `outcome`, fail-closed.
+///
+/// Propagates [`record_audit`]'s `Result` rather than swallowing it, since
+/// this is the sink whose whole purpose is to make a mutation with no
+/// accompanying record impossible (ADR-0080 §11). Callers on the write path
+/// (as opposed to `drive lease acquire`, which mutates no Drive content)
+/// must refuse the write itself when this returns `Err` — see
+/// `content_edit.rs`'s eventual write-ahead call site for the pattern.
+pub fn record_audit_event(outcome: AuditOutcome) -> anyhow::Result<()> {
+    record_audit(&build_audit_record(outcome, current_context()))
+}
+
+/// Builds the `kind: "audit"` record for `outcome` under `ctx`. Split out
+/// from [`record_audit_event`] so the record shape is unit-testable without
+/// touching the filesystem, mirroring [`build_drive_mutation_record`].
+fn build_audit_record(outcome: AuditOutcome, ctx: RequestLogContext) -> LogRecord {
+    let mut rec = LogRecord::new(RecordKind::Audit, ctx.invocation_id);
+    rec.source = Some(ctx.source);
+    rec.mcp_tool = ctx.mcp_tool;
+    rec.service = Some("drive".to_string());
+    rec.command = outcome.command;
+    rec.error = outcome.error;
+
+    let mut context = BTreeMap::new();
+    context.insert("integration".to_string(), outcome.integration.to_string());
+    context.insert("file_id".to_string(), outcome.file_id);
+    if let Some(lease_id) = outcome.lease_id {
+        context.insert("lease_id".to_string(), lease_id);
+    }
+    context.insert("verdict".to_string(), outcome.verdict);
+    if let Some(version) = outcome.version_before {
+        context.insert("version_before".to_string(), version);
+    }
+    if let Some(version) = outcome.version_after {
+        context.insert("version_after".to_string(), version);
+    }
+    if let Some(modified_time) = outcome.modified_time_before {
+        context.insert("modified_time_before".to_string(), modified_time);
+    }
+    if let Some(modified_time) = outcome.modified_time_after {
+        context.insert("modified_time_after".to_string(), modified_time);
+    }
+    if let Some(location) = outcome.backup_location {
+        context.insert("backup_location".to_string(), location);
+    }
+    if let Some(sha256) = outcome.backup_sha256 {
+        context.insert("backup_sha256".to_string(), sha256);
+    }
+    if let Some(size) = outcome.backup_size {
+        context.insert("backup_size".to_string(), size.to_string());
+    }
+    if let Some(auth_policy) = outcome.auth_policy {
+        context.insert("auth_policy".to_string(), auth_policy);
+    }
+    rec.context = context;
+    rec
+}
+
 /// Optional, non-secret extras for an HTTP record. Bodies/headers are gated and
 /// redacted centrally in [`record_http_with`], so callers may pass them freely.
 #[derive(Debug, Clone, Default)]
@@ -2308,6 +2425,128 @@ mod tests {
         assert_eq!(back.kind, RecordKind::Gh);
         assert_eq!(back.command, argv(&["pr", "list"]));
         assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn build_audit_record_stamps_kind_service_command_and_context() {
+        let ctx = RequestLogContext {
+            invocation_id: "inv-4".to_string(),
+            source: Source::Cli,
+            mcp_tool: None,
+        };
+        let rec = build_audit_record(
+            AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: "f1".to_string(),
+                lease_id: Some("lease-1".to_string()),
+                verdict: "acquired".to_string(),
+                version_after: Some("42".to_string()),
+                modified_time_after: Some("2026-09-12T00:00:00Z".to_string()),
+                backup_location: Some("/tmp/backup".to_string()),
+                backup_sha256: Some("deadbeef".to_string()),
+                backup_size: Some(5),
+                auth_policy: Some("device-owner".to_string()),
+                ..Default::default()
+            },
+            ctx,
+        );
+        assert_eq!(rec.kind, RecordKind::Audit);
+        assert_eq!(rec.invocation_id, "inv-4");
+        assert_eq!(rec.source, Some(Source::Cli));
+        assert_eq!(rec.service.as_deref(), Some("drive"));
+        assert_eq!(
+            rec.command,
+            vec!["drive".to_string(), "lease-acquire".to_string()]
+        );
+        assert_eq!(
+            rec.context.get("integration").map(String::as_str),
+            Some("drive")
+        );
+        assert_eq!(rec.context.get("file_id").map(String::as_str), Some("f1"));
+        assert_eq!(
+            rec.context.get("lease_id").map(String::as_str),
+            Some("lease-1")
+        );
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("acquired")
+        );
+        assert_eq!(
+            rec.context.get("version_after").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            rec.context.get("modified_time_after").map(String::as_str),
+            Some("2026-09-12T00:00:00Z")
+        );
+        assert_eq!(
+            rec.context.get("backup_location").map(String::as_str),
+            Some("/tmp/backup")
+        );
+        assert_eq!(
+            rec.context.get("backup_sha256").map(String::as_str),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            rec.context.get("backup_size").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            rec.context.get("auth_policy").map(String::as_str),
+            Some("device-owner")
+        );
+    }
+
+    #[test]
+    fn build_audit_record_omits_absent_optional_context_keys() {
+        let rec = build_audit_record(
+            AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: "f1".to_string(),
+                verdict: "denied".to_string(),
+                error: Some("no".to_string()),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.error.as_deref(), Some("no"));
+        assert_eq!(rec.context.get("lease_id"), None);
+        assert_eq!(rec.context.get("version_before"), None);
+        assert_eq!(rec.context.get("version_after"), None);
+        assert_eq!(rec.context.get("backup_location"), None);
+        assert_eq!(rec.context.get("backup_sha256"), None);
+        assert_eq!(rec.context.get("backup_size"), None);
+        assert_eq!(rec.context.get("auth_policy"), None);
+    }
+
+    #[test]
+    fn record_audit_event_writes_to_the_audit_sink() {
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+
+        let result = record_audit_event(AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: "f1".to_string(),
+            verdict: "acquired".to_string(),
+            ..Default::default()
+        });
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        result.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(back.kind, RecordKind::Audit);
+        assert_eq!(
+            back.context.get("verdict").map(String::as_str),
+            Some("acquired")
+        );
     }
 
     #[test]

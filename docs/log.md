@@ -460,17 +460,36 @@ sinks are siblings by default but not otherwise mutually exclusive by
 construction, so misconfiguration is caught at write time instead of
 silently blending the fail-closed sink into the best-effort one.
 
-Every record carries `kind: "audit"` and an `integration` context key
+Every record carries `kind: "audit"` and, in `context`, an `integration` key
 (`"drive"` today, so a later integration's audit trail is additive rather
-than a rename) alongside the usual invocation/HTTP fields. `RecordKind::Audit`
-is the schema landed by issue [#1664](https://github.com/rust-works/omni-dev/issues/1664)
-([ADR-0080](adrs/adr-0080.md) §11); what populates it — the Drive
-leased-write lifecycle (`lease acquire`, a write under a lease, expiry/
-release, restore, and every refusal along the way) — lands in that same
-issue's later phases. A leased write produces records in **both** files,
-correlated by `invocation_id`: its ordinary `drivemutation` record here in
-`log.jsonl` (ADR-0070/0071/0073/0075/0076/0077/0078), and its fail-closed
-`audit` record in `audit.jsonl`.
+than a rename), a `file_id`, and a `verdict` — alongside the usual
+invocation/HTTP fields. `RecordKind::Audit` is the schema landed by issue
+[#1664](https://github.com/rust-works/omni-dev/issues/1664)
+([ADR-0080](adrs/adr-0080.md) §11); what populates it is the Drive
+leased-write lifecycle, landing across that same issue's phases.
+
+**`drive lease acquire`** writes one record per attempt, `command: ["drive",
+"lease-acquire"]`, regardless of outcome — `verdict` is `acquired`,
+`refused-native-document`, `denied`, `unavailable`, or `failed`, matching
+`AcquireResult`'s own kebab-case status. An `acquired` record additionally
+carries `lease_id` (the token), `version_after`/`modified_time_after` (the
+Drive state actually recorded into the ledger — re-read after the backup,
+not the pre-authentication snapshot, for the same TOCTOU reason the ledger
+itself does), `backup_location` (a local path for a byte backup, or the
+backup copy's own file id for a native-document backup),
+`backup_sha256`/`backup_size` (byte backups only), and `auth_policy`
+(`device-owner` or `biometrics-only`). Unlike a leased *write*'s own record
+(a later phase), this one is best-effort rather than write-ahead/fail-closed:
+acquiring mutates no Drive content — by the time the record is written the
+consent, the backup and the ledger row have already durably happened, so a
+logging failure is warned and does not turn a successful acquisition into a
+reported failure.
+
+A leased **write** will, in a later phase, produce records in **both**
+files, correlated by `invocation_id`: its ordinary `drivemutation` record
+here in `log.jsonl` (ADR-0070/0071/0073/0075/0076/0077/0078), and a
+write-ahead/outcome pair of fail-closed `audit` records in `audit.jsonl` —
+not yet landed.
 
 ## Redaction posture
 
