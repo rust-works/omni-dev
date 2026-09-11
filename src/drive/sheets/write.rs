@@ -1128,6 +1128,179 @@ mod tests {
         assert!(matches!(outcome.result, WriteResult::Written { .. }));
     }
 
+    // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
+
+    fn allow_rule_no_lease(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            require_lease: false,
+            ..allow_rule(folder)
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No PUT mock mounted — a refusal must make zero mutating calls.
+
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = None;
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedNoLease);
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = Some("bogus-token".to_string());
+        // Never seeded — no ledger exists at this fresh path.
+        o.ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedLeaseExpired);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "other-sheet", "1");
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedLeaseWrongFile);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // Live version "1" (`mount_file`'s default) but the lease was
+        // acquired at "0" — the file has moved since.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedLeaseStale);
+    }
+
+    #[tokio::test]
+    async fn reports_a_lock_acquisition_failure_as_failed() {
+        // A pre-existing lock file simulates another `drive lease`
+        // operation genuinely in progress — reported as an operational
+        // failure, not folded into `RefusedLeaseExpired`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let o = opts(WriteVerb::Write, false);
+        let mut lock_path = o.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_values_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the write must report `Failed` and never reach the
+        // values endpoint.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let outcome = write(
+            &drive,
+            &sheets,
+            &opts(WriteVerb::Write, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_skips_the_check_entirely() {
+        // No lease token and no ledger seeded, with a rule that sets
+        // `require_lease: false` — the write must still succeed, taking
+        // the `else { None }` branch and never consulting the ledger.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "updatedRange": "'Q1'!A1:B2", "updatedRows": 1, "updatedCells": 2,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = None;
+        let outcome = write(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::Written { .. }));
+    }
+
     // ── describing an outcome ──────────────────────────────────────────
 
     #[tokio::test]
@@ -1399,6 +1572,19 @@ mod tests {
             }
             .log_status(),
             "failed"
+        );
+        assert_eq!(WriteResult::RefusedNoLease.log_status(), "refused-no-lease");
+        assert_eq!(
+            WriteResult::RefusedLeaseExpired.log_status(),
+            "refused-lease-expired"
+        );
+        assert_eq!(
+            WriteResult::RefusedLeaseWrongFile.log_status(),
+            "refused-lease-wrong-file"
+        );
+        assert_eq!(
+            WriteResult::RefusedLeaseStale.log_status(),
+            "refused-lease-stale"
         );
     }
 

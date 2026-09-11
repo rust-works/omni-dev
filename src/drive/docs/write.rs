@@ -1421,6 +1421,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_a_lock_acquisition_failure_as_failed() {
+        // A pre-existing lock file simulates another `drive lease`
+        // operation genuinely in progress — reported as an operational
+        // failure, not folded into `RefusedLeaseExpired`.
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+
+        let opts = replace_opts(false);
+        let mut lock_path = opts.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the write must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/doc-1"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/documents/doc-1:batchUpdate"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let outcome = write(
+            &drive,
+            &docs,
+            &replace_opts(false),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
     async fn refuses_an_unknown_lease_token() {
         let server = MockServer::start().await;
         let (drive, docs) = clients(&server).await;
@@ -1535,6 +1599,48 @@ mod tests {
         };
         let outcome = write(&drive, &docs, &opts, &[rule]).await;
         assert!(matches!(outcome.result, WriteResult::Replaced { .. }));
+    }
+
+    #[test]
+    fn describe_renders_every_lease_refusal_with_the_lease_acquire_hint() {
+        let outcome_with = |result: WriteResult| WriteOutcome {
+            document_id: "doc-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            required_revision_id: None,
+            result,
+        };
+
+        let text = describe(
+            &outcome_with(WriteResult::RefusedNoLease),
+            WriteVerb::Replace,
+        );
+        assert!(text.contains("requires a Drive write lease"), "{text}");
+        assert!(text.contains("drive lease acquire doc-1"), "{text}");
+
+        let text = describe(
+            &outcome_with(WriteResult::RefusedLeaseExpired),
+            WriteVerb::Replace,
+        );
+        assert!(text.contains("expired, released, or unknown"), "{text}");
+        assert!(text.contains("drive lease acquire doc-1"), "{text}");
+
+        let text = describe(
+            &outcome_with(WriteResult::RefusedLeaseWrongFile),
+            WriteVerb::Replace,
+        );
+        assert!(text.contains("acquired for a different file"), "{text}");
+        assert!(text.contains("drive lease acquire doc-1"), "{text}");
+
+        let text = describe(
+            &outcome_with(WriteResult::RefusedLeaseStale),
+            WriteVerb::Replace,
+        );
+        assert!(
+            text.contains("changed since the lease was acquired"),
+            "{text}"
+        );
+        assert!(text.contains("drive lease acquire doc-1"), "{text}");
     }
 
     #[tokio::test]

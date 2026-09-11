@@ -1790,6 +1790,48 @@ mod tests {
         assert_eq!(describe(&out), "Failed: boom");
     }
 
+    #[test]
+    fn describe_lines_renders_every_lease_refusal_with_the_lease_acquire_hint() {
+        let no_lease = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedNoLease,
+        );
+        let text = describe(&no_lease);
+        assert!(text.contains("requires a Drive write lease"), "{text}");
+        assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+
+        let expired = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedLeaseExpired,
+        );
+        let text = describe(&expired);
+        assert!(text.contains("expired, released, or unknown"), "{text}");
+        assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+
+        let wrong_file = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedLeaseWrongFile,
+        );
+        let text = describe(&wrong_file);
+        assert!(text.contains("acquired for a different file"), "{text}");
+        assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+
+        let stale = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::RefusedLeaseStale,
+        );
+        let text = describe(&stale);
+        assert!(
+            text.contains("changed since the lease was acquired"),
+            "{text}"
+        );
+        assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+    }
+
     #[tokio::test]
     async fn a_metadata_fetch_failure_surfaces_as_failed() {
         let server = wiremock::MockServer::start().await;
@@ -2343,6 +2385,100 @@ mod tests {
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::RefusedNoLease));
         assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    #[tokio::test]
+    async fn reports_a_lock_acquisition_failure_as_failed() {
+        // A pre-existing lock file simulates another `drive lease`
+        // operation genuinely in progress — reported as an operational
+        // failure, not folded into `RefusedLeaseExpired`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let mut lock_path = ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the change must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
     }
 
     #[tokio::test]

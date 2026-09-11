@@ -97,10 +97,15 @@ pub(crate) fn check_and_lock_lease(
     let ledger = match LeaseLedger::load(ledger_path) {
         Ok(ledger) => ledger,
         Err(err) => {
+            // Bind the path so it is formatted whenever the branch runs —
+            // not only when a subscriber happens to be installed — so
+            // coverage sees it (the `daemon/services/worktrees.rs::
+            // load_pr_cache` pattern).
+            let ledger_path = ledger_path.display();
             tracing::warn!(
-                "{log_prefix}: lease ledger at {} could not be read ({err}); refusing the \
-                 presented lease as expired rather than trusting an unreadable ledger",
-                ledger_path.display()
+                "{log_prefix}: lease ledger at {ledger_path} could not be read ({err}); \
+                 refusing the presented lease as expired rather than trusting an unreadable \
+                 ledger"
             );
             return LeaseCheckOutcome::Expired;
         }
@@ -195,5 +200,102 @@ pub(crate) async fn refresh_lease_after_native_write(
                  ledger not refreshed: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::client::DriveClient;
+    use crate::drive::lease::ledger::{LeaseBackup, LeaseRecord};
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    #[test]
+    fn refuses_as_expired_and_logs_the_path_when_the_ledger_is_unreadable() {
+        // A directory in place of the ledger file makes `LeaseLedger::load`
+        // fail with something other than a missing-file error — refused as
+        // expired, and the `warn!` names the unreadable path (the field
+        // expression this test exercises).
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        std::fs::create_dir(&ledger_path).unwrap();
+
+        let outcome =
+            check_and_lock_lease("test", &ledger_path, Some("any-token"), "file-1", Some("1"));
+        assert!(matches!(outcome, LeaseCheckOutcome::Expired));
+    }
+
+    #[tokio::test]
+    async fn native_refresh_logs_and_swallows_a_failed_refetch() {
+        // The second `files.get` (needed because Sheets/Docs write calls
+        // carry no Drive metadata of their own) fails here — the refresh is
+        // best-effort, so this must log and return without panicking or
+        // touching the ledger's recorded version.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let lock = LedgerLock::acquire(&ledger_path).unwrap();
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(LeaseRecord {
+            token: "tok".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            released_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        refresh_lease_after_native_write("test", &lock, &ledger_path, "tok", &files_api, "file-1")
+            .await;
+
+        let reloaded = LeaseLedger::load(&ledger_path).unwrap();
+        assert_eq!(reloaded.get("tok").unwrap().version, "1");
     }
 }

@@ -4294,6 +4294,185 @@ mod tests {
         );
     }
 
+    // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
+
+    fn allow_rule_no_lease(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            require_lease: false,
+            ..allow_rule(folder)
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+
+        let mut o = opts(rename(), false);
+        o.lease_token = None;
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, StructureResult::RefusedNoLease);
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let mut o = opts(rename(), false);
+        o.lease_token = Some("bogus-token".to_string());
+        // Never seeded — no ledger exists at this fresh path.
+        o.ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, StructureResult::RefusedLeaseExpired);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "other-sheet", "1");
+        let mut o = opts(rename(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, StructureResult::RefusedLeaseWrongFile);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // Live version "1" (`mount_file`'s default) but the lease was
+        // acquired at "0" — the file has moved since.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(rename(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, StructureResult::RefusedLeaseStale);
+    }
+
+    #[tokio::test]
+    async fn reports_a_lock_acquisition_failure_as_failed() {
+        // A pre-existing lock file simulates another `drive lease`
+        // operation genuinely in progress — reported as an operational
+        // failure, not folded into `RefusedLeaseExpired`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let o = opts(rename(), false);
+        let mut lock_path = o.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, StructureResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the change must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(rename(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_skips_the_check_entirely() {
+        // No lease token and no ledger seeded, with a rule that sets
+        // `require_lease: false` — the change must still succeed, taking
+        // the `else { None }` branch and never consulting the ledger.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(rename(), false);
+        o.lease_token = None;
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+    }
+
     // ── plumbing ───────────────────────────────────────────────────────
 
     #[test]
@@ -4609,6 +4788,10 @@ mod tests {
             }
             .log_status(),
             StructureResult::Blocked { decided_by: None }.log_status(),
+            StructureResult::RefusedNoLease.log_status(),
+            StructureResult::RefusedLeaseExpired.log_status(),
+            StructureResult::RefusedLeaseWrongFile.log_status(),
+            StructureResult::RefusedLeaseStale.log_status(),
             StructureResult::Changed {
                 sheet: None,
                 sheet_id: None,
