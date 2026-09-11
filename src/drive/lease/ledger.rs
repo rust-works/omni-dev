@@ -227,19 +227,24 @@ impl LedgerLock {
                 crate::daemon::paths::ensure_dir_0700(dir)?;
             }
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "another `drive lease` operation appears to already be in progress ({} \
-                     exists) — concurrent access would clobber the ledger. If you're sure no \
-                     other operation is active (e.g. after a crash), remove the lock file and \
-                     retry",
-                    path.display()
-                )
-            })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).with_context(|| {
+            format!(
+                "another `drive lease` operation appears to already be in progress ({} \
+                 exists) — concurrent access would clobber the ledger. If you're sure no \
+                 other operation is active (e.g. after a crash), remove the lock file and \
+                 retry",
+                path.display()
+            )
+        })?;
+        crate::daemon::paths::ensure_handle_0600(&file)
+            .with_context(|| format!("Failed to set 0600 on lock file {}", path.display()))?;
         Ok(Self { path })
     }
 }

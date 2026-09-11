@@ -794,14 +794,16 @@ useful for authoring and debugging rules before relying on them.
 
 ```bash
 $ omni-dev drive permissions show
-SCOPE   TARGET_ID                RECURSIVE  ALLOW                DENY
-folder  1AbC...AiWorkspace       true       create,edit,upload   -
-folder  1XyZ...DropZone          false      create               -
-file    1Sh4r3d...QuarterlyPlan  -          sheets-write         -
+SCOPE   TARGET_ID                RECURSIVE  LEASE  ALLOW                DENY
+folder  1AbC...AiWorkspace       true       true   create,edit,upload   -
+folder  1XyZ...DropZone          false      false  create               -
+file    1Sh4r3d...QuarterlyPlan  -          true   sheets-write         -
 ```
 
 `RECURSIVE` shows `-` rather than `false` for a file rule: the column has
-no meaning there.
+no meaning there. `LEASE` (ADR-0080 §13) renders `require_lease` directly —
+`false` means writes matching that rule skip the write-lease's Touch ID
+prompt and backup requirement (below).
 
 Reads only `settings.json` — no network call. With no rules configured, it
 explains that every write is refused everywhere and points at the

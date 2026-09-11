@@ -44,8 +44,17 @@ fn run_show(rules: &[FolderPermissionRule], output: &OutputFormat) -> Result<()>
 }
 
 /// Renders rules as an aligned text table: `SCOPE | TARGET_ID | RECURSIVE
-/// | ALLOW | DENY`. An empty input prints a message explaining that every
-/// write is refused everywhere until a rule is configured.
+/// | LEASE | ALLOW | DENY`. An empty input prints a message explaining that
+/// every write is refused everywhere until a rule is configured.
+///
+/// `LEASE` renders `require_lease` directly (`true`/`false`) — unlike
+/// `RECURSIVE` it is meaningful for both a folder and a file rule, so it
+/// needs no rule-kind-dependent `-` case (ADR-0080 §13). Surfacing it here
+/// matters because it is the one field on this rule that silently relaxes a
+/// *different* gate (the write lease, not this one) — an operator auditing
+/// configured policy through this table would otherwise have no way to see
+/// that a folder has opted out of the Touch ID/backup requirement without
+/// switching to `--output json`.
 ///
 /// `RECURSIVE` renders `-` for a file rule rather than `false`: a file has
 /// no descendants, so `false` would imply the column means something there
@@ -75,6 +84,7 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
         .len()
         .max(ids.iter().map(String::len).max().unwrap_or(0));
     let recursives: Vec<String> = rules.iter().map(format_recursive).collect();
+    let leases: Vec<String> = rules.iter().map(|r| r.require_lease.to_string()).collect();
     let allow_strings: Vec<String> = rules.iter().map(|r| format_op_set(&r.allow)).collect();
     let allow_width = "ALLOW"
         .len()
@@ -86,15 +96,15 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
 
     writeln!(
         out,
-        "{:<scope_width$}  {:<id_width$}  RECURSIVE  {:<allow_width$}  {:<deny_width$}",
+        "{:<scope_width$}  {:<id_width$}  RECURSIVE  LEASE  {:<allow_width$}  {:<deny_width$}",
         "SCOPE", "TARGET_ID", "ALLOW", "DENY"
     )
     .context("Failed to write header row")?;
     for i in 0..rules.len() {
         writeln!(
             out,
-            "{:<scope_width$}  {:<id_width$}  {:<9}  {:<allow_width$}  {:<deny_width$}",
-            scopes[i], ids[i], recursives[i], allow_strings[i], deny_strings[i],
+            "{:<scope_width$}  {:<id_width$}  {:<9}  {:<5}  {:<allow_width$}  {:<deny_width$}",
+            scopes[i], ids[i], recursives[i], leases[i], allow_strings[i], deny_strings[i],
         )
         .context("Failed to write rule row")?;
     }
@@ -180,12 +190,25 @@ mod tests {
         assert!(out.contains("SCOPE"));
         assert!(out.contains("TARGET_ID"));
         assert!(out.contains("RECURSIVE"));
+        assert!(out.contains("LEASE"));
         assert!(out.contains("ALLOW"));
         assert!(out.contains("DENY"));
         assert!(out.contains("folder-1"));
         assert!(out.contains("true"));
         assert!(out.contains("create,upload"));
         assert!(out.contains("edit"));
+    }
+
+    #[test]
+    fn render_table_shows_require_lease_false_for_an_opted_out_rule() {
+        let rules = [FolderPermissionRule::folder("folder-1")
+            .allowing([DriveOperation::Edit])
+            .requiring_lease(false)];
+        let mut buf = Vec::new();
+        render_rules_table(&rules, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("LEASE"), "{out}");
+        assert!(out.contains("false"), "{out}");
     }
 
     #[test]

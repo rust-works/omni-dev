@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -182,15 +183,43 @@ fn backup_file_path(dir: &Path, file_id: &str, name: &str) -> PathBuf {
 
 /// Writes `bytes` to `path`, creating a missing `0700` parent directory
 /// first — the same posture `crate::request_log`/the lease ledger use.
+///
+/// Opened `0600`-from-birth (never `std::fs::write`'s umask-derived mode)
+/// — a backup is exactly the private, sensitive content this feature
+/// exists to protect. Also `create_new` (`O_EXCL`) rather than a
+/// truncating write: [`backup_file_path`]'s name has only whole-second
+/// precision, so two acquisitions for the same file within one second
+/// collide on the same path. Failing loudly here, instead of silently
+/// overwriting, is what stops that rare collision from corrupting the
+/// *earlier* lease's ledger row — its recorded `backup_sha256` would
+/// otherwise no longer match the bytes actually on disk.
 fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             crate::daemon::paths::ensure_dir_0700(parent)?;
         }
     }
-    std::fs::write(path, bytes)
-        .map_err(anyhow::Error::from)
-        .map_err(|e| e.context(format!("Failed to write backup to {}", path.display())))
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "Failed to create backup file at {} — it may already exist from a near-simultaneous \
+             `drive lease acquire` on the same file within the same second; retry",
+            path.display()
+        )
+    })?;
+    crate::daemon::paths::ensure_handle_0600(&file)
+        .with_context(|| format!("Failed to set 0600 on backup file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("Failed to write backup to {}", path.display()))?;
+    Ok(())
 }
 
 /// Inserts `record` into the ledger at `ledger_path` under [`LedgerLock`],
