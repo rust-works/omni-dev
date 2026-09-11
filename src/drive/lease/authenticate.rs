@@ -6,8 +6,11 @@
 //! (ADR-0058): everything above this trait — the ledger, the backup, the
 //! CLI verb — is plain, platform-independent code that is unit-testable
 //! with a fake, and the only real implementation is the macOS
-//! LocalAuthentication FFI isolated in [`macos`] (STYLE-0013). Every other
-//! target gets [`Unsupported`], which always reports no authenticator
+//! LocalAuthentication FFI isolated in `macos` (STYLE-0013; named without a
+//! doc link deliberately — it is a macOS-only module, so linking it would
+//! break doc builds on other platforms, the same convention
+//! `daemon::services::worktrees::geometry::ax` and `launchd_listener` use).
+//! Every other target gets [`Unsupported`], which always reports no authenticator
 //! available — the fail-closed default ADR-0080 §8 requires for headless
 //! and off-macOS contexts, with no code path that could accidentally grant
 //! a lease there.
@@ -31,13 +34,21 @@ pub(crate) enum AuthPolicy {
 }
 
 /// The result of one [`Authenticator::authenticate`] call.
+///
+/// `Authorized`/`Denied` are constructed only by `macos::LocalAuthenticator`
+/// (a real prompt can succeed or be refused); on every other target only
+/// [`Unsupported`] implements [`Authenticator`], and it only ever returns
+/// `Unavailable` — so, like [`Unsupported`] itself, those two variants are
+/// genuinely unconstructed in a non-macOS production build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthOutcome {
     /// A human answered the prompt and it succeeded.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Authorized,
     /// A human answered the prompt and it failed — declined, cancelled, or
     /// timed out waiting for a response. Carries the platform's own
     /// message.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied(String),
     /// No authenticator is available in this context at all: off-macOS, or
     /// a macOS process with no attached GUI session to render a prompt in.
@@ -49,7 +60,7 @@ pub(crate) enum AuthOutcome {
 
 /// Presents a device-owner authentication prompt and blocks until it
 /// resolves. The only implementation with a real prompt is
-/// [`macos::LocalAuthenticator`]; every other target uses [`Unsupported`].
+/// `macos::LocalAuthenticator`; every other target uses [`Unsupported`].
 ///
 /// `Send + Sync`: [`crate::drive::lease::acquire::acquire`] holds a `&dyn Authenticator` across
 /// an `.await` point (the `files.get` preceding it), so the future it
@@ -69,7 +80,7 @@ pub(crate) trait Authenticator: Send + Sync {
 /// target, and is the whole reason `drive lease acquire` fails closed there
 /// by construction rather than by a runtime check that could be wrong. On
 /// macOS itself [`platform_authenticator`] never selects it in production
-/// (only [`macos::LocalAuthenticator`] does), so it is genuinely unused
+/// (only `macos::LocalAuthenticator` does), so it is genuinely unused
 /// there outside its own unit test.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) struct Unsupported;
@@ -82,7 +93,7 @@ impl Authenticator for Unsupported {
     }
 }
 
-/// Returns the platform's [`Authenticator`]: [`macos::LocalAuthenticator`]
+/// Returns the platform's [`Authenticator`]: `macos::LocalAuthenticator`
 /// on macOS, [`Unsupported`] everywhere else.
 pub(crate) fn platform_authenticator() -> Box<dyn Authenticator> {
     #[cfg(target_os = "macos")]
