@@ -695,11 +695,20 @@ pub fn decided_by_log_fields(decided_by: Option<&DecidingRule>) -> DecidedByLogF
 /// must call this once per parent and OR the results together *before*
 /// folding the decisions, or a losing parent's own lease requirement would
 /// be silently dropped along with its `decided_by`.
+///
+/// `op` narrows `matching` to rules that actually govern this operation
+/// (`rule.allow`/`rule.deny` contains it) — without it, an unrelated rule
+/// on the same folder/depth (or file id) governing a *different*
+/// operation would still contribute its own `require_lease`, silently
+/// overriding a same-scope rule that explicitly opted this operation out.
 #[must_use]
 pub fn decided_rule_requires_lease(
     decided_by: Option<&DecidingRule>,
+    op: DriveOperation,
     rules: &[FolderPermissionRule],
 ) -> bool {
+    let governs_op =
+        |rule: &&FolderPermissionRule| rule.allow.contains(&op) || rule.deny.contains(&op);
     let matching: Vec<&FolderPermissionRule> = match decided_by {
         None => return true,
         Some(DecidingRule::Folder { folder_id, depth }) => rules
@@ -708,10 +717,12 @@ pub fn decided_rule_requires_lease(
                 rule.folder_id.as_deref() == Some(folder_id.as_str())
                     && (*depth == 0 || rule.recursive)
             })
+            .filter(governs_op)
             .collect(),
         Some(DecidingRule::File { file_id }) => rules
             .iter()
             .filter(|rule| rule.file_id.as_deref() == Some(file_id.as_str()))
+            .filter(governs_op)
             .collect(),
     };
     if matching.is_empty() {
@@ -1107,7 +1118,7 @@ mod tests {
 
     #[test]
     fn decided_rule_requires_lease_defaults_true_with_no_decided_by() {
-        assert!(decided_rule_requires_lease(None, &[]));
+        assert!(decided_rule_requires_lease(None, DriveOperation::Edit, &[]));
     }
 
     #[test]
@@ -1117,7 +1128,11 @@ mod tests {
             folder_id: "f1".to_string(),
             depth: 0,
         };
-        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+        assert!(decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
     }
 
     #[test]
@@ -1129,7 +1144,11 @@ mod tests {
             folder_id: "f1".to_string(),
             depth: 0,
         };
-        assert!(!decided_rule_requires_lease(Some(&decided_by), &rules));
+        assert!(!decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
     }
 
     #[test]
@@ -1138,24 +1157,33 @@ mod tests {
         let decided_by = DecidingRule::File {
             file_id: "file-1".to_string(),
         };
-        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+        assert!(decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
     }
 
     #[test]
     fn decided_rule_requires_lease_any_matching_rule_opting_in_wins() {
-        // Two rules on the same folder, one opting out and one not — the
-        // safe direction (any rule requiring a lease is enough) wins.
+        // Two rules on the same folder, both governing `Edit`: one opting
+        // out and one not — the safe direction (any rule requiring a
+        // lease is enough) wins.
         let rules = [
             FolderPermissionRule::folder("f1")
                 .allowing([DriveOperation::Edit])
                 .requiring_lease(false),
-            FolderPermissionRule::folder("f1").allowing([DriveOperation::SheetsWrite]),
+            FolderPermissionRule::folder("f1").allowing([DriveOperation::Edit]),
         ];
         let decided_by = DecidingRule::Folder {
             folder_id: "f1".to_string(),
             depth: 0,
         };
-        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+        assert!(decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
     }
 
     #[test]
@@ -1173,7 +1201,35 @@ mod tests {
         // depth=1 with a non-recursive rule: the rule does not match at
         // this depth, so no matching rule is found and the fail-safe
         // default (true) applies.
-        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+        assert!(decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_ignores_a_rule_for_a_different_operation() {
+        // Two rules on the same folder/depth, governing different
+        // operations: the `Edit` rule opts out, and an unrelated
+        // `SheetsWrite` rule (which does not opt out) must not contribute
+        // its own `require_lease` to the `Edit` lookup — a rule that
+        // doesn't govern the operation being checked isn't "matching".
+        let rules = [
+            FolderPermissionRule::folder("f1")
+                .allowing([DriveOperation::Edit])
+                .requiring_lease(false),
+            FolderPermissionRule::folder("f1").allowing([DriveOperation::SheetsWrite]),
+        ];
+        let decided_by = DecidingRule::Folder {
+            folder_id: "f1".to_string(),
+            depth: 0,
+        };
+        assert!(!decided_rule_requires_lease(
+            Some(&decided_by),
+            DriveOperation::Edit,
+            &rules
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::cli::drive::format::{output_as, OutputFormat};
+use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::lease::acquire::{self, AcquireOptions, AcquireResult};
 use crate::drive::lease::authenticate::{self, AuthPolicy};
@@ -140,9 +141,17 @@ fn print_result(result: &AcquireResult) {
             backup,
         } => {
             println!("{token}");
+            // The backup path embeds the file's Drive name (`backup_name`
+            // in `acquire.rs`), which is server-controlled — sanitize
+            // before it reaches the terminal, the same as every other
+            // server-supplied string this CLI prints (#1137).
             let backup_desc = match backup {
-                LeaseBackup::Bytes { path, .. } => path.display().to_string(),
-                LeaseBackup::DriveCopy { file_id } => format!("Drive copy {file_id}"),
+                LeaseBackup::Bytes { path, .. } => {
+                    sanitize_for_terminal(&path.display().to_string())
+                }
+                LeaseBackup::DriveCopy { file_id } => {
+                    format!("Drive copy {}", sanitize_for_terminal(file_id))
+                }
             };
             eprintln!("Backed up to {backup_desc} (expires {expires_at})");
         }

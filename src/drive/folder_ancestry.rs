@@ -214,7 +214,7 @@ pub async fn resolve_decision_for_file_target(
 ) -> Result<FileTargetDecision> {
     if let Some(decision) = write_gate::resolve_file_rule(&target.id, op, rules) {
         let requires_lease =
-            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), op, rules);
         return Ok(FileTargetDecision {
             decision,
             resolved_folder_id: None,
@@ -225,7 +225,7 @@ pub async fn resolve_decision_for_file_target(
     if target.parents.is_empty() {
         let decision = write_gate::resolve(&[], op, rules);
         let requires_lease =
-            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), op, rules);
         return Ok(FileTargetDecision {
             decision,
             resolved_folder_id: None,
@@ -275,16 +275,16 @@ async fn resolve_decision_for_parents(
     let Some((first_parent, rest_parents)) = parents.split_first() else {
         let decision = write_gate::resolve(&[], op, rules);
         let requires_lease =
-            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), op, rules);
         return Ok((decision, None, requires_lease));
     };
     let mut combined = resolve_decision(files_api, first_parent, op, rules).await?;
     let mut requires_lease =
-        write_gate::decided_rule_requires_lease(combined.decided_by.as_ref(), rules);
+        write_gate::decided_rule_requires_lease(combined.decided_by.as_ref(), op, rules);
     for parent_id in rest_parents {
         let decision = resolve_decision(files_api, parent_id, op, rules).await?;
         requires_lease |=
-            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), op, rules);
         combined = write_gate::combine_across_parents(combined, [decision]);
     }
     let resolved_folder_id = rest_parents.is_empty().then(|| first_parent.clone());

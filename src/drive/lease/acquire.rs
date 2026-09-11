@@ -14,6 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::cli::drive::format::JsonlSerialize;
+use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
@@ -107,18 +108,39 @@ pub async fn acquire(
         return AcquireResult::RefusedNativeDocument;
     }
 
-    let Some(version) = target.version.clone() else {
+    if target.version.is_none() {
         return AcquireResult::Failed {
             detail: "Drive did not return a `version` for this file; refusing to lease it \
                      without a staleness check"
                 .to_string(),
         };
-    };
+    }
 
     // 1. Authenticate — consent gates the action, not merely possession of
     // the resulting token (ADR-0080 §2). Nothing below runs on refusal.
-    let reason = format!("back up and lease-write '{}'", target.name);
-    match authenticator.authenticate(&reason, opts.auth_policy) {
+    // `target.name` is Drive-controlled (renamable by anyone with edit
+    // access to the file) and is shown verbatim inside the OS consent
+    // prompt, so it is sanitized the same way any other server-supplied
+    // string reaching a terminal or prompt is elsewhere in this CLI —
+    // stripping control characters and bidi-override code points closes
+    // off a spoofed/deceptive file name misleading what the operator is
+    // authorising.
+    let reason = format!(
+        "back up and lease-write '{}'",
+        sanitize_for_terminal(&target.name)
+    );
+    // `authenticate` blocks synchronously on the human's answer, up to
+    // `PROMPT_TIMEOUT` (120s) — `block_in_place` hands this worker
+    // thread's other queued tasks off to the runtime's other workers for
+    // the duration, so a single Touch ID prompt cannot stall unrelated
+    // concurrent work on a shared multi-thread runtime (the daemon and
+    // the MCP server both run one). `acquire` itself stays a plain `async
+    // fn` — `block_in_place` runs the closure on the *current* thread, so
+    // it needs no `'static`/`Send` bound on `authenticator`, unlike
+    // `spawn_blocking`.
+    let auth_outcome =
+        tokio::task::block_in_place(|| authenticator.authenticate(&reason, opts.auth_policy));
+    match auth_outcome {
         AuthOutcome::Authorized => {}
         AuthOutcome::Denied(detail) => return AcquireResult::Denied { detail },
         AuthOutcome::Unavailable(detail) => return AcquireResult::Unavailable { detail },
@@ -148,7 +170,32 @@ pub async fn acquire(
         }
     };
 
-    // 3. Ledger record.
+    // 3. Ledger record. `version`/`modified_time` are re-fetched here
+    // rather than reused from the `target` metadata read at the very top —
+    // that read happened before the (up to 120s) Touch ID prompt and
+    // before the backup itself, so the file could have moved in the
+    // meantime. Recording that earlier, now-possibly-stale version would
+    // break the token's own invariant of being "bound to a specific backup
+    // and a specific Drive version" (ADR-0080 §2/§4): the backup reflects
+    // whatever the file was at backup time, so the recorded version must
+    // too, or the very next write under this lease could spuriously refuse
+    // as stale (or, worse, pass a staleness check against a version that
+    // doesn't match what was actually backed up).
+    let post_backup = match files_api.get_metadata(&opts.file_id).await {
+        Ok(post_backup) => post_backup,
+        Err(err) => {
+            return AcquireResult::Failed {
+                detail: err.to_string(),
+            }
+        }
+    };
+    let Some(version) = post_backup.version else {
+        return AcquireResult::Failed {
+            detail: "Drive did not return a `version` for this file after the backup; \
+                     refusing to record a lease without a staleness check"
+                .to_string(),
+        };
+    };
     let token = crate::request_log::new_id();
     let now = Utc::now();
     let expires_at = now + opts.expiry;
@@ -156,7 +203,7 @@ pub async fn acquire(
         token: token.clone(),
         file_id: opts.file_id.clone(),
         version,
-        modified_time: target.modified_time.clone(),
+        modified_time: post_backup.modified_time,
         backup: backup.clone(),
         acquired_at: now,
         expires_at,
@@ -185,7 +232,7 @@ async fn byte_backup(
     name: &str,
 ) -> anyhow::Result<LeaseBackup> {
     let bytes = files_api.download(file_id).await?;
-    let sha256 = sha256_hex(&bytes);
+    let sha256 = crate::cli::drive::read::to_hex_string(&Sha256::digest(&bytes));
     let path = backup_file_path(backup_dir, file_id, name);
     write_backup(&path, &bytes)?;
     Ok(LeaseBackup::Bytes {
@@ -209,18 +256,6 @@ async fn native_backup(
         .copy(file_id, backup_folder_id, &copy_name)
         .await?;
     Ok(LeaseBackup::DriveCopy { file_id: copy.id })
-}
-
-/// SHA-256 of `bytes`, as lowercase hex.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
 }
 
 /// `<dir>` joined with [`backup_name`]'s result.
@@ -348,7 +383,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn denied_authentication_takes_no_backup_and_writes_no_ledger_row() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -375,7 +410,7 @@ mod tests {
         assert!(!root.path().join("backups").exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn unavailable_authentication_takes_no_backup() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -422,7 +457,7 @@ mod tests {
         assert!(matches!(result, AcquireResult::Failed { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn download_failure_after_authorization_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -455,7 +490,7 @@ mod tests {
         assert!(!root.path().join("backups").exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_backup_write_collision_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -498,7 +533,7 @@ mod tests {
         assert!(detail.contains("Failed to create backup file"), "{detail}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_ledger_insert_failure_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -610,7 +645,7 @@ mod tests {
         assert!(matches!(result, AcquireResult::Failed { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn authorized_acquisition_backs_up_bytes_and_records_a_ledger_row() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -655,7 +690,74 @@ mod tests {
             .contains("f1-report.pdf"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recorded_version_reflects_a_post_backup_fetch_not_the_pre_auth_snapshot() {
+        // Regression test for the lease-record TOCTOU (issue #1664): the
+        // metadata read at the very top of `acquire` (before the
+        // authenticator prompt and the backup itself) returns version
+        // "0". A foreign edit lands during that window, so the fetch
+        // taken right after the backup returns "1" — and "1" is what must
+        // end up in the ledger record, not the pre-auth "0" (which would
+        // no longer match what was actually backed up).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "0", "modifiedTime": "2026-09-11T00:00:00Z"
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "1", "modifiedTime": "2026-09-11T00:05:00Z"
+                })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let test_opts = opts(root.path());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        let AcquireResult::Acquired { token, .. } = result else {
+            panic!("expected Acquired, got {result:?}");
+        };
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        let record = ledger.get(&token).expect("token must be in the ledger");
+        assert_eq!(
+            record.version, "1",
+            "the recorded version must come from the post-backup fetch, not the pre-auth one"
+        );
+        assert_eq!(
+            record.modified_time.as_deref(),
+            Some("2026-09-11T00:05:00Z")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn native_document_with_a_backup_folder_configured_copies_instead_of_refusing() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
