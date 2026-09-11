@@ -794,6 +794,134 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_native_copy_after_authorization_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut opts = opts(root.path());
+        opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire(&client, &opts, &FakeAuthenticator(AuthOutcome::Authorized)).await;
+
+        assert!(
+            matches!(result, AcquireResult::Failed { .. }),
+            "expected Failed, got {result:?}"
+        );
+        assert!(!opts.ledger_path.exists(), "no ledger row must be written");
+    }
+
+    /// Mounts the pre-auth `files.get` (version "1", consumed once) plus
+    /// the byte download, leaving the post-backup `files.get` to the
+    /// caller — for tests exercising a failure in that second fetch.
+    async fn mount_pre_auth_metadata_and_download(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "1"
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_post_backup_metadata_fetch_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        mount_pre_auth_metadata_and_download(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let test_opts = opts(root.path());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        assert!(
+            matches!(result, AcquireResult::Failed { .. }),
+            "expected Failed, got {result:?}"
+        );
+        assert!(
+            !test_opts.ledger_path.exists(),
+            "no ledger row must be written"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_post_backup_fetch_without_a_version_is_reported_as_failed() {
+        // The pre-auth fetch carried a `version`, so the early refusal
+        // does not fire; the post-backup fetch — the one the ledger row is
+        // actually recorded from — omits it, and a lease with no staleness
+        // check must not be minted.
+        let server = wiremock::MockServer::start().await;
+        mount_pre_auth_metadata_and_download(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf"
+                })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let test_opts = opts(root.path());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        let AcquireResult::Failed { detail } = result else {
+            panic!("expected Failed, got {result:?}");
+        };
+        assert!(detail.contains("after the backup"), "{detail}");
+        assert!(
+            !test_opts.ledger_path.exists(),
+            "no ledger row must be written"
+        );
+    }
+
     #[tokio::test]
     async fn native_document_without_a_backup_folder_is_refused_before_authenticating() {
         let server = wiremock::MockServer::start().await;

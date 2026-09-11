@@ -710,6 +710,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_edit_call() {
+        // The gate's ancestor walk succeeds off the first `files.get`, but
+        // the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the edit must report `Failed` and never reach the
+        // media PATCH.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let outcome = edit(
+            &client,
+            &opts_with_lease("file-1", &ledger_path, "1"),
+            &[allow_rule()],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, EditResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("file-1"));
+    }
+
     /// A responder that makes the ledger's directory read-only the instant
     /// the media PATCH lands — i.e. after `check_and_lock_lease` has
     /// already locked and loaded the ledger, but before
