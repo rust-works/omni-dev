@@ -116,6 +116,11 @@ pub struct CheckReport {
     /// give. Always `"folder-chain"` for a folder target, which never
     /// consults file rules.
     pub evaluated_via: String,
+    /// Whether a write acting on this verdict would need a valid `--lease`
+    /// token ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9).
+    /// Only meaningful alongside `verdict: "allow"` — a denied write never
+    /// reaches the lease check either way.
+    pub requires_lease: bool,
 }
 
 impl JsonlSerialize for CheckReport {
@@ -138,6 +143,8 @@ async fn run_check(
 ) -> Result<()> {
     let files_api = FilesApi::new(client);
     let evaluated = evaluate_target(&files_api, target_id, op, rules).await?;
+    let requires_lease = evaluated.requires_lease;
+    let evaluated_via = evaluated_via(evaluated.source).to_string();
     let decision = evaluated.decision;
     let log_fields = write_gate::decided_by_log_fields(decision.decided_by.as_ref());
     let report = CheckReport {
@@ -150,7 +157,8 @@ async fn run_check(
         decided_by_folder_id: log_fields.folder_id,
         decided_by_depth: log_fields.depth,
         decided_by_file_id: log_fields.file_id,
-        evaluated_via: evaluated_via(evaluated.source).to_string(),
+        evaluated_via,
+        requires_lease,
     };
     if output_as(&report, output)? {
         return Ok(());
@@ -183,7 +191,7 @@ async fn evaluate_target(
     if target.mime_type == GOOGLE_FOLDER_MIME_TYPE {
         let decision = folder_ancestry::resolve_decision_from(files_api, target, op, rules).await?;
         let requires_lease =
-            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), op, rules);
         return Ok(FileTargetDecision {
             decision,
             resolved_folder_id: None,
@@ -235,6 +243,16 @@ fn print_report(report: &CheckReport) {
             ),
             None => println!("decided by: default policy (no matching rule)"),
         },
+    }
+    if report.verdict == "allow" {
+        println!(
+            "lease:      {}",
+            if report.requires_lease {
+                "required"
+            } else {
+                "not required"
+            }
+        );
     }
     // The one line this diagnostic exists to print: it names the *only*
     // rule shape that could ever change this verdict.
@@ -357,6 +375,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decision.decision.verdict, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn requires_lease_ignores_a_same_folder_rule_for_a_different_operation() {
+        // Regression test (issue #1664): a `Create` rule on `folder-1`
+        // opts out of the lease; an unrelated `Upload` rule on the same
+        // folder/depth (which does not opt out) must not make a `Create`
+        // check say `requires_lease: true` — a rule that doesn't govern
+        // the operation being checked isn't "matching".
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let rules = [
+            FolderPermissionRule::folder("folder-1")
+                .allowing([DriveOperation::Create])
+                .requiring_lease(false),
+            FolderPermissionRule::folder("folder-1").allowing([DriveOperation::Upload]),
+        ];
+
+        let decision = evaluate_target(&files_api, "folder-1", DriveOperation::Create, &rules)
+            .await
+            .unwrap();
+        assert_eq!(decision.decision.verdict, Verdict::Allow);
+        assert!(!decision.requires_lease);
     }
 
     #[tokio::test]
@@ -535,6 +586,7 @@ mod tests {
             decided_by_depth: None,
             decided_by_file_id: None,
             evaluated_via: "folder-chain".to_string(),
+            requires_lease: true,
         };
         // Smoke test only — print_report writes to stdout directly.
         print_report(&report);
@@ -550,6 +602,7 @@ mod tests {
             decided_by_depth: None,
             decided_by_file_id: Some("x1".to_string()),
             evaluated_via: "file-rule".to_string(),
+            requires_lease: true,
         });
         print_report(&CheckReport {
             target_id: "x2".to_string(),
@@ -559,6 +612,7 @@ mod tests {
             decided_by_depth: None,
             decided_by_file_id: None,
             evaluated_via: "no-visible-parents".to_string(),
+            requires_lease: true,
         });
     }
 

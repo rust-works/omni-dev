@@ -262,6 +262,18 @@ async fn edit_inner(
     // which would only see the one parent whose decision happened to win
     // the verdict.
     //
+    // The staleness check below is re-fetched fresh here rather than
+    // reusing `target.version` from the very first `get_metadata` call:
+    // `resolve_decision_for_file_target` above can issue its own
+    // `files.get` calls walking the ancestor chain, so by this point
+    // `target.version` may already be stale relative to the live file —
+    // exactly the same window ADR-0080 §6 introduces the check to guard
+    // against. Re-fetching immediately before the check (and thus
+    // immediately before `edit_content`) keeps that window as small as
+    // the Sheets/Docs equivalent ("a `files.get` immediately before the
+    // `batchUpdate`", ADR-0080 §6) rather than spanning the whole gate
+    // evaluation.
+    //
     // The ledger lock acquired by `check_and_lock_lease` below is held
     // across the `edit_content` call and released only after
     // `refresh_lease_after_write` — otherwise a second concurrent `drive
@@ -270,11 +282,24 @@ async fn edit_inner(
     // recorded version, and pass its own staleness check even though this
     // write is about to invalidate it (a lease-token double-spend).
     let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.file_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result: EditResult::Failed {
+                        detail: err.to_string(),
+                    },
+                };
+            }
+        };
         match check_and_lock_lease(
             &opts.ledger_path,
             opts.lease_token.as_deref(),
             &opts.file_id,
-            target.version.as_deref(),
+            live_version.as_deref(),
         ) {
             Ok(lock) => Some(lock),
             Err(result) => {
@@ -620,6 +645,68 @@ mod tests {
             reloaded.get("test-lease-token").unwrap().version,
             "2",
             "a successful write refreshes the lease's recorded version"
+        );
+    }
+
+    #[tokio::test]
+    async fn staleness_check_uses_a_version_fetched_after_the_ancestor_walk_not_before() {
+        // Regression test for the lease staleness-check TOCTOU (issue
+        // #1664): the *first* `files.get` (used for the permission-gate's
+        // ancestor walk) returns version "0" — stale, as if a foreign edit
+        // landed while the gate was still resolving. A *second*,
+        // freshly-fetched `files.get` returns "1", matching the lease. If
+        // the staleness check reused the first call's snapshot (the bug),
+        // this would incorrectly refuse as stale; using the fresh fetch,
+        // it must succeed.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "mimeType": "text/plain",
+                    "parents": ["parent-1"], "version": "0",
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "mimeType": "text/plain",
+                    "parents": ["parent-1"], "version": "1",
+                })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "2",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let outcome = edit(
+            &client,
+            &opts_with_lease("file-1", &ledger_path, "1"),
+            &[allow_rule()],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, EditResult::Edited),
+            "{:?}",
+            outcome.result
         );
     }
 
