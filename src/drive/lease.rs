@@ -8,4 +8,5 @@
 
 pub(crate) mod acquire;
 pub(crate) mod authenticate;
+pub(crate) mod check;
 pub(crate) mod ledger;

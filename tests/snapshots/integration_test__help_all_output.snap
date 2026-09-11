@@ -3922,6 +3922,7 @@ Options:
       --text <TEXT>       The text to append
       --text-file <PATH>  Read the text to append from a file, or `-` for stdin
       --dry-run           Report what would change without sending anything
+      --lease <TOKEN>     The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help              Print help (see more with '--help')
 
@@ -3998,6 +3999,7 @@ Options:
       --replace <REPLACE>  What to put in its place. May be empty, which deletes the match
       --ignore-case        Match case-insensitively
       --dry-run            Report what would change without sending anything
+      --lease <TOKEN>      The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help               Print help (see more with '--help')
 
@@ -4260,6 +4262,7 @@ Options:
       --rows <N>         Initial row count. Omitted takes Sheets' own default (1000)
       --columns <N>      Initial column count. Omitted takes Sheets' own default (26)
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4282,6 +4285,7 @@ Options:
       --values-format <VALUES_FORMAT>  How to parse `--values`. `auto` infers from the file extension [default: auto] [possible values: auto, csv, json]
       --input <INPUT>                  How the API interprets the values (see `drive sheets write`) [default: user-entered] [possible values: user-entered, raw]
       --dry-run                        Reports the gate verdict and the parsed dimensions without calling the Sheets API
+      --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
 
@@ -4303,6 +4307,7 @@ Options:
       --start <N>              1-based first row/column, inclusive
       --end <N>                1-based last row/column, inclusive
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4322,6 +4327,7 @@ Options:
       --range <A1>       A1 range to clear, optionally carrying its own `Sheet!` prefix
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or clears the whole tab on its own
       --dry-run          Reports the gate verdict without calling the Sheets API
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4341,6 +4347,7 @@ Options:
       --range <A1>       A1 range to clear validation from, optionally carrying its own `Sheet!` prefix
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4380,6 +4387,7 @@ Options:
       --at <COLUMN>      First column to delete, 1-based inclusive (column A is 1)
       --count <N>        How many columns to delete [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4403,6 +4411,7 @@ Options:
       --end-column <COLUMN>    Last column of the range, 1-based inclusive
       --shift <SHIFT>          Which way to shift the remaining cells afterward [possible values: rows, columns]
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4423,6 +4432,7 @@ Options:
       --at <ROW>         First row to delete, 1-based inclusive — the row number the spreadsheet itself shows
       --count <N>        How many rows to delete [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4441,6 +4451,7 @@ Arguments:
 Options:
       --sheet <NAME>     Title of the sheet to delete
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4461,6 +4472,7 @@ Options:
       --title <TITLE>    Title for the copy. Omitted takes Sheets' own "Copy of X" default. Must not already exist in the workbook (checked against the source's own title too — the source keeps its name)
       --index <N>        Zero-based position for the copy. Omitted takes Sheets' own default — confirmed against the live API to be the *front* of the workbook (index 0), not the end: unlike `add-sheet`, `duplicateSheetRequest` does not default to appending
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4492,6 +4504,7 @@ Options:
       --number-format-type <TYPE>  The number format's type. Requires `--number-format` [possible values: text, number, percent, currency, date, time, date-time, scientific]
       --wrap <WRAP>                Text wrap behavior [possible values: overflow, clip, wrap]
       --dry-run                    Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>              The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                       Print help (see more with '--help')
 
@@ -4510,6 +4523,7 @@ Arguments:
 Options:
       --sheet <NAME>     Title of the sheet to hide
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4546,6 +4560,7 @@ Options:
       --at <COLUMN>      Insert before this column, 1-based (column A is 1)
       --count <N>        How many columns to insert [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4566,6 +4581,7 @@ Options:
       --at <ROW>         Insert before this row, 1-based — the row number the spreadsheet itself shows. `--at 5` puts the new rows above the current row 5
       --count <N>        How many rows to insert [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4602,6 +4618,7 @@ Options:
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
       --type <TYPE>      How to merge: one cell for the whole range, one per row, or one per column [default: all] [possible values: all, rows, columns]
       --dry-run          Reports the gate verdict and, critically, every cell value the merge would discard — see `drive sheets merge-cells --help` before running without this flag first
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4625,6 +4642,7 @@ Options:
       --warning-only        Only warn on an edit rather than blocking it outright
       --editor <EMAIL>      An editor exempted from the protection. Repeatable
       --dry-run             Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>       The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
 
@@ -4663,6 +4681,7 @@ Options:
       --sheet <NAME>     Current title of the sheet to rename
       --title <TITLE>    The new title
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4682,6 +4701,7 @@ Options:
       --sheet <NAME>     Title of the sheet to move
       --index <N>        The new zero-based position among the workbook's existing sheets
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4707,6 +4727,7 @@ Options:
       --input-message <TEXT>        Tooltip text shown on the cell
       --show-warning                Allow an invalid entry through with a warning, instead of rejecting it outright
       --dry-run                     Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>               The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>             Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                        Print help (see more with '--help')
 
@@ -4725,6 +4746,7 @@ Arguments:
 Options:
       --sheet <NAME>     Title of the sheet to show
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4744,6 +4766,7 @@ Options:
       --range <A1>       A1 range to unmerge, optionally carrying its own `Sheet!` prefix
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4764,6 +4787,7 @@ Options:
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
       --whole-sheet      Target the whole-sheet protection on `--sheet`, rather than one covering a range within it — the only way to reach a protection created with `protect-range --whole-sheet`, which has no range of its own to match against
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4790,6 +4814,7 @@ Options:
       --style <STYLE>    Line style, shared by every edge this call sets [default: solid] [possible values: solid, solid-medium, solid-thick, dashed, dotted, double]
       --color <HEX>      Line color, `#RRGGBB`. Omitted takes solid black
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -4812,6 +4837,7 @@ Options:
       --end <N>                1-based last row/column, inclusive
       --pixel-size <N>         The new size, in pixels
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4836,6 +4862,7 @@ Options:
       --add-editor <EMAIL>     An editor to add. Repeatable
       --remove-editor <EMAIL>  An editor to remove. Repeatable
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -4858,6 +4885,7 @@ Options:
       --values-format <VALUES_FORMAT>  How to parse `--values`. `auto` infers from the file extension [default: auto] [possible values: auto, csv, json]
       --input <INPUT>                  How the API interprets the values. `user-entered` (the default) parses formulas, dates and numbers the way typing them into the UI would; `raw` stores every value verbatim as text [default: user-entered] [possible values: user-entered, raw]
       --dry-run                        Reports the gate verdict and the parsed dimensions without calling the Sheets API
+      --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
 

@@ -32,12 +32,17 @@
 //! would be lost, exactly the honesty ADR-0075 §6 requires of a preview
 //! whose effect a bounded range can't otherwise express.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
+use crate::drive::files_api::FilesApi;
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+};
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
 use crate::drive::sheets::client::SheetsClient;
@@ -225,6 +230,15 @@ pub struct FormatOptions {
     pub verb: FormatVerb,
     /// Classify and describe only; never call `batchUpdate`.
     pub dry_run: bool,
+    /// The lease token presented via `--lease`. Checked only when the
+    /// deciding rule requires one
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9);
+    /// `None` is only ever valid when it does not.
+    pub lease_token: Option<String>,
+    /// Path to the lease ledger the token is checked against. Production
+    /// callers pass `crate::drive::lease::ledger::ledger_path`'s own
+    /// result; tests pass a path under a `tempdir`.
+    pub ledger_path: PathBuf,
 }
 
 /// What happened (or, under `--dry-run`, would happen).
@@ -268,6 +282,17 @@ pub enum FormatResult {
         /// The rule that decided the refusal, if any.
         decided_by: Option<DecidingRule>,
     },
+    /// No `--lease` was presented, and the deciding rule requires one
+    /// (ADR-0080 §9).
+    RefusedNoLease,
+    /// The presented lease has expired, or was never a token this ledger
+    /// knows about.
+    RefusedLeaseExpired,
+    /// The presented lease is bound to a different file id.
+    RefusedLeaseWrongFile,
+    /// The file has moved since the lease's recorded `version` — the
+    /// staleness check (ADR-0080 §6).
+    RefusedLeaseStale,
     /// The mutation succeeded.
     Changed {
         /// Same summary as [`Self::WouldChange`], describing what was
@@ -294,6 +319,10 @@ impl FormatResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::Blocked { .. } => "blocked",
+            Self::RefusedNoLease => "refused-no-lease",
+            Self::RefusedLeaseExpired => "refused-lease-expired",
+            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
+            Self::RefusedLeaseStale => "refused-lease-stale",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -478,7 +507,7 @@ async fn format_inner(
         None
     };
 
-    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
         DriveOperation::SheetsStructure,
@@ -518,7 +547,8 @@ async fn format_inner(
             target,
             decision,
             resolved_folder_id,
-        } => (target, decision, resolved_folder_id),
+            requires_lease,
+        } => (target, decision, resolved_folder_id, requires_lease),
     };
 
     let gated = |result| FormatOutcome {
@@ -576,20 +606,70 @@ async fn format_inner(
         });
     }
 
+    // The lease check (ADR-0080 §9) sits here: after the permission gate
+    // and the `--dry-run` branch, before the mutating call — see
+    // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
+    // shared verbatim by every leased engine. A fresh `files.get` immediately
+    // before `batchUpdate`, not a reuse of the metadata `target_gate::resolve`
+    // fetched before the (potentially slow) ancestor-chain walk and workbook
+    // fetch above.
+    let files_api = FilesApi::new(drive);
+    let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return gated(FormatResult::Failed {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        match check_and_lock_lease(
+            "drive sheets format",
+            &opts.ledger_path,
+            opts.lease_token.as_deref(),
+            &opts.spreadsheet_id,
+            live_version.as_deref(),
+        ) {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => return gated(FormatResult::RefusedNoLease),
+            LeaseCheckOutcome::Expired => return gated(FormatResult::RefusedLeaseExpired),
+            LeaseCheckOutcome::WrongFile => return gated(FormatResult::RefusedLeaseWrongFile),
+            LeaseCheckOutcome::Stale => return gated(FormatResult::RefusedLeaseStale),
+            LeaseCheckOutcome::Failed(detail) => return gated(FormatResult::Failed { detail }),
+        }
+    } else {
+        None
+    };
+
     let request = match build_request(&opts.verb, &resolved) {
         Ok(request) => request,
         Err(detail) => return gated(FormatResult::RefusedInvalidRange { detail }),
     };
 
-    match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
-        Ok(_response) => gated(FormatResult::Changed {
-            summary,
-            discarded_cells,
-        }),
-        Err(err) => gated(FormatResult::Failed {
+    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
+        Ok(_response) => {
+            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+                refresh_lease_after_native_write(
+                    "drive sheets format",
+                    lock,
+                    &opts.ledger_path,
+                    token,
+                    &files_api,
+                    &opts.spreadsheet_id,
+                )
+                .await;
+            }
+            FormatResult::Changed {
+                summary,
+                discarded_cells,
+            }
+        }
+        Err(err) => FormatResult::Failed {
             detail: format!("{err:#}"),
-        }),
-    }
+        },
+    };
+    drop(lease_lock);
+    gated(result)
 }
 
 /// What a verb resolved to: enough to build its request, whichever shape
@@ -1029,6 +1109,26 @@ pub fn describe_lines(outcome: &FormatOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
+        FormatResult::RefusedNoLease => vec![format!(
+            "Refused: {book} requires a Drive write lease — run `omni-dev drive lease acquire \
+             {}` and pass the printed token via `--lease`.",
+            outcome.spreadsheet_id
+        )],
+        FormatResult::RefusedLeaseExpired => vec![format!(
+            "Refused: the presented lease is expired, released, or unknown to this ledger — \
+             run `omni-dev drive lease acquire {}` again.",
+            outcome.spreadsheet_id
+        )],
+        FormatResult::RefusedLeaseWrongFile => vec![format!(
+            "Refused: the presented lease was acquired for a different file — run `omni-dev \
+             drive lease acquire {}` for this one.",
+            outcome.spreadsheet_id
+        )],
+        FormatResult::RefusedLeaseStale => vec![format!(
+            "Refused: {book} changed since the lease was acquired (or last written under) — \
+             re-run `omni-dev drive lease acquire {}` to lease the current version.",
+            outcome.spreadsheet_id
+        )],
         FormatResult::Changed { summary, .. } => {
             vec![format!("{}: {summary} in {book}", capitalize(verb.label()))]
         }
@@ -1084,6 +1184,9 @@ mod tests {
         (drive, sheets)
     }
 
+    /// `version: "1"` throughout — matches [`format_cells_opts`]'s default
+    /// seeded lease, so any test reaching the mutating call has a live,
+    /// non-stale lease by construction (ADR-0080 §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
         let parents: Vec<&str> = parents.to_vec();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1091,6 +1194,7 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
                 })),
             )
     }
@@ -1134,7 +1238,20 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
     }
 
+    /// Seeds a fresh, isolated ledger with a live lease for `"sheet-1"` at
+    /// version `"1"` (matching [`mount_file`]'s default) and returns options
+    /// carrying it. Every existing test built before the lease (ADR-0080 §9)
+    /// reaches its mutating call this way by construction — see
+    /// `structure.rs::opts_for`'s doc comment for why this doesn't need
+    /// touching each test individually. A test exercising the lease
+    /// *refusal* paths builds `FormatOptions` directly instead (see the "the
+    /// Drive write lease" test section below).
     fn format_cells_opts(dry_run: bool) -> FormatOptions {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "1");
         FormatOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: FormatVerb::FormatCells {
@@ -1146,7 +1263,35 @@ mod tests {
                 },
             },
             dry_run,
+            lease_token: Some(token),
+            ledger_path,
         }
+    }
+
+    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
+    /// `version`, returning its token.
+    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
+        // A fixed token, not a random one: every call gets its own isolated
+        // ledger (a fresh tempdir), so uniqueness across tests is never a
+        // concern.
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: spreadsheet_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+        token
     }
 
     #[tokio::test]
@@ -1271,6 +1416,8 @@ mod tests {
                 merge_type: "MERGE_ALL".to_string(),
             },
             dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = format(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1377,6 +1524,8 @@ mod tests {
                 merge_type: "MERGE_ALL".to_string(),
             },
             dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = format(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1419,10 +1568,17 @@ mod tests {
     // ── Verb helpers ─────────────────────────────────────────────────
 
     fn opts(verb: FormatVerb, dry_run: bool) -> FormatOptions {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "1");
         FormatOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb,
             dry_run,
+            lease_token: Some(token),
+            ledger_path,
         }
     }
 
@@ -1557,6 +1713,10 @@ mod tests {
             }
             .log_status(),
             FormatResult::Blocked { decided_by: None }.log_status(),
+            FormatResult::RefusedNoLease.log_status(),
+            FormatResult::RefusedLeaseExpired.log_status(),
+            FormatResult::RefusedLeaseWrongFile.log_status(),
+            FormatResult::RefusedLeaseStale.log_status(),
             FormatResult::Changed {
                 summary: "x".to_string(),
                 discarded_cells: Vec::new(),
@@ -2474,6 +2634,10 @@ mod tests {
                 }),
             },
             FormatResult::Blocked { decided_by: None },
+            FormatResult::RefusedNoLease,
+            FormatResult::RefusedLeaseExpired,
+            FormatResult::RefusedLeaseWrongFile,
+            FormatResult::RefusedLeaseStale,
             FormatResult::Changed {
                 summary: "set bold".to_string(),
                 discarded_cells: Vec::new(),
@@ -2497,6 +2661,10 @@ mod tests {
                     | FormatResult::RefusedSheetNotFound { .. }
                     | FormatResult::RefusedInvalidRange { .. }
                     | FormatResult::Blocked { .. }
+                    | FormatResult::RefusedNoLease
+                    | FormatResult::RefusedLeaseExpired
+                    | FormatResult::RefusedLeaseWrongFile
+                    | FormatResult::RefusedLeaseStale
                     | FormatResult::Changed { .. }
                     | FormatResult::Failed { .. } => {}
                 }
@@ -2519,5 +2687,206 @@ mod tests {
                 assert_eq!(describe(&outcome), lines.join("\n"));
             }
         }
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = FormatOptions {
+            lease_token: None,
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FormatResult::RefusedNoLease));
+        assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Never seeded — the ledger exists nowhere near this token.
+
+        let opts = FormatOptions {
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FormatResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn refuses_an_expired_lease() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = "expired-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: "sheet-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            released_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let opts = FormatOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FormatResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Seeded for a *different* spreadsheet id.
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+
+        let opts = FormatOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FormatResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+
+        let opts = FormatOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FormatResult::RefusedLeaseStale));
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_skips_the_lease_check_entirely() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rule = FolderPermissionRule {
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            deny: HashSet::default(),
+            require_lease: false,
+        };
+
+        // No lease token presented at all, and no ledger exists.
+        let opts = FormatOptions {
+            lease_token: None,
+            ledger_path: std::path::PathBuf::from("/nonexistent/lease-ledger.jsonl"),
+            ..format_cells_opts(false)
+        };
+        let outcome = format(&drive, &sheets, &opts, &[rule]).await;
+        assert!(matches!(outcome.result, FormatResult::Changed { .. }));
     }
 }

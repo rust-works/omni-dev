@@ -1006,10 +1006,17 @@ provably present at the moment consent is given. The prompt is a real
 system dialog rendered by macOS itself; there is no way to answer it from
 a script or a PTY.
 
-**`drive lease acquire` already works against both binary files and native
-documents** (see the fidelity split below), but only `drive edit` requires
-one so far — every `drive sheets`/`drive docs` write verb still runs
-unleased; wiring `--lease` into them is a later phase.
+**`drive lease acquire` works against both binary files and native
+documents** (see the fidelity split below). `--lease` is required by every
+content-mutating write verb: `drive edit`; `drive sheets`
+`write`/`append`/`clear`, `add-sheet`/`rename-sheet`/`insert-rows`/
+`insert-columns`/`duplicate-sheet`/`reorder-sheet`/`hide-sheet`/
+`show-sheet`, `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
+`format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
+`update-dimension-properties`/`auto-resize-columns`,
+`set-data-validation`/`clear-data-validation`, and
+`protect-range`/`update-protection`/`unprotect-range`; and `drive docs
+replace`/`append`. `--dry-run` never needs one on any of them.
 
 **The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
 §3). A binary file backs up as **bytes on this machine**, named

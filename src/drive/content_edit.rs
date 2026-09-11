@@ -26,7 +26,9 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
-use crate::drive::lease::ledger::{LeaseLedger, LedgerLock};
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_write, LeaseCheckOutcome,
+};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
@@ -296,18 +298,51 @@ async fn edit_inner(
             }
         };
         match check_and_lock_lease(
+            "drive edit",
             &opts.ledger_path,
             opts.lease_token.as_deref(),
             &opts.file_id,
             live_version.as_deref(),
         ) {
-            Ok(lock) => Some(lock),
-            Err(result) => {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => {
                 return EditOutcome {
                     file_id: opts.file_id.clone(),
                     file_name: Some(target.name),
                     resolved_folder_id,
-                    result,
+                    result: EditResult::RefusedNoLease,
+                };
+            }
+            LeaseCheckOutcome::Expired => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result: EditResult::RefusedLeaseExpired,
+                };
+            }
+            LeaseCheckOutcome::WrongFile => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result: EditResult::RefusedLeaseWrongFile,
+                };
+            }
+            LeaseCheckOutcome::Stale => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result: EditResult::RefusedLeaseStale,
+                };
+            }
+            LeaseCheckOutcome::Failed(detail) => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result: EditResult::Failed { detail },
                 };
             }
         }
@@ -322,6 +357,7 @@ async fn edit_inner(
         Ok(updated) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
                 refresh_lease_after_write(
+                    "drive edit",
                     lock,
                     &opts.ledger_path,
                     token,
@@ -341,114 +377,6 @@ async fn edit_inner(
         file_name: Some(target.name),
         resolved_folder_id,
         result,
-    }
-}
-
-/// Acquires the ledger lock and checks a presented `--lease` token against
-/// it: present, unexpired, bound to `file_id`, and not stale against
-/// `live_version` (ADR-0080 §6/§9). On success, returns the still-held
-/// [`LedgerLock`] — the caller must keep it alive across the mutating
-/// call and into [`refresh_lease_after_write`], not drop it right away, or
-/// two concurrent writes presenting the same token could each load the
-/// ledger before either has recorded its write and both pass the
-/// staleness check against the same now-stale `version` (a lease-token
-/// double-spend). On refusal, no lock is held (either none was ever taken,
-/// or it is dropped before returning).
-///
-/// A ledger load failure is reported as [`EditResult::RefusedLeaseExpired`]
-/// rather than [`EditResult::Failed`] — an unreadable ledger means "no
-/// token in it can be verified," which is exactly what that refusal
-/// already communicates, and it avoids a corrupt/missing ledger being
-/// mistaken for an API or validation error. It is still logged at `warn`
-/// (distinct from the plain "no such token" case, which is expected and
-/// not logged) so a systemic ledger problem — as opposed to an ordinary
-/// expired/unknown token — leaves an operator-visible trace rather than
-/// silently masquerading as the latter.
-///
-/// A failure to acquire the lock itself (another `drive lease` operation
-/// genuinely in progress) is reported as [`EditResult::Failed`], not
-/// folded into `RefusedLeaseExpired`: it says nothing about whether the
-/// token is valid, and retrying immediately is the right response, not
-/// re-running `drive lease acquire`.
-fn check_and_lock_lease(
-    ledger_path: &std::path::Path,
-    lease_token: Option<&str>,
-    file_id: &str,
-    live_version: Option<&str>,
-) -> Result<LedgerLock, EditResult> {
-    let Some(token) = lease_token else {
-        return Err(EditResult::RefusedNoLease);
-    };
-    let lock = LedgerLock::acquire(ledger_path).map_err(|err| EditResult::Failed {
-        detail: err.to_string(),
-    })?;
-    // Every exit below is `Err(refusal)` unless the token is verified
-    // live, bound to this file, and fresh — a `Result` failure anywhere in
-    // this lookup (an unreadable ledger, an absent token) must refuse,
-    // never fall through as "no refusal". `?` is deliberately not used on
-    // the ledger load: a stray `?` here would turn a read error into
-    // silent approval — the opposite of fail-closed.
-    let ledger = match LeaseLedger::load(ledger_path) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                "drive edit: lease ledger at {} could not be read ({err}); refusing the \
-                 presented lease as expired rather than trusting an unreadable ledger",
-                ledger_path.display()
-            );
-            return Err(EditResult::RefusedLeaseExpired);
-        }
-    };
-    let Some(record) = ledger.get(token) else {
-        return Err(EditResult::RefusedLeaseExpired);
-    };
-    if !record.is_live(chrono::Utc::now()) {
-        return Err(EditResult::RefusedLeaseExpired);
-    }
-    if record.file_id != file_id {
-        return Err(EditResult::RefusedLeaseWrongFile);
-    }
-    if live_version != Some(record.version.as_str()) {
-        return Err(EditResult::RefusedLeaseStale);
-    }
-    Ok(lock)
-}
-
-/// Best-effort: updates the lease's recorded `version`/`modified_time`
-/// after a successful write, so a second write under the same lease is
-/// checked against the file's *new* state (ADR-0080 §5's multi-use
-/// semantics). A failure here is logged, never surfaced as a failed edit —
-/// the edit already succeeded — and its consequence is safe rather than
-/// silent: the ledger keeps the *old* version, so the next write under
-/// this lease sees a spurious staleness mismatch and refuses, never a
-/// missed one (ADR-0080 §4).
-///
-/// Takes `_lock` (already held by the caller since
-/// [`check_and_lock_lease`]) rather than acquiring its own — acquiring a
-/// second time here, in the same process, on the same path, would fail
-/// against the lock this call is still holding.
-fn refresh_lease_after_write(
-    _lock: &LedgerLock,
-    ledger_path: &std::path::Path,
-    token: &str,
-    version: Option<String>,
-    modified_time: Option<String>,
-) {
-    let Some(version) = version else {
-        tracing::debug!(
-            "drive edit: write response carried no `version`; lease ledger not refreshed"
-        );
-        return;
-    };
-    let result = (|| -> anyhow::Result<()> {
-        let mut ledger = LeaseLedger::load(ledger_path)?;
-        ledger.record_write(token, version, modified_time);
-        ledger.save(ledger_path)
-    })();
-    if let Err(err) = result {
-        tracing::debug!(
-            "drive edit: failed to refresh lease ledger after a successful write: {err}"
-        );
     }
 }
 
@@ -486,6 +414,7 @@ fn record_attempt(outcome: &EditOutcome, duration: Duration) {
 mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::lease::ledger::LeaseLedger;
     use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
     use crate::drive::write_gate::DriveOperation;
     use crate::utils::secret::Secret;

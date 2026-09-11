@@ -27,6 +27,7 @@
 //!    the write would fail anyway; refusing keeps "there is no unleased
 //!    path" true without exception.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -38,6 +39,9 @@ use crate::drive::docs::client::DocsClient;
 use crate::drive::docs::write_types::DocsRequest;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+};
 use crate::drive::types::{GOOGLE_DOC_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
@@ -148,6 +152,15 @@ pub struct WriteOptions {
     pub payload: WritePayload,
     /// Classify and preview, but send no mutation.
     pub dry_run: bool,
+    /// The lease token presented via `--lease`. Checked only when the
+    /// deciding rule requires one
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9);
+    /// `None` is only ever valid when it does not.
+    pub lease_token: Option<String>,
+    /// Path to the lease ledger the token is checked against. Production
+    /// callers pass `crate::drive::lease::ledger::ledger_path`'s own
+    /// result; tests pass a path under a `tempdir`.
+    pub ledger_path: PathBuf,
 }
 
 /// What happened (or, under `--dry-run`, would happen).
@@ -189,6 +202,18 @@ pub enum WriteResult {
         /// The rule that decided, when one did.
         decided_by: Option<DecidingRule>,
     },
+    /// No `--lease` was presented, and the deciding rule requires one
+    /// (ADR-0080 §9).
+    RefusedNoLease,
+    /// The presented lease has expired, or was never a token this ledger
+    /// knows about.
+    RefusedLeaseExpired,
+    /// The presented lease is bound to a different file id.
+    RefusedLeaseWrongFile,
+    /// The file has moved since the lease's recorded `version` — the
+    /// staleness check (ADR-0080 §6). Distinct from [`Self::StaleRevision`],
+    /// which is ADR-0076's own, unrelated Docs revision check.
+    RefusedLeaseStale,
     /// A replace landed.
     Replaced {
         /// What the *server* reported changing.
@@ -234,6 +259,10 @@ impl WriteResult {
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::RefusedNoRevisionId => "refused-no-revision-id",
             Self::Blocked { .. } => "blocked",
+            Self::RefusedNoLease => "refused-no-lease",
+            Self::RefusedLeaseExpired => "refused-lease-expired",
+            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
+            Self::RefusedLeaseStale => "refused-lease-stale",
             Self::Replaced { .. } => "replaced",
             Self::Appended { .. } => "appended",
             Self::StaleRevision { .. } => "stale-revision",
@@ -387,6 +416,7 @@ async fn write_inner(
     let folder_ancestry::FileTargetDecision {
         decision,
         resolved_folder_id,
+        requires_lease,
         ..
     } = evaluated;
 
@@ -452,20 +482,83 @@ async fn write_inner(
         return gated(preview, Some(revision_id));
     }
 
+    // The lease check (ADR-0080 §9) sits here: after the permission gate
+    // and the `--dry-run` branch, before the mutating call — see
+    // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
+    // shared verbatim by every leased engine. This is a *separate*,
+    // unrelated staleness check from ADR-0076's own `revisionId` lease
+    // above: that one guards the Docs `batchUpdate` itself against a
+    // concurrent edit, while this one guards the *lease ledger*'s recorded
+    // Drive `version` (ADR-0080 §6). A fresh `files.get` immediately before
+    // `batchUpdate`, not a reuse of the metadata fetched before the
+    // (potentially slow) ancestor-chain walk and `documents.get` above.
+    let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.document_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return gated(
+                    WriteResult::Failed {
+                        detail: err.to_string(),
+                    },
+                    Some(revision_id),
+                )
+            }
+        };
+        match check_and_lock_lease(
+            "drive docs write",
+            &opts.ledger_path,
+            opts.lease_token.as_deref(),
+            &opts.document_id,
+            live_version.as_deref(),
+        ) {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => {
+                return gated(WriteResult::RefusedNoLease, Some(revision_id))
+            }
+            LeaseCheckOutcome::Expired => {
+                return gated(WriteResult::RefusedLeaseExpired, Some(revision_id))
+            }
+            LeaseCheckOutcome::WrongFile => {
+                return gated(WriteResult::RefusedLeaseWrongFile, Some(revision_id))
+            }
+            LeaseCheckOutcome::Stale => {
+                return gated(WriteResult::RefusedLeaseStale, Some(revision_id))
+            }
+            LeaseCheckOutcome::Failed(detail) => {
+                return gated(WriteResult::Failed { detail }, Some(revision_id))
+            }
+        }
+    } else {
+        None
+    };
+
     // ── The mutation ───────────────────────────────────────────────────
     let result = match api
         .batch_update(&opts.document_id, opts.payload.to_request(), &revision_id)
         .await
     {
-        Ok(response) => match &opts.payload {
-            WritePayload::Replace { .. } => WriteResult::Replaced {
-                occurrences_changed: response.occurrences_changed_for_replace(),
-            },
-            WritePayload::Append { text } => WriteResult::Appended {
-                chars: text.chars().count(),
-                bytes: text.len(),
-            },
-        },
+        Ok(response) => {
+            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+                refresh_lease_after_native_write(
+                    "drive docs write",
+                    lock,
+                    &opts.ledger_path,
+                    token,
+                    &files_api,
+                    &opts.document_id,
+                )
+                .await;
+            }
+            match &opts.payload {
+                WritePayload::Replace { .. } => WriteResult::Replaced {
+                    occurrences_changed: response.occurrences_changed_for_replace(),
+                },
+                WritePayload::Append { text } => WriteResult::Appended {
+                    chars: text.chars().count(),
+                    bytes: text.len(),
+                },
+            }
+        }
         Err(err) if is_stale_revision(&err) => WriteResult::StaleRevision {
             required_revision_id: revision_id.clone(),
             detail: err.to_string(),
@@ -474,6 +567,7 @@ async fn write_inner(
             detail: err.to_string(),
         },
     };
+    drop(lease_lock);
     gated(result, Some(revision_id))
 }
 
@@ -615,6 +709,26 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             ),
             None => format!("Blocked: '{name}' — refused by default policy (no matching rule)"),
         },
+        WriteResult::RefusedNoLease => format!(
+            "Refused: '{name}' requires a Drive write lease — run `omni-dev drive lease \
+             acquire {}` and pass the printed token via `--lease`.",
+            outcome.document_id
+        ),
+        WriteResult::RefusedLeaseExpired => format!(
+            "Refused: the presented lease is expired, released, or unknown to this ledger — \
+             run `omni-dev drive lease acquire {}` again.",
+            outcome.document_id
+        ),
+        WriteResult::RefusedLeaseWrongFile => format!(
+            "Refused: the presented lease was acquired for a different file — run `omni-dev \
+             drive lease acquire {}` for this one.",
+            outcome.document_id
+        ),
+        WriteResult::RefusedLeaseStale => format!(
+            "Refused: '{name}' changed since the lease was acquired (or last written under) \
+             — re-run `omni-dev drive lease acquire {}` to lease the current version.",
+            outcome.document_id
+        ),
         WriteResult::Replaced {
             occurrences_changed,
         } => format!("Replaced: {occurrences_changed} occurrence(s) in '{name}'"),
@@ -681,13 +795,55 @@ mod tests {
         (drive, docs)
     }
 
+    /// `version: "1"` throughout — matches [`replace_opts`]'s/
+    /// [`append_opts`]'s default seeded lease, so any test reaching the
+    /// mutating call has a live, non-stale lease by construction (ADR-0080
+    /// §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> Mock {
         let parents: Vec<&str> = parents.to_vec();
         Mock::given(method("GET"))
             .and(path(format!("/drive/v3/files/{id}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                "version": "1",
             })))
+    }
+
+    /// Seeds `ledger_path` with a fresh, live lease for `document_id` at
+    /// `version`, returning its token.
+    fn seed_lease(ledger_path: &std::path::Path, document_id: &str, version: &str) -> String {
+        // A fixed token, not a random one: every call gets its own isolated
+        // ledger (a fresh tempdir), so uniqueness across tests is never a
+        // concern.
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: document_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+        token
+    }
+
+    /// A fresh, isolated ledger path holding a live lease for `document_id`
+    /// at version `"1"` (matching [`mount_file`]'s default).
+    fn leased_opts_for(document_id: &str) -> (Option<String>, std::path::PathBuf) {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, document_id, "1");
+        (Some(token), ledger_path)
     }
 
     fn mount_folder(id: &str) -> Mock {
@@ -727,7 +883,16 @@ mod tests {
         }
     }
 
+    /// Seeds a fresh, isolated ledger with a live lease for `"doc-1"` at
+    /// version `"1"` (matching [`mount_file`]'s default) and returns options
+    /// carrying it. Every existing test built before the lease (ADR-0080
+    /// §9) reaches its mutating call this way by construction — see
+    /// `sheets/structure.rs::opts_for`'s doc comment for why this doesn't
+    /// need touching each test individually. A test exercising the lease
+    /// *refusal* paths builds `WriteOptions` directly instead (see the "the
+    /// Drive write lease" test section below).
     fn replace_opts(dry_run: bool) -> WriteOptions {
+        let (lease_token, ledger_path) = leased_opts_for("doc-1");
         WriteOptions {
             document_id: "doc-1".to_string(),
             payload: WritePayload::Replace {
@@ -736,16 +901,21 @@ mod tests {
                 match_case: true,
             },
             dry_run,
+            lease_token,
+            ledger_path,
         }
     }
 
     fn append_opts(dry_run: bool) -> WriteOptions {
+        let (lease_token, ledger_path) = leased_opts_for("doc-1");
         WriteOptions {
             document_id: "doc-1".to_string(),
             payload: WritePayload::Append {
                 text: "hello".to_string(),
             },
             dry_run,
+            lease_token,
+            ledger_path,
         }
     }
 
@@ -1222,5 +1392,171 @@ mod tests {
         )
         .await;
         assert_eq!(outcome.result, WriteResult::Appended { chars: 5, bytes: 5 });
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+
+        let opts = WriteOptions {
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::RefusedNoLease));
+        assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Never seeded — the ledger exists nowhere near this token.
+
+        let opts = WriteOptions {
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Seeded for a *different* document id.
+        let token = seed_lease(&ledger_path, "some-other-doc", "1");
+
+        let opts = WriteOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::RefusedLeaseWrongFile));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "doc-1", "0");
+
+        let opts = WriteOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::RefusedLeaseStale));
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_skips_the_lease_check_entirely() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        mount_batch_update(serde_json::json!({
+            "documentId": "doc-1",
+            "replies": [{"replaceAllText": {"occurrencesChanged": 1}}],
+        }))
+        .mount(&server)
+        .await;
+        let rule = FolderPermissionRule {
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::DocsWrite).collect(),
+            deny: HashSet::default(),
+            require_lease: false,
+        };
+
+        // No lease token presented at all, and no ledger exists.
+        let opts = WriteOptions {
+            lease_token: None,
+            ledger_path: std::path::PathBuf::from("/nonexistent/lease-ledger.jsonl"),
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[rule]).await;
+        assert!(matches!(outcome.result, WriteResult::Replaced { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_never_needs_a_lease() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        // No batchUpdate mock, no lease token, no ledger — a dry run must
+        // not need any of them.
+
+        let opts = WriteOptions {
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+            ..replace_opts(true)
+        };
+        let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::WouldReplace { .. }));
     }
 }

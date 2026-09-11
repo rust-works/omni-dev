@@ -75,6 +75,13 @@ pub struct WriteCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -112,6 +119,13 @@ pub struct AppendCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -136,9 +150,30 @@ pub struct ClearCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+}
+
+/// Resolves the lease ledger path for one of this module's commands.
+///
+/// A dry run never checks a lease (`write_inner` returns `WouldWrite`
+/// before the ledger is ever touched, mirroring `drive edit`'s own
+/// `--dry-run` reasoning) — resolving a real path here would make a purely
+/// read-only preview depend on the state directory existing at all.
+fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
+    if dry_run {
+        Ok(std::path::PathBuf::new())
+    } else {
+        crate::drive::lease::ledger::ledger_path()
+    }
 }
 
 impl WriteCommand {
@@ -153,6 +188,8 @@ impl WriteCommand {
             values,
             input: self.input.into(),
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -170,6 +207,8 @@ impl AppendCommand {
             values,
             input: self.input.into(),
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -186,6 +225,8 @@ impl ClearCommand {
             values: Vec::new(),
             input: ValueInputOption::default(),
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -350,6 +391,9 @@ mod tests {
         client
     }
 
+    /// `version: "1"` throughout — matches [`seed_ledger_lease`]'s default,
+    /// so a test that seeds a lease and mounts a file via this helper has a
+    /// live, non-stale lease by construction (ADR-0080 §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
         let parents: Vec<&str> = parents.to_vec();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -357,8 +401,37 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
                 })),
             )
+    }
+
+    /// Seeds a live lease for `spreadsheet_id` at `version` into the ledger
+    /// path `resolve_ledger_path`/`ledger::ledger_path` will themselves
+    /// resolve to (i.e. under the `HOME` a prior `EnvGuard::clear_credentials`
+    /// call already redirected) — for tests exercising `Command::execute`
+    /// itself, which resolves its own ledger path rather than taking one as
+    /// a parameter the way the engine-level tests do.
+    fn seed_ledger_lease(spreadsheet_id: &str, version: &str) -> String {
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: spreadsheet_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+        token
     }
 
     fn mount_folder(id: &str) -> wiremock::Mock {
@@ -384,6 +457,11 @@ mod tests {
             values: vec![vec!["a".to_string(), "b".to_string()]],
             input: InputArg::UserEntered.into(),
             dry_run,
+            // Both callers of this helper are refused before the lease
+            // check ever runs (default-deny with no rules written) — a
+            // nonexistent ledger path never gets touched.
+            lease_token: None,
+            ledger_path: std::path::PathBuf::from("/nonexistent/lease-ledger.jsonl"),
         }
     }
 
@@ -466,6 +544,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let lease = Some(seed_ledger_lease("sheet-1", "1"));
 
         let cmd = WriteCommand {
             spreadsheet_id: "sheet-1".to_string(),
@@ -475,6 +554,7 @@ mod tests {
             values_format: ValuesFormat::Auto,
             input: InputArg::UserEntered,
             dry_run: false,
+            lease,
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();
@@ -517,6 +597,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let lease = Some(seed_ledger_lease("sheet-1", "1"));
 
         let cmd = AppendCommand {
             spreadsheet_id: "sheet-1".to_string(),
@@ -526,6 +607,7 @@ mod tests {
             values_format: ValuesFormat::Auto,
             input: InputArg::UserEntered,
             dry_run: false,
+            lease,
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();
@@ -564,12 +646,14 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let lease = Some(seed_ledger_lease("sheet-1", "1"));
 
         let cmd = ClearCommand {
             spreadsheet_id: "sheet-1".to_string(),
             range: Some("A1:B2".to_string()),
             sheet: None,
             dry_run: false,
+            lease,
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();

@@ -27,12 +27,17 @@
 //! resulting set from the range's *current* editors (read in the same
 //! fetch used to resolve the target) before sending it.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
+use crate::drive::files_api::FilesApi;
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+};
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
@@ -157,6 +162,15 @@ pub struct ProtectionOptions {
     pub verb: ProtectionVerb,
     /// Classify and describe only; never call `batchUpdate`.
     pub dry_run: bool,
+    /// The lease token presented via `--lease`. Checked only when the
+    /// deciding rule requires one
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9);
+    /// `None` is only ever valid when it does not.
+    pub lease_token: Option<String>,
+    /// Path to the lease ledger the token is checked against. Production
+    /// callers pass `crate::drive::lease::ledger::ledger_path`'s own
+    /// result; tests pass a path under a `tempdir`.
+    pub ledger_path: PathBuf,
 }
 
 /// What happened (or, under `--dry-run`, would happen).
@@ -207,6 +221,17 @@ pub enum ProtectionResult {
         /// The rule that decided the refusal, if any.
         decided_by: Option<DecidingRule>,
     },
+    /// No `--lease` was presented, and the deciding rule requires one
+    /// (ADR-0080 §9).
+    RefusedNoLease,
+    /// The presented lease has expired, or was never a token this ledger
+    /// knows about.
+    RefusedLeaseExpired,
+    /// The presented lease is bound to a different file id.
+    RefusedLeaseWrongFile,
+    /// The file has moved since the lease's recorded `version` — the
+    /// staleness check (ADR-0080 §6).
+    RefusedLeaseStale,
     /// The mutation succeeded.
     Changed {
         /// Same summary as [`Self::WouldChange`].
@@ -234,6 +259,10 @@ impl ProtectionResult {
             Self::RefusedProtectionNotFound { .. } => "refused-protection-not-found",
             Self::RefusedAmbiguousProtection { .. } => "refused-ambiguous-protection",
             Self::Blocked { .. } => "blocked",
+            Self::RefusedNoLease => "refused-no-lease",
+            Self::RefusedLeaseExpired => "refused-lease-expired",
+            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
+            Self::RefusedLeaseStale => "refused-lease-stale",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -303,7 +332,7 @@ async fn protection_inner(
         return bare(ProtectionResult::RefusedInvalidRange { detail });
     }
 
-    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
         DriveOperation::SheetsProtection,
@@ -343,7 +372,8 @@ async fn protection_inner(
             target,
             decision,
             resolved_folder_id,
-        } => (target, decision, resolved_folder_id),
+            requires_lease,
+        } => (target, decision, resolved_folder_id, requires_lease),
     };
 
     let gated = |result| ProtectionOutcome {
@@ -462,18 +492,66 @@ async fn protection_inner(
         Err(detail) => return gated(ProtectionResult::RefusedInvalidRange { detail }),
     };
 
-    match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
+    // The lease check (ADR-0080 §9) sits here: after the permission gate
+    // and the `--dry-run` branch, before the mutating call — see
+    // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
+    // shared verbatim by every leased engine. A fresh `files.get` immediately
+    // before `batchUpdate`, not a reuse of the metadata `target_gate::resolve`
+    // fetched before the (potentially slow) ancestor-chain walk and workbook
+    // fetch above.
+    let files_api = FilesApi::new(drive);
+    let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return gated(ProtectionResult::Failed {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        match check_and_lock_lease(
+            "drive sheets protection",
+            &opts.ledger_path,
+            opts.lease_token.as_deref(),
+            &opts.spreadsheet_id,
+            live_version.as_deref(),
+        ) {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => return gated(ProtectionResult::RefusedNoLease),
+            LeaseCheckOutcome::Expired => return gated(ProtectionResult::RefusedLeaseExpired),
+            LeaseCheckOutcome::WrongFile => return gated(ProtectionResult::RefusedLeaseWrongFile),
+            LeaseCheckOutcome::Stale => return gated(ProtectionResult::RefusedLeaseStale),
+            LeaseCheckOutcome::Failed(detail) => return gated(ProtectionResult::Failed { detail }),
+        }
+    } else {
+        None
+    };
+
+    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
+            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+                refresh_lease_after_native_write(
+                    "drive sheets protection",
+                    lock,
+                    &opts.ledger_path,
+                    token,
+                    &files_api,
+                    &opts.spreadsheet_id,
+                )
+                .await;
+            }
             let protected_range_id = added_protected_range_id(&response).or(existing_id);
-            gated(ProtectionResult::Changed {
+            ProtectionResult::Changed {
                 summary,
                 protected_range_id,
-            })
+            }
         }
-        Err(err) => gated(ProtectionResult::Failed {
+        Err(err) => ProtectionResult::Failed {
             detail: format!("{err:#}"),
-        }),
-    }
+        },
+    };
+    drop(lease_lock);
+    gated(result)
 }
 
 /// Composes the `--sheet`/`--range` pair into one string, exactly like
@@ -828,6 +906,26 @@ pub fn describe_lines(outcome: &ProtectionOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
+        ProtectionResult::RefusedNoLease => vec![format!(
+            "Refused: {book} requires a Drive write lease — run `omni-dev drive lease acquire \
+             {}` and pass the printed token via `--lease`.",
+            outcome.spreadsheet_id
+        )],
+        ProtectionResult::RefusedLeaseExpired => vec![format!(
+            "Refused: the presented lease is expired, released, or unknown to this ledger — \
+             run `omni-dev drive lease acquire {}` again.",
+            outcome.spreadsheet_id
+        )],
+        ProtectionResult::RefusedLeaseWrongFile => vec![format!(
+            "Refused: the presented lease was acquired for a different file — run `omni-dev \
+             drive lease acquire {}` for this one.",
+            outcome.spreadsheet_id
+        )],
+        ProtectionResult::RefusedLeaseStale => vec![format!(
+            "Refused: {book} changed since the lease was acquired (or last written under) — \
+             re-run `omni-dev drive lease acquire {}` to lease the current version.",
+            outcome.spreadsheet_id
+        )],
         ProtectionResult::Changed {
             summary,
             protected_range_id,
@@ -1011,6 +1109,9 @@ mod tests {
         (drive, sheets)
     }
 
+    /// `version: "1"` throughout — matches [`leased_opts_for`]'s default
+    /// seeded lease, so any test reaching the mutating call has a live,
+    /// non-stale lease by construction (ADR-0080 §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
         let parents: Vec<&str> = parents.to_vec();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1018,8 +1119,47 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
                 })),
             )
+    }
+
+    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
+    /// `version`, returning its token.
+    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
+        // A fixed token, not a random one: every call gets its own isolated
+        // ledger (a fresh tempdir), so uniqueness across tests is never a
+        // concern.
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: spreadsheet_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+        token
+    }
+
+    /// A fresh, isolated ledger path holding a live lease for
+    /// `spreadsheet_id` at version `"1"` (matching [`mount_file`]'s
+    /// default).
+    fn leased_opts_for(spreadsheet_id: &str) -> (Option<String>, std::path::PathBuf) {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, spreadsheet_id, "1");
+        (Some(token), ledger_path)
     }
 
     fn mount_folder(id: &str) -> wiremock::Mock {
@@ -1076,6 +1216,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Blocked { .. }));
@@ -1106,6 +1248,7 @@ mod tests {
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: ProtectionVerb::ProtectRange {
@@ -1117,6 +1260,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token,
+            ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1149,6 +1294,8 @@ mod tests {
                 whole_sheet: false,
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(
@@ -1190,6 +1337,7 @@ mod tests {
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: ProtectionVerb::UnprotectRange {
@@ -1198,6 +1346,8 @@ mod tests {
                 whole_sheet: true,
             },
             dry_run: false,
+            lease_token,
+            ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1661,6 +1811,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
@@ -1689,6 +1841,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::RefusedShortcut));
@@ -1718,6 +1872,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(
@@ -1745,6 +1901,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(
@@ -1781,6 +1939,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
@@ -1815,6 +1975,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
@@ -1836,6 +1998,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1862,6 +2026,8 @@ mod tests {
                 editors: vec!["a@example.com".to_string()],
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -1897,6 +2063,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(
@@ -1931,6 +2099,8 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(
@@ -1964,6 +2134,7 @@ mod tests {
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: ProtectionVerb::ProtectRange {
@@ -1975,6 +2146,8 @@ mod tests {
                 editors: vec!["a@example.com".to_string()],
             },
             dry_run: false,
+            lease_token,
+            ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Changed { .. }));
@@ -2017,6 +2190,7 @@ mod tests {
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: ProtectionVerb::UpdateProtection {
@@ -2029,6 +2203,8 @@ mod tests {
                 remove_editors: vec!["a@example.com".to_string()],
             },
             dry_run: false,
+            lease_token,
+            ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -2079,6 +2255,8 @@ mod tests {
                 remove_editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
@@ -2110,6 +2288,7 @@ mod tests {
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: ProtectionVerb::ProtectRange {
@@ -2121,8 +2300,226 @@ mod tests {
                 editors: Vec::new(),
             },
             dry_run: false,
+            lease_token,
+            ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, ProtectionResult::Failed { .. }));
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ProtectionResult::RefusedNoLease));
+        assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Never seeded — the ledger exists nowhere near this token.
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedLeaseExpired
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        // Seeded for a *different* spreadsheet id.
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            ProtectionResult::RefusedLeaseStale
+        ));
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_skips_the_lease_check_entirely() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addProtectedRange": {"protectedRange": {"protectedRangeId": 1}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rule = FolderPermissionRule {
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsProtection).collect(),
+            deny: HashSet::default(),
+            require_lease: false,
+        };
+
+        // No lease token presented at all, and no ledger exists.
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::from("/nonexistent/lease-ledger.jsonl"),
+        };
+        let outcome = protection(&drive, &sheets, &opts, &[rule]).await;
+        assert!(matches!(outcome.result, ProtectionResult::Changed { .. }));
     }
 }

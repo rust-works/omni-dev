@@ -19,12 +19,17 @@
 //! A third refusal is policy-adjacent but distinct: a target whose `parents`
 //! are not visible. See [`WriteResult::RefusedNoVisibleParents`].
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
+use crate::drive::files_api::FilesApi;
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+};
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueInputOption};
 use crate::drive::sheets::client::SheetsClient;
@@ -86,6 +91,15 @@ pub struct WriteOptions {
     pub input: ValueInputOption,
     /// Classify only; never call a mutating endpoint.
     pub dry_run: bool,
+    /// The lease token presented via `--lease`. Checked only when the
+    /// deciding rule requires one
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9);
+    /// `None` is only ever valid when it does not.
+    pub lease_token: Option<String>,
+    /// Path to the lease ledger the token is checked against. Production
+    /// callers pass `crate::drive::lease::ledger::ledger_path`'s own
+    /// result; tests pass a path under a `tempdir`.
+    pub ledger_path: PathBuf,
 }
 
 /// What happened (or, under `--dry-run`, would happen).
@@ -128,6 +142,17 @@ pub enum WriteResult {
         /// default policy — every write defaults deny).
         decided_by: Option<DecidingRule>,
     },
+    /// No `--lease` was presented, and the deciding rule requires one
+    /// (ADR-0080 §9).
+    RefusedNoLease,
+    /// The presented lease has expired, or was never a token this ledger
+    /// knows about.
+    RefusedLeaseExpired,
+    /// The presented lease is bound to a different file id.
+    RefusedLeaseWrongFile,
+    /// The file has moved since the lease's recorded `version` — the
+    /// staleness check (ADR-0080 §6).
+    RefusedLeaseStale,
     /// The mutation succeeded.
     ///
     /// Every count is optional because the API may omit it — which is why
@@ -168,6 +193,10 @@ impl WriteResult {
             Self::RefusedShortcut => "refused-shortcut",
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::Blocked { .. } => "blocked",
+            Self::RefusedNoLease => "refused-no-lease",
+            Self::RefusedLeaseExpired => "refused-lease-expired",
+            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
+            Self::RefusedLeaseStale => "refused-lease-stale",
             Self::Written { .. } => "written",
             Self::Failed { .. } => "failed",
         }
@@ -259,7 +288,7 @@ async fn write_inner(
     // shape — the metadata fetch, the shortcut/non-spreadsheet checks, and
     // the file-id-then-ancestor-chain gate lookup — can't quietly drift
     // between the two engines.
-    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
         DriveOperation::SheetsWrite,
@@ -303,7 +332,8 @@ async fn write_inner(
             target,
             decision,
             resolved_folder_id,
-        } => (target, decision, resolved_folder_id),
+            requires_lease,
+        } => (target, decision, resolved_folder_id, requires_lease),
     };
 
     let gated = |result| WriteOutcome {
@@ -328,6 +358,42 @@ async fn write_inner(
         });
     }
 
+    // The lease check (ADR-0080 §9) sits here: after the permission gate
+    // and the `--dry-run` branch, before the mutating call — see
+    // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
+    // shared verbatim by every leased engine. Sheets has no revision field
+    // of any kind (§6), so the staleness check is a fresh `files.get`
+    // immediately before the values call, not a reuse of the metadata
+    // `target_gate::resolve` fetched before the (potentially slow)
+    // ancestor-chain walk above.
+    let files_api = FilesApi::new(drive);
+    let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return gated(WriteResult::Failed {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        match check_and_lock_lease(
+            "drive sheets write",
+            &opts.ledger_path,
+            opts.lease_token.as_deref(),
+            &opts.spreadsheet_id,
+            live_version.as_deref(),
+        ) {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => return gated(WriteResult::RefusedNoLease),
+            LeaseCheckOutcome::Expired => return gated(WriteResult::RefusedLeaseExpired),
+            LeaseCheckOutcome::WrongFile => return gated(WriteResult::RefusedLeaseWrongFile),
+            LeaseCheckOutcome::Stale => return gated(WriteResult::RefusedLeaseStale),
+            LeaseCheckOutcome::Failed(detail) => return gated(WriteResult::Failed { detail }),
+        }
+    } else {
+        None
+    };
+
     // ── The mutation ───────────────────────────────────────────────────
     let api = SheetsApi::new(sheets);
     let result = match opts.verb {
@@ -349,6 +415,21 @@ async fn write_inner(
                 updated_cells: None,
             }),
     };
+
+    if result.is_ok() {
+        if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+            refresh_lease_after_native_write(
+                "drive sheets write",
+                lock,
+                &opts.ledger_path,
+                token,
+                &files_api,
+                &opts.spreadsheet_id,
+            )
+            .await;
+        }
+    }
+    drop(lease_lock);
 
     gated(result.unwrap_or_else(|err| WriteResult::Failed {
         detail: format!("{err:#}"),
@@ -468,6 +549,26 @@ pub fn describe(outcome: &WriteOutcome) -> String {
                 "Blocked: {range} of '{name}' — refused by default policy (no matching rule)"
             ),
         },
+        WriteResult::RefusedNoLease => format!(
+            "Refused: '{name}' requires a Drive write lease — run `omni-dev drive lease \
+             acquire {}` and pass the printed token via `--lease`.",
+            outcome.spreadsheet_id
+        ),
+        WriteResult::RefusedLeaseExpired => format!(
+            "Refused: the presented lease is expired, released, or unknown to this ledger — \
+             run `omni-dev drive lease acquire {}` again.",
+            outcome.spreadsheet_id
+        ),
+        WriteResult::RefusedLeaseWrongFile => format!(
+            "Refused: the presented lease was acquired for a different file — run `omni-dev \
+             drive lease acquire {}` for this one.",
+            outcome.spreadsheet_id
+        ),
+        WriteResult::RefusedLeaseStale => format!(
+            "Refused: '{name}' changed since the lease was acquired (or last written under) — \
+             re-run `omni-dev drive lease acquire {}` to lease the current version.",
+            outcome.spreadsheet_id
+        ),
         WriteResult::Written {
             updated_range,
             updated_cells,
@@ -573,6 +674,10 @@ mod tests {
                     file_id: "sheet-1".to_string(),
                 }),
             },
+            WriteResult::RefusedNoLease,
+            WriteResult::RefusedLeaseExpired,
+            WriteResult::RefusedLeaseWrongFile,
+            WriteResult::RefusedLeaseStale,
             WriteResult::Written {
                 updated_range: Some("Sheet1!A1:B2".to_string()),
                 updated_rows: Some(2),
@@ -596,6 +701,10 @@ mod tests {
                 | WriteResult::RefusedShortcut
                 | WriteResult::RefusedNoVisibleParents
                 | WriteResult::Blocked { .. }
+                | WriteResult::RefusedNoLease
+                | WriteResult::RefusedLeaseExpired
+                | WriteResult::RefusedLeaseWrongFile
+                | WriteResult::RefusedLeaseStale
                 | WriteResult::Written { .. }
                 | WriteResult::Failed { .. } => (),
             }
@@ -646,6 +755,9 @@ mod tests {
         (drive, sheets)
     }
 
+    /// `version: "1"` throughout — matches [`opts`]'s default seeded
+    /// lease, so any test reaching the mutating call has a live, non-stale
+    /// lease by construction (ADR-0080 §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
         let parents: Vec<&str> = parents.to_vec();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -653,6 +765,7 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
                 })),
             )
     }
@@ -672,7 +785,19 @@ mod tests {
         }
     }
 
+    /// Seeds a fresh, isolated ledger with a live lease for `"sheet-1"` at
+    /// version `"1"` (matching [`mount_file`]'s default) and returns
+    /// options carrying it. Every existing test built before the lease
+    /// (ADR-0080 §9) reaches its mutating call this way by construction;
+    /// see `structure.rs::opts`'s doc comment (same rationale, same
+    /// leaked-tempdir mechanism) for why this doesn't need touching each
+    /// test individually.
     fn opts(verb: WriteVerb, dry_run: bool) -> WriteOptions {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "1");
         WriteOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb,
@@ -681,7 +806,35 @@ mod tests {
             values: vec![vec!["a".to_string(), "b".to_string()]],
             input: ValueInputOption::UserEntered,
             dry_run,
+            lease_token: Some(token),
+            ledger_path,
         }
+    }
+
+    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
+    /// `version`, returning its token.
+    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
+        // A fixed token, not a random one: every call gets its own
+        // isolated ledger (a fresh tempdir), so uniqueness across tests is
+        // never a concern.
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: spreadsheet_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+        token
     }
 
     // ── refusals that must precede the gate and the network ────────────
