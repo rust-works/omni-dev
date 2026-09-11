@@ -170,4 +170,53 @@ mod tests {
             .allow
             .contains(&crate::drive::write_gate::DriveOperation::Create));
     }
+
+    // ── active_account_lease_backup_folder_id ───────────────────────────
+
+    #[test]
+    fn active_account_lease_backup_folder_id_is_none_for_an_unconfigured_account() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        assert_eq!(active_account_lease_backup_folder_id().unwrap(), None);
+    }
+
+    #[test]
+    fn active_account_lease_backup_folder_id_is_none_when_the_account_sets_none() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[(
+                "client_id",
+                serde_json::Value::String("work-id".to_string()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(active_account_lease_backup_folder_id().unwrap(), None);
+    }
+
+    #[test]
+    fn active_account_lease_backup_folder_id_reads_the_sole_configured_accounts_folder() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[(
+                "lease_backup_folder_id",
+                serde_json::Value::String("backup-folder-1".to_string()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            active_account_lease_backup_folder_id().unwrap().as_deref(),
+            Some("backup-folder-1")
+        );
+    }
 }

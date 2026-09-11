@@ -286,6 +286,13 @@ mod tests {
                     size: 0,
                 },
             },
+            AcquireResult::Acquired {
+                token: "tok-2".to_string(),
+                expires_at: chrono::Utc::now(),
+                backup: LeaseBackup::DriveCopy {
+                    file_id: "copy-1".to_string(),
+                },
+            },
             AcquireResult::RefusedNativeDocument,
             AcquireResult::Denied {
                 detail: "no".to_string(),

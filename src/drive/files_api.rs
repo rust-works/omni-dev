@@ -1667,6 +1667,18 @@ mod tests {
         assert!(msg.contains("--write-full"), "{msg}");
     }
 
+    #[test]
+    fn append_write_scope_hint_copy_for_backup_names_write_full_only() {
+        let msg = append_write_scope_hint(
+            insufficient_permissions_error(),
+            WriteCapability::CopyForBackup,
+        )
+        .to_string();
+        assert!(msg.contains("--write-full"), "{msg}");
+        assert!(msg.contains("back up a native document"), "{msg}");
+        assert!(!msg.contains("--write-file"), "{msg}");
+    }
+
     // ── check_download_size ─────────────────────────────────────────
 
     #[test]

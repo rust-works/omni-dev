@@ -617,6 +617,20 @@ mod tests {
     }
 
     #[test]
+    fn print_report_renders_an_allow_that_does_not_require_a_lease() {
+        print_report(&CheckReport {
+            target_id: "x3".to_string(),
+            operation: "create".to_string(),
+            verdict: "allow".to_string(),
+            decided_by_folder_id: Some("folder-1".to_string()),
+            decided_by_depth: Some(0),
+            decided_by_file_id: None,
+            evaluated_via: "folder-chain".to_string(),
+            requires_lease: false,
+        });
+    }
+
+    #[test]
     fn the_no_visible_parents_note_is_gated_on_a_deny() {
         assert!(should_note_no_visible_parents("no-visible-parents", "deny"));
         // `read` defaults to allow on an empty chain, so this pairing is
