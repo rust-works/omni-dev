@@ -173,8 +173,9 @@ pub struct InsertColumnsCommand {
 /// Gated by the folder write-permission rules' `sheets-delete` operation
 /// (issue #1623) — distinct from `sheets-structure`, so an existing
 /// `allow: ["sheets-structure"]` rule does not also grant this. This cannot
-/// be undone through omni-dev; Google Drive's own version history is the
-/// only recovery path.
+/// be undone through omni-dev; the `--lease` this delete requires (ADR-0080
+/// §9) already backed the file up, and that backup — not Google Drive's own
+/// version history — is the primary recovery path.
 #[derive(Parser)]
 pub struct DeleteSheetCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).

@@ -1855,12 +1855,16 @@ fn describe_inserted(
     )
 }
 
-/// There is no `files.delete` or undo anywhere in this integration (ADR-0077):
-/// Drive's own version history is the only recovery path, so every
-/// destructive real-run message says so.
+/// There is no `files.delete` or undo anywhere in this integration
+/// (ADR-0077). ADR-0080 §9 requires `--lease` on every destructive verb
+/// alongside every other Sheets/Docs write, and acquiring that lease backs
+/// the file up before the delete — so the lease's own backup, not Drive's
+/// version history, is now the primary recovery path, and every
+/// destructive real-run message points there first.
 const RECOVERY_NOTE: &str =
-    "this cannot be undone through omni-dev — use Google Drive's version history to recover it \
-     if needed";
+    "this cannot be undone through omni-dev — the lease this write required already backed \
+     the file up; restore that copy from the Drive UI, or fall back to Google Drive's own \
+     version history";
 
 /// The `DeleteRows`/`DeleteColumns` arm of [`describe_changed`].
 #[allow(clippy::too_many_arguments)]
@@ -3269,7 +3273,8 @@ mod tests {
         .await;
         assert!(matches!(outcome.result, StructureResult::Changed { .. }));
         assert!(describe(&outcome).contains("Deleted sheet 'Q2'"));
-        assert!(describe(&outcome).contains("Google Drive's version history"));
+        assert!(describe(&outcome).contains("restore that copy from the Drive UI"));
+        assert!(describe(&outcome).contains("Google Drive's own version history"));
 
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = requests
