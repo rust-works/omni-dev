@@ -65,7 +65,16 @@ impl EditCommand {
         let content_type = self
             .mime_type
             .unwrap_or_else(|| DEFAULT_CONTENT_MIME_TYPE.to_string());
-        let ledger_path = crate::drive::lease::ledger::ledger_path()?;
+        // A dry run never checks a lease (see the `--dry-run` flag's own
+        // doc comment) — `content_edit::edit` returns `WouldEdit` before
+        // the ledger is ever touched, so resolving a real path here would
+        // make a purely read-only preview depend on the state directory
+        // existing at all.
+        let ledger_path = if self.dry_run {
+            std::path::PathBuf::new()
+        } else {
+            crate::drive::lease::ledger::ledger_path()?
+        };
         let opts = EditOptions {
             file_id: self.file_id,
             content,

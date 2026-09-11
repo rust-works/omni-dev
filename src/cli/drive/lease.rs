@@ -13,6 +13,31 @@ use crate::drive::lease::ledger;
 /// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
 const DEFAULT_EXPIRY_MINUTES: i64 = 30;
 
+/// The accepted `--expiry-minutes` range: at least a minute (0 or negative
+/// would mint a lease that is already expired the instant Touch ID
+/// succeeds, spending a real prompt on a token nothing could ever use), and
+/// capped at 24 hours (ADR-0080 §5 frames expiry as bounding "the window in
+/// which the agent may write without a fresh Touch ID prompt" — a value far
+/// past that intent is far more likely a typo than a deliberate choice, and
+/// an unbounded `i64` risks overflowing `chrono::Duration::minutes`).
+const MAX_EXPIRY_MINUTES: i64 = 24 * 60;
+
+/// Validates `--expiry-minutes` before anything else runs — no network
+/// call, no Touch ID prompt — so a bad value is a clean parse error instead
+/// of either an instantly-dead lease (a non-positive value) or a panic
+/// (`chrono::Duration::minutes` overflowing on an extreme one).
+fn parse_expiry_minutes(s: &str) -> Result<i64, String> {
+    let value: i64 = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a valid integer"))?;
+    if !(1..=MAX_EXPIRY_MINUTES).contains(&value) {
+        return Err(format!(
+            "must be between 1 and {MAX_EXPIRY_MINUTES} (24 hours), got {value}"
+        ));
+    }
+    Ok(value)
+}
+
 /// The Drive write lease: acquire a Touch ID-authorised backup token before
 /// a content-mutating write.
 #[derive(Parser)]
@@ -53,7 +78,7 @@ pub struct AcquireCommand {
     /// Minutes the lease stays live once authorised. A write never
     /// extends this — a fresh window means a fresh `drive lease acquire`
     /// (ADR-0080 §5).
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_EXPIRY_MINUTES)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_EXPIRY_MINUTES, value_parser = parse_expiry_minutes)]
     pub expiry_minutes: i64,
 
     /// Require Touch ID specifically, failing outright rather than
@@ -130,7 +155,7 @@ fn print_result(result: &AcquireResult) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -155,6 +180,16 @@ mod tests {
         }
     }
 
+    /// Like [`parse`], but for a value expected to fail `clap` validation.
+    fn parse_err(args: &[&str]) -> String {
+        let mut full = vec!["omni-dev", "lease"];
+        full.extend_from_slice(args);
+        Wrapper::try_parse_from(full)
+            .err()
+            .expect("expected a parse error")
+            .to_string()
+    }
+
     #[test]
     fn defaults_are_sane() {
         let cmd = parse(&["acquire", "file1"]);
@@ -162,6 +197,62 @@ mod tests {
         assert!(cmd.backup_dir.is_none());
         assert_eq!(cmd.expiry_minutes, DEFAULT_EXPIRY_MINUTES);
         assert!(!cmd.biometrics_only);
+    }
+
+    #[test]
+    fn expiry_minutes_boundary_values_are_accepted() {
+        assert_eq!(
+            parse(&["acquire", "file1", "--expiry-minutes", "1"]).expiry_minutes,
+            1
+        );
+        assert_eq!(
+            parse(&["acquire", "file1", "--expiry-minutes", "1440"]).expiry_minutes,
+            1440
+        );
+    }
+
+    #[test]
+    fn expiry_minutes_zero_is_rejected() {
+        let err = parse_err(&["acquire", "file1", "--expiry-minutes", "0"]);
+        assert!(err.contains("must be between 1 and 1440"), "{err}");
+    }
+
+    #[test]
+    fn expiry_minutes_negative_is_rejected() {
+        // clap treats a leading `-` as looking like a flag before our own
+        // `value_parser` ever runs (`-- -5` is the escape hatch) — still a
+        // clean rejection, just with clap's own message rather than ours.
+        let err = parse_err(&["acquire", "file1", "--expiry-minutes", "-5"]);
+        assert!(err.contains("unexpected argument"), "{err}");
+    }
+
+    #[test]
+    fn expiry_minutes_past_the_cap_is_rejected() {
+        let err = parse_err(&["acquire", "file1", "--expiry-minutes", "1441"]);
+        assert!(err.contains("must be between 1 and 1440"), "{err}");
+    }
+
+    #[test]
+    fn expiry_minutes_over_the_cap_but_still_a_valid_i64_is_rejected_cleanly() {
+        // Large enough to be a plausible typo, small enough to still parse
+        // as `i64` — exercises the range check specifically, as opposed to
+        // the integer-parse failure below.
+        let err = parse_err(&["acquire", "file1", "--expiry-minutes", "999999999999999999"]);
+        assert!(err.contains("must be between 1 and 1440"), "{err}");
+    }
+
+    #[test]
+    fn expiry_minutes_past_i64_range_is_a_clean_parse_error_not_a_panic() {
+        // Would overflow `chrono::Duration::minutes` if it ever reached
+        // that call — must be rejected as a plain integer-parse failure
+        // instead, well before the range check.
+        let err = parse_err(&[
+            "acquire",
+            "file1",
+            "--expiry-minutes",
+            "99999999999999999999",
+        ]);
+        assert!(err.contains("not a valid integer"), "{err}");
     }
 
     #[test]

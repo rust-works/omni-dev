@@ -182,10 +182,13 @@ async fn evaluate_target(
     let target = files_api.get_metadata(target_id).await?;
     if target.mime_type == GOOGLE_FOLDER_MIME_TYPE {
         let decision = folder_ancestry::resolve_decision_from(files_api, target, op, rules).await?;
+        let requires_lease =
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
         return Ok(FileTargetDecision {
             decision,
             resolved_folder_id: None,
             source: DecisionSource::FolderChain,
+            requires_lease,
         });
     }
     folder_ancestry::resolve_decision_for_file_target(files_api, &target, op, rules).await

@@ -682,10 +682,19 @@ pub fn decided_by_log_fields(decided_by: Option<&DecidingRule>) -> DecidedByLogF
 /// requiring a lease — moot in practice, since every write operation
 /// defaults to `Deny` (`DriveOperation::default_policy`), so a `None`
 /// `decided_by` never accompanies an `Allow` verdict a caller would act on.
-/// When more than one configured rule matches the decided target (the
-/// legacy multi-parent case, or simply two rules naming the same folder),
-/// **any** of them requiring a lease is enough — the same safe-direction
-/// tie-break every other ambiguity in this gate resolves with.
+/// When more than one configured rule matches `decided_by` itself (two
+/// rules naming the same folder and depth, or the same file id), **any**
+/// of them requiring a lease is enough — the same safe-direction tie-break
+/// every other ambiguity in this gate resolves with.
+///
+/// This function only ever sees the **one** `decided_by` its caller passes
+/// in — it cannot by itself account for a legacy multi-parent target,
+/// where [`combine_across_parents`] keeps only the winning parent's
+/// `decided_by` and discards the rest. A caller with more than one parent
+/// decision in hand (`crate::drive::folder_ancestry::resolve_decision_for_parents`)
+/// must call this once per parent and OR the results together *before*
+/// folding the decisions, or a losing parent's own lease requirement would
+/// be silently dropped along with its `decided_by`.
 #[must_use]
 pub fn decided_rule_requires_lease(
     decided_by: Option<&DecidingRule>,

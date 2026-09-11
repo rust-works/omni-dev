@@ -26,7 +26,7 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
-use crate::drive::lease::ledger::LeaseLedger;
+use crate::drive::lease::ledger::{LeaseLedger, LedgerLock};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
@@ -227,6 +227,7 @@ async fn edit_inner(
     let folder_ancestry::FileTargetDecision {
         decision,
         resolved_folder_id,
+        requires_lease,
         ..
     } = evaluated;
 
@@ -254,29 +255,49 @@ async fn edit_inner(
     // and the `--dry-run` branch, before the mutating call. A folder-
     // permission refusal above already made zero Drive API calls with the
     // lease never touched; a `--dry-run` never needs `--lease` at all.
-    if write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules) {
-        if let Some(result) = check_lease(
+    //
+    // `requires_lease` already folds in every legacy multi-parent's own
+    // requirement (see `FileTargetDecision::requires_lease`'s doc comment)
+    // — it must not be re-derived from `decision.decided_by` alone here,
+    // which would only see the one parent whose decision happened to win
+    // the verdict.
+    //
+    // The ledger lock acquired by `check_and_lock_lease` below is held
+    // across the `edit_content` call and released only after
+    // `refresh_lease_after_write` — otherwise a second concurrent `drive
+    // edit` presenting the same token could load the ledger before this
+    // write's `record_write` lands, see the same (still non-stale)
+    // recorded version, and pass its own staleness check even though this
+    // write is about to invalidate it (a lease-token double-spend).
+    let lease_lock = if requires_lease {
+        match check_and_lock_lease(
             &opts.ledger_path,
             opts.lease_token.as_deref(),
             &opts.file_id,
             target.version.as_deref(),
         ) {
-            return EditOutcome {
-                file_id: opts.file_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id,
-                result,
-            };
+            Ok(lock) => Some(lock),
+            Err(result) => {
+                return EditOutcome {
+                    file_id: opts.file_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id,
+                    result,
+                };
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let result = match files_api
         .edit_content(&opts.file_id, &opts.content, &opts.content_type)
         .await
     {
         Ok(updated) => {
-            if let Some(token) = &opts.lease_token {
+            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
                 refresh_lease_after_write(
+                    lock,
                     &opts.ledger_path,
                     token,
                     updated.version,
@@ -289,6 +310,7 @@ async fn edit_inner(
             detail: err.to_string(),
         },
     };
+    drop(lease_lock);
     EditOutcome {
         file_id: opts.file_id.clone(),
         file_name: Some(target.name),
@@ -297,48 +319,74 @@ async fn edit_inner(
     }
 }
 
-/// Checks a presented `--lease` token against the ledger: present,
-/// unexpired, bound to `file_id`, and not stale against `live_version`
-/// (ADR-0080 §6/§9). Returns `None` when the check passes (nothing to
-/// refuse), else the specific refusal.
+/// Acquires the ledger lock and checks a presented `--lease` token against
+/// it: present, unexpired, bound to `file_id`, and not stale against
+/// `live_version` (ADR-0080 §6/§9). On success, returns the still-held
+/// [`LedgerLock`] — the caller must keep it alive across the mutating
+/// call and into [`refresh_lease_after_write`], not drop it right away, or
+/// two concurrent writes presenting the same token could each load the
+/// ledger before either has recorded its write and both pass the
+/// staleness check against the same now-stale `version` (a lease-token
+/// double-spend). On refusal, no lock is held (either none was ever taken,
+/// or it is dropped before returning).
 ///
 /// A ledger load failure is reported as [`EditResult::RefusedLeaseExpired`]
 /// rather than [`EditResult::Failed`] — an unreadable ledger means "no
 /// token in it can be verified," which is exactly what that refusal
 /// already communicates, and it avoids a corrupt/missing ledger being
-/// mistaken for an API or validation error.
-fn check_lease(
+/// mistaken for an API or validation error. It is still logged at `warn`
+/// (distinct from the plain "no such token" case, which is expected and
+/// not logged) so a systemic ledger problem — as opposed to an ordinary
+/// expired/unknown token — leaves an operator-visible trace rather than
+/// silently masquerading as the latter.
+///
+/// A failure to acquire the lock itself (another `drive lease` operation
+/// genuinely in progress) is reported as [`EditResult::Failed`], not
+/// folded into `RefusedLeaseExpired`: it says nothing about whether the
+/// token is valid, and retrying immediately is the right response, not
+/// re-running `drive lease acquire`.
+fn check_and_lock_lease(
     ledger_path: &std::path::Path,
     lease_token: Option<&str>,
     file_id: &str,
     live_version: Option<&str>,
-) -> Option<EditResult> {
+) -> Result<LedgerLock, EditResult> {
     let Some(token) = lease_token else {
-        return Some(EditResult::RefusedNoLease);
+        return Err(EditResult::RefusedNoLease);
     };
-    // Every exit below is `Some(refusal)` unless the token is verified
-    // live, bound to this file, and fresh — a `Result`/`Option` failure
-    // anywhere in this lookup (an unreadable ledger, an absent token) must
-    // refuse, never fall through as "no refusal". `?` is deliberately not
-    // used here: this function's own `Option<EditResult>` return means
-    // `None`, so a stray `?` on the ledger load would turn a read error
-    // into silent approval — the opposite of fail-closed.
-    let Ok(ledger) = LeaseLedger::load(ledger_path) else {
-        return Some(EditResult::RefusedLeaseExpired);
+    let lock = LedgerLock::acquire(ledger_path).map_err(|err| EditResult::Failed {
+        detail: err.to_string(),
+    })?;
+    // Every exit below is `Err(refusal)` unless the token is verified
+    // live, bound to this file, and fresh — a `Result` failure anywhere in
+    // this lookup (an unreadable ledger, an absent token) must refuse,
+    // never fall through as "no refusal". `?` is deliberately not used on
+    // the ledger load: a stray `?` here would turn a read error into
+    // silent approval — the opposite of fail-closed.
+    let ledger = match LeaseLedger::load(ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                "drive edit: lease ledger at {} could not be read ({err}); refusing the \
+                 presented lease as expired rather than trusting an unreadable ledger",
+                ledger_path.display()
+            );
+            return Err(EditResult::RefusedLeaseExpired);
+        }
     };
     let Some(record) = ledger.get(token) else {
-        return Some(EditResult::RefusedLeaseExpired);
+        return Err(EditResult::RefusedLeaseExpired);
     };
     if !record.is_live(chrono::Utc::now()) {
-        return Some(EditResult::RefusedLeaseExpired);
+        return Err(EditResult::RefusedLeaseExpired);
     }
     if record.file_id != file_id {
-        return Some(EditResult::RefusedLeaseWrongFile);
+        return Err(EditResult::RefusedLeaseWrongFile);
     }
     if live_version != Some(record.version.as_str()) {
-        return Some(EditResult::RefusedLeaseStale);
+        return Err(EditResult::RefusedLeaseStale);
     }
-    None
+    Ok(lock)
 }
 
 /// Best-effort: updates the lease's recorded `version`/`modified_time`
@@ -349,7 +397,13 @@ fn check_lease(
 /// silent: the ledger keeps the *old* version, so the next write under
 /// this lease sees a spurious staleness mismatch and refuses, never a
 /// missed one (ADR-0080 §4).
+///
+/// Takes `_lock` (already held by the caller since
+/// [`check_and_lock_lease`]) rather than acquiring its own — acquiring a
+/// second time here, in the same process, on the same path, would fail
+/// against the lock this call is still holding.
 fn refresh_lease_after_write(
+    _lock: &LedgerLock,
     ledger_path: &std::path::Path,
     token: &str,
     version: Option<String>,
@@ -362,7 +416,6 @@ fn refresh_lease_after_write(
         return;
     };
     let result = (|| -> anyhow::Result<()> {
-        let _lock = crate::drive::lease::ledger::LedgerLock::acquire(ledger_path)?;
         let mut ledger = LeaseLedger::load(ledger_path)?;
         ledger.record_write(token, version, modified_time);
         ledger.save(ledger_path)
@@ -938,6 +991,71 @@ mod tests {
         };
         let outcome = edit(&client, &opts, &[allow_rule()]).await;
         assert!(matches!(outcome.result, EditResult::RefusedLeaseStale));
+    }
+
+    #[tokio::test]
+    async fn edit_requires_a_lease_when_any_legacy_parent_requires_one_even_if_the_deciding_parent_opted_out(
+    ) {
+        // Regression test for the multi-parent lease-bypass (issue #1664):
+        // `combine_across_parents` keeps only the *last* Allow decision's
+        // `decided_by` — here that's `lenient-parent`, whose rule opts out
+        // of the lease. `strict-parent`'s own requirement must still
+        // apply, or a lease could be silently skipped just by attaching an
+        // opted-out legacy parent to a file.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["strict-parent", "lenient-parent"])
+            .mount(&server)
+            .await;
+        mount_folder("strict-parent").mount(&server).await;
+        mount_folder("lenient-parent").mount(&server).await;
+        // No PATCH mock mounted — a refusal must make zero mutating calls.
+        let rules = [
+            FolderPermissionRule::folder("strict-parent").allowing([DriveOperation::Edit]),
+            FolderPermissionRule::folder("lenient-parent")
+                .allowing([DriveOperation::Edit])
+                .requiring_lease(false),
+        ];
+
+        let outcome = edit(&client, &opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, EditResult::RefusedNoLease),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_ledger_lock_fails_the_edit_rather_than_risking_a_lease_double_spend() {
+        // Regression test for the lease-check/refresh TOCTOU (issue
+        // #1664): simulates a concurrent `drive lease`/`drive edit`
+        // operation already holding the ledger lock. The edit must fail
+        // outright rather than silently reading the ledger unlocked.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No PATCH mock mounted — a refusal must make zero mutating calls.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "file-1", "1");
+        let mut lock_path = ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::File::create(std::path::PathBuf::from(lock_path)).unwrap();
+
+        let opts = EditOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..opts_for("file-1", false)
+        };
+        let outcome = edit(&client, &opts, &[allow_rule()]).await;
+        assert!(
+            matches!(outcome.result, EditResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
     }
 
     #[tokio::test]

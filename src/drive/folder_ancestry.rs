@@ -171,6 +171,21 @@ pub struct FileTargetDecision {
     pub resolved_folder_id: Option<String>,
     /// How the verdict was reached.
     pub source: DecisionSource,
+    /// Whether a write acting on `decision` needs a valid Drive write lease
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§13).
+    ///
+    /// Computed **here**, not by re-deriving it from `decision.decided_by`
+    /// after the fact: for a legacy multi-parent target,
+    /// [`write_gate::combine_across_parents`] keeps only the *winning*
+    /// parent's `decided_by`, discarding every other parent's — including
+    /// one whose rule required a lease. Re-querying
+    /// `decided_rule_requires_lease` against the single surviving
+    /// `decided_by` would silently drop that requirement whenever the
+    /// winning parent's own rule happened to opt out. This field is instead
+    /// the OR of each contributing parent's own requirement, computed
+    /// before its `decided_by` is folded away — see
+    /// [`resolve_decision_for_parents`].
+    pub requires_lease: bool,
 }
 
 /// Resolves `op` for a file target whose metadata the caller already has.
@@ -198,25 +213,33 @@ pub async fn resolve_decision_for_file_target(
     rules: &[FolderPermissionRule],
 ) -> Result<FileTargetDecision> {
     if let Some(decision) = write_gate::resolve_file_rule(&target.id, op, rules) {
+        let requires_lease =
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
         return Ok(FileTargetDecision {
             decision,
             resolved_folder_id: None,
             source: DecisionSource::FileRule,
+            requires_lease,
         });
     }
     if target.parents.is_empty() {
+        let decision = write_gate::resolve(&[], op, rules);
+        let requires_lease =
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
         return Ok(FileTargetDecision {
-            decision: write_gate::resolve(&[], op, rules),
+            decision,
             resolved_folder_id: None,
             source: DecisionSource::NoVisibleParents,
+            requires_lease,
         });
     }
-    let (decision, resolved_folder_id) =
+    let (decision, resolved_folder_id, requires_lease) =
         resolve_decision_for_parents(files_api, &target.parents, op, rules).await?;
     Ok(FileTargetDecision {
         decision,
         resolved_folder_id,
         source: DecisionSource::FolderChain,
+        requires_lease,
     })
 }
 
@@ -228,6 +251,16 @@ pub async fn resolve_decision_for_file_target(
 /// when there's exactly one parent — `None` for an orphan target or a
 /// multi-parent target, where no single folder id would be accurate.
 ///
+/// Also returns whether the combined decision needs a lease, computed as
+/// the OR of **every** parent's own `decided_rule_requires_lease` result —
+/// each evaluated against that parent's own `decided_by`, before
+/// [`write_gate::combine_across_parents`] discards every `decided_by` but
+/// the winning one. Re-deriving the requirement from only the combined
+/// `Decision` afterward would silently drop it whenever the surviving
+/// parent's rule happened to opt out, even though a losing (but still
+/// `Allow`) parent's rule required one — the safe direction this gate takes
+/// everywhere else.
+///
 /// **Private on purpose** (issue #1612): every file target must go through
 /// [`resolve_decision_for_file_target`], which consults `file_id` rules
 /// first. A caller reaching this primitive directly would skip that step
@@ -238,17 +271,24 @@ async fn resolve_decision_for_parents(
     parents: &[String],
     op: DriveOperation,
     rules: &[FolderPermissionRule],
-) -> Result<(Decision, Option<String>)> {
+) -> Result<(Decision, Option<String>, bool)> {
     let Some((first_parent, rest_parents)) = parents.split_first() else {
-        return Ok((write_gate::resolve(&[], op, rules), None));
+        let decision = write_gate::resolve(&[], op, rules);
+        let requires_lease =
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
+        return Ok((decision, None, requires_lease));
     };
     let mut combined = resolve_decision(files_api, first_parent, op, rules).await?;
+    let mut requires_lease =
+        write_gate::decided_rule_requires_lease(combined.decided_by.as_ref(), rules);
     for parent_id in rest_parents {
         let decision = resolve_decision(files_api, parent_id, op, rules).await?;
+        requires_lease |=
+            write_gate::decided_rule_requires_lease(decision.decided_by.as_ref(), rules);
         combined = write_gate::combine_across_parents(combined, [decision]);
     }
     let resolved_folder_id = rest_parents.is_empty().then(|| first_parent.clone());
-    Ok((combined, resolved_folder_id))
+    Ok((combined, resolved_folder_id, requires_lease))
 }
 
 #[cfg(test)]
@@ -501,12 +541,13 @@ mod tests {
         let client = client_with_bootstrapped_token(&server).await;
         let files_api = FilesApi::new(&client);
 
-        let (decision, resolved_folder_id) =
+        let (decision, resolved_folder_id, requires_lease) =
             resolve_decision_for_parents(&files_api, &[], DriveOperation::Edit, &[])
                 .await
                 .unwrap();
         assert_eq!(decision.verdict, write_gate::Verdict::Deny);
         assert_eq!(resolved_folder_id, None);
+        assert!(requires_lease, "no decided_by defaults to requiring one");
     }
 
     #[tokio::test]
@@ -524,7 +565,7 @@ mod tests {
             require_lease: true,
         }];
 
-        let (decision, resolved_folder_id) = resolve_decision_for_parents(
+        let (decision, resolved_folder_id, _requires_lease) = resolve_decision_for_parents(
             &files_api,
             &["parent-1".to_string()],
             DriveOperation::Edit,
@@ -562,7 +603,7 @@ mod tests {
             },
         ];
 
-        let (decision, resolved_folder_id) = resolve_decision_for_parents(
+        let (decision, resolved_folder_id, _requires_lease) = resolve_decision_for_parents(
             &files_api,
             &["allow-parent".to_string(), "deny-parent".to_string()],
             DriveOperation::Edit,
@@ -572,6 +613,44 @@ mod tests {
         .unwrap();
         assert_eq!(decision.verdict, write_gate::Verdict::Deny);
         assert_eq!(resolved_folder_id, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_decision_for_parents_lease_requirement_is_the_or_of_every_parent_even_though_only_one_decides_the_verdict(
+    ) {
+        // Regression test: `combine_across_parents` keeps only the winning
+        // parent's `decided_by` (issue #1664's multi-parent lease-bypass
+        // fix). Here both parents Allow — `lenient-parent` opts out of the
+        // lease and, because `combine_across_parents` folds left-to-right
+        // and keeps the *later* decision on an Allow/Allow tie, its
+        // decision is what the combined `Decision` reports. `strict-parent`
+        // still requires a lease, and it must not be silently dropped.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_folder("strict-parent", None).mount(&server).await;
+        mount_folder("lenient-parent", None).mount(&server).await;
+        let files_api = FilesApi::new(&client);
+        let rules = [
+            FolderPermissionRule::folder("strict-parent").allowing([DriveOperation::Edit]),
+            FolderPermissionRule::folder("lenient-parent")
+                .allowing([DriveOperation::Edit])
+                .requiring_lease(false),
+        ];
+
+        let (decision, _resolved_folder_id, requires_lease) = resolve_decision_for_parents(
+            &files_api,
+            &["strict-parent".to_string(), "lenient-parent".to_string()],
+            DriveOperation::Edit,
+            &rules,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.verdict, write_gate::Verdict::Allow);
+        assert!(
+            requires_lease,
+            "strict-parent's lease requirement must survive even though \
+             lenient-parent's decision is the one the combined verdict reports"
+        );
     }
 
     // ── file targets (issue #1612) ────────────────────────────────────
