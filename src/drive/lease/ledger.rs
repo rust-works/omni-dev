@@ -303,6 +303,18 @@ mod tests {
     }
 
     #[test]
+    fn load_surfaces_a_non_not_found_read_error() {
+        // A directory at the ledger path makes `read_to_string` fail with
+        // something other than `NotFound` (e.g. "Is a directory") — unlike
+        // an absent file, that must be a hard error, not an empty ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let err = LeaseLedger::load(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to read lease ledger"));
+    }
+
+    #[test]
     fn load_rejects_a_corrupt_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lease-ledger.jsonl");
@@ -365,6 +377,19 @@ mod tests {
     }
 
     #[test]
+    fn save_creates_a_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("lease-ledger.jsonl");
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        ledger.save(&path).unwrap();
+
+        assert!(path.exists());
+        let reloaded = LeaseLedger::load(&path).unwrap();
+        assert!(reloaded.get("t1").is_some());
+    }
+
+    #[test]
     fn save_is_atomic_and_leaves_no_temp_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lease-ledger.jsonl");
@@ -400,6 +425,19 @@ mod tests {
             .create_new(true)
             .open(&lock_path);
         assert!(second.is_err());
+    }
+
+    #[test]
+    fn ledger_lock_acquire_creates_a_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("nested").join("lease-ledger.jsonl");
+        let lock = LedgerLock::acquire(&ledger_path).unwrap();
+        assert!(dir
+            .path()
+            .join("nested")
+            .join("lease-ledger.jsonl.lock")
+            .exists());
+        drop(lock);
     }
 
     #[test]
