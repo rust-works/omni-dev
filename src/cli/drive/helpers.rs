@@ -56,6 +56,25 @@ pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
     })
 }
 
+/// Reads the active account's `lease_backup_folder_id`
+/// ([ADR-0080](../../../docs/adrs/adr-0080.md) §3/§13) — the destination
+/// for a native-document lease's Drive-side backup copy. `None` for an
+/// [`ResolvedAccount::Unconfigured`] account, or one with no folder id set,
+/// either of which means `drive lease acquire` refuses every native-
+/// document target for this account.
+pub fn active_account_lease_backup_folder_id() -> Result<Option<String>> {
+    let settings = Settings::load().unwrap_or_default();
+    let resolved = auth::resolve(&settings.drive, None)?;
+    Ok(match &resolved {
+        ResolvedAccount::Named(name) => settings
+            .drive
+            .accounts
+            .get(name)
+            .and_then(|a| a.lease_backup_folder_id.clone()),
+        ResolvedAccount::Unconfigured => None,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

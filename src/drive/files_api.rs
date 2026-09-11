@@ -250,6 +250,42 @@ impl<'a> FilesApi<'a> {
             .map_err(|err| append_write_scope_hint(err, WriteCapability::CreateOrUpload))
     }
 
+    /// Copies an existing file (`files.copy`) into `parent_folder_id`,
+    /// naming the copy `name` — the native-document backup mechanism for
+    /// the Drive write lease ([ADR-0080](../../docs/adrs/adr-0080.md) §3):
+    /// a Google Sheet/Doc/Slide has no bytes [`FilesApi::download`] can
+    /// read, so a lossless, Drive-side copy is the only backup a native
+    /// document can have. Requires the unrestricted `drive` scope — a copy
+    /// reads a file `omni-dev` did not necessarily create, which
+    /// `drive.file` cannot do.
+    ///
+    /// Restricted to `crate::drive`, for the identical reason
+    /// [`Self::create`]'s doc comment gives: only
+    /// `crate::drive::lease::acquire` may call this, never an ungated CLI
+    /// command directly.
+    pub(in crate::drive) async fn copy(
+        &self,
+        file_id: &str,
+        parent_folder_id: &str,
+        name: &str,
+    ) -> Result<DriveFile> {
+        let url = build_file_copy_url(self.client.base_url(), file_id)?;
+        let response = self
+            .client
+            .post_json(
+                url.as_str(),
+                &serde_json::json!({
+                    "name": name,
+                    "parents": [parent_folder_id],
+                }),
+            )
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.copy response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::CopyForBackup))
+    }
+
     /// Uploads `content` as a new file (`files.create` with
     /// `uploadType=multipart`, Drive's simple upload endpoint — no
     /// resumable-session support). Requires the `drive.file` or `drive`
@@ -437,6 +473,19 @@ fn build_file_create_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// `files.copy` URL for [`FilesApi::copy`] — `fields` selects the same
+/// response shape `files.get` returns, so the copy's own metadata
+/// (including its new `id`) comes back in one call.
+fn build_file_copy_url(base_url: &str, file_id: &str) -> Result<Url> {
+    let mut url = DriveClient::api_url(base_url, &format!("/drive/v3/files/{file_id}/copy"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("fields", GET_FIELDS);
+        pairs.append_pair("supportsAllDrives", "true");
+    }
+    Ok(url)
+}
+
 /// `files.create` URL for [`FilesApi::upload`], on Drive's separate
 /// `/upload/` path prefix (`uploadType=multipart`, Google's simple-upload
 /// endpoint — no resumable-session support here).
@@ -523,6 +572,12 @@ pub(crate) enum WriteCapability {
     /// client has no cheap way to know which a given file id is, so the
     /// hint names both.
     EditContent,
+    /// Copying an existing file for a native-document lease backup
+    /// ([ADR-0080](../../docs/adrs/adr-0080.md) §3) — always the
+    /// unrestricted `drive` scope: unlike [`Self::EditContent`], there is
+    /// no app-created-it case to consider, since the lease exists
+    /// precisely to back up files `omni-dev` did not create.
+    CopyForBackup,
 }
 
 /// Appends an actionable hint to a mutating-call failure caused by an
@@ -563,6 +618,10 @@ pub(in crate::drive) fn append_write_scope_hint(
         WriteCapability::EditContent => {
             "Run `omni-dev drive auth login --write-file` if this file was created by \
              omni-dev, or `--write-full` to edit any pre-existing file's content, then retry"
+        }
+        WriteCapability::CopyForBackup => {
+            "Run `omni-dev drive auth login --write-full` to grant the unrestricted scope \
+             needed to back up a native document before a leased write, then retry"
         }
     };
     err.context(hint)

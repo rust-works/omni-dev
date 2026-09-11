@@ -1,9 +1,10 @@
 //! `drive lease acquire` — the engine behind
 //! [ADR-0080](../../../docs/adrs/adr-0080.md) §2: authenticate, then back
-//! up, then record, then mint. Binary files only in this phase (§3's
-//! native-file `files.copy` case lands with Phase 3); a Google-native
-//! target is refused client-side, before any of the four steps, mirroring
-//! `drive edit`'s identical refusal.
+//! up, then record, then mint. Binary files back up as bytes to local disk;
+//! a Google-native document (Sheet/Doc/Slide) backs up as a lossless
+//! Drive-side `files.copy` into the account's configured backup folder
+//! (§3's fidelity split) — refused outright, before authenticating at all,
+//! when no backup folder is configured for this account.
 
 use std::path::{Path, PathBuf};
 
@@ -16,15 +17,21 @@ use crate::cli::drive::format::JsonlSerialize;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
-use crate::drive::lease::ledger::{LeaseLedger, LeaseRecord, LedgerLock};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock};
 
 /// Per-call options for `drive lease acquire`.
 #[derive(Debug, Clone)]
 pub struct AcquireOptions {
     /// The file id to lease.
     pub file_id: String,
-    /// Local directory byte backups are written under.
+    /// Local directory byte backups are written under. Unused for a
+    /// native-document target.
     pub backup_dir: PathBuf,
+    /// Destination folder for a native document's Drive-side backup copy
+    /// (ADR-0080 §3/§13) — the account's configured
+    /// `lease_backup_folder_id`. `None` means a native-document target is
+    /// refused outright; unused for a binary target.
+    pub native_backup_folder_id: Option<String>,
     /// How long the lease stays live from the moment it is authorised.
     pub expiry: ChronoDuration,
     /// Which authentication policy to present (ADR-0080 §7).
@@ -48,10 +55,11 @@ pub enum AcquireResult {
         /// When this lease stops authorising writes.
         expires_at: DateTime<Utc>,
         /// Where the backup landed.
-        backup_path: PathBuf,
+        backup: LeaseBackup,
     },
-    /// The target is a Google-native document — no bytes to back up this
-    /// way. Native-file leases land with Phase 3.
+    /// The target is a Google-native document and no backup folder is
+    /// configured for this account (`lease_backup_folder_id`) — nowhere to
+    /// put the required Drive-side copy.
     RefusedNativeDocument,
     /// A human answered the prompt and refused, or it timed out.
     Denied {
@@ -94,7 +102,8 @@ pub async fn acquire(
         }
     };
 
-    if target.is_google_native() {
+    let is_native = target.is_google_native();
+    if is_native && opts.native_backup_folder_id.is_none() {
         return AcquireResult::RefusedNativeDocument;
     }
 
@@ -115,22 +124,29 @@ pub async fn acquire(
         AuthOutcome::Unavailable(detail) => return AcquireResult::Unavailable { detail },
     }
 
-    // 2. Backup.
-    let bytes = match files_api.download(&opts.file_id).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return AcquireResult::Failed {
-                detail: err.to_string(),
+    // 2. Backup — bytes for a binary file, a Drive-side copy for a native
+    // document (ADR-0080 §3). `native_backup_folder_id` is guaranteed
+    // `Some` here whenever `is_native`, by the refusal above.
+    let backup = if is_native {
+        let folder_id = opts.native_backup_folder_id.as_deref().unwrap_or_default();
+        match native_backup(&files_api, &opts.file_id, folder_id, &target.name).await {
+            Ok(backup) => backup,
+            Err(err) => {
+                return AcquireResult::Failed {
+                    detail: err.to_string(),
+                }
+            }
+        }
+    } else {
+        match byte_backup(&files_api, &opts.file_id, &opts.backup_dir, &target.name).await {
+            Ok(backup) => backup,
+            Err(err) => {
+                return AcquireResult::Failed {
+                    detail: err.to_string(),
+                }
             }
         }
     };
-    let sha256 = sha256_hex(&bytes);
-    let backup_path = backup_file_path(&opts.backup_dir, &opts.file_id, &target.name);
-    if let Err(err) = write_backup(&backup_path, &bytes) {
-        return AcquireResult::Failed {
-            detail: err.to_string(),
-        };
-    }
 
     // 3. Ledger record.
     let token = crate::request_log::new_id();
@@ -141,9 +157,7 @@ pub async fn acquire(
         file_id: opts.file_id.clone(),
         version,
         modified_time: target.modified_time.clone(),
-        backup_path: backup_path.clone(),
-        backup_sha256: sha256,
-        backup_size: bytes.len() as u64,
+        backup: backup.clone(),
         acquired_at: now,
         expires_at,
         released_at: None,
@@ -158,8 +172,43 @@ pub async fn acquire(
     AcquireResult::Acquired {
         token,
         expires_at,
-        backup_path,
+        backup,
     }
+}
+
+/// Downloads a binary file's bytes and writes them to `backup_dir`
+/// (ADR-0080 §3's binary-file case).
+async fn byte_backup(
+    files_api: &FilesApi<'_>,
+    file_id: &str,
+    backup_dir: &Path,
+    name: &str,
+) -> anyhow::Result<LeaseBackup> {
+    let bytes = files_api.download(file_id).await?;
+    let sha256 = sha256_hex(&bytes);
+    let path = backup_file_path(backup_dir, file_id, name);
+    write_backup(&path, &bytes)?;
+    Ok(LeaseBackup::Bytes {
+        path,
+        sha256,
+        size: bytes.len() as u64,
+    })
+}
+
+/// Copies a native document into `backup_folder_id` via `files.copy`
+/// (ADR-0080 §3's native-document case) — lossless, and restorable by a
+/// human in the Drive UI even without this tool.
+async fn native_backup(
+    files_api: &FilesApi<'_>,
+    file_id: &str,
+    backup_folder_id: &str,
+    name: &str,
+) -> anyhow::Result<LeaseBackup> {
+    let copy_name = backup_name(file_id, name);
+    let copy = files_api
+        .copy(file_id, backup_folder_id, &copy_name)
+        .await?;
+    Ok(LeaseBackup::DriveCopy { file_id: copy.id })
 }
 
 /// SHA-256 of `bytes`, as lowercase hex.
@@ -174,12 +223,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
-/// `<dir>/<YYYYMMDDTHHMMSSZ>-<fileId>-<name>` (ADR-0080 §3) — UTC, seconds
-/// precision, the file id first to survive a name containing `/`.
+/// `<dir>` joined with [`backup_name`]'s result.
 fn backup_file_path(dir: &Path, file_id: &str, name: &str) -> PathBuf {
+    dir.join(backup_name(file_id, name))
+}
+
+/// `<YYYYMMDDTHHMMSSZ>-<fileId>-<name>` (ADR-0080 §3) — UTC, seconds
+/// precision, the file id first to survive a name containing `/`. Shared by
+/// the local byte-backup path ([`backup_file_path`] joins it under a
+/// directory) and the native Drive-copy path (used directly as the copy's
+/// own `name`).
+fn backup_name(file_id: &str, name: &str) -> String {
     let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let safe_name = name.replace('/', "_");
-    dir.join(format!("{timestamp}-{file_id}-{safe_name}"))
+    format!("{timestamp}-{file_id}-{safe_name}")
 }
 
 /// Writes `bytes` to `path`, creating a missing `0700` parent directory
@@ -284,6 +341,7 @@ mod tests {
         AcquireOptions {
             file_id: "f1".to_string(),
             backup_dir: dir.join("backups"),
+            native_backup_folder_id: None,
             expiry: ChronoDuration::minutes(30),
             auth_policy: AuthPolicy::DeviceOwner,
             ledger_path: dir.join("lease-ledger.jsonl"),
@@ -484,7 +542,11 @@ mod tests {
         AcquireResult::Acquired {
             token: "tok-1".to_string(),
             expires_at: Utc::now(),
-            backup_path: PathBuf::from("/tmp/backup"),
+            backup: LeaseBackup::Bytes {
+                path: PathBuf::from("/tmp/backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
         }
         .write_jsonl(&mut buf)
         .unwrap();
@@ -578,18 +640,80 @@ mod tests {
         )
         .await;
 
-        let AcquireResult::Acquired {
-            token, backup_path, ..
-        } = result
-        else {
+        let AcquireResult::Acquired { token, backup, .. } = result else {
             panic!("expected Acquired, got {result:?}");
         };
+        let LeaseBackup::Bytes { path, .. } = backup else {
+            panic!("expected a Bytes backup for a binary file, got {backup:?}");
+        };
         assert!(!token.is_empty());
-        assert_eq!(std::fs::read(&backup_path).unwrap(), b"hello");
-        assert!(backup_path
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(path
             .file_name()
             .unwrap()
             .to_string_lossy()
             .contains("f1-report.pdf"));
+    }
+
+    #[tokio::test]
+    async fn native_document_with_a_backup_folder_configured_copies_instead_of_refusing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let mut opts = opts(root.path());
+        opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire(&client, &opts, &FakeAuthenticator(AuthOutcome::Authorized)).await;
+
+        let AcquireResult::Acquired { backup, .. } = result else {
+            panic!("expected Acquired, got {result:?}");
+        };
+        assert_eq!(
+            backup,
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn native_document_without_a_backup_folder_is_refused_before_authenticating() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!("must not authenticate with no backup folder configured");
+            }
+        }
+
+        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        assert!(matches!(result, AcquireResult::RefusedNativeDocument));
     }
 }

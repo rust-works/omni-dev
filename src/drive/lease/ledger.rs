@@ -25,14 +25,39 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// One row of the ledger — a lease's full operational state.
+/// Where a lease's backup landed (ADR-0080 §3's fidelity split).
 ///
-/// `backup_path`/`backup_sha256`/`backup_size` are the byte-backup fields
-/// (ADR-0080 §3's binary-file case, the only one Phase 2 implements); the
-/// native-file case (`files.copy` into a backup folder) needs its own
-/// fields and lands with Phase 3, following the same practice
-/// `DriveOperation`'s own vocabulary grows by per landed capability rather
-/// than being modelled speculatively ahead of it.
+/// An enum, not a set of `Option` fields on [`LeaseRecord`] directly: the
+/// two kinds are mutually exclusive by construction (a lease backs up
+/// either bytes or a native document, never both or neither), which a
+/// type-level split enforces and a handful of independently-optional
+/// fields would only document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum LeaseBackup {
+    /// A binary file's raw bytes, copied to local disk (ADR-0080 §3,
+    /// Phase 2).
+    Bytes {
+        /// Local path the bytes were written to.
+        path: PathBuf,
+        /// SHA-256 of the backed-up bytes, so a later restore (or an
+        /// auditor) can verify the backup was not corrupted or tampered
+        /// with.
+        sha256: String,
+        /// Size of the backed-up bytes.
+        size: u64,
+    },
+    /// A native document (Sheet/Doc/Slide), copied Drive-side via
+    /// `files.copy` into the account's configured backup folder
+    /// (ADR-0080 §3, Phase 3) — lossless, and restorable by a human in the
+    /// Drive UI even without this tool.
+    DriveCopy {
+        /// The copy's own Drive file id.
+        file_id: String,
+    },
+}
+
+/// One row of the ledger — a lease's full operational state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct LeaseRecord {
     /// The opaque token identifying this lease. An identifier, not a
@@ -53,13 +78,8 @@ pub(crate) struct LeaseRecord {
     /// for the audit trail, not itself compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) modified_time: Option<String>,
-    /// Local path the file's bytes were backed up to.
-    pub(crate) backup_path: PathBuf,
-    /// SHA-256 of the backed-up bytes, so a later restore (or an auditor)
-    /// can verify the backup was not corrupted or tampered with.
-    pub(crate) backup_sha256: String,
-    /// Size of the backed-up bytes.
-    pub(crate) backup_size: u64,
+    /// Where the backup landed.
+    pub(crate) backup: LeaseBackup,
     /// When Touch ID (or the account password) authorised this lease.
     pub(crate) acquired_at: DateTime<Utc>,
     /// Absolute expiry, fixed at acquisition. Never extended by a write —
@@ -267,13 +287,26 @@ mod tests {
             file_id: "file1".to_string(),
             version: "1".to_string(),
             modified_time: Some("2026-09-11T00:00:00Z".to_string()),
-            backup_path: PathBuf::from("/tmp/backup1"),
-            backup_sha256: "abc123".to_string(),
-            backup_size: 42,
+            backup: LeaseBackup::Bytes {
+                path: PathBuf::from("/tmp/backup1"),
+                sha256: "abc123".to_string(),
+                size: 42,
+            },
             acquired_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
         }
+    }
+
+    #[test]
+    fn lease_backup_drive_copy_round_trips_through_json() {
+        let backup = LeaseBackup::DriveCopy {
+            file_id: "copy-1".to_string(),
+        };
+        let json = serde_json::to_string(&backup).unwrap();
+        assert!(json.contains("\"kind\":\"drive_copy\""), "{json}");
+        let back: LeaseBackup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, backup);
     }
 
     #[test]

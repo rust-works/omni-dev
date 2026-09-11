@@ -8,7 +8,7 @@ use crate::cli::drive::format::{output_as, OutputFormat};
 use crate::drive::client::DriveClient;
 use crate::drive::lease::acquire::{self, AcquireOptions, AcquireResult};
 use crate::drive::lease::authenticate::{self, AuthPolicy};
-use crate::drive::lease::ledger;
+use crate::drive::lease::ledger::{self, LeaseBackup};
 
 /// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
 const DEFAULT_EXPIRY_MINUTES: i64 = 30;
@@ -99,9 +99,12 @@ impl AcquireCommand {
             None => default_backup_dir()?,
         };
         let ledger_path = ledger::ledger_path()?;
+        let native_backup_folder_id =
+            crate::cli::drive::helpers::active_account_lease_backup_folder_id()?;
         let opts = AcquireOptions {
             file_id: self.file_id,
             backup_dir,
+            native_backup_folder_id,
             expiry: chrono::Duration::minutes(self.expiry_minutes),
             auth_policy: if self.biometrics_only {
                 AuthPolicy::BiometricsOnly
@@ -134,18 +137,20 @@ fn print_result(result: &AcquireResult) {
         AcquireResult::Acquired {
             token,
             expires_at,
-            backup_path,
+            backup,
         } => {
             println!("{token}");
-            eprintln!(
-                "Backed up to {} (expires {expires_at})",
-                backup_path.display()
-            );
+            let backup_desc = match backup {
+                LeaseBackup::Bytes { path, .. } => path.display().to_string(),
+                LeaseBackup::DriveCopy { file_id } => format!("Drive copy {file_id}"),
+            };
+            eprintln!("Backed up to {backup_desc} (expires {expires_at})");
         }
         AcquireResult::RefusedNativeDocument => {
             eprintln!(
-                "Refused: this is a Google-native document (Doc/Sheet/Slide) — native-file \
-                 leases are not yet supported"
+                "Refused: this is a Google-native document (Doc/Sheet/Slide) and no backup \
+                 folder is configured for this account — set `lease_backup_folder_id` in \
+                 settings.json to enable leasing native documents"
             );
         }
         AcquireResult::Denied { detail } => eprintln!("Denied: {detail}"),
@@ -211,6 +216,14 @@ mod tests {
 
     #[tokio::test]
     async fn lease_command_dispatches_acquire_with_a_default_backup_dir() {
+        // Isolated so `active_account_lease_backup_folder_id` (which
+        // `execute` now calls) reads an empty, unconfigured account rather
+        // than this machine's real settings.json — the target here is a
+        // native document with no backup folder configured, so it must
+        // resolve `RefusedNativeDocument` deterministically regardless of
+        // what Drive accounts happen to be configured locally.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
         let server = native_document_server().await;
         let client = client_with_bootstrapped_token(&server).await;
         let cmd = LeaseCommand {
@@ -227,6 +240,8 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_command_honours_an_explicit_backup_dir_and_biometrics_only() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
         let server = native_document_server().await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
@@ -256,7 +271,11 @@ mod tests {
             AcquireResult::Acquired {
                 token: "tok-1".to_string(),
                 expires_at: chrono::Utc::now(),
-                backup_path: std::path::PathBuf::from("/tmp/backup"),
+                backup: LeaseBackup::Bytes {
+                    path: std::path::PathBuf::from("/tmp/backup"),
+                    sha256: "deadbeef".to_string(),
+                    size: 0,
+                },
             },
             AcquireResult::RefusedNativeDocument,
             AcquireResult::Denied {

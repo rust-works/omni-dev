@@ -997,8 +997,7 @@ lease-abc123...
 Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11T00:30:00Z)
 ```
 
-Before `drive edit` (and, in later phases, every other content-mutating
-Drive/Sheets/Docs verb) can write, it needs a **lease**: a token bound to a
+Before `drive edit` can write, it needs a **lease**: a token bound to a
 mandatory pre-write backup and the file's current Drive `version`
 ([ADR-0080](adrs/adr-0080.md)). Acquiring one prompts for **device-owner
 authentication** — Touch ID, or the account password when biometrics are
@@ -1007,20 +1006,32 @@ provably present at the moment consent is given. The prompt is a real
 system dialog rendered by macOS itself; there is no way to answer it from
 a script or a PTY.
 
-**This phase covers binary files only.** A Google-native document
-(Docs/Sheets/Slides) is refused outright — there are no bytes to back up
-this way; native-file leases (a lossless `files.copy` into a backup
-folder) land in a later phase:
+**`drive lease acquire` already works against both binary files and native
+documents** (see the fidelity split below), but only `drive edit` requires
+one so far — every `drive sheets`/`drive docs` write verb still runs
+unleased; wiring `--lease` into them is a later phase.
 
-```bash
-$ omni-dev drive lease acquire 1SomeGoogleDocId
-Refused: this is a Google-native document (Doc/Sheet/Slide) — native-file leases are not yet supported
-```
-
-**The backup is bytes on this machine**, named
+**The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
+§3). A binary file backs up as **bytes on this machine**, named
 `<YYYYMMDDTHHMMSSZ>-<fileId>-<name>` under `--backup-dir` (default
 `<state dir>/omni-dev/drive-backups`) — UTC, seconds precision, the file id
-first since Drive names collide and may contain `/`.
+first since Drive names collide and may contain `/`. A Google-native
+document (Docs/Sheets/Slides) has no bytes to back up this way, so it
+backs up instead as a **lossless Drive-side copy** (`files.copy`) into the
+account's configured `lease_backup_folder_id` — restorable by a human in
+the Drive UI even without this tool. Configure it in `settings.json`:
+
+```jsonc
+{ "drive": { "accounts": { "work": { "lease_backup_folder_id": "1BaCkup...Folder" } } } }
+```
+
+Without it, a native-document target is refused outright, before
+authenticating at all — there is nowhere configured to put the copy:
+
+```bash
+$ omni-dev drive lease acquire 1SomeGoogleSheetId
+Refused: this is a Google-native document (Doc/Sheet/Slide) and no backup folder is configured for this account — set `lease_backup_folder_id` in settings.json to enable leasing native documents
+```
 
 **The token is an identifier, not a bearer credential** — safe to log or
 paste, since a write under it still needs this account's own OAuth
