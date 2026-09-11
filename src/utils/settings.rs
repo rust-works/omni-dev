@@ -264,6 +264,17 @@ pub struct DriveAccountSettings {
     #[serde(default)]
     pub browser_command: Option<String>,
 
+    /// Destination folder id for the Drive-side backup copy a native
+    /// (Google Sheets/Docs/Slides) `drive lease acquire` makes
+    /// ([ADR-0080](../../docs/adrs/adr-0080.md) §3) — per-account, for the
+    /// identical reason `write_permissions` is: a folder id only means
+    /// something inside the one Drive it was minted in. Absent means
+    /// `drive lease acquire` refuses every native-document target for this
+    /// account outright (`RefusedNativeDocument`), since there is nowhere
+    /// configured to put the copy.
+    #[serde(default)]
+    pub lease_backup_folder_id: Option<String>,
+
     /// Folder-scoped write-permission rules gating `drive create`/`upload`/
     /// `edit` for this account (issue #1574).
     ///
