@@ -1415,12 +1415,16 @@ omni-dev drive sheets delete-range <ID> --sheet Q2 \
 ```
 
 Every real (non-`--dry-run`) delete says how to recover, since there is no
-`files.delete` or undo anywhere in this integration:
+`files.delete` or undo anywhere in this integration. The `--lease` these
+verbs require ([ADR-0080](adrs/adr-0080.md) §9) already backed the file up
+before the delete, so that backup — not Drive's own version history — is
+named as the primary recovery path:
 
 ```
 Deleted sheet 'Q2' (sheetId 118293) from 'Budget'; this cannot be undone
-through omni-dev — use Google Drive's version history to recover it if
-needed
+through omni-dev — the lease this write required already backed the file
+up; restore that copy from the Drive UI, or fall back to Google Drive's
+own version history
 ```
 
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
