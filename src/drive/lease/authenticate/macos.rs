@@ -4,8 +4,10 @@
 //! The crate sets `unsafe_code = "deny"`; STYLE-0013 allows an exception
 //! only when it is justified in an ADR ([ADR-0080](../../../../docs/adrs/adr-0080.md)),
 //! isolated in a dedicated module (this one), and carries `SAFETY:`
-//! comments — the same shape [`daemon::services::worktrees::geometry::ax`]
-//! already established for the Accessibility FFI.
+//! comments — the same shape `daemon::services::worktrees::geometry::ax`
+//! already established for the Accessibility FFI (named without a doc
+//! link deliberately, per that module's own convention for cross-module
+//! references to a `pub(super)` item).
 //!
 //! `LAContext` is an Objective-C class whose `evaluatePolicy` dispatches
 //! through Objective-C message sending and replies via a block-based async

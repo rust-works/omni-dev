@@ -30,8 +30,9 @@ pub struct AcquireOptions {
     /// Which authentication policy to present (ADR-0080 §7).
     pub auth_policy: AuthPolicy,
     /// Path to the lease ledger. Production callers pass
-    /// [`ledger::ledger_path`]'s own result; tests pass a path under a
-    /// `tempdir` so a test run never touches the real ledger.
+    /// [`crate::drive::lease::ledger::ledger_path`]'s own result; tests
+    /// pass a path under a `tempdir` so a test run never touches the real
+    /// ledger.
     pub ledger_path: PathBuf,
 }
 
