@@ -64,6 +64,13 @@ pub struct SetDataValidationCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -92,6 +99,8 @@ impl SetDataValidationCommand {
                 show_warning: self.show_warning,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_validation(client, &opts, &self.output).await
     }
@@ -117,6 +126,13 @@ pub struct ClearDataValidationCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -132,8 +148,24 @@ impl ClearDataValidationCommand {
                 range: self.range,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_validation(client, &opts, &self.output).await
+    }
+}
+
+/// Resolves the lease ledger path for one of this module's commands.
+///
+/// A dry run never checks a lease (`validation_inner` returns `WouldChange`
+/// before the ledger is ever touched, mirroring `drive edit`'s own
+/// `--dry-run` reasoning) — resolving a real path here would make a purely
+/// read-only preview depend on the state directory existing at all.
+fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
+    if dry_run {
+        Ok(std::path::PathBuf::new())
+    } else {
+        crate::drive::lease::ledger::ledger_path()
     }
 }
 
@@ -188,6 +220,7 @@ mod tests {
             input_message: None,
             show_warning: false,
             dry_run: false,
+            lease: None,
             output: crate::cli::drive::format::OutputFormat::Table,
         }
     }

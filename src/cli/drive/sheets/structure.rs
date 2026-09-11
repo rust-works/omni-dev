@@ -54,6 +54,13 @@ pub struct AddSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -77,6 +84,13 @@ pub struct RenameSheetCommand {
     /// calling `spreadsheets.batchUpdate`.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -107,6 +121,13 @@ pub struct InsertRowsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -135,6 +156,13 @@ pub struct InsertColumnsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -160,6 +188,13 @@ pub struct DeleteSheetCommand {
     /// calling `spreadsheets.batchUpdate`.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -193,6 +228,13 @@ pub struct DeleteRowsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -223,6 +265,13 @@ pub struct DeleteColumnsCommand {
     /// calling `spreadsheets.batchUpdate`.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -293,6 +342,13 @@ pub struct DeleteRangeCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -326,6 +382,13 @@ pub struct DuplicateSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -350,6 +413,13 @@ pub struct ReorderSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -369,6 +439,13 @@ pub struct HideSheetCommand {
     /// calling `spreadsheets.batchUpdate`.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -390,6 +467,13 @@ pub struct ShowSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -407,6 +491,8 @@ impl AddSheetCommand {
                 columns: self.columns,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -422,6 +508,8 @@ impl RenameSheetCommand {
                 new_title: self.title,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -438,6 +526,8 @@ impl InsertRowsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -454,6 +544,8 @@ impl InsertColumnsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -466,6 +558,8 @@ impl DeleteSheetCommand {
             spreadsheet_id: self.spreadsheet_id,
             verb: StructureVerb::DeleteSheet { sheet: self.sheet },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -482,6 +576,8 @@ impl DeleteRowsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -498,6 +594,8 @@ impl DeleteColumnsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -517,6 +615,8 @@ impl DeleteRangeCommand {
                 shift: self.shift.into(),
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -533,6 +633,8 @@ impl DuplicateSheetCommand {
                 index: self.index,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -548,6 +650,8 @@ impl ReorderSheetCommand {
                 index: self.index,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -563,6 +667,8 @@ impl HideSheetCommand {
                 hidden: true,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -578,8 +684,24 @@ impl ShowSheetCommand {
                 hidden: false,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
+    }
+}
+
+/// Resolves the lease ledger path for one of this module's commands.
+///
+/// A dry run never checks a lease (`structure_inner` returns `WouldChange`
+/// before the ledger is ever touched, mirroring `drive edit`'s own
+/// `--dry-run` reasoning) — resolving a real path here would make a
+/// purely read-only preview depend on the state directory existing at all.
+fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
+    if dry_run {
+        Ok(std::path::PathBuf::new())
+    } else {
+        crate::drive::lease::ledger::ledger_path()
     }
 }
 

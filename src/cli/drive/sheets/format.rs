@@ -229,6 +229,13 @@ pub struct FormatCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -268,6 +275,8 @@ impl FormatCellsCommand {
                 format,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
     }
@@ -316,6 +325,13 @@ pub struct UpdateBordersCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -348,6 +364,8 @@ impl UpdateBordersCommand {
                 color: self.color,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
     }
@@ -378,6 +396,13 @@ pub struct MergeCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -394,6 +419,8 @@ impl MergeCellsCommand {
                 merge_type: self.r#type.wire().to_string(),
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
     }
@@ -418,6 +445,13 @@ pub struct UnmergeCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -433,6 +467,8 @@ impl UnmergeCellsCommand {
                 range: self.range,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
     }
@@ -465,6 +501,13 @@ pub struct AutoResizeDimensionCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -482,6 +525,8 @@ impl AutoResizeDimensionCommand {
                 end: self.end,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
     }
@@ -518,6 +563,13 @@ pub struct UpdateDimensionPropertiesCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -536,8 +588,24 @@ impl UpdateDimensionPropertiesCommand {
                 pixel_size: self.pixel_size,
             },
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path: resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
+    }
+}
+
+/// Resolves the lease ledger path for one of this module's commands.
+///
+/// A dry run never checks a lease (`format_inner` returns `WouldChange`
+/// before the ledger is ever touched, mirroring `drive edit`'s own
+/// `--dry-run` reasoning) — resolving a real path here would make a purely
+/// read-only preview depend on the state directory existing at all.
+fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
+    if dry_run {
+        Ok(std::path::PathBuf::new())
+    } else {
+        crate::drive::lease::ledger::ledger_path()
     }
 }
 

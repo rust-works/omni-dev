@@ -63,6 +63,14 @@ pub(crate) enum TargetGateOutcome {
         /// The single folder the gate evaluated against, when the target
         /// had exactly one parent.
         resolved_folder_id: Option<String>,
+        /// Whether the deciding rule (or, for a legacy multi-parent target,
+        /// any parent's own rule) requires a `--lease` token for a
+        /// mutating write (ADR-0080 §1/§9/§13). Already folds in every
+        /// parent's own requirement — see
+        /// `folder_ancestry::FileTargetDecision::requires_lease`'s doc
+        /// comment — so a caller must use this rather than re-deriving it
+        /// from `decision.decided_by` alone.
+        requires_lease: bool,
     },
 }
 
@@ -110,6 +118,7 @@ pub(crate) async fn resolve(
             target,
             decision: evaluated.decision,
             resolved_folder_id: evaluated.resolved_folder_id,
+            requires_lease: evaluated.requires_lease,
         },
         Err(err) => TargetGateOutcome::GateFetchFailed {
             target,
@@ -270,6 +279,7 @@ mod tests {
             target,
             decision,
             resolved_folder_id,
+            ..
         } = outcome
         else {
             panic!("expected Gated");

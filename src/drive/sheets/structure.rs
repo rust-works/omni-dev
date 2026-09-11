@@ -49,12 +49,17 @@
 //! may reference what would be deleted, which cannot be checked from the
 //! sheet's own dimensions (ADR-0077).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
+use crate::drive::files_api::FilesApi;
+use crate::drive::lease::check::{
+    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+};
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::target_gate;
@@ -317,6 +322,15 @@ pub struct StructureOptions {
     pub verb: StructureVerb,
     /// Classify and describe only; never call `batchUpdate`.
     pub dry_run: bool,
+    /// The lease token presented via `--lease`. Checked only when the
+    /// deciding rule requires one
+    /// ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9);
+    /// `None` is only ever valid when it does not.
+    pub lease_token: Option<String>,
+    /// Path to the lease ledger the token is checked against. Production
+    /// callers pass `crate::drive::lease::ledger::ledger_path`'s own
+    /// result; tests pass a path under a `tempdir`.
+    pub ledger_path: PathBuf,
 }
 
 /// The sheet a verb resolved to, plus its dimensions at that moment.
@@ -413,6 +427,17 @@ pub enum StructureResult {
         /// default policy — every write defaults deny).
         decided_by: Option<DecidingRule>,
     },
+    /// No `--lease` was presented, and the deciding rule requires one
+    /// (ADR-0080 §9).
+    RefusedNoLease,
+    /// The presented lease has expired, or was never a token this ledger
+    /// knows about.
+    RefusedLeaseExpired,
+    /// The presented lease is bound to a different file id.
+    RefusedLeaseWrongFile,
+    /// The file has moved since the lease's recorded `version` — the
+    /// staleness check (ADR-0080 §6).
+    RefusedLeaseStale,
     /// The mutation succeeded.
     Changed {
         /// The sheet acted on, as it stood *before* the change.
@@ -446,6 +471,10 @@ impl StructureResult {
             Self::RefusedSheetExists { .. } => "refused-sheet-exists",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::Blocked { .. } => "blocked",
+            Self::RefusedNoLease => "refused-no-lease",
+            Self::RefusedLeaseExpired => "refused-lease-expired",
+            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
+            Self::RefusedLeaseStale => "refused-lease-stale",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -539,7 +568,7 @@ async fn structure_inner(
     // shape — the metadata fetch, the shortcut/non-spreadsheet checks, and
     // the file-id-then-ancestor-chain gate lookup — can't quietly drift
     // between the two engines.
-    let (target, decision, resolved_folder_id) = match target_gate::resolve(
+    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
         drive,
         &opts.spreadsheet_id,
         opts.verb.gate_operation(),
@@ -581,7 +610,8 @@ async fn structure_inner(
             target,
             decision,
             resolved_folder_id,
-        } => (target, decision, resolved_folder_id),
+            requires_lease,
+        } => (target, decision, resolved_folder_id, requires_lease),
     };
 
     let gated = |result| StructureOutcome {
@@ -630,21 +660,73 @@ async fn structure_inner(
         return gated(StructureResult::WouldChange { sheet, sheet_count });
     }
 
+    // The lease check (ADR-0080 §9) sits here: after the permission gate
+    // and the `--dry-run` branch, before the mutating call — see
+    // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
+    // shared verbatim by every leased engine. Sheets has no revision field
+    // of any kind (§6), so the staleness check is a fresh `files.get`
+    // immediately before `batchUpdate`, not a reuse of the metadata
+    // `target_gate::resolve` fetched before the (potentially slow)
+    // ancestor-chain walk and workbook fetch above.
+    let files_api = FilesApi::new(drive);
+    let lease_lock = if requires_lease {
+        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
+            Ok(fresh) => fresh.version,
+            Err(err) => {
+                return gated(StructureResult::Failed {
+                    detail: err.to_string(),
+                })
+            }
+        };
+        match check_and_lock_lease(
+            "drive sheets structure",
+            &opts.ledger_path,
+            opts.lease_token.as_deref(),
+            &opts.spreadsheet_id,
+            live_version.as_deref(),
+        ) {
+            LeaseCheckOutcome::Ok(lock) => Some(lock),
+            LeaseCheckOutcome::NoLease => return gated(StructureResult::RefusedNoLease),
+            LeaseCheckOutcome::Expired => return gated(StructureResult::RefusedLeaseExpired),
+            LeaseCheckOutcome::WrongFile => return gated(StructureResult::RefusedLeaseWrongFile),
+            LeaseCheckOutcome::Stale => return gated(StructureResult::RefusedLeaseStale),
+            LeaseCheckOutcome::Failed(detail) => return gated(StructureResult::Failed { detail }),
+        }
+    } else {
+        None
+    };
+
     // ── The mutation ───────────────────────────────────────────────────
     let request = match build_request(&opts.verb, sheet.as_ref()) {
         Ok(request) => request,
         Err(detail) => return gated(StructureResult::Failed { detail }),
     };
 
-    match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
-        Ok(response) => gated(StructureResult::Changed {
-            sheet_id: added_sheet_id(&response).or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
-            sheet,
-        }),
-        Err(err) => gated(StructureResult::Failed {
+    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
+        Ok(response) => {
+            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+                refresh_lease_after_native_write(
+                    "drive sheets structure",
+                    lock,
+                    &opts.ledger_path,
+                    token,
+                    &files_api,
+                    &opts.spreadsheet_id,
+                )
+                .await;
+            }
+            StructureResult::Changed {
+                sheet_id: added_sheet_id(&response)
+                    .or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
+                sheet,
+            }
+        }
+        Err(err) => StructureResult::Failed {
             detail: format!("{err:#}"),
-        }),
-    }
+        },
+    };
+    drop(lease_lock);
+    gated(result)
 }
 
 /// Finds the sheet a verb targets, or classifies why it cannot.
@@ -1351,6 +1433,26 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 ),
             }]
         }
+        StructureResult::RefusedNoLease => vec![format!(
+            "Refused: {book} requires a Drive write lease — run `omni-dev drive lease acquire \
+             {}` and pass the printed token via `--lease`.",
+            outcome.spreadsheet_id
+        )],
+        StructureResult::RefusedLeaseExpired => vec![format!(
+            "Refused: the presented lease is expired, released, or unknown to this ledger — \
+             run `omni-dev drive lease acquire {}` again.",
+            outcome.spreadsheet_id
+        )],
+        StructureResult::RefusedLeaseWrongFile => vec![format!(
+            "Refused: the presented lease was acquired for a different file — run `omni-dev \
+             drive lease acquire {}` for this one.",
+            outcome.spreadsheet_id
+        )],
+        StructureResult::RefusedLeaseStale => vec![format!(
+            "Refused: {book} changed since the lease was acquired (or last written under) — \
+             re-run `omni-dev drive lease acquire {}` to lease the current version.",
+            outcome.spreadsheet_id
+        )],
         StructureResult::Changed { sheet, sheet_id } => {
             vec![describe_changed(verb, sheet.as_ref(), *sheet_id, &book)]
         }
@@ -1863,6 +1965,9 @@ mod tests {
         (drive, sheets)
     }
 
+    /// `version: "1"` throughout — matches [`opts`]'s default seeded
+    /// lease, so any test reaching the mutating call has a live, non-stale
+    /// lease by construction (ADR-0080 §9).
     fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
         let parents: Vec<&str> = parents.to_vec();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1870,6 +1975,7 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
                 })),
             )
     }
@@ -1918,12 +2024,66 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
     }
 
+    /// Seeds a fresh, isolated ledger with a live lease for `"sheet-1"` at
+    /// version `"1"` (matching [`mount_file`]'s default) and returns
+    /// options carrying it. Every existing test built before the lease
+    /// (ADR-0080 §9) reaches its mutating call this way by construction —
+    /// see [`opts_for`]'s doc comment for why this doesn't need touching
+    /// each test individually. A test exercising the lease *refusal* paths
+    /// builds `StructureOptions` directly instead (see the
+    /// "the Drive write lease" test section below).
     fn opts(verb: StructureVerb, dry_run: bool) -> StructureOptions {
+        opts_for("sheet-1", verb, dry_run)
+    }
+
+    /// [`opts`], generalised over the spreadsheet id.
+    ///
+    /// The backing ledger directory is deliberately leaked (`into_path`,
+    /// not dropped) rather than threaded through every caller as a
+    /// `tempfile::TempDir` binding: it must outlive the `.await` on
+    /// `structure(...)`, and plumbing that lifetime through several dozen
+    /// pre-existing tests — none of which are *about* the lease — would
+    /// dwarf the fix in size for no reviewing benefit. The leak costs a
+    /// few bytes of `/tmp` per test process, cleaned up by the OS.
+    fn opts_for(spreadsheet_id: &str, verb: StructureVerb, dry_run: bool) -> StructureOptions {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, spreadsheet_id, "1");
         StructureOptions {
-            spreadsheet_id: "sheet-1".to_string(),
+            spreadsheet_id: spreadsheet_id.to_string(),
             verb,
             dry_run,
+            lease_token: Some(token),
+            ledger_path,
         }
+    }
+
+    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
+    /// `version`, returning its token.
+    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
+        // A fixed token, not a random one: every call gets its own
+        // isolated ledger (a fresh tempdir), so uniqueness across tests is
+        // never a concern.
+        let token = "test-lease-token".to_string();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: token.clone(),
+            file_id: spreadsheet_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+        token
     }
 
     fn rename() -> StructureVerb {
@@ -4217,6 +4377,10 @@ mod tests {
                 detail: "--count must be at least 1, got 0".to_string(),
             },
             StructureResult::Blocked { decided_by: None },
+            StructureResult::RefusedNoLease,
+            StructureResult::RefusedLeaseExpired,
+            StructureResult::RefusedLeaseWrongFile,
+            StructureResult::RefusedLeaseStale,
             StructureResult::Changed {
                 sheet: Some(SheetSnapshot {
                     sheet_id: Some(7),
@@ -4241,6 +4405,10 @@ mod tests {
                 | StructureResult::RefusedSheetExists { .. }
                 | StructureResult::RefusedInvalidRange { .. }
                 | StructureResult::Blocked { .. }
+                | StructureResult::RefusedNoLease
+                | StructureResult::RefusedLeaseExpired
+                | StructureResult::RefusedLeaseWrongFile
+                | StructureResult::RefusedLeaseStale
                 | StructureResult::Changed { .. }
                 | StructureResult::Failed { .. } => {}
             }
