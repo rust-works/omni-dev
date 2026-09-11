@@ -203,6 +203,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
+        // A dry run short-circuits to an empty path (tested via `execute`
+        // with `--dry-run`); a real run delegates to the shared resolver.
+        let path = resolve_ledger_path(false).unwrap();
+        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
+        assert_eq!(
+            resolve_ledger_path(true).unwrap(),
+            std::path::PathBuf::new()
+        );
+    }
+
+    #[test]
     fn read_text_reads_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");

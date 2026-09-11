@@ -2718,6 +2718,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_a_lock_acquisition_failure_as_failed() {
+        // A pre-existing lock file simulates another `drive lease`
+        // operation genuinely in progress — reported as an operational
+        // failure, not folded into `RefusedLeaseExpired`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = format_cells_opts(false);
+        let mut lock_path = opts.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the change must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(matches!(outcome.result, FormatResult::Failed { .. }));
+    }
+
+    #[tokio::test]
     async fn refuses_an_unknown_lease_token() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;

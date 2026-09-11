@@ -195,6 +195,18 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 
+    #[test]
+    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
+        // A dry run short-circuits to an empty path (tested via `execute`
+        // with `--dry-run`); a real run delegates to the shared resolver.
+        let path = resolve_ledger_path(false).unwrap();
+        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
+        assert_eq!(
+            resolve_ledger_path(true).unwrap(),
+            std::path::PathBuf::new()
+        );
+    }
+
     fn dead_credentials() -> DriveCredentials {
         DriveCredentials {
             client_id: "client".to_string(),
