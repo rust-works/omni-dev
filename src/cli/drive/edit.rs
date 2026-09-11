@@ -45,6 +45,13 @@ pub struct EditCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false`
+    /// ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -58,11 +65,14 @@ impl EditCommand {
         let content_type = self
             .mime_type
             .unwrap_or_else(|| DEFAULT_CONTENT_MIME_TYPE.to_string());
+        let ledger_path = crate::drive::lease::ledger::ledger_path()?;
         let opts = EditOptions {
             file_id: self.file_id,
             content,
             content_type,
             dry_run: self.dry_run,
+            lease_token: self.lease,
+            ledger_path,
         };
         let rules = active_account_rules()?;
         run_edit(client, &opts, &rules, &self.output).await
@@ -170,6 +180,35 @@ fn write_outcome(outcome: &EditOutcome, out: &mut dyn std::io::Write) -> std::io
                 None => writeln!(out, "  refused by default policy (no matching rule)")?,
             }
         }
+        EditResult::RefusedNoLease => {
+            writeln!(
+                out,
+                "Refused: {file_id} requires a Drive write lease — run `omni-dev drive lease \
+                 acquire {file_id}` and pass the printed token via `--lease`."
+            )?;
+        }
+        EditResult::RefusedLeaseExpired => {
+            writeln!(
+                out,
+                "Refused: the presented lease is expired, released, or unknown to this ledger \
+                 — run `omni-dev drive lease acquire {file_id}` again."
+            )?;
+        }
+        EditResult::RefusedLeaseWrongFile => {
+            writeln!(
+                out,
+                "Refused: the presented lease was acquired for a different file — run \
+                 `omni-dev drive lease acquire {file_id}` for this one."
+            )?;
+        }
+        EditResult::RefusedLeaseStale => {
+            writeln!(
+                out,
+                "Refused: {file_id} changed since the lease was acquired (or last written \
+                 under) — re-run `omni-dev drive lease acquire {file_id}` to lease the current \
+                 version."
+            )?;
+        }
         EditResult::Edited => writeln!(out, "Edited: {file_id}")?,
         EditResult::Failed { detail } => {
             writeln!(out, "Failed: {file_id}: {}", sanitize_for_terminal(detail))?;
@@ -223,6 +262,8 @@ mod tests {
             content: b"new content".to_vec(),
             content_type: "text/plain".to_string(),
             dry_run,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::from("/nonexistent/lease-ledger.jsonl"),
         }
     }
 
@@ -233,6 +274,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }
     }
 

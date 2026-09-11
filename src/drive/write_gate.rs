@@ -238,6 +238,25 @@ pub struct FolderPermissionRule {
     pub allow: HashSet<DriveOperation>,
     /// Operations explicitly refused at this target.
     pub deny: HashSet<DriveOperation>,
+    /// Whether a content-mutating write matching this rule requires a
+    /// valid Drive write lease ([ADR-0080](../../docs/adrs/adr-0080.md)
+    /// §1/§13) in addition to this gate's own verdict. Defaults to `true`;
+    /// an operator sets it to `false` to relax the requirement for a
+    /// specific folder, which skips **both** the backup and the Touch ID
+    /// prompt (§13) — a rule that skipped only one of the two would either
+    /// surprise an operator who explicitly relaxed this, or ask for
+    /// consent to a guarantee it then doesn't provide. Independent of
+    /// `allow`/`deny`: the lease is orthogonal to this gate, not another
+    /// operation in its vocabulary.
+    #[serde(default = "default_require_lease")]
+    pub require_lease: bool,
+}
+
+/// The default for [`FolderPermissionRule::require_lease`] — a free
+/// function because `#[serde(default)]` needs a path, not a literal, and
+/// `true` is not `bool`'s own `Default`.
+fn default_require_lease() -> bool {
+    true
 }
 
 impl FolderPermissionRule {
@@ -250,6 +269,7 @@ impl FolderPermissionRule {
             recursive: false,
             allow: HashSet::new(),
             deny: HashSet::new(),
+            require_lease: default_require_lease(),
         }
     }
 
@@ -262,6 +282,7 @@ impl FolderPermissionRule {
             recursive: false,
             allow: HashSet::new(),
             deny: HashSet::new(),
+            require_lease: default_require_lease(),
         }
     }
 
@@ -270,6 +291,14 @@ impl FolderPermissionRule {
     #[must_use]
     pub fn recursive(mut self, recursive: bool) -> Self {
         self.recursive = recursive;
+        self
+    }
+
+    /// Sets `require_lease`, for builder-style construction in tests and
+    /// callers assembling rules programmatically.
+    #[must_use]
+    pub fn requiring_lease(mut self, require_lease: bool) -> Self {
+        self.require_lease = require_lease;
         self
     }
 
@@ -314,6 +343,8 @@ struct RawPermissionRule {
     allow: HashSet<DriveOperation>,
     #[serde(default)]
     deny: HashSet<DriveOperation>,
+    #[serde(default = "default_require_lease")]
+    require_lease: bool,
 }
 
 impl TryFrom<RawPermissionRule> for FolderPermissionRule {
@@ -348,6 +379,7 @@ impl TryFrom<RawPermissionRule> for FolderPermissionRule {
             recursive: raw.recursive,
             allow: raw.allow,
             deny: raw.deny,
+            require_lease: raw.require_lease,
         })
     }
 }
@@ -631,6 +663,52 @@ pub fn decided_by_log_fields(decided_by: Option<&DecidingRule>) -> DecidedByLogF
         },
         None => DecidedByLogFields::default(),
     }
+}
+
+/// Whether the rule(s) that decided `decided_by` require a Drive write
+/// lease ([ADR-0080](../../docs/adrs/adr-0080.md) §1/§13), in addition to
+/// this gate's own verdict.
+///
+/// Deliberately a separate lookup rather than a field threaded through
+/// [`resolve`]/[`resolve_file_rule`]/[`combine_across_parents`]: those are
+/// well-exercised and security-critical, and `require_lease` is
+/// orthogonal to the verdict they compute — a rule's lease requirement
+/// never changes *whether* an operation is allowed, only whether a caller
+/// must also present a valid lease before acting on an `Allow`. Re-deriving
+/// it from `decided_by` against the same rule set keeps that code
+/// untouched.
+///
+/// `decided_by: None` (the bare default policy decided it) is treated as
+/// requiring a lease — moot in practice, since every write operation
+/// defaults to `Deny` (`DriveOperation::default_policy`), so a `None`
+/// `decided_by` never accompanies an `Allow` verdict a caller would act on.
+/// When more than one configured rule matches the decided target (the
+/// legacy multi-parent case, or simply two rules naming the same folder),
+/// **any** of them requiring a lease is enough — the same safe-direction
+/// tie-break every other ambiguity in this gate resolves with.
+#[must_use]
+pub fn decided_rule_requires_lease(
+    decided_by: Option<&DecidingRule>,
+    rules: &[FolderPermissionRule],
+) -> bool {
+    let matching: Vec<&FolderPermissionRule> = match decided_by {
+        None => return true,
+        Some(DecidingRule::Folder { folder_id, depth }) => rules
+            .iter()
+            .filter(|rule| {
+                rule.folder_id.as_deref() == Some(folder_id.as_str())
+                    && (*depth == 0 || rule.recursive)
+            })
+            .collect(),
+        Some(DecidingRule::File { file_id }) => rules
+            .iter()
+            .filter(|rule| rule.file_id.as_deref() == Some(file_id.as_str()))
+            .collect(),
+    };
+    if matching.is_empty() {
+        return true;
+    }
+    matching.iter().any(|rule| rule.require_lease)
 }
 
 #[cfg(test)]
@@ -1016,6 +1094,77 @@ mod tests {
                 depth: None,
             }
         );
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_defaults_true_with_no_decided_by() {
+        assert!(decided_rule_requires_lease(None, &[]));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_true_when_the_folder_rule_says_so() {
+        let rules = [FolderPermissionRule::folder("f1").allowing([DriveOperation::Edit])];
+        let decided_by = DecidingRule::Folder {
+            folder_id: "f1".to_string(),
+            depth: 0,
+        };
+        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_false_when_the_folder_rule_opts_out() {
+        let rules = [FolderPermissionRule::folder("f1")
+            .allowing([DriveOperation::Edit])
+            .requiring_lease(false)];
+        let decided_by = DecidingRule::Folder {
+            folder_id: "f1".to_string(),
+            depth: 0,
+        };
+        assert!(!decided_rule_requires_lease(Some(&decided_by), &rules));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_true_when_the_file_rule_says_so() {
+        let rules = [FolderPermissionRule::file("file-1").allowing([DriveOperation::Edit])];
+        let decided_by = DecidingRule::File {
+            file_id: "file-1".to_string(),
+        };
+        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_any_matching_rule_opting_in_wins() {
+        // Two rules on the same folder, one opting out and one not — the
+        // safe direction (any rule requiring a lease is enough) wins.
+        let rules = [
+            FolderPermissionRule::folder("f1")
+                .allowing([DriveOperation::Edit])
+                .requiring_lease(false),
+            FolderPermissionRule::folder("f1").allowing([DriveOperation::SheetsWrite]),
+        ];
+        let decided_by = DecidingRule::Folder {
+            folder_id: "f1".to_string(),
+            depth: 0,
+        };
+        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
+    }
+
+    #[test]
+    fn decided_rule_requires_lease_ignores_a_non_recursive_rule_on_an_ancestor() {
+        // The depth-0 rule opted out; an unrelated non-recursive rule
+        // naming the same folder id at a *different* depth must not be
+        // consulted (mirrors `resolve`'s own recursive-match rule).
+        let rules = [FolderPermissionRule::folder("f1")
+            .allowing([DriveOperation::Edit])
+            .requiring_lease(false)];
+        let decided_by = DecidingRule::Folder {
+            folder_id: "f1".to_string(),
+            depth: 1,
+        };
+        // depth=1 with a non-recursive rule: the rule does not match at
+        // this depth, so no matching rule is found and the fail-safe
+        // default (true) applies.
+        assert!(decided_rule_requires_lease(Some(&decided_by), &rules));
     }
 
     #[test]

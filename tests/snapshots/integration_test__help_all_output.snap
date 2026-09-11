@@ -3736,6 +3736,7 @@ Commands:
   create       Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   upload       Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   edit         Replaces an existing file's content, gated by the write-permission rules (issues #1574, #1612). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+  lease        Backs up a file and mints a Touch ID-authorised lease token, required by `drive edit` and (in later phases) every other content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md))
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
   permissions  Inspects the write-permission rules gating `drive create`/`upload`/`edit`, `drive sheets write`/`append`/`clear`/`create` and `drive docs replace`/`append`/`create` (issues #1574, #1589, #1612, #1615)
@@ -4016,8 +4017,44 @@ Options:
       --content <LOCAL_PATH|->  New content: a local file path, or `-` to read from stdin
       --mime-type <TYPE>        MIME type for the content. Defaults to `application/octet-stream`
       --dry-run                 Reports the gate verdict without calling `files.update`
+      --lease <TOKEN>           The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>         Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                    Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive lease - Backs up a file and mints a Touch ID-authorised lease token, required by `drive edit` and (in later phases) every other content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md))
+
+Backs up a file and mints a Touch ID-authorised lease token, required by `drive edit` and (in later phases) every other content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md))
+
+Usage: lease <COMMAND>
+
+Commands:
+  acquire  Backs up a file and mints a lease token, prompting for device-owner authentication (Touch ID or the account password)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive lease acquire - Backs up a file and mints a lease token, prompting for device-owner authentication (Touch ID or the account password)
+
+Backs up a file and mints a lease token, prompting for device-owner authentication (Touch ID or the account password)
+
+Usage: acquire [OPTIONS] <FILE_ID>
+
+Arguments:
+  <FILE_ID>  Drive file id to lease (from `drive search`, or the `id` segment of a Drive URL)
+
+Options:
+      --backup-dir <PATH>   Local directory byte backups are written under. Defaults to `<state dir>/omni-dev/drive-backups`
+      --expiry-minutes <N>  Minutes the lease stays live once authorised. A write never extends this — a fresh window means a fresh `drive lease acquire` (ADR-0080 §5) [default: 30]
+      --biometrics-only     Require Touch ID specifically, failing outright rather than falling back to the account password (ADR-0080 §7). Needs Touch ID hardware; the default policy works on any Mac
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================

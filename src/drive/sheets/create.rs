@@ -503,6 +503,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 
@@ -628,6 +629,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            require_lease: true,
         };
         let values = vec![vec!["x".to_string()]];
         let outcome = create(&drive, &sheets, &opts(values, false), &[rule]).await;
@@ -693,6 +695,7 @@ mod tests {
             recursive: true,
             allow: HashSet::default(),
             deny: std::iter::once(DriveOperation::Create).collect(),
+            require_lease: true,
         };
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;

@@ -175,6 +175,16 @@ pub struct DriveFile {
         rename = "modifiedTime"
     )]
     pub modified_time: Option<String>,
+    /// A monotonically increasing version number for the file, incremented
+    /// on every change including ones that do not modify content (e.g. a
+    /// permission change) — Drive's own opaque revision counter, requested
+    /// so the Drive write lease ([ADR-0080](../../docs/adrs/adr-0080.md)
+    /// §6) can detect that a file moved since a lease was acquired or last
+    /// written under. An arbitrary-precision decimal string per Drive's own
+    /// documentation, so it is compared for equality only, never parsed as
+    /// a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Ids of the parent folders containing this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<String>,

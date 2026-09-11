@@ -55,11 +55,12 @@ walkthrough — this page is the topic-by-topic reference.
 11. [Create](#create)
 12. [Upload](#upload)
 13. [Edit](#edit)
-14. [Sheets](#sheets)
-15. [Docs](#docs)
-16. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-17. [Troubleshooting](#troubleshooting)
-18. [See also](#see-also)
+14. [Lease](#lease)
+15. [Sheets](#sheets)
+16. [Docs](#docs)
+17. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+18. [Troubleshooting](#troubleshooting)
+19. [See also](#see-also)
 
 ## Prerequisites
 
@@ -701,6 +702,7 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
           "rules": [
             { "folder_id": "1AbC...AiWorkspace",  "recursive": true,  "allow": ["create", "upload", "edit"] },
             { "folder_id": "1XyZ...DropZone",     "recursive": false, "allow": ["create"] },
+            { "folder_id": "1Scr...Scratch",      "recursive": true,  "allow": ["edit"], "require_lease": false },
             { "folder_id": "1Sen...Confidential", "recursive": true,  "deny": ["read"] },
 
             // File rules — for a file you can't reach with a folder rule.
@@ -729,6 +731,12 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
+- `require_lease` — whether a write this rule decides also needs a valid
+  Drive write lease (`--lease`, [ADR-0080](adrs/adr-0080.md); see
+  [Lease](#lease)). Defaults to `true`; set `false` to relax it for a
+  specific folder or file — this skips **both** the backup and the Touch ID
+  prompt, not just one of them. Orthogonal to `allow`/`deny`: the lease is
+  checked in addition to this gate's verdict, never instead of it.
 
 A rule that names neither key, names both, or puts `recursive: true` on a
 `file_id` is a **settings load error**, not a silently-ignored rule — and
@@ -924,10 +932,14 @@ Same gate, scope requirement, and logging behavior as [Create](#create).
 ## Edit
 
 ```bash
-$ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf
+$ omni-dev drive lease acquire 1ExistingFileId
+lease-abc123...
+Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11T00:30:00Z)
+
+$ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf --lease lease-abc123...
 Edited: 1ExistingFileId
 
-$ cat ./new-report.pdf | omni-dev drive edit 1ExistingFileId --content -
+$ cat ./new-report.pdf | omni-dev drive edit 1ExistingFileId --content - --lease lease-abc123...
 Edited: 1ExistingFileId
 
 $ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf --dry-run
@@ -937,6 +949,10 @@ Would edit: 1ExistingFileId
 Replaces an existing file's raw content. `--content` accepts a local path,
 or `-` to read from stdin (bounded at the same 5 MB cap — an
 unbounded pipe is never buffered past the limit before being refused).
+
+**Requires a Drive write lease** (`--lease`, [ADR-0080](adrs/adr-0080.md)),
+unless the deciding write-permission rule sets `require_lease: false` — see
+[Lease](#lease) below. Never needed with `--dry-run`.
 
 **Gated differently from create/upload.** Since there's no `--parent` to
 check, the gate evaluates the target's *current* parent folder(s) instead
@@ -970,6 +986,81 @@ Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insu
 ```
 
 Same request-log behavior as [Create](#create)/[Upload](#upload).
+
+## Lease
+
+```bash
+$ omni-dev drive lease acquire 1ExistingFileId
+lease-abc123...
+Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11T00:30:00Z)
+```
+
+Before `drive edit` (and, in later phases, every other content-mutating
+Drive/Sheets/Docs verb) can write, it needs a **lease**: a token bound to a
+mandatory pre-write backup and the file's current Drive `version`
+([ADR-0080](adrs/adr-0080.md)). Acquiring one prompts for **device-owner
+authentication** — Touch ID, or the account password when biometrics are
+unavailable — so an agent can obtain its own lease, but a human is
+provably present at the moment consent is given. The prompt is a real
+system dialog rendered by macOS itself; there is no way to answer it from
+a script or a PTY.
+
+**This phase covers binary files only.** A Google-native document
+(Docs/Sheets/Slides) is refused outright — there are no bytes to back up
+this way; native-file leases (a lossless `files.copy` into a backup
+folder) land in a later phase:
+
+```bash
+$ omni-dev drive lease acquire 1SomeGoogleDocId
+Refused: this is a Google-native document (Doc/Sheet/Slide) — native-file leases are not yet supported
+```
+
+**The backup is bytes on this machine**, named
+`<YYYYMMDDTHHMMSSZ>-<fileId>-<name>` under `--backup-dir` (default
+`<state dir>/omni-dev/drive-backups`) — UTC, seconds precision, the file id
+first since Drive names collide and may contain `/`.
+
+**The token is an identifier, not a bearer credential** — safe to log or
+paste, since a write under it still needs this account's own OAuth
+credentials and folder-permission grant. Present it via `--lease`:
+
+```bash
+$ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf --lease lease-abc123...
+```
+
+A refusal names what to do next:
+
+| Refusal | Meaning |
+|---|---|
+| `requires a Drive write lease` | No `--lease` was presented, and the deciding write-permission rule requires one. |
+| `expired, released, or unknown` | The token doesn't resolve to a live lease — it expired, was never valid, or the ledger doesn't recognise it. Acquire a new one. |
+| `acquired for a different file` | The token is bound to a different file id than the one being edited. |
+| `changed since the lease was acquired` | The file's Drive `version` moved since the lease was taken out (or last written under) — someone or something else edited it. Acquire a fresh lease against the current version before writing. |
+
+**Expiry is absolute and never extends.** `--expiry-minutes` (default 30)
+is fixed at acquisition; a write under the lease never resets it. The only
+way to get a fresh window is a fresh `drive lease acquire` — which means a
+fresh authentication prompt. A lease is otherwise multi-use: each
+successful write refreshes its recorded `version`, so a second write under
+the same lease is checked against the file's state *after* the first, not
+the original backup point.
+
+**`--biometrics-only`** requires Touch ID specifically, failing outright
+rather than falling back to the account password — for operators who want
+no keyboard-answerable prompt at all, at the cost of needing Touch ID
+hardware. The default policy (device-owner authentication) works on every
+Mac.
+
+**A folder rule can opt out** with `require_lease: false` in
+`write_permissions.rules` (default `true`), which skips both the backup
+and the authentication prompt for that folder — see [Write
+permissions](#write-permissions).
+
+**Off-macOS and headless**, `drive lease acquire` fails closed: no
+authenticator is available, so no lease can ever be acquired there, and
+every gated write refuses in turn. This is deliberate (ADR-0080 §8) — a TTY
+prompt would let a script answer on the human's behalf, defeating the
+point.
 
 ## Sheets
 

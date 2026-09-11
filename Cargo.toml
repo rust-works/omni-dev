@@ -140,6 +140,28 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
   "CFNumber",
   "CFString",
 ] }
+# LocalAuthentication for the Drive write lease's Touch ID/device-owner
+# prompt (`drive lease acquire`, ADR-0080 §7) — the crate's third OS trust
+# surface and second `#[allow(unsafe_code)]` module after the Accessibility
+# FFI above. `LAContext` is an Objective-C class with a block-based async
+# completion handler, unlike Accessibility's plain-C surface, so this uses
+# the upstream-generated bindings rather than hand-rolled `extern "C"`
+# declarations (ADR-0080 §7 explains the asymmetry with ADR-0058 §6's
+# choice). `objc2`/`block2` are the same crates' own dependencies, not
+# pulled in freshly. Deliberately **not** optional — the lease is not
+# behind a feature flag.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+block2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSString",
+  "NSError",
+] }
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "LAContext",
+  "block2",
+] }
 
 [features]
 mcp = ["dep:rmcp"]

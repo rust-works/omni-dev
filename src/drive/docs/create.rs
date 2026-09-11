@@ -443,6 +443,7 @@ mod tests {
             recursive: true,
             allow: ops.iter().copied().collect(),
             deny: denies.iter().copied().collect::<HashSet<_>>(),
+            require_lease: true,
         }
     }
 

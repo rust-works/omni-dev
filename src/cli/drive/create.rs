@@ -173,6 +173,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }
     }
 

@@ -178,6 +178,7 @@ mod tests {
             recursive: true,
             allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
             deny: HashSet::default(),
+            require_lease: true,
         }
     }
 

@@ -421,6 +421,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Create).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }];
 
         let decision = resolve_decision(&files_api, "child", DriveOperation::Create, &rules)
@@ -483,6 +484,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Read).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }];
 
         let decision = resolve_decision_from(&files_api, start, DriveOperation::Read, &rules)
@@ -519,6 +521,7 @@ mod tests {
             recursive: false,
             allow: std::iter::once(DriveOperation::Edit).collect(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }];
 
         let (decision, resolved_folder_id) = resolve_decision_for_parents(
@@ -547,6 +550,7 @@ mod tests {
                 recursive: false,
                 allow: std::iter::once(DriveOperation::Edit).collect(),
                 deny: std::collections::HashSet::default(),
+                require_lease: true,
             },
             FolderPermissionRule {
                 folder_id: Some("deny-parent".to_string()),
@@ -554,6 +558,7 @@ mod tests {
                 recursive: false,
                 allow: std::collections::HashSet::default(),
                 deny: std::iter::once(DriveOperation::Edit).collect(),
+                require_lease: true,
             },
         ];
 

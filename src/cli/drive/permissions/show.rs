@@ -158,6 +158,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             deny: std::iter::once(DriveOperation::Edit).collect(),
+            require_lease: true,
         }
     }
 
@@ -195,6 +196,7 @@ mod tests {
             recursive: false,
             allow: std::collections::HashSet::default(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }];
         let mut buf = Vec::new();
         render_rules_table(&rules, &mut buf).unwrap();
@@ -210,6 +212,7 @@ mod tests {
             recursive: false,
             allow: std::collections::HashSet::default(),
             deny: std::collections::HashSet::default(),
+            require_lease: true,
         }];
         let mut buf = Vec::new();
         render_rules_table(&rules, &mut buf).unwrap();
