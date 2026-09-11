@@ -87,8 +87,29 @@ impl JsonlSerialize for AcquireResult {
 }
 
 /// Runs the four-step sequence ADR-0080 §2 specifies, in order, aborting at
-/// the first failure with nothing further attempted.
+/// the first failure with nothing further attempted, then records the
+/// attempt to the audit sink regardless of outcome (ADR-0080 §11).
+///
+/// The audit record here is best-effort, not write-ahead/fail-closed the
+/// way a leased *write*'s is: `drive lease acquire` mutates no Drive
+/// content — it takes a backup and writes a ledger row, both already
+/// durable by the time this function is about to return — so there is no
+/// "mutating API call" for a write-ahead record to precede. A logging
+/// failure here is warned, not surfaced as a failed acquisition: the
+/// consent, the backup and the ledger row already happened, and turning a
+/// genuine success into a reported failure because a follow-up log write
+/// failed would make the tool's own output less trustworthy, not more.
 pub async fn acquire(
+    client: &DriveClient,
+    opts: &AcquireOptions,
+    authenticator: &dyn Authenticator,
+) -> AcquireResult {
+    let result = acquire_inner(client, opts, authenticator).await;
+    record_attempt(opts, &result);
+    result
+}
+
+async fn acquire_inner(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
@@ -325,6 +346,99 @@ fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<()> 
     ledger.save(ledger_path)
 }
 
+/// Builds and writes the `kind: "audit"` record for one acquire attempt.
+/// See [`acquire`]'s own doc comment for why this is best-effort rather than
+/// write-ahead/fail-closed.
+fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
+    let auth_policy = Some(
+        match opts.auth_policy {
+            AuthPolicy::DeviceOwner => "device-owner",
+            AuthPolicy::BiometricsOnly => "biometrics-only",
+        }
+        .to_string(),
+    );
+    let outcome = match result {
+        AcquireResult::Acquired {
+            token,
+            backup,
+            expires_at: _,
+        } => {
+            let (backup_location, backup_sha256, backup_size) = match backup {
+                LeaseBackup::Bytes { path, sha256, size } => (
+                    Some(path.display().to_string()),
+                    Some(sha256.clone()),
+                    Some(*size),
+                ),
+                LeaseBackup::DriveCopy { file_id } => (Some(file_id.clone()), None, None),
+            };
+            // Re-read the just-written ledger row for the version/
+            // modified_time actually recorded, rather than widening
+            // `AcquireResult::Acquired` (a public, `--output json` wire
+            // shape) with fields that exist only for this best-effort audit
+            // record. A read failure here just omits them — the acquisition
+            // itself already fully succeeded.
+            let (version_after, modified_time_after) = LeaseLedger::load(&opts.ledger_path)
+                .ok()
+                .and_then(|ledger| ledger.get(token).cloned())
+                .map_or((None, None), |record| {
+                    (Some(record.version), record.modified_time)
+                });
+            crate::request_log::AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: opts.file_id.clone(),
+                lease_id: Some(token.clone()),
+                verdict: "acquired".to_string(),
+                version_after,
+                modified_time_after,
+                backup_location,
+                backup_sha256,
+                backup_size,
+                auth_policy,
+                ..Default::default()
+            }
+        }
+        AcquireResult::RefusedNativeDocument => crate::request_log::AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: opts.file_id.clone(),
+            verdict: "refused-native-document".to_string(),
+            auth_policy,
+            ..Default::default()
+        },
+        AcquireResult::Denied { detail } => crate::request_log::AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: opts.file_id.clone(),
+            verdict: "denied".to_string(),
+            error: Some(detail.clone()),
+            auth_policy,
+            ..Default::default()
+        },
+        AcquireResult::Unavailable { detail } => crate::request_log::AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: opts.file_id.clone(),
+            verdict: "unavailable".to_string(),
+            error: Some(detail.clone()),
+            auth_policy,
+            ..Default::default()
+        },
+        AcquireResult::Failed { detail } => crate::request_log::AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: opts.file_id.clone(),
+            verdict: "failed".to_string(),
+            error: Some(detail.clone()),
+            auth_policy,
+            ..Default::default()
+        },
+    };
+    if let Err(err) = crate::request_log::record_audit_event(outcome) {
+        tracing::warn!("drive lease acquire: failed to write audit record: {err}");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -332,6 +446,35 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::Unsupported;
     use crate::utils::secret::Secret;
+
+    /// Redirects `OMNI_DEV_AUDIT_LOG_FILE` into an isolated tempdir for the
+    /// life of one test, holding [`crate::test_support::REQUEST_LOG_ENV_MUTEX`]
+    /// the whole time.
+    ///
+    /// Every test in this module that calls `acquire()` now triggers a
+    /// best-effort audit write (ADR-0080 §11) as a side effect, whether or
+    /// not the test cares about its content — without this guard, that
+    /// write would resolve to the real machine's default audit-log path
+    /// (writing test noise into a developer's or CI runner's actual
+    /// `audit.jsonl`) and, since the env var is process-global, could race
+    /// with any other concurrently-running test that also redirects it.
+    struct AuditGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl AuditGuard {
+        fn redirect(dir: &std::path::Path) -> Self {
+            let lock = crate::test_support::REQUEST_LOG_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.join("audit.jsonl"));
+            Self { _lock: lock }
+        }
+    }
+    impl Drop for AuditGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        }
+    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
@@ -398,6 +541,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         let result = acquire(
             &client,
@@ -424,6 +568,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         let result = acquire(&client, &opts(root.path()), &Unsupported).await;
 
@@ -445,6 +590,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         struct PanicsIfCalled;
         impl Authenticator for PanicsIfCalled {
@@ -478,6 +624,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         let result = acquire(
             &client,
@@ -511,6 +658,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
         // Pre-create the exact backup path `write_backup` will try to
         // `create_new` — the same-second collision its own doc comment
@@ -554,6 +702,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
         // A directory in place of the ledger file makes `LeaseLedger::load`
         // fail, which `insert_record` surfaces as an `anyhow::Error`.
@@ -604,6 +753,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         // An authenticator that panics if called at all — proves the
         // native-document refusal happens before authentication, per the
@@ -633,6 +783,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         struct PanicsIfCalled;
         impl Authenticator for PanicsIfCalled {
@@ -667,6 +818,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         let result = acquire(
             &client,
@@ -733,6 +885,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
 
         let result = acquire(
@@ -778,6 +931,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let mut opts = opts(root.path());
         opts.native_backup_folder_id = Some("backup-folder".to_string());
 
@@ -813,6 +967,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let mut opts = opts(root.path());
         opts.native_backup_folder_id = Some("backup-folder".to_string());
 
@@ -863,6 +1018,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
 
         let result = acquire(
@@ -903,6 +1059,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
 
         let result = acquire(
@@ -922,6 +1079,97 @@ mod tests {
         );
     }
 
+    // ── the audit sink (ADR-0080 §11) ──────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acquired_lease_writes_an_audit_record_carrying_the_backup_and_version() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "42", "modifiedTime": "2026-09-11T00:00:00Z"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        let AcquireResult::Acquired { token, .. } = result else {
+            panic!("expected Acquired, got {result:?}");
+        };
+
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(rec.kind, crate::request_log::RecordKind::Audit);
+        assert_eq!(rec.context.get("lease_id"), Some(&token));
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("acquired")
+        );
+        assert_eq!(
+            rec.context.get("version_after").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            rec.context.get("auth_policy").map(String::as_str),
+            Some("device-owner")
+        );
+        assert!(rec.context.contains_key("backup_sha256"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_acquisition_still_writes_an_audit_record() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!("must not authenticate with no backup folder configured");
+            }
+        }
+
+        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+
+        assert!(matches!(result, AcquireResult::RefusedNativeDocument));
+
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("refused-native-document")
+        );
+        assert_eq!(rec.context.get("lease_id"), None);
+    }
+
     #[tokio::test]
     async fn native_document_without_a_backup_folder_is_refused_before_authenticating() {
         let server = wiremock::MockServer::start().await;
@@ -935,6 +1183,7 @@ mod tests {
             .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
 
         struct PanicsIfCalled;
         impl Authenticator for PanicsIfCalled {
