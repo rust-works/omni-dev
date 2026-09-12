@@ -309,6 +309,23 @@ fn print_restore_result(result: &RestoreResult) {
         RestoreResult::Denied { detail } => eprintln!("Denied: {detail}"),
         RestoreResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
         RestoreResult::Failed { detail } => eprintln!("Failed: {detail}"),
+        RestoreResult::FreshLeaseButWriteFailed {
+            token,
+            expires_at,
+            detail,
+        } => {
+            // The token is printed even though the write itself failed —
+            // it is real and live (Touch ID was answered, a backup of the
+            // current state was taken, a ledger row was written), so it
+            // must not be surfaced nowhere the caller could ever find it
+            // again.
+            println!("{token}");
+            eprintln!(
+                "Failed: {detail}\nA fresh lease was minted before the failure and is still \
+                 live (expires {expires_at}) — present it to `--lease`, or re-run `drive lease \
+                 restore` with it, rather than spending another prompt"
+            );
+        }
     }
 }
 
@@ -571,6 +588,11 @@ mod tests {
                 detail: "no authenticator".to_string(),
             },
             RestoreResult::Failed {
+                detail: "boom".to_string(),
+            },
+            RestoreResult::FreshLeaseButWriteFailed {
+                token: "tok-4".to_string(),
+                expires_at: chrono::Utc::now(),
                 detail: "boom".to_string(),
             },
         ] {
