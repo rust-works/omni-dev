@@ -108,6 +108,22 @@ mod audit_log_guard_tests {
         let guard = AuditLogGuard::redirect(dir.path());
         assert!(guard.records().is_empty());
     }
+
+    /// Direct cover for the panic branch of [`AuditLogGuard::records`]: a
+    /// read failure other than `NotFound` must not read as "nothing wrote
+    /// yet" — it must panic instead, the same fail-loud contract every
+    /// other test-support helper in this file follows. A directory in
+    /// place of the audit file forces that non-`NotFound` failure, the
+    /// same trick `drive::lease::check`'s own fail-closed test uses.
+    #[test]
+    fn records_panics_when_the_read_fails_for_a_reason_other_than_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir(dir.path().join("audit.jsonl")).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.records()));
+        assert!(result.is_err());
+    }
 }
 
 /// Opts the current test thread into release-build audit path resolution
