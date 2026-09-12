@@ -632,13 +632,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
-        // Pre-create the exact backup path `write_backup` will try to
-        // `create_new` — the same-second collision its own doc comment
-        // describes — so the `open()` call fails and the `with_context`
-        // closure (otherwise dead in every other test here) actually runs.
-        let expected_path = backup_file_path(&test_opts.backup_dir, "f1", "report.pdf");
-        std::fs::create_dir_all(&test_opts.backup_dir).unwrap();
-        std::fs::write(&expected_path, b"stale").unwrap();
+        // Force `write_backup`'s `create_new` `open()` to fail deterministically
+        // by putting a plain file where the backup directory should be, so the
+        // `with_context` closure (otherwise dead in every other test here)
+        // actually runs. Pre-creating the *exact* colliding path instead (the
+        // same-second collision the doc comment describes) is racy under CI
+        // load: the backup filename has only whole-second precision, and
+        // enough time can pass between computing it here and `acquire()`
+        // computing its own for the two to land in different seconds.
+        std::fs::write(&test_opts.backup_dir, b"not a directory").unwrap();
 
         let result = acquire(
             &client,
