@@ -4034,6 +4034,7 @@ Usage: lease <COMMAND>
 
 Commands:
   acquire  Backs up a file and mints a lease token, prompting for device-owner authentication (Touch ID or the account password)
+  restore  Restores a file from a backup lease's recorded content, minting a fresh lease of its own before writing
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4055,6 +4056,25 @@ Options:
       --backup-dir <PATH>   Local directory byte backups are written under. Defaults to `<state dir>/omni-dev/drive-backups`
       --expiry-minutes <N>  Minutes the lease stays live once authorised. A write never extends this — a fresh window means a fresh `drive lease acquire` (ADR-0080 §5) [default: 30]
       --biometrics-only     Require Touch ID specifically, failing outright rather than falling back to the account password (ADR-0080 §7). Needs Touch ID hardware; the default policy works on any Mac
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive lease restore - Restores a file from a backup lease's recorded content, minting a fresh lease of its own before writing
+
+Restores a file from a backup lease's recorded content, minting a fresh lease of its own before writing
+
+Usage: restore [OPTIONS] <TOKEN>
+
+Arguments:
+  <TOKEN>  The backup lease's token (from `drive lease acquire`), expired or not — an expired-but-kept row is the expected common case
+
+Options:
+      --backup-dir <PATH>   Local directory the fresh lease's own byte backup is written under. Defaults to `<state dir>/omni-dev/drive-backups`
+      --expiry-minutes <N>  Minutes the fresh lease stays live once authorised [default: 30]
+      --biometrics-only     Require Touch ID specifically for the fresh lease, failing outright rather than falling back to the account password (ADR-0080 §7)
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
 

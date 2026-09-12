@@ -1848,12 +1848,18 @@ fn describe_inserted(
     )
 }
 
-/// There is no `files.delete` or undo anywhere in this integration (ADR-0077):
-/// Drive's own version history is the only recovery path, so every
-/// destructive real-run message says so.
+/// There is no `files.delete` or undo anywhere in this integration
+/// (ADR-0077). ADR-0080 closes the recovery gap this note originally
+/// admitted outright: a write made under a Drive write lease (`--lease
+/// <TOKEN>`) can be located — for a native document like this one, `drive
+/// lease restore <TOKEN>` reports the Drive-copy backup's location (no
+/// typed sheet-restore path exists yet, ADR-0080 §10); a write made without
+/// one has no lease-tracked backup, and Drive's own version history remains
+/// the only path either way.
 const RECOVERY_NOTE: &str =
-    "this cannot be undone through omni-dev — use Google Drive's version history to recover it \
-     if needed";
+    "this cannot be undone through omni-dev directly — if this write presented a `--lease`, run \
+     `omni-dev drive lease restore <TOKEN>` to locate its backup; otherwise, use Google Drive's \
+     version history to recover it if needed";
 
 /// The `DeleteRows`/`DeleteColumns` arm of [`describe_changed`].
 #[allow(clippy::too_many_arguments)]
@@ -2074,6 +2080,7 @@ mod tests {
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
+            restored_at: None,
         });
         ledger.save(ledger_path).unwrap();
         token

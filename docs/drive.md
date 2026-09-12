@@ -1090,6 +1090,60 @@ every gated write refuses in turn. This is deliberate (ADR-0080 §8) — a TTY
 prompt would let a script answer on the human's behalf, defeating the
 point.
 
+### Restore
+
+```bash
+$ omni-dev drive lease restore lease-abc123...
+lease-def456...
+Restored. Backed up the pre-restore content to /home/user/.local/state/omni-dev/drive-backups/20260912T000000Z-1ExistingFileId-report.pdf (expires 2026-09-12T00:30:00Z)
+```
+
+`drive lease restore <TOKEN>` restores a file from the backup a lease
+recorded, closing the recovery gap [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md)
+§5 admitted: `<TOKEN>` names the **backup** lease — the one whose row
+records where the content to restore from lives — not a lease presented to
+authorise this write. It locates the backup and authorises nothing itself;
+restore mints its own fresh lease internally (Touch ID, a backup of the
+file's *current* state, a new ledger row) before ever writing, so the
+restore is itself reversible by the same verb, and prints the new token for
+exactly that reason. One command, one prompt — the same `--backup-dir`/
+`--expiry-minutes`/`--biometrics-only` flags `drive lease acquire` takes
+apply to this fresh lease. The backup lease's `<TOKEN>` works whether it has
+expired or not — an expired-but-kept row is the expected common case,
+since a restore is almost always wanted after the fact, once a bad write
+has been noticed.
+
+**Binary files restore in full**, by re-uploading the backed-up bytes —
+verified against the backup's recorded SHA-256 first, so a backup that has
+been corrupted or tampered with on disk since it was taken is never
+silently written back to Drive.
+
+**Native documents (Sheets/Docs/Slides) have no typed restore path yet.**
+Their backup is a lossless Drive-side copy, restorable today by a human via
+the Drive UI — `restore` reports exactly where:
+
+```bash
+$ omni-dev drive lease restore lease-native789...
+No typed restore path exists for this backup yet — it is a Drive copy at 1BackupCopyFileId you can restore from by hand in the Drive UI
+```
+
+A later phase adds the one typed path ADR-0080 §10 names worth building: a
+deleted sheet's backup copy still contains that sheet, so `restore` on a
+file that had a sheet deleted from it under lease will offer
+`spreadsheets.sheets.copyTo` from the backup into the live spreadsheet,
+rather than only reporting the copy's location.
+
+**The folder write-permission gate still applies.** Restore mints its own
+lease, but that is a *third*, independent check alongside OAuth scope and
+the write-permission gate — never a substitute for either: a write-blocked
+folder refuses a restore the same way it refuses any other write.
+
+**The backup lease's own row is marked once restored from**, kept (never
+dropped) alongside the fresh lease's new row — both remain findable by
+token in the ledger and in `audit.jsonl`, which records both tokens on a
+restore (`lease_id` the fresh one, `restored_from_lease_id` the backup one
+read from) — see [docs/log.md](log.md#audit-log).
+
 ## Sheets
 
 `drive sheets` reads and writes the *cells* of a Google Sheet through the

@@ -1486,6 +1486,12 @@ pub struct AuditOutcome {
     /// Which authentication policy (ADR-0080 §7) an acquire satisfied —
     /// `"device-owner"` or `"biometrics-only"`.
     pub auth_policy: Option<String>,
+    /// `drive lease restore` only: the *backup* lease's token the restore
+    /// read from — distinct from [`Self::lease_id`], the *fresh* token the
+    /// restore itself minted before writing (ADR-0080 §10/§11: "the restore
+    /// is audit-logged carrying both tokens"). `None` for every other
+    /// event.
+    pub restored_from_lease_id: Option<String>,
     /// The error, when the event itself failed (an API/filesystem/ledger
     /// error — distinct from an ordinary refusal, which is a `verdict`, not
     /// an `error`).
@@ -1545,6 +1551,9 @@ fn build_audit_record(outcome: AuditOutcome, ctx: RequestLogContext) -> LogRecor
     }
     if let Some(auth_policy) = outcome.auth_policy {
         context.insert("auth_policy".to_string(), auth_policy);
+    }
+    if let Some(restored_from) = outcome.restored_from_lease_id {
+        context.insert("restored_from_lease_id".to_string(), restored_from);
     }
     rec.context = context;
     rec

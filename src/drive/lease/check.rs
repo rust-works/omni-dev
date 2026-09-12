@@ -455,6 +455,7 @@ mod tests {
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             released_at: None,
+            restored_at: None,
         });
         ledger.save(ledger_path).unwrap();
     }

@@ -522,6 +522,20 @@ An intent record with no matching outcome is itself the signal that
 something was interrupted mid-write — the whole point of writing the
 former durably before the latter can even be attempted.
 
+**`drive lease restore <TOKEN>`** writes its own top-level, best-effort
+record, `command: ["drive", "lease-restore"]`, in addition to the
+generic write-ahead/outcome pair its internal fresh-lease acquisition and
+restore write already produce (both keyed on the *fresh* token). This one
+names **both** tokens (ADR-0080 §10/§11): `lease_id` is the fresh token
+once minted (or the existing one, for `already-leased`), and
+`restored_from_lease_id` is always the backup lease's own token — the
+`<TOKEN>` argument — so `--query 'restored_from_lease_id:<token>'` finds
+every restore attempt made from one backup regardless of outcome. `verdict`
+matches `drive lease restore`'s own reported status: `restored`,
+`no-such-backup-token`, `no-typed-restore-path`,
+`refused-no-visible-parents`, `blocked`, `already-leased`,
+`refused-native-document`, `denied`, `unavailable`, or `failed`.
+
 ## Redaction posture
 
 No secret material is ever written, under any code path:
