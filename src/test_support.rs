@@ -94,6 +94,22 @@ impl Drop for AuditLogGuard {
     }
 }
 
+#[cfg(test)]
+mod audit_log_guard_tests {
+    use super::AuditLogGuard;
+
+    /// Direct cover for the "nothing wrote" branch of [`AuditLogGuard::records`]
+    /// (`ErrorKind::NotFound` reads as empty rather than panicking): every
+    /// other caller in the crate redirects and then triggers a write before
+    /// reading records back, so this path is otherwise never exercised.
+    #[test]
+    fn records_reads_as_empty_before_anything_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = AuditLogGuard::redirect(dir.path());
+        assert!(guard.records().is_empty());
+    }
+}
+
 /// Opts the current test thread into release-build audit path resolution
 /// — `OMNI_DEV_AUDIT_LOG_FILE` if set, else the scratch default — for the
 /// life of one test. The counterpart of [`AuditLogGuard`] for the handful
