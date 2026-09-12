@@ -7,10 +7,10 @@
 //! ([`acquire`]) reads and writes; [`check`] is the shared "does this
 //! presented `--lease` token authorise this write" gate every
 //! content-mutating engine (`drive edit`, every Sheets/Docs write verb)
-//! calls. `drive lease restore` (ADR-0080 §4) is the one piece not yet
-//! landed.
+//! calls; [`restore`] is `drive lease restore` (ADR-0080 §10).
 
 pub(crate) mod acquire;
 pub(crate) mod authenticate;
 pub(crate) mod check;
 pub(crate) mod ledger;
+pub(crate) mod restore;

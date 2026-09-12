@@ -91,6 +91,16 @@ pub(crate) struct LeaseRecord {
     /// effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) released_at: Option<DateTime<Utc>>,
+    /// Set once `drive lease restore <TOKEN>` successfully restores from
+    /// this row's backup (ADR-0080 §4/§10) — the "transition" §4 says a
+    /// restored-from row is marked with, kept rather than dropped so a
+    /// second restore attempt (or an auditor) can still see this backup was
+    /// already used. Does not affect [`Self::is_live`]: a row can be
+    /// restored from and still separately expire/be released on its own
+    /// schedule, and restoring from an already-expired backup is the
+    /// expected common case (§4), not something this field forbids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restored_at: Option<DateTime<Utc>>,
 }
 
 impl LeaseRecord {
@@ -180,6 +190,17 @@ impl LeaseLedger {
         self.0
             .values()
             .find(|record| record.file_id == file_id && record.is_live(now))
+    }
+
+    /// Marks `token`'s row as having been restored from (ADR-0080 §4/§10),
+    /// stamped with `at`. A no-op if the token is absent. Idempotent: a
+    /// second restore from the same backup just overwrites the timestamp,
+    /// since the row already carries no count of how many times it has
+    /// been used — `drive lease restore` is not rate-limited by this field.
+    pub(crate) fn mark_restored(&mut self, token: &str, at: DateTime<Utc>) {
+        if let Some(rec) = self.0.get_mut(token) {
+            rec.restored_at = Some(at);
+        }
     }
 
     /// Updates the recorded `version`/`modified_time` for `token` after a
@@ -301,6 +322,7 @@ mod tests {
             acquired_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
+            restored_at: None,
         }
     }
 
