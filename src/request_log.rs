@@ -2835,6 +2835,43 @@ mod tests {
     }
 
     #[test]
+    fn record_audit_locks_and_syncs_the_handle_when_bodies_are_enabled() {
+        // `bodies_enabled()` gates a separate, otherwise-untested append
+        // path (an advisory `flock` around the write) inside
+        // `append_line_unrotated`; `record_audit`'s `sync=true` additionally
+        // exercises the `sync_data` call on the locked handle.
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("OMNI_DEV_LOG_BODIES").ok();
+        std::env::set_var("OMNI_DEV_LOG_BODIES", "1");
+        assert!(bodies_enabled());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        let result = record_audit(&rec);
+
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        match prior {
+            Some(v) => std::env::set_var("OMNI_DEV_LOG_BODIES", v),
+            None => std::env::remove_var("OMNI_DEV_LOG_BODIES"),
+        }
+
+        result.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(back.id, rec.id);
+    }
+
+    #[test]
     fn record_audit_fails_closed_when_the_write_errors() {
         // A directory is not a valid target for `OpenOptions::append`, so this
         // forces the same write failure a permission error or a missing parent
