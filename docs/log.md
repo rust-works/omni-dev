@@ -485,11 +485,33 @@ consent, the backup and the ledger row have already durably happened, so a
 logging failure is warned and does not turn a successful acquisition into a
 reported failure.
 
-A leased **write** will, in a later phase, produce records in **both**
-files, correlated by `invocation_id`: its ordinary `drivemutation` record
-here in `log.jsonl` (ADR-0070/0071/0073/0075/0076/0077/0078), and a
-write-ahead/outcome pair of fail-closed `audit` records in `audit.jsonl` —
-not yet landed.
+A leased **write** produces records in **both** files, correlated by
+`invocation_id`: its ordinary `drivemutation` record here in `log.jsonl`
+(ADR-0070/0071/0073/0075/0076/0077/0078), and, in `audit.jsonl`, up to two
+`audit` records from `crate::drive::lease::check::check_and_lock_lease`
+(shared by every leased-write engine — `drive edit` today, the six
+Sheets/Docs engines following the same one-line pattern):
+
+- A refusal that never reaches the mutating call (`verdict`:
+  `refused`/`expired`/`stale`/`failed`) writes **one** best-effort record —
+  there is no mutation to pair a write-ahead record around.
+- A presented lease that checks out writes a **write-ahead** `"pending"`
+  intent record, `command: ["drive edit"]` (or the equivalent Sheets/Docs
+  command), carrying `lease_id` and `version_before` — durably, before the
+  mutating API call this lease authorises, and fail-closed: if this write
+  fails, the write itself is refused rather than proceeding unaudited (the
+  one place in the whole ADR this contract actually applies, per §11).
+  After the mutating call returns, a best-effort **outcome** record follows
+  with the same `lease_id` and `verdict: allowed` or `verdict: failed`,
+  plus `version_after`/`modified_time_after` when the mutating call's own
+  response carried them for free (`drive edit`'s `files.update`; every
+  Sheets/Docs call carries no Drive metadata in its response at all, so
+  those omit it rather than spend a third round trip only to duplicate
+  what the refreshed ledger row already has).
+
+An intent record with no matching outcome is itself the signal that
+something was interrupted mid-write — the whole point of writing the
+former durably before the latter can even be attempted.
 
 ## Redaction posture
 

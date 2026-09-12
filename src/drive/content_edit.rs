@@ -27,7 +27,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    check_and_lock_lease, refresh_lease_after_write, LeaseCheckOutcome,
+    check_and_lock_lease, refresh_lease_after_write, write_outcome_audit, LeaseCheckOutcome,
 };
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
@@ -356,6 +356,14 @@ async fn edit_inner(
     {
         Ok(updated) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
+                write_outcome_audit(
+                    "drive edit",
+                    &opts.file_id,
+                    token,
+                    "allowed",
+                    updated.version.clone(),
+                    updated.modified_time.clone(),
+                );
                 refresh_lease_after_write(
                     "drive edit",
                     lock,
@@ -367,9 +375,14 @@ async fn edit_inner(
             }
             EditResult::Edited
         }
-        Err(err) => EditResult::Failed {
-            detail: err.to_string(),
-        },
+        Err(err) => {
+            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+                write_outcome_audit("drive edit", &opts.file_id, token, "failed", None, None);
+            }
+            EditResult::Failed {
+                detail: err.to_string(),
+            }
+        }
     };
     drop(lease_lock);
     EditOutcome {
@@ -417,7 +430,16 @@ mod tests {
     use crate::drive::lease::ledger::LeaseLedger;
     use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
     use crate::drive::write_gate::DriveOperation;
+    use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
+
+    fn read_audit_lines(audit_path: &std::path::Path) -> Vec<crate::request_log::LogRecord> {
+        std::fs::read_to_string(audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
@@ -559,6 +581,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -624,6 +647,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -666,6 +690,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -718,6 +743,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let root = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(root.path());
         let ledger_dir = root.path().join("ledger");
         std::fs::create_dir(&ledger_dir).unwrap();
         let ledger_path = ledger_dir.join("lease-ledger.jsonl");
@@ -871,6 +897,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -935,6 +962,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -1009,6 +1037,8 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         // No PATCH mock mounted — a refusal must make zero mutating calls.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
 
         let outcome = edit(&client, &opts(false), &[allow_rule()]).await;
         assert!(matches!(outcome.result, EditResult::RefusedNoLease));
@@ -1024,6 +1054,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         // Never seeded — the ledger exists nowhere near this token.
 
@@ -1049,6 +1080,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         std::fs::create_dir(&ledger_path).unwrap();
 
@@ -1070,6 +1102,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let token = "expired-token".to_string();
         let mut ledger = LeaseLedger::default();
@@ -1107,6 +1140,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         // Seeded for a *different* file id.
         let token = seed_lease(&ledger_path, "some-other-file", "1");
@@ -1131,6 +1165,7 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let token = seed_lease(&ledger_path, "file-1", "0");
 
@@ -1160,6 +1195,8 @@ mod tests {
         mount_folder("strict-parent").mount(&server).await;
         mount_folder("lenient-parent").mount(&server).await;
         // No PATCH mock mounted — a refusal must make zero mutating calls.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
         let rules = [
             FolderPermissionRule::folder("strict-parent").allowing([DriveOperation::Edit]),
             FolderPermissionRule::folder("lenient-parent")
@@ -1189,6 +1226,7 @@ mod tests {
         mount_folder("parent-1").mount(&server).await;
         // No PATCH mock mounted — a refusal must make zero mutating calls.
         let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let token = seed_lease(&ledger_path, "file-1", "1");
         let mut lock_path = ledger_path.clone().into_os_string();
@@ -1247,5 +1285,85 @@ mod tests {
 
         let outcome = edit(&client, &opts(true), &[allow_rule()]).await;
         assert!(matches!(outcome.result, EditResult::WouldEdit));
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[tokio::test]
+    async fn a_successful_edit_writes_a_pending_intent_and_an_allowed_outcome() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "2",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let outcome = edit(
+            &client,
+            &opts_with_lease("file-1", &ledger_path, "1"),
+            &[allow_rule()],
+        )
+        .await;
+        assert!(matches!(outcome.result, EditResult::Edited));
+
+        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
+        let verdicts: Vec<Option<&String>> =
+            records.iter().map(|r| r.context.get("verdict")).collect();
+        assert_eq!(
+            verdicts,
+            vec![Some(&"pending".to_string()), Some(&"allowed".to_string())],
+            "{records:?}"
+        );
+        assert_eq!(
+            records[1].context.get("version_after").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_edit_after_a_valid_lease_writes_a_failed_outcome() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let outcome = edit(
+            &client,
+            &opts_with_lease("file-1", &ledger_path, "1"),
+            &[allow_rule()],
+        )
+        .await;
+        assert!(matches!(outcome.result, EditResult::Failed { .. }));
+
+        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
+        let verdicts: Vec<Option<&String>> =
+            records.iter().map(|r| r.context.get("verdict")).collect();
+        assert_eq!(
+            verdicts,
+            vec![Some(&"pending".to_string()), Some(&"failed".to_string())],
+            "{records:?}"
+        );
     }
 }

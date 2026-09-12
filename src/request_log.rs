@@ -388,8 +388,59 @@ pub fn log_file_path() -> Option<PathBuf> {
 /// independently via its own env override, nothing here *guarantees* the two
 /// stay distinct; [`record_audit`] checks that at write time instead of
 /// merely assuming it.
+///
+/// In test builds, an unset override never falls through to the real
+/// machine's default path: it resolves to one process-lifetime scratch
+/// path instead (`test_default_audit_log_path`, `#[cfg(test)]`-only).
+/// ADR-0080 §9/§11 made
+/// `check_and_lock_lease` (and `drive lease acquire`) write an audit
+/// record on essentially every lease-checking code path, so *any* test
+/// anywhere in the crate that exercises a leased write or an acquire
+/// without itself redirecting `OMNI_DEV_AUDIT_LOG_FILE` would otherwise
+/// silently write real-looking rows into a developer's or CI runner's
+/// actual `audit.jsonl` — which is exactly what happened before this
+/// fallback existed. A test that wants to inspect its *own* isolated
+/// audit output still should redirect the env var explicitly (see
+/// `crate::test_support::AuditLogGuard`) rather than rely on this shared
+/// fallback, which many tests write into concurrently.
+#[cfg(not(test))]
 pub fn audit_file_path() -> Option<PathBuf> {
     resolve_runtime_log_path("OMNI_DEV_AUDIT_LOG_FILE", AUDIT_FILE_NAME)
+}
+
+/// Test-build variant of the function above.
+///
+/// An unset override resolves to a shared scratch path
+/// (`test_default_audit_log_path`) rather than the real machine's default,
+/// for the reason spelled out in that doc comment.
+#[cfg(test)]
+pub fn audit_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("OMNI_DEV_AUDIT_LOG_FILE") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    Some(test_default_audit_log_path())
+}
+
+/// The shared scratch path every test-build call to [`audit_file_path`]
+/// falls back to when `OMNI_DEV_AUDIT_LOG_FILE` is unset. One `tempdir` for
+/// the whole test binary's process lifetime, deliberately never cleaned up
+/// (`mem::forget`) — a `cargo test` process is short-lived, and the
+/// alternative (resolving to the real machine's default path) is the
+/// actual risk this function exists to close off.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+fn test_default_audit_log_path() -> PathBuf {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("failed to create a scratch dir for test audit logs");
+        let path = dir.path().join(AUDIT_FILE_NAME);
+        std::mem::forget(dir);
+        path
+    })
+    .clone()
 }
 
 /// Appends one record. Best effort: every error is swallowed (logged at
@@ -2575,6 +2626,40 @@ mod tests {
             Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl"))
         );
         std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+    }
+
+    #[test]
+    fn audit_file_path_never_resolves_to_the_real_machine_default_when_unset() {
+        // Regression test for a real incident: before this fallback
+        // existed, any test exercising a leased write or `drive lease
+        // acquire` without itself redirecting `OMNI_DEV_AUDIT_LOG_FILE`
+        // silently wrote into this machine's actual `audit.jsonl`. With
+        // the var unset, every call in a test build must land on the
+        // same shared scratch path — stable across calls (so it's
+        // memoized once, not re-created per call) and never the real
+        // `dirs::state_dir()`/`dirs::data_dir()`-based default the
+        // non-test build resolves to.
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+
+        let first = audit_file_path().unwrap();
+        let second = audit_file_path().unwrap();
+        assert_eq!(
+            first, second,
+            "the fallback path must be stable across calls"
+        );
+
+        let real_default = dirs::state_dir()
+            .or_else(dirs::data_dir)
+            .unwrap()
+            .join("omni-dev")
+            .join(AUDIT_FILE_NAME);
+        assert_ne!(
+            first, real_default,
+            "must never fall back to the real machine's default audit log path in a test build"
+        );
     }
 
     #[test]
