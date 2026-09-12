@@ -265,6 +265,7 @@ async fn acquire_inner(
         acquired_at: now,
         expires_at,
         released_at: None,
+        restored_at: None,
     };
     // Synchronous ledger I/O (lock, load, save) on the async runtime's
     // current thread — `block_in_place` hands its other queued tasks off

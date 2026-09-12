@@ -1916,17 +1916,27 @@ fn describe_inserted(
 ///   "version history is the only recovery path" wording, never a claim
 ///   that a copy exists. `backup` comes from the ledger record the write
 ///   was checked against, so this cannot be wrong by assumption.
+///
+/// Now that `drive lease restore` (ADR-0080 §10, Phase 4) exists, the
+/// message names it too — but only ever what it actually does: for a
+/// native document (always [`LeaseBackup::DriveCopy`] here, since every
+/// Sheets write is native) it only *locates* the Drive copy (no typed
+/// sheet-restore path exists yet), so the wording still points at the
+/// Drive UI for the restore itself; the [`LeaseBackup::Bytes`] arm is kept
+/// exhaustive for a future non-native caller of this same helper, and
+/// there `drive lease restore` really does restore the content directly.
 fn recovery_note(backup: Option<&LeaseBackup>) -> String {
     match backup {
         Some(LeaseBackup::DriveCopy { file_id }) => format!(
             "this cannot be undone through omni-dev — the lease this write required backed the \
-             whole spreadsheet up when it was acquired (Drive copy {file_id}); restore from that \
-             copy in the Drive UI, or fall back to Google Drive's own version history"
+             whole spreadsheet up when it was acquired (Drive copy {file_id}); run `omni-dev \
+             drive lease restore <TOKEN>` to locate it, restore from that copy in the Drive UI, \
+             or fall back to Google Drive's own version history"
         ),
         Some(LeaseBackup::Bytes { path, .. }) => format!(
             "this cannot be undone through omni-dev — the lease this write required backed the \
-             file up when it was acquired ({}); restore from that copy, or fall back to Google \
-             Drive's own version history",
+             file up when it was acquired ({}); run `omni-dev drive lease restore <TOKEN>` to \
+             restore it, or fall back to Google Drive's own version history",
             path.display()
         ),
         None => "this cannot be undone through omni-dev — no lease backup was taken (the \
@@ -2173,6 +2183,7 @@ mod tests {
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
+            restored_at: None,
         });
         ledger.save(ledger_path).unwrap();
         token
