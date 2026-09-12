@@ -27,7 +27,8 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    check_and_lock_lease, refresh_lease_after_write, write_outcome_audit, LeaseCheckOutcome,
+    check_and_lock_lease, finish_leased_write, record_failed_leased_write, LeaseCheckOutcome,
+    LeasedWrite,
 };
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
@@ -278,14 +279,20 @@ async fn edit_inner(
     //
     // The ledger lock acquired by `check_and_lock_lease` below is held
     // across the `edit_content` call and released only after
-    // `refresh_lease_after_write` — otherwise a second concurrent `drive
+    // `finish_leased_write` — otherwise a second concurrent `drive
     // edit` presenting the same token could load the ledger before this
     // write's `record_write` lands, see the same (still non-stale)
     // recorded version, and pass its own staleness check even though this
     // write is about to invalidate it (a lease-token double-spend).
+    let leased = LeasedWrite {
+        log_prefix: "drive edit",
+        operation: "edit",
+        ledger_path: &opts.ledger_path,
+        file_id: &opts.file_id,
+    };
     let lease_lock = if requires_lease {
-        let live_version = match files_api.get_metadata(&opts.file_id).await {
-            Ok(fresh) => fresh.version,
+        let (live_version, live_modified_time) = match files_api.get_metadata(&opts.file_id).await {
+            Ok(fresh) => (fresh.version, fresh.modified_time),
             Err(err) => {
                 return EditOutcome {
                     file_id: opts.file_id.clone(),
@@ -298,11 +305,10 @@ async fn edit_inner(
             }
         };
         match check_and_lock_lease(
-            "drive edit",
-            &opts.ledger_path,
+            leased,
             opts.lease_token.as_deref(),
-            &opts.file_id,
             live_version.as_deref(),
+            live_modified_time.as_deref(),
         ) {
             LeaseCheckOutcome::Ok(lock) => Some(lock),
             LeaseCheckOutcome::NoLease => {
@@ -356,32 +362,16 @@ async fn edit_inner(
     {
         Ok(updated) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                write_outcome_audit(
-                    "drive edit",
-                    &opts.file_id,
-                    token,
-                    "allowed",
-                    updated.version.clone(),
-                    updated.modified_time.clone(),
-                );
-                refresh_lease_after_write(
-                    "drive edit",
-                    lock,
-                    &opts.ledger_path,
-                    token,
-                    updated.version,
-                    updated.modified_time,
-                );
+                finish_leased_write(leased, lock, token, updated.version, updated.modified_time);
             }
             EditResult::Edited
         }
         Err(err) => {
+            let detail = err.to_string();
             if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
-                write_outcome_audit("drive edit", &opts.file_id, token, "failed", None, None);
+                record_failed_leased_write(leased, token, &detail);
             }
-            EditResult::Failed {
-                detail: err.to_string(),
-            }
+            EditResult::Failed { detail }
         }
     };
     drop(lease_lock);
@@ -432,14 +422,6 @@ mod tests {
     use crate::drive::write_gate::DriveOperation;
     use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
-
-    fn read_audit_lines(audit_path: &std::path::Path) -> Vec<crate::request_log::LogRecord> {
-        std::fs::read_to_string(audit_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
@@ -710,7 +692,7 @@ mod tests {
     /// A responder that makes the ledger's directory read-only the instant
     /// the media PATCH lands — i.e. after `check_and_lock_lease` has
     /// already locked and loaded the ledger, but before
-    /// `refresh_lease_after_write` tries to save it. `tempfile::NamedTempFile::new_in`
+    /// `finish_leased_write` tries to save it. `tempfile::NamedTempFile::new_in`
     /// then fails to create its temp file, so `LeaseLedger::save` errors.
     #[cfg(unix)]
     struct MakeDirReadOnlyThenRespond {
@@ -730,7 +712,7 @@ mod tests {
 
     /// A failed post-write lease refresh (ADR-0080 §5) must never turn an
     /// already-successful edit into a reported failure — see
-    /// `refresh_lease_after_write`'s own doc comment.
+    /// `finish_leased_write`'s own doc comment.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_lease_refresh_after_a_successful_write_does_not_fail_the_edit() {
@@ -1307,7 +1289,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
-        let _audit = AuditLogGuard::redirect(dir.path());
+        let audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -1318,18 +1300,26 @@ mod tests {
         .await;
         assert!(matches!(outcome.result, EditResult::Edited));
 
-        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
-        let verdicts: Vec<Option<&String>> =
-            records.iter().map(|r| r.context.get("verdict")).collect();
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "allowed"], "{records:?}");
+        // Both halves share the lease id, and `command` has the same
+        // segmented shape every other record kind uses.
+        for record in &records {
+            assert_eq!(record.command, ["drive", "edit"]);
+            assert_eq!(
+                record.context.get("lease_id").map(String::as_str),
+                Some("test-lease-token")
+            );
+        }
         assert_eq!(
-            verdicts,
-            vec![Some(&"pending".to_string()), Some(&"allowed".to_string())],
-            "{records:?}"
+            records[0].context.get("version_before").map(String::as_str),
+            Some("1")
         );
         assert_eq!(
             records[1].context.get("version_after").map(String::as_str),
             Some("2")
         );
+        assert_eq!(records[1].error, None);
     }
 
     #[tokio::test]
@@ -1346,7 +1336,7 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
-        let _audit = AuditLogGuard::redirect(dir.path());
+        let audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let outcome = edit(
@@ -1355,15 +1345,13 @@ mod tests {
             &[allow_rule()],
         )
         .await;
-        assert!(matches!(outcome.result, EditResult::Failed { .. }));
+        let EditResult::Failed { detail } = &outcome.result else {
+            panic!("expected Failed, got {:?}", outcome.result);
+        };
 
-        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
-        let verdicts: Vec<Option<&String>> =
-            records.iter().map(|r| r.context.get("verdict")).collect();
-        assert_eq!(
-            verdicts,
-            vec![Some(&"pending".to_string()), Some(&"failed".to_string())],
-            "{records:?}"
-        );
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "failed"], "{records:?}");
+        // The outcome carries the same error the CLI reports.
+        assert_eq!(records[1].error.as_deref(), Some(detail.as_str()));
     }
 }

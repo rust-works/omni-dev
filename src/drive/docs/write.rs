@@ -40,7 +40,8 @@ use crate::drive::docs::write_types::DocsRequest;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+    check_and_lock_lease, finish_leased_native_write, record_failed_leased_write,
+    LeaseCheckOutcome, LeasedWrite,
 };
 use crate::drive::types::{GOOGLE_DOC_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -492,24 +493,30 @@ async fn write_inner(
     // Drive `version` (ADR-0080 §6). A fresh `files.get` immediately before
     // `batchUpdate`, not a reuse of the metadata fetched before the
     // (potentially slow) ancestor-chain walk and `documents.get` above.
+    let leased = LeasedWrite {
+        log_prefix: "drive docs write",
+        operation: opts.payload.verb().log_operation(),
+        ledger_path: &opts.ledger_path,
+        file_id: &opts.document_id,
+    };
     let lease_lock = if requires_lease {
-        let live_version = match files_api.get_metadata(&opts.document_id).await {
-            Ok(fresh) => fresh.version,
-            Err(err) => {
-                return gated(
-                    WriteResult::Failed {
-                        detail: err.to_string(),
-                    },
-                    Some(revision_id),
-                )
-            }
-        };
+        let (live_version, live_modified_time) =
+            match files_api.get_metadata(&opts.document_id).await {
+                Ok(fresh) => (fresh.version, fresh.modified_time),
+                Err(err) => {
+                    return gated(
+                        WriteResult::Failed {
+                            detail: err.to_string(),
+                        },
+                        Some(revision_id),
+                    )
+                }
+            };
         match check_and_lock_lease(
-            "drive docs write",
-            &opts.ledger_path,
+            leased,
             opts.lease_token.as_deref(),
-            &opts.document_id,
             live_version.as_deref(),
+            live_modified_time.as_deref(),
         ) {
             LeaseCheckOutcome::Ok(lock) => Some(lock),
             LeaseCheckOutcome::NoLease => {
@@ -539,15 +546,7 @@ async fn write_inner(
     {
         Ok(response) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                refresh_lease_after_native_write(
-                    "drive docs write",
-                    lock,
-                    &opts.ledger_path,
-                    token,
-                    &files_api,
-                    &opts.document_id,
-                )
-                .await;
+                finish_leased_native_write(leased, lock, token, &files_api).await;
             }
             match &opts.payload {
                 WritePayload::Replace { .. } => WriteResult::Replaced {
@@ -559,13 +558,23 @@ async fn write_inner(
                 },
             }
         }
-        Err(err) if is_stale_revision(&err) => WriteResult::StaleRevision {
-            required_revision_id: revision_id.clone(),
-            detail: err.to_string(),
-        },
-        Err(err) => WriteResult::Failed {
-            detail: err.to_string(),
-        },
+        Err(err) => {
+            // Either way the mutation did not happen — a `412` on
+            // `writeControl.requiredRevisionId` included — so the intent
+            // record gets a `failed` outcome carrying the reason.
+            let detail = err.to_string();
+            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+                record_failed_leased_write(leased, token, &detail);
+            }
+            if is_stale_revision(&err) {
+                WriteResult::StaleRevision {
+                    required_revision_id: revision_id.clone(),
+                    detail,
+                }
+            } else {
+                WriteResult::Failed { detail }
+            }
+        }
     };
     drop(lease_lock);
     gated(result, Some(revision_id))
@@ -1664,5 +1673,81 @@ mod tests {
         };
         let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
         assert!(matches!(outcome.result, WriteResult::WouldReplace { .. }));
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[tokio::test]
+    async fn a_leased_docs_write_concludes_its_audit_pair_with_allowed() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-abc"), "Q3 report")
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/documents/doc-1:batchUpdate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "documentId": "doc-1",
+                "replies": [{"replaceAllText": {"occurrencesChanged": 1}}],
+            })))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+
+        let outcome = write(
+            &drive,
+            &docs,
+            &replace_opts(false),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, WriteResult::Replaced { .. }));
+
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "allowed"], "{records:?}");
+        // The verb, not the engine — the same `["drive", <log_operation>]`
+        // this write's `drivemutation` record carries, so an auditor can
+        // see which verb ran without joining back to `log.jsonl`.
+        assert_eq!(records[0].command, ["drive", "docs-replace"]);
+    }
+
+    #[tokio::test]
+    async fn a_leased_docs_write_that_fails_concludes_its_audit_pair_with_the_error() {
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-abc"), "Q3 report")
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/documents/doc-1:batchUpdate"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+
+        let outcome = write(
+            &drive,
+            &docs,
+            &replace_opts(false),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        let WriteResult::Failed { detail } = &outcome.result else {
+            panic!("expected Failed, got {:?}", outcome.result);
+        };
+
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "failed"], "{records:?}");
+        assert_eq!(records[1].error.as_deref(), Some(detail.as_str()));
     }
 }

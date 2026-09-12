@@ -27,7 +27,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+    check_and_lock_lease, finish_leased_native_write, record_failed_leased_write,
+    LeaseCheckOutcome, LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
@@ -410,21 +411,27 @@ async fn validation_inner(
     // fetched before the (potentially slow) ancestor-chain walk and workbook
     // fetch above.
     let files_api = FilesApi::new(drive);
+    let leased = LeasedWrite {
+        log_prefix: "drive sheets validation",
+        operation: opts.verb.log_operation(),
+        ledger_path: &opts.ledger_path,
+        file_id: &opts.spreadsheet_id,
+    };
     let lease_lock = if requires_lease {
-        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
-            Ok(fresh) => fresh.version,
-            Err(err) => {
-                return gated(ValidationResult::Failed {
-                    detail: err.to_string(),
-                })
-            }
-        };
+        let (live_version, live_modified_time) =
+            match files_api.get_metadata(&opts.spreadsheet_id).await {
+                Ok(fresh) => (fresh.version, fresh.modified_time),
+                Err(err) => {
+                    return gated(ValidationResult::Failed {
+                        detail: err.to_string(),
+                    })
+                }
+            };
         match check_and_lock_lease(
-            "drive sheets validation",
-            &opts.ledger_path,
+            leased,
             opts.lease_token.as_deref(),
-            &opts.spreadsheet_id,
             live_version.as_deref(),
+            live_modified_time.as_deref(),
         ) {
             LeaseCheckOutcome::Ok(lock) => Some(lock),
             LeaseCheckOutcome::NoLease => return gated(ValidationResult::RefusedNoLease),
@@ -441,21 +448,17 @@ async fn validation_inner(
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(_response) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                refresh_lease_after_native_write(
-                    "drive sheets validation",
-                    lock,
-                    &opts.ledger_path,
-                    token,
-                    &files_api,
-                    &opts.spreadsheet_id,
-                )
-                .await;
+                finish_leased_native_write(leased, lock, token, &files_api).await;
             }
             ValidationResult::Changed { summary }
         }
-        Err(err) => ValidationResult::Failed {
-            detail: format!("{err:#}"),
-        },
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+                record_failed_leased_write(leased, token, &detail);
+            }
+            ValidationResult::Failed { detail }
+        }
     };
     drop(lease_lock);
     gated(result)
@@ -1757,5 +1760,59 @@ mod tests {
         };
         let outcome = validation(&drive, &sheets, &opts, &[rule]).await;
         assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[tokio::test]
+    async fn a_leased_validation_change_concludes_its_audit_pair_with_allowed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A10".to_string()),
+                condition: Condition::OneOfList(vec!["yes".to_string(), "no".to_string()]),
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
+
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "allowed"], "{records:?}");
+        // The verb, not the engine — the same `["drive", <log_operation>]`
+        // this write's `drivemutation` record carries, so an auditor can
+        // see which verb ran without joining back to `log.jsonl`.
+        assert_eq!(records[0].command, ["drive", "sheets-set-data-validation"]);
     }
 }

@@ -58,7 +58,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    check_and_lock_lease, refresh_lease_after_native_write, LeaseCheckOutcome,
+    check_and_lock_lease, finish_leased_native_write, record_failed_leased_write,
+    LeaseCheckOutcome, LeasedWrite,
 };
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
@@ -669,21 +670,27 @@ async fn structure_inner(
     // `target_gate::resolve` fetched before the (potentially slow)
     // ancestor-chain walk and workbook fetch above.
     let files_api = FilesApi::new(drive);
+    let leased = LeasedWrite {
+        log_prefix: "drive sheets structure",
+        operation: opts.verb.log_operation(),
+        ledger_path: &opts.ledger_path,
+        file_id: &opts.spreadsheet_id,
+    };
     let lease_lock = if requires_lease {
-        let live_version = match files_api.get_metadata(&opts.spreadsheet_id).await {
-            Ok(fresh) => fresh.version,
-            Err(err) => {
-                return gated(StructureResult::Failed {
-                    detail: err.to_string(),
-                })
-            }
-        };
+        let (live_version, live_modified_time) =
+            match files_api.get_metadata(&opts.spreadsheet_id).await {
+                Ok(fresh) => (fresh.version, fresh.modified_time),
+                Err(err) => {
+                    return gated(StructureResult::Failed {
+                        detail: err.to_string(),
+                    })
+                }
+            };
         match check_and_lock_lease(
-            "drive sheets structure",
-            &opts.ledger_path,
+            leased,
             opts.lease_token.as_deref(),
-            &opts.spreadsheet_id,
             live_version.as_deref(),
+            live_modified_time.as_deref(),
         ) {
             LeaseCheckOutcome::Ok(lock) => Some(lock),
             LeaseCheckOutcome::NoLease => return gated(StructureResult::RefusedNoLease),
@@ -705,15 +712,7 @@ async fn structure_inner(
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
             if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                refresh_lease_after_native_write(
-                    "drive sheets structure",
-                    lock,
-                    &opts.ledger_path,
-                    token,
-                    &files_api,
-                    &opts.spreadsheet_id,
-                )
-                .await;
+                finish_leased_native_write(leased, lock, token, &files_api).await;
             }
             StructureResult::Changed {
                 sheet_id: added_sheet_id(&response)
@@ -721,9 +720,13 @@ async fn structure_inner(
                 sheet,
             }
         }
-        Err(err) => StructureResult::Failed {
-            detail: format!("{err:#}"),
-        },
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+                record_failed_leased_write(leased, token, &detail);
+            }
+            StructureResult::Failed { detail }
+        }
     };
     drop(lease_lock);
     gated(result)
@@ -4919,5 +4922,43 @@ mod tests {
         let text = describe(&outcome);
         assert!(text.contains("file_id"), "{text}");
         assert!(text.contains("sheets-structure"), "{text}");
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[tokio::test]
+    async fn a_leased_structure_change_concludes_its_audit_pair_with_allowed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let verb = StructureVerb::RenameSheet {
+            sheet: "Q2".to_string(),
+            new_title: "Q2 (final)".to_string(),
+        };
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "allowed"], "{records:?}");
+        // The verb, not the engine — the same `["drive", <log_operation>]`
+        // this write's `drivemutation` record carries, so an auditor can
+        // see which verb ran without joining back to `log.jsonl`.
+        assert_eq!(records[0].command, ["drive", "sheets-rename-sheet"]);
     }
 }
