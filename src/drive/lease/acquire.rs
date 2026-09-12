@@ -445,36 +445,8 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::Unsupported;
+    use crate::test_support::AuditLogGuard as AuditGuard;
     use crate::utils::secret::Secret;
-
-    /// Redirects `OMNI_DEV_AUDIT_LOG_FILE` into an isolated tempdir for the
-    /// life of one test, holding [`crate::test_support::REQUEST_LOG_ENV_MUTEX`]
-    /// the whole time.
-    ///
-    /// Every test in this module that calls `acquire()` now triggers a
-    /// best-effort audit write (ADR-0080 §11) as a side effect, whether or
-    /// not the test cares about its content — without this guard, that
-    /// write would resolve to the real machine's default audit-log path
-    /// (writing test noise into a developer's or CI runner's actual
-    /// `audit.jsonl`) and, since the env var is process-global, could race
-    /// with any other concurrently-running test that also redirects it.
-    struct AuditGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl AuditGuard {
-        fn redirect(dir: &std::path::Path) -> Self {
-            let lock = crate::test_support::REQUEST_LOG_ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.join("audit.jsonl"));
-            Self { _lock: lock }
-        }
-    }
-    impl Drop for AuditGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-        }
-    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {

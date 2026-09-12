@@ -232,7 +232,8 @@ mod tests {
         // resolve `RefusedNativeDocument` deterministically regardless of
         // what Drive accounts happen to be configured locally.
         let guard = crate::drive::test_support::EnvGuard::take();
-        let _dir = guard.clear_credentials();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let server = native_document_server().await;
         let client = client_with_bootstrapped_token(&server).await;
         let cmd = LeaseCommand {
@@ -250,7 +251,8 @@ mod tests {
     #[tokio::test]
     async fn acquire_command_honours_an_explicit_backup_dir_and_biometrics_only() {
         let guard = crate::drive::test_support::EnvGuard::take();
-        let _dir = guard.clear_credentials();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let server = native_document_server().await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();

@@ -33,6 +33,41 @@ pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// follow-up, not a blocker.
 pub(crate) static REQUEST_LOG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Redirects `OMNI_DEV_AUDIT_LOG_FILE` into an isolated tempdir for the life
+/// of one test, holding [`REQUEST_LOG_ENV_MUTEX`] the whole time.
+///
+/// Every Drive lease-check/acquire test that reaches a live lease or a
+/// refusal now triggers a best-effort or write-ahead audit write
+/// (ADR-0080 §11) as a side effect of calling production code, whether or
+/// not the test cares about its content. Without this guard, that write
+/// resolves to the real machine's default audit-log path — silently
+/// writing test noise into a developer's or CI runner's actual
+/// `audit.jsonl` — and, since the env var is process-global, could also
+/// race with any other concurrently running test that redirects it.
+/// `drive::lease::acquire`'s test module was the first to need this and
+/// `drive::content_edit`/every Sheets/Docs write engine's test module
+/// needs the identical treatment, hence living here rather than as a
+/// private copy per module.
+pub(crate) struct AuditLogGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl AuditLogGuard {
+    pub(crate) fn redirect(dir: &std::path::Path) -> Self {
+        let lock = REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.join("audit.jsonl"));
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for AuditLogGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+    }
+}
+
 pub(crate) mod failing_io {
     //! Writer fixture that always returns `ErrorKind::Other` from
     //! `write` and `flush`. Used to drive `?`-propagation Err branches

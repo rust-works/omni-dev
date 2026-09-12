@@ -81,12 +81,27 @@ pub(crate) fn check_and_lock_lease(
     file_id: &str,
     live_version: Option<&str>,
 ) -> LeaseCheckOutcome {
+    // Every refusal below is also an audit event (ADR-0080 §11): "refused"/
+    // "expired"/"stale" for the ledger-level verdicts named in that section,
+    // widened by "failed" for an operational error (the ledger lock itself
+    // could not be acquired) the same way `drive lease acquire`'s own audit
+    // trail widens its verdict set beyond the ADR's base four. Best-effort —
+    // a write is already being refused regardless of whether this record
+    // lands, so a logging failure here changes nothing about the refusal.
+    let audit_refusal = |verdict: &str, lease_id: Option<&str>| {
+        write_check_audit(log_prefix, file_id, lease_id, verdict, live_version);
+    };
+
     let Some(token) = lease_token else {
+        audit_refusal("refused", None);
         return LeaseCheckOutcome::NoLease;
     };
     let lock = match LedgerLock::acquire(ledger_path) {
         Ok(lock) => lock,
-        Err(err) => return LeaseCheckOutcome::Failed(err.to_string()),
+        Err(err) => {
+            audit_refusal("failed", Some(token));
+            return LeaseCheckOutcome::Failed(err.to_string());
+        }
     };
     // Every exit below refuses unless the token is verified live, bound to
     // this file, and fresh — a `Result` failure anywhere in this lookup (an
@@ -107,22 +122,118 @@ pub(crate) fn check_and_lock_lease(
                  refusing the presented lease as expired rather than trusting an unreadable \
                  ledger"
             );
+            audit_refusal("expired", Some(token));
             return LeaseCheckOutcome::Expired;
         }
     };
     let Some(record) = ledger.get(token) else {
+        audit_refusal("expired", Some(token));
         return LeaseCheckOutcome::Expired;
     };
     if !record.is_live(chrono::Utc::now()) {
+        audit_refusal("expired", Some(token));
         return LeaseCheckOutcome::Expired;
     }
     if record.file_id != file_id {
+        audit_refusal("refused", Some(token));
         return LeaseCheckOutcome::WrongFile;
     }
     if live_version != Some(record.version.as_str()) {
+        audit_refusal("stale", Some(token));
         return LeaseCheckOutcome::Stale;
     }
+
+    // The write-ahead intent record (ADR-0080 §11): durably written before
+    // the mutating API call this lease authorises, fail-closed. Unlike
+    // every other audit write in this module and in `drive lease acquire`,
+    // a failure here refuses the write outright — this is the one point in
+    // the whole leased-write path the ADR requires it, since everything
+    // before it (the permission gate, the lease lookup itself) refuses
+    // without ever touching Drive content, and everything after it (the
+    // mutating call) is the content-mutating act this record's whole
+    // purpose is to make un-auditable-by-omission impossible.
+    let intent = crate::request_log::AuditOutcome {
+        command: vec![log_prefix.to_string()],
+        integration: "drive",
+        file_id: file_id.to_string(),
+        lease_id: Some(token.to_string()),
+        verdict: "pending".to_string(),
+        version_before: live_version.map(str::to_string),
+        ..Default::default()
+    };
+    if let Err(err) = crate::request_log::record_audit_event(intent) {
+        return LeaseCheckOutcome::Failed(format!(
+            "failed to write the write-ahead audit record: {err}"
+        ));
+    }
+
     LeaseCheckOutcome::Ok(lock)
+}
+
+/// Writes one best-effort `kind: "audit"` record for a lease-check outcome
+/// that never reaches a mutating call — either a refusal (see
+/// [`check_and_lock_lease`]'s own doc comment for why these stay
+/// best-effort) or, via [`write_outcome_audit`], the outcome half of a
+/// write that did.
+fn write_check_audit(
+    log_prefix: &str,
+    file_id: &str,
+    lease_id: Option<&str>,
+    verdict: &str,
+    version_before: Option<&str>,
+) {
+    let outcome = crate::request_log::AuditOutcome {
+        command: vec![log_prefix.to_string()],
+        integration: "drive",
+        file_id: file_id.to_string(),
+        lease_id: lease_id.map(str::to_string),
+        verdict: verdict.to_string(),
+        version_before: version_before.map(str::to_string),
+        ..Default::default()
+    };
+    if let Err(err) = crate::request_log::record_audit_event(outcome) {
+        tracing::warn!("{log_prefix}: failed to write audit record: {err}");
+    }
+}
+
+/// Writes the outcome half of a leased write's audit pair (ADR-0080 §11),
+/// after the mutating call this write's intent record (written inside
+/// [`check_and_lock_lease`]) already authorised has returned — `"allowed"`
+/// on success, `"failed"` on an API error. Best-effort, and deliberately
+/// independent of the intent record's own success: the mutating call has
+/// already happened either way by the time this runs, so there is nothing
+/// left to refuse (mirrors [`refresh_lease_after_write`]'s identical
+/// reasoning for the ledger side of a successful write).
+///
+/// `version_after`/`modified_time_after` are opportunistic, not another
+/// round trip: pass them when the mutating call's own response already
+/// carries them (content_edit.rs's `files.update`), `None` otherwise (every
+/// Sheets/Docs call, whose response carries no Drive metadata at all) — the
+/// refreshed ledger row already has that state for a surface willing to pay
+/// [`refresh_lease_after_native_write`]'s extra fetch, so a third round
+/// trip here just to duplicate it into the audit record would not be
+/// buying anything the ledger doesn't already have.
+pub(crate) fn write_outcome_audit(
+    log_prefix: &str,
+    file_id: &str,
+    lease_id: &str,
+    verdict: &str,
+    version_after: Option<String>,
+    modified_time_after: Option<String>,
+) {
+    let outcome = crate::request_log::AuditOutcome {
+        command: vec![log_prefix.to_string()],
+        integration: "drive",
+        file_id: file_id.to_string(),
+        lease_id: Some(lease_id.to_string()),
+        verdict: verdict.to_string(),
+        version_after,
+        modified_time_after,
+        ..Default::default()
+    };
+    if let Err(err) = crate::request_log::record_audit_event(outcome) {
+        tracing::warn!("{log_prefix}: failed to write outcome audit record: {err}");
+    }
 }
 
 /// Best-effort: updates the lease's recorded `version`/`modified_time`
@@ -209,8 +320,36 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::client::DriveClient;
-    use crate::drive::lease::ledger::{LeaseBackup, LeaseRecord};
+    use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
+    use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
+
+    fn seed_lease(ledger_path: &Path, token: &str, file_id: &str, version: &str) {
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(LeaseRecord {
+            token: token.to_string(),
+            file_id: file_id.to_string(),
+            version: version.to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            released_at: None,
+        });
+        ledger.save(ledger_path).unwrap();
+    }
+
+    fn read_audit_lines(audit_path: &Path) -> Vec<crate::request_log::LogRecord> {
+        std::fs::read_to_string(audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
@@ -249,6 +388,7 @@ mod tests {
         // expired, and the `warn!` names the unreadable path (the field
         // expression this test exercises).
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         std::fs::create_dir(&ledger_path).unwrap();
 
@@ -297,5 +437,159 @@ mod tests {
 
         let reloaded = LeaseLedger::load(&ledger_path).unwrap();
         assert_eq!(reloaded.get("tok").unwrap().version, "1");
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[test]
+    fn a_successful_check_writes_a_pending_intent_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        let outcome = check_and_lock_lease(
+            "drive edit",
+            &ledger_path,
+            Some("tok-1"),
+            "file-1",
+            Some("1"),
+        );
+        assert!(matches!(outcome, LeaseCheckOutcome::Ok(_)));
+
+        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].context.get("verdict").map(String::as_str),
+            Some("pending")
+        );
+        assert_eq!(
+            records[0].context.get("lease_id").map(String::as_str),
+            Some("tok-1")
+        );
+        assert_eq!(
+            records[0].context.get("version_before").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn the_write_is_refused_when_the_intent_record_cannot_be_written() {
+        // Fail-closed (ADR-0080 §11): unlike every refusal above, a failure
+        // to write the write-ahead record must refuse the write outright —
+        // this is the one point in the lease check the ADR requires it.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        // A directory in place of the audit file makes the write fail the
+        // same way an unwritable/missing-permission path would.
+        std::fs::create_dir(dir.path().join("audit.jsonl")).unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        let outcome = check_and_lock_lease(
+            "drive edit",
+            &ledger_path,
+            Some("tok-1"),
+            "file-1",
+            Some("1"),
+        );
+        let LeaseCheckOutcome::Failed(detail) = outcome else {
+            panic!("expected Failed, got a lock/refusal instead");
+        };
+        assert!(detail.contains("write-ahead"), "{detail}");
+    }
+
+    #[test]
+    fn each_refusal_writes_its_own_verdict_to_the_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        // No token presented at all.
+        assert!(matches!(
+            check_and_lock_lease("drive edit", &ledger_path, None, "file-1", Some("1")),
+            LeaseCheckOutcome::NoLease
+        ));
+        // Unknown token.
+        assert!(matches!(
+            check_and_lock_lease(
+                "drive edit",
+                &ledger_path,
+                Some("bogus"),
+                "file-1",
+                Some("1")
+            ),
+            LeaseCheckOutcome::Expired
+        ));
+        // Bound to a different file.
+        assert!(matches!(
+            check_and_lock_lease(
+                "drive edit",
+                &ledger_path,
+                Some("tok-1"),
+                "some-other-file",
+                Some("1")
+            ),
+            LeaseCheckOutcome::WrongFile
+        ));
+        // Stale version.
+        assert!(matches!(
+            check_and_lock_lease(
+                "drive edit",
+                &ledger_path,
+                Some("tok-1"),
+                "file-1",
+                Some("2")
+            ),
+            LeaseCheckOutcome::Stale
+        ));
+
+        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
+        let verdicts: Vec<Option<&String>> =
+            records.iter().map(|r| r.context.get("verdict")).collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                Some(&"refused".to_string()),
+                Some(&"expired".to_string()),
+                Some(&"refused".to_string()),
+                Some(&"stale".to_string()),
+            ]
+        );
+        // The no-token refusal carries no lease id; every other one does,
+        // even though the token turned out invalid — it is an identifier,
+        // not a bearer credential (docs/drive.md), safe to record.
+        assert_eq!(records[0].context.get("lease_id"), None);
+        assert_eq!(
+            records[1].context.get("lease_id").map(String::as_str),
+            Some("bogus")
+        );
+    }
+
+    #[test]
+    fn write_outcome_audit_records_the_final_verdict_and_post_write_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+
+        write_outcome_audit(
+            "drive edit",
+            "file-1",
+            "tok-1",
+            "allowed",
+            Some("2".to_string()),
+            Some("2026-09-12T00:00:00Z".to_string()),
+        );
+
+        let records = read_audit_lines(&dir.path().join("audit.jsonl"));
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].context.get("verdict").map(String::as_str),
+            Some("allowed")
+        );
+        assert_eq!(
+            records[0].context.get("version_after").map(String::as_str),
+            Some("2")
+        );
     }
 }
