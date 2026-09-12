@@ -326,4 +326,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ensure_parent_dir_0700_creates_a_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("run").join("k");
+        ensure_parent_dir_0700(&file).unwrap();
+        assert!(dir.path().join("run").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.path().join("run"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_parent_dir_0700_is_a_noop_when_the_parent_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k");
+        // The parent (`dir`) already exists — this must not error or touch it.
+        ensure_parent_dir_0700(&file).unwrap();
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn ensure_parent_dir_0700_is_a_noop_for_a_bare_filename() {
+        // A bare relative filename has an empty parent — nothing to create.
+        ensure_parent_dir_0700(Path::new("bare.txt")).unwrap();
+    }
 }
