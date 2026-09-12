@@ -39,7 +39,7 @@ use crate::drive::lease::check::{
     finish_leased_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::AuditOutcome;
 
@@ -128,9 +128,28 @@ pub enum RestoreResult {
         /// Why no authenticator is available.
         detail: String,
     },
-    /// An API, filesystem, integrity or ledger error.
+    /// An API, filesystem, integrity or ledger error — before any fresh
+    /// lease was minted. No Touch ID was spent and no backup was taken.
     Failed {
         /// A human-readable summary of what failed.
+        detail: String,
+    },
+    /// A fresh lease *was* minted — Touch ID answered, the file's current
+    /// state backed up, a ledger row written — but the restore write
+    /// itself could not go ahead: either the write-permission gate, checked
+    /// again immediately before the write (a human can answer the Touch ID
+    /// prompt up to two minutes after it's presented, ADR-0080 §7, and a
+    /// permission change landing in that window must not be ignored), now
+    /// refuses it, or the mutating call itself failed. `token` is real and
+    /// live regardless: present it to a later `--lease`, or re-run `drive
+    /// lease restore token` to use it rather than spending another prompt.
+    FreshLeaseButWriteFailed {
+        /// The fresh lease's token — not orphaned, even though this
+        /// attempt did not use it to write anything.
+        token: String,
+        /// When the fresh lease expires.
+        expires_at: DateTime<Utc>,
+        /// What stopped the write.
         detail: String,
     },
 }
@@ -157,6 +176,7 @@ impl RestoreResult {
             Self::Denied { .. } => "denied",
             Self::Unavailable { .. } => "unavailable",
             Self::Failed { .. } => "failed",
+            Self::FreshLeaseButWriteFailed { .. } => "fresh-lease-but-write-failed",
         }
     }
 }
@@ -285,6 +305,50 @@ async fn restore_inner(
             AcquireResult::Unavailable { detail } => return RestoreResult::Unavailable { detail },
             AcquireResult::Failed { detail } => return RestoreResult::Failed { detail },
         };
+    // From here on, a fresh lease is real and live — every remaining
+    // refusal must say so via `FreshLeaseButWriteFailed` rather than a
+    // bare `Failed`/`Blocked`, or the token (Touch ID spent, a real backup
+    // taken, a real ledger row) would be surfaced nowhere the caller could
+    // ever find it again (issue #1664 review finding).
+    let fresh_lease_but = |detail: String| RestoreResult::FreshLeaseButWriteFailed {
+        token: new_token.clone(),
+        expires_at,
+        detail,
+    };
+
+    // The write-permission gate is re-checked against a *fresh* target
+    // fetch here, immediately before the write — not reused from the
+    // check above, before `acquire`'s internal Touch ID prompt: that
+    // prompt can take up to two minutes to answer (ADR-0080 §7), and a
+    // permission change (or a mime-type change) landing in that window
+    // must not be silently ignored just because it was already checked
+    // once (issue #1664 review finding, mirroring `content_edit.rs`'s own
+    // "re-fetched fresh here rather than reusing the earlier snapshot"
+    // reasoning for its staleness check).
+    let target = match files_api.get_metadata(&file_id).await {
+        Ok(target) => target,
+        Err(err) => return fresh_lease_but(err.to_string()),
+    };
+    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
+        &files_api,
+        &target,
+        DriveOperation::Edit,
+        rules,
+    )
+    .await
+    {
+        Ok(evaluated) => evaluated,
+        Err(err) => return fresh_lease_but(err.to_string()),
+    };
+    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents
+        || evaluated.decision.verdict == write_gate::Verdict::Deny
+    {
+        return fresh_lease_but(
+            "the write-permission gate no longer allows this write, re-checked after the \
+             fresh lease's authentication prompt"
+                .to_string(),
+        );
+    }
 
     // The restore write itself, through the exact same audited, fail-closed
     // path every other leased write in this codebase uses — the fresh
@@ -300,10 +364,7 @@ async fn restore_inner(
     };
     let lock = match gate_leased_write(leased, &files_api, Some(&new_token)).await {
         Ok(lock) => lock,
-        Err(refusal) => {
-            let detail = leased_write_refusal_detail(refusal);
-            return RestoreResult::Failed { detail };
-        }
+        Err(refusal) => return fresh_lease_but(leased_write_refusal_detail(refusal)),
     };
     let result = match files_api
         .edit_content(&file_id, &backup_bytes, &target.mime_type)
@@ -326,7 +387,7 @@ async fn restore_inner(
         Err(err) => {
             let detail = err.to_string();
             record_failed_leased_write(leased, &new_token, &detail);
-            RestoreResult::Failed { detail }
+            fresh_lease_but(detail)
         }
     };
     drop(lock);
@@ -350,7 +411,12 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
     let bytes = std::fs::read(path)
         .map_err(|err| format!("Failed to read backup at {}: {err}", path.display()))?;
     let actual = crate::cli::drive::read::to_hex_string(&Sha256::digest(&bytes));
-    if actual != expected_sha256 {
+    // Case-insensitive, matching `verify_sha256_checksum`'s own comparison
+    // (`src/cli/drive/read.rs`) — both hash producers in this codebase
+    // always emit lowercase hex today, so this has no live trigger, but a
+    // case-sensitive compare here would be a latent bug the moment that
+    // stops being true (issue #1664 review finding).
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
         return Err(format!(
             "backup at {} no longer matches its recorded SHA-256 (expected {expected_sha256}, \
              got {actual}) — refusing to restore from what may be corrupted or tampered-with \
@@ -362,8 +428,19 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 }
 
 /// Best-effort: stamps `token`'s row with `restored_at` (ADR-0080 §4).
+///
+/// Takes its own [`LedgerLock`] — this runs after `restore_inner` has
+/// already released its own lock (acquired via `gate_leased_write`/
+/// `finish_leased_write` for the *fresh* lease's row), so without a fresh
+/// lock here this load-then-save could race a concurrent, unrelated `drive
+/// lease acquire`/write on a *different* file: `LeaseLedger::save`
+/// rewrites the whole file, so whichever of the two calls saves last would
+/// silently discard the other's change (issue #1664 review finding) —
+/// exactly the class of bug `LedgerLock` exists to prevent everywhere else
+/// in this module.
 fn mark_backup_restored(ledger_path: &Path, token: &str) {
     let result = (|| -> anyhow::Result<()> {
+        let _lock = LedgerLock::acquire(ledger_path)?;
         let mut ledger = LeaseLedger::load(ledger_path)?;
         ledger.mark_restored(token, Utc::now());
         ledger.save(ledger_path)
@@ -410,6 +487,13 @@ fn record_attempt(opts: &RestoreOptions, result: &RestoreResult) {
     let (lease_id, error) = match result {
         RestoreResult::Restored { new_token, .. } => (Some(new_token.clone()), None),
         RestoreResult::AlreadyLeased { token, .. } => (Some(token.clone()), None),
+        // A fresh lease was minted even though the write itself didn't
+        // land — its token belongs in `lease_id` here for the same reason
+        // `drive lease acquire`'s own audit record does: it is real and
+        // live, not merely attempted.
+        RestoreResult::FreshLeaseButWriteFailed { token, detail, .. } => {
+            (Some(token.clone()), Some(detail.clone()))
+        }
         RestoreResult::Denied { detail }
         | RestoreResult::Unavailable { detail }
         | RestoreResult::Failed { detail } => (None, Some(detail.clone())),
@@ -757,6 +841,147 @@ mod tests {
             .get(&new_token)
             .expect("fresh lease must be recorded");
         assert!(new_record.is_live(Utc::now()));
+    }
+
+    #[test]
+    fn mark_backup_restored_takes_its_own_lock_and_is_best_effort_when_unavailable() {
+        // Regression test for issue #1664's review finding: marking the
+        // backup lease as restored-from must take its own `LedgerLock`
+        // (closing a concurrent-save race with an unrelated
+        // acquire/write elsewhere in this module — `LeaseLedger::save`
+        // rewrites the whole file). Tested directly against the private
+        // function rather than through the full `restore()` flow: every
+        // step of that flow (the fresh lease's own acquire, its
+        // `gate_leased_write` check) shares the *same* lock path, so
+        // pre-holding it for the whole flow would block those legitimate
+        // acquisitions too, not just this one.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_backup_lease(&ledger_path, "file-1", write_backup_file(dir.path(), b"x"));
+        let mut lock_path = ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::File::create(std::path::PathBuf::from(lock_path)).unwrap();
+
+        // Must not panic despite the lock already being held.
+        mark_backup_restored(&ledger_path, "backup-token");
+
+        let ledger = LeaseLedger::load(&ledger_path).unwrap();
+        assert!(
+            ledger.get("backup-token").unwrap().restored_at.is_none(),
+            "the lock was held, so the mark must not have landed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_revoked_during_the_prompt_reports_the_fresh_lease_but_refuses_the_write()
+    {
+        // Regression test for issue #1664's review finding: the
+        // write-permission gate is checked once before minting the fresh
+        // lease and again immediately before the write, since the
+        // interactive authentication prompt in between can take up to two
+        // minutes to answer (ADR-0080 §7). The first `files.get`/gate pair
+        // allows; the second denies — simulating a permission change
+        // landing during the wait.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+
+        // First pass (the initial gate check, before minting a fresh
+        // lease): parent-1 allows.
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // The fresh acquire's own two `files.get`s (pre-auth and
+        // post-backup) still see `parent-1` too — only the *third* fetch,
+        // the re-check right before the write, sees the new, unlisted
+        // parent.
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(2)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        // The re-check's own fetch: now parented under a folder no rule
+        // grants.
+        mount_file("file-1", "text/plain", &["now-unlisted-parent"])
+            .with_priority(3)
+            .mount(&server)
+            .await;
+        mount_folder("now-unlisted-parent").mount(&server).await;
+        // No PATCH mock: reaching the write would mean the re-check failed
+        // to catch the revoked permission.
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(
+            token, old_token,
+            "the surfaced token must be the fresh one, not the backup token"
+        );
+        // The fresh lease must still be live and findable, even though the
+        // write it authorised never happened.
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        assert!(ledger.get(&token).unwrap().is_live(Utc::now()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_restore_write_still_surfaces_the_fresh_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        assert!(
+            ledger.get(&old_token).unwrap().restored_at.is_none(),
+            "a failed write must not mark the backup lease as restored-from"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

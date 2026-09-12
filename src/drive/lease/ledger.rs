@@ -192,10 +192,6 @@ impl LeaseLedger {
             .find(|record| record.file_id == file_id && record.is_live(now))
     }
 
-    /// Updates the recorded `version`/`modified_time` for `token` after a
-    /// successful write under it (ADR-0080 §5's multi-use semantics). A
-    /// no-op if the token is absent, which should not happen — the caller
-    /// already validated it via [`Self::get`] before performing the write.
     /// Marks `token`'s row as having been restored from (ADR-0080 §4/§10),
     /// stamped with `at`. A no-op if the token is absent. Idempotent: a
     /// second restore from the same backup just overwrites the timestamp,
