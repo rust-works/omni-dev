@@ -272,6 +272,7 @@ mod tests {
 
     #[test]
     fn resolve_path_reads_audit_jsonl_only_when_the_flag_is_set() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

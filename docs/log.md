@@ -479,7 +479,7 @@ itself does), `backup_location` (a local path for a byte backup, or the
 backup copy's own file id for a native-document backup),
 `backup_sha256`/`backup_size` (byte backups only), and `auth_policy`
 (`device-owner` or `biometrics-only`). Unlike a leased *write*'s own record
-(a later phase), this one is best-effort rather than write-ahead/fail-closed:
+(below), this one is best-effort rather than write-ahead/fail-closed:
 acquiring mutates no Drive content — by the time the record is written the
 consent, the backup and the ledger row have already durably happened, so a
 logging failure is warned and does not turn a successful acquisition into a
@@ -487,27 +487,36 @@ reported failure.
 
 A leased **write** produces records in **both** files, correlated by
 `invocation_id`: its ordinary `drivemutation` record here in `log.jsonl`
-(ADR-0070/0071/0073/0075/0076/0077/0078), and, in `audit.jsonl`, up to two
-`audit` records from `crate::drive::lease::check::check_and_lock_lease`
-(shared by every leased-write engine — `drive edit` today, the six
-Sheets/Docs engines following the same one-line pattern):
+(ADR-0070/0071/0073/0075/0076/0077/0078), and, in `audit.jsonl`, one or
+two `audit` records from `crate::drive::lease::check` — shared by every
+leased-write engine (`drive edit`, the five Sheets engines and `drive docs
+write`). Their `command` is `["drive", <operation>]` with the **verb's**
+operation name — `["drive", "edit"]`, `["drive", "sheets-delete-sheet"]`,
+`["drive", "docs-replace"]` — byte-for-byte the `command` of the same
+write's `drivemutation` record, so `--query 'command:sheets-delete-sheet'`
+matches both files and the audit record names the verb that ran, not
+merely which engine ran it:
 
-- A refusal that never reaches the mutating call (`verdict`:
-  `refused`/`expired`/`stale`/`failed`) writes **one** best-effort record —
-  there is no mutation to pair a write-ahead record around.
-- A presented lease that checks out writes a **write-ahead** `"pending"`
-  intent record, `command: ["drive edit"]` (or the equivalent Sheets/Docs
-  command), carrying `lease_id` and `version_before` — durably, before the
-  mutating API call this lease authorises, and fail-closed: if this write
-  fails, the write itself is refused rather than proceeding unaudited (the
-  one place in the whole ADR this contract actually applies, per §11).
-  After the mutating call returns, a best-effort **outcome** record follows
-  with the same `lease_id` and `verdict: allowed` or `verdict: failed`,
-  plus `version_after`/`modified_time_after` when the mutating call's own
-  response carried them for free (`drive edit`'s `files.update`; every
-  Sheets/Docs call carries no Drive metadata in its response at all, so
-  those omit it rather than spend a third round trip only to duplicate
-  what the refreshed ledger row already has).
+- A refusal that never reaches the mutating call writes **one** best-effort
+  record — `verdict: refused-no-lease`, `refused-lease-expired`,
+  `refused-lease-wrong-file` or `refused-lease-stale`, mirroring the
+  engine's own reported result, or `failed` with the `error` when the
+  ledger lock could not be taken. There is no mutation to pair a
+  write-ahead record around.
+- A presented lease that checks out writes a **write-ahead** `pending`
+  intent record carrying `lease_id`, `version_before` and
+  `modified_time_before`, `fsync`ed before the mutating API call this
+  lease authorises, and fail-closed: if this record cannot be written the
+  write itself is refused rather than proceeding unaudited (the one place
+  in the whole ADR this contract applies, per §11). After the mutating
+  call returns, a best-effort **outcome** record follows with the same
+  `lease_id`: `verdict: allowed` with `version_after`/`modified_time_after`
+  (from `files.update`'s own response for `drive edit`, from the post-write
+  `files.get` the ledger refresh already pays for on Sheets/Docs), or
+  `verdict: failed` with the API `error` — including a Docs `412` on
+  `writeControl.requiredRevisionId`, which the CLI reports as
+  `stale-revision`: the *lease* was not stale, the mutation simply did not
+  happen, and the error says why.
 
 An intent record with no matching outcome is itself the signal that
 something was interrupted mid-write — the whole point of writing the

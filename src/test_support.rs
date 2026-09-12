@@ -33,38 +33,87 @@ pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// follow-up, not a blocker.
 pub(crate) static REQUEST_LOG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Redirects `OMNI_DEV_AUDIT_LOG_FILE` into an isolated tempdir for the life
-/// of one test, holding [`REQUEST_LOG_ENV_MUTEX`] the whole time.
+/// Redirects the audit log into an isolated tempdir for the life of one
+/// test — for this thread only, through `request_log::TEST_AUDIT_ROUTE`,
+/// not the process-global `OMNI_DEV_AUDIT_LOG_FILE` — so it needs no
+/// [`REQUEST_LOG_ENV_MUTEX`] and tests holding one run fully in parallel.
 ///
 /// Every Drive lease-check/acquire test that reaches a live lease or a
-/// refusal now triggers a best-effort or write-ahead audit write
-/// (ADR-0080 §11) as a side effect of calling production code, whether or
-/// not the test cares about its content. Without this guard, that write
-/// resolves to the real machine's default audit-log path — silently
-/// writing test noise into a developer's or CI runner's actual
-/// `audit.jsonl` — and, since the env var is process-global, could also
-/// race with any other concurrently running test that redirects it.
-/// `drive::lease::acquire`'s test module was the first to need this and
-/// `drive::content_edit`/every Sheets/Docs write engine's test module
-/// needs the identical treatment, hence living here rather than as a
-/// private copy per module.
+/// refusal triggers a best-effort or write-ahead audit write (ADR-0080
+/// §11) as a side effect of calling production code, whether or not the
+/// test cares about its content. A test that doesn't redirect lands in
+/// `request_log`'s shared scratch file — never the real machine's
+/// `audit.jsonl`, and never another test's env override either, since an
+/// un-opted thread does not consult the env var at all; a test that wants
+/// to read its *own* records back takes this guard. The writes this guard
+/// observes must therefore happen on the test's own thread (a
+/// `#[tokio::test]` body does; a `spawn_blocking` closure does not).
+///
+/// [`Self::records`] reads back what production code wrote, so a test
+/// asserting on the audit trail needs no private line-parsing helper.
 pub(crate) struct AuditLogGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    path: std::path::PathBuf,
 }
 
 impl AuditLogGuard {
     pub(crate) fn redirect(dir: &std::path::Path) -> Self {
-        let lock = REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.join("audit.jsonl"));
-        Self { _lock: lock }
+        let path = dir.join("audit.jsonl");
+        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| {
+            *slot.borrow_mut() = Some(crate::request_log::TestAuditRoute::Path(path.clone()));
+        });
+        Self { path }
+    }
+
+    /// Every record written so far, in order. An audit file that was never
+    /// created (nothing wrote) reads as empty rather than panicking, so a
+    /// "must write nothing" assertion is `assert!(guard.records().is_empty())`.
+    pub(crate) fn records(&self) -> Vec<crate::request_log::LogRecord> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => panic!("failed to read {}: {err}", self.path.display()),
+        }
+    }
+
+    /// The `verdict` of every record written so far, in order — the
+    /// assertion almost every audit-trail test makes.
+    pub(crate) fn verdicts(&self) -> Vec<String> {
+        self.records()
+            .iter()
+            .map(|record| record.context.get("verdict").cloned().unwrap_or_default())
+            .collect()
     }
 }
 
 impl Drop for AuditLogGuard {
     fn drop(&mut self) {
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Opts the current test thread into release-build audit path resolution
+/// — `OMNI_DEV_AUDIT_LOG_FILE` if set, else the scratch default — for the
+/// life of one test. The counterpart of [`AuditLogGuard`] for the handful
+/// of tests *of* the env override itself; a thread holding neither is
+/// pinned to the scratch file and cannot see the env var. Anything that
+/// sets the env var must still hold [`REQUEST_LOG_ENV_MUTEX`], since the
+/// var itself remains process-global among the threads that opted in.
+pub(crate) struct AuditEnvRouteGuard;
+
+impl AuditEnvRouteGuard {
+    pub(crate) fn take() -> Self {
+        crate::request_log::TEST_AUDIT_ROUTE
+            .with(|slot| *slot.borrow_mut() = Some(crate::request_log::TestAuditRoute::Env));
+        Self
+    }
+}
+
+impl Drop for AuditEnvRouteGuard {
+    fn drop(&mut self) {
+        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = None);
     }
 }
 

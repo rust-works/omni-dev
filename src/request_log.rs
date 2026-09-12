@@ -360,16 +360,17 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
-/// Resolves a runtime log path: `env_var` override if set and non-empty,
-/// else `state_dir` (falling back to `data_dir`) joined with
-/// `omni-dev/<file_name>`. Shared by [`log_file_path`] and
-/// [`audit_file_path`] so the two sinks' resolution policy can't drift apart.
-fn resolve_runtime_log_path(env_var: &str, file_name: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(env_var) {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
+/// The `env_var` override of a runtime log path, if set and non-empty.
+fn env_path_override(env_var: &str) -> Option<PathBuf> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The default location of a runtime log: `state_dir` (falling back to
+/// `data_dir`) joined with `omni-dev/<file_name>`.
+fn default_runtime_log_path(file_name: &str) -> Option<PathBuf> {
     let base = dirs::state_dir().or_else(dirs::data_dir)?;
     Some(base.join("omni-dev").join(file_name))
 }
@@ -377,70 +378,127 @@ fn resolve_runtime_log_path(env_var: &str, file_name: &str) -> Option<PathBuf> {
 /// Resolves the log file path: `OMNI_DEV_LOG_FILE` override, else
 /// `state_dir` (falling back to `data_dir`) joined with `omni-dev/log.jsonl`.
 pub fn log_file_path() -> Option<PathBuf> {
-    resolve_runtime_log_path("OMNI_DEV_LOG_FILE", LOG_FILE_NAME)
+    env_path_override("OMNI_DEV_LOG_FILE").or_else(|| default_runtime_log_path(LOG_FILE_NAME))
 }
 
 /// Resolves the audit log file path.
 ///
 /// `OMNI_DEV_AUDIT_LOG_FILE` override, else `state_dir` (falling back to
 /// `data_dir`) joined with `omni-dev/audit.jsonl` — a sibling of
-/// [`log_file_path`]'s default, but since either resolver can be redirected
-/// independently via its own env override, nothing here *guarantees* the two
-/// stay distinct; [`record_audit`] checks that at write time instead of
-/// merely assuming it.
+/// [`log_file_path`]'s default, resolved through the same two helpers so
+/// the two sinks' policy can't drift apart. Since either can be redirected
+/// independently via its own env override, nothing here *guarantees* the
+/// two stay distinct; [`record_audit`] checks that at write time instead
+/// of merely assuming it.
 ///
-/// In test builds, an unset override never falls through to the real
-/// machine's default path: it resolves to one process-lifetime scratch
-/// path instead (`test_default_audit_log_path`, `#[cfg(test)]`-only).
-/// ADR-0080 §9/§11 made
-/// `check_and_lock_lease` (and `drive lease acquire`) write an audit
-/// record on essentially every lease-checking code path, so *any* test
-/// anywhere in the crate that exercises a leased write or an acquire
-/// without itself redirecting `OMNI_DEV_AUDIT_LOG_FILE` would otherwise
+/// The body is the same in every build; only `test_audit_file_override`
+/// differs. In a release build it is always `None`, so the env override
+/// and the real default are all there is. In a test build it routes
+/// **per thread** (see that function): a thread that opted into nothing
+/// is pinned to a shared scratch file and never sees the env var or the
+/// real default, so no test can pollute another's file — or the machine's
+/// — by omission.
+pub fn audit_file_path() -> Option<PathBuf> {
+    test_audit_file_override()
+        .or_else(|| env_path_override("OMNI_DEV_AUDIT_LOG_FILE"))
+        .or_else(default_audit_file_path)
+}
+
+/// Release builds have no per-thread override.
+#[cfg(not(test))]
+fn test_audit_file_override() -> Option<PathBuf> {
+    None
+}
+
+/// How the current test thread's audit writes are routed
+/// (`crate::test_support::AuditLogGuard` / `AuditEnvRouteGuard` set it).
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum TestAuditRoute {
+    /// This thread's own isolated file — a test that reads its records back.
+    Path(PathBuf),
+    /// Release-build semantics: `OMNI_DEV_AUDIT_LOG_FILE`, else the
+    /// scratch default — a test of the env override itself.
+    Env,
+}
+
+/// The per-thread routing a test build applies before the env override.
+///
+/// Per thread rather than via the env var, and defaulting to the scratch
+/// file rather than to "consult the env var", both on purpose. The env
+/// var is process-global, and dozens of engine tests exercise a leased
+/// write without caring about the audit record it writes; if those fell
+/// through to the env var, any of them running concurrently with a test
+/// that had *set* it — under `REQUEST_LOG_ENV_MUTEX`, which the engine
+/// tests never take — would append into that test's file (a `trailing
+/// characters` parse failure there, seen in practice) or, when the
+/// setter names a real path, onto the machine. So an un-opted thread is
+/// pinned to the scratch file unconditionally, and only a thread that
+/// declared [`TestAuditRoute::Env`] can see the env var at all. The
+/// isolation is therefore symmetric: a redirecting test cannot be written
+/// into by a non-redirecting one, and an env-routing test cannot either.
+///
+/// Being per-thread does mean the writes a test wants to observe must
+/// happen on the test's own thread: `#[tokio::test]`'s current-thread
+/// runtime and even a `multi_thread` runtime's root future both run
+/// there, but a `spawn_blocking`/`tokio::spawn`ed write lands in the
+/// shared scratch file instead.
+#[cfg(test)]
+fn test_audit_file_override() -> Option<PathBuf> {
+    match TEST_AUDIT_ROUTE.with(|slot| slot.borrow().clone()) {
+        Some(TestAuditRoute::Path(path)) => Some(path),
+        Some(TestAuditRoute::Env) => None,
+        None => default_audit_file_path(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_AUDIT_ROUTE: std::cell::RefCell<Option<TestAuditRoute>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where [`audit_file_path`] lands when `OMNI_DEV_AUDIT_LOG_FILE` is unset.
+#[cfg(not(test))]
+fn default_audit_file_path() -> Option<PathBuf> {
+    default_runtime_log_path(AUDIT_FILE_NAME)
+}
+
+/// Test-build variant of the function above: one shared scratch path for
+/// the whole test binary's process lifetime, never the real machine's
+/// default. Reached both for an un-opted thread (from
+/// `test_audit_file_override`, unconditionally) and for a
+/// `TestAuditRoute::Env` thread whose env var is unset.
+///
+/// ADR-0080 §9/§11 made `check_and_lock_lease` (and `drive lease acquire`)
+/// write an audit record on essentially every lease-checking code path, so
+/// *any* test anywhere in the crate that exercises a leased write or an
+/// acquire without itself redirecting the audit log would otherwise
 /// silently write real-looking rows into a developer's or CI runner's
 /// actual `audit.jsonl` — which is exactly what happened before this
-/// fallback existed. A test that wants to inspect its *own* isolated
-/// audit output still should redirect the env var explicitly (see
-/// `crate::test_support::AuditLogGuard`) rather than rely on this shared
-/// fallback, which many tests write into concurrently.
-#[cfg(not(test))]
-pub fn audit_file_path() -> Option<PathBuf> {
-    resolve_runtime_log_path("OMNI_DEV_AUDIT_LOG_FILE", AUDIT_FILE_NAME)
-}
-
-/// Test-build variant of the function above.
-///
-/// An unset override resolves to a shared scratch path
-/// (`test_default_audit_log_path`) rather than the real machine's default,
-/// for the reason spelled out in that doc comment.
-#[cfg(test)]
-pub fn audit_file_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OMNI_DEV_AUDIT_LOG_FILE") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    Some(test_default_audit_log_path())
-}
-
-/// The shared scratch path every test-build call to [`audit_file_path`]
-/// falls back to when `OMNI_DEV_AUDIT_LOG_FILE` is unset. One `tempdir` for
-/// the whole test binary's process lifetime, deliberately never cleaned up
-/// (`mem::forget`) — a `cargo test` process is short-lived, and the
-/// alternative (resolving to the real machine's default path) is the
+/// fallback existed. A test that wants to inspect its *own* audit output
+/// redirects explicitly (`crate::test_support::AuditLogGuard`) rather than
+/// rely on this shared fallback, which many tests write into concurrently
+/// — and which is why a fail-closed intent write to it never fails
+/// (nothing ever makes it unwritable, unlike a test's own redirected
+/// path). The `tempdir` is deliberately never cleaned up (`mem::forget`)
+/// — a `cargo test` process is short-lived, and the alternative is the
 /// actual risk this function exists to close off.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-fn test_default_audit_log_path() -> PathBuf {
+fn default_audit_file_path() -> Option<PathBuf> {
     use std::sync::OnceLock;
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = tempfile::tempdir().expect("failed to create a scratch dir for test audit logs");
-        let path = dir.path().join(AUDIT_FILE_NAME);
-        std::mem::forget(dir);
-        path
-    })
-    .clone()
+    Some(
+        PATH.get_or_init(|| {
+            let dir =
+                tempfile::tempdir().expect("failed to create a scratch dir for test audit logs");
+            let path = dir.path().join(AUDIT_FILE_NAME);
+            std::mem::forget(dir);
+            path
+        })
+        .clone(),
+    )
 }
 
 /// Appends one record. Best effort: every error is swallowed (logged at
@@ -489,6 +547,16 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// [`audit_file_path`] resolves to the same path as [`log_file_path`] (an env
 /// override misconfiguration that would otherwise silently blend the
 /// fail-closed sink into the best-effort, prunable one).
+///
+/// The appended line is `fsync`ed (`sync_data`, then the parent directory
+/// on unix so a freshly created file's entry is durable too) before this
+/// returns — the one place in the module that pays for it. "Durably
+/// written before the mutating call" (ADR-0080 §11) has to survive more
+/// than the process dying: a plain `write` only reaches the page cache,
+/// which an OS crash or power loss between this return and the mutating
+/// call would discard, leaving a mutation with no intent record — the
+/// exact gap the sink exists to make impossible. Two syncs per leased
+/// write are cheap; the best-effort request log deliberately pays neither.
 pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::{ensure, Context};
 
@@ -506,16 +574,16 @@ pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
             path.display()
         );
     }
-    append_record_to(&path, entry, append_line_no_rotation)
+    append_record_to(&path, entry, append_line_synced)
 }
 
 /// Serializes `entry` and appends it to `path` via `append`, creating a
 /// missing `0700` parent directory first. Shared by [`try_record`] (passing
 /// [`append_line`], which opts into rotation when configured) and
-/// [`record_audit`] (passing [`append_line_no_rotation`] directly, so the
-/// audit sink can never be rotated regardless of
-/// `OMNI_DEV_LOG_MAX_SIZE`) — the two differ only in path resolution and
-/// which appender they hand in, not in how a line actually gets written.
+/// [`record_audit`] (passing [`append_line_synced`], which never rotates
+/// regardless of `OMNI_DEV_LOG_MAX_SIZE` and syncs the line to disk) — the
+/// two differ only in path resolution and which appender they hand in, not
+/// in how a line actually gets written.
 fn append_record_to(
     path: &Path,
     entry: &LogRecord,
@@ -565,6 +633,28 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
 /// [`append_line`] itself once rotation is confirmed inactive.
 #[cfg(unix)]
 fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    append_line_unrotated(path, line, false)
+}
+
+/// [`append_line_no_rotation`] plus a `sync_data` on the handle before it
+/// closes, so the line is on disk (not merely in the page cache) when this
+/// returns, followed by an `fsync` of the parent directory: the first-ever
+/// append *creates* the file, and a data sync on the file does not persist
+/// the new directory entry — without the directory sync a crash right
+/// after the first leased write could lose the whole file, not just the
+/// line. The audit sink's appender — see [`record_audit`] for why it is
+/// the one writer that pays for either.
+#[cfg(unix)]
+fn append_line_synced(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    append_line_unrotated(path, line, true)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -578,14 +668,23 @@ fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive) {
             Ok(mut guard) => {
                 guard.write_all(line.as_bytes())?;
+                if sync {
+                    guard.sync_data()?;
+                }
             }
             Err((mut file, _)) => {
                 file.write_all(line.as_bytes())?;
+                if sync {
+                    file.sync_data()?;
+                }
             }
         }
     } else {
         let mut file = file;
         file.write_all(line.as_bytes())?;
+        if sync {
+            file.sync_data()?;
+        }
     }
     Ok(())
 }
@@ -603,11 +702,26 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
 /// See [`append_line`]'s doc comment on non-unix targets.
 #[cfg(not(unix))]
 fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    append_line_unrotated(path, line, false)
+}
+
+/// See the unix variant. No directory sync here: a directory cannot be
+/// opened as a `File` off unix, and the data sync is still applied.
+#[cfg(not(unix))]
+fn append_line_synced(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
+    append_line_unrotated(path, line, true)
+}
+
+#[cfg(not(unix))]
+fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)?;
     file.write_all(line.as_bytes())?;
+    if sync {
+        file.sync_data()?;
+    }
     Ok(())
 }
 
@@ -1337,9 +1451,12 @@ pub struct AuditOutcome {
     pub lease_id: Option<String>,
     /// What happened, kebab-case: `"acquired"`, `"refused-native-document"`,
     /// `"denied"`, `"unavailable"`, `"failed"` for an acquire attempt;
-    /// `"allowed"`, `"refused-no-lease"`, `"refused-lease-expired"`,
-    /// `"refused-lease-wrong-file"`, `"refused-lease-stale"` for a leased
-    /// write. Free-form rather than a closed enum, like every other
+    /// `"pending"` (the write-ahead intent), then `"allowed"` or `"failed"`
+    /// (the outcome), or a single `"refused-no-lease"`,
+    /// `"refused-lease-expired"`, `"refused-lease-wrong-file"`,
+    /// `"refused-lease-stale"` / `"failed"` for a leased write that never
+    /// reached its mutating call (`crate::drive::lease::check::verdict`).
+    /// Free-form rather than a closed enum, like every other
     /// `*Result::log_status` in this codebase — a later integration's
     /// verdict vocabulary doesn't need a schema change here.
     pub verdict: String,
@@ -2574,6 +2691,7 @@ mod tests {
 
     #[test]
     fn record_audit_event_writes_to_the_audit_sink() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2617,6 +2735,7 @@ mod tests {
 
     #[test]
     fn audit_file_path_honors_env_override() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2632,38 +2751,66 @@ mod tests {
     fn audit_file_path_never_resolves_to_the_real_machine_default_when_unset() {
         // Regression test for a real incident: before this fallback
         // existed, any test exercising a leased write or `drive lease
-        // acquire` without itself redirecting `OMNI_DEV_AUDIT_LOG_FILE`
-        // silently wrote into this machine's actual `audit.jsonl`. With
-        // the var unset, every call in a test build must land on the
-        // same shared scratch path — stable across calls (so it's
-        // memoized once, not re-created per call) and never the real
+        // acquire` without itself redirecting the audit log silently
+        // wrote into this machine's actual `audit.jsonl`. With the var
+        // unset, every call in a test build must land on the same shared
+        // scratch path — stable across calls (so it's memoized once, not
+        // re-created per call) and never the real
         // `dirs::state_dir()`/`dirs::data_dir()`-based default the
-        // non-test build resolves to.
+        // non-test build resolves to — whether the thread routes through
+        // the env var or not.
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-
-        let first = audit_file_path().unwrap();
-        let second = audit_file_path().unwrap();
-        assert_eq!(
-            first, second,
-            "the fallback path must be stable across calls"
-        );
-
         let real_default = dirs::state_dir()
             .or_else(dirs::data_dir)
             .unwrap()
             .join("omni-dev")
             .join(AUDIT_FILE_NAME);
+
+        let unrouted = audit_file_path().unwrap();
+        assert_eq!(
+            unrouted,
+            audit_file_path().unwrap(),
+            "the fallback path must be stable across calls"
+        );
         assert_ne!(
-            first, real_default,
+            unrouted, real_default,
             "must never fall back to the real machine's default audit log path in a test build"
+        );
+
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
+        assert_eq!(
+            audit_file_path().unwrap(),
+            unrouted,
+            "an env-routing thread with the var unset lands on the same scratch file"
+        );
+    }
+
+    #[test]
+    fn an_unrouted_test_thread_never_sees_the_audit_env_override() {
+        // The other half of the isolation: a test that did not opt into
+        // the env route (every engine test that merely goes through a
+        // lease) must be pinned to the scratch file even while some other
+        // thread has the env var set — otherwise it would append into
+        // that thread's file, mutex or no mutex.
+        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
+        let resolved = audit_file_path();
+        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        assert_ne!(
+            resolved,
+            Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl")),
+            "an unrouted thread must not resolve to another test's env override"
         );
     }
 
     #[test]
     fn record_audit_writes_a_line_that_round_trips() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2706,6 +2853,7 @@ mod tests {
 
     #[test]
     fn record_audit_is_exempt_from_omni_dev_log_disable() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2751,6 +2899,7 @@ mod tests {
 
     #[test]
     fn record_audit_refuses_a_non_audit_kind_entry() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2771,6 +2920,7 @@ mod tests {
 
     #[test]
     fn record_audit_refuses_when_the_audit_path_collides_with_the_log_path() {
+        let _route = crate::test_support::AuditEnvRouteGuard::take();
         let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
