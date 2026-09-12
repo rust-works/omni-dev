@@ -6,7 +6,7 @@ use crate::drive::account::ResolvedAccount;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
 use crate::drive::write_gate::FolderPermissionRule;
-use crate::utils::settings::Settings;
+use crate::utils::settings::{DriveAccountSettings, Settings};
 
 /// Creates an authenticated Drive API client from environment/settings-resolved credentials.
 pub fn create_client() -> Result<DriveClient> {
@@ -33,6 +33,23 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
     DriveClient::from_credentials(&credentials)
 }
 
+/// Reads one field off the active account's settings — `Some` for a
+/// [`ResolvedAccount::Named`] account that has one configured, `None` for
+/// an [`ResolvedAccount::Unconfigured`] account (nothing configured at all)
+/// or a named one with no value set for `f` to read. The load/resolve/match
+/// dance every "active account's X" helper needs, factored out once so it
+/// cannot drift between them the way copied-by-hand code eventually does.
+fn active_account_field<T>(
+    f: impl FnOnce(&DriveAccountSettings) -> Option<T>,
+) -> Result<Option<T>> {
+    let settings = Settings::load().unwrap_or_default();
+    let resolved = auth::resolve(&settings.drive, None)?;
+    Ok(match &resolved {
+        ResolvedAccount::Named(name) => settings.drive.accounts.get(name).and_then(f),
+        ResolvedAccount::Unconfigured => None,
+    })
+}
+
 /// Reads the active account's `write_permissions.rules` from
 /// `~/.omni-dev/settings.json` (issue #1574). An
 /// [`ResolvedAccount::Unconfigured`] account has no `write_permissions`
@@ -43,17 +60,7 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
 /// `permissions check` — previously each of the five reimplemented this
 /// identically.
 pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
-    let settings = Settings::load().unwrap_or_default();
-    let resolved = auth::resolve(&settings.drive, None)?;
-    Ok(match &resolved {
-        ResolvedAccount::Named(name) => settings
-            .drive
-            .accounts
-            .get(name)
-            .map(|a| a.write_permissions.rules.clone())
-            .unwrap_or_default(),
-        ResolvedAccount::Unconfigured => Vec::new(),
-    })
+    Ok(active_account_field(|a| Some(a.write_permissions.rules.clone()))?.unwrap_or_default())
 }
 
 /// Reads the active account's `lease_backup_folder_id`
@@ -63,16 +70,7 @@ pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
 /// either of which means `drive lease acquire` refuses every native-
 /// document target for this account.
 pub fn active_account_lease_backup_folder_id() -> Result<Option<String>> {
-    let settings = Settings::load().unwrap_or_default();
-    let resolved = auth::resolve(&settings.drive, None)?;
-    Ok(match &resolved {
-        ResolvedAccount::Named(name) => settings
-            .drive
-            .accounts
-            .get(name)
-            .and_then(|a| a.lease_backup_folder_id.clone()),
-        ResolvedAccount::Unconfigured => None,
-    })
+    active_account_field(|a| a.lease_backup_folder_id.clone())
 }
 
 #[cfg(test)]

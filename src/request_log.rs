@@ -368,17 +368,21 @@ fn env_path_override(env_var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The default location of a runtime log: `state_dir` (falling back to
-/// `data_dir`) joined with `omni-dev/<file_name>`.
-fn default_runtime_log_path(file_name: &str) -> Option<PathBuf> {
+/// The default location of an omni-dev runtime file: `state_dir` (falling
+/// back to `data_dir`) joined with `omni-dev/<component>`. `pub(crate)`
+/// rather than private: the Drive lease ledger and its default backup
+/// directory (`drive::lease::ledger::ledger_path`,
+/// `cli::drive::lease::default_backup_dir`) resolve their own location the
+/// same way and share this rather than re-deriving it.
+pub(crate) fn omni_dev_state_subpath(component: &str) -> Option<PathBuf> {
     let base = dirs::state_dir().or_else(dirs::data_dir)?;
-    Some(base.join("omni-dev").join(file_name))
+    Some(base.join("omni-dev").join(component))
 }
 
 /// Resolves the log file path: `OMNI_DEV_LOG_FILE` override, else
 /// `state_dir` (falling back to `data_dir`) joined with `omni-dev/log.jsonl`.
 pub fn log_file_path() -> Option<PathBuf> {
-    env_path_override("OMNI_DEV_LOG_FILE").or_else(|| default_runtime_log_path(LOG_FILE_NAME))
+    env_path_override("OMNI_DEV_LOG_FILE").or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))
 }
 
 /// Resolves the audit log file path.
@@ -461,7 +465,7 @@ thread_local! {
 /// Where [`audit_file_path`] lands when `OMNI_DEV_AUDIT_LOG_FILE` is unset.
 #[cfg(not(test))]
 fn default_audit_file_path() -> Option<PathBuf> {
-    default_runtime_log_path(AUDIT_FILE_NAME)
+    omni_dev_state_subpath(AUDIT_FILE_NAME)
 }
 
 /// Test-build variant of the function above: one shared scratch path for

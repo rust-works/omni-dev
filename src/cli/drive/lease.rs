@@ -7,33 +7,30 @@ use clap::{Parser, Subcommand};
 use crate::cli::drive::format::{output_as, OutputFormat};
 use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
-use crate::drive::lease::acquire::{self, AcquireOptions, AcquireResult};
+use crate::drive::lease::acquire::{
+    self, AcquireOptions, AcquireResult, MAX_EXPIRY_MINUTES, MIN_EXPIRY_MINUTES,
+};
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
 
 /// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
 const DEFAULT_EXPIRY_MINUTES: i64 = 30;
 
-/// The accepted `--expiry-minutes` range: at least a minute (0 or negative
-/// would mint a lease that is already expired the instant Touch ID
-/// succeeds, spending a real prompt on a token nothing could ever use), and
-/// capped at 24 hours (ADR-0080 §5 frames expiry as bounding "the window in
-/// which the agent may write without a fresh Touch ID prompt" — a value far
-/// past that intent is far more likely a typo than a deliberate choice, and
-/// an unbounded `i64` risks overflowing `chrono::Duration::minutes`).
-const MAX_EXPIRY_MINUTES: i64 = 24 * 60;
-
 /// Validates `--expiry-minutes` before anything else runs — no network
 /// call, no Touch ID prompt — so a bad value is a clean parse error instead
 /// of either an instantly-dead lease (a non-positive value) or a panic
-/// (`chrono::Duration::minutes` overflowing on an extreme one).
+/// (`chrono::Duration::minutes` overflowing on an extreme one). The
+/// accepted range itself ([`MIN_EXPIRY_MINUTES`]/[`MAX_EXPIRY_MINUTES`]) is
+/// owned by the engine, not duplicated here, so the CLI parser and the
+/// engine's own defense-in-depth check (issue #1664 review finding) can't
+/// drift apart.
 fn parse_expiry_minutes(s: &str) -> Result<i64, String> {
     let value: i64 = s
         .parse()
         .map_err(|_| format!("`{s}` is not a valid integer"))?;
-    if !(1..=MAX_EXPIRY_MINUTES).contains(&value) {
+    if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&value) {
         return Err(format!(
-            "must be between 1 and {MAX_EXPIRY_MINUTES} (24 hours), got {value}"
+            "must be between {MIN_EXPIRY_MINUTES} and {MAX_EXPIRY_MINUTES} (24 hours), got {value}"
         ));
     }
     Ok(value)
@@ -63,8 +60,10 @@ impl LeaseCommand {
 }
 
 /// Backs up `FILE_ID`'s current content and mints a lease token
-/// (ADR-0080 §2). Refuses a Google-native document (Docs/Sheets/Slides) —
-/// native-file leases land in a later phase.
+/// (ADR-0080 §2). Refuses a Google-native document (Docs/Sheets/Slides)
+/// unless the active account has `lease_backup_folder_id` configured, in
+/// which case it backs up via a lossless Drive-side `files.copy` into that
+/// folder instead (ADR-0080 §3).
 #[derive(Parser)]
 pub struct AcquireCommand {
     /// Drive file id to lease (from `drive search`, or the `id` segment of
@@ -154,6 +153,13 @@ fn print_result(result: &AcquireResult) {
                 }
             };
             eprintln!("Backed up to {backup_desc} (expires {expires_at})");
+        }
+        AcquireResult::AlreadyLeased { token, expires_at } => {
+            println!("{token}");
+            eprintln!(
+                "A live lease already covers this file (expires {expires_at}) — reusing its \
+                 token rather than minting a second one"
+            );
         }
         AcquireResult::RefusedNativeDocument => {
             eprintln!(
@@ -294,6 +300,10 @@ mod tests {
                 backup: LeaseBackup::DriveCopy {
                     file_id: "copy-1".to_string(),
                 },
+            },
+            AcquireResult::AlreadyLeased {
+                token: "tok-3".to_string(),
+                expires_at: chrono::Utc::now(),
             },
             AcquireResult::RefusedNativeDocument,
             AcquireResult::Denied {

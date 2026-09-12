@@ -248,6 +248,58 @@ pub(crate) fn check_and_lock_lease(
     LeaseCheckOutcome::Ok(lock)
 }
 
+/// The reason a leased write was refused, folding a failure fetching the
+/// live version (the one step every engine must take before it can even
+/// call [`check_and_lock_lease`]) together with that function's own four
+/// refusal variants. Returned by [`gate_leased_write`] so a caller maps
+/// exactly one enum onto its own `Refused*`/`Failed` result variants,
+/// instead of two.
+pub(crate) enum LeaseGateRefusal {
+    /// No `--lease` was presented at all.
+    NoLease,
+    /// The token is unknown, has expired, or the ledger was unreadable.
+    Expired,
+    /// The token is bound to a different file id.
+    WrongFile,
+    /// The file has moved since the lease's recorded `version`.
+    Stale,
+    /// The live-version fetch failed, or acquiring/checking the lease did —
+    /// an operational failure, not a verdict on the token.
+    Failed(String),
+}
+
+/// Fetches `write.file_id`'s live version/`modifiedTime` and checks
+/// `lease_token` against it via [`check_and_lock_lease`] — the "fetch, then
+/// check" sequence every leased-write engine repeats verbatim (ADR-0080
+/// §9). Returns the still-held [`LedgerLock`] on success (see
+/// [`check_and_lock_lease`]'s own doc comment for why the caller must keep
+/// it alive across the mutating call and into [`finish_leased_write`]/
+/// [`finish_leased_native_write`]), or the reason for refusal.
+pub(crate) async fn gate_leased_write(
+    write: LeasedWrite<'_>,
+    files_api: &FilesApi<'_>,
+    lease_token: Option<&str>,
+) -> Result<LedgerLock, LeaseGateRefusal> {
+    let (live_version, live_modified_time) = files_api
+        .get_metadata(write.file_id)
+        .await
+        .map(|fresh| (fresh.version, fresh.modified_time))
+        .map_err(|err| LeaseGateRefusal::Failed(err.to_string()))?;
+    match check_and_lock_lease(
+        write,
+        lease_token,
+        live_version.as_deref(),
+        live_modified_time.as_deref(),
+    ) {
+        LeaseCheckOutcome::Ok(lock) => Ok(lock),
+        LeaseCheckOutcome::NoLease => Err(LeaseGateRefusal::NoLease),
+        LeaseCheckOutcome::Expired => Err(LeaseGateRefusal::Expired),
+        LeaseCheckOutcome::WrongFile => Err(LeaseGateRefusal::WrongFile),
+        LeaseCheckOutcome::Stale => Err(LeaseGateRefusal::Stale),
+        LeaseCheckOutcome::Failed(detail) => Err(LeaseGateRefusal::Failed(detail)),
+    }
+}
+
 /// The fields every one of this module's audit records shares. `command`
 /// is `["drive", <operation>]`, byte-for-byte what
 /// `request_log::build_drive_mutation_record` writes for the same write.

@@ -1,14 +1,17 @@
 //! Shared target-resolution-and-gate step for every Sheets-mutating engine
 //! (`write.rs`'s `write`/`append`/`clear`, `structure.rs`'s
-//! `add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`).
+//! `add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`, and —
+//! since ADR-0080's Phase 3 — `format.rs`, `protection.rs` and
+//! `validation.rs`'s own verbs).
 //!
-//! Both engines follow the identical linear shape up to this point: fetch
-//! the target's Drive metadata, refuse a shortcut/non-spreadsheet target
-//! before ever consulting policy, then resolve the write-permission gate —
-//! a `file_id` rule first, then the target's current parents, then
-//! "no visible parents" if neither decided it (issue #1612). [`resolve`] is
-//! that shape, factored out once so it cannot quietly drift between the two
-//! engines the way copied-by-hand code eventually does.
+//! Every one of these engines follows the identical linear shape up to this
+//! point: fetch the target's Drive metadata, refuse a shortcut/non-
+//! spreadsheet target before ever consulting policy, then resolve the
+//! write-permission gate — a `file_id` rule first, then the target's
+//! current parents, then "no visible parents" if neither decided it (issue
+//! #1612). [`resolve`] is that shape, factored out once so it cannot
+//! quietly drift between the five engines the way copied-by-hand code
+//! eventually does.
 //!
 //! What is deliberately *not* shared: building the engine's own `Outcome`
 //! type (`WriteOutcome`/`StructureOutcome` carry different fields — a

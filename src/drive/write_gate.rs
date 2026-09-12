@@ -1359,6 +1359,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_lease_rule_with_no_require_lease_key_defaults_to_requiring_one() {
+        // Pins `default_require_lease`'s return value against a
+        // pre-existing `settings.json` written before ADR-0080 (issue
+        // #1664): every operator's already-saved rule has no
+        // `require_lease` key at all, and the backward-compatibility
+        // guarantee is that it is still gated by the lease, not silently
+        // exempted. Nothing else in this test file asserts this — a
+        // refactor that broke `default_require_lease`'s body (e.g.
+        // swapping `#[serde(default = "default_require_lease")]` for a
+        // bare `#[serde(default)]`) would otherwise compile and pass every
+        // other test while disabling Touch ID/backup enforcement crate-wide
+        // for every such rule.
+        let parsed =
+            parse_rule(r#"{"folder_id":"f1","recursive":true,"allow":["create"]}"#).unwrap();
+        assert!(parsed.require_lease);
+    }
+
+    #[test]
     fn a_file_rule_parses_and_serializes_without_a_folder_id() {
         let parsed = parse_rule(r#"{"file_id":"x1","allow":["sheets-write"]}"#).unwrap();
         assert_eq!(parsed.file_id.as_deref(), Some("x1"));

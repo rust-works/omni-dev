@@ -27,8 +27,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    check_and_lock_lease, finish_leased_native_write, record_failed_leased_write,
-    LeaseCheckOutcome, LeasedWrite,
+    finish_leased_native_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
@@ -418,27 +418,17 @@ async fn validation_inner(
         file_id: &opts.spreadsheet_id,
     };
     let lease_lock = if requires_lease {
-        let (live_version, live_modified_time) =
-            match files_api.get_metadata(&opts.spreadsheet_id).await {
-                Ok(fresh) => (fresh.version, fresh.modified_time),
-                Err(err) => {
-                    return gated(ValidationResult::Failed {
-                        detail: err.to_string(),
-                    })
-                }
-            };
-        match check_and_lock_lease(
-            leased,
-            opts.lease_token.as_deref(),
-            live_version.as_deref(),
-            live_modified_time.as_deref(),
-        ) {
-            LeaseCheckOutcome::Ok(lock) => Some(lock),
-            LeaseCheckOutcome::NoLease => return gated(ValidationResult::RefusedNoLease),
-            LeaseCheckOutcome::Expired => return gated(ValidationResult::RefusedLeaseExpired),
-            LeaseCheckOutcome::WrongFile => return gated(ValidationResult::RefusedLeaseWrongFile),
-            LeaseCheckOutcome::Stale => return gated(ValidationResult::RefusedLeaseStale),
-            LeaseCheckOutcome::Failed(detail) => return gated(ValidationResult::Failed { detail }),
+        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
+            Ok(lock) => Some(lock),
+            Err(LeaseGateRefusal::NoLease) => return gated(ValidationResult::RefusedNoLease),
+            Err(LeaseGateRefusal::Expired) => return gated(ValidationResult::RefusedLeaseExpired),
+            Err(LeaseGateRefusal::WrongFile) => {
+                return gated(ValidationResult::RefusedLeaseWrongFile)
+            }
+            Err(LeaseGateRefusal::Stale) => return gated(ValidationResult::RefusedLeaseStale),
+            Err(LeaseGateRefusal::Failed(detail)) => {
+                return gated(ValidationResult::Failed { detail })
+            }
         }
     } else {
         None

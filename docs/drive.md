@@ -1065,6 +1065,14 @@ successful write refreshes its recorded `version`, so a second write under
 the same lease is checked against the file's state *after* the first, not
 the original backup point.
 
+**At most one live lease per file.** Acquiring a lease on a file that
+already has an unexpired one returns that lease's existing token instead of
+minting a second, independent one — two independently-checked leases on the
+same file could otherwise each pass their own staleness check against a
+version the other's write had already moved past, letting the second
+writer silently clobber the first's change. Wait for the existing lease to
+expire (or write under it) before a fresh acquisition mints a new one.
+
 **`--biometrics-only`** requires Touch ID specifically, failing outright
 rather than falling back to the account password — for operators who want
 no keyboard-answerable prompt at all, at the cost of needing Touch ID
