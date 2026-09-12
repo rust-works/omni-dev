@@ -1138,6 +1138,26 @@ lease, but that is a *third*, independent check alongside OAuth scope and
 the write-permission gate — never a substitute for either: a write-blocked
 folder refuses a restore the same way it refuses any other write.
 
+**A backup over the 5 MB simple-upload cap can't be restored yet**, for the
+same reason a byte upload that large is refused elsewhere in this CLI (see
+"5 MB size cap" above) — the restore write goes through that same capped
+endpoint. Refused up front from the backup's own recorded size, before any
+network call, so no Touch ID prompt is spent on a restore that could never
+have succeeded:
+
+```bash
+$ omni-dev drive lease restore lease-large123...
+Refused: this backup is 83886080 bytes, over Drive's 5 MB simple-upload limit — restoring it is not supported yet (no fresh lease was minted, no Touch ID was spent)
+```
+
+**A file that became native since the backup was taken is also refused.**
+If the target at `file_id` was binary when its backup was recorded but has
+since been replaced by a Google-native document, restore refuses the write
+rather than PATCHing raw bytes into it — checked immediately before the
+write, since the account may have a `lease_backup_folder_id` configured
+that would otherwise let the internal fresh lease acquire successfully
+against the now-native file.
+
 **The backup lease's own row is marked once restored from**, kept (never
 dropped) alongside the fresh lease's new row — both remain findable by
 token in the ledger and in `audit.jsonl`, which records both tokens on a

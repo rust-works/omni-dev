@@ -39,7 +39,7 @@ use crate::drive::lease::check::{
     finish_leased_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::AuditOutcome;
 
@@ -92,6 +92,22 @@ pub enum RestoreResult {
         /// The backup copy's own Drive file id.
         backup_location: String,
     },
+    /// The backup's bytes are too large for Drive's simple-upload endpoint
+    /// (`files.update` with `uploadType=media`, capped at 5 MB — see
+    /// [`crate::drive::files_api::check_upload_size`]); restoring it would
+    /// need resumable upload, not yet supported. Refused before any network
+    /// call — from the backup's own recorded size, no fresh lease minted,
+    /// no Touch ID spent — since a backup this large is guaranteed to fail
+    /// the same check the restore write's own `edit_content` call would
+    /// make *after* the prompt (issue #1664 review finding: `acquire` can
+    /// back up a binary file up to its own, much larger download cap, but
+    /// only ever restore up to the upload cap — checking only at write
+    /// time would waste a real authentication prompt, a fresh backup and a
+    /// live ledger row on a restore that could never have succeeded).
+    BackupTooLargeForSimpleUpload {
+        /// The backup's size in bytes.
+        size: u64,
+    },
     /// The target has no parents this account can see and no `file_id`
     /// rule named it — mirrors `EditResult::RefusedNoVisibleParents`.
     RefusedNoVisibleParents,
@@ -112,10 +128,18 @@ pub enum RestoreResult {
         /// When it expires.
         expires_at: DateTime<Utc>,
     },
-    /// The internal [`acquire`] step refused a native-document target — not
-    /// reachable while restore only ever acquires against a *binary* file's
-    /// own id (see the module doc), kept for exhaustive mapping from
-    /// [`AcquireResult`] rather than an `unreachable!()`.
+    /// The internal [`acquire`] step refused a native-document target. Reachable:
+    /// the backup being restored from is a `Bytes` backup (a `DriveCopy`
+    /// backup short-circuits to [`Self::NoTypedRestorePath`] before any
+    /// network call), but the file at `file_id` has since become a
+    /// Google-native document and this account has no
+    /// `lease_backup_folder_id` configured — the same refusal `acquire`
+    /// gives any other native-document target with nowhere to put its
+    /// backup. When a backup folder *is* configured, `acquire` instead
+    /// succeeds (taking a native Drive-copy backup of the file's current
+    /// state), and the write itself is refused post-lease via
+    /// [`Self::FreshLeaseButWriteFailed`] — see the mime-type re-check
+    /// immediately before the restore write.
     RefusedNativeDocument,
     /// A human answered the fresh authentication prompt and refused, or it
     /// timed out.
@@ -169,6 +193,7 @@ impl RestoreResult {
             Self::Restored { .. } => "restored",
             Self::NoSuchBackupToken => "no-such-backup-token",
             Self::NoTypedRestorePath { .. } => "no-typed-restore-path",
+            Self::BackupTooLargeForSimpleUpload { .. } => "backup-too-large-for-simple-upload",
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::Blocked { .. } => "blocked",
             Self::AlreadyLeased { .. } => "already-leased",
@@ -223,56 +248,47 @@ async fn restore_inner(
     // this phase cannot yet act on (see the module doc) is refused before
     // the gate or any network call at all, mirroring how
     // `content_edit.rs` refuses a Google-native target before its own
-    // gate: this is a structural fact, not a policy decision.
+    // gate: this is a structural fact, not a policy decision. Likewise, a
+    // backup too large for Drive's simple-upload endpoint is refused from
+    // its own recorded size alone (issue #1664 review finding) — see
+    // `RestoreResult::BackupTooLargeForSimpleUpload`'s doc comment.
     let (backup_path, backup_sha256) = match &backup_record.backup {
         LeaseBackup::DriveCopy { file_id: copy_id } => {
             return RestoreResult::NoTypedRestorePath {
                 backup_location: copy_id.clone(),
             };
         }
-        LeaseBackup::Bytes { path, sha256, .. } => (path.clone(), sha256.clone()),
+        LeaseBackup::Bytes { path, sha256, size } => {
+            if crate::drive::files_api::check_upload_size(*size).is_err() {
+                return RestoreResult::BackupTooLargeForSimpleUpload { size: *size };
+            }
+            (path.clone(), sha256.clone())
+        }
     };
 
     let files_api = FilesApi::new(client);
-    let target = match files_api.get_metadata(&file_id).await {
-        Ok(target) => target,
-        Err(err) => {
-            return RestoreResult::Failed {
-                detail: err.to_string(),
-            }
-        }
-    };
-
     // The write-permission gate — a *third*, independent check alongside
     // OAuth scope and the lease this function is about to mint, never
-    // substituted by either (ADR-0080 Consequences). A `file_id` rule is
-    // consulted before the parents, so a file shared by link or email can
-    // still be granted (issue #1612), mirroring `content_edit.rs` exactly.
-    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
-        &files_api,
-        &target,
-        DriveOperation::Edit,
-        rules,
-    )
-    .await
-    {
-        Ok(evaluated) => evaluated,
-        Err(err) => {
-            return RestoreResult::Failed {
-                detail: err.to_string(),
-            }
-        }
-    };
-    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
-        return RestoreResult::RefusedNoVisibleParents;
-    }
-    if evaluated.decision.verdict == write_gate::Verdict::Deny {
-        return RestoreResult::Blocked {
-            decided_by: evaluated.decision.decided_by,
-        };
+    // substituted by either (ADR-0080 Consequences). The fetched target
+    // itself is not needed past this point — only the re-check immediately
+    // before the write (below) needs its own, fresher fetch.
+    match check_write_permission_gate(&files_api, &file_id, rules).await {
+        GateCheck::Ok(_) => {}
+        GateCheck::Failed(detail) => return RestoreResult::Failed { detail },
+        GateCheck::NoVisibleParents => return RestoreResult::RefusedNoVisibleParents,
+        GateCheck::Denied(decided_by) => return RestoreResult::Blocked { decided_by },
     }
 
-    let backup_bytes = match verify_and_read_backup(&backup_path, &backup_sha256) {
+    // Synchronous filesystem I/O (a read plus a SHA-256 hash over the
+    // whole backup) on the async runtime's current thread — `block_in_place`
+    // hands this worker thread's other queued tasks off to the runtime's
+    // other workers for the duration, the same reasoning `acquire.rs`'s own
+    // `write_backup`/`insert_record` calls document (issue #1664 review
+    // finding: this call and `mark_backup_restored`'s below were the two
+    // synchronous calls in this module not already following that pattern).
+    let backup_bytes = match tokio::task::block_in_place(|| {
+        verify_and_read_backup(&backup_path, &backup_sha256)
+    }) {
         Ok(bytes) => bytes,
         Err(detail) => return RestoreResult::Failed { detail },
     };
@@ -320,32 +336,37 @@ async fn restore_inner(
     // fetch here, immediately before the write — not reused from the
     // check above, before `acquire`'s internal Touch ID prompt: that
     // prompt can take up to two minutes to answer (ADR-0080 §7), and a
-    // permission change (or a mime-type change) landing in that window
-    // must not be silently ignored just because it was already checked
-    // once (issue #1664 review finding, mirroring `content_edit.rs`'s own
-    // "re-fetched fresh here rather than reusing the earlier snapshot"
-    // reasoning for its staleness check).
-    let target = match files_api.get_metadata(&file_id).await {
-        Ok(target) => target,
-        Err(err) => return fresh_lease_but(err.to_string()),
+    // permission change landing in that window must not be silently
+    // ignored just because it was already checked once (issue #1664
+    // review finding, mirroring `content_edit.rs`'s own "re-fetched fresh
+    // here rather than reusing the earlier snapshot" reasoning for its
+    // staleness check).
+    let target = match check_write_permission_gate(&files_api, &file_id, rules).await {
+        GateCheck::Ok(target) => target,
+        GateCheck::Failed(detail) => return fresh_lease_but(detail),
+        GateCheck::NoVisibleParents | GateCheck::Denied(_) => {
+            return fresh_lease_but(
+                "the write-permission gate no longer allows this write, re-checked after the \
+                 fresh lease's authentication prompt"
+                    .to_string(),
+            )
+        }
     };
-    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
-        &files_api,
-        &target,
-        DriveOperation::Edit,
-        rules,
-    )
-    .await
-    {
-        Ok(evaluated) => evaluated,
-        Err(err) => return fresh_lease_but(err.to_string()),
-    };
-    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents
-        || evaluated.decision.verdict == write_gate::Verdict::Deny
-    {
+
+    // The target may also have changed *kind* during the same window: a
+    // `Bytes` backup can only ever be restored into a still-binary file.
+    // `acquire` above only refuses a native-document target when no
+    // `native_backup_folder_id` is configured for this account (see
+    // `RestoreResult::RefusedNativeDocument`'s doc comment) — when a backup
+    // folder *is* configured, `acquire` instead succeeds by taking a native
+    // Drive-copy backup of whatever the file now is, leaving nothing to
+    // stop this write from PATCHing stale binary bytes into what is now a
+    // Google-native document unless it is caught here (issue #1664 review
+    // finding).
+    if target.is_google_native() {
         return fresh_lease_but(
-            "the write-permission gate no longer allows this write, re-checked after the \
-             fresh lease's authentication prompt"
+            "the target has become a Google-native document since this backup was taken; a \
+             byte backup cannot be restored into a native document"
                 .to_string(),
         );
     }
@@ -397,10 +418,72 @@ async fn restore_inner(
     // failed by this point, so a failure to stamp this is logged, not
     // surfaced as a failed restore.
     if matches!(result, RestoreResult::Restored { .. }) {
-        mark_backup_restored(&opts.ledger_path, &opts.token);
+        // Synchronous ledger I/O (lock, load, save) on the async runtime's
+        // current thread — `block_in_place` hands its other queued tasks
+        // off to the runtime's other workers for the duration, the same
+        // reasoning `acquire.rs`'s own ledger writes document (issue #1664
+        // review finding).
+        tokio::task::block_in_place(|| mark_backup_restored(&opts.ledger_path, &opts.token));
     }
 
     result
+}
+
+/// The outcome of fetching `file_id`'s current metadata and evaluating the
+/// write-permission gate against it — shared by the pre-lease-mint check
+/// and the post-authentication re-check immediately before the write
+/// (issue #1664 review finding: hand-copying this three-step sequence
+/// risked exactly the kind of drift `check.rs`'s own module doc warns a
+/// shared function exists to prevent — see its "half-dozen independent
+/// copies" reasoning).
+enum GateCheck {
+    /// Allowed. The freshly fetched target, for the caller's own further
+    /// use (its `mime_type`, in particular) — boxed since it otherwise
+    /// dwarfs every other variant here (`clippy::large_enum_variant`).
+    Ok(Box<crate::drive::types::DriveFile>),
+    /// The metadata fetch or the gate evaluation itself failed — an
+    /// operational error, not a verdict.
+    Failed(String),
+    /// The target has no parents this account can see and no `file_id`
+    /// rule named it.
+    NoVisibleParents,
+    /// The folder write-permission gate refused it.
+    Denied(Option<DecidingRule>),
+}
+
+/// Fetches `file_id`'s current metadata and evaluates the write-permission
+/// gate against it (ADR-0080 Consequences: a *third*, independent check
+/// alongside OAuth scope and the lease, never substituted by either). A
+/// `file_id` rule is consulted before the parents, so a file shared by link
+/// or email can still be granted (issue #1612), mirroring
+/// `content_edit.rs` exactly.
+async fn check_write_permission_gate(
+    files_api: &FilesApi<'_>,
+    file_id: &str,
+    rules: &[FolderPermissionRule],
+) -> GateCheck {
+    let target = match files_api.get_metadata(file_id).await {
+        Ok(target) => target,
+        Err(err) => return GateCheck::Failed(err.to_string()),
+    };
+    let evaluated = match folder_ancestry::resolve_decision_for_file_target(
+        files_api,
+        &target,
+        DriveOperation::Edit,
+        rules,
+    )
+    .await
+    {
+        Ok(evaluated) => evaluated,
+        Err(err) => return GateCheck::Failed(err.to_string()),
+    };
+    if evaluated.source == folder_ancestry::DecisionSource::NoVisibleParents {
+        return GateCheck::NoVisibleParents;
+    }
+    if evaluated.decision.verdict == write_gate::Verdict::Deny {
+        return GateCheck::Denied(evaluated.decision.decided_by);
+    }
+    GateCheck::Ok(Box::new(target))
 }
 
 /// Reads a `LeaseBackup::Bytes` file and verifies its SHA-256 still matches
@@ -429,22 +512,19 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 
 /// Best-effort: stamps `token`'s row with `restored_at` (ADR-0080 §4).
 ///
-/// Takes its own [`LedgerLock`] — this runs after `restore_inner` has
-/// already released its own lock (acquired via `gate_leased_write`/
-/// `finish_leased_write` for the *fresh* lease's row), so without a fresh
-/// lock here this load-then-save could race a concurrent, unrelated `drive
-/// lease acquire`/write on a *different* file: `LeaseLedger::save`
-/// rewrites the whole file, so whichever of the two calls saves last would
-/// silently discard the other's change (issue #1664 review finding) —
-/// exactly the class of bug `LedgerLock` exists to prevent everywhere else
-/// in this module.
+/// Goes through [`LeaseLedger::mutate_locked`] — this runs after
+/// `restore_inner` has already released its own lock (acquired via
+/// `gate_leased_write`/`finish_leased_write` for the *fresh* lease's row),
+/// so without a fresh lock here this load-then-save could race a
+/// concurrent, unrelated `drive lease acquire`/write on a *different*
+/// file: `LeaseLedger::save` rewrites the whole file, so whichever of the
+/// two calls saves last would silently discard the other's change (issue
+/// #1664 review finding) — exactly the class of bug the lock exists to
+/// prevent everywhere else in this module.
 fn mark_backup_restored(ledger_path: &Path, token: &str) {
-    let result = (|| -> anyhow::Result<()> {
-        let _lock = LedgerLock::acquire(ledger_path)?;
-        let mut ledger = LeaseLedger::load(ledger_path)?;
+    let result = LeaseLedger::mutate_locked(ledger_path, |ledger| {
         ledger.mark_restored(token, Utc::now());
-        ledger.save(ledger_path)
-    })();
+    });
     if let Err(err) = result {
         tracing::debug!(
             "drive lease restore: failed to mark the backup lease as restored-from: {err}"
@@ -499,6 +579,7 @@ fn record_attempt(opts: &RestoreOptions, result: &RestoreResult) {
         | RestoreResult::Failed { detail } => (None, Some(detail.clone())),
         RestoreResult::NoSuchBackupToken
         | RestoreResult::NoTypedRestorePath { .. }
+        | RestoreResult::BackupTooLargeForSimpleUpload { .. }
         | RestoreResult::RefusedNoVisibleParents
         | RestoreResult::Blocked { .. }
         | RestoreResult::RefusedNativeDocument => (None, None),
@@ -534,7 +615,7 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::{AuthOutcome, Unsupported};
     use crate::drive::lease::ledger::LeaseRecord;
-    use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
+    use crate::drive::types::{GOOGLE_FOLDER_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE};
     use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
     use std::path::PathBuf;
@@ -578,7 +659,9 @@ mod tests {
     struct PanicsIfCalled;
     impl Authenticator for PanicsIfCalled {
         fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-            panic!("must not authenticate: refused before minting a fresh lease");
+            // omni-dev: coverage ignore reason="every test using this double refuses before authenticating; a hit here is a regression, not a coverage gap"
+            panic!("must not authenticate: refused before minting a fresh lease")
+            // omni-dev: coverage end
         }
     }
 
@@ -708,7 +791,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_corrupted_backup_is_refused_before_minting_a_fresh_lease() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1086,6 +1169,452 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+    }
+
+    #[test]
+    fn leased_write_refusal_detail_covers_every_variant() {
+        assert_eq!(
+            leased_write_refusal_detail(LeaseGateRefusal::NoLease),
+            "the freshly minted lease was not presented to its own write check"
+        );
+        assert_eq!(
+            leased_write_refusal_detail(LeaseGateRefusal::Expired),
+            "the freshly minted lease was already expired or released by the time of the \
+             restore write"
+        );
+        assert_eq!(
+            leased_write_refusal_detail(LeaseGateRefusal::WrongFile),
+            "the freshly minted lease was bound to a different file than the restore write \
+             targeted"
+        );
+        assert_eq!(
+            leased_write_refusal_detail(LeaseGateRefusal::Stale),
+            "the file changed again between minting the fresh lease and the restore write"
+        );
+        assert_eq!(
+            leased_write_refusal_detail(LeaseGateRefusal::Failed("boom".to_string())),
+            "boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_ledger_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "backup-token");
+        std::fs::write(&test_opts.ledger_path, "not json\n").unwrap();
+        // No mocks at all: an unreadable ledger must be refused before any
+        // network call.
+
+        let result = restore(&client, &test_opts, &PanicsIfCalled, &[]).await;
+
+        assert!(matches!(result, RestoreResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_target_metadata_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"original content");
+        let test_opts = opts(dir.path(), "");
+        let token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        // No mock for file-1 at all: the gate check's own `files.get` 404s.
+
+        let result = restore(&client, &opts(dir.path(), &token), &PanicsIfCalled, &[]).await;
+
+        assert!(matches!(result, RestoreResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_parent_lookup_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"original content");
+        let test_opts = opts(dir.path(), "");
+        let token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        // No mock for parent-1: resolving the folder chain 404s.
+
+        let result = restore(&client, &opts(dir.path(), &token), &PanicsIfCalled, &[]).await;
+
+        assert!(matches!(result, RestoreResult::Failed { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_document_target_is_refused_via_the_fresh_acquire_step() {
+        // The initial gate check's own `files.get` never inspects the
+        // target's mime type — only the internal, fresh `acquire` step
+        // does, refusing a Google-native file before ever authenticating
+        // (`acquire.rs`). A `Bytes` backup for a file that is, by the time
+        // of restore, a native document exercises that refusal bubbling
+        // through `restore_inner` unchanged.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"original content");
+        let test_opts = opts(dir.path(), "");
+        let token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        mount_file("file-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No download/PATCH mock: reaching either would mean the
+        // native-document refusal failed to short-circuit first.
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &token),
+            &PanicsIfCalled,
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(matches!(result, RestoreResult::RefusedNativeDocument));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_that_became_native_is_refused_at_the_recheck_when_a_backup_folder_is_configured(
+    ) {
+        // Regression test for issue #1664's review finding: when this
+        // account has a `native_backup_folder_id` configured, the internal
+        // fresh `acquire` step no longer refuses a native-document target
+        // (it takes a native Drive-copy backup instead, see
+        // `acquire::tests::native_document_with_a_backup_folder_configured_copies_instead_of_refusing`)
+        // — so restore's own mime-type re-check, immediately before the
+        // write, is the only thing left to stop stale binary bytes from
+        // being PATCHed into what is now a Google-native document.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+
+        mount_file("file-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-1", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No PATCH mock: reaching the write would mean the mime-type
+        // re-check failed to catch the target having become native.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = restore(
+            &client,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, detail, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+        assert!(
+            detail.contains("Google-native document"),
+            "expected the mime-type re-check's own refusal detail, got: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_over_the_upload_cap_is_refused_before_any_network_call() {
+        // Regression test for issue #1664's review finding: `acquire` can
+        // back up a binary file well past Drive's 5 MB simple-upload cap,
+        // but the restore write goes through that same capped endpoint —
+        // checked from the backup's own recorded size, before any network
+        // call, so a restore that could never succeed does not spend a
+        // real Touch ID prompt and a fresh backup finding that out.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let oversized = crate::drive::files_api::MAX_UPLOAD_BYTES + 1;
+        let token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "file-1",
+            LeaseBackup::Bytes {
+                path: PathBuf::from("/does/not/need/to/exist"),
+                sha256: "deadbeef".to_string(),
+                size: oversized,
+            },
+        );
+        // No mocks at all: reaching any Drive call fails the test.
+
+        let result = restore(&client, &opts(dir.path(), &token), &PanicsIfCalled, &[]).await;
+
+        assert!(matches!(
+            result,
+            RestoreResult::BackupTooLargeForSimpleUpload { size } if size == oversized
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_fresh_authentication_is_reported() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"original content");
+        let test_opts = opts(dir.path(), "");
+        let token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No download/PATCH mock: a denied prompt must stop before either.
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &token),
+            &FakeAuthenticator(AuthOutcome::Denied("no".to_string())),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(matches!(result, RestoreResult::Denied { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_fresh_expiry_surfaces_as_failed() {
+        // `RestoreOptions.expiry` is not itself range-checked — the CLI's
+        // own `--expiry-minutes` parser is the usual gate — but the
+        // internal fresh `acquire` call enforces the same range
+        // independently, and its refusal must bubble through unchanged.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"original content");
+        let test_opts = opts(dir.path(), "");
+        let token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let mut restore_opts = opts(dir.path(), &token);
+        restore_opts.expiry = ChronoDuration::minutes(0);
+
+        let result = restore(
+            &client,
+            &restore_opts,
+            &PanicsIfCalled,
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(matches!(result, RestoreResult::Failed { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_metadata_fetch_failure_during_the_recheck_reports_fresh_lease_but_write_failed() {
+        // The write-permission gate is re-checked against a *fresh*
+        // `files.get` immediately before the restore write (issue #1664
+        // review finding) — the fresh lease is already real and live by
+        // then, so a failure fetching that metadata must surface as
+        // `FreshLeaseButWriteFailed`, never a bare `Failed` that would
+        // orphan the token nowhere the caller could find it again.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+
+        // The gate check's own fetch, plus the fresh `acquire`'s two
+        // (pre-auth and post-backup) fetches — three total before the
+        // re-check.
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        // The re-check's own fetch — the fourth `files.get` — fails outright.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parent_lookup_failure_during_the_recheck_reports_fresh_lease_but_write_failed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(3)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        // The re-check's own fetch sees a brand-new, unmounted parent — its
+        // own lookup 404s, rather than merely being unlisted by any rule.
+        mount_file("file-1", "text/plain", &["parent-2"])
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_file_at_write_time_reports_fresh_lease_but_write_failed() {
+        // `gate_leased_write` re-fetches the live version/`modifiedTime`
+        // itself, immediately before the write — a *fifth* `files.get`,
+        // distinct from the write-permission re-check's own fourth one
+        // above. A version change caught only here (not by the permission
+        // re-check, which never looks at `version`) must refuse via the
+        // same `FreshLeaseButWriteFailed` path.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
+
+        // Covers the gate check, the fresh acquire's two fetches, and the
+        // permission re-check — four calls, all still at version "1".
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .up_to_n_times(4)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        // `gate_leased_write`'s own fetch — the fifth call — sees a new
+        // version, moved by something else after the fresh lease recorded
+        // version "1".
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "mimeType": "text/plain",
+                    "parents": ["parent-1"], "version": "2",
+                })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, detail, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+        assert!(
+            detail.contains("file changed again"),
+            "expected the staleness refusal's own detail, got: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_best_effort_audit_write_failure_is_warned_and_swallowed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir(dir.path().join("audit.jsonl")).unwrap();
+
+        // Cheapest way to reach `record_attempt`: an unknown token, so no
+        // network call is needed either.
+        let result = restore(
+            &client,
+            &opts(dir.path(), "no-such-token"),
+            &PanicsIfCalled,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(result, RestoreResult::NoSuchBackupToken));
     }
 
     #[test]

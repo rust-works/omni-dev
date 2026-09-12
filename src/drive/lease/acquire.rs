@@ -18,7 +18,7 @@ use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
 
 /// Per-call options for `drive lease acquire`.
 #[derive(Debug, Clone)]
@@ -380,33 +380,47 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     crate::daemon::paths::ensure_parent_dir_0700(path)?;
-    let mut file = crate::daemon::paths::create_new_file_0600(path).with_context(|| {
-        format!(
-            "Failed to create backup file at {} — it may already exist from a near-simultaneous \
-             `drive lease acquire` on the same file within the same second; retry",
-            path.display()
-        )
+    let mut file = crate::daemon::paths::create_new_file_0600(path).map_err(|err| {
+        // Distinguish a genuine same-second collision (the path already
+        // existed) from the file being created fine but the follow-up
+        // `fchmod` safety net failing — the latter is an unrelated
+        // permissions/filesystem problem that "may already exist, retry"
+        // would misdiagnose (issue #1664 review finding).
+        if crate::daemon::paths::is_already_exists_error(&err) {
+            err.context(format!(
+                "Failed to create backup file at {} — it may already exist from a \
+                 near-simultaneous `drive lease acquire` on the same file within the same \
+                 second; retry",
+                path.display()
+            ))
+        } else {
+            err.context(format!(
+                "Failed to create backup file at {} — not a same-second collision; check \
+                 filesystem permissions",
+                path.display()
+            ))
+        }
     })?;
     file.write_all(bytes)
         .with_context(|| format!("Failed to write backup to {}", path.display()))?;
     Ok(())
 }
 
-/// Inserts `record` into the ledger at `ledger_path` under [`LedgerLock`],
-/// loading and saving it in full — the atomic-rewrite contract
-/// [`LeaseLedger`] documents. This lock-held check-then-insert is the
+/// Inserts `record` into the ledger at `ledger_path` under
+/// [`LeaseLedger::mutate_locked`]'s lock, loading and saving it in full —
+/// the atomic-rewrite contract [`LeaseLedger`] documents. This lock-held
+/// check-then-insert is the
 /// authoritative gate against two leases ever being live on the same file
 /// at once (see [`LeaseLedger::live_lease_for_file`]'s doc comment) — unlike
 /// a check made before taking the lock, nothing can race it.
 fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<InsertOutcome> {
-    let _lock = LedgerLock::acquire(ledger_path)?;
-    let mut ledger = LeaseLedger::load(ledger_path)?;
-    if let Some(existing) = ledger.live_lease_for_file(&record.file_id, Utc::now()) {
-        return Ok(InsertOutcome::AlreadyLeased(existing.clone()));
-    }
-    ledger.insert(record);
-    ledger.save(ledger_path)?;
-    Ok(InsertOutcome::Inserted)
+    LeaseLedger::mutate_locked(ledger_path, |ledger| {
+        if let Some(existing) = ledger.live_lease_for_file(&record.file_id, Utc::now()) {
+            return InsertOutcome::AlreadyLeased(existing.clone());
+        }
+        ledger.insert(record);
+        InsertOutcome::Inserted
+    })
 }
 
 /// Builds and writes the `kind: "audit"` record for one acquire attempt.

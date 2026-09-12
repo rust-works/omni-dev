@@ -195,6 +195,24 @@ pub fn create_new_file_0600(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Whether `err`'s cause chain includes an `io::Error` of kind
+/// `AlreadyExists`.
+///
+/// A caller of [`create_new_file_0600`] that wraps its `Result` in extra
+/// "this looks like a collision, retry" guidance must apply that guidance
+/// only when the underlying failure actually was the path already existing
+/// — not when `open(2)` itself succeeded and the follow-up `fchmod` safety
+/// net failed instead, which is an unrelated permissions/filesystem problem
+/// that "remove the stale lock and retry" or "may already exist" would
+/// misdiagnose (issue #1664 review finding).
+pub fn is_already_exists_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::AlreadyExists)
+    })
+}
+
 /// Tightens an existing file to owner read/write only (`0600`) on Unix.
 pub fn set_file_0600(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -360,5 +378,24 @@ mod tests {
     fn ensure_parent_dir_0700_is_a_noop_for_a_bare_filename() {
         // A bare relative filename has an empty parent — nothing to create.
         ensure_parent_dir_0700(Path::new("bare.txt")).unwrap();
+    }
+
+    #[test]
+    fn is_already_exists_error_detects_the_wrapped_io_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collide");
+        create_new_file_0600(&path).unwrap();
+        let err = create_new_file_0600(&path).unwrap_err();
+        assert!(is_already_exists_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn is_already_exists_error_is_false_for_an_unrelated_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing parent directory makes `open()` fail with `NotFound`,
+        // not `AlreadyExists`.
+        let path = dir.path().join("no-such-parent").join("child");
+        let err = create_new_file_0600(&path).unwrap_err();
+        assert!(!is_already_exists_error(&err), "{err:?}");
     }
 }

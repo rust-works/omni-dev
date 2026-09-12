@@ -403,11 +403,9 @@ pub(crate) fn finish_leased_write(
         );
         return;
     };
-    let result = (|| -> anyhow::Result<()> {
-        let mut ledger = LeaseLedger::load(ledger_path)?;
+    let result = LeaseLedger::mutate(ledger_path, |ledger| {
         ledger.record_write(token, version, modified_time);
-        ledger.save(ledger_path)
-    })();
+    });
     if let Err(err) = result {
         tracing::debug!(
             "{log_prefix}: failed to refresh lease ledger after a successful write: {err}"

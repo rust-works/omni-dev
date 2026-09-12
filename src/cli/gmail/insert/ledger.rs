@@ -190,19 +190,30 @@ pub(crate) struct LedgerLock {
 impl LedgerLock {
     pub(crate) fn acquire(archive_dir: &Path) -> Result<Self> {
         let path = ledger_lock_path(archive_dir);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
+        crate::daemon::paths::create_new_file_0600(&path).map_err(|err| {
+            // Distinguish a genuine collision (another run's lock file
+            // already exists) from the file being created fine but the
+            // follow-up `fchmod` safety net failing — the latter is an
+            // unrelated permissions/filesystem problem that "remove the
+            // stale lock and re-run" would misdiagnose (issue #1664 review
+            // finding, applied here too since this lock now shares
+            // `create_new_file_0600` with the Drive lease ledger's).
+            if crate::daemon::paths::is_already_exists_error(&err) {
+                err.context(format!(
                     "another `gmail insert` run appears to already be in progress against this \
                      archive dir ({} exists) — concurrent runs would clobber each other's \
                      ledger. If you're sure no other run is active (e.g. after a crash), remove \
                      the lock file and re-run",
                     path.display()
-                )
-            })?;
+                ))
+            } else {
+                err.context(format!(
+                    "failed to create the insert-ledger lock file at {} — the file did not \
+                     already exist, so this is not a stale lock; check filesystem permissions",
+                    path.display()
+                ))
+            }
+        })?;
         Ok(Self { path })
     }
 }
