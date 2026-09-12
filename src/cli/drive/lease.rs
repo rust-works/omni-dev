@@ -274,6 +274,13 @@ fn print_restore_result(result: &RestoreResult) {
                 sanitize_for_terminal(backup_location)
             );
         }
+        RestoreResult::BackupTooLargeForSimpleUpload { size } => {
+            eprintln!(
+                "Refused: this backup is {size} bytes, over Drive's 5 MB simple-upload limit — \
+                 restoring it is not supported yet (no fresh lease was minted, no Touch ID was \
+                 spent)"
+            );
+        }
         RestoreResult::RefusedNoVisibleParents => {
             eprintln!(
                 "Refused: this file has no parent folder visible to this account, so no folder \
@@ -529,11 +536,14 @@ mod tests {
         });
         ledger.save(&ledger_path).unwrap();
 
+        // An explicit `--backup-dir` and `--biometrics-only`, exercising
+        // `RestoreCommand::execute`'s own option-resolution branches — the
+        // gate still blocks first, so neither ever reaches use.
         let cmd = RestoreCommand {
             token: "backup-token".to_string(),
-            backup_dir: None,
+            backup_dir: Some(dir.path().join("fresh-backups")),
             expiry_minutes: DEFAULT_EXPIRY_MINUTES,
-            biometrics_only: false,
+            biometrics_only: true,
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
@@ -568,6 +578,7 @@ mod tests {
             RestoreResult::NoTypedRestorePath {
                 backup_location: "copy-1".to_string(),
             },
+            RestoreResult::BackupTooLargeForSimpleUpload { size: 10_000_000 },
             RestoreResult::RefusedNoVisibleParents,
             RestoreResult::Blocked { decided_by: None },
             RestoreResult::Blocked {
@@ -665,7 +676,9 @@ mod tests {
         match Wrapper::try_parse_from(full).unwrap().cmd {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Acquire(acquire) => acquire,
+                // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes an acquire subcommand"
                 LeaseAction::Restore(_) => panic!("expected an Acquire command"),
+                // omni-dev: coverage end
             },
         }
     }

@@ -219,6 +219,39 @@ impl LeaseLedger {
         }
     }
 
+    /// Loads the ledger at `path`, gives `f` mutable access, and saves the
+    /// result back — the "load, mutate, save" step every ledger update in
+    /// this module used to hand-roll independently (issue #1664 review
+    /// finding: three near-identical copies of this sequence risked
+    /// drifting from one another, ironically right after one of them —
+    /// `drive lease restore`'s own `mark_backup_restored` — was fixed to
+    /// close a lost-update race).
+    ///
+    /// Deliberately does **not** acquire [`LedgerLock`] itself: a leased
+    /// write's own conclusion ([`super::check::finish_leased_write`])
+    /// already holds the lock across its mutating Drive call and must not
+    /// release it early by re-acquiring here — that caller uses this
+    /// function directly. A caller that has not already taken the lock
+    /// should use [`Self::mutate_locked`] instead.
+    pub(crate) fn mutate<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        let mut ledger = Self::load(path)?;
+        let result = f(&mut ledger);
+        ledger.save(path)?;
+        Ok(result)
+    }
+
+    /// [`Self::mutate`], additionally acquiring [`LedgerLock`] first and
+    /// holding it for the call's duration — the fully self-contained
+    /// "acquire, load, mutate, save" sequence used by every ledger update
+    /// that does not need to hold the lock across additional work beyond
+    /// the mutation itself (e.g. `drive lease acquire`'s own
+    /// check-then-insert, or `drive lease restore`'s best-effort
+    /// mark-as-restored-from).
+    pub(crate) fn mutate_locked<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        let _lock = LedgerLock::acquire(path)?;
+        Self::mutate(path, f)
+    }
+
     /// Atomically rewrites `lease-ledger.jsonl` in full — the same
     /// temp-file-in-the-same-directory-then-rename pattern
     /// `InsertLedger::save`/`sync::manifest::Manifest::save` use.
@@ -283,14 +316,27 @@ impl LedgerLock {
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
-        crate::daemon::paths::create_new_file_0600(&path).with_context(|| {
-            format!(
-                "another `drive lease` operation appears to already be in progress ({} \
-                 exists) — concurrent access would clobber the ledger. If you're sure no \
-                 other operation is active (e.g. after a crash), remove the lock file and \
-                 retry",
-                path.display()
-            )
+        crate::daemon::paths::create_new_file_0600(&path).map_err(|err| {
+            // Distinguish a genuine collision (the lock file already
+            // existed) from the file being created fine but the follow-up
+            // `fchmod` safety net failing — the latter is an unrelated
+            // permissions/filesystem problem that "remove the stale lock
+            // and retry" would misdiagnose (issue #1664 review finding).
+            if crate::daemon::paths::is_already_exists_error(&err) {
+                err.context(format!(
+                    "another `drive lease` operation appears to already be in progress ({} \
+                     exists) — concurrent access would clobber the ledger. If you're sure no \
+                     other operation is active (e.g. after a crash), remove the lock file and \
+                     retry",
+                    path.display()
+                ))
+            } else {
+                err.context(format!(
+                    "failed to create the lease lock file at {} — the file did not already \
+                     exist, so this is not a stale lock; check filesystem permissions",
+                    path.display()
+                ))
+            }
         })?;
         Ok(Self { path })
     }
@@ -512,6 +558,54 @@ mod tests {
 
         drop(first);
         assert!(LedgerLock::acquire(&ledger_path).is_ok());
+    }
+
+    #[test]
+    fn mutate_loads_applies_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        ledger.save(&path).unwrap();
+
+        let returned = LeaseLedger::mutate(&path, |ledger| {
+            ledger.mark_restored("t1", Utc::now());
+            "ok"
+        })
+        .unwrap();
+        assert_eq!(returned, "ok");
+
+        let reloaded = LeaseLedger::load(&path).unwrap();
+        assert!(reloaded.get("t1").unwrap().restored_at.is_some());
+    }
+
+    #[test]
+    fn mutate_locked_acquires_and_releases_its_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+
+        LeaseLedger::mutate_locked(&path, |ledger| {
+            ledger.insert(sample_record("t1"));
+        })
+        .unwrap();
+
+        // The lock must not outlive the call.
+        assert!(LedgerLock::acquire(&path).is_ok());
+        let reloaded = LeaseLedger::load(&path).unwrap();
+        assert!(reloaded.get("t1").is_some());
+    }
+
+    #[test]
+    fn mutate_locked_refuses_while_another_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+        let _held = LedgerLock::acquire(&path).unwrap();
+
+        let err = LeaseLedger::mutate_locked(&path, |ledger| {
+            ledger.insert(sample_record("t1"));
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already be in progress"));
     }
 
     #[test]

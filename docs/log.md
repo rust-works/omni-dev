@@ -533,8 +533,9 @@ once minted (or the existing one, for `already-leased`), and
 every restore attempt made from one backup regardless of outcome. `verdict`
 matches `drive lease restore`'s own reported status: `restored`,
 `no-such-backup-token`, `no-typed-restore-path`,
-`refused-no-visible-parents`, `blocked`, `already-leased`,
-`refused-native-document`, `denied`, `unavailable`, or `failed`.
+`backup-too-large-for-simple-upload`, `refused-no-visible-parents`,
+`blocked`, `already-leased`, `refused-native-document`, `denied`,
+`unavailable`, `failed`, or `fresh-lease-but-write-failed`.
 
 ## Redaction posture
 
