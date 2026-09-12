@@ -12,6 +12,7 @@ use crate::drive::lease::acquire::{
 };
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
+use crate::drive::lease::restore::{self, RestoreOptions, RestoreResult};
 
 /// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
 const DEFAULT_EXPIRY_MINUTES: i64 = 30;
@@ -49,12 +50,16 @@ enum LeaseAction {
     /// Backs up a file and mints a lease token, prompting for device-owner
     /// authentication (Touch ID or the account password).
     Acquire(AcquireCommand),
+    /// Restores a file from a backup lease's recorded content, minting a
+    /// fresh lease of its own before writing.
+    Restore(RestoreCommand),
 }
 
 impl LeaseCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         match self.action {
             LeaseAction::Acquire(cmd) => cmd.execute(client).await,
+            LeaseAction::Restore(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -132,6 +137,67 @@ fn default_backup_dir() -> Result<std::path::PathBuf> {
     Ok(base.join("omni-dev").join("drive-backups"))
 }
 
+/// Restores a file from the backup a lease recorded (ADR-0080 §10). `TOKEN`
+/// is the *backup* lease — it locates the backup and authorises nothing
+/// itself; restoring mints its own fresh lease, prompting for device-owner
+/// authentication the same way `acquire` does.
+#[derive(Parser)]
+pub struct RestoreCommand {
+    /// The backup lease's token (from `drive lease acquire`), expired or
+    /// not — an expired-but-kept row is the expected common case.
+    pub token: String,
+
+    /// Local directory the fresh lease's own byte backup is written under.
+    /// Defaults to `<state dir>/omni-dev/drive-backups`.
+    #[arg(long, value_name = "PATH")]
+    pub backup_dir: Option<std::path::PathBuf>,
+
+    /// Minutes the fresh lease stays live once authorised.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_EXPIRY_MINUTES, value_parser = parse_expiry_minutes)]
+    pub expiry_minutes: i64,
+
+    /// Require Touch ID specifically for the fresh lease, failing outright
+    /// rather than falling back to the account password (ADR-0080 §7).
+    #[arg(long)]
+    pub biometrics_only: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl RestoreCommand {
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let backup_dir = match self.backup_dir {
+            Some(dir) => dir,
+            None => default_backup_dir()?,
+        };
+        let ledger_path = ledger::ledger_path()?;
+        let native_backup_folder_id =
+            crate::cli::drive::helpers::active_account_lease_backup_folder_id()?;
+        let rules = crate::cli::drive::helpers::active_account_rules()?;
+        let opts = RestoreOptions {
+            token: self.token,
+            backup_dir,
+            native_backup_folder_id,
+            expiry: chrono::Duration::minutes(self.expiry_minutes),
+            auth_policy: if self.biometrics_only {
+                AuthPolicy::BiometricsOnly
+            } else {
+                AuthPolicy::DeviceOwner
+            },
+            ledger_path,
+        };
+        let authenticator = authenticate::platform_authenticator();
+        let result = restore::restore(client, &opts, authenticator.as_ref(), &rules).await;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
+        print_restore_result(&result);
+        Ok(())
+    }
+}
+
 fn print_result(result: &AcquireResult) {
     match result {
         AcquireResult::Acquired {
@@ -171,6 +237,78 @@ fn print_result(result: &AcquireResult) {
         AcquireResult::Denied { detail } => eprintln!("Denied: {detail}"),
         AcquireResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
         AcquireResult::Failed { detail } => eprintln!("Failed: {detail}"),
+    }
+}
+
+fn print_restore_result(result: &RestoreResult) {
+    match result {
+        RestoreResult::Restored {
+            new_token,
+            expires_at,
+            backup,
+        } => {
+            println!("{new_token}");
+            let backup_desc = match backup {
+                LeaseBackup::Bytes { path, .. } => {
+                    sanitize_for_terminal(&path.display().to_string())
+                }
+                LeaseBackup::DriveCopy { file_id } => {
+                    format!("Drive copy {}", sanitize_for_terminal(file_id))
+                }
+            };
+            eprintln!(
+                "Restored. Backed up the pre-restore content to {backup_desc} (expires \
+                 {expires_at})"
+            );
+        }
+        RestoreResult::NoSuchBackupToken => {
+            eprintln!(
+                "Refused: no lease in this ledger was ever acquired with that token — check it \
+                 was copied correctly from `drive lease acquire`'s own output"
+            );
+        }
+        RestoreResult::NoTypedRestorePath { backup_location } => {
+            eprintln!(
+                "No typed restore path exists for this backup yet — it is a Drive copy at {} \
+                 you can restore from by hand in the Drive UI",
+                sanitize_for_terminal(backup_location)
+            );
+        }
+        RestoreResult::RefusedNoVisibleParents => {
+            eprintln!(
+                "Refused: this file has no parent folder visible to this account, so no folder \
+                 rule can apply to it. Grant it by id instead: add {{\"file_id\": \"<file \
+                 id>\", \"allow\": [\"edit\"]}} to write_permissions.rules."
+            );
+        }
+        RestoreResult::Blocked { decided_by } => {
+            eprintln!("Blocked");
+            match decided_by {
+                Some(rule) => eprintln!(
+                    "  refused by rule on {} {}{}",
+                    rule.kind_label(),
+                    sanitize_for_terminal(rule.id()),
+                    rule.depth_suffix()
+                ),
+                None => eprintln!("  refused by default policy (no matching rule)"),
+            }
+        }
+        RestoreResult::AlreadyLeased { token, expires_at } => {
+            println!("{token}");
+            eprintln!(
+                "A live lease already covers this file (expires {expires_at}) — reusing its \
+                 token rather than minting a second one; re-run once it expires to restore"
+            );
+        }
+        RestoreResult::RefusedNativeDocument => {
+            eprintln!(
+                "Refused: this is a Google-native document and no backup folder is configured \
+                 for this account — set `lease_backup_folder_id` in settings.json"
+            );
+        }
+        RestoreResult::Denied { detail } => eprintln!("Denied: {detail}"),
+        RestoreResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
+        RestoreResult::Failed { detail } => eprintln!("Failed: {detail}"),
     }
 }
 
@@ -272,6 +410,174 @@ mod tests {
         cmd.execute(&client).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn lease_command_dispatches_restore_with_no_such_backup_token() {
+        // Isolated the same way the acquire dispatch test is: an
+        // unconfigured account plus a token this fresh ledger has never
+        // recorded resolves `NoSuchBackupToken` deterministically, with no
+        // Drive call needed at all — cheap enough to double as "the
+        // subcommand routes to `RestoreCommand::execute`".
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let cmd = LeaseCommand {
+            action: LeaseAction::Restore(RestoreCommand {
+                token: "no-such-token".to_string(),
+                backup_dir: None,
+                expiry_minutes: DEFAULT_EXPIRY_MINUTES,
+                biometrics_only: false,
+                output: OutputFormat::Table,
+            }),
+        };
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_command_execute_reaches_the_gate_and_is_blocked() {
+        // Deliberately stops at the folder-permission gate, *before* the
+        // internal fresh-`acquire` step would ever call
+        // `authenticate::platform_authenticator()` — unlike every test in
+        // `restore.rs` itself (which injects a fake `Authenticator`),
+        // `RestoreCommand::execute` always resolves the *real* one, exactly
+        // like `AcquireCommand::execute` already does. Actually reaching it
+        // here would make this test depend on this machine's real
+        // LocalAuthentication state (Touch ID enrolled and interactively
+        // answered, or not) rather than being hermetic — precisely why
+        // `acquire_command_honours_an_explicit_backup_dir_and_biometrics_only`
+        // above uses a fixture that resolves `RefusedNativeDocument` for
+        // the identical reason. The full authorized-restore path is
+        // already covered, with an injected fake, by `restore.rs`'s own
+        // `a_successful_restore_re_uploads_the_backup_and_mints_a_fresh_lease`.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        // No write_permissions configured for this unconfigured account, so
+        // the gate's bare default policy denies — reached only after this
+        // command resolves the ledger path, loads the backup token's row,
+        // and fetches the target + its parent, exercising the whole CLI
+        // wiring short of authentication itself.
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "mimeType": "text/plain",
+                    "parents": ["parent-1"], "version": "1",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "parent-1", "name": "parent-1",
+                    "mimeType": crate::drive::types::GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Deliberately no download/PATCH mock: reaching either (which would
+        // require authenticating first) fails the test.
+
+        // Seed a backup lease directly into the ledger `RestoreCommand`
+        // will itself resolve, under the `HOME` the guard already
+        // redirected.
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let backup_path = dir.path().join("original.bin");
+        std::fs::write(&backup_path, b"original").unwrap();
+        let sha256 = crate::cli::drive::read::to_hex_string(&{
+            use sha2::Digest as _;
+            sha2::Sha256::digest(b"original")
+        });
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "backup-token".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: backup_path,
+                sha256,
+                size: b"original".len() as u64,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            released_at: None,
+            restored_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let cmd = RestoreCommand {
+            token: "backup-token".to_string(),
+            backup_dir: None,
+            expiry_minutes: DEFAULT_EXPIRY_MINUTES,
+            biometrics_only: false,
+            output: OutputFormat::Json,
+        };
+        cmd.execute(&client).await.unwrap();
+
+        let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        assert!(
+            reloaded.get("backup-token").unwrap().restored_at.is_none(),
+            "a blocked restore must never mark the backup lease as restored-from"
+        );
+    }
+
+    #[test]
+    fn print_restore_result_does_not_panic_for_any_variant() {
+        for result in [
+            RestoreResult::Restored {
+                new_token: "tok-1".to_string(),
+                expires_at: chrono::Utc::now(),
+                backup: LeaseBackup::Bytes {
+                    path: std::path::PathBuf::from("/tmp/backup"),
+                    sha256: "deadbeef".to_string(),
+                    size: 0,
+                },
+            },
+            RestoreResult::Restored {
+                new_token: "tok-2".to_string(),
+                expires_at: chrono::Utc::now(),
+                backup: LeaseBackup::DriveCopy {
+                    file_id: "copy-1".to_string(),
+                },
+            },
+            RestoreResult::NoSuchBackupToken,
+            RestoreResult::NoTypedRestorePath {
+                backup_location: "copy-1".to_string(),
+            },
+            RestoreResult::RefusedNoVisibleParents,
+            RestoreResult::Blocked { decided_by: None },
+            RestoreResult::Blocked {
+                decided_by: Some(crate::drive::write_gate::DecidingRule::Folder {
+                    folder_id: "parent-1".to_string(),
+                    depth: 0,
+                }),
+            },
+            RestoreResult::AlreadyLeased {
+                token: "tok-3".to_string(),
+                expires_at: chrono::Utc::now(),
+            },
+            RestoreResult::RefusedNativeDocument,
+            RestoreResult::Denied {
+                detail: "no".to_string(),
+            },
+            RestoreResult::Unavailable {
+                detail: "no authenticator".to_string(),
+            },
+            RestoreResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ] {
+            print_restore_result(&result);
+        }
+    }
+
     #[test]
     fn default_backup_dir_ends_with_the_expected_suffix() {
         let dir = default_backup_dir().unwrap();
@@ -337,6 +643,7 @@ mod tests {
         match Wrapper::try_parse_from(full).unwrap().cmd {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Acquire(acquire) => acquire,
+                LeaseAction::Restore(_) => panic!("expected an Acquire command"),
             },
         }
     }

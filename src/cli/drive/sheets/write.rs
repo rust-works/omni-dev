@@ -441,6 +441,7 @@ mod tests {
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
+            restored_at: None,
         });
         ledger.save(&ledger_path).unwrap();
         token
