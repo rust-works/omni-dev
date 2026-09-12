@@ -918,8 +918,17 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("now-unlisted-parent").mount(&server).await;
-        // No PATCH mock: reaching the write would mean the re-check failed
-        // to catch the revoked permission.
+        // Reaching the write at all would mean the re-check failed to catch
+        // the revoked permission — an unmocked PATCH would 404 and *also*
+        // produce a `FreshLeaseButWriteFailed` with a different token than
+        // the backup's, which would let this test pass for the wrong
+        // reason. Pin it down explicitly: expect zero PATCH requests.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
 
         let result = restore(
             &client,
@@ -929,12 +938,16 @@ mod tests {
         )
         .await;
 
-        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+        let RestoreResult::FreshLeaseButWriteFailed { token, detail, .. } = result else {
             panic!("expected FreshLeaseButWriteFailed, got {result:?}");
         };
         assert_ne!(
             token, old_token,
             "the surfaced token must be the fresh one, not the backup token"
+        );
+        assert!(
+            detail.contains("write-permission gate no longer allows this write"),
+            "expected the permission re-check's own refusal detail, got: {detail}"
         );
         // The fresh lease must still be live and findable, even though the
         // write it authorised never happened.
