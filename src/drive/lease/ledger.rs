@@ -157,6 +157,31 @@ impl LeaseLedger {
         self.0.insert(record.token.clone(), record);
     }
 
+    /// The live (unexpired, unreleased) lease already covering `file_id`,
+    /// if any.
+    ///
+    /// `drive lease acquire` refuses to mint a second, independent lease
+    /// while one is already live: [`check_and_lock_lease`]'s staleness
+    /// check compares the *caller's own* pre-lock version snapshot against
+    /// *that token's own* ledger row, so two leases acquired concurrently
+    /// on the same file would each capture the same version and each pass
+    /// their own check against it — the second write would then silently
+    /// overwrite the first's, exactly what the staleness check exists to
+    /// prevent (issue #1664 review finding). Refusing a second live lease
+    /// on the same file closes that gap: only one token can ever be
+    /// checked against the file's true current state at a time.
+    ///
+    /// [`check_and_lock_lease`]: super::check::check_and_lock_lease
+    pub(crate) fn live_lease_for_file(
+        &self,
+        file_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<&LeaseRecord> {
+        self.0
+            .values()
+            .find(|record| record.file_id == file_id && record.is_live(now))
+    }
+
     /// Updates the recorded `version`/`modified_time` for `token` after a
     /// successful write under it (ADR-0080 §5's multi-use semantics). A
     /// no-op if the token is absent, which should not happen — the caller
@@ -177,11 +202,7 @@ impl LeaseLedger {
     /// temp-file-in-the-same-directory-then-rename pattern
     /// `InsertLedger::save`/`sync::manifest::Manifest::save` use.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if !dir.exists() {
-                crate::daemon::paths::ensure_dir_0700(dir)?;
-            }
-        }
+        crate::daemon::paths::ensure_parent_dir_0700(path)?;
         let dir = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -208,10 +229,8 @@ impl LeaseLedger {
 /// (unlike the log files, nothing about *which* ledger a write consults is
 /// meant to be redirectable per-invocation).
 pub(crate) fn ledger_path() -> Result<PathBuf> {
-    let base = dirs::state_dir()
-        .or_else(dirs::data_dir)
-        .context("could not resolve the state/data directory for the lease ledger")?;
-    Ok(base.join("omni-dev").join("lease-ledger.jsonl"))
+    crate::request_log::omni_dev_state_subpath("lease-ledger.jsonl")
+        .context("could not resolve the state/data directory for the lease ledger")
 }
 
 /// `<ledger_path>.lock`, an advisory marker held for the lifetime of a
@@ -242,19 +261,8 @@ impl LedgerLock {
     /// they never touch the real ledger or its lock.
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
-        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if !dir.exists() {
-                crate::daemon::paths::ensure_dir_0700(dir)?;
-            }
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path).with_context(|| {
+        crate::daemon::paths::ensure_parent_dir_0700(&path)?;
+        crate::daemon::paths::create_new_file_0600(&path).with_context(|| {
             format!(
                 "another `drive lease` operation appears to already be in progress ({} \
                  exists) — concurrent access would clobber the ledger. If you're sure no \
@@ -263,8 +271,6 @@ impl LedgerLock {
                 path.display()
             )
         })?;
-        crate::daemon::paths::ensure_handle_0600(&file)
-            .with_context(|| format!("Failed to set 0600 on lock file {}", path.display()))?;
         Ok(Self { path })
     }
 }

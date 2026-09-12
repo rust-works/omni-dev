@@ -155,6 +155,46 @@ pub fn ensure_handle_0600(file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
+/// Creates `path`'s parent directory at `0700` if it doesn't already exist.
+///
+/// A no-op for a bare relative filename, whose "parent" is empty — the
+/// "make room for the file I'm about to create" step shared by every
+/// `0600`-file writer in the crate (the request log, the Drive lease ledger
+/// and its lock, the Drive lease backup directory).
+pub fn ensure_parent_dir_0700(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if !dir.exists() {
+            ensure_dir_0700(dir)?;
+        }
+    }
+    Ok(())
+}
+
+/// Creates `path` exclusively, owner read/write only (`0600`) from birth on
+/// Unix.
+///
+/// `create_new` (`O_EXCL`), so two callers racing to create the same path
+/// see exactly one winner and the other an error, never a silent overwrite
+/// — [`write_file_0600`]'s sibling for callers that need "either I created
+/// this file first, or I must fail" rather than a truncating write. Used by
+/// the Drive lease ledger's advisory lock file, its backup files, and the
+/// pre-existing `gmail insert` ledger lock.
+pub fn create_new_file_0600(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to exclusively create file {}", path.display()))?;
+    ensure_handle_0600(&file)
+        .with_context(|| format!("failed to set 0600 on {}", path.display()))?;
+    Ok(file)
+}
+
 /// Tightens an existing file to owner read/write only (`0600`) on Unix.
 pub fn set_file_0600(path: &Path) -> Result<()> {
     #[cfg(unix)]

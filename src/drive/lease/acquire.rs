@@ -58,6 +58,21 @@ pub enum AcquireResult {
         /// Where the backup landed.
         backup: LeaseBackup,
     },
+    /// A live lease already covers this file — its token is returned for
+    /// reuse rather than minting a second, independent one. Two leases
+    /// concurrently acquired on the same file could each pass their own
+    /// staleness check against the same now-stale snapshot, letting the
+    /// second writer silently clobber the first's write (issue #1664
+    /// review finding) — see
+    /// [`LeaseLedger::live_lease_for_file`](super::ledger::LeaseLedger::live_lease_for_file)'s
+    /// doc comment. A fresh Touch ID prompt was already spent finding this
+    /// out; the backup this attempt took (if any) is orphaned.
+    AlreadyLeased {
+        /// The existing lease's token — present this to `--lease` instead.
+        token: String,
+        /// When the existing lease expires.
+        expires_at: DateTime<Utc>,
+    },
     /// The target is a Google-native document and no backup folder is
     /// configured for this account (`lease_backup_folder_id`) — nowhere to
     /// put the required Drive-side copy.
@@ -109,11 +124,32 @@ pub async fn acquire(
     result
 }
 
+/// The accepted lease-expiry range (ADR-0080 §5): at least a minute, at
+/// most 24 hours. Enforced here, in the engine, not only by the CLI's own
+/// `--expiry-minutes` parser (`cli::drive::lease::parse_expiry_minutes`,
+/// which shares these constants) — a non-CLI caller of this engine (a
+/// future MCP tool, a test helper reused outside tests) could otherwise
+/// mint a lease whose expiry silently violates the ADR's intent, or one
+/// that overflows `chrono::Duration` (issue #1664 review finding).
+pub(crate) const MIN_EXPIRY_MINUTES: i64 = 1;
+/// See [`MIN_EXPIRY_MINUTES`].
+pub(crate) const MAX_EXPIRY_MINUTES: i64 = 24 * 60;
+
 async fn acquire_inner(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
 ) -> AcquireResult {
+    let expiry_minutes = opts.expiry.num_minutes();
+    if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&expiry_minutes) {
+        return AcquireResult::Failed {
+            detail: format!(
+                "expiry must be between {MIN_EXPIRY_MINUTES} and {MAX_EXPIRY_MINUTES} minutes, \
+                 got {expiry_minutes}"
+            ),
+        };
+    }
+
     let files_api = FilesApi::new(client);
     let target = match files_api.get_metadata(&opts.file_id).await {
         Ok(target) => target,
@@ -230,10 +266,28 @@ async fn acquire_inner(
         expires_at,
         released_at: None,
     };
-    if let Err(err) = insert_record(record, &opts.ledger_path) {
-        return AcquireResult::Failed {
-            detail: err.to_string(),
-        };
+    // Synchronous ledger I/O (lock, load, save) on the async runtime's
+    // current thread — `block_in_place` hands its other queued tasks off
+    // to the runtime's other workers for the duration, the same reasoning
+    // the `authenticate` call above documents.
+    match tokio::task::block_in_place(|| insert_record(record, &opts.ledger_path)) {
+        Ok(InsertOutcome::Inserted) => {}
+        // Refuse rather than mint a second, independent lease on a file
+        // that already has a live one — see `AcquireResult::AlreadyLeased`'s
+        // doc comment. The backup just taken above is orphaned; a `lease
+        // prune` reclaiming stray backups is the same deliberate fast-follow
+        // the ledger module doc names for expired/released rows.
+        Ok(InsertOutcome::AlreadyLeased(existing)) => {
+            return AcquireResult::AlreadyLeased {
+                token: existing.token,
+                expires_at: existing.expires_at,
+            };
+        }
+        Err(err) => {
+            return AcquireResult::Failed {
+                detail: err.to_string(),
+            };
+        }
     }
 
     // 4. Print the token (the caller's job) and exit 0.
@@ -242,6 +296,16 @@ async fn acquire_inner(
         expires_at,
         backup,
     }
+}
+
+/// What [`insert_record`] did.
+enum InsertOutcome {
+    /// The record was inserted; the lease is minted.
+    Inserted,
+    /// A live lease already covered this record's `file_id` — nothing was
+    /// inserted or overwritten. Carries that existing record so the caller
+    /// can return its token instead.
+    AlreadyLeased(LeaseRecord),
 }
 
 /// Downloads a binary file's bytes and writes them to `backup_dir`
@@ -255,7 +319,11 @@ async fn byte_backup(
     let bytes = files_api.download(file_id).await?;
     let sha256 = crate::cli::drive::read::to_hex_string(&Sha256::digest(&bytes));
     let path = backup_file_path(backup_dir, file_id, name);
-    write_backup(&path, &bytes)?;
+    // `write_backup` is synchronous filesystem I/O for a backup of arbitrary
+    // size — `block_in_place` hands this worker thread's other queued tasks
+    // off to the runtime's other workers for the duration, the same
+    // reasoning the `authenticate` call above documents.
+    tokio::task::block_in_place(|| write_backup(&path, &bytes))?;
     Ok(LeaseBackup::Bytes {
         path,
         sha256,
@@ -310,27 +378,14 @@ fn backup_name(file_id: &str, name: &str) -> String {
 fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            crate::daemon::paths::ensure_dir_0700(parent)?;
-        }
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).with_context(|| {
+    crate::daemon::paths::ensure_parent_dir_0700(path)?;
+    let mut file = crate::daemon::paths::create_new_file_0600(path).with_context(|| {
         format!(
             "Failed to create backup file at {} — it may already exist from a near-simultaneous \
              `drive lease acquire` on the same file within the same second; retry",
             path.display()
         )
     })?;
-    crate::daemon::paths::ensure_handle_0600(&file)
-        .with_context(|| format!("Failed to set 0600 on backup file {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("Failed to write backup to {}", path.display()))?;
     Ok(())
@@ -338,12 +393,19 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 /// Inserts `record` into the ledger at `ledger_path` under [`LedgerLock`],
 /// loading and saving it in full — the atomic-rewrite contract
-/// [`LeaseLedger`] documents.
-fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<()> {
+/// [`LeaseLedger`] documents. This lock-held check-then-insert is the
+/// authoritative gate against two leases ever being live on the same file
+/// at once (see [`LeaseLedger::live_lease_for_file`]'s doc comment) — unlike
+/// a check made before taking the lock, nothing can race it.
+fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<InsertOutcome> {
     let _lock = LedgerLock::acquire(ledger_path)?;
     let mut ledger = LeaseLedger::load(ledger_path)?;
+    if let Some(existing) = ledger.live_lease_for_file(&record.file_id, Utc::now()) {
+        return Ok(InsertOutcome::AlreadyLeased(existing.clone()));
+    }
     ledger.insert(record);
-    ledger.save(ledger_path)
+    ledger.save(ledger_path)?;
+    Ok(InsertOutcome::Inserted)
 }
 
 /// Builds and writes the `kind: "audit"` record for one acquire attempt.
@@ -398,6 +460,15 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
                 ..Default::default()
             }
         }
+        AcquireResult::AlreadyLeased { token, .. } => crate::request_log::AuditOutcome {
+            command: vec!["drive".to_string(), "lease-acquire".to_string()],
+            integration: "drive",
+            file_id: opts.file_id.clone(),
+            lease_id: Some(token.clone()),
+            verdict: "already-leased".to_string(),
+            auth_policy,
+            ..Default::default()
+        },
         AcquireResult::RefusedNativeDocument => crate::request_log::AuditOutcome {
             command: vec!["drive".to_string(), "lease-acquire".to_string()],
             integration: "drive",
@@ -1168,5 +1239,199 @@ mod tests {
 
         let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
         assert!(matches!(result, AcquireResult::RefusedNativeDocument));
+    }
+
+    // ── expiry bound enforced in the engine, not only the CLI (#1664) ───
+
+    #[tokio::test]
+    async fn expiry_below_the_minimum_is_refused_before_authenticating() {
+        // No `/drive/v3/files/f1` mock is mounted — if the check below did
+        // not gate before the metadata fetch, this would fail differently
+        // (a connection/parse error, not this message).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.expiry = ChronoDuration::minutes(0);
+
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!("must not authenticate with an out-of-range expiry");
+            }
+        }
+
+        let result = acquire(&client, &test_opts, &PanicsIfCalled).await;
+        let AcquireResult::Failed { detail } = result else {
+            panic!("expected Failed, got {result:?}");
+        };
+        assert!(detail.contains("expiry must be between"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn expiry_above_the_maximum_is_refused_before_authenticating() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.expiry = ChronoDuration::minutes(MAX_EXPIRY_MINUTES + 1);
+
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!("must not authenticate with an out-of-range expiry");
+            }
+        }
+
+        let result = acquire(&client, &test_opts, &PanicsIfCalled).await;
+        let AcquireResult::Failed { detail } = result else {
+            panic!("expected Failed, got {result:?}");
+        };
+        assert!(detail.contains("expiry must be between"), "{detail}");
+    }
+
+    // ── refusing a second live lease on the same file (#1664) ───────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_acquisition_while_one_is_still_live_reuses_the_existing_token_instead_of_minting_a_second(
+    ) {
+        // Regression test for the TOCTOU this closes: two independently
+        // acquired leases on the same file would otherwise each capture the
+        // same version and each pass their own staleness check against it,
+        // letting the second writer's write silently clobber the first's.
+        // Refusing to mint the second lease at all closes that gap.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let test_opts = opts(root.path());
+
+        let first = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+        let AcquireResult::Acquired {
+            token: first_token, ..
+        } = first
+        else {
+            panic!("expected Acquired, got {first:?}");
+        };
+
+        // A distinct `backup_dir` for the second attempt: `backup_name`'s
+        // timestamp has only whole-second precision (see `write_backup`'s
+        // own doc comment), so two backups of the same file within one
+        // test's runtime would otherwise collide on the same path.
+        let mut second_opts = test_opts.clone();
+        second_opts.backup_dir = root.path().join("backups2");
+
+        let second = acquire(
+            &client,
+            &second_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+        let AcquireResult::AlreadyLeased { token, .. } = second else {
+            panic!("expected AlreadyLeased, got {second:?}");
+        };
+        assert_eq!(token, first_token);
+
+        // Only the first lease is live in the ledger.
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        assert_eq!(
+            ledger
+                .live_lease_for_file("f1", Utc::now())
+                .map(|r| &r.token),
+            Some(&first_token)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_acquisition_after_the_first_expires_mints_a_fresh_lease() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf",
+                    "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let test_opts = opts(root.path());
+
+        let first = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+        let AcquireResult::Acquired {
+            token: first_token, ..
+        } = first
+        else {
+            panic!("expected Acquired, got {first:?}");
+        };
+        // Backdate the first lease's expiry directly rather than waiting out
+        // a real one — `MIN_EXPIRY_MINUTES` now rules out a sub-minute
+        // `--expiry-minutes` that a real sleep-then-retry could use instead.
+        let mut ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        let mut expired = ledger.get(&first_token).unwrap().clone();
+        expired.expires_at = Utc::now() - ChronoDuration::minutes(1);
+        ledger.insert(expired);
+        ledger.save(&test_opts.ledger_path).unwrap();
+
+        // A distinct `backup_dir`: `backup_name`'s timestamp has only
+        // whole-second precision, so a second backup of the same file
+        // within one test's runtime would otherwise collide on the same
+        // path (see `write_backup`'s own doc comment).
+        let mut second_opts = test_opts.clone();
+        second_opts.backup_dir = root.path().join("backups2");
+
+        let second = acquire(
+            &client,
+            &second_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+        let AcquireResult::Acquired {
+            token: second_token,
+            ..
+        } = second
+        else {
+            panic!("expected Acquired, got {second:?}");
+        };
+        assert_ne!(second_token, first_token);
     }
 }

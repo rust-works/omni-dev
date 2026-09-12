@@ -27,7 +27,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    check_and_lock_lease, finish_leased_write, record_failed_leased_write, LeaseCheckOutcome,
+    finish_leased_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
     LeasedWrite,
 };
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -234,24 +234,21 @@ async fn edit_inner(
         ..
     } = evaluated;
 
+    let gated = |result: EditResult| EditOutcome {
+        file_id: opts.file_id.clone(),
+        file_name: Some(target.name.clone()),
+        resolved_folder_id: resolved_folder_id.clone(),
+        result,
+    };
+
     if decision.verdict == write_gate::Verdict::Deny {
-        return EditOutcome {
-            file_id: opts.file_id.clone(),
-            file_name: Some(target.name),
-            resolved_folder_id,
-            result: EditResult::Blocked {
-                decided_by: decision.decided_by,
-            },
-        };
+        return gated(EditResult::Blocked {
+            decided_by: decision.decided_by,
+        });
     }
 
     if opts.dry_run {
-        return EditOutcome {
-            file_id: opts.file_id.clone(),
-            file_name: Some(target.name),
-            resolved_folder_id,
-            result: EditResult::WouldEdit,
-        };
+        return gated(EditResult::WouldEdit);
     }
 
     // The lease check (ADR-0080 §9) sits here: after the permission gate
@@ -291,66 +288,13 @@ async fn edit_inner(
         file_id: &opts.file_id,
     };
     let lease_lock = if requires_lease {
-        let (live_version, live_modified_time) = match files_api.get_metadata(&opts.file_id).await {
-            Ok(fresh) => (fresh.version, fresh.modified_time),
-            Err(err) => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::Failed {
-                        detail: err.to_string(),
-                    },
-                };
-            }
-        };
-        match check_and_lock_lease(
-            leased,
-            opts.lease_token.as_deref(),
-            live_version.as_deref(),
-            live_modified_time.as_deref(),
-        ) {
-            LeaseCheckOutcome::Ok(lock) => Some(lock),
-            LeaseCheckOutcome::NoLease => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::RefusedNoLease,
-                };
-            }
-            LeaseCheckOutcome::Expired => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::RefusedLeaseExpired,
-                };
-            }
-            LeaseCheckOutcome::WrongFile => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::RefusedLeaseWrongFile,
-                };
-            }
-            LeaseCheckOutcome::Stale => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::RefusedLeaseStale,
-                };
-            }
-            LeaseCheckOutcome::Failed(detail) => {
-                return EditOutcome {
-                    file_id: opts.file_id.clone(),
-                    file_name: Some(target.name),
-                    resolved_folder_id,
-                    result: EditResult::Failed { detail },
-                };
-            }
+        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
+            Ok(lock) => Some(lock),
+            Err(LeaseGateRefusal::NoLease) => return gated(EditResult::RefusedNoLease),
+            Err(LeaseGateRefusal::Expired) => return gated(EditResult::RefusedLeaseExpired),
+            Err(LeaseGateRefusal::WrongFile) => return gated(EditResult::RefusedLeaseWrongFile),
+            Err(LeaseGateRefusal::Stale) => return gated(EditResult::RefusedLeaseStale),
+            Err(LeaseGateRefusal::Failed(detail)) => return gated(EditResult::Failed { detail }),
         }
     } else {
         None
@@ -375,12 +319,7 @@ async fn edit_inner(
         }
     };
     drop(lease_lock);
-    EditOutcome {
-        file_id: opts.file_id.clone(),
-        file_name: Some(target.name),
-        resolved_folder_id,
-        result,
-    }
+    gated(result)
 }
 
 /// Builds and writes the [`DriveMutationOutcome`] for one `edit` attempt.
