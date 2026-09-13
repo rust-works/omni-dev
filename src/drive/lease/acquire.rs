@@ -741,6 +741,21 @@ mod tests {
         assert!(detail.contains("Failed to create backup file"), "{detail}");
     }
 
+    #[test]
+    fn write_backup_reports_a_genuine_same_second_collision_distinctly() {
+        // Exercises `write_backup` directly against a literal path, rather
+        // than racing `acquire()`'s whole-second-precision timestamp — see
+        // `a_backup_write_collision_is_reported_as_failed`'s doc comment for
+        // why that race is avoided everywhere else.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-file");
+        std::fs::write(&path, b"already here").unwrap();
+
+        let err = write_backup(&path, b"hello").unwrap_err();
+
+        assert!(err.to_string().contains("may already exist"), "{err:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ledger_insert_failure_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
