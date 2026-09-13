@@ -1363,6 +1363,164 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_spreadsheet_fetch_failure_at_the_sheet_recheck_reports_fresh_lease_but_write_failed(
+    ) {
+        // Mirrors `a_metadata_fetch_failure_during_the_recheck_...` above,
+        // but for the sheet-restore path's own pre-`copyTo` re-check
+        // (line-numbered `sheets_api.get_spreadsheet(&file_id)` just before
+        // `copy_to`) rather than the byte-restore path's `files.get`.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        // Detection's own read succeeds ("Deleted" missing live)...
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // ...but the pre-`copyTo` re-check's read fails outright.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-2", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No `copyTo` mock: reaching it would mean the failed re-check
+        // didn't stop the restore.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/copy-1/sheets/2:copyTo",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_to_response_with_no_sheet_id_reports_fresh_lease_but_write_failed() {
+        // `copyTo`'s response is trusted for the one field the restore
+        // actually needs (`sheetId`) — Sheets is not expected to omit it,
+        // but a malformed/unexpected response must still surface as a
+        // clean `FreshLeaseButWriteFailed` rather than panic or silently
+        // treat the sheet as restored under an unknown id.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-2", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/copy-1/sheets/2:copyTo",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"title": "Copy of Deleted"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No `batchUpdate` mock: reaching it would mean the missing-id
+        // response wasn't caught before the rename-back step.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { token, detail, .. } = result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(token, old_token);
+        assert!(detail.contains("no sheetId"), "{detail}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_restored_sheet_keeps_the_copy_default_title_when_the_original_is_taken() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1430,6 +1588,100 @@ mod tests {
             panic!("expected RestoredSheet, got {result:?}");
         };
         assert_eq!(sheet_title, "Copy of Deleted");
+    }
+
+    // ── `rename_back_if_free` (exercised directly — no `restore()` needed) ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_back_if_free_skips_the_network_when_the_title_already_matches() {
+        // `copyTo` occasionally hands back a sheet whose title already is
+        // the original (no "Copy of " prefix collision to resolve) — the
+        // cheap string check short-circuits before any request is made.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let title = rename_back_if_free(
+            &SheetsApi::new(&sheets),
+            "sheet-1",
+            999,
+            "Deleted",
+            "Deleted",
+        )
+        .await;
+
+        assert_eq!(title, "Deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_back_if_free_swallows_a_spreadsheet_fetch_failure_and_keeps_the_copy_title() {
+        // The free-title check is itself best-effort (module doc comment):
+        // a failure fetching the live spreadsheet must fall back to leaving
+        // the sheet under its `copyTo`-assigned title, never fail the
+        // restore that already succeeded.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let title = rename_back_if_free(
+            &SheetsApi::new(&sheets),
+            "sheet-1",
+            999,
+            "Deleted",
+            "Copy of Deleted",
+        )
+        .await;
+
+        assert_eq!(title, "Copy of Deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_back_if_free_swallows_a_rename_failure_and_keeps_the_copy_title() {
+        // The title was free, but the rename call itself fails — same
+        // best-effort fallback as a failed free-title check.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let title = rename_back_if_free(
+            &SheetsApi::new(&sheets),
+            "sheet-1",
+            999,
+            "Deleted",
+            "Copy of Deleted",
+        )
+        .await;
+
+        assert_eq!(title, "Copy of Deleted");
     }
 
     #[tokio::test(flavor = "multi_thread")]
