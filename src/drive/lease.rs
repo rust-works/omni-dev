@@ -7,10 +7,13 @@
 //! ([`acquire`]) reads and writes; [`check`] is the shared "does this
 //! presented `--lease` token authorise this write" gate every
 //! content-mutating engine (`drive edit`, every Sheets/Docs write verb)
-//! calls; [`restore`] is `drive lease restore` (ADR-0080 §10).
+//! calls; [`restore`] is `drive lease restore` (ADR-0080 §10); [`settings`]
+//! resolves the global CLI-flag/env-var/`settings.json` policy layer
+//! (ADR-0080 §13, issue #1677).
 
 pub(crate) mod acquire;
 pub(crate) mod authenticate;
 pub(crate) mod check;
 pub(crate) mod ledger;
 pub(crate) mod restore;
+pub(crate) mod settings;

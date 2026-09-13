@@ -321,6 +321,38 @@ pub struct DriveSettings {
     pub accounts: HashMap<String, DriveAccountSettings>,
 }
 
+/// The `lease` section of `settings.json` — global, machine-wide policy for
+/// `drive lease acquire`/`restore`.
+///
+/// Sibling of `drive` rather than nested under it (issue #1677,
+/// [ADR-0080](../../docs/adrs/adr-0080.md) §13): none of these are
+/// meaningful per-Drive-account, they describe *this machine's* policy.
+/// Every field is optional; an unset field falls back to the built-in
+/// default, so an absent `lease` block preserves `drive lease`'s behaviour
+/// byte-for-byte. See `crate::drive::lease::settings` for the resolvers that
+/// layer a CLI flag and an env var on top of each of these.
+#[derive(Debug, Default, Deserialize)]
+pub struct LeaseSettings {
+    /// Default `--expiry-minutes` when the flag is omitted (ADR-0080 §5/§13).
+    #[serde(default)]
+    pub default_expiry_minutes: Option<i64>,
+
+    /// Default `--backup-dir` when the flag is omitted (ADR-0080 §3/§13).
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
+
+    /// Default authentication policy: `false` selects device-owner (the
+    /// default), `true` selects biometrics-only (ADR-0080 §7/§13).
+    #[serde(default)]
+    pub biometrics_only: bool,
+
+    /// Opt-out for headless/off-macOS contexts (ADR-0080 §8/§13): `true`
+    /// lets `drive lease acquire`/`restore` proceed with no device-owner
+    /// authenticator, waiving the human-presence guarantee.
+    #[serde(default)]
+    pub allow_headless: bool,
+}
+
 /// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
@@ -348,6 +380,11 @@ pub struct Settings {
     /// [`DriveSettings::default`], which is an empty account map.
     #[serde(default)]
     pub drive: DriveSettings,
+
+    /// Global Drive lease policy (issue #1677); an absent block yields
+    /// [`LeaseSettings::default`].
+    #[serde(default)]
+    pub lease: LeaseSettings,
 }
 
 /// Returns the active profile name from `raw` (the process environment), or
@@ -435,6 +472,14 @@ impl Settings {
     /// graceful `unwrap_or_default` of [`SettingsEnv::load`].
     pub fn load_mcp() -> McpSettings {
         Self::load().map(|s| s.mcp).unwrap_or_default()
+    }
+
+    /// Loads just the [`lease`](LeaseSettings) section, falling back to its
+    /// defaults when the settings file is absent or unreadable — so `drive
+    /// lease acquire`/`restore` always run with a malformed `settings.json`
+    /// (issue #1677). Mirrors [`Settings::load_mcp`].
+    pub fn load_lease() -> LeaseSettings {
+        Self::load().map(|s| s.lease).unwrap_or_default()
     }
 
     /// Loads settings from a specific path.
@@ -1374,6 +1419,48 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
         assert!(settings.drive.default_account.is_none());
         assert!(settings.drive.accounts.is_empty());
+    }
+
+    #[test]
+    fn settings_parse_lease_section_from_json() {
+        let json = r#"{
+            "lease": {
+                "default_expiry_minutes": 45,
+                "backup_dir": "/tmp/drive-backups",
+                "biometrics_only": true,
+                "allow_headless": true
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.lease.default_expiry_minutes, Some(45));
+        assert_eq!(
+            settings.lease.backup_dir.as_deref(),
+            Some(Path::new("/tmp/drive-backups"))
+        );
+        assert!(settings.lease.biometrics_only);
+        assert!(settings.lease.allow_headless);
+    }
+
+    #[test]
+    fn settings_without_lease_key_defaults_all_unset() {
+        // An absent `lease` block must leave every field at its built-in
+        // default so `drive lease` behaves byte-for-byte as before (issue
+        // #1677).
+        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
+        assert!(settings.lease.default_expiry_minutes.is_none());
+        assert!(settings.lease.backup_dir.is_none());
+        assert!(!settings.lease.biometrics_only);
+        assert!(!settings.lease.allow_headless);
+    }
+
+    #[test]
+    fn settings_lease_partial_section_leaves_others_default() {
+        let settings: Settings =
+            serde_json::from_str(r#"{ "lease": { "biometrics_only": true } }"#).unwrap();
+        assert!(settings.lease.biometrics_only);
+        assert!(settings.lease.default_expiry_minutes.is_none());
+        assert!(settings.lease.backup_dir.is_none());
+        assert!(!settings.lease.allow_headless);
     }
 
     // ── free get_env_var seam (pure: injected raw env + lazy settings loader) ──

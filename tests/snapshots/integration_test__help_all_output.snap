@@ -4053,9 +4053,10 @@ Arguments:
   <FILE_ID>  Drive file id to lease (from `drive search`, or the `id` segment of a Drive URL)
 
 Options:
-      --backup-dir <PATH>   Local directory byte backups are written under. Defaults to `<state dir>/omni-dev/drive-backups`
-      --expiry-minutes <N>  Minutes the lease stays live once authorised. A write never extends this — a fresh window means a fresh `drive lease acquire` (ADR-0080 §5) [default: 30]
-      --biometrics-only     Require Touch ID specifically, failing outright rather than falling back to the account password (ADR-0080 §7). Needs Touch ID hardware; the default policy works on any Mac
+      --backup-dir <PATH>   Local directory byte backups are written under. Defaults to `settings.json`'s `lease.backup_dir`, then `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`, then `<state dir>/omni-dev/drive-backups`
+      --expiry-minutes <N>  Minutes the lease stays live once authorised. A write never extends this — a fresh window means a fresh `drive lease acquire` (ADR-0080 §5). Defaults to `settings.json`'s `lease.default_expiry_minutes`, then `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`, then 30
+      --biometrics-only     Require Touch ID specifically, failing outright rather than falling back to the account password (ADR-0080 §7). Needs Touch ID hardware; the default policy works on any Mac. Also settable via `settings.json`'s `lease.biometrics_only` or `OMNI_DEV_DRIVE_LEASE_BIOMETRICS_ONLY`; any layer selecting it wins
+      --allow-headless      Proceed even when no device-owner authenticator is available in this context — off-macOS, or a macOS process with no attached GUI session (ADR-0080 §8) — waiving the human-presence guarantee instead of refusing outright. Also settable via `settings.json`'s `lease.allow_headless` or `OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS`; any layer opting in wins
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
 
@@ -4072,9 +4073,10 @@ Arguments:
   <TOKEN>  The backup lease's token (from `drive lease acquire`), expired or not — an expired-but-kept row is the expected common case
 
 Options:
-      --backup-dir <PATH>   Local directory the fresh lease's own byte backup is written under. Defaults to `<state dir>/omni-dev/drive-backups`
-      --expiry-minutes <N>  Minutes the fresh lease stays live once authorised [default: 30]
-      --biometrics-only     Require Touch ID specifically for the fresh lease, failing outright rather than falling back to the account password (ADR-0080 §7)
+      --backup-dir <PATH>   Local directory byte backups are written under. Defaults to `settings.json`'s `lease.backup_dir`, then `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`, then `<state dir>/omni-dev/drive-backups`
+      --expiry-minutes <N>  Minutes the lease stays live once authorised. A write never extends this — a fresh window means a fresh `drive lease acquire` (ADR-0080 §5). Defaults to `settings.json`'s `lease.default_expiry_minutes`, then `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`, then 30
+      --biometrics-only     Require Touch ID specifically, failing outright rather than falling back to the account password (ADR-0080 §7). Needs Touch ID hardware; the default policy works on any Mac. Also settable via `settings.json`'s `lease.biometrics_only` or `OMNI_DEV_DRIVE_LEASE_BIOMETRICS_ONLY`; any layer selecting it wins
+      --allow-headless      Proceed even when no device-owner authenticator is available in this context — off-macOS, or a macOS process with no attached GUI session (ADR-0080 §8) — waiving the human-presence guarantee instead of refusing outright. Also settable via `settings.json`'s `lease.allow_headless` or `OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS`; any layer opting in wins
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
 

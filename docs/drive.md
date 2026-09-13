@@ -1084,11 +1084,45 @@ Mac.
 and the authentication prompt for that folder — see [Write
 permissions](#write-permissions).
 
-**Off-macOS and headless**, `drive lease acquire` fails closed: no
-authenticator is available, so no lease can ever be acquired there, and
+**Global settings** (ADR-0080 §13) let this machine's operator set defaults
+for `--expiry-minutes`, `--backup-dir`, and `--biometrics-only` without
+passing them on every invocation, plus the headless opt-out below. They live
+in a top-level `lease` block, sibling of `drive`:
+
+```jsonc
+{
+  "lease": {
+    "default_expiry_minutes": 60,
+    "backup_dir": "/Users/alice/drive-backups",
+    "biometrics_only": true,
+    "allow_headless": false
+  }
+}
+```
+
+Each also has an env var, and every setting resolves in the same order:
+the CLI flag, if given, wins outright; then the env var; then the
+`settings.json` field; then the built-in default.
+
+| Setting          | Flag                | Env var                                | Default                              |
+|------------------|---------------------|----------------------------------------|--------------------------------------|
+| Lease expiry     | `--expiry-minutes`  | `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`  | 30                                   |
+| Backup directory | `--backup-dir`      | `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`      | `<state dir>/omni-dev/drive-backups` |
+| Auth policy      | `--biometrics-only` | `OMNI_DEV_DRIVE_LEASE_BIOMETRICS_ONLY` | device-owner                         |
+| Headless opt-out | `--allow-headless`  | `OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS`  | off (fails closed)                   |
+
+For `biometrics_only`/`allow_headless`, any layer that opts in wins — there
+is no way to force one back off from a lower layer once it is set.
+
+**Off-macOS and headless**, `drive lease acquire` fails closed by default:
+no authenticator is available, so no lease can ever be acquired there, and
 every gated write refuses in turn. This is deliberate (ADR-0080 §8) — a TTY
 prompt would let a script answer on the human's behalf, defeating the
-point.
+point. An operator can explicitly waive this with `--allow-headless`, the
+`OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS` env var, or `lease.allow_headless` in
+`settings.json` — the acquisition then proceeds with no human ever
+prompted, and the resulting lease (and its audit record) is marked as
+having used the waiver, so it stays visible after the fact.
 
 ### Restore
 
