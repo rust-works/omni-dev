@@ -1506,8 +1506,9 @@ path:
 ```
 Deleted sheet 'Q2' (sheetId 118293) from 'Budget'; this cannot be undone
 through omni-dev — the lease this write required backed the whole
-spreadsheet up when it was acquired (Drive copy 1AbC…); restore from that
-copy in the Drive UI, or fall back to Google Drive's own version history
+spreadsheet up when it was acquired (Drive copy 1AbC…); run `omni-dev
+drive lease restore <TOKEN>` to locate it, restore from that copy in the
+Drive UI, or fall back to Google Drive's own version history
 ```
 
 Two things the wording is careful about. The copy dates from **acquisition**,
@@ -1520,6 +1521,11 @@ same token are not in it. And a folder whose deciding rule sets
 recovery path`` rather than pointing at a copy that does not exist. The
 `--output json` outcome carries the same copy as a `backup` field
 (`{"kind": "drive_copy", "file_id": …}`), omitted when none was taken.
+`drive lease restore` ([ADR-0080](adrs/adr-0080.md) §10) is named here for
+what it actually does today: for a native document like this one, it only
+*locates* the copy (no typed sheet-restore path exists yet, see
+[Restore](#restore) below) — restoring it into the live spreadsheet is
+still a manual Drive-UI copy-back.
 
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
 `--at`/`--count` (or the range bounds) must name rows/columns/cells that
