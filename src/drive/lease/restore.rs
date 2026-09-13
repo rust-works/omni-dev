@@ -383,8 +383,8 @@ async fn restore_inner(
         ledger_path: &opts.ledger_path,
         file_id: &file_id,
     };
-    let lock = match gate_leased_write(leased, &files_api, Some(&new_token)).await {
-        Ok(lock) => lock,
+    let grant = match gate_leased_write(leased, &files_api, Some(&new_token)).await {
+        Ok(grant) => grant,
         Err(refusal) => return fresh_lease_but(leased_write_refusal_detail(refusal)),
     };
     let result = match files_api
@@ -394,7 +394,7 @@ async fn restore_inner(
         Ok(updated) => {
             finish_leased_write(
                 leased,
-                &lock,
+                &grant.lock,
                 &new_token,
                 updated.version,
                 updated.modified_time,
@@ -411,7 +411,7 @@ async fn restore_inner(
             fresh_lease_but(detail)
         }
     };
-    drop(lock);
+    drop(grant);
 
     // Mark the backup lease's own row as consumed (ADR-0080 §4's
     // "transition"), best-effort — the restore itself already succeeded or
