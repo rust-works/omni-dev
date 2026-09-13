@@ -42,6 +42,13 @@ pub struct AcquireOptions {
     /// pass a path under a `tempdir` so a test run never touches the real
     /// ledger.
     pub ledger_path: PathBuf,
+    /// The global headless/off-macOS opt-out (ADR-0080 §8/§13, issue
+    /// #1677): when `true`, an [`AuthOutcome::Unavailable`] outcome — no
+    /// authenticator exists in this context at all — is waived instead of
+    /// refusing the lease, and the acquisition proceeds without a human
+    /// ever having been prompted. Resolved by
+    /// `crate::drive::lease::settings::resolve_allow_headless`.
+    pub allow_headless: bool,
 }
 
 /// What happened.
@@ -57,6 +64,12 @@ pub enum AcquireResult {
         expires_at: DateTime<Utc>,
         /// Where the backup landed.
         backup: LeaseBackup,
+        /// `true` when this acquisition proceeded under the headless
+        /// opt-out (ADR-0080 §8/§13) instead of a real device-owner
+        /// prompt — no human presence was verified. Carried into the audit
+        /// record ([`record_attempt`]) so a waived acquisition is durably
+        /// distinguishable from a normally-authorised one.
+        headless_waiver: bool,
     },
     /// A live lease already covers this file — its token is returned for
     /// reuse rather than minting a second, independent one. Two leases
@@ -197,11 +210,21 @@ async fn acquire_inner(
     // `spawn_blocking`.
     let auth_outcome =
         tokio::task::block_in_place(|| authenticator.authenticate(&reason, opts.auth_policy));
-    match auth_outcome {
-        AuthOutcome::Authorized => {}
+    let headless_waiver = match auth_outcome {
+        AuthOutcome::Authorized => false,
         AuthOutcome::Denied(detail) => return AcquireResult::Denied { detail },
-        AuthOutcome::Unavailable(detail) => return AcquireResult::Unavailable { detail },
-    }
+        AuthOutcome::Unavailable(detail) => {
+            // ADR-0080 §8/§13: an explicit, per-installation opt-out lets
+            // this proceed with no human ever having been prompted, rather
+            // than refusing outright. `headless_waiver` on the eventual
+            // `Acquired` result (and so the audit record) is what makes
+            // this waiver durably visible.
+            if !opts.allow_headless {
+                return AcquireResult::Unavailable { detail };
+            }
+            true
+        }
+    };
 
     // 2. Backup — bytes for a binary file, a Drive-side copy for a native
     // document (ADR-0080 §3). `native_backup_folder_id` is guaranteed
@@ -296,6 +319,7 @@ async fn acquire_inner(
         token,
         expires_at,
         backup,
+        headless_waiver,
     }
 }
 
@@ -439,6 +463,7 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
             token,
             backup,
             expires_at: _,
+            headless_waiver,
         } => {
             let (backup_location, backup_sha256, backup_size) = match backup {
                 LeaseBackup::Bytes { path, sha256, size } => (
@@ -465,7 +490,16 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
                 integration: "drive",
                 file_id: opts.file_id.clone(),
                 lease_id: Some(token.clone()),
-                verdict: "acquired".to_string(),
+                // ADR-0080 §8/§13, issue #1677: a distinct verdict, rather
+                // than a separate field on this shared, free-form-vocabulary
+                // struct (ADR-0080 §11), durably distinguishes an
+                // acquisition that waived the human-presence guarantee from
+                // a normally-authorised one.
+                verdict: if *headless_waiver {
+                    "acquired-headless-waiver".to_string()
+                } else {
+                    "acquired".to_string()
+                },
                 version_after,
                 modified_time_after,
                 backup_location,
@@ -581,6 +615,7 @@ mod tests {
             expiry: ChronoDuration::minutes(30),
             auth_policy: AuthPolicy::DeviceOwner,
             ledger_path: dir.join("lease-ledger.jsonl"),
+            allow_headless: false,
         }
     }
 
@@ -632,6 +667,54 @@ mod tests {
 
         assert!(matches!(result, AcquireResult::Unavailable { .. }));
         assert!(!root.path().join("backups").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_opt_out_proceeds_without_an_authenticator() {
+        // ADR-0080 §8/§13, issue #1677: the same `Unsupported` authenticator
+        // as `unavailable_authentication_takes_no_backup` above, but with
+        // `allow_headless: true` — this must now proceed to a real backup
+        // and ledger row instead of refusing, with `headless_waiver` set so
+        // the waiver is durably visible.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+
+        let result = acquire(
+            &client,
+            &AcquireOptions {
+                allow_headless: true,
+                ..opts(root.path())
+            },
+            &Unsupported,
+        )
+        .await;
+
+        let AcquireResult::Acquired {
+            headless_waiver, ..
+        } = result
+        else {
+            panic!("expected Acquired, got {result:?}");
+        };
+        assert!(headless_waiver);
+        assert!(root.path().join("backups").exists());
     }
 
     #[tokio::test]
@@ -806,6 +889,7 @@ mod tests {
                 sha256: "deadbeef".to_string(),
                 size: 0,
             },
+            headless_waiver: false,
         }
         .write_jsonl(&mut buf)
         .unwrap();

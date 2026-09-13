@@ -1,7 +1,7 @@
 //! CLI commands for `omni-dev drive lease` — the Drive write lease
 //! ([ADR-0080](../../../docs/adrs/adr-0080.md)).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::cli::drive::format::{output_as, OutputFormat};
@@ -13,10 +13,9 @@ use crate::drive::lease::acquire::{
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
 use crate::drive::lease::restore::{self, RestoreOptions, RestoreResult};
+use crate::drive::lease::settings as lease_settings;
 use crate::drive::sheets::client::SheetsClient;
-
-/// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
-const DEFAULT_EXPIRY_MINUTES: i64 = 30;
+use crate::utils::settings::{Settings, SettingsEnv};
 
 /// Validates `--expiry-minutes` before anything else runs — no network
 /// call, no Touch ID prompt — so a bad value is a clean parse error instead
@@ -65,6 +64,76 @@ impl LeaseCommand {
     }
 }
 
+/// The four global-policy flags shared verbatim by `acquire` and `restore`
+/// (ADR-0080 §13, issue #1677) — flattened into both subcommands rather than
+/// duplicated, since each also needs the identical resolution logic in
+/// [`LeaseFlags::resolve`].
+#[derive(Parser)]
+pub struct LeaseFlags {
+    /// Local directory byte backups are written under. Defaults to
+    /// `settings.json`'s `lease.backup_dir`, then
+    /// `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`, then
+    /// `<state dir>/omni-dev/drive-backups`.
+    #[arg(long, value_name = "PATH")]
+    pub backup_dir: Option<std::path::PathBuf>,
+
+    /// Minutes the lease stays live once authorised. A write never extends
+    /// this — a fresh window means a fresh `drive lease acquire` (ADR-0080
+    /// §5). Defaults to `settings.json`'s `lease.default_expiry_minutes`,
+    /// then `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`, then 30.
+    #[arg(long, value_name = "N", value_parser = parse_expiry_minutes)]
+    pub expiry_minutes: Option<i64>,
+
+    /// Require Touch ID specifically, failing outright rather than falling
+    /// back to the account password (ADR-0080 §7). Needs Touch ID hardware;
+    /// the default policy works on any Mac. Also settable via
+    /// `settings.json`'s `lease.biometrics_only` or
+    /// `OMNI_DEV_DRIVE_LEASE_BIOMETRICS_ONLY`; any layer selecting it wins.
+    #[arg(long)]
+    pub biometrics_only: bool,
+
+    /// Proceed even when no device-owner authenticator is available in this
+    /// context — off-macOS, or a macOS process with no attached GUI session
+    /// (ADR-0080 §8) — waiving the human-presence guarantee instead of
+    /// refusing outright. Also settable via `settings.json`'s
+    /// `lease.allow_headless` or `OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS`; any
+    /// layer opting in wins.
+    #[arg(long)]
+    pub allow_headless: bool,
+}
+
+/// What [`LeaseFlags`] resolved to, after layering the CLI flags over
+/// `OMNI_DEV_DRIVE_LEASE_*`/`settings.json`/hard-coded defaults.
+struct ResolvedLeaseFlags {
+    backup_dir: std::path::PathBuf,
+    expiry: chrono::Duration,
+    auth_policy: AuthPolicy,
+    allow_headless: bool,
+}
+
+impl LeaseFlags {
+    fn resolve(self) -> Result<ResolvedLeaseFlags> {
+        let env = SettingsEnv::load();
+        let settings = Settings::load_lease();
+        let backup_dir = lease_settings::resolve_backup_dir(self.backup_dir, &env, &settings)?;
+        let expiry = chrono::Duration::minutes(lease_settings::resolve_expiry_minutes(
+            self.expiry_minutes,
+            &env,
+            &settings,
+        ));
+        let auth_policy =
+            lease_settings::resolve_auth_policy(self.biometrics_only, &env, &settings);
+        let allow_headless =
+            lease_settings::resolve_allow_headless(self.allow_headless, &env, &settings);
+        Ok(ResolvedLeaseFlags {
+            backup_dir,
+            expiry,
+            auth_policy,
+            allow_headless,
+        })
+    }
+}
+
 /// Backs up `FILE_ID`'s current content and mints a lease token
 /// (ADR-0080 §2). Refuses a Google-native document (Docs/Sheets/Slides)
 /// unless the active account has `lease_backup_folder_id` configured, in
@@ -76,22 +145,8 @@ pub struct AcquireCommand {
     /// a Drive URL).
     pub file_id: String,
 
-    /// Local directory byte backups are written under. Defaults to
-    /// `<state dir>/omni-dev/drive-backups`.
-    #[arg(long, value_name = "PATH")]
-    pub backup_dir: Option<std::path::PathBuf>,
-
-    /// Minutes the lease stays live once authorised. A write never
-    /// extends this — a fresh window means a fresh `drive lease acquire`
-    /// (ADR-0080 §5).
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_EXPIRY_MINUTES, value_parser = parse_expiry_minutes)]
-    pub expiry_minutes: i64,
-
-    /// Require Touch ID specifically, failing outright rather than
-    /// falling back to the account password (ADR-0080 §7). Needs Touch ID
-    /// hardware; the default policy works on any Mac.
-    #[arg(long)]
-    pub biometrics_only: bool,
+    #[command(flatten)]
+    pub flags: LeaseFlags,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -100,24 +155,18 @@ pub struct AcquireCommand {
 
 impl AcquireCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let backup_dir = match self.backup_dir {
-            Some(dir) => dir,
-            None => default_backup_dir()?,
-        };
+        let resolved = self.flags.resolve()?;
         let ledger_path = ledger::ledger_path()?;
         let native_backup_folder_id =
             crate::cli::drive::helpers::active_account_lease_backup_folder_id()?;
         let opts = AcquireOptions {
             file_id: self.file_id,
-            backup_dir,
+            backup_dir: resolved.backup_dir,
             native_backup_folder_id,
-            expiry: chrono::Duration::minutes(self.expiry_minutes),
-            auth_policy: if self.biometrics_only {
-                AuthPolicy::BiometricsOnly
-            } else {
-                AuthPolicy::DeviceOwner
-            },
+            expiry: resolved.expiry,
+            auth_policy: resolved.auth_policy,
             ledger_path,
+            allow_headless: resolved.allow_headless,
         };
         let authenticator = authenticate::platform_authenticator();
         let result = acquire::acquire(client, &opts, authenticator.as_ref()).await;
@@ -127,15 +176,6 @@ impl AcquireCommand {
         print_result(&result);
         Ok(())
     }
-}
-
-/// `<state dir>/omni-dev/drive-backups` — a sibling of the request log and
-/// lease ledger, same posture.
-fn default_backup_dir() -> Result<std::path::PathBuf> {
-    let base = dirs::state_dir()
-        .or_else(dirs::data_dir)
-        .context("could not resolve the state/data directory for the default backup directory")?;
-    Ok(base.join("omni-dev").join("drive-backups"))
 }
 
 /// Restores a file from the backup a lease recorded (ADR-0080 §10). `TOKEN`
@@ -148,19 +188,8 @@ pub struct RestoreCommand {
     /// not — an expired-but-kept row is the expected common case.
     pub token: String,
 
-    /// Local directory the fresh lease's own byte backup is written under.
-    /// Defaults to `<state dir>/omni-dev/drive-backups`.
-    #[arg(long, value_name = "PATH")]
-    pub backup_dir: Option<std::path::PathBuf>,
-
-    /// Minutes the fresh lease stays live once authorised.
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_EXPIRY_MINUTES, value_parser = parse_expiry_minutes)]
-    pub expiry_minutes: i64,
-
-    /// Require Touch ID specifically for the fresh lease, failing outright
-    /// rather than falling back to the account password (ADR-0080 §7).
-    #[arg(long)]
-    pub biometrics_only: bool,
+    #[command(flatten)]
+    pub flags: LeaseFlags,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -169,25 +198,19 @@ pub struct RestoreCommand {
 
 impl RestoreCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let backup_dir = match self.backup_dir {
-            Some(dir) => dir,
-            None => default_backup_dir()?,
-        };
+        let resolved = self.flags.resolve()?;
         let ledger_path = ledger::ledger_path()?;
         let native_backup_folder_id =
             crate::cli::drive::helpers::active_account_lease_backup_folder_id()?;
         let rules = crate::cli::drive::helpers::active_account_rules()?;
         let opts = RestoreOptions {
             token: self.token,
-            backup_dir,
+            backup_dir: resolved.backup_dir,
             native_backup_folder_id,
-            expiry: chrono::Duration::minutes(self.expiry_minutes),
-            auth_policy: if self.biometrics_only {
-                AuthPolicy::BiometricsOnly
-            } else {
-                AuthPolicy::DeviceOwner
-            },
+            expiry: resolved.expiry,
+            auth_policy: resolved.auth_policy,
             ledger_path,
+            allow_headless: resolved.allow_headless,
         };
         let sheets = SheetsClient::from_drive_client(client)?;
         let authenticator = authenticate::platform_authenticator();
@@ -206,6 +229,7 @@ fn print_result(result: &AcquireResult) {
             token,
             expires_at,
             backup,
+            headless_waiver,
         } => {
             println!("{token}");
             // The backup path embeds the file's Drive name (`backup_name`
@@ -221,6 +245,12 @@ fn print_result(result: &AcquireResult) {
                 }
             };
             eprintln!("Backed up to {backup_desc} (expires {expires_at})");
+            if *headless_waiver {
+                eprintln!(
+                    "Warning: acquired under the headless opt-out (ADR-0080 §8) — no \
+                     device-owner prompt was presented for this lease."
+                );
+            }
         }
         AcquireResult::AlreadyLeased { token, expires_at } => {
             println!("{token}");
@@ -248,6 +278,7 @@ fn print_restore_result(result: &RestoreResult) {
             new_token,
             expires_at,
             backup,
+            headless_waiver,
         } => {
             println!("{new_token}");
             let backup_desc = match backup {
@@ -262,6 +293,12 @@ fn print_restore_result(result: &RestoreResult) {
                 "Restored. Backed up the pre-restore content to {backup_desc} (expires \
                  {expires_at})"
             );
+            if *headless_waiver {
+                eprintln!(
+                    "Warning: the fresh lease was minted under the headless opt-out (ADR-0080 \
+                     §8) — no device-owner prompt was presented for it."
+                );
+            }
         }
         RestoreResult::RestoredSheet {
             new_token,
@@ -270,6 +307,7 @@ fn print_restore_result(result: &RestoreResult) {
             spreadsheet_id,
             sheet_id,
             sheet_title,
+            headless_waiver,
         } => {
             println!("{new_token}");
             let backup_desc = match backup {
@@ -288,6 +326,12 @@ fn print_restore_result(result: &RestoreResult) {
                 sanitize_for_terminal(sheet_title),
                 sanitize_for_terminal(spreadsheet_id)
             );
+            if *headless_waiver {
+                eprintln!(
+                    "Warning: the fresh lease was minted under the headless opt-out (ADR-0080 \
+                     §8) — no device-owner prompt was presented for it."
+                );
+            }
         }
         RestoreResult::NoSuchBackupToken => {
             eprintln!(
@@ -435,9 +479,12 @@ mod tests {
         let cmd = LeaseCommand {
             action: LeaseAction::Acquire(AcquireCommand {
                 file_id: "f1".to_string(),
-                backup_dir: None,
-                expiry_minutes: DEFAULT_EXPIRY_MINUTES,
-                biometrics_only: false,
+                flags: LeaseFlags {
+                    backup_dir: None,
+                    expiry_minutes: None,
+                    biometrics_only: false,
+                    allow_headless: false,
+                },
                 output: OutputFormat::Table,
             }),
         };
@@ -454,9 +501,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cmd = AcquireCommand {
             file_id: "f1".to_string(),
-            backup_dir: Some(root.path().join("backups")),
-            expiry_minutes: 10,
-            biometrics_only: true,
+            flags: LeaseFlags {
+                backup_dir: Some(root.path().join("backups")),
+                expiry_minutes: Some(10),
+                biometrics_only: true,
+                allow_headless: false,
+            },
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
@@ -477,9 +527,12 @@ mod tests {
         let cmd = LeaseCommand {
             action: LeaseAction::Restore(RestoreCommand {
                 token: "no-such-token".to_string(),
-                backup_dir: None,
-                expiry_minutes: DEFAULT_EXPIRY_MINUTES,
-                biometrics_only: false,
+                flags: LeaseFlags {
+                    backup_dir: None,
+                    expiry_minutes: None,
+                    biometrics_only: false,
+                    allow_headless: false,
+                },
                 output: OutputFormat::Table,
             }),
         };
@@ -569,9 +622,12 @@ mod tests {
         // gate still blocks first, so neither ever reaches use.
         let cmd = RestoreCommand {
             token: "backup-token".to_string(),
-            backup_dir: Some(dir.path().join("fresh-backups")),
-            expiry_minutes: DEFAULT_EXPIRY_MINUTES,
-            biometrics_only: true,
+            flags: LeaseFlags {
+                backup_dir: Some(dir.path().join("fresh-backups")),
+                expiry_minutes: None,
+                biometrics_only: true,
+                allow_headless: false,
+            },
             output: OutputFormat::Json,
         };
         cmd.execute(&client).await.unwrap();
@@ -594,6 +650,7 @@ mod tests {
                     sha256: "deadbeef".to_string(),
                     size: 0,
                 },
+                headless_waiver: false,
             },
             RestoreResult::Restored {
                 new_token: "tok-2".to_string(),
@@ -601,6 +658,7 @@ mod tests {
                 backup: LeaseBackup::DriveCopy {
                     file_id: "copy-1".to_string(),
                 },
+                headless_waiver: true,
             },
             RestoreResult::RestoredSheet {
                 new_token: "tok-5".to_string(),
@@ -611,6 +669,7 @@ mod tests {
                 spreadsheet_id: "sheet-1".to_string(),
                 sheet_id: 999,
                 sheet_title: "Deleted".to_string(),
+                headless_waiver: false,
             },
             RestoreResult::NoSuchBackupToken,
             RestoreResult::NoTypedRestorePath {
@@ -651,7 +710,17 @@ mod tests {
 
     #[test]
     fn default_backup_dir_ends_with_the_expected_suffix() {
-        let dir = default_backup_dir().unwrap();
+        // `LeaseFlags::resolve` delegates the whole chain to
+        // `lease_settings::resolve_backup_dir`, whose own precedence tiers
+        // are covered in `src/drive/lease/settings.rs` — this just confirms
+        // the hard-coded bottom of the chain is still what this CLI's docs
+        // promise.
+        let dir = lease_settings::resolve_backup_dir(
+            None,
+            &crate::test_support::env::MapEnv::new(),
+            &crate::utils::settings::LeaseSettings::default(),
+        )
+        .unwrap();
         assert!(
             dir.ends_with(std::path::Path::new("omni-dev").join("drive-backups")),
             "{}",
@@ -670,6 +739,7 @@ mod tests {
                     sha256: "deadbeef".to_string(),
                     size: 0,
                 },
+                headless_waiver: false,
             },
             AcquireResult::Acquired {
                 token: "tok-2".to_string(),
@@ -677,6 +747,7 @@ mod tests {
                 backup: LeaseBackup::DriveCopy {
                     file_id: "copy-1".to_string(),
                 },
+                headless_waiver: true,
             },
             AcquireResult::AlreadyLeased {
                 token: "tok-3".to_string(),
@@ -735,20 +806,25 @@ mod tests {
     fn defaults_are_sane() {
         let cmd = parse(&["acquire", "file1"]);
         assert_eq!(cmd.file_id, "file1");
-        assert!(cmd.backup_dir.is_none());
-        assert_eq!(cmd.expiry_minutes, DEFAULT_EXPIRY_MINUTES);
-        assert!(!cmd.biometrics_only);
+        assert!(cmd.flags.backup_dir.is_none());
+        assert!(cmd.flags.expiry_minutes.is_none());
+        assert!(!cmd.flags.biometrics_only);
+        assert!(!cmd.flags.allow_headless);
     }
 
     #[test]
     fn expiry_minutes_boundary_values_are_accepted() {
         assert_eq!(
-            parse(&["acquire", "file1", "--expiry-minutes", "1"]).expiry_minutes,
-            1
+            parse(&["acquire", "file1", "--expiry-minutes", "1"])
+                .flags
+                .expiry_minutes,
+            Some(1)
         );
         assert_eq!(
-            parse(&["acquire", "file1", "--expiry-minutes", "1440"]).expiry_minutes,
-            1440
+            parse(&["acquire", "file1", "--expiry-minutes", "1440"])
+                .flags
+                .expiry_minutes,
+            Some(1440)
         );
     }
 
@@ -806,12 +882,14 @@ mod tests {
             "--expiry-minutes",
             "10",
             "--biometrics-only",
+            "--allow-headless",
         ]);
         assert_eq!(
-            cmd.backup_dir,
+            cmd.flags.backup_dir,
             Some(std::path::PathBuf::from("/tmp/backups"))
         );
-        assert_eq!(cmd.expiry_minutes, 10);
-        assert!(cmd.biometrics_only);
+        assert_eq!(cmd.flags.expiry_minutes, Some(10));
+        assert!(cmd.flags.biometrics_only);
+        assert!(cmd.flags.allow_headless);
     }
 }

@@ -79,6 +79,10 @@ pub struct RestoreOptions {
     /// Path to the lease ledger — both the backup token's own row and the
     /// fresh lease this restore mints live here.
     pub ledger_path: std::path::PathBuf,
+    /// The global headless/off-macOS opt-out (ADR-0080 §8/§13, issue
+    /// #1677), forwarded verbatim into the internal fresh-lease
+    /// [`AcquireOptions`]'s own field of the same name.
+    pub allow_headless: bool,
 }
 
 /// What happened.
@@ -95,6 +99,11 @@ pub enum RestoreResult {
         /// Where the fresh lease's own backup (of the file's state
         /// immediately before this restore) landed.
         backup: LeaseBackup,
+        /// `true` when the fresh lease was minted under the headless
+        /// opt-out (ADR-0080 §8/§13) rather than a real device-owner
+        /// prompt — see `AcquireResult::Acquired`'s field of the same
+        /// name.
+        headless_waiver: bool,
     },
     /// A single deleted sheet was detected and restored via
     /// `spreadsheets.sheets.copyTo` — see the module doc. `sheet_title` is
@@ -115,6 +124,11 @@ pub enum RestoreResult {
         sheet_id: i64,
         /// The restored sheet's actual resulting title.
         sheet_title: String,
+        /// `true` when the fresh lease was minted under the headless
+        /// opt-out (ADR-0080 §8/§13) rather than a real device-owner
+        /// prompt — see `AcquireResult::Acquired`'s field of the same
+        /// name.
+        headless_waiver: bool,
     },
     /// `<TOKEN>` names no row this ledger has ever recorded.
     NoSuchBackupToken,
@@ -367,14 +381,16 @@ async fn restore_inner(
         expiry: opts.expiry,
         auth_policy: opts.auth_policy,
         ledger_path: opts.ledger_path.clone(),
+        allow_headless: opts.allow_headless,
     };
-    let (new_token, expires_at, fresh_backup) =
+    let (new_token, expires_at, fresh_backup, headless_waiver) =
         match acquire::acquire(client, &acquire_opts, authenticator).await {
             AcquireResult::Acquired {
                 token,
                 expires_at,
                 backup,
-            } => (token, expires_at, backup),
+                headless_waiver,
+            } => (token, expires_at, backup, headless_waiver),
             AcquireResult::AlreadyLeased { token, expires_at } => {
                 return RestoreResult::AlreadyLeased { token, expires_at }
             }
@@ -490,6 +506,7 @@ async fn restore_inner(
                         new_token: new_token.clone(),
                         expires_at,
                         backup: fresh_backup,
+                        headless_waiver,
                     }
                 }
                 Err(err) => record_failure(err.to_string()),
@@ -546,6 +563,7 @@ async fn restore_inner(
                 spreadsheet_id: file_id.clone(),
                 sheet_id: new_sheet_id,
                 sheet_title: final_title,
+                headless_waiver,
             }
         }
     };
@@ -1079,6 +1097,7 @@ mod tests {
             expiry: ChronoDuration::minutes(30),
             auth_policy: AuthPolicy::DeviceOwner,
             ledger_path: dir.join("lease-ledger.jsonl"),
+            allow_headless: false,
         }
     }
 
@@ -2830,6 +2849,7 @@ mod tests {
                 sha256: "deadbeef".to_string(),
                 size: 0,
             },
+            headless_waiver: false,
         }
         .write_jsonl(&mut buf)
         .unwrap();
