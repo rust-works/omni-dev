@@ -658,11 +658,11 @@ mod tests {
 
     struct PanicsIfCalled;
     impl Authenticator for PanicsIfCalled {
+        // omni-dev: coverage ignore reason="every test using this double refuses before authenticating; a hit here is a regression, not a coverage gap"
         fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-            // omni-dev: coverage ignore reason="every test using this double refuses before authenticating; a hit here is a regression, not a coverage gap"
             panic!("must not authenticate: refused before minting a fresh lease")
-            // omni-dev: coverage end
         }
+        // omni-dev: coverage end
     }
 
     fn mount_file(server_id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
