@@ -12,7 +12,8 @@ use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     AppendValuesResponse, BatchGetValuesResponse, BatchUpdateRequest, BatchUpdateRequestItem,
-    BatchUpdateResponse, ClearValuesResponse, Spreadsheet, UpdateValuesResponse, ValueRange,
+    BatchUpdateResponse, ClearValuesResponse, CopySheetToAnotherSpreadsheetRequest,
+    SheetProperties, Spreadsheet, UpdateValuesResponse, ValueRange,
 };
 
 /// `fields` mask for `spreadsheets.get`.
@@ -279,6 +280,36 @@ impl<'a> SheetsApi<'a> {
             .await
             .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
     }
+
+    /// Copies one sheet from `spreadsheet_id` into `destination_spreadsheet_id`
+    /// (ADR-0080 §10 / issue #1676's typed native-document restore path — a
+    /// deleted sheet's Drive-copy backup still contains it, so `drive lease
+    /// restore` copies it straight back into the live spreadsheet rather
+    /// than requiring a manual copy-back via the Drive UI).
+    ///
+    /// `pub(in crate::drive)` like the other mutating methods here — the
+    /// same no-bypass-by-construction fence.
+    pub(in crate::drive) async fn copy_to(
+        &self,
+        spreadsheet_id: &str,
+        sheet_id: i64,
+        destination_spreadsheet_id: &str,
+    ) -> Result<SheetProperties> {
+        let url = build_copy_to_url(self.client.base_url(), spreadsheet_id, sheet_id)?;
+        let body = CopySheetToAnotherSpreadsheetRequest {
+            destination_spreadsheet_id: destination_spreadsheet_id.to_string(),
+        };
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(response, "Failed to parse Sheets copyTo response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+    }
 }
 
 fn build_spreadsheet_get_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
@@ -401,6 +432,21 @@ fn build_batch_update_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
     let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
         .context("Invalid Sheets base URL")?;
     GoogleApiClient::push_path_segments(&mut url, &[&format!("{spreadsheet_id}:batchUpdate")])?;
+    Ok(url)
+}
+
+/// `POST /v4/spreadsheets/{spreadsheetId}/sheets/{sheetId}:copyTo`.
+///
+/// The `:copyTo` suffix rides the sheet-id segment, same reasoning as
+/// [`build_batch_update_url`]'s `:batchUpdate` suffix — a sheet id is a
+/// plain integer, so nothing caller-influenced reaches the path here either.
+fn build_copy_to_url(base_url: &str, spreadsheet_id: &str, sheet_id: i64) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(
+        &mut url,
+        &[spreadsheet_id, "sheets", &format!("{sheet_id}:copyTo")],
+    )?;
     Ok(url)
 }
 
@@ -593,6 +639,18 @@ mod tests {
     fn clear_url_keeps_the_colon_suffix_and_sends_no_query() {
         let url = build_values_clear_url(BASE, "s", "A1:B2").unwrap();
         assert!(url.as_str().contains("/values/A1:B2:clear"), "{url}");
+        assert!(url.query().is_none(), "{url}");
+    }
+
+    // ── spreadsheets.sheets.copyTo ─────────────────────────────────────
+
+    #[test]
+    fn copy_to_url_keeps_the_colon_suffix_on_the_sheet_id_segment() {
+        let url = build_copy_to_url(BASE, "dest-or-source-id", 12345).unwrap();
+        assert_eq!(
+            url.path(),
+            "/v4/spreadsheets/dest-or-source-id/sheets/12345:copyTo"
+        );
         assert!(url.query().is_none(), "{url}");
     }
 

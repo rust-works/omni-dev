@@ -1118,20 +1118,31 @@ verified against the backup's recorded SHA-256 first, so a backup that has
 been corrupted or tampered with on disk since it was taken is never
 silently written back to Drive.
 
-**Native documents (Sheets/Docs/Slides) have no typed restore path yet.**
-Their backup is a lossless Drive-side copy, restorable today by a human via
-the Drive UI — `restore` reports exactly where:
+**A spreadsheet with exactly one sheet deleted since the backup restores
+that sheet**, via `spreadsheets.sheets.copyTo` from the backup spreadsheet
+into the live one — the one typed native-document path ADR-0080 §10 names
+worth building. Detection is structural: `restore` diffs the backup's and
+the live spreadsheet's sheet-id sets (Drive's `files.copy` preserves
+internal sheet ids verbatim), and restores the one id present in the backup
+but missing live. It also renames the restored sheet back to its original
+title when that title is currently free:
+
+```bash
+$ omni-dev drive lease restore lease-native789...
+lease-def456...
+Restored sheet 'Q3 Numbers' (id 1481923) back into spreadsheet 1SpreadsheetId. Backed up the pre-restore content to Drive copy 1FreshBackupCopyId (expires 2026-09-12T00:30:00Z)
+```
+
+**Everything else native has no typed restore path.** Zero or more than one
+sheet missing (nothing to restore this way, or ambiguous — this never
+guesses), a Docs/Slides backup, or anything below whole-sheet granularity
+(a deleted row/column/range) all fall back to reporting the backup's
+location — restorable today by a human via the Drive UI:
 
 ```bash
 $ omni-dev drive lease restore lease-native789...
 No typed restore path exists for this backup yet — it is a Drive copy at 1BackupCopyFileId you can restore from by hand in the Drive UI
 ```
-
-A later phase adds the one typed path ADR-0080 §10 names worth building: a
-deleted sheet's backup copy still contains that sheet, so `restore` on a
-file that had a sheet deleted from it under lease will offer
-`spreadsheets.sheets.copyTo` from the backup into the live spreadsheet,
-rather than only reporting the copy's location.
 
 **The folder write-permission gate still applies.** Restore mints its own
 lease, but that is a *third*, independent check alongside OAuth scope and
@@ -1507,8 +1518,9 @@ path:
 Deleted sheet 'Q2' (sheetId 118293) from 'Budget'; this cannot be undone
 through omni-dev — the lease this write required backed the whole
 spreadsheet up when it was acquired (Drive copy 1AbC…); run `omni-dev
-drive lease restore <TOKEN>` to locate it, restore from that copy in the
-Drive UI, or fall back to Google Drive's own version history
+drive lease restore <TOKEN>` — it restores a single deleted sheet
+automatically, or otherwise locates the copy to restore from by hand in
+the Drive UI — or fall back to Google Drive's own version history
 ```
 
 Two things the wording is careful about. The copy dates from **acquisition**,

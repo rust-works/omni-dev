@@ -771,12 +771,7 @@ fn resolve_sheet(
         },
         StructureVerb::RenameSheet { new_title, .. } => match found {
             Some(props) => {
-                let collides = new_title != wanted
-                    && workbook
-                        .sheets
-                        .iter()
-                        .filter_map(|sheet| sheet.properties.as_ref())
-                        .any(|other| other.title == *new_title);
+                let collides = new_title != wanted && workbook.has_sheet_titled(new_title);
                 if collides {
                     return Err(StructureResult::RefusedSheetExists {
                         title: new_title.clone(),
@@ -797,11 +792,7 @@ fn resolve_sheet(
         StructureVerb::DuplicateSheet { title, .. } => match found {
             Some(props) => {
                 if let Some(new_title) = title {
-                    let collides = workbook
-                        .sheets
-                        .iter()
-                        .filter_map(|sheet| sheet.properties.as_ref())
-                        .any(|other| other.title == *new_title);
+                    let collides = workbook.has_sheet_titled(new_title);
                     if collides {
                         return Err(StructureResult::RefusedSheetExists {
                             title: new_title.clone(),
@@ -1780,7 +1771,7 @@ fn describe_changed(
     book: &str,
 ) -> String {
     let id = sheet_id.map_or_else(String::new, |id| format!(" (sheetId {id})"));
-    let recovery = recovery_note(backup);
+    let recovery = recovery_note(backup, matches!(verb, StructureVerb::DeleteSheet { .. }));
     match verb {
         StructureVerb::AddSheet { title, .. } => {
             format!("Added sheet '{title}'{id} to {book}")
@@ -1920,13 +1911,23 @@ fn describe_inserted(
 /// Now that `drive lease restore` (ADR-0080 §10, Phase 4) exists, the
 /// message names it too — but only ever what it actually does: for a
 /// native document (always [`LeaseBackup::DriveCopy`] here, since every
-/// Sheets write is native) it only *locates* the Drive copy (no typed
-/// sheet-restore path exists yet), so the wording still points at the
-/// Drive UI for the restore itself; the [`LeaseBackup::Bytes`] arm is kept
-/// exhaustive for a future non-native caller of this same helper, and
-/// there `drive lease restore` really does restore the content directly.
-fn recovery_note(backup: Option<&LeaseBackup>) -> String {
+/// Sheets write is native) it only *locates* the Drive copy for most
+/// verbs — Phase 5 (issue #1676) added exactly one typed exception, a
+/// deleted sheet, so `is_delete_sheet` names that case for wording that
+/// tells the truth about it too (restore may already have put the sheet
+/// back automatically, rather than pointing straight at the Drive UI); the
+/// [`LeaseBackup::Bytes`] arm is kept exhaustive for a future non-native
+/// caller of this same helper, and there `drive lease restore` really does
+/// restore the content directly.
+fn recovery_note(backup: Option<&LeaseBackup>, is_delete_sheet: bool) -> String {
     match backup {
+        Some(LeaseBackup::DriveCopy { file_id }) if is_delete_sheet => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             whole spreadsheet up when it was acquired (Drive copy {file_id}); run `omni-dev \
+             drive lease restore <TOKEN>` — it restores a single deleted sheet automatically, or \
+             otherwise locates the copy to restore from by hand in the Drive UI — or fall back \
+             to Google Drive's own version history"
+        ),
         Some(LeaseBackup::DriveCopy { file_id }) => format!(
             "this cannot be undone through omni-dev — the lease this write required backed the \
              whole spreadsheet up when it was acquired (Drive copy {file_id}); run `omni-dev \
@@ -4636,7 +4637,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("restore from that copy in the Drive UI"),
+            text.contains("restores a single deleted sheet automatically"),
             "{text}"
         );
         assert!(

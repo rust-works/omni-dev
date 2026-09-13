@@ -56,6 +56,24 @@ impl Spreadsheet {
             .map(|sheet| sheet.title().to_string())
             .collect()
     }
+
+    /// Every sheet id, for sheets that carry one.
+    #[must_use]
+    pub fn sheet_ids(&self) -> std::collections::HashSet<i64> {
+        self.sheets.iter().filter_map(Sheet::sheet_id).collect()
+    }
+
+    /// Whether any sheet in the workbook currently uses `title` as its
+    /// display title — the collision check `drive sheets rename-sheet`/
+    /// `duplicate-sheet` (via `structure.rs`'s `resolve_sheet`) and `drive
+    /// lease restore`'s best-effort rename-back (issue #1676) share, so a
+    /// future change to what counts as "the same title" (e.g.
+    /// case-insensitive) lands in one place rather than drifting between
+    /// two hand-written copies.
+    #[must_use]
+    pub fn has_sheet_titled(&self, title: &str) -> bool {
+        self.sheets.iter().any(|sheet| sheet.title() == title)
+    }
 }
 
 /// Workbook-level properties.
@@ -92,6 +110,13 @@ impl Sheet {
         self.properties
             .as_ref()
             .map_or("", |props| props.title.as_str())
+    }
+
+    /// This sheet's stable numeric id, or `None` if the properties (or the
+    /// id within them) are absent from the response.
+    #[must_use]
+    pub fn sheet_id(&self) -> Option<i64> {
+        self.properties.as_ref()?.sheet_id
     }
 
     /// Whether the sheet is hidden in the UI.
@@ -375,6 +400,18 @@ pub struct UpdateSheetPropertiesRequest {
     pub properties: SheetPropertiesUpdate,
     /// The field mask limiting what this request may change.
     pub fields: String,
+}
+
+/// Body of `spreadsheets.sheets.copyTo`.
+///
+/// Copies one sheet into another spreadsheet, creating a new sheet there
+/// with a server-assigned id (never the source's), so no destination-side
+/// id collision is possible.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CopySheetToAnotherSpreadsheetRequest {
+    /// The spreadsheet to copy the sheet into.
+    #[serde(rename = "destinationSpreadsheetId")]
+    pub destination_spreadsheet_id: String,
 }
 
 /// The mutable subset of a sheet's properties this crate can set.
