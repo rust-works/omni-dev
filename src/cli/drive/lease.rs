@@ -273,9 +273,11 @@ fn print_restore_result(result: &RestoreResult) {
         } => {
             println!("{new_token}");
             let backup_desc = match backup {
+                // omni-dev: coverage ignore reason="a sheet restore's fresh backup is always a DriveCopy — restore.rs's own recheck refuses unless the target is still a spreadsheet, and acquire() only ever takes a Bytes backup of a non-native target; this arm exists solely for exhaustiveness over the shared LeaseBackup enum"
                 LeaseBackup::Bytes { path, .. } => {
                     sanitize_for_terminal(&path.display().to_string())
                 }
+                // omni-dev: coverage end
                 LeaseBackup::DriveCopy { file_id } => {
                     format!("Drive copy {}", sanitize_for_terminal(file_id))
                 }
