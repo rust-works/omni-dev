@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::drive::lease::acquire::{MAX_EXPIRY_MINUTES, MIN_EXPIRY_MINUTES};
 use crate::drive::lease::authenticate::AuthPolicy;
 use crate::utils::env::EnvSource;
 use crate::utils::settings::LeaseSettings;
@@ -51,14 +52,28 @@ fn non_empty_var(env: &impl EnvSource, key: &str) -> Option<String> {
 }
 
 /// Parses `var` as a truthy boolean: `1`, `true`, or `yes` (trimmed,
-/// case-insensitive). Anything else — including unset, empty, or
-/// unparseable — is `false`. Mirrors
+/// case-insensitive) is `true`; `0`, `false`, or `no` is `false`; unset or
+/// empty is `false` with no warning (the ordinary "not set" case). Anything
+/// else — a typo like `treu` — is also treated as `false`, but logs a
+/// warning first: a silently-discarded, unrecognized value is exactly the
+/// broken-configuration case docs/STYLE_GUIDE.md's silent-discard rule
+/// warns against (issue #1677 review finding). Otherwise mirrors
 /// `crate::claude::backend::resolve_structured_output_disabled`.
 fn truthy_var(env: &impl EnvSource, key: &str) -> bool {
-    env.var(key).is_some_and(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "yes"
-    })
+    let Some(raw) = non_empty_var(env, key) else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => true,
+        "0" | "false" | "no" => false,
+        _ => {
+            tracing::warn!(
+                "{key}={raw:?} is not a recognized boolean (expected 1/true/yes or \
+                 0/false/no); treating it as unset"
+            );
+            false
+        }
+    }
 }
 
 /// `<state dir>/omni-dev/drive-backups` — a sibling of the request log and
@@ -71,26 +86,49 @@ fn default_backup_dir() -> Result<PathBuf> {
     Ok(base.join("omni-dev").join("drive-backups"))
 }
 
-/// Resolves `--expiry-minutes`. No range validation happens here —
-/// `crate::drive::lease::acquire::acquire_inner` already range-checks the
-/// resulting expiry regardless of which layer it came from, so a bad env or
-/// settings value surfaces as `AcquireResult::Failed`, not a silent clamp.
-/// An unparseable env value is treated as unset, the same spirit as an empty
-/// string.
+/// Resolves `--expiry-minutes`, range-checked against the same
+/// [`MIN_EXPIRY_MINUTES`]/[`MAX_EXPIRY_MINUTES`] bounds the CLI's own
+/// `value_parser` enforces on an explicit flag. Checking here too — not just
+/// in `crate::drive::lease::acquire::acquire_inner`'s own defense-in-depth
+/// pass — matters because the caller turns this into a `chrono::Duration`
+/// immediately (`chrono::Duration::minutes` panics on an out-of-range `i64`
+/// long before `acquire_inner` ever runs), so an unchecked env/settings.json
+/// value would crash the process instead of erroring cleanly (issue #1677
+/// review finding). An unparseable env value is treated as unset, the same
+/// spirit as an empty string.
 pub(crate) fn resolve_expiry_minutes(
     explicit: Option<i64>,
     env: &impl EnvSource,
     settings: &LeaseSettings,
-) -> i64 {
-    if let Some(value) = explicit {
-        return value;
+) -> Result<i64> {
+    let fallback = || {
+        settings
+            .default_expiry_minutes
+            .unwrap_or(DEFAULT_EXPIRY_MINUTES)
+    };
+    let value = if let Some(value) = explicit {
+        value
+    } else if let Some(raw) = non_empty_var(env, LEASE_EXPIRY_MINUTES_ENV) {
+        if let Ok(value) = raw.parse() {
+            value
+        } else {
+            tracing::warn!(
+                "{LEASE_EXPIRY_MINUTES_ENV}={raw:?} is not a valid integer; falling back to \
+                 settings.json/the hard-coded default"
+            );
+            fallback()
+        }
+    } else {
+        fallback()
+    };
+    if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&value) {
+        anyhow::bail!(
+            "lease expiry must be between {MIN_EXPIRY_MINUTES} and {MAX_EXPIRY_MINUTES} \
+             minutes (24 hours), got {value} (from {LEASE_EXPIRY_MINUTES_ENV} or \
+             settings.json's lease.default_expiry_minutes)"
+        );
     }
-    if let Some(value) = non_empty_var(env, LEASE_EXPIRY_MINUTES_ENV).and_then(|v| v.parse().ok()) {
-        return value;
-    }
-    settings
-        .default_expiry_minutes
-        .unwrap_or(DEFAULT_EXPIRY_MINUTES)
+    Ok(value)
 }
 
 /// Resolves `--backup-dir`.
@@ -128,13 +166,37 @@ pub(crate) fn resolve_auth_policy(
 }
 
 /// Resolves the headless/off-macOS opt-out (ADR-0080 §8). Any layer saying
-/// `true` wins.
+/// `true` wins. An explicit `--allow-headless` is a deliberate, visible,
+/// per-invocation act and warrants no extra warning; but because this waives
+/// the human-presence authentication guarantee rather than merely widening a
+/// sandbox, a `true` from the *ambient* layers — an inherited env var or a
+/// machine-wide `settings.json` — is warned about, naming which layer
+/// triggered it, the same way `--claude-cli-allow-tools`' escape hatch names
+/// its own source (issue #1677 review finding).
 pub(crate) fn resolve_allow_headless(
     cli_flag: bool,
     env: &impl EnvSource,
     settings: &LeaseSettings,
 ) -> bool {
-    cli_flag || truthy_var(env, LEASE_ALLOW_HEADLESS_ENV) || settings.allow_headless
+    if cli_flag {
+        return true;
+    }
+    if truthy_var(env, LEASE_ALLOW_HEADLESS_ENV) {
+        tracing::warn!(
+            "drive lease: the human-presence authentication guarantee is waived for this \
+             invocation because {LEASE_ALLOW_HEADLESS_ENV} is set (ADR-0080 §8)"
+        );
+        return true;
+    }
+    if settings.allow_headless {
+        tracing::warn!(
+            "drive lease: the human-presence authentication guarantee is waived because \
+             settings.json's lease.allow_headless is true (ADR-0080 §8/§13) — this applies to \
+             every invocation on this machine until that setting is turned off"
+        );
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -154,7 +216,7 @@ mod tests {
         let env = MapEnv::new().with(LEASE_EXPIRY_MINUTES_ENV, "10");
         let mut s = settings();
         s.default_expiry_minutes = Some(20);
-        assert_eq!(resolve_expiry_minutes(Some(5), &env, &s), 5);
+        assert_eq!(resolve_expiry_minutes(Some(5), &env, &s).unwrap(), 5);
     }
 
     #[test]
@@ -162,20 +224,23 @@ mod tests {
         let env = MapEnv::new().with(LEASE_EXPIRY_MINUTES_ENV, "10");
         let mut s = settings();
         s.default_expiry_minutes = Some(20);
-        assert_eq!(resolve_expiry_minutes(None, &env, &s), 10);
+        assert_eq!(resolve_expiry_minutes(None, &env, &s).unwrap(), 10);
     }
 
     #[test]
     fn expiry_minutes_settings_beats_hardcoded_default() {
         let mut s = settings();
         s.default_expiry_minutes = Some(20);
-        assert_eq!(resolve_expiry_minutes(None, &MapEnv::new(), &s), 20);
+        assert_eq!(
+            resolve_expiry_minutes(None, &MapEnv::new(), &s).unwrap(),
+            20
+        );
     }
 
     #[test]
     fn expiry_minutes_falls_back_to_hardcoded_default() {
         assert_eq!(
-            resolve_expiry_minutes(None, &MapEnv::new(), &settings()),
+            resolve_expiry_minutes(None, &MapEnv::new(), &settings()).unwrap(),
             DEFAULT_EXPIRY_MINUTES
         );
     }
@@ -185,7 +250,7 @@ mod tests {
         let env = MapEnv::new().with(LEASE_EXPIRY_MINUTES_ENV, "not-a-number");
         let mut s = settings();
         s.default_expiry_minutes = Some(20);
-        assert_eq!(resolve_expiry_minutes(None, &env, &s), 20);
+        assert_eq!(resolve_expiry_minutes(None, &env, &s).unwrap(), 20);
     }
 
     #[test]
@@ -193,7 +258,22 @@ mod tests {
         let env = MapEnv::new().with(LEASE_EXPIRY_MINUTES_ENV, "");
         let mut s = settings();
         s.default_expiry_minutes = Some(20);
-        assert_eq!(resolve_expiry_minutes(None, &env, &s), 20);
+        assert_eq!(resolve_expiry_minutes(None, &env, &s).unwrap(), 20);
+    }
+
+    #[test]
+    fn expiry_minutes_out_of_range_env_value_is_a_clean_error_not_a_panic() {
+        let env = MapEnv::new().with(LEASE_EXPIRY_MINUTES_ENV, "9223372036854775807");
+        let err = resolve_expiry_minutes(None, &env, &settings()).unwrap_err();
+        assert!(err.to_string().contains("must be between"), "{err}");
+    }
+
+    #[test]
+    fn expiry_minutes_out_of_range_settings_value_is_a_clean_error_not_a_panic() {
+        let mut s = settings();
+        s.default_expiry_minutes = Some(0);
+        let err = resolve_expiry_minutes(None, &MapEnv::new(), &s).unwrap_err();
+        assert!(err.to_string().contains("must be between"), "{err}");
     }
 
     // ── resolve_backup_dir ──

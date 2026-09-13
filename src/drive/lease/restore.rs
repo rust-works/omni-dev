@@ -239,7 +239,19 @@ impl RestoreResult {
     /// vocabulary).
     fn verdict(&self) -> &'static str {
         match self {
+            // A distinct verdict for a headless-waived restore, mirroring
+            // `acquire::record_attempt`'s "acquired-headless-waiver" (ADR-0080
+            // §8/§13, issue #1677) — without it, an operator auditing waived-
+            // authentication events could never find one here.
+            Self::Restored {
+                headless_waiver: true,
+                ..
+            } => "restored-headless-waiver",
             Self::Restored { .. } => "restored",
+            Self::RestoredSheet {
+                headless_waiver: true,
+                ..
+            } => "restored-sheet-headless-waiver",
             Self::RestoredSheet { .. } => "restored-sheet",
             Self::NoSuchBackupToken => "no-such-backup-token",
             Self::NoTypedRestorePath { .. } => "no-typed-restore-path",
@@ -2856,5 +2868,43 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("\"status\":\"restored\""), "{text}");
         assert!(text.contains("tok-2"), "{text}");
+    }
+
+    #[test]
+    fn verdict_distinguishes_a_headless_waived_restore() {
+        let restored = |headless_waiver| RestoreResult::Restored {
+            new_token: "tok".to_string(),
+            expires_at: Utc::now(),
+            backup: LeaseBackup::Bytes {
+                path: PathBuf::from("/tmp/backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            headless_waiver,
+        };
+        assert_eq!(restored(false).verdict(), "restored");
+        assert_eq!(restored(true).verdict(), "restored-headless-waiver");
+    }
+
+    #[test]
+    fn verdict_distinguishes_a_headless_waived_sheet_restore() {
+        let restored_sheet = |headless_waiver| RestoreResult::RestoredSheet {
+            new_token: "tok".to_string(),
+            expires_at: Utc::now(),
+            backup: LeaseBackup::Bytes {
+                path: PathBuf::from("/tmp/backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet_id: 1,
+            sheet_title: "Sheet1".to_string(),
+            headless_waiver,
+        };
+        assert_eq!(restored_sheet(false).verdict(), "restored-sheet");
+        assert_eq!(
+            restored_sheet(true).verdict(),
+            "restored-sheet-headless-waiver"
+        );
     }
 }
