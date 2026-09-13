@@ -13,6 +13,7 @@ use crate::drive::lease::acquire::{
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
 use crate::drive::lease::restore::{self, RestoreOptions, RestoreResult};
+use crate::drive::sheets::client::SheetsClient;
 
 /// Default lease expiry when `--expiry-minutes` is not given (ADR-0080 §5).
 const DEFAULT_EXPIRY_MINUTES: i64 = 30;
@@ -188,8 +189,9 @@ impl RestoreCommand {
             },
             ledger_path,
         };
+        let sheets = SheetsClient::from_drive_client(client)?;
         let authenticator = authenticate::platform_authenticator();
-        let result = restore::restore(client, &opts, authenticator.as_ref(), &rules).await;
+        let result = restore::restore(client, &sheets, &opts, authenticator.as_ref(), &rules).await;
         if output_as(&result, &self.output)? {
             return Ok(());
         }
@@ -259,6 +261,30 @@ fn print_restore_result(result: &RestoreResult) {
             eprintln!(
                 "Restored. Backed up the pre-restore content to {backup_desc} (expires \
                  {expires_at})"
+            );
+        }
+        RestoreResult::RestoredSheet {
+            new_token,
+            expires_at,
+            backup,
+            spreadsheet_id,
+            sheet_id,
+            sheet_title,
+        } => {
+            println!("{new_token}");
+            let backup_desc = match backup {
+                LeaseBackup::Bytes { path, .. } => {
+                    sanitize_for_terminal(&path.display().to_string())
+                }
+                LeaseBackup::DriveCopy { file_id } => {
+                    format!("Drive copy {}", sanitize_for_terminal(file_id))
+                }
+            };
+            eprintln!(
+                "Restored sheet '{}' (id {sheet_id}) back into spreadsheet {}. Backed up the \
+                 pre-restore content to {backup_desc} (expires {expires_at})",
+                sanitize_for_terminal(sheet_title),
+                sanitize_for_terminal(spreadsheet_id)
             );
         }
         RestoreResult::NoSuchBackupToken => {
@@ -573,6 +599,16 @@ mod tests {
                 backup: LeaseBackup::DriveCopy {
                     file_id: "copy-1".to_string(),
                 },
+            },
+            RestoreResult::RestoredSheet {
+                new_token: "tok-5".to_string(),
+                expires_at: chrono::Utc::now(),
+                backup: LeaseBackup::DriveCopy {
+                    file_id: "copy-2".to_string(),
+                },
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet_id: 999,
+                sheet_title: "Deleted".to_string(),
             },
             RestoreResult::NoSuchBackupToken,
             RestoreResult::NoTypedRestorePath {
