@@ -71,16 +71,15 @@ impl LeaseCommand {
 #[derive(Parser)]
 pub struct LeaseFlags {
     /// Local directory byte backups are written under. Defaults to
-    /// `settings.json`'s `lease.backup_dir`, then
-    /// `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`, then
-    /// `<state dir>/omni-dev/drive-backups`.
+    /// `OMNI_DEV_DRIVE_LEASE_BACKUP_DIR`, then `settings.json`'s
+    /// `lease.backup_dir`, then `<state dir>/omni-dev/drive-backups`.
     #[arg(long, value_name = "PATH")]
     pub backup_dir: Option<std::path::PathBuf>,
 
     /// Minutes the lease stays live once authorised. A write never extends
     /// this — a fresh window means a fresh `drive lease acquire` (ADR-0080
-    /// §5). Defaults to `settings.json`'s `lease.default_expiry_minutes`,
-    /// then `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`, then 30.
+    /// §5). Defaults to `OMNI_DEV_DRIVE_LEASE_EXPIRY_MINUTES`, then
+    /// `settings.json`'s `lease.default_expiry_minutes`, then 30.
     #[arg(long, value_name = "N", value_parser = parse_expiry_minutes)]
     pub expiry_minutes: Option<i64>,
 
@@ -113,18 +112,24 @@ struct ResolvedLeaseFlags {
 
 impl LeaseFlags {
     fn resolve(self) -> Result<ResolvedLeaseFlags> {
-        let env = SettingsEnv::load();
-        let settings = Settings::load_lease();
-        let backup_dir = lease_settings::resolve_backup_dir(self.backup_dir, &env, &settings)?;
+        // One disk read/parse of settings.json, not two — `SettingsEnv::load()`
+        // and `Settings::load_lease()` each independently re-read it;
+        // `SettingsEnv::from_settings` was added for exactly this (issue
+        // #1533), so both views come from the same parse (issue #1677 review
+        // finding).
+        let loaded = Settings::load().unwrap_or_default();
+        let lease = loaded.lease.clone();
+        let profile = crate::utils::settings::active_profile_from(&crate::utils::env::SystemEnv);
+        let env = SettingsEnv::from_settings(loaded, profile.as_deref());
+        let backup_dir = lease_settings::resolve_backup_dir(self.backup_dir, &env, &lease)?;
         let expiry = chrono::Duration::minutes(lease_settings::resolve_expiry_minutes(
             self.expiry_minutes,
             &env,
-            &settings,
-        ));
-        let auth_policy =
-            lease_settings::resolve_auth_policy(self.biometrics_only, &env, &settings);
+            &lease,
+        )?);
+        let auth_policy = lease_settings::resolve_auth_policy(self.biometrics_only, &env, &lease);
         let allow_headless =
-            lease_settings::resolve_allow_headless(self.allow_headless, &env, &settings);
+            lease_settings::resolve_allow_headless(self.allow_headless, &env, &lease);
         Ok(ResolvedLeaseFlags {
             backup_dir,
             expiry,

@@ -331,7 +331,7 @@ pub struct DriveSettings {
 /// default, so an absent `lease` block preserves `drive lease`'s behaviour
 /// byte-for-byte. See `crate::drive::lease::settings` for the resolvers that
 /// layer a CLI flag and an env var on top of each of these.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct LeaseSettings {
     /// Default `--expiry-minutes` when the flag is omitted (ADR-0080 §5/§13).
     #[serde(default)]
@@ -472,14 +472,6 @@ impl Settings {
     /// graceful `unwrap_or_default` of [`SettingsEnv::load`].
     pub fn load_mcp() -> McpSettings {
         Self::load().map(|s| s.mcp).unwrap_or_default()
-    }
-
-    /// Loads just the [`lease`](LeaseSettings) section, falling back to its
-    /// defaults when the settings file is absent or unreadable — so `drive
-    /// lease acquire`/`restore` always run with a malformed `settings.json`
-    /// (issue #1677). Mirrors [`Settings::load_mcp`].
-    pub fn load_lease() -> LeaseSettings {
-        Self::load().map(|s| s.lease).unwrap_or_default()
     }
 
     /// Loads settings from a specific path.
