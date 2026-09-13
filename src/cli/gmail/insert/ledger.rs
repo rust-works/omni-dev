@@ -389,4 +389,19 @@ mod tests {
         let err = LedgerLock::acquire(dir.path()).unwrap_err();
         assert!(err.to_string().contains("already be in progress"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_lock_acquire_reports_a_non_collision_failure_distinctly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = LedgerLock::acquire(dir.path()).unwrap_err();
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(err.to_string().contains("not a stale lock"), "{err:?}");
+    }
 }
