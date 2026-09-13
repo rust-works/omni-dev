@@ -507,9 +507,9 @@ async fn protection_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
     };
-    let lease_lock = if requires_lease {
+    let lease_grant = if requires_lease {
         match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(lock) => Some(lock),
+            Ok(grant) => Some(grant),
             Err(LeaseGateRefusal::NoLease) => return gated(ProtectionResult::RefusedNoLease),
             Err(LeaseGateRefusal::Expired) => return gated(ProtectionResult::RefusedLeaseExpired),
             Err(LeaseGateRefusal::WrongFile) => {
@@ -526,8 +526,8 @@ async fn protection_inner(
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
-            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                finish_leased_native_write(leased, lock, token, &files_api).await;
+            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
             }
             let protected_range_id = added_protected_range_id(&response).or(existing_id);
             ProtectionResult::Changed {
@@ -537,13 +537,13 @@ async fn protection_inner(
         }
         Err(err) => {
             let detail = format!("{err:#}");
-            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
                 record_failed_leased_write(leased, token, &detail);
             }
             ProtectionResult::Failed { detail }
         }
     };
-    drop(lease_lock);
+    drop(lease_grant);
     gated(result)
 }
 

@@ -499,9 +499,9 @@ async fn write_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.document_id,
     };
-    let lease_lock = if requires_lease {
+    let lease_grant = if requires_lease {
         match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(lock) => Some(lock),
+            Ok(grant) => Some(grant),
             Err(LeaseGateRefusal::NoLease) => {
                 return gated(WriteResult::RefusedNoLease, Some(revision_id))
             }
@@ -528,8 +528,8 @@ async fn write_inner(
         .await
     {
         Ok(response) => {
-            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                finish_leased_native_write(leased, lock, token, &files_api).await;
+            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
             }
             match &opts.payload {
                 WritePayload::Replace { .. } => WriteResult::Replaced {
@@ -546,7 +546,7 @@ async fn write_inner(
             // `writeControl.requiredRevisionId` included — so the intent
             // record gets a `failed` outcome carrying the reason.
             let detail = err.to_string();
-            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
                 record_failed_leased_write(leased, token, &detail);
             }
             if is_stale_revision(&err) {
@@ -559,7 +559,7 @@ async fn write_inner(
             }
         }
     };
-    drop(lease_lock);
+    drop(lease_grant);
     gated(result, Some(revision_id))
 }
 

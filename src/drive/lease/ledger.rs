@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 /// fields would only document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum LeaseBackup {
+pub enum LeaseBackup {
     /// A binary file's raw bytes, copied to local disk (ADR-0080 §3,
     /// Phase 2).
     Bytes {

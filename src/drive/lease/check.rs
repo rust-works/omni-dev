@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use crate::drive::files_api::FilesApi;
-use crate::drive::lease::ledger::{LeaseLedger, LedgerLock};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
 use crate::request_log::AuditOutcome;
 
 /// The `verdict` vocabulary of a leased write's audit records (ADR-0080
@@ -60,14 +60,31 @@ pub(crate) mod verdict {
     pub const REFUSED_LEASE_STALE: &str = "refused-lease-stale";
 }
 
+/// What a passed lease check hands the engine: the still-held ledger
+/// lock, and where the lease's backup landed.
+///
+/// The backup rides along so a destructive verb's *outcome* can name the
+/// copy to restore from — `sheets delete-sheet` and friends say "the lease
+/// backed this up" in their real-run message, and a claim like that must
+/// come from the ledger record the write was actually checked against, not
+/// from the engine assuming one exists (a `require_lease: false` rule
+/// reaches the mutating call with no lease and no backup at all).
+pub(crate) struct LeaseGrant {
+    /// See [`LeaseCheckOutcome::Ok`] for why this must outlive the write.
+    pub(crate) lock: LedgerLock,
+    /// The backup recorded at `drive lease acquire` time — bytes on disk
+    /// for a binary file, a Drive copy for a native document (ADR-0080 §3).
+    pub(crate) backup: LeaseBackup,
+}
+
 /// The result of checking a presented `--lease` token against the ledger.
 pub(crate) enum LeaseCheckOutcome {
     /// The token is present, live, bound to `file_id`, and not stale. The
-    /// still-held [`LedgerLock`] must be kept alive by the caller across
-    /// the mutating call and into [`finish_leased_write`] — see that
-    /// function's doc comment for why releasing it early reopens the
-    /// double-spend window this lock exists to close.
-    Ok(LedgerLock),
+    /// [`LeaseGrant`]'s still-held [`LedgerLock`] must be kept alive by the
+    /// caller across the mutating call and into [`finish_leased_write`] —
+    /// see that function's doc comment for why releasing it early reopens
+    /// the double-spend window this lock exists to close.
+    Ok(LeaseGrant),
     /// No `--lease` was presented at all.
     NoLease,
     /// The ledger could not be read, the token is not in it, or it has
@@ -245,7 +262,10 @@ pub(crate) fn check_and_lock_lease(
         ));
     }
 
-    LeaseCheckOutcome::Ok(lock)
+    LeaseCheckOutcome::Ok(LeaseGrant {
+        lock,
+        backup: record.backup.clone(),
+    })
 }
 
 /// The reason a leased write was refused, folding a failure fetching the
@@ -274,12 +294,13 @@ pub(crate) enum LeaseGateRefusal {
 /// §9). Returns the still-held [`LedgerLock`] on success (see
 /// [`check_and_lock_lease`]'s own doc comment for why the caller must keep
 /// it alive across the mutating call and into [`finish_leased_write`]/
-/// [`finish_leased_native_write`]), or the reason for refusal.
+/// [`finish_leased_native_write`]) inside its [`LeaseGrant`], or the
+/// reason for refusal.
 pub(crate) async fn gate_leased_write(
     write: LeasedWrite<'_>,
     files_api: &FilesApi<'_>,
     lease_token: Option<&str>,
-) -> Result<LedgerLock, LeaseGateRefusal> {
+) -> Result<LeaseGrant, LeaseGateRefusal> {
     let (live_version, live_modified_time) = files_api
         .get_metadata(write.file_id)
         .await
@@ -291,7 +312,7 @@ pub(crate) async fn gate_leased_write(
         live_version.as_deref(),
         live_modified_time.as_deref(),
     ) {
-        LeaseCheckOutcome::Ok(lock) => Ok(lock),
+        LeaseCheckOutcome::Ok(grant) => Ok(grant),
         LeaseCheckOutcome::NoLease => Err(LeaseGateRefusal::NoLease),
         LeaseCheckOutcome::Expired => Err(LeaseGateRefusal::Expired),
         LeaseCheckOutcome::WrongFile => Err(LeaseGateRefusal::WrongFile),
@@ -436,7 +457,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::client::DriveClient;
-    use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
+    use crate::drive::lease::ledger::{LeaseLedger, LeaseRecord};
     use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
 
