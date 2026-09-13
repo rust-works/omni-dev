@@ -61,6 +61,7 @@ use crate::drive::lease::check::{
     finish_leased_native_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
     LeasedWrite,
 };
+use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::target_gate;
@@ -448,6 +449,21 @@ pub enum StructureResult {
         /// only knowable from the reply.
         #[serde(skip_serializing_if = "Option::is_none")]
         sheet_id: Option<i64>,
+        /// Where the lease this write presented backed the file up at
+        /// `drive lease acquire` time — the copy to restore from after a
+        /// destructive verb. `None` when the deciding write-permission
+        /// rule set `require_lease: false`, in which case no backup was
+        /// taken (ADR-0080 §13) and the outcome must not claim one.
+        ///
+        /// Read straight off the ledger record the write was checked
+        /// against (`drive::lease::check::LeaseGrant`), never
+        /// assumed, so the recovery message a real-run delete prints is
+        /// only ever true. Boxed only to keep the enum under clippy's
+        /// `result_large_err` threshold — `LeaseBackup::Bytes` carries a
+        /// path plus a hash, and this enum is a `Result` error type inside
+        /// the engine.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backup: Option<Box<LeaseBackup>>,
     },
     /// An API or validation error.
     Failed {
@@ -676,9 +692,9 @@ async fn structure_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
     };
-    let lease_lock = if requires_lease {
+    let lease_grant = if requires_lease {
         match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(lock) => Some(lock),
+            Ok(grant) => Some(grant),
             Err(LeaseGateRefusal::NoLease) => return gated(StructureResult::RefusedNoLease),
             Err(LeaseGateRefusal::Expired) => return gated(StructureResult::RefusedLeaseExpired),
             Err(LeaseGateRefusal::WrongFile) => {
@@ -701,24 +717,27 @@ async fn structure_inner(
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
-            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                finish_leased_native_write(leased, lock, token, &files_api).await;
+            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
             }
             StructureResult::Changed {
                 sheet_id: added_sheet_id(&response)
                     .or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
                 sheet,
+                backup: lease_grant
+                    .as_ref()
+                    .map(|grant| Box::new(grant.backup.clone())),
             }
         }
         Err(err) => {
             let detail = format!("{err:#}");
-            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
                 record_failed_leased_write(leased, token, &detail);
             }
             StructureResult::Failed { detail }
         }
     };
-    drop(lease_lock);
+    drop(lease_grant);
     gated(result)
 }
 
@@ -1446,8 +1465,18 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
              re-run `omni-dev drive lease acquire {}` to lease the current version.",
             outcome.spreadsheet_id
         )],
-        StructureResult::Changed { sheet, sheet_id } => {
-            vec![describe_changed(verb, sheet.as_ref(), *sheet_id, &book)]
+        StructureResult::Changed {
+            sheet,
+            sheet_id,
+            backup,
+        } => {
+            vec![describe_changed(
+                verb,
+                sheet.as_ref(),
+                *sheet_id,
+                backup.as_deref(),
+                &book,
+            )]
         }
         StructureResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1747,9 +1776,11 @@ fn describe_changed(
     verb: &StructureVerb,
     sheet: Option<&SheetSnapshot>,
     sheet_id: Option<i64>,
+    backup: Option<&LeaseBackup>,
     book: &str,
 ) -> String {
     let id = sheet_id.map_or_else(String::new, |id| format!(" (sheetId {id})"));
+    let recovery = recovery_note(backup);
     match verb {
         StructureVerb::AddSheet { title, .. } => {
             format!("Added sheet '{title}'{id} to {book}")
@@ -1771,18 +1802,36 @@ fn describe_changed(
             count,
         } => describe_inserted(Dimension::Columns, from, &id, *at, *count, sheet, book),
         StructureVerb::DeleteSheet { sheet: from } => {
-            format!("Deleted sheet '{from}'{id} from {book}; {RECOVERY_NOTE}")
+            format!("Deleted sheet '{from}'{id} from {book}; {recovery}")
         }
         StructureVerb::DeleteRows {
             sheet: from,
             at,
             count,
-        } => describe_deleted_dimension(Dimension::Rows, from, &id, *at, *count, sheet, book),
+        } => describe_deleted_dimension(
+            Dimension::Rows,
+            from,
+            &id,
+            *at,
+            *count,
+            sheet,
+            book,
+            &recovery,
+        ),
         StructureVerb::DeleteColumns {
             sheet: from,
             at,
             count,
-        } => describe_deleted_dimension(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        } => describe_deleted_dimension(
+            Dimension::Columns,
+            from,
+            &id,
+            *at,
+            *count,
+            sheet,
+            book,
+            &recovery,
+        ),
         StructureVerb::DeleteRange {
             sheet: from,
             start_row,
@@ -1799,6 +1848,7 @@ fn describe_changed(
             *end_column,
             *shift,
             book,
+            &recovery,
         ),
         StructureVerb::DuplicateSheet {
             sheet: from, title, ..
@@ -1848,16 +1898,43 @@ fn describe_inserted(
     )
 }
 
+/// The "how to recover" tail every destructive real-run message ends with.
+///
 /// There is no `files.delete` or undo anywhere in this integration
 /// (ADR-0077). ADR-0080 §9 requires `--lease` on every destructive verb
 /// alongside every other Sheets/Docs write, and acquiring that lease backs
-/// the file up before the delete — so the lease's own backup, not Drive's
-/// version history, is now the primary recovery path, and every
-/// destructive real-run message points there first.
-const RECOVERY_NOTE: &str =
-    "this cannot be undone through omni-dev — the lease this write required already backed \
-     the file up; restore that copy from the Drive UI, or fall back to Google Drive's own \
-     version history";
+/// the whole file up — so the lease's own backup, not Drive's version
+/// history, is the primary recovery path, and the message names the copy
+/// (a Drive file id for a native document, a local path for bytes) so
+/// there is something to search for. Two honesty rules shape the wording:
+///
+/// - The backup is taken at *acquire* time, not immediately before this
+///   delete — a lease is multi-use (ADR-0080 §5), so earlier writes under
+///   the same token are not in the copy. The message says so.
+/// - A `require_lease: false` rule (§13) reaches the mutating call with no
+///   lease and therefore no backup; that path gets ADR-0077's original
+///   "version history is the only recovery path" wording, never a claim
+///   that a copy exists. `backup` comes from the ledger record the write
+///   was checked against, so this cannot be wrong by assumption.
+fn recovery_note(backup: Option<&LeaseBackup>) -> String {
+    match backup {
+        Some(LeaseBackup::DriveCopy { file_id }) => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             whole spreadsheet up when it was acquired (Drive copy {file_id}); restore from that \
+             copy in the Drive UI, or fall back to Google Drive's own version history"
+        ),
+        Some(LeaseBackup::Bytes { path, .. }) => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             file up when it was acquired ({}); restore from that copy, or fall back to Google \
+             Drive's own version history",
+            path.display()
+        ),
+        None => "this cannot be undone through omni-dev — no lease backup was taken (the \
+                 deciding write-permission rule sets `require_lease: false`), so Google Drive's \
+                 version history is the only recovery path"
+            .to_string(),
+    }
+}
 
 /// The `DeleteRows`/`DeleteColumns` arm of [`describe_changed`].
 #[allow(clippy::too_many_arguments)]
@@ -1869,6 +1946,7 @@ fn describe_deleted_dimension(
     count: i64,
     sheet: Option<&SheetSnapshot>,
     book: &str,
+    recovery: &str,
 ) -> String {
     let last = at.checked_add(count).and_then(|end| end.checked_sub(1));
     let range = last.map_or_else(|| at.to_string(), |last| format!("{at}-{last}"));
@@ -1881,7 +1959,7 @@ fn describe_deleted_dimension(
         format!(" ({after} {} now)", plural(dimension))
     });
     format!(
-        "Deleted {count} {noun}(s) {range} of '{from}'{id} in {book}{now}; {RECOVERY_NOTE}",
+        "Deleted {count} {noun}(s) {range} of '{from}'{id} in {book}{now}; {recovery}",
         noun = dimension.noun(),
     )
 }
@@ -1897,6 +1975,7 @@ fn describe_deleted_range(
     end_column: i64,
     shift: ShiftDimension,
     book: &str,
+    recovery: &str,
 ) -> String {
     let direction = match shift {
         ShiftDimension::Rows => "up",
@@ -1904,7 +1983,7 @@ fn describe_deleted_range(
     };
     format!(
         "Deleted rows {start_row}-{end_row}, columns {start_column}-{end_column} of '{from}'{id} \
-         in {book}, shifted remaining cells {direction}; {RECOVERY_NOTE}"
+         in {book}, shifted remaining cells {direction}; {recovery}"
     )
 }
 
@@ -2058,8 +2137,28 @@ mod tests {
     }
 
     /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
-    /// `version`, returning its token.
+    /// `version`, returning its token. The backup is bytes at a fixed path;
+    /// [`seed_lease_with_backup`] takes the backup a test is about.
     fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
+        seed_lease_with_backup(
+            ledger_path,
+            spreadsheet_id,
+            version,
+            LeaseBackup::Bytes {
+                path: std::path::PathBuf::from("/tmp/test-backup"),
+                sha256: "deadbeef".to_string(),
+                size: 0,
+            },
+        )
+    }
+
+    /// [`seed_lease`], with the backup the lease records.
+    fn seed_lease_with_backup(
+        ledger_path: &std::path::Path,
+        spreadsheet_id: &str,
+        version: &str,
+        backup: LeaseBackup,
+    ) -> String {
         // A fixed token, not a random one: every call gets its own
         // isolated ledger (a fresh tempdir), so uniqueness across tests is
         // never a concern.
@@ -2070,11 +2169,7 @@ mod tests {
             file_id: spreadsheet_id.to_string(),
             version: version.to_string(),
             modified_time: None,
-            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
+            backup,
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
@@ -3266,7 +3361,11 @@ mod tests {
         .await;
         assert!(matches!(outcome.result, StructureResult::Changed { .. }));
         assert!(describe(&outcome).contains("Deleted sheet 'Q2'"));
-        assert!(describe(&outcome).contains("restore that copy from the Drive UI"));
+        // `seed_lease` records a bytes backup, so the message names its
+        // path; the Drive-copy and no-lease wordings have their own tests
+        // in the lease section below.
+        assert!(describe(&outcome).contains("backed the file up when it was acquired"));
+        assert!(describe(&outcome).contains("/tmp/test-backup"));
         assert!(describe(&outcome).contains("Google Drive's own version history"));
 
         let requests = server.received_requests().await.unwrap();
@@ -4468,7 +4567,122 @@ mod tests {
         let mut o = opts(rename(), false);
         o.lease_token = None;
         let outcome = structure(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
-        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(matches!(
+            outcome.result,
+            StructureResult::Changed { backup: None, .. }
+        ));
+    }
+
+    /// A native document's lease backs it up as a Drive copy (ADR-0080
+    /// §3); a real-run delete under it names that copy's file id — the one
+    /// thing a user can search the Drive UI for — and says the copy dates
+    /// from acquisition, since a multi-use lease (§5) may have written
+    /// since.
+    #[tokio::test]
+    async fn a_leased_delete_names_the_drive_copy_to_restore_from() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease_with_backup(
+            &ledger_path,
+            "sheet-1",
+            "1",
+            LeaseBackup::DriveCopy {
+                file_id: "backup-copy-1".to_string(),
+            },
+        );
+        let mut o = opts(delete_sheet(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = structure(&drive, &sheets, &o, &[delete_allow_rule("parent-1")]).await;
+
+        assert!(matches!(
+            &outcome.result,
+            StructureResult::Changed {
+                backup: Some(backup),
+                ..
+            } if **backup == LeaseBackup::DriveCopy { file_id: "backup-copy-1".to_string() }
+        ));
+        let text = describe(&outcome);
+        assert!(text.contains("Deleted sheet 'Q2'"), "{text}");
+        assert!(
+            text.contains(
+                "backed the whole spreadsheet up when it was acquired (Drive copy backup-copy-1)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("restore from that copy in the Drive UI"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Google Drive's own version history"),
+            "{text}"
+        );
+        assert!(!text.contains("only recovery path"), "{text}");
+
+        // The copy rides the JSON outcome too, so a machine caller can find
+        // it without parsing the message.
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["result"]["backup"]["kind"], "drive_copy");
+        assert_eq!(json["result"]["backup"]["file_id"], "backup-copy-1");
+    }
+
+    /// The other half of the honesty rule: a `require_lease: false` rule
+    /// reaches the delete with no lease and no backup, and the message
+    /// must not claim one — it falls back to ADR-0077's original wording
+    /// and says why.
+    #[tokio::test]
+    async fn an_unleased_delete_does_not_claim_a_backup_exists() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(delete_sheet(), false);
+        o.lease_token = None;
+        let rule = FolderPermissionRule {
+            require_lease: false,
+            ..delete_allow_rule("parent-1")
+        };
+        let outcome = structure(&drive, &sheets, &o, &[rule]).await;
+
+        assert!(matches!(
+            outcome.result,
+            StructureResult::Changed { backup: None, .. }
+        ));
+        let text = describe(&outcome);
+        assert!(text.contains("Deleted sheet 'Q2'"), "{text}");
+        assert!(text.contains("no lease backup was taken"), "{text}");
+        assert!(text.contains("`require_lease: false`"), "{text}");
+        assert!(
+            text.contains("version history is the only recovery path"),
+            "{text}"
+        );
+        assert!(!text.contains("restore from that copy"), "{text}");
+        assert!(serde_json::to_value(&outcome).unwrap()["result"]
+            .get("backup")
+            .is_none());
     }
 
     // ── plumbing ───────────────────────────────────────────────────────
@@ -4566,6 +4780,9 @@ mod tests {
                     column_count: Some(26),
                 }),
                 sheet_id: Some(7),
+                backup: Some(Box::new(LeaseBackup::DriveCopy {
+                    file_id: "backup-copy-1".to_string(),
+                })),
             },
             StructureResult::Failed {
                 detail: "boom".to_string(),
@@ -4793,6 +5010,7 @@ mod tests {
             StructureResult::Changed {
                 sheet: None,
                 sheet_id: None,
+                backup: None,
             }
             .log_status(),
             StructureResult::Failed {

@@ -287,9 +287,9 @@ async fn edit_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.file_id,
     };
-    let lease_lock = if requires_lease {
+    let lease_grant = if requires_lease {
         match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(lock) => Some(lock),
+            Ok(grant) => Some(grant),
             Err(LeaseGateRefusal::NoLease) => return gated(EditResult::RefusedNoLease),
             Err(LeaseGateRefusal::Expired) => return gated(EditResult::RefusedLeaseExpired),
             Err(LeaseGateRefusal::WrongFile) => return gated(EditResult::RefusedLeaseWrongFile),
@@ -305,20 +305,26 @@ async fn edit_inner(
         .await
     {
         Ok(updated) => {
-            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                finish_leased_write(leased, lock, token, updated.version, updated.modified_time);
+            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+                finish_leased_write(
+                    leased,
+                    &grant.lock,
+                    token,
+                    updated.version,
+                    updated.modified_time,
+                );
             }
             EditResult::Edited
         }
         Err(err) => {
             let detail = err.to_string();
-            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
                 record_failed_leased_write(leased, token, &detail);
             }
             EditResult::Failed { detail }
         }
     };
-    drop(lease_lock);
+    drop(lease_grant);
     gated(result)
 }
 

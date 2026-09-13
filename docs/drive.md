@@ -1424,16 +1424,28 @@ omni-dev drive sheets delete-range <ID> --sheet Q2 \
 
 Every real (non-`--dry-run`) delete says how to recover, since there is no
 `files.delete` or undo anywhere in this integration. The `--lease` these
-verbs require ([ADR-0080](adrs/adr-0080.md) §9) already backed the file up
-before the delete, so that backup — not Drive's own version history — is
-named as the primary recovery path:
+verbs require ([ADR-0080](adrs/adr-0080.md) §9) backed the whole
+spreadsheet up as a Drive copy when it was acquired, so that copy — named
+by its file id, not Drive's own version history — is the primary recovery
+path:
 
 ```
 Deleted sheet 'Q2' (sheetId 118293) from 'Budget'; this cannot be undone
-through omni-dev — the lease this write required already backed the file
-up; restore that copy from the Drive UI, or fall back to Google Drive's
-own version history
+through omni-dev — the lease this write required backed the whole
+spreadsheet up when it was acquired (Drive copy 1AbC…); restore from that
+copy in the Drive UI, or fall back to Google Drive's own version history
 ```
+
+Two things the wording is careful about. The copy dates from **acquisition**,
+not from immediately before this delete: a lease is multi-use for its
+lifetime ([ADR-0080](adrs/adr-0080.md) §5), so earlier writes under the
+same token are not in it. And a folder whose deciding rule sets
+`require_lease: false` takes no backup at all, so a delete there says
+``no lease backup was taken (the deciding write-permission rule sets
+`require_lease: false`), so Google Drive's version history is the only
+recovery path`` rather than pointing at a copy that does not exist. The
+`--output json` outcome carries the same copy as a `backup` field
+(`{"kind": "drive_copy", "file_id": …}`), omitted when none was taken.
 
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
 `--at`/`--count` (or the range bounds) must name rows/columns/cells that

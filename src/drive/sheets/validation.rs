@@ -417,9 +417,9 @@ async fn validation_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
     };
-    let lease_lock = if requires_lease {
+    let lease_grant = if requires_lease {
         match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(lock) => Some(lock),
+            Ok(grant) => Some(grant),
             Err(LeaseGateRefusal::NoLease) => return gated(ValidationResult::RefusedNoLease),
             Err(LeaseGateRefusal::Expired) => return gated(ValidationResult::RefusedLeaseExpired),
             Err(LeaseGateRefusal::WrongFile) => {
@@ -437,20 +437,20 @@ async fn validation_inner(
     let request = build_request(&opts.verb, grid);
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(_response) => {
-            if let (Some(token), Some(lock)) = (&opts.lease_token, &lease_lock) {
-                finish_leased_native_write(leased, lock, token, &files_api).await;
+            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
             }
             ValidationResult::Changed { summary }
         }
         Err(err) => {
             let detail = format!("{err:#}");
-            if let (Some(token), Some(_lock)) = (&opts.lease_token, &lease_lock) {
+            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
                 record_failed_leased_write(leased, token, &detail);
             }
             ValidationResult::Failed { detail }
         }
     };
-    drop(lease_lock);
+    drop(lease_grant);
     gated(result)
 }
 

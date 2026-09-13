@@ -174,8 +174,10 @@ pub struct InsertColumnsCommand {
 /// (issue #1623) — distinct from `sheets-structure`, so an existing
 /// `allow: ["sheets-structure"]` rule does not also grant this. This cannot
 /// be undone through omni-dev; the `--lease` this delete requires (ADR-0080
-/// §9) already backed the file up, and that backup — not Google Drive's own
-/// version history — is the primary recovery path.
+/// §9) backed the whole spreadsheet up when it was acquired, and that copy
+/// — named in the real-run message, not Google Drive's own version history
+/// — is the primary recovery path. A rule that opts out with
+/// `require_lease: false` takes no backup, and the message then says so.
 #[derive(Parser)]
 pub struct DeleteSheetCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
