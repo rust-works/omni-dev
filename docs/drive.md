@@ -1209,6 +1209,54 @@ token in the ledger and in `audit.jsonl`, which records both tokens on a
 restore (`lease_id` the fresh one, `restored_from_lease_id` the backup one
 read from) — see [docs/log.md](log.md#audit-log).
 
+### Prune
+
+```bash
+$ omni-dev drive lease prune --older-than 30d --dry-run
+$ omni-dev drive lease prune --older-than 30d
+```
+
+`drive lease prune` bounds the ledger's and the backup directory/folder's
+otherwise-unbounded growth ([ADR-0080](adrs/adr-0080.md) Consequences,
+#1678) by dropping expired rows together with the backups they point at.
+It mirrors [`omni-dev log prune`](log.md#omni-dev-log-prune)'s shape:
+
+| Flag | Effect |
+|------|--------|
+| `--older-than <DUR>` | Drop non-live rows whose expiry is strictly before this relative window (`7d`, `24h`, `2w`). A row expiring exactly at the cutoff survives. |
+| `--max-size <SIZE>` | After age pruning, additionally drop the oldest-expiring survivors until their local backup bytes total at most `<SIZE>` (`10mb`, `512kb`, or a bare byte count). A Drive-copy backup counts as zero local bytes, so it's only reachable through `--older-than`. |
+| `--dry-run` | Report what would be removed without deleting/trashing any backup or modifying the ledger. |
+
+At least one of `--older-than`/`--max-size` is required. A **live** lease
+(unexpired and unreleased) is never a removal candidate regardless of
+either bound — pruning can never invalidate a lease a write is still
+relying on. `--max-size` always keeps at least the single
+most-recently-expired row's backup, even if it alone exceeds the budget.
+
+A row and the backup it points at are always dropped **together, never one
+without the other**: a byte backup is deleted from local disk, a
+Drive-copy backup is moved to Drive Trash (recoverable by hand for ~30
+days via the Drive UI) — and the ledger row is dropped, with that removal
+persisted to disk, only once its own backup has been cleared (or found
+already gone). Persistence happens one row at a time, not batched across
+the whole run, so an interrupted prune (a crash, a killed process) can
+leave at most the one row it was working on inconsistent with its
+already-cleared backup — never the rest of the run. A backup
+deletion/trash failure for one row (e.g. a transient Drive error) skips
+just that row, leaving it for a future prune run, rather than failing the
+whole command.
+
+```bash
+$ omni-dev drive lease prune --older-than 30d
+Removed 12 lease(s); kept 4 (3 trashed Drive backup(s), 0 failure(s), freed 8241203 bytes of local backups).
+```
+
+`audit.jsonl` is out of scope for this command: it is append-only forensic
+history by design ([ADR-0080](adrs/adr-0080.md) §11) and is never touched
+here, the same exemption it has from `OMNI_DEV_LOG_DISABLE` and
+`omni-dev log prune`'s own rotation — see
+[docs/log.md](log.md#audit-log).
+
 ## Sheets
 
 `drive sheets` reads and writes the *cells* of a Google Sheet through the

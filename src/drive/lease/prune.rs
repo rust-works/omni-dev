@@ -12,7 +12,9 @@
 //! [`LeaseBackup::Bytes`] backup is deleted from local disk, a
 //! [`LeaseBackup::DriveCopy`] backup is moved to Drive Trash
 //! ([`FilesApi::trash`]), and only once that step succeeds (or finds the
-//! backup already gone) does the row itself get dropped from the ledger.
+//! backup already gone) does the row itself get dropped from the ledger —
+//! and the ledger is saved immediately, per row, not batched until the run
+//! finishes, so a crash mid-run strands at most the one row it interrupts.
 //! A backup-deletion failure for one row skips just that row — it is left
 //! for a future prune, not treated as a hard error for the whole command.
 
@@ -30,8 +32,10 @@ use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, LedgerL
 
 /// Options controlling [`prune`].
 pub struct PruneOptions {
-    /// Drop non-live rows whose `expires_at` is at or before this cutoff. A
-    /// live row is never a candidate regardless of this bound.
+    /// Drop non-live rows whose `expires_at` is strictly before this
+    /// cutoff (a row expiring exactly at the cutoff survives) — mirrors
+    /// `request_log::keep_by_age`'s inclusive boundary. A live row is never
+    /// a candidate regardless of this bound.
     pub older_than: Option<DateTime<Utc>>,
     /// After the age filter, additionally drop the oldest-expiring
     /// survivors until the local backup bytes they account for total at
@@ -131,9 +135,14 @@ fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
 /// Prunes the lease ledger at `opts.ledger_path` by age and/or size,
 /// dropping each removed row together with the backup it points at.
 ///
-/// Runs under [`LedgerLock`] for its whole duration (load through save), so
-/// a concurrent `drive lease acquire`/`restore` can't race the rewrite —
-/// the same lock those commands themselves hold while mutating the ledger.
+/// Runs under [`LedgerLock`] for its whole duration (load through the last
+/// save), so a concurrent `drive lease acquire`/`restore` can't race the
+/// rewrite — the same lock those commands themselves hold while mutating
+/// the ledger. That single continuous lock is also what makes the per-row
+/// save below safe: nothing else can observe or rewrite the ledger between
+/// one row's removal and the next, so there is no window for a concurrent
+/// writer (e.g. `restore`'s `mark_restored`, ADR-0080 §4) to race a save
+/// this function didn't yet make.
 pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOutcome> {
     let _lock = LedgerLock::acquire(&opts.ledger_path)?;
     let mut ledger = LeaseLedger::load(&opts.ledger_path)?;
@@ -153,12 +162,13 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
     };
 
     // Age filter: a non-live row survives into the size filter unless it's
-    // past the `--older-than` cutoff (no cutoff means every non-live row
-    // proceeds to the size filter, mirroring `request_log::prune` with
-    // `older_than: None`).
+    // strictly past the `--older-than` cutoff (no cutoff means every
+    // non-live row proceeds to the size filter, mirroring
+    // `request_log::prune` with `older_than: None`; a row expiring exactly
+    // at the cutoff survives, mirroring `request_log::keep_by_age`'s `>=`).
     let (mut age_survivors, mut removed): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
         non_live.into_iter().partition(|rec| match opts.older_than {
-            Some(cutoff) => rec.expires_at > cutoff,
+            Some(cutoff) => rec.expires_at >= cutoff,
             None => true,
         });
 
@@ -189,6 +199,12 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
         }
         if clear_backup(&files_api, &rec.backup).await.is_ok() {
             ledger.remove(&rec.token);
+            // Persisted immediately, one row at a time: the backup is
+            // already gone (or was found already gone), so the ledger must
+            // catch up before this function does anything else — a crash
+            // right after this call strands at most this one row, never
+            // the rest of the batch.
+            ledger.save(&opts.ledger_path)?;
             outcome.removed += 1;
             match &rec.backup {
                 LeaseBackup::Bytes { size, .. } => outcome.bytes_freed += size,
@@ -198,10 +214,6 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
             outcome.failed += 1;
             outcome.kept += 1;
         }
-    }
-
-    if !opts.dry_run && outcome.removed > 0 {
-        ledger.save(&opts.ledger_path)?;
     }
 
     Ok(outcome)
@@ -365,6 +377,107 @@ mod tests {
         let reloaded = LeaseLedger::load(&ledger_path).unwrap();
         assert!(reloaded.get("old").is_none());
         assert!(reloaded.get("recent").is_some());
+    }
+
+    #[tokio::test]
+    async fn older_than_boundary_keeps_a_row_expiring_exactly_at_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let backup_path = dir.path().join("backup");
+        std::fs::write(&backup_path, b"x").unwrap();
+
+        let cutoff = Utc::now() - ChronoDuration::days(1);
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "on-the-boundary",
+            cutoff,
+            1,
+            backup_path.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(cutoff),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.removed, 0,
+            "a row expiring exactly at the cutoff must survive, mirroring \
+             `request_log::keep_by_age`'s inclusive `>=` boundary"
+        );
+        assert_eq!(outcome.kept, 1);
+        assert!(backup_path.exists());
+        assert!(LeaseLedger::load(&ledger_path)
+            .unwrap()
+            .get("on-the-boundary")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_mixed_batch_persists_successful_removals_independently_of_a_failing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(drive_copy_record(
+            "ok",
+            Utc::now() - ChronoDuration::hours(2),
+            "drive-copy-ok",
+        ));
+        ledger.insert(drive_copy_record(
+            "bad",
+            Utc::now() - ChronoDuration::hours(2),
+            "drive-copy-bad",
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/drive-copy-ok"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "drive-copy-ok", "name": "backup", "trashed": true,
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/drive-copy-bad"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.kept, 1);
+        let reloaded = LeaseLedger::load(&ledger_path).unwrap();
+        assert!(
+            reloaded.get("ok").is_none(),
+            "the successful removal must be persisted regardless of the other row's outcome"
+        );
+        assert!(reloaded.get("bad").is_some());
     }
 
     #[tokio::test]
