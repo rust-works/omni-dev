@@ -389,6 +389,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backup_size_is_zero_for_a_drive_copy() {
+        // A `DriveCopy` never reaches `backup_size` through `prune`'s own
+        // call site today (only `Bytes`-backed survivors are ever passed to
+        // `keep_count_by_size`) — covered directly here so the zero-bytes
+        // contract documented on `backup_size` itself stays pinned even if
+        // that call site ever changes.
+        assert_eq!(
+            backup_size(&LeaseBackup::DriveCopy {
+                file_id: "drive-copy-1".to_string(),
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn prune_outcome_serializes_to_jsonl() {
+        let mut buf = Vec::new();
+        PruneOutcome {
+            removed: 1,
+            kept: 2,
+            bytes_freed: 3,
+            trashed_drive_copies: 1,
+            failed: 0,
+        }
+        .write_jsonl(&mut buf)
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"removed\":1"), "{text}");
+        assert!(text.contains("\"kept\":2"), "{text}");
+    }
+
     #[tokio::test]
     async fn a_live_lease_is_never_pruned_regardless_of_bounds() {
         let dir = tempfile::tempdir().unwrap();
@@ -832,6 +864,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bytes_backup_already_removed_is_tolerated_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        // Deliberately never written to disk — a prior manual cleanup or a
+        // previous partially-failed prune run could have already removed
+        // it; `clear_backup` must tolerate `NotFound` the same way it does
+        // for a `DriveCopy`'s already-trashed 404.
+        let backup_path = dir.path().join("already-gone");
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path,
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(LeaseLedger::load(&ledger_path)
+            .unwrap()
+            .get("old")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bytes_backup_deletion_failure_leaves_the_row_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        // A directory in place of the backup file forces `remove_file` to
+        // fail with something other than `NotFound` (mirrors the same
+        // trick used elsewhere in this crate to force a non-`NotFound`
+        // I/O failure deterministically).
+        let backup_path = dir.path().join("not-a-file");
+        std::fs::create_dir(&backup_path).unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path,
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.kept, 1);
+        assert!(LeaseLedger::load(&ledger_path)
+            .unwrap()
+            .get("old")
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn a_backup_deletion_failure_leaves_the_row_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(dir.path());
@@ -1024,6 +1142,112 @@ mod tests {
             records[0].error.is_some(),
             "the underlying clear_backup error must be captured, not just an opaque count"
         );
+    }
+
+    #[tokio::test]
+    async fn a_best_effort_audit_write_failure_is_warned_and_swallowed() {
+        // Mirrors `restore.rs`'s identically-named test: a directory in
+        // place of the audit file forces `record_audit_event` to fail.
+        // `record_prune_attempt` is best-effort — the prune itself (already
+        // committed by the time this is called) must still succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        std::fs::create_dir(dir.path().join("audit.jsonl")).unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let backup_path = dir.path().join("backup");
+        std::fs::write(&backup_path, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(!backup_path.exists());
+        assert!(LeaseLedger::load(&ledger_path)
+            .unwrap()
+            .get("old")
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ledger_persist_failure_after_clearing_the_backup_is_reported_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(drive_copy_record(
+            "copy",
+            Utc::now() - ChronoDuration::hours(2),
+            "drive-copy-1",
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        // An artificial delay on the `trash` response gives the background
+        // thread below a wide window to break the ledger directory's
+        // writability *after* this run's own initial (candidate-selection)
+        // lock has already been acquired and released, but *before* the
+        // per-row removal reaches its own `mutate_locked` call — the exact
+        // gap `prune`'s own doc comment calls out as the one case a crash
+        // (or, here, a filesystem fault) can strand a row.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/drive-copy-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "id": "drive-copy-1", "name": "backup", "trashed": true,
+                    }))
+                    .set_delay(std::time::Duration::from_millis(150)),
+            )
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let dir_path = dir.path().to_path_buf();
+        let jammer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        });
+
+        let err = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        jammer.join().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(err.to_string().contains("may now dangle"), "{err:?}");
     }
 
     #[tokio::test]
