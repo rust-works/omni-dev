@@ -225,7 +225,8 @@ impl<'a> FilesApi<'a> {
     /// codebase has otherwise never needed. Requires the `drive.metadata`
     /// scope (`drive auth login --write`) — same as [`Self::rename`], since
     /// a backup copy is always a file `omni-dev` itself created via
-    /// [`Self::copy`].
+    /// [`Self::copy`]; uses [`WriteCapability::Metadata`] rather than a
+    /// dedicated variant, since the scope it needs is identical.
     ///
     /// Restricted to `crate::drive` — only `crate::drive::lease::prune` may
     /// call this, never an ungated CLI command directly (same restriction
@@ -239,7 +240,7 @@ impl<'a> FilesApi<'a> {
         self.client
             .parse_response(response, "Failed to parse files.update (trash) response")
             .await
-            .map_err(|err| append_write_scope_hint(err, WriteCapability::Trash))
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
     }
 
     /// Creates a new file or folder (`files.create`, metadata-only — no
@@ -590,7 +591,10 @@ fn build_file_update_url(
 /// 403 instead of hardcoding a single hint (issue #1574 generalization of
 /// [ADR-0070](../../docs/adrs/adr-0070.md) §2's rename/move-only hint).
 pub(crate) enum WriteCapability {
-    /// `files.update` on `name`/`parents` (rename/move) — `drive.metadata`.
+    /// `files.update` on `name`/`parents` (rename/move) or `trashed`
+    /// (`drive lease prune`, #1678) — `drive.metadata`. One variant covers
+    /// all three verbs since they share the identical scope; only the hint
+    /// wording below distinguishes them.
     Metadata,
     /// Creating a new file/folder, or uploading new content — `drive.file`
     /// or `drive`.
@@ -606,10 +610,6 @@ pub(crate) enum WriteCapability {
     /// no app-created-it case to consider, since the lease exists
     /// precisely to back up files `omni-dev` did not create.
     CopyForBackup,
-    /// Trashing a `DriveCopy` lease backup during `drive lease prune`
-    /// (#1678) — `drive.metadata`, the same scope [`Self::Metadata`] names,
-    /// but worded for trashing rather than rename/move.
-    Trash,
 }
 
 /// Appends an actionable hint to a mutating-call failure caused by an
@@ -641,7 +641,7 @@ pub(in crate::drive) fn append_write_scope_hint(
     let hint = match capability {
         WriteCapability::Metadata => {
             "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
-             for rename/move"
+             for rename/move/trash"
         }
         WriteCapability::CreateOrUpload => {
             "Run `omni-dev drive auth login --write-file` (or `--write-full`) to grant the \
@@ -654,10 +654,6 @@ pub(in crate::drive) fn append_write_scope_hint(
         WriteCapability::CopyForBackup => {
             "Run `omni-dev drive auth login --write-full` to grant the unrestricted scope \
              needed to back up a native document before a leased write, then retry"
-        }
-        WriteCapability::Trash => {
-            "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
-             to trash a lease backup, then retry"
         }
     };
     err.context(hint)
@@ -1740,7 +1736,7 @@ mod tests {
             append_write_scope_hint(insufficient_permissions_error(), WriteCapability::Metadata)
                 .to_string();
         assert!(msg.contains("--write"), "{msg}");
-        assert!(msg.contains("rename/move"), "{msg}");
+        assert!(msg.contains("rename/move/trash"), "{msg}");
     }
 
     #[test]
@@ -1774,15 +1770,6 @@ mod tests {
         .to_string();
         assert!(msg.contains("--write-full"), "{msg}");
         assert!(msg.contains("back up a native document"), "{msg}");
-        assert!(!msg.contains("--write-file"), "{msg}");
-    }
-
-    #[test]
-    fn append_write_scope_hint_trash_names_write_flag() {
-        let msg = append_write_scope_hint(insufficient_permissions_error(), WriteCapability::Trash)
-            .to_string();
-        assert!(msg.contains("--write"), "{msg}");
-        assert!(msg.contains("trash a lease backup"), "{msg}");
         assert!(!msg.contains("--write-file"), "{msg}");
     }
 
