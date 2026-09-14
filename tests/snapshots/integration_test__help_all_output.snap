@@ -4035,6 +4035,7 @@ Usage: lease <COMMAND>
 Commands:
   acquire  Backs up a file and mints a lease token, prompting for device-owner authentication (Touch ID or the account password)
   restore  Restores a file from a backup lease's recorded content, minting a fresh lease of its own before writing
+  prune    Bounds the ledger's and the backup directory/folder's growth by dropping expired rows together with the backups they point at (ADR-0080 Consequences fast-follow, #1678)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4059,6 +4060,22 @@ Options:
       --allow-headless      Proceed even when no device-owner authenticator is available in this context — off-macOS, or a macOS process with no attached GUI session (ADR-0080 §8) — waiving the human-presence guarantee instead of refusing outright. Also settable via `settings.json`'s `lease.allow_headless` or `OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS`; any layer opting in wins
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive lease prune - Bounds the ledger's and the backup directory/folder's growth by dropping expired rows together with the backups they point at (ADR-0080 Consequences fast-follow, #1678)
+
+Bounds the ledger's and the backup directory/folder's growth by dropping expired rows together with the backups they point at (ADR-0080 Consequences fast-follow, #1678)
+
+Usage: prune [OPTIONS]
+
+Options:
+      --older-than <DUR>  Drop non-live rows whose expiry is older than this relative window (e.g. `7d`, `24h`, `2w`)
+      --max-size <SIZE>   After `--older-than`, additionally drop the oldest-expiring survivors until their local backup bytes total at most this size (e.g. `10mb`, `512kb`, `1048576`). A `DriveCopy` backup counts as zero bytes here — it consumes no local disk
+      --dry-run           Report what would be removed without deleting/trashing any backup or modifying the ledger
+  -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help              Print help (see more with '--help')
 
 
 ================================================================================
