@@ -1084,4 +1084,118 @@ mod tests {
         let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
         assert!(reloaded.get("old-token").is_none());
     }
+
+    #[tokio::test]
+    async fn prune_command_max_size_only_dispatches_through_lease_command_and_prints_a_table_summary(
+    ) {
+        // `--max-size` alone (no `--older-than`) through the top-level
+        // `LeaseCommand::execute` dispatch, with the default `Table`
+        // output — covers the `older_than: None` branch, the `--max-size`
+        // parse branch, and the human-readable non-dry-run summary, none
+        // of which the other prune tests (which always pass `--older-than`
+        // and always request JSON output) reach.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let old_backup = dir.path().join("old-backup.bin");
+        let new_backup = dir.path().join("new-backup.bin");
+        std::fs::write(&old_backup, vec![0u8; 100]).unwrap();
+        std::fs::write(&new_backup, vec![0u8; 100]).unwrap();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "old-token".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: old_backup.clone(),
+                sha256: "deadbeef".to_string(),
+                size: 100,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::hours(3),
+            expires_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            released_at: None,
+            restored_at: None,
+        });
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "new-token".to_string(),
+            file_id: "file-2".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: new_backup.clone(),
+                sha256: "deadbeef".to_string(),
+                size: 100,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            released_at: None,
+            restored_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let lease_cmd = LeaseCommand {
+            action: LeaseAction::Prune(PruneCommand {
+                older_than: None,
+                max_size: Some("150".to_string()),
+                dry_run: false,
+                output: OutputFormat::Table,
+            }),
+        };
+        lease_cmd.execute(&client).await.unwrap();
+
+        assert!(!old_backup.exists());
+        assert!(new_backup.exists());
+        let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        assert!(reloaded.get("old-token").is_none());
+        assert!(reloaded.get("new-token").is_some());
+    }
+
+    #[tokio::test]
+    async fn prune_command_dry_run_prints_a_would_remove_table_summary() {
+        // The dry-run half of the human-readable summary's verb/backup-verb
+        // tuple — the non-dry-run half is covered above.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let backup_path = dir.path().join("old-backup.bin");
+        std::fs::write(&backup_path, b"stale").unwrap();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "old-token".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: backup_path.clone(),
+                sha256: "deadbeef".to_string(),
+                size: 5,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::days(10),
+            expires_at: chrono::Utc::now() - chrono::Duration::days(9),
+            released_at: None,
+            restored_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let cmd = PruneCommand {
+            older_than: Some("1d".to_string()),
+            max_size: None,
+            dry_run: true,
+            output: OutputFormat::Table,
+        };
+        cmd.execute(&client).await.unwrap();
+
+        assert!(backup_path.exists(), "dry-run must not delete the backup");
+        let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        assert!(reloaded.get("old-token").is_some());
+    }
 }
