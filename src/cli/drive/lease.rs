@@ -299,13 +299,13 @@ impl PruneCommand {
         if output_as(&outcome, &self.output)? {
             return Ok(());
         }
-        let verb = if self.dry_run {
-            "Would remove"
+        let (verb, backup_verb, byte_verb) = if self.dry_run {
+            ("Would remove", "would trash", "would free")
         } else {
-            "Removed"
+            ("Removed", "trashed", "freed")
         };
         println!(
-            "{verb} {} lease(s); kept {} ({} trashed Drive backup(s), {} failure(s), freed \
+            "{verb} {} lease(s); kept {} ({} {backup_verb} Drive backup(s), {} failure(s), {byte_verb} \
              {} bytes of local backups).",
             outcome.removed,
             outcome.kept,

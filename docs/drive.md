@@ -1241,20 +1241,30 @@ persisted to disk, only once its own backup has been cleared (or found
 already gone). Persistence happens one row at a time, not batched across
 the whole run, so an interrupted prune (a crash, a killed process) can
 leave at most the one row it was working on inconsistent with its
-already-cleared backup — never the rest of the run. A backup
-deletion/trash failure for one row (e.g. a transient Drive error) skips
-just that row, leaving it for a future prune run, rather than failing the
-whole command.
+already-cleared backup — never the rest of the run. The ledger lock
+itself is likewise held only briefly per step (once to decide candidates,
+then once per row to persist that row's own removal), not for the whole
+run, so a large batch never blocks a concurrent `drive lease
+acquire`/`restore`/write for longer than a single row's own local disk
+I/O. A backup deletion/trash failure for one row (e.g. a transient Drive
+error) is logged and skips just that row, leaving it for a future prune
+run, rather than failing the whole command.
 
 ```bash
 $ omni-dev drive lease prune --older-than 30d
 Removed 12 lease(s); kept 4 (3 trashed Drive backup(s), 0 failure(s), freed 8241203 bytes of local backups).
 ```
 
-`audit.jsonl` is out of scope for this command: it is append-only forensic
-history by design ([ADR-0080](adrs/adr-0080.md) §11) and is never touched
-here, the same exemption it has from `OMNI_DEV_LOG_DISABLE` and
-`omni-dev log prune`'s own rotation — see
+Every removal attempt — successful or failed — writes its own best-effort
+`audit.jsonl` record (`verdict: "pruned"` or `"prune-failed"`, the latter
+carrying the underlying error), the same fail-open posture `drive lease
+acquire`'s own audit trail uses, so `omni-dev log --audit` can always
+answer "why is this backup gone" for a specific lease. This is distinct
+from `audit.jsonl` itself being out of scope *as a pruning target*: the
+file is append-only forensic history by design
+([ADR-0080](adrs/adr-0080.md) §11) and `drive lease prune` never rotates
+or deletes its content, the same exemption it has from
+`OMNI_DEV_LOG_DISABLE` and `omni-dev log prune`'s own rotation — see
 [docs/log.md](log.md#audit-log).
 
 ## Sheets
