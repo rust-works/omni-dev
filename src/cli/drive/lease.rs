@@ -12,6 +12,7 @@ use crate::drive::lease::acquire::{
 };
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
+use crate::drive::lease::prune::{self, PruneOptions};
 use crate::drive::lease::restore::{self, RestoreOptions, RestoreResult};
 use crate::drive::lease::settings as lease_settings;
 use crate::drive::sheets::client::SheetsClient;
@@ -53,6 +54,10 @@ enum LeaseAction {
     /// Restores a file from a backup lease's recorded content, minting a
     /// fresh lease of its own before writing.
     Restore(RestoreCommand),
+    /// Bounds the ledger's and the backup directory/folder's growth by
+    /// dropping expired rows together with the backups they point at
+    /// (ADR-0080 Consequences fast-follow, #1678).
+    Prune(PruneCommand),
 }
 
 impl LeaseCommand {
@@ -60,6 +65,7 @@ impl LeaseCommand {
         match self.action {
             LeaseAction::Acquire(cmd) => cmd.execute(client).await,
             LeaseAction::Restore(cmd) => cmd.execute(client).await,
+            LeaseAction::Prune(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -224,6 +230,89 @@ impl RestoreCommand {
             return Ok(());
         }
         print_restore_result(&result);
+        Ok(())
+    }
+}
+
+/// Bounds the lease ledger's and the backup directory/folder's growth
+/// (ADR-0080 Consequences fast-follow, #1678). Mirrors `omni-dev log
+/// prune`'s shape: `--older-than`/`--max-size`, at least one required,
+/// applied sequentially (age first, then size trims what's left),
+/// `--dry-run` reports without mutating anything. Unlike `log prune`, there
+/// is no `--audit` flag to refuse — this command's underlying artifacts
+/// (the ledger, the backup directory/folder) never include `audit.jsonl` in
+/// the first place.
+///
+/// No [`LeaseFlags`] here: prune touches no per-lease `backup_dir`/
+/// `expiry_minutes`/Touch-ID policy — every row already carries its own
+/// absolute backup path or Drive file id, and pruning never mints a new
+/// lease.
+#[derive(Parser)]
+pub struct PruneCommand {
+    /// Drop non-live rows whose expiry is older than this relative window
+    /// (e.g. `7d`, `24h`, `2w`).
+    #[arg(long, value_name = "DUR")]
+    older_than: Option<String>,
+    /// After `--older-than`, additionally drop the oldest-expiring
+    /// survivors until their local backup bytes total at most this size
+    /// (e.g. `10mb`, `512kb`, `1048576`). A `DriveCopy` backup counts as
+    /// zero bytes here — it consumes no local disk.
+    #[arg(long, value_name = "SIZE")]
+    max_size: Option<String>,
+    /// Report what would be removed without deleting/trashing any backup
+    /// or modifying the ledger.
+    #[arg(long)]
+    dry_run: bool,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl PruneCommand {
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        if self.older_than.is_none() && self.max_size.is_none() {
+            anyhow::bail!("nothing to prune: pass --older-than <DUR> and/or --max-size <SIZE>");
+        }
+        let older_than = match self.older_than.as_deref() {
+            Some(s) => Some(
+                crate::cli::log::parse_since(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --older-than: {e}"))?,
+            ),
+            None => None,
+        };
+        let max_size = match self.max_size.as_deref() {
+            Some(s) => Some(
+                crate::request_log::parse_size(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --max-size: {e}"))?,
+            ),
+            None => None,
+        };
+
+        let ledger_path = ledger::ledger_path()?;
+        let opts = PruneOptions {
+            older_than,
+            max_size,
+            dry_run: self.dry_run,
+            ledger_path,
+        };
+        let outcome = prune::prune(client, &opts).await?;
+        if output_as(&outcome, &self.output)? {
+            return Ok(());
+        }
+        let verb = if self.dry_run {
+            "Would remove"
+        } else {
+            "Removed"
+        };
+        println!(
+            "{verb} {} lease(s); kept {} ({} trashed Drive backup(s), {} failure(s), freed \
+             {} bytes of local backups).",
+            outcome.removed,
+            outcome.kept,
+            outcome.trashed_drive_copies,
+            outcome.failed,
+            outcome.bytes_freed,
+        );
         Ok(())
     }
 }
@@ -791,8 +880,23 @@ mod tests {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Acquire(acquire) => acquire,
                 // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes an acquire subcommand"
-                LeaseAction::Restore(_) => panic!("expected an Acquire command"),
-                // omni-dev: coverage end
+                LeaseAction::Restore(_) | LeaseAction::Prune(_) => {
+                    panic!("expected an Acquire command")
+                } // omni-dev: coverage end
+            },
+        }
+    }
+
+    fn parse_prune(args: &[&str]) -> PruneCommand {
+        let mut full = vec!["omni-dev", "lease"];
+        full.extend_from_slice(args);
+        match Wrapper::try_parse_from(full).unwrap().cmd {
+            Wrapped::Lease(cmd) => match cmd.action {
+                LeaseAction::Prune(prune) => prune,
+                // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes a prune subcommand"
+                LeaseAction::Acquire(_) | LeaseAction::Restore(_) => {
+                    panic!("expected a Prune command")
+                } // omni-dev: coverage end
             },
         }
     }
@@ -896,5 +1000,88 @@ mod tests {
         assert_eq!(cmd.flags.expiry_minutes, Some(10));
         assert!(cmd.flags.biometrics_only);
         assert!(cmd.flags.allow_headless);
+    }
+
+    // ── prune ────────────────────────────────────────────────────────
+
+    #[test]
+    fn prune_flags_parse() {
+        let cmd = parse_prune(&[
+            "prune",
+            "--older-than",
+            "7d",
+            "--max-size",
+            "10mb",
+            "--dry-run",
+        ]);
+        assert_eq!(cmd.older_than.as_deref(), Some("7d"));
+        assert_eq!(cmd.max_size.as_deref(), Some("10mb"));
+        assert!(cmd.dry_run);
+    }
+
+    #[tokio::test]
+    async fn prune_requires_at_least_one_bound() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let cmd = parse_prune(&["prune"]);
+        let err = cmd.execute(&client).await.unwrap_err();
+        assert!(err.to_string().contains("nothing to prune"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prune_rejects_an_invalid_older_than() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let cmd = parse_prune(&["prune", "--older-than", "not-a-duration"]);
+        let err = cmd.execute(&client).await.unwrap_err();
+        assert!(err.to_string().contains("invalid --older-than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prune_command_removes_an_expired_lease_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let backup_path = dir.path().join("old-backup.bin");
+        std::fs::write(&backup_path, b"stale").unwrap();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "old-token".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::Bytes {
+                path: backup_path.clone(),
+                sha256: "deadbeef".to_string(),
+                size: 5,
+            },
+            acquired_at: chrono::Utc::now() - chrono::Duration::days(10),
+            expires_at: chrono::Utc::now() - chrono::Duration::days(9),
+            released_at: None,
+            restored_at: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let cmd = PruneCommand {
+            older_than: Some("1d".to_string()),
+            max_size: None,
+            dry_run: false,
+            output: OutputFormat::Json,
+        };
+        cmd.execute(&client).await.unwrap();
+
+        assert!(!backup_path.exists());
+        let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        assert!(reloaded.get("old-token").is_none());
     }
 }

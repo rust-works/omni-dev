@@ -214,6 +214,34 @@ impl<'a> FilesApi<'a> {
             .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
     }
 
+    /// Moves a file to Drive Trash (`files.update` with `trashed: true`) —
+    /// the `drive lease prune` (#1678) mechanism for dropping a
+    /// [`LeaseBackup::DriveCopy`](crate::drive::lease::ledger::LeaseBackup::DriveCopy)
+    /// backup together with the ledger row that points at it. Deliberately
+    /// trash, not permanent delete: this is the integration's first
+    /// delete-adjacent capability, and trashing keeps it reversible (Drive
+    /// Trash, auto-purged after ~30 days, or recoverable by hand before
+    /// then) rather than adding the one irreversible Drive mutation this
+    /// codebase has otherwise never needed. Requires the `drive.metadata`
+    /// scope (`drive auth login --write`) — same as [`Self::rename`], since
+    /// a backup copy is always a file `omni-dev` itself created via
+    /// [`Self::copy`].
+    ///
+    /// Restricted to `crate::drive` — only `crate::drive::lease::prune` may
+    /// call this, never an ungated CLI command directly (same restriction
+    /// [`Self::copy`]/[`Self::create`] carry).
+    pub(in crate::drive) async fn trash(&self, file_id: &str) -> Result<DriveFile> {
+        let url = build_file_update_url(self.client.base_url(), file_id, None, None)?;
+        let response = self
+            .client
+            .patch_json(url.as_str(), &serde_json::json!({ "trashed": true }))
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.update (trash) response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::Trash))
+    }
+
     /// Creates a new file or folder (`files.create`, metadata-only — no
     /// content). Requires the `drive.file` or `drive` scope (`drive auth
     /// login --write-file`/`--write-full`).
@@ -578,6 +606,10 @@ pub(crate) enum WriteCapability {
     /// no app-created-it case to consider, since the lease exists
     /// precisely to back up files `omni-dev` did not create.
     CopyForBackup,
+    /// Trashing a `DriveCopy` lease backup during `drive lease prune`
+    /// (#1678) — `drive.metadata`, the same scope [`Self::Metadata`] names,
+    /// but worded for trashing rather than rename/move.
+    Trash,
 }
 
 /// Appends an actionable hint to a mutating-call failure caused by an
@@ -622,6 +654,10 @@ pub(in crate::drive) fn append_write_scope_hint(
         WriteCapability::CopyForBackup => {
             "Run `omni-dev drive auth login --write-full` to grant the unrestricted scope \
              needed to back up a native document before a leased write, then retry"
+        }
+        WriteCapability::Trash => {
+            "Run `omni-dev drive auth login --write` to grant the drive.metadata scope needed \
+             to trash a lease backup, then retry"
         }
     };
     err.context(hint)
@@ -1295,6 +1331,68 @@ mod tests {
         );
     }
 
+    // ── trash ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn trash_sends_a_trashed_true_body() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"trashed": true}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "backup", "trashed": true,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client).trash("f1").await.unwrap();
+        assert_eq!(file.id, "f1");
+    }
+
+    #[tokio::test]
+    async fn trash_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client).trash("f1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn trash_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client).trash("f1").await.unwrap_err();
+        assert!(
+            err.to_string().contains("drive auth login --write"),
+            "{err}"
+        );
+    }
+
     // ── create ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1676,6 +1774,15 @@ mod tests {
         .to_string();
         assert!(msg.contains("--write-full"), "{msg}");
         assert!(msg.contains("back up a native document"), "{msg}");
+        assert!(!msg.contains("--write-file"), "{msg}");
+    }
+
+    #[test]
+    fn append_write_scope_hint_trash_names_write_flag() {
+        let msg = append_write_scope_hint(insufficient_permissions_error(), WriteCapability::Trash)
+            .to_string();
+        assert!(msg.contains("--write"), "{msg}");
+        assert!(msg.contains("trash a lease backup"), "{msg}");
         assert!(!msg.contains("--write-file"), "{msg}");
     }
 

@@ -10,12 +10,13 @@
 //! (`src/cli/gmail/insert/ledger.rs`): an in-memory `BTreeMap` is the
 //! source of truth, and every state change atomically rewrites the whole
 //! file (`tempfile::NamedTempFile` + `persist`), never appends an event.
-//! Unlike `InsertLedger`, a row is **never dropped** on rewrite once
-//! expired or released — `drive lease restore` (a later phase) locates a
-//! backup by token, and a restore is almost always wanted *after* the
-//! expiry window, once a bad write has been noticed. A `lease prune` that
-//! drops a row together with the backup it points at is the deliberate
-//! fast-follow ADR-0080's Consequences name, not implemented here.
+//! Unlike `InsertLedger`, a row is not dropped on an ordinary rewrite once
+//! expired or released — `drive lease restore` locates a backup by token,
+//! and a restore is almost always wanted *after* the expiry window, once a
+//! bad write has been noticed. [`super::prune`] is the one caller that does
+//! drop rows, deliberately: it is the ADR-0080 Consequences fast-follow
+//! (#1678) that drops a row together with the backup it points at, never
+//! one without the other.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -165,6 +166,25 @@ impl LeaseLedger {
     /// Records a freshly acquired lease.
     pub(crate) fn insert(&mut self, record: LeaseRecord) {
         self.0.insert(record.token.clone(), record);
+    }
+
+    /// Every row currently in the ledger, in token order. Read-only —
+    /// [`super::prune`] uses this to decide what's eligible, never to
+    /// mutate a row directly (a row is only ever dropped wholesale, via
+    /// [`Self::remove`]).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &LeaseRecord> {
+        self.0.values()
+    }
+
+    /// Drops `token`'s row entirely — unlike every other mutator here, this
+    /// removes state rather than updating it. The sole caller is
+    /// [`super::prune`], and only ever after that row's backup has already
+    /// been deleted/trashed: a ledger row and the backup it points at must
+    /// never be dropped one without the other (ADR-0080 Consequences,
+    /// #1678). Returns the removed row, if any, so a caller can account for
+    /// what it freed.
+    pub(crate) fn remove(&mut self, token: &str) -> Option<LeaseRecord> {
+        self.0.remove(token)
     }
 
     /// The live (unexpired, unreleased) lease already covering `file_id`,
@@ -467,6 +487,32 @@ mod tests {
         let mut ledger = LeaseLedger::default();
         ledger.record_write("missing", "2".to_string(), None);
         assert!(ledger.get("missing").is_none());
+    }
+
+    #[test]
+    fn iter_yields_every_row() {
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        ledger.insert(sample_record("t2"));
+        let tokens: Vec<&str> = ledger.iter().map(|r| r.token.as_str()).collect();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&"t1"));
+        assert!(tokens.contains(&"t2"));
+    }
+
+    #[test]
+    fn remove_drops_a_present_row_and_returns_it() {
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        let removed = ledger.remove("t1").unwrap();
+        assert_eq!(removed.token, "t1");
+        assert!(ledger.get("t1").is_none());
+    }
+
+    #[test]
+    fn remove_on_an_absent_token_is_a_noop() {
+        let mut ledger = LeaseLedger::default();
+        assert!(ledger.remove("missing").is_none());
     }
 
     #[test]
