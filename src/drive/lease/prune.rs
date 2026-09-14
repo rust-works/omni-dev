@@ -15,8 +15,20 @@
 //! backup already gone) does the row itself get dropped from the ledger —
 //! and the ledger is saved immediately, per row, not batched until the run
 //! finishes, so a crash mid-run strands at most the one row it interrupts.
-//! A backup-deletion failure for one row skips just that row — it is left
-//! for a future prune, not treated as a hard error for the whole command.
+//! A backup-deletion failure for one row skips just that row, logging and
+//! auditing why — it is left for a future prune, not treated as a hard
+//! error for the whole command.
+//!
+//! `--max-size` bounds *local* bytes only: a `DriveCopy` backup counts as
+//! zero and never participates in that budget, so it is reachable only
+//! through `--older-than` — a `DriveCopy` sorted behind an oversized
+//! `Bytes` backup must never be dropped as that backup's collateral
+//! damage. The ledger lock is held only briefly per step (once to decide
+//! candidates, then once per row to persist that row's removal) rather
+//! than for the whole run, so a large batch never blocks a concurrent
+//! `drive lease acquire`/`restore`/write for longer than a single row's
+//! own local disk I/O — the same lock discipline every other lease command
+//! already uses.
 
 use std::path::PathBuf;
 
@@ -110,12 +122,56 @@ async fn clear_backup(files_api: &FilesApi<'_>, backup: &LeaseBackup) -> Result<
     }
 }
 
+/// Applies one removed row's backup to `outcome`'s tallies. Shared by the
+/// dry-run and real-removal paths so their accounting can never drift
+/// apart — both must treat "this row is being removed" identically.
+fn account_removal(outcome: &mut PruneOutcome, backup: &LeaseBackup) {
+    outcome.removed += 1;
+    match backup {
+        LeaseBackup::Bytes { size, .. } => outcome.bytes_freed += size,
+        LeaseBackup::DriveCopy { .. } => outcome.trashed_drive_copies += 1,
+    }
+}
+
+/// Writes `drive lease prune`'s own best-effort audit record (ADR-0080
+/// §11) for one row, mirroring `acquire.rs`'s `record_attempt`'s
+/// backup-field mapping. Never fails the prune itself — a logging failure
+/// here only warns, the same posture `acquire`/`restore` already take,
+/// since the destructive step (the backup already cleared, or refused to
+/// be) has already happened by the time this is called.
+fn record_prune_attempt(rec: &LeaseRecord, verdict: &str, error: Option<String>) {
+    let (backup_location, backup_sha256, backup_size) = match &rec.backup {
+        LeaseBackup::Bytes { path, sha256, size } => (
+            Some(path.display().to_string()),
+            Some(sha256.clone()),
+            Some(*size),
+        ),
+        LeaseBackup::DriveCopy { file_id } => (Some(file_id.clone()), None, None),
+    };
+    let outcome = crate::request_log::AuditOutcome {
+        command: vec!["drive".to_string(), "lease-prune".to_string()],
+        integration: "drive",
+        file_id: rec.file_id.clone(),
+        lease_id: Some(rec.token.clone()),
+        verdict: verdict.to_string(),
+        backup_location,
+        backup_sha256,
+        backup_size,
+        error,
+        ..Default::default()
+    };
+    if let Err(err) = crate::request_log::record_audit_event(outcome) {
+        tracing::warn!("drive lease prune: failed to write audit record: {err}");
+    }
+}
+
 /// Longest prefix of `sorted_desc` (sorted newest-`expires_at`-first) whose
 /// backup bytes fit within `max` — but never fewer than the single
 /// most-recently-expired candidate, even if it alone exceeds the budget.
 /// Mirrors `request_log::keep_by_size`, adapted from reverse iteration over
 /// chronological lines to forward iteration over an already-descending
-/// slice.
+/// slice. Only ever called with `Bytes`-backed candidates (see
+/// [`prune`]) — a `DriveCopy` never participates in this budget at all.
 fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
     let mut acc = 0u64;
     let mut keep = 0usize;
@@ -135,84 +191,121 @@ fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
 /// Prunes the lease ledger at `opts.ledger_path` by age and/or size,
 /// dropping each removed row together with the backup it points at.
 ///
-/// Runs under [`LedgerLock`] for its whole duration (load through the last
-/// save), so a concurrent `drive lease acquire`/`restore` can't race the
-/// rewrite — the same lock those commands themselves hold while mutating
-/// the ledger. That single continuous lock is also what makes the per-row
-/// save below safe: nothing else can observe or rewrite the ledger between
-/// one row's removal and the next, so there is no window for a concurrent
-/// writer (e.g. `restore`'s `mark_restored`, ADR-0080 §4) to race a save
-/// this function didn't yet make.
+/// The ledger lock is held only briefly, not for this whole call: once to
+/// decide the removal candidates (below), then once per row (via
+/// [`LeaseLedger::mutate_locked`]) to persist that row's own removal —
+/// mirroring the brief load-mutate-save hold every other lease command
+/// uses, rather than one continuous lock for a potentially long batch of
+/// sequential Drive `trash` calls. Nothing else in this codebase ever
+/// removes a ledger row, so re-removing a candidate's token by name from
+/// whatever the ledger looks like at that later moment is always safe,
+/// even if a concurrent `acquire`/`restore` changed unrelated rows in the
+/// gap between the snapshot and this row's own turn.
 pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOutcome> {
-    let _lock = LedgerLock::acquire(&opts.ledger_path)?;
-    let mut ledger = LeaseLedger::load(&opts.ledger_path)?;
     let now = Utc::now();
 
-    let (live_count, non_live): (usize, Vec<LeaseRecord>) = {
-        let mut live_count = 0usize;
-        let mut non_live = Vec::new();
-        for rec in ledger.iter() {
-            if rec.is_live(now) {
-                live_count += 1;
-            } else {
-                non_live.push(rec.clone());
+    let (kept_after_filters, removed) = {
+        let _lock = LedgerLock::acquire(&opts.ledger_path)?;
+        let ledger = LeaseLedger::load(&opts.ledger_path)?;
+
+        let (live_count, non_live): (usize, Vec<LeaseRecord>) = {
+            let mut live_count = 0usize;
+            let mut non_live = Vec::new();
+            for rec in ledger.iter() {
+                if rec.is_live(now) {
+                    live_count += 1;
+                } else {
+                    non_live.push(rec.clone());
+                }
             }
+            (live_count, non_live)
+        };
+
+        // Age filter: a non-live row survives into the size filter unless
+        // it's strictly past the `--older-than` cutoff (no cutoff means
+        // every non-live row proceeds to the size filter, mirroring
+        // `request_log::prune` with `older_than: None`; a row expiring
+        // exactly at the cutoff survives, mirroring
+        // `request_log::keep_by_age`'s `>=`).
+        let (mut age_survivors, mut removed): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
+            non_live.into_iter().partition(|rec| match opts.older_than {
+                Some(cutoff) => rec.expires_at >= cutoff,
+                None => true,
+            });
+
+        // Size filter, applied only to the `Bytes`-backed age survivors —
+        // a `DriveCopy` contributes zero local bytes and must stay
+        // reachable only through `--older-than`, so it is set aside first
+        // and always kept here regardless of position, never dropped as
+        // collateral damage from an oversized `Bytes` backup sorted ahead
+        // of it in the same budget.
+        if let Some(max) = opts.max_size {
+            let (mut bytes_survivors, copy_survivors): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
+                age_survivors
+                    .into_iter()
+                    .partition(|rec| matches!(rec.backup, LeaseBackup::Bytes { .. }));
+            bytes_survivors.sort_by_key(|rec| std::cmp::Reverse(rec.expires_at));
+            let refs: Vec<&LeaseRecord> = bytes_survivors.iter().collect();
+            let keep = keep_count_by_size(&refs, max);
+            removed.extend(bytes_survivors.split_off(keep));
+            age_survivors = bytes_survivors;
+            age_survivors.extend(copy_survivors);
         }
-        (live_count, non_live)
+
+        (live_count + age_survivors.len(), removed)
     };
 
-    // Age filter: a non-live row survives into the size filter unless it's
-    // strictly past the `--older-than` cutoff (no cutoff means every
-    // non-live row proceeds to the size filter, mirroring
-    // `request_log::prune` with `older_than: None`; a row expiring exactly
-    // at the cutoff survives, mirroring `request_log::keep_by_age`'s `>=`).
-    let (mut age_survivors, mut removed): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
-        non_live.into_iter().partition(|rec| match opts.older_than {
-            Some(cutoff) => rec.expires_at >= cutoff,
-            None => true,
-        });
-
-    // Size filter, applied only to the age survivors: keep the
-    // most-recently-expired ones whose backups fit `max_size`, moving the
-    // rest into `removed` too.
-    if let Some(max) = opts.max_size {
-        age_survivors.sort_by_key(|rec| std::cmp::Reverse(rec.expires_at));
-        let refs: Vec<&LeaseRecord> = age_survivors.iter().collect();
-        let keep = keep_count_by_size(&refs, max);
-        removed.extend(age_survivors.split_off(keep));
-    }
-
-    let files_api = FilesApi::new(client);
     let mut outcome = PruneOutcome {
-        kept: live_count + age_survivors.len(),
+        kept: kept_after_filters,
         ..Default::default()
     };
 
-    for rec in &removed {
-        if opts.dry_run {
-            outcome.removed += 1;
-            match &rec.backup {
-                LeaseBackup::Bytes { size, .. } => outcome.bytes_freed += size,
-                LeaseBackup::DriveCopy { .. } => outcome.trashed_drive_copies += 1,
-            }
-            continue;
+    if opts.dry_run {
+        for rec in &removed {
+            account_removal(&mut outcome, &rec.backup);
         }
-        if clear_backup(&files_api, &rec.backup).await.is_ok() {
-            ledger.remove(&rec.token);
-            // Persisted immediately, one row at a time: the backup is
-            // already gone (or was found already gone), so the ledger must
-            // catch up before this function does anything else — a crash
-            // right after this call strands at most this one row, never
-            // the rest of the batch.
-            ledger.save(&opts.ledger_path)?;
-            outcome.removed += 1;
-            match &rec.backup {
-                LeaseBackup::Bytes { size, .. } => outcome.bytes_freed += size,
-                LeaseBackup::DriveCopy { .. } => outcome.trashed_drive_copies += 1,
+        return Ok(outcome);
+    }
+
+    let files_api = FilesApi::new(client);
+    for rec in &removed {
+        match clear_backup(&files_api, &rec.backup).await {
+            Ok(()) => {
+                // The backup is already gone (or was found already gone),
+                // so the ledger must catch up before anything else — a
+                // crash right after this call strands at most this one
+                // row, never the rest of the batch. A failure *here*
+                // (distinct from a crash) can't be made fully atomic with
+                // the backup step above across two different storage
+                // systems, so make it loud and actionable instead of
+                // silently leaving a dangling row: name the stranded token
+                // and stop, rather than compounding the same failure
+                // across every remaining candidate.
+                if let Err(err) = LeaseLedger::mutate_locked(&opts.ledger_path, |ledger| {
+                    ledger.remove(&rec.token);
+                }) {
+                    return Err(err.context(format!(
+                        "drive lease prune: cleared the backup for lease {} but failed to \
+                         persist its ledger removal — that row may now dangle, pointing at a \
+                         backup that no longer exists; remove it from the ledger by hand once \
+                         the underlying issue is fixed",
+                        rec.token
+                    )));
+                }
+                account_removal(&mut outcome, &rec.backup);
+                record_prune_attempt(rec, "pruned", None);
             }
-        } else {
-            outcome.failed += 1;
-            outcome.kept += 1;
+            Err(err) => {
+                tracing::warn!(
+                    "drive lease prune: failed to clear the backup for lease {} (file {}): \
+                     {err:#}; leaving it for a future prune",
+                    rec.token,
+                    rec.file_id
+                );
+                record_prune_attempt(rec, "prune-failed", Some(err.to_string()));
+                outcome.failed += 1;
+                outcome.kept += 1;
+            }
         }
     }
 
@@ -224,6 +317,7 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
 mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::test_support::AuditLogGuard as AuditGuard;
     use crate::utils::secret::Secret;
     use chrono::Duration as ChronoDuration;
 
@@ -298,6 +392,7 @@ mod tests {
     #[tokio::test]
     async fn a_live_lease_is_never_pruned_regardless_of_bounds() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let backup_path = dir.path().join("live-backup");
         std::fs::write(&backup_path, b"x").unwrap();
@@ -334,6 +429,7 @@ mod tests {
     #[tokio::test]
     async fn older_than_alone_drops_only_rows_past_the_cutoff() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let old_backup = dir.path().join("old-backup");
         let recent_backup = dir.path().join("recent-backup");
@@ -382,6 +478,7 @@ mod tests {
     #[tokio::test]
     async fn older_than_boundary_keeps_a_row_expiring_exactly_at_the_cutoff() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let backup_path = dir.path().join("backup");
         std::fs::write(&backup_path, b"x").unwrap();
@@ -426,6 +523,7 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_batch_persists_successful_removals_independently_of_a_failing_one() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let mut ledger = LeaseLedger::default();
@@ -483,6 +581,7 @@ mod tests {
     #[tokio::test]
     async fn max_size_alone_keeps_the_most_recently_expired_that_fit() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let b1 = dir.path().join("b1");
         let b2 = dir.path().join("b2");
@@ -542,6 +641,7 @@ mod tests {
     #[tokio::test]
     async fn max_size_alone_never_prunes_a_drive_copy_since_it_is_zero_bytes() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let mut ledger = LeaseLedger::default();
@@ -579,8 +679,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_size_never_trashes_a_drive_copy_sorted_behind_an_oversized_bytes_backup() {
+        // Regression test: `--max-size` must never touch a `DriveCopy` just
+        // because it happens to sort behind (i.e. expire earlier than) an
+        // oversized `Bytes` backup that alone exceeds the budget on its
+        // own — a `DriveCopy` is 0 local bytes and is only ever reachable
+        // through `--older-than`. Before the fix, the size filter's single
+        // combined "keep from newest until budget exceeded" pass treated
+        // position, not backup kind, as what determined removal, so a
+        // `DriveCopy` sorted after an oversized `Bytes` record was dropped
+        // (and trashed on Drive) purely as that record's collateral
+        // damage.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let big_backup = dir.path().join("big-backup");
+        std::fs::write(&big_backup, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        // "big" is the more-recently-expired of the two, so it sorts
+        // ahead of "copy" in the size filter's newest-first order.
+        ledger.insert(bytes_record(
+            "big",
+            Utc::now() - ChronoDuration::hours(1),
+            1_000_000,
+            big_backup.clone(),
+        ));
+        ledger.insert(drive_copy_record(
+            "copy",
+            Utc::now() - ChronoDuration::hours(2),
+            "drive-copy-1",
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        // Deliberately no PATCH mock mounted — reaching `FilesApi::trash`
+        // for "copy" fails the test.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1), // far below "big"'s own size
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // "big" alone exceeds the budget, so the always-keep-the-newest
+        // rule (mirroring `log prune`) keeps it regardless — the point
+        // under test is that "copy" is untouched either way.
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.trashed_drive_copies, 0);
+        let reloaded = LeaseLedger::load(&ledger_path).unwrap();
+        assert!(
+            reloaded.get("copy").is_some(),
+            "a DriveCopy must never be pruned by --max-size alone"
+        );
+        assert!(reloaded.get("big").is_some());
+    }
+
+    #[tokio::test]
     async fn a_drive_copy_backup_is_trashed_and_dropped_together_with_its_row() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let mut ledger = LeaseLedger::default();
@@ -629,6 +793,7 @@ mod tests {
     #[tokio::test]
     async fn a_drive_copy_already_trashed_is_tolerated_as_success() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let mut ledger = LeaseLedger::default();
@@ -669,6 +834,7 @@ mod tests {
     #[tokio::test]
     async fn a_backup_deletion_failure_leaves_the_row_in_place() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
 
         let mut ledger = LeaseLedger::default();
@@ -710,6 +876,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_reports_without_deleting_or_saving() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let backup_path = dir.path().join("backup");
         std::fs::write(&backup_path, b"x").unwrap();
@@ -748,6 +915,7 @@ mod tests {
     #[tokio::test]
     async fn no_op_prune_does_not_rewrite_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let mut ledger = LeaseLedger::default();
         ledger.insert(bytes_record(
@@ -778,8 +946,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_successful_removal_writes_a_pruned_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let backup_path = dir.path().join("backup");
+        std::fs::write(&backup_path, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path,
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            audit.verdicts(),
+            vec!["pruned".to_string()],
+            "a pruned lease's removal must be independently discoverable via `omni-dev log \
+             --audit`, not just the transient CLI summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_removal_writes_a_prune_failed_audit_record_carrying_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(drive_copy_record(
+            "copy",
+            Utc::now() - ChronoDuration::hours(2),
+            "drive-copy-1",
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/drive-copy-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(audit.verdicts(), vec!["prune-failed".to_string()]);
+        let records = audit.records();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].error.is_some(),
+            "the underlying clear_backup error must be captured, not just an opaque count"
+        );
+    }
+
+    #[tokio::test]
     async fn prune_refuses_while_another_lock_is_held() {
         let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let _held = LedgerLock::acquire(&ledger_path).unwrap();
 

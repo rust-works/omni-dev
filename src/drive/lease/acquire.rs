@@ -298,9 +298,11 @@ async fn acquire_inner(
         Ok(InsertOutcome::Inserted) => {}
         // Refuse rather than mint a second, independent lease on a file
         // that already has a live one — see `AcquireResult::AlreadyLeased`'s
-        // doc comment. The backup just taken above is orphaned; a `lease
-        // prune` reclaiming stray backups is the same deliberate fast-follow
-        // the ledger module doc names for expired/released rows.
+        // doc comment. The backup just taken above is orphaned: it was
+        // never inserted into the ledger, so `drive lease prune` (#1678,
+        // which only ever iterates existing ledger rows) cannot discover
+        // or reclaim it — a known gap this race leaves open, distinct from
+        // the expired/released-row growth `lease prune` does bound.
         Ok(InsertOutcome::AlreadyLeased(existing)) => {
             return AcquireResult::AlreadyLeased {
                 token: existing.token,
