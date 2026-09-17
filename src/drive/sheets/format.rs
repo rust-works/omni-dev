@@ -607,6 +607,17 @@ async fn format_inner(
         });
     }
 
+    // Built before the gate, not after: `build_request` (in particular its
+    // `parse_hex_color` call) is the one fallible step between here and the
+    // mutating call, and the gate must be the *last* fallible step before
+    // it (see `gate_leased_write`'s doc comment) — otherwise a request that
+    // was always going to fail to build would still fsync a `pending`
+    // audit record for a write that never happens (#1688).
+    let request = match build_request(&opts.verb, &resolved) {
+        Ok(request) => request,
+        Err(detail) => return gated(FormatResult::RefusedInvalidRange { detail }),
+    };
+
     // The lease check (ADR-0080 §9) sits here: after the permission gate
     // and the `--dry-run` branch, before the mutating call — see
     // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
@@ -632,11 +643,6 @@ async fn format_inner(
         }
     } else {
         None
-    };
-
-    let request = match build_request(&opts.verb, &resolved) {
-        Ok(request) => request,
-        Err(detail) => return gated(FormatResult::RefusedInvalidRange { detail }),
     };
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
@@ -2316,6 +2322,8 @@ mod tests {
         // No batchUpdate mock mounted: `describe_effect` doesn't validate
         // the color (only `sides.any()`), so this proves the request-build
         // step's own `parse_hex_color` call is the one that catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let rules = vec![allow_rule("folder-1")];
         let sides = BorderSides {
             top: true,
@@ -2323,6 +2331,8 @@ mod tests {
         };
         let verb = update_borders_verb(sides, "SOLID", Some("ZZZZZZ"));
 
+        // `opts()` seeds a live, matching lease, so this exercises the real
+        // gate — not just a verb that never reaches it.
         let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
         match outcome.result {
             FormatResult::RefusedInvalidRange { detail } => {
@@ -2330,6 +2340,11 @@ mod tests {
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }
+
+        // #1688: `build_request` now runs before the gate, so a request
+        // that can never be issued must never open a `pending` audit
+        // record in the first place — there is nothing to conclude it.
+        assert!(audit.records().is_empty(), "{:?}", audit.records());
     }
 
     // ── format_inner: full non-dry-run round trips per verb ───────────────
