@@ -122,8 +122,18 @@ impl LeaseFlags {
         // and `Settings::load_lease()` each independently re-read it;
         // `SettingsEnv::from_settings` was added for exactly this (issue
         // #1533), so both views come from the same parse (issue #1677 review
-        // finding).
-        let loaded = Settings::load().unwrap_or_default();
+        // finding). A parse failure warns rather than silently falling back
+        // (issue #1695) — `biometrics_only`'s default is the less-secure
+        // direction, so a broken settings.json must not silently downgrade
+        // it.
+        let loaded = Settings::load().unwrap_or_else(|e| {
+            tracing::warn!(
+                "{e:#}; falling back to default settings for this invocation — any \
+                 `lease.*` config in settings.json (backup_dir, default_expiry_minutes, \
+                 biometrics_only, allow_headless) is being ignored"
+            );
+            Settings::default()
+        });
         let lease = loaded.lease.clone();
         let profile = crate::utils::settings::active_profile_from(&crate::utils::env::SystemEnv);
         let env = SettingsEnv::from_settings(loaded, profile.as_deref());
@@ -866,6 +876,68 @@ mod tests {
             "{}",
             dir.display()
         );
+    }
+
+    /// Thread-scoped log buffer, mirroring the `CaptureWriter`/`capture_info`
+    /// pattern in `src/gmail/chrome_profile.rs`.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` under a thread-local WARN-level subscriber and returns
+    /// everything it logged. `f` must be fully synchronous on this thread.
+    fn capture_warn(f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+        logs
+    }
+
+    #[test]
+    fn resolve_warns_and_falls_back_when_settings_json_fails_to_parse() {
+        // A missing settings.json resolves to defaults with no warning
+        // (the ordinary case, covered implicitly by every other test in
+        // this module) — this covers the "file exists but doesn't parse"
+        // case (issue #1695), which must warn rather than silently drop
+        // `lease.biometrics_only`/`backup_dir`/`default_expiry_minutes`.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_dir = dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
+
+        let flags = LeaseFlags {
+            backup_dir: None,
+            expiry_minutes: None,
+            biometrics_only: false,
+            allow_headless: false,
+        };
+        let logs = capture_warn(|| {
+            let resolved = flags.resolve().unwrap();
+            assert_eq!(resolved.auth_policy, AuthPolicy::DeviceOwner);
+        });
+        assert!(logs.contains("settings.json"), "{logs}");
     }
 
     #[test]
