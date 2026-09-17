@@ -916,7 +916,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::{AuthOutcome, Unsupported};
-    use crate::drive::lease::ledger::LeaseRecord;
+    use crate::drive::lease::ledger::{LeaseRecord, LedgerLock};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::drive::types::{
         GOOGLE_DOC_MIME_TYPE, GOOGLE_FOLDER_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE,
@@ -2057,12 +2057,15 @@ mod tests {
         // `gate_leased_write` check) shares the *same* lock path, so
         // pre-holding it for the whole flow would block those legitimate
         // acquisitions too, not just this one.
+        //
+        // A held `LedgerLock`, not a bare `File::create` on the lock path
+        // (issue #1687): under `flock`, the file's mere existence holds
+        // nothing — only an actual lock does, and `flock` conflicts against
+        // a second `open()` even from this same process.
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         seed_backup_lease(&ledger_path, "file-1", write_backup_file(dir.path(), b"x"));
-        let mut lock_path = ledger_path.clone().into_os_string();
-        lock_path.push(".lock");
-        std::fs::File::create(std::path::PathBuf::from(lock_path)).unwrap();
+        let _held = LedgerLock::acquire(&ledger_path).unwrap();
 
         // Must not panic despite the lock already being held.
         mark_backup_restored(&ledger_path, "backup-token");

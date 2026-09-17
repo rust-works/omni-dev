@@ -1242,13 +1242,38 @@ already gone). Persistence happens one row at a time, not batched across
 the whole run, so an interrupted prune (a crash, a killed process) can
 leave at most the one row it was working on inconsistent with its
 already-cleared backup — never the rest of the run. The ledger lock
-itself is likewise held only briefly per step (once to decide candidates,
-then once per row to persist that row's own removal), not for the whole
-run, so a large batch never blocks a concurrent `drive lease
-acquire`/`restore`/write for longer than a single row's own local disk
-I/O. A backup deletion/trash failure for one row (e.g. a transient Drive
-error) is logged and skips just that row, leaving it for a future prune
-run, rather than failing the whole command.
+itself is likewise taken only per row, not for the whole run — but each
+row now holds it across *both* that row's backup deletion/trash call and
+its ledger removal, secured *before* the backup is touched (issue #1687):
+a lock collision on one row is therefore fully recoverable (neither the
+backup nor the row has been touched yet) and simply leaves that row for a
+future prune, rather than the old failure mode of deleting a backup and
+then being unable to record its row as gone. The trade-off is that a large
+batch can now hold the lock for a row's full Drive API round trip, not
+just its local disk I/O — a concurrent leased write queues behind it
+rather than failing outright (see [Concurrent access](#concurrent-access)
+below), but a very large prune run can make one wait noticeably longer. A
+backup deletion/trash failure for one row (e.g. a transient Drive error),
+or a failure to lock the ledger for one row, is logged and skips just that
+row, leaving it for a future prune run, rather than failing the whole
+command.
+
+### Concurrent access
+
+Two overlapping `drive lease acquire`/write/prune/restore invocations
+against the same ledger are serialized by an advisory lock — a
+`flock(2)` on a persistent `<ledger-path>.lock` sibling file, kernel-
+released on process death, so a crashed or killed holder never leaves a
+stale lock. **Never delete this lock file by hand** — it is not a marker
+of anything being wrong, and nothing in this codebase ever advises
+deleting it. A leased write waits for a busy lock rather than failing
+outright (printing a one-line notice while it does), up to
+`OMNI_DEV_LEASE_LOCK_WAIT_SECS` (default: four times the HTTP read
+timeout, since a held lock can span several sequential Drive calls, e.g.
+`drive lease restore`'s copy-then-edit-then-rename sequence). The lock
+is **ledger-global**, not per-file: a write to one file and a concurrent
+write to a *different* file still serialize against each other, they
+just wait instead of hard-failing.
 
 ```bash
 $ omni-dev drive lease prune --older-than 30d

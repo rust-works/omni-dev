@@ -190,8 +190,20 @@ pub fn create_new_file_0600(path: &Path) -> Result<std::fs::File> {
     let file = options
         .open(path)
         .with_context(|| format!("failed to exclusively create file {}", path.display()))?;
-    ensure_handle_0600(&file)
-        .with_context(|| format!("failed to set 0600 on {}", path.display()))?;
+    if let Err(err) = ensure_handle_0600(&file) {
+        // We just created this file exclusively; leaving it behind on this
+        // failure would be a phantom lock/marker indistinguishable from a
+        // genuine collision to the next caller (issue #1687 point 6).
+        // Best-effort: a failure to remove it doesn't change which error is
+        // reported.
+        if let Err(remove_err) = std::fs::remove_file(path) {
+            tracing::debug!(
+                "failed to remove {} after its fchmod failed: {remove_err}",
+                path.display()
+            );
+        }
+        return Err(err).with_context(|| format!("failed to set 0600 on {}", path.display()));
+    }
     Ok(file)
 }
 
@@ -211,6 +223,135 @@ pub fn is_already_exists_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::AlreadyExists)
     })
+}
+
+/// Why [`try_lock_file_exclusive`] failed.
+#[derive(Debug)]
+pub enum FileLockError {
+    /// The lock is already held by someone else — distinguishable from
+    /// [`Self::Io`] without string-sniffing a message, so a waiting caller
+    /// can poll on this variant specifically and treat any other error as
+    /// unconditionally fatal.
+    Busy,
+    /// Opening, locking, or verifying the lock file failed for a reason
+    /// other than contention.
+    Io(anyhow::Error),
+}
+
+/// An advisory exclusive lock on `path`, held for [`FileLock`]'s lifetime.
+///
+/// On Unix this is a `flock(2)` lock: kernel-released when every handle to
+/// it closes — including on process death — so unlike
+/// [`create_new_file_0600`]'s `O_EXCL` marker, a crashed or SIGKILLed
+/// holder never leaves a stale lock. The lock file itself is never deleted
+/// (`Drop` unlocks, it does not unlink): **no caller should ever tell an
+/// operator to delete this file by hand**, since that reopens the exact
+/// double-spend a naive marker-plus-unlink lock risks (issue #1687).
+///
+/// On non-Unix (`nix`'s `flock` wrapper is Unix-only) this falls back to
+/// an `O_EXCL` marker removed on drop, preserving today's semantics there.
+#[derive(Debug)]
+pub struct FileLock {
+    #[cfg(unix)]
+    #[allow(dead_code)] // Held only for its Drop (unlocks on drop); never read.
+    inner: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+/// Bound on the replacement-check retries in [`try_lock_file_exclusive`] —
+/// see its doc comment.
+#[cfg(unix)]
+const LOCK_REPLACEMENT_RETRIES: u32 = 3;
+
+/// Acquires an advisory exclusive lock on `path` (non-blocking).
+///
+/// Creates the file at `0600` if absent, but not `path`'s parent directory
+/// — callers with an opinion on that call [`ensure_parent_dir_0700`] first.
+///
+/// `flock` locks the *open file description*, not the path: if the file at
+/// `path` is deleted and recreated while a lock is held (nothing in this
+/// crate does that, but a stray `rm` could), a second locker could lock the
+/// new inode while the first still holds the old one — both would then
+/// "hold the lock" without conflicting. After locking, this function
+/// re-`stat`s `path` and compares device/inode against the locked handle;
+/// on a mismatch it drops that lock and retries against the current path,
+/// bounded to [`LOCK_REPLACEMENT_RETRIES`] attempts. This narrows the race,
+/// it does not close it — the actual mitigation is that nothing in this
+/// crate ever instructs an operator to delete the file.
+#[cfg(unix)]
+pub fn try_lock_file_exclusive(path: &Path) -> std::result::Result<FileLock, FileLockError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    for _ in 0..LOCK_REPLACEMENT_RETRIES {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(false).mode(0o600);
+        let file = options
+            .open(path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))
+            .map_err(FileLockError::Io)?;
+        ensure_handle_0600(&file)
+            .with_context(|| format!("failed to set 0600 on {}", path.display()))
+            .map_err(FileLockError::Io)?;
+
+        let locked =
+            match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                Ok(locked) => locked,
+                Err((_file, nix::errno::Errno::EWOULDBLOCK)) => return Err(FileLockError::Busy),
+                Err((_file, errno)) => {
+                    return Err(FileLockError::Io(anyhow::anyhow!(
+                        "failed to lock {}: {errno}",
+                        path.display()
+                    )))
+                }
+            };
+
+        let locked_meta = locked
+            .metadata()
+            .with_context(|| format!("failed to stat locked handle for {}", path.display()))
+            .map_err(FileLockError::Io)?;
+        match std::fs::metadata(path) {
+            Ok(current_meta)
+                if current_meta.dev() == locked_meta.dev()
+                    && current_meta.ino() == locked_meta.ino() =>
+            {
+                return Ok(FileLock { inner: locked });
+            }
+            // The path now names a different inode (or nothing) than the
+            // one we locked — someone deleted/recreated it out from under
+            // us. Drop this lock and retry against the current path.
+            _ => {}
+        }
+    }
+    Err(FileLockError::Io(anyhow::anyhow!(
+        "gave up acquiring the lock on {} after {LOCK_REPLACEMENT_RETRIES} attempts — the file \
+         kept being replaced out from under us",
+        path.display()
+    )))
+}
+
+#[cfg(not(unix))]
+pub fn try_lock_file_exclusive(path: &Path) -> std::result::Result<FileLock, FileLockError> {
+    match create_new_file_0600(path) {
+        Ok(_) => Ok(FileLock {
+            path: path.to_path_buf(),
+        }),
+        Err(err) if is_already_exists_error(&err) => Err(FileLockError::Busy),
+        Err(err) => Err(FileLockError::Io(err)),
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Best-effort: this is a marker, not the lock itself — the next
+        // caller's `create_new` collision check is what actually enforces
+        // exclusion, so a failed unlink here just means a future acquire
+        // will (incorrectly) see this as still held (STYLE-0018).
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            tracing::debug!("failed to remove lock file {}: {err}", self.path.display());
+        }
+    }
 }
 
 /// Tightens an existing file to owner read/write only (`0600`) on Unix.

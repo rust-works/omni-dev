@@ -175,52 +175,44 @@ pub(crate) fn dedupe_key(rfc822_msgid: Option<&str>, source_id: &str) -> String 
     }
 }
 
-/// An advisory, run-scoped lock (`create_new`, so two processes racing to
-/// create it see exactly one winner) guarding against two concurrent
-/// `gmail insert` runs sharing an archive dir: [`InsertLedger::save`]
-/// rewrites the whole file, so a second run's rewrite would silently
-/// discard the first run's in-flight progress. Held for the run's duration
-/// and removed on drop — best-effort, `--dry-run` never acquires it (it
-/// never touches the ledger file at all).
+/// An advisory, run-scoped, non-waiting lock guarding against two
+/// concurrent `gmail insert` runs sharing an archive dir:
+/// [`InsertLedger::save`] rewrites the whole file, so a second run's
+/// rewrite would silently discard the first run's in-flight progress.
+/// Held for the run's duration — best-effort, `--dry-run` never acquires
+/// it (it never touches the ledger file at all).
+///
+/// Deliberately fail-fast rather than waiting, unlike the Drive lease
+/// ledger's own lock: this one is held for a whole multi-message run
+/// (potentially hours), so a second run queuing behind it would be worse
+/// than telling the operator now. Backed by
+/// [`crate::daemon::paths::FileLock`] (`flock(2)` on Unix): kernel-released
+/// on process death, so a crashed run never leaves a stale lock, and
+/// `Drop` never unlinks the lock file — it persists in the archive dir,
+/// which is what makes it safe for `Drop` to stop being the thing that
+/// releases the lock (issue #1687, applied here alongside the Drive lease
+/// ledger's identical fix).
 #[derive(Debug)]
 pub(crate) struct LedgerLock {
-    path: PathBuf,
+    #[allow(dead_code)] // Held only for its Drop (releases the flock); never read.
+    inner: crate::daemon::paths::FileLock,
 }
 
 impl LedgerLock {
     pub(crate) fn acquire(archive_dir: &Path) -> Result<Self> {
         let path = ledger_lock_path(archive_dir);
-        crate::daemon::paths::create_new_file_0600(&path).map_err(|err| {
-            // Distinguish a genuine collision (another run's lock file
-            // already exists) from the file being created fine but the
-            // follow-up `fchmod` safety net failing — the latter is an
-            // unrelated permissions/filesystem problem that "remove the
-            // stale lock and re-run" would misdiagnose (issue #1664 review
-            // finding, applied here too since this lock now shares
-            // `create_new_file_0600` with the Drive lease ledger's).
-            if crate::daemon::paths::is_already_exists_error(&err) {
-                err.context(format!(
-                    "another `gmail insert` run appears to already be in progress against this \
-                     archive dir ({} exists) — concurrent runs would clobber each other's \
-                     ledger. If you're sure no other run is active (e.g. after a crash), remove \
-                     the lock file and re-run",
-                    path.display()
-                ))
-            } else {
-                err.context(format!(
-                    "failed to create the insert-ledger lock file at {} — the file did not \
-                     already exist, so this is not a stale lock; check filesystem permissions",
-                    path.display()
-                ))
-            }
-        })?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for LedgerLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        match crate::daemon::paths::try_lock_file_exclusive(&path) {
+            Ok(inner) => Ok(Self { inner }),
+            Err(crate::daemon::paths::FileLockError::Busy) => anyhow::bail!(
+                "another `gmail insert` run appears to already be in progress against this \
+                 archive dir ({} is locked) — concurrent runs would clobber each other's ledger",
+                path.display()
+            ),
+            Err(crate::daemon::paths::FileLockError::Io(err)) => Err(err.context(format!(
+                "failed to lock the insert-ledger lock file at {}",
+                path.display()
+            ))),
+        }
     }
 }
 
@@ -372,14 +364,23 @@ mod tests {
     // ── LedgerLock ────────────────────────────────────────────────────
 
     #[test]
-    fn ledger_lock_acquire_then_drop_removes_the_lock_file() {
+    fn ledger_lock_file_persists_after_drop_and_is_re_lockable() {
+        // Unlike the old `create_new` marker, `Drop` must not unlink the
+        // lock file — see the Drive lease ledger's identical test/rationale
+        // (issue #1687 point 2). The flock itself is what releases the
+        // lock, not the file's absence.
         let dir = tempfile::tempdir().unwrap();
         let lock_path = ledger_lock_path(dir.path());
-        {
-            let _lock = LedgerLock::acquire(dir.path()).unwrap();
-            assert!(lock_path.exists());
-        }
-        assert!(!lock_path.exists());
+
+        let lock = LedgerLock::acquire(dir.path()).unwrap();
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "the lock file must survive its own drop"
+        );
+
+        LedgerLock::acquire(dir.path()).unwrap();
     }
 
     #[test]
@@ -395,6 +396,10 @@ mod tests {
     fn ledger_lock_acquire_reports_a_non_collision_failure_distinctly() {
         use std::os::unix::fs::PermissionsExt;
 
+        // As in the Drive lease ledger: a permission failure only arises
+        // from the lock file's *first* creation, exercised here against a
+        // lock path that does not yet exist in a directory with no write
+        // permission.
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
 
@@ -402,6 +407,10 @@ mod tests {
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(err.to_string().contains("not a stale lock"), "{err:?}");
+        assert!(err.to_string().contains("failed to lock"), "{err:?}");
+        assert!(
+            !err.to_string().contains("already be in progress"),
+            "{err:?}"
+        );
     }
 }

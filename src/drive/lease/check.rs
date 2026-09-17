@@ -170,7 +170,7 @@ pub(crate) struct LeasedWrite<'a> {
 /// impossible. The record is `fsync`ed before this returns
 /// (`request_log::record_audit`), so a process that dies mid-write still
 /// leaves it behind.
-pub(crate) fn check_and_lock_lease(
+pub(crate) async fn check_and_lock_lease(
     write: LeasedWrite<'_>,
     lease_token: Option<&str>,
     live_version: Option<&str>,
@@ -198,7 +198,16 @@ pub(crate) fn check_and_lock_lease(
         refuse(None, verdict::REFUSED_NO_LEASE, None);
         return LeaseCheckOutcome::NoLease;
     };
-    let lock = match LedgerLock::acquire(ledger_path) {
+    // Waits rather than refusing outright: a concurrent leased write to an
+    // *unrelated* file must not hard-fail just because the ledger lock is
+    // ledger-global (issue #1687 point 1 — this narrows "hard-fail" to
+    // "wait", it does not add per-file scope, so two writes to the *same*
+    // file still serialize as before). Lock ordering: this lock is always
+    // taken before the write-ahead audit record below, which takes its own
+    // lock on `<log>.lock` (`request_log::record_audit_event`) — never the
+    // reverse, or the two could deadlock against a caller doing the
+    // opposite.
+    let lock = match LedgerLock::acquire_waiting(ledger_path).await {
         Ok(lock) => lock,
         Err(err) => {
             refuse(Some(token), verdict::FAILED, Some(err.to_string()));
@@ -311,7 +320,9 @@ pub(crate) async fn gate_leased_write(
         lease_token,
         live_version.as_deref(),
         live_modified_time.as_deref(),
-    ) {
+    )
+    .await
+    {
         LeaseCheckOutcome::Ok(grant) => Ok(grant),
         LeaseCheckOutcome::NoLease => Err(LeaseGateRefusal::NoLease),
         LeaseCheckOutcome::Expired => Err(LeaseGateRefusal::Expired),
@@ -520,8 +531,8 @@ mod tests {
         client
     }
 
-    #[test]
-    fn refuses_as_expired_and_logs_the_path_when_the_ledger_is_unreadable() {
+    #[tokio::test]
+    async fn refuses_as_expired_and_logs_the_path_when_the_ledger_is_unreadable() {
         // A directory in place of the ledger file makes `LeaseLedger::load`
         // fail with something other than a missing-file error — refused as
         // expired, and the `warn!` names the unreadable path (the field
@@ -536,7 +547,8 @@ mod tests {
             Some("any-token"),
             Some("1"),
             None,
-        );
+        )
+        .await;
         assert!(matches!(outcome, LeaseCheckOutcome::Expired));
 
         // Refused as expired like an unknown token, but the audit record
@@ -635,8 +647,8 @@ mod tests {
 
     // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
 
-    #[test]
-    fn a_successful_check_writes_a_pending_intent_record() {
+    #[tokio::test]
+    async fn a_successful_check_writes_a_pending_intent_record() {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
@@ -647,7 +659,8 @@ mod tests {
             Some("tok-1"),
             Some("1"),
             Some("2026-09-12T00:00:00Z"),
-        );
+        )
+        .await;
         assert!(matches!(outcome, LeaseCheckOutcome::Ok(_)));
 
         let records = audit.records();
@@ -679,8 +692,8 @@ mod tests {
         assert_eq!(record.error, None);
     }
 
-    #[test]
-    fn the_write_is_refused_when_the_intent_record_cannot_be_written() {
+    #[tokio::test]
+    async fn the_write_is_refused_when_the_intent_record_cannot_be_written() {
         // Fail-closed (ADR-0080 §11): unlike every refusal above, a failure
         // to write the write-ahead record must refuse the write outright —
         // this is the one point in the lease check the ADR requires it.
@@ -697,7 +710,8 @@ mod tests {
             Some("tok-1"),
             Some("1"),
             None,
-        );
+        )
+        .await;
         let LeaseCheckOutcome::Failed(detail) = outcome else {
             panic!("expected Failed, got a lock/refusal instead");
         };
@@ -711,8 +725,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn each_refusal_writes_its_own_verdict_to_the_audit_log() {
+    #[tokio::test]
+    async fn each_refusal_writes_its_own_verdict_to_the_audit_log() {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
@@ -725,7 +739,8 @@ mod tests {
                 None,
                 Some("1"),
                 None
-            ),
+            )
+            .await,
             LeaseCheckOutcome::NoLease
         ));
         // Unknown token.
@@ -735,7 +750,8 @@ mod tests {
                 Some("bogus"),
                 Some("1"),
                 None
-            ),
+            )
+            .await,
             LeaseCheckOutcome::Expired
         ));
         // Bound to a different file.
@@ -745,7 +761,8 @@ mod tests {
                 Some("tok-1"),
                 Some("1"),
                 None
-            ),
+            )
+            .await,
             LeaseCheckOutcome::WrongFile
         ));
         // Stale version.
@@ -755,7 +772,8 @@ mod tests {
                 Some("tok-1"),
                 Some("2"),
                 None
-            ),
+            )
+            .await,
             LeaseCheckOutcome::Stale
         ));
 
@@ -876,8 +894,8 @@ mod tests {
         assert_eq!(records[0].error.as_deref(), Some("HTTP 500 from Sheets"));
     }
 
-    #[test]
-    fn a_best_effort_audit_failure_is_warned_and_swallowed() {
+    #[tokio::test]
+    async fn a_best_effort_audit_failure_is_warned_and_swallowed() {
         // Only the intent record is fail-closed; every other record in the
         // module must never turn a refusal or a succeeded write into a
         // panic or a different outcome when the sink is unwritable.
@@ -893,7 +911,8 @@ mod tests {
                 None,
                 Some("1"),
                 None
-            ),
+            )
+            .await,
             LeaseCheckOutcome::NoLease
         ));
         record_failed_leased_write(leased("edit", &ledger_path, "file-1"), "tok-1", "boom");
@@ -912,21 +931,38 @@ mod tests {
         assert_eq!(reloaded.get("tok-1").unwrap().version, "2");
     }
 
-    #[test]
-    fn a_ledger_lock_failure_writes_a_failed_record_carrying_the_error() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ledger_lock_failure_writes_a_failed_record_carrying_the_error() {
+        // A held lock now makes the check *wait*, not fail (issue #1687
+        // point 1 — see `check_and_lock_lease_waits_for_a_concurrent_holder`
+        // below), so this exercises the `Failed` branch via a permission
+        // failure instead: a 0o500 ledger dir makes the *first* lock
+        // creation fail outright, with no waiting loop entered at all. The
+        // ledger lives in its own subdirectory, restricted independently of
+        // `dir.path()` itself, so the *audit log* (a sibling of the ledger
+        // dir, not inside it) stays writable — otherwise this would also
+        // block the very `failed` record the test asserts on.
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
-        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let ledger_dir = dir.path().join("locked");
+        std::fs::create_dir(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join("lease-ledger.jsonl");
         seed_lease(&ledger_path, "tok-1", "file-1", "1");
-        // Another `drive lease` operation is mid-flight.
-        let _held = LedgerLock::acquire(&ledger_path).unwrap();
+        std::fs::set_permissions(&ledger_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let outcome = check_and_lock_lease(
             leased("edit", &ledger_path, "file-1"),
             Some("tok-1"),
             Some("1"),
             None,
-        );
+        )
+        .await;
+
+        std::fs::set_permissions(&ledger_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
         assert!(matches!(outcome, LeaseCheckOutcome::Failed(_)));
 
         // An operational failure, not a verdict about the token: `failed`,
@@ -935,6 +971,38 @@ mod tests {
         let records = audit.records();
         assert_eq!(audit.verdicts(), [verdict::FAILED], "{records:?}");
         let error = records[0].error.as_deref().unwrap_or_default();
-        assert!(error.contains("already be in progress"), "{error}");
+        assert!(error.contains("failed to lock"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn check_and_lock_lease_waits_for_a_concurrent_holder_then_succeeds() {
+        // The direct regression test for issue #1687 point 1: a write to
+        // this ledger that is already locked by another (unrelated) write
+        // must queue behind it, not hard-fail.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+        let held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+
+        let outcome = check_and_lock_lease(
+            leased("edit", &ledger_path, "file-1"),
+            Some("tok-1"),
+            Some("1"),
+            None,
+        )
+        .await;
+        releaser.join().unwrap();
+
+        assert!(
+            matches!(outcome, LeaseCheckOutcome::Ok(_)),
+            "waited holder should have released the lock"
+        );
+        assert_eq!(audit.verdicts(), [verdict::PENDING]);
     }
 }
