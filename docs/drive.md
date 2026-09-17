@@ -731,12 +731,15 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
-- `require_lease` — whether a write this rule decides also needs a valid
+- `require_lease` — whether a write this rule decides also *needs* a valid
   Drive write lease (`--lease`, [ADR-0080](adrs/adr-0080.md); see
   [Lease](#lease)). Defaults to `true`; set `false` to relax it for a
   specific folder or file — this skips **both** the backup and the Touch ID
-  prompt, not just one of them. Orthogonal to `allow`/`deny`: the lease is
-  checked in addition to this gate's verdict, never instead of it.
+  prompt, not just one of them. It does not change what a lease token
+  *means*: a `--lease` presented anyway is still validated, consumed and
+  audited exactly as it would be under a requiring rule, and refused if
+  it's expired, wrong-file, or stale. Orthogonal to `allow`/`deny`: the
+  lease is checked in addition to this gate's verdict, never instead of it.
 
 A rule that names neither key, names both, or puts `recursive: true` on a
 `file_id` is a **settings load error**, not a silently-ignored rule — and
@@ -1057,6 +1060,10 @@ A refusal names what to do next:
 | `acquired for a different file` | The token is bound to a different file id than the one being edited. |
 | `changed since the lease was acquired` | The file's Drive `version` moved since the lease was taken out (or last written under) — someone or something else edited it. Acquire a fresh lease against the current version before writing. |
 
+The last three rows are reachable even under a `require_lease: false` rule
+if a `--lease` is presented anyway — that rule opts out of *needing* one, not
+of validating one that shows up (see `require_lease` above).
+
 **Expiry is absolute and never extends.** `--expiry-minutes` (default 30)
 is fixed at acquisition; a write under the lease never resets it. The only
 way to get a fresh window is a fresh `drive lease acquire` — which means a
@@ -1082,7 +1089,11 @@ Mac.
 **A folder rule can opt out** with `require_lease: false` in
 `write_permissions.rules` (default `true`), which skips both the backup
 and the authentication prompt for that folder — see [Write
-permissions](#write-permissions).
+permissions](#write-permissions). This opts the folder out of *needing* a
+lease, not out of the lease mechanism entirely: a `--lease` presented on a
+write to that folder anyway is still validated, consumed, and audited —
+including refusing an expired, wrong-file, or stale token — exactly as it
+would be under a requiring rule.
 
 **Global settings** (ADR-0080 §13) let this machine's operator set defaults
 for `--expiry-minutes`, `--backup-dir`, and `--biometrics-only` without

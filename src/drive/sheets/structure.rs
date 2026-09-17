@@ -58,8 +58,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
-    LeasedWrite,
+    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
+    LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
@@ -705,21 +705,20 @@ async fn structure_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
     };
-    let lease_grant = if requires_lease {
-        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(grant) => Some(grant),
-            Err(LeaseGateRefusal::NoLease) => return gated(StructureResult::RefusedNoLease),
-            Err(LeaseGateRefusal::Expired) => return gated(StructureResult::RefusedLeaseExpired),
-            Err(LeaseGateRefusal::WrongFile) => {
-                return gated(StructureResult::RefusedLeaseWrongFile)
-            }
-            Err(LeaseGateRefusal::Stale) => return gated(StructureResult::RefusedLeaseStale),
-            Err(LeaseGateRefusal::Failed(detail)) => {
-                return gated(StructureResult::Failed { detail })
-            }
-        }
-    } else {
-        None
+    let lease_grant = match gate_optional_leased_write(
+        leased,
+        &files_api,
+        requires_lease,
+        opts.lease_token.as_deref(),
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(LeaseGateRefusal::NoLease) => return gated(StructureResult::RefusedNoLease),
+        Err(LeaseGateRefusal::Expired) => return gated(StructureResult::RefusedLeaseExpired),
+        Err(LeaseGateRefusal::WrongFile) => return gated(StructureResult::RefusedLeaseWrongFile),
+        Err(LeaseGateRefusal::Stale) => return gated(StructureResult::RefusedLeaseStale),
+        Err(LeaseGateRefusal::Failed(detail)) => return gated(StructureResult::Failed { detail }),
     };
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
@@ -4598,6 +4597,35 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_still_refuses_a_stale_one_if_presented() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a token volunteered anyway is checked exactly
+        // like a required one, including staleness.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // Live version "1" (`mount_file`'s default) but the lease was
+        // acquired at "0" — the file has moved since.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(rename(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert_eq!(outcome.result, StructureResult::RefusedLeaseStale);
+    }
+
     /// A native document's lease backs it up as a Drive copy (ADR-0080
     /// §3); a real-run delete under it names that copy's file id — the one
     /// thing a user can search the Drive UI for — and says the copy dates
@@ -4664,6 +4692,64 @@ mod tests {
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["result"]["backup"]["kind"], "drive_copy");
         assert_eq!(json["result"]["backup"]["file_id"], "backup-copy-1");
+    }
+
+    /// ADR-0080 §13: a `require_lease: false` rule takes no backup of its
+    /// own, so `recovery_note` falls back to ADR-0077 §5's "no recovery
+    /// path but Drive's own version history" wording — but a lease
+    /// volunteered anyway is still checked and its backup still named,
+    /// making that fallback wording false unless the presented lease is
+    /// honoured.
+    #[tokio::test]
+    async fn a_presented_lease_under_a_non_requiring_rule_still_names_the_backup() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease_with_backup(
+            &ledger_path,
+            "sheet-1",
+            "1",
+            LeaseBackup::DriveCopy {
+                file_id: "backup-copy-1".to_string(),
+            },
+        );
+        let mut o = opts(delete_sheet(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let rule = FolderPermissionRule {
+            require_lease: false,
+            ..delete_allow_rule("parent-1")
+        };
+        let outcome = structure(&drive, &sheets, &o, &[rule]).await;
+
+        assert!(matches!(
+            &outcome.result,
+            StructureResult::Changed {
+                backup: Some(backup),
+                ..
+            } if **backup == LeaseBackup::DriveCopy { file_id: "backup-copy-1".to_string() }
+        ));
+        let text = describe(&outcome);
+        assert!(
+            text.contains(
+                "backed the whole spreadsheet up when it was acquired (Drive copy backup-copy-1)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("only recovery path"), "{text}");
     }
 
     /// The other half of the honesty rule: a `require_lease: false` rule
