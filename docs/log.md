@@ -445,8 +445,8 @@ described:
 |---|---|---|
 | On a write failure | Swallowed; the command's exit code is unaffected | Propagated; the caller aborts the operation it was about to audit |
 | `OMNI_DEV_LOG_DISABLE=1` | Suppresses all writes | No effect |
-| `omni-dev log prune` | Trims by age/size | Refuses `--audit` outright (`log prune does not support --audit`) |
-| `OMNI_DEV_LOG_MAX_SIZE` rotation | Applies | Never applies, regardless of the setting |
+| `omni-dev log prune` | Trims by age/size | Refuses `--audit` outright (`log prune does not support --audit`), **and** refuses any resolved log path that names the audit file — e.g. `OMNI_DEV_LOG_FILE` pointed at `audit.jsonl` directly, via a `..` segment, or via a symlink |
+| `OMNI_DEV_LOG_MAX_SIZE` rotation | Applies | Never applies, regardless of the setting or how `OMNI_DEV_LOG_FILE` is spelled |
 | Path override | `OMNI_DEV_LOG_FILE` | `OMNI_DEV_AUDIT_LOG_FILE` |
 | Location when unset | `<state dir>/omni-dev/log.jsonl` | `<state dir>/omni-dev/audit.jsonl` |
 
@@ -455,10 +455,18 @@ separately, on `prune` (`omni-dev log prune --audit`, always refused, above);
 placed before a subcommand name instead — `omni-dev log --audit prune ...` —
 it is refused rather than silently ignored, since a subcommand never
 consults it. `record_audit` also refuses to write if `OMNI_DEV_LOG_FILE` and
-`OMNI_DEV_AUDIT_LOG_FILE` are configured to resolve to the same path: the two
-sinks are siblings by default but not otherwise mutually exclusive by
+`OMNI_DEV_AUDIT_LOG_FILE` are configured to resolve to the **same file** —
+compared by file identity (the `same-file` crate — inode on unix, a file
+handle on Windows — falling back to a normalized path when one side doesn't
+exist yet), not merely by identical spelling, so a `..` segment,
+a relative-vs-absolute spelling, or a symlink can't slip past the check: the
+two sinks are siblings by default but not otherwise mutually exclusive by
 construction, so misconfiguration is caught at write time instead of
-silently blending the fail-closed sink into the best-effort one.
+silently blending the fail-closed sink into the best-effort one. That guard
+only stops writes *into* `log.jsonl`; a colliding `OMNI_DEV_LOG_FILE` can
+still cause a best-effort record to *land in* `audit.jsonl` (it just can no
+longer be pruned or rotated away, per the table above) — the next
+`record_audit` call still fails loudly, surfacing the misconfiguration.
 
 Every record carries `kind: "audit"` and, in `context`, an `integration` key
 (`"drive"` today, so a later integration's audit trail is additive rather

@@ -40,6 +40,10 @@ termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.27"
+# Cross-platform file-identity comparison (inode on unix, a file handle on
+# Windows) for request_log.rs's audit-file collision guard (issue #1694) —
+# already in the dependency graph transitively via `walkdir`.
+same-file = "1.0"
 reqwest = { version = "0.13", features = ["form", "json", "multipart", "stream"] }
 tokio = { version = "1.52", features = ["full"] }
 axum = "0.8"
