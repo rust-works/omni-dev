@@ -191,7 +191,9 @@ pub(crate) fn dedupe_key(rfc822_msgid: Option<&str>, source_id: &str) -> String 
 /// `Drop` never unlinks the lock file — it persists in the archive dir,
 /// which is what makes it safe for `Drop` to stop being the thing that
 /// releases the lock (issue #1687, applied here alongside the Drive lease
-/// ledger's identical fix).
+/// ledger's identical fix). On non-Unix, [`crate::daemon::paths::FileLock`]
+/// falls back to a `create_new`-marker-plus-`Drop`-unlink scheme, so this
+/// guarantee is Unix-only.
 #[derive(Debug)]
 pub(crate) struct LedgerLock {
     #[allow(dead_code)] // Held only for its Drop (releases the flock); never read.
