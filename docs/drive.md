@@ -1266,7 +1266,9 @@ against the same ledger are serialized by an advisory lock — a
 released on process death, so a crashed or killed holder never leaves a
 stale lock. **Never delete this lock file by hand** — it is not a marker
 of anything being wrong, and nothing in this codebase ever advises
-deleting it. A leased write waits for a busy lock rather than failing
+deleting it. (This holds on Unix; on non-Unix platforms, where `flock`
+isn't available, the lock falls back to the older create-and-delete
+marker scheme, so a crashed holder there can still leave a stale lock.) A leased write waits for a busy lock rather than failing
 outright (printing a one-line notice while it does), up to
 `OMNI_DEV_LEASE_LOCK_WAIT_SECS` (default: four times the HTTP read
 timeout, since a held lock can span several sequential Drive calls, e.g.

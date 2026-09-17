@@ -360,7 +360,9 @@ fn default_lock_wait_timeout() -> Duration {
 /// a new marker that the first holder's own `Drop` would then delete by
 /// path with no identity check, reopening a lease-token double-spend
 /// (issue #1687). Nothing in this module ever tells an operator to delete
-/// this file.
+/// this file. On non-Unix, [`crate::daemon::paths::FileLock`] falls back
+/// to the old `create_new`-marker-plus-`Drop`-unlink scheme, so that
+/// double-spend window is only closed on Unix.
 #[derive(Debug)]
 pub(crate) struct LedgerLock {
     #[allow(dead_code)] // Held only for its Drop (releases the flock); never read.
@@ -422,7 +424,7 @@ impl LedgerLock {
                 Ok(inner) => return Ok(Self { inner }),
                 Err(crate::daemon::paths::FileLockError::Busy) => {
                     if !announced {
-                        tracing::info!(
+                        tracing::warn!(
                             "drive lease: waiting for another `drive lease` operation to \
                              finish ({} is locked)",
                             path.display()
@@ -771,6 +773,7 @@ mod tests {
         LedgerLock::acquire(&ledger_path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ledger_lock_is_released_by_plain_fd_close_with_no_explicit_unlock() {
         // The direct regression test for issue #1687 point 3: a SIGKILLed
