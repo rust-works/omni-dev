@@ -391,6 +391,7 @@ async fn finish_acquisition(
         expires_at,
         released_at: None,
         restored_at: None,
+        restored_sheet_id: None,
     };
     // Synchronous ledger I/O (lock, load, save) on the async runtime's
     // current thread — `block_in_place` hands its other queued tasks off
@@ -465,8 +466,10 @@ enum InsertOutcome {
     Inserted,
     /// A live lease already covered this record's `file_id` — nothing was
     /// inserted or overwritten. Carries that existing record so the caller
-    /// can return its token instead.
-    AlreadyLeased(LeaseRecord),
+    /// can return its token instead — boxed, since it otherwise dwarfs the
+    /// dataless `Inserted` variant (`clippy::large_enum_variant`), the same
+    /// reasoning `restore.rs`'s `GateCheck::Ok` documents.
+    AlreadyLeased(Box<LeaseRecord>),
 }
 
 /// Downloads a binary file's bytes and writes them to `backup_dir`
@@ -576,7 +579,7 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<InsertOutcome> {
     LeaseLedger::mutate_locked(ledger_path, |ledger| {
         if let Some(existing) = ledger.live_lease_for_file(&record.file_id, Utc::now()) {
-            return InsertOutcome::AlreadyLeased(existing.clone());
+            return InsertOutcome::AlreadyLeased(Box::new(existing.clone()));
         }
         ledger.insert(record);
         InsertOutcome::Inserted

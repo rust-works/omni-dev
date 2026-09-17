@@ -936,7 +936,7 @@ Same gate, scope requirement, and logging behavior as [Create](#create).
 ```bash
 $ omni-dev drive lease acquire 1ExistingFileId
 lease-abc123...
-Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11T00:30:00Z)
+Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11 00:30:00 UTC)
 
 $ omni-dev drive edit 1ExistingFileId --content ./new-report.pdf --lease lease-abc123...
 Edited: 1ExistingFileId
@@ -994,7 +994,7 @@ Same request-log behavior as [Create](#create)/[Upload](#upload).
 ```bash
 $ omni-dev drive lease acquire 1ExistingFileId
 lease-abc123...
-Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11T00:30:00Z)
+Backed up to /home/user/.local/state/omni-dev/drive-backups/20260911T000000Z-1ExistingFileId-report.pdf (expires 2026-09-11 00:30:00 UTC)
 ```
 
 Before `drive edit` can write, it needs a **lease**: a token bound to a
@@ -1129,7 +1129,7 @@ having used the waiver, so it stays visible after the fact.
 ```bash
 $ omni-dev drive lease restore lease-abc123...
 lease-def456...
-Restored. Backed up the pre-restore content to /home/user/.local/state/omni-dev/drive-backups/20260912T000000Z-1ExistingFileId-report.pdf (expires 2026-09-12T00:30:00Z)
+Restored. Backed up the pre-restore content to /home/user/.local/state/omni-dev/drive-backups/20260912T000000Z-1ExistingFileId-report.pdf (expires 2026-09-12 00:30:00 UTC)
 ```
 
 `drive lease restore <TOKEN>` restores a file from the backup a lease
@@ -1164,8 +1164,25 @@ title when that title is currently free:
 ```bash
 $ omni-dev drive lease restore lease-native789...
 lease-def456...
-Restored sheet 'Q3 Numbers' (id 1481923) back into spreadsheet 1SpreadsheetId. Backed up the pre-restore content to Drive copy 1FreshBackupCopyId (expires 2026-09-12T00:30:00Z)
+Restored sheet 'Q3 Numbers' (id 1481923) back into spreadsheet 1SpreadsheetId. Backed up the pre-restore content to Drive copy 1FreshBackupCopyId (expires 2026-09-12 00:30:00 UTC)
 ```
+
+**Restoring the same sheet backup twice is refused, not repeated.**
+`copyTo` gives the restored sheet a *fresh* id, so the backup sheet's own id
+stays missing from the live spreadsheet and the structural diff above would
+happily fire again — silently adding another "Copy of …" every run. The
+ledger row records the id each restore creates, and a re-run is refused while
+that sheet is still there, before the authentication prompt and before the
+fresh backup copy:
+
+```bash
+$ omni-dev drive lease restore lease-native789...
+Refused: this backup's deleted sheet was already restored on 2026-09-12 00:00:00 UTC into spreadsheet 1SpreadsheetId as 'Q3 Numbers' (id 1481923), which is still there — restoring again would only add a second copy. Delete that sheet first if you do want another one. No fresh lease was minted, no Touch ID was spent.
+```
+
+The check keys on that sheet still being live, not on the backup merely
+having been restored from before — so if the restored sheet is deleted
+*again*, re-running restores it again as normal.
 
 **Everything else native has no typed restore path.** Zero or more than one
 sheet missing (nothing to restore this way, or ambiguous — this never

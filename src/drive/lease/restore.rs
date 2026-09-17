@@ -130,6 +130,32 @@ pub enum RestoreResult {
         /// name.
         headless_waiver: bool,
     },
+    /// An earlier restore from this same backup already copied its deleted
+    /// sheet back in, and that copy is still live (issue #1689). Refused
+    /// *before* the fresh lease's authentication prompt and before its
+    /// backup copy, since `spreadsheets.sheets.copyTo` would otherwise
+    /// happily make a second, independent duplicate — it assigns a fresh
+    /// id every time, so the backup sheet's own id stays missing-live and
+    /// the structural detection keeps firing. Delete the sheet named here
+    /// and re-run to restore it again.
+    SheetAlreadyRestored {
+        /// The live spreadsheet the earlier restore copied into.
+        spreadsheet_id: String,
+        /// The id that restore created there, still present.
+        sheet_id: i64,
+        /// That sheet's current title — read live, so a rename since the
+        /// restore shows up rather than the backup's own title.
+        sheet_title: String,
+        /// When the earlier restore was recorded. Absent only if the row
+        /// somehow carries an id but no timestamp — the two are written
+        /// together.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        restored_at: Option<DateTime<Utc>>,
+        /// The lease that earlier restore minted, when it is still live —
+        /// present it to `--lease` rather than spending a fresh prompt.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        live_lease: Option<LiveLease>,
+    },
     /// `<TOKEN>` names no row this ledger has ever recorded.
     NoSuchBackupToken,
     /// The backup is a native-document Drive copy, and either it isn't a
@@ -227,6 +253,15 @@ pub enum RestoreResult {
     },
 }
 
+/// A lease that is still live, named on a refusal so its token isn't lost.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveLease {
+    /// The lease's token.
+    pub token: String,
+    /// When it expires.
+    pub expires_at: DateTime<Utc>,
+}
+
 impl JsonlSerialize for RestoreResult {
     fn write_jsonl(&self, out: &mut dyn std::io::Write) -> Result<(), anyhow::Error> {
         crate::cli::drive::format::write_scalar_jsonl(self, out)
@@ -253,6 +288,7 @@ impl RestoreResult {
                 ..
             } => "restored-sheet-headless-waiver",
             Self::RestoredSheet { .. } => "restored-sheet",
+            Self::SheetAlreadyRestored { .. } => "sheet-already-restored",
             Self::NoSuchBackupToken => "no-such-backup-token",
             Self::NoTypedRestorePath { .. } => "no-typed-restore-path",
             Self::BackupTooLargeForSimpleUpload { .. } => "backup-too-large-for-simple-upload",
@@ -341,13 +377,36 @@ async fn restore_inner(
     let sheets_api = SheetsApi::new(sheets);
     let plan = match &backup_record.backup {
         LeaseBackup::DriveCopy { file_id: copy_id } => {
-            match detect_deleted_sheet(&sheets_api, copy_id, &file_id).await {
-                Some((sheet_id, sheet_title)) => RestorePlan::Sheet(SheetRestorePlan {
+            let previously_restored_sheet_id = backup_record.restored_sheet_id;
+            match detect_sheet_restore(&sheets_api, copy_id, &file_id, previously_restored_sheet_id)
+                .await
+            {
+                SheetDetection::Deleted {
+                    sheet_id,
+                    sheet_title,
+                } => RestorePlan::Sheet(SheetRestorePlan {
                     backup_spreadsheet_id: copy_id.clone(),
                     sheet_id,
                     sheet_title,
+                    previously_restored_sheet_id,
                 }),
-                None => {
+                // Refused here, before `acquire` — so a repeat run spends
+                // no authentication prompt and takes no fresh Drive backup
+                // copy, which is the whole cost of the duplicate this
+                // guards against (issue #1689).
+                SheetDetection::AlreadyRestored {
+                    sheet_id,
+                    sheet_title,
+                } => {
+                    return RestoreResult::SheetAlreadyRestored {
+                        spreadsheet_id: file_id.clone(),
+                        sheet_id,
+                        sheet_title,
+                        restored_at: backup_record.restored_at,
+                        live_lease: live_lease_for(&opts.ledger_path, &file_id),
+                    }
+                }
+                SheetDetection::None => {
                     return RestoreResult::NoTypedRestorePath {
                         backup_location: copy_id.clone(),
                     }
@@ -528,6 +587,7 @@ async fn restore_inner(
             backup_spreadsheet_id,
             sheet_id,
             sheet_title,
+            previously_restored_sheet_id,
         }) => {
             // A race with the initial detection: the sheet could have been
             // manually recreated in the roughly two minutes the fresh
@@ -540,6 +600,21 @@ async fn restore_inner(
                 Ok(live) if live.sheet_ids().contains(sheet_id) => {
                     return record_failure(
                         "a sheet with the same id already exists again in the live \
+                         spreadsheet; nothing to restore"
+                            .to_string(),
+                    );
+                }
+                // The same window can also have seen a *concurrent restore*
+                // from this very backup land — free to check, since the
+                // live workbook is already fetched here, and the id it
+                // would have created is the one the pre-prompt guard read
+                // (issue #1689).
+                Ok(live)
+                    if previously_restored_sheet_id
+                        .is_some_and(|id| live.sheet_ids().contains(&id)) =>
+                {
+                    return record_failure(
+                        "this backup's deleted sheet was already restored into the live \
                          spreadsheet; nothing to restore"
                             .to_string(),
                     );
@@ -585,6 +660,13 @@ async fn restore_inner(
     // "transition"), best-effort — the restore itself already succeeded or
     // failed by this point, so a failure to stamp this is logged, not
     // surfaced as a failed restore.
+    // A sheet restore also records the id `copyTo` just created, which is
+    // the only thing that lets a later run tell "already restored" from "a
+    // live sheet that merely shares the title" (issue #1689).
+    let restored_sheet_id = match &result {
+        RestoreResult::RestoredSheet { sheet_id, .. } => Some(*sheet_id),
+        _ => None,
+    };
     if matches!(
         result,
         RestoreResult::Restored { .. } | RestoreResult::RestoredSheet { .. }
@@ -594,7 +676,9 @@ async fn restore_inner(
         // off to the runtime's other workers for the duration, the same
         // reasoning `acquire.rs`'s own ledger writes document (issue #1664
         // review finding).
-        tokio::task::block_in_place(|| mark_backup_restored(&opts.ledger_path, &opts.token));
+        tokio::task::block_in_place(|| {
+            mark_backup_restored(&opts.ledger_path, &opts.token, restored_sheet_id);
+        });
     }
 
     result
@@ -612,6 +696,11 @@ struct SheetRestorePlan {
     backup_spreadsheet_id: String,
     sheet_id: i64,
     sheet_title: String,
+    /// The live id an earlier restore from this same backup created, if
+    /// any — carried so the pre-write recheck can refuse a duplicate that
+    /// appeared during the authentication prompt, not just a sheet whose
+    /// *original* id came back (issue #1689).
+    previously_restored_sheet_id: Option<i64>,
 }
 
 /// Which write `restore_inner` is about to perform, decided once from the
@@ -637,36 +726,106 @@ enum PreparedRestore {
     Sheet(SheetRestorePlan),
 }
 
-/// Diffs `backup_spreadsheet_id`'s sheet-id set against
-/// `live_spreadsheet_id`'s, returning the one sheet id (and its title) that
-/// is present in the backup but missing live — only when that difference has
-/// exactly one element. Any error (wrong resource type — a Docs/Slides
-/// backup fails `spreadsheets.get` outright; a spreadsheet that's vanished;
-/// a network failure) or an ambiguous (zero or more than one) diff collapses
-/// to `None`, never `RestoreResult::Failed`: this is a best-effort detection
-/// whose failure mode is always the existing, safe `NoTypedRestorePath`
-/// fallback, never a wrong guess.
-async fn detect_deleted_sheet(
+/// What a `DriveCopy` backup's two sheet lists say this restore should do.
+enum SheetDetection {
+    /// Exactly one sheet is present in the backup but missing live — the
+    /// deleted sheet, to be restored via `copyTo`.
+    Deleted {
+        /// Its id *in the backup* — never the id a restore will create.
+        sheet_id: i64,
+        /// Its title in the backup, for the best-effort rename-back.
+        sheet_title: String,
+    },
+    /// An earlier restore from this same backup already copied the sheet
+    /// in, and that copy is still live (issue #1689).
+    AlreadyRestored {
+        /// The live id that earlier restore created.
+        sheet_id: i64,
+        /// That live sheet's current title — read fresh, so a rename since
+        /// the restore is reflected rather than the backup's title assumed.
+        sheet_title: String,
+    },
+    /// Nothing to restore this way, ambiguous, or the detection reads
+    /// failed — all collapse to the same safe fallback.
+    None,
+}
+
+/// Decides which [`SheetDetection`] applies, from the backup spreadsheet's
+/// and the live spreadsheet's sheet lists alone.
+///
+/// `previously_restored_sheet_id` is the live id an earlier restore from
+/// this same backup created ([`LeaseRecord::restored_sheet_id`]). It is
+/// checked **first**, and that order is load-bearing: `copyTo` assigns the
+/// destination a fresh id, so the backup sheet's own id stays missing-live
+/// even after a successful restore and the diff below would happily report
+/// "exactly one deleted sheet" a second time (issue #1689). When that id is
+/// *gone* from live — the restored sheet was deleted again — this falls
+/// through and restores it once more, which is the legitimate flow a blunt
+/// "refuse whenever `restored_at` is set" gate would have blocked.
+///
+/// Any error (wrong resource type — a Docs/Slides backup fails
+/// `spreadsheets.get` outright; a spreadsheet that's vanished; a network
+/// failure) or an ambiguous (zero or more than one) diff collapses to
+/// [`SheetDetection::None`], never `RestoreResult::Failed`: this is a
+/// best-effort detection whose failure mode is always the existing, safe
+/// `NoTypedRestorePath` fallback, never a wrong guess.
+///
+/// [`LeaseRecord::restored_sheet_id`]: super::ledger::LeaseRecord::restored_sheet_id
+async fn detect_sheet_restore(
     sheets_api: &SheetsApi<'_>,
     backup_spreadsheet_id: &str,
     live_spreadsheet_id: &str,
-) -> Option<(i64, String)> {
-    let backup = sheets_api
-        .get_spreadsheet(backup_spreadsheet_id)
-        .await
-        .ok()?;
-    let live = sheets_api.get_spreadsheet(live_spreadsheet_id).await.ok()?;
+    previously_restored_sheet_id: Option<i64>,
+) -> SheetDetection {
+    let Ok(backup) = sheets_api.get_spreadsheet(backup_spreadsheet_id).await else {
+        return SheetDetection::None;
+    };
+    let Ok(live) = sheets_api.get_spreadsheet(live_spreadsheet_id).await else {
+        return SheetDetection::None;
+    };
+    if let Some(restored_id) = previously_restored_sheet_id {
+        if let Some(sheet) = live
+            .sheets
+            .iter()
+            .find(|sheet| sheet.sheet_id() == Some(restored_id))
+        {
+            return SheetDetection::AlreadyRestored {
+                sheet_id: restored_id,
+                sheet_title: sheet.title().to_string(),
+            };
+        }
+    }
     let live_ids = live.sheet_ids();
     let mut missing = backup.sheets.iter().filter_map(|sheet| {
         let props = sheet.properties.as_ref()?;
         let id = props.sheet_id?;
         (!live_ids.contains(&id)).then(|| (id, props.title.clone()))
     });
-    let first = missing.next()?;
+    let Some((sheet_id, sheet_title)) = missing.next() else {
+        return SheetDetection::None;
+    };
     if missing.next().is_some() {
-        return None;
+        return SheetDetection::None;
     }
-    Some(first)
+    SheetDetection::Deleted {
+        sheet_id,
+        sheet_title,
+    }
+}
+
+/// The live (unexpired, unreleased) lease covering `file_id`, if any —
+/// read back purely to surface its token on a refusal that would otherwise
+/// leave the caller with no way to find it (issue #1689's
+/// [`RestoreResult::SheetAlreadyRestored`]; there is no `drive lease list`
+/// verb). Best-effort: an unreadable ledger yields `None`, since this is
+/// decoration on a refusal already decided, never itself a gate.
+fn live_lease_for(ledger_path: &Path, file_id: &str) -> Option<LiveLease> {
+    let ledger = LeaseLedger::load(ledger_path).ok()?;
+    let record = ledger.live_lease_for_file(file_id, Utc::now())?;
+    Some(LiveLease {
+        token: record.token.clone(),
+        expires_at: record.expires_at,
+    })
 }
 
 /// Best-effort: renames the just-copied sheet back to `original_title` if
@@ -811,7 +970,8 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-/// Best-effort: stamps `token`'s row with `restored_at` (ADR-0080 §4).
+/// Best-effort: stamps `token`'s row with `restored_at` and, for a sheet
+/// restore, the id `copyTo` created live (ADR-0080 §4, issue #1689).
 ///
 /// Goes through [`LeaseLedger::mutate_locked`] — this runs after
 /// `restore_inner` has already released its own lock (acquired via
@@ -822,9 +982,9 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 /// two calls saves last would silently discard the other's change (issue
 /// #1664 review finding) — exactly the class of bug the lock exists to
 /// prevent everywhere else in this module.
-fn mark_backup_restored(ledger_path: &Path, token: &str) {
+fn mark_backup_restored(ledger_path: &Path, token: &str, restored_sheet_id: Option<i64>) {
     let result = LeaseLedger::mutate_locked(ledger_path, |ledger| {
-        ledger.mark_restored(token, Utc::now());
+        ledger.mark_restored(token, Utc::now(), restored_sheet_id);
     });
     if let Err(err) = result {
         tracing::debug!(
@@ -880,6 +1040,7 @@ fn record_attempt(opts: &RestoreOptions, result: &RestoreResult) {
         | RestoreResult::Unavailable { detail }
         | RestoreResult::Failed { detail } => (None, Some(detail.clone())),
         RestoreResult::NoSuchBackupToken
+        | RestoreResult::SheetAlreadyRestored { .. }
         | RestoreResult::NoTypedRestorePath { .. }
         | RestoreResult::BackupTooLargeForSimpleUpload { .. }
         | RestoreResult::RefusedNoVisibleParents
@@ -1096,6 +1257,7 @@ mod tests {
             expires_at: Utc::now() - ChronoDuration::hours(1),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(ledger_path).unwrap();
         token
@@ -1391,6 +1553,302 @@ mod tests {
         assert_eq!(update["properties"]["title"], "Deleted");
         assert_eq!(update["fields"], "title");
         assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restoring_the_same_sheet_backup_twice_refuses_instead_of_duplicating_it() {
+        // Regression test for issue #1689. `copyTo` assigns the
+        // destination a *fresh* sheet id, so the backup sheet's own id
+        // stays missing-live even after a successful restore and the
+        // structural diff happily fires a second time — silently adding a
+        // "Copy of Deleted" duplicate per run, each costing a Touch ID
+        // prompt and a fresh Drive backup copy. The second run must refuse
+        // before spending either.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+
+        // ── Run 1: the ordinary successful restore. ──
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-2", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_copy_to("copy-1", 2, 999, "Copy of Deleted")
+            .mount(&server)
+            .await;
+        mount_batch_update("sheet-1").mount(&server).await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+        let first = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let RestoreResult::RestoredSheet {
+            sheet_id: first_sheet_id,
+            new_token: fresh_token,
+            ..
+        } = first
+        else {
+            panic!("expected RestoredSheet on the first run, got {first:?}");
+        };
+        assert_eq!(first_sheet_id, 999);
+        assert_eq!(
+            LeaseLedger::load(&test_opts.ledger_path)
+                .unwrap()
+                .get(&old_token)
+                .unwrap()
+                .restored_sheet_id,
+            Some(999),
+            "the first restore must record the live id it created"
+        );
+
+        // ── Run 2: the live spreadsheet now holds the restored sheet. ──
+        // Re-mounted from scratch (the cached OAuth token survives the
+        // reset, so no `/token` mock is needed again). Every mutating call
+        // is mounted with `.expect(0)`: reaching one is the bug.
+        server.reset().await;
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1"), (999, "Deleted")])
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        for path in [
+            "/drive/v3/files/sheet-1/copy",
+            "/v4/spreadsheets/copy-1/sheets/2:copyTo",
+            "/v4/spreadsheets/sheet-1:batchUpdate",
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path(path))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+
+        // `PanicsIfCalled` proves no second authentication prompt is spent.
+        let second = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &PanicsIfCalled,
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::SheetAlreadyRestored {
+            spreadsheet_id,
+            sheet_id,
+            sheet_title,
+            restored_at,
+            live_lease,
+        } = second
+        else {
+            panic!("expected SheetAlreadyRestored on the second run, got {second:?}");
+        };
+        assert_eq!(spreadsheet_id, "sheet-1");
+        assert_eq!(sheet_id, 999);
+        assert_eq!(sheet_title, "Deleted");
+        assert!(restored_at.is_some());
+        let live_lease = live_lease.expect("the first run's lease is still live");
+        assert_eq!(
+            live_lease.token, fresh_token,
+            "the refusal must name the still-live lease the first restore minted, since \
+             there is no other way to recover its token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_sheet_deleted_again_is_restored_again() {
+        // The other half of #1689: the guard keys on whether the id the
+        // earlier restore created is *still live*, not on the mere fact
+        // that a restore happened — so re-deleting the restored sheet and
+        // re-running restores it once more, which a blunt "refuse whenever
+        // `restored_at` is set" gate would have wrongly blocked.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+        LeaseLedger::mutate(&test_opts.ledger_path, |ledger| {
+            ledger.mark_restored(&old_token, Utc::now(), Some(999));
+        })
+        .unwrap();
+
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        // Neither the backup sheet's original id (2) nor the id the
+        // earlier restore created (999) is live — both were deleted.
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-2", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_copy_to("copy-1", 2, 1001, "Copy of Deleted")
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_batch_update("sheet-1").expect(1).mount(&server).await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+        let result = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::RestoredSheet { sheet_id, .. } = result else {
+            panic!("expected RestoredSheet, got {result:?}");
+        };
+        assert_eq!(sheet_id, 1001);
+        assert_eq!(
+            LeaseLedger::load(&test_opts.ledger_path)
+                .unwrap()
+                .get(&old_token)
+                .unwrap()
+                .restored_sheet_id,
+            Some(1001),
+            "the row must now point at the newest restore, not the stale 999"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_concurrent_restore_landing_during_the_prompt_is_caught_at_the_recheck() {
+        // #1689's post-prompt half: the pre-prompt guard saw the recorded
+        // id absent, but by write time a concurrent restore from the same
+        // backup had put it back. The authentication prompt can take two
+        // minutes to answer (ADR-0080 §7), so the recheck must not trust
+        // the earlier detection here either.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+        LeaseLedger::mutate(&test_opts.ledger_path, |ledger| {
+            ledger.mark_restored(&old_token, Utc::now(), Some(999));
+        })
+        .unwrap();
+
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted")])
+            .mount(&server)
+            .await;
+        // First live read (detection): 999 is absent, so the plan is made.
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Every read after it (the pre-write recheck): 999 is back.
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1"), (999, "Deleted")])
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1/copy"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-2", "name": "backup", "mimeType": GOOGLE_SHEET_MIME_TYPE
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/copy-1/sheets/2:copyTo",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut restore_opts = opts(dir.path(), &old_token);
+        restore_opts.native_backup_folder_id = Some("backup-folder".to_string());
+        let result = restore(
+            &client,
+            &sheets,
+            &restore_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed { detail, .. } = &result else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert!(
+            detail.contains("was already restored"),
+            "must name the duplicate, not some other refusal: {detail}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2068,7 +2526,7 @@ mod tests {
         let _held = LedgerLock::acquire(&ledger_path).unwrap();
 
         // Must not panic despite the lock already being held.
-        mark_backup_restored(&ledger_path, "backup-token");
+        mark_backup_restored(&ledger_path, "backup-token", Some(999));
 
         let ledger = LeaseLedger::load(&ledger_path).unwrap();
         assert!(
@@ -2299,6 +2757,7 @@ mod tests {
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&test_opts.ledger_path).unwrap();
         // `mount_file`/`mount_folder` are still needed: the write-permission
@@ -2868,6 +3327,44 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("\"status\":\"restored\""), "{text}");
         assert!(text.contains("tok-2"), "{text}");
+    }
+
+    #[test]
+    fn a_sheet_already_restored_refusal_serializes_to_jsonl() {
+        let mut buf = Vec::new();
+        RestoreResult::SheetAlreadyRestored {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet_id: 999,
+            sheet_title: "Deleted".to_string(),
+            restored_at: Some(Utc::now()),
+            live_lease: Some(LiveLease {
+                token: "tok-6".to_string(),
+                expires_at: Utc::now(),
+            }),
+        }
+        .write_jsonl(&mut buf)
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"status\":\"sheet-already-restored\""),
+            "{text}"
+        );
+        assert!(text.contains("tok-6"), "{text}");
+    }
+
+    #[test]
+    fn verdict_names_the_already_restored_refusal() {
+        assert_eq!(
+            RestoreResult::SheetAlreadyRestored {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet_id: 999,
+                sheet_title: "Deleted".to_string(),
+                restored_at: None,
+                live_lease: None,
+            }
+            .verdict(),
+            "sheet-already-restored"
+        );
     }
 
     #[test]

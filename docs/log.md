@@ -541,6 +541,8 @@ once minted (or the existing one, for `already-leased`), and
 `<TOKEN>` argument — so `--query 'restored_from_lease_id:<token>'` finds
 every restore attempt made from one backup regardless of outcome. `verdict`
 matches `drive lease restore`'s own reported status: `restored`,
+`restored-sheet`, `restored-headless-waiver`,
+`restored-sheet-headless-waiver`, `sheet-already-restored`,
 `no-such-backup-token`, `no-typed-restore-path`,
 `backup-too-large-for-simple-upload`, `refused-no-visible-parents`,
 `blocked`, `already-leased`, `refused-native-document`, `denied`,

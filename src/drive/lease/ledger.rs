@@ -123,6 +123,19 @@ pub(crate) struct LeaseRecord {
     /// expected common case (§4), not something this field forbids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) restored_at: Option<DateTime<Utc>>,
+    /// The `sheetId` the most recent successful sheet restore from this
+    /// row's backup created in the live spreadsheet (issue #1689) — absent
+    /// for a `Bytes` restore, and for a row never restored from.
+    ///
+    /// `spreadsheets.sheets.copyTo` assigns the destination a *fresh* id,
+    /// so the backup sheet's own id stays missing-live forever and the
+    /// structural diff `restore` detects a deletion by keeps firing. This
+    /// is the only durable way to tell "already restored" from "a live
+    /// sheet that merely shares the backup sheet's title", which by
+    /// [ADR-0080](../../../docs/adrs/adr-0080.md) §10 is a state a restore
+    /// is expected to proceed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restored_sheet_id: Option<i64>,
 }
 
 impl LeaseRecord {
@@ -234,13 +247,26 @@ impl LeaseLedger {
     }
 
     /// Marks `token`'s row as having been restored from (ADR-0080 §4/§10),
-    /// stamped with `at`. A no-op if the token is absent. Idempotent: a
-    /// second restore from the same backup just overwrites the timestamp,
-    /// since the row already carries no count of how many times it has
-    /// been used — `drive lease restore` is not rate-limited by this field.
-    pub(crate) fn mark_restored(&mut self, token: &str, at: DateTime<Utc>) {
+    /// stamped with `at` and, for a sheet restore, the `sheetId` it created
+    /// live. A no-op if the token is absent.
+    ///
+    /// Both fields describe the *most recent* restore, not a history: a
+    /// second restore from the same backup overwrites them, since the row
+    /// carries no count of how many times it has been used. Plain
+    /// assignment rather than a don't-clobber merge is deliberate — a
+    /// `DriveCopy` row's successful restore always yields `Some`, a
+    /// `Bytes` row's always `None`, so a row can never regress from one to
+    /// the other. The id is what [`super::restore`] reads back to refuse a
+    /// duplicate (issue #1689); the timestamp is for the audit trail.
+    pub(crate) fn mark_restored(
+        &mut self,
+        token: &str,
+        at: DateTime<Utc>,
+        restored_sheet_id: Option<i64>,
+    ) {
         if let Some(rec) = self.0.get_mut(token) {
             rec.restored_at = Some(at);
+            rec.restored_sheet_id = restored_sheet_id;
         }
     }
 
@@ -494,6 +520,7 @@ mod tests {
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         }
     }
 
@@ -728,14 +755,36 @@ mod tests {
         ledger.save(&path).unwrap();
 
         let returned = LeaseLedger::mutate(&path, |ledger| {
-            ledger.mark_restored("t1", Utc::now());
+            ledger.mark_restored("t1", Utc::now(), Some(999));
             "ok"
         })
         .unwrap();
         assert_eq!(returned, "ok");
 
         let reloaded = LeaseLedger::load(&path).unwrap();
-        assert!(reloaded.get("t1").unwrap().restored_at.is_some());
+        let record = reloaded.get("t1").unwrap();
+        assert!(record.restored_at.is_some());
+        assert_eq!(
+            record.restored_sheet_id,
+            Some(999),
+            "the restored sheet's live id must survive the save/load round-trip — it is what \
+             a later restore reads back to refuse a duplicate (#1689)"
+        );
+    }
+
+    #[test]
+    fn a_ledger_line_predating_restored_sheet_id_still_parses() {
+        // The field is additive (`serde(default)`), so a ledger written by
+        // a build before #1689 must keep loading rather than turning every
+        // existing lease into an unparseable line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+        let mut without = serde_json::to_value(sample_record("t1")).unwrap();
+        without.as_object_mut().unwrap().remove("restored_sheet_id");
+        std::fs::write(&path, format!("{without}\n")).unwrap();
+
+        let record = LeaseLedger::load(&path).unwrap();
+        assert_eq!(record.get("t1").unwrap().restored_sheet_id, None);
     }
 
     #[test]
