@@ -59,6 +59,26 @@ pub enum LeaseBackup {
     },
 }
 
+impl LeaseBackup {
+    /// The `(location, sha256, size)` triple every acquire/prune audit
+    /// record maps a backup into: `location` is a local path for a byte
+    /// backup or the backup copy's own Drive file id for a
+    /// native-document backup (always `Some`); `sha256`/`size` are
+    /// byte-backup-only. Shared by `acquire::record_attempt` and
+    /// `prune::record_prune_attempt` so their mapping can never drift
+    /// apart, as it once risked doing when each held an independent copy.
+    pub(crate) fn audit_fields(&self) -> (Option<String>, Option<String>, Option<u64>) {
+        match self {
+            Self::Bytes { path, sha256, size } => (
+                Some(path.display().to_string()),
+                Some(sha256.clone()),
+                Some(*size),
+            ),
+            Self::DriveCopy { file_id } => (Some(file_id.clone()), None, None),
+        }
+    }
+}
+
 /// One row of the ledger — a lease's full operational state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct LeaseRecord {

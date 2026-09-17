@@ -2301,26 +2301,23 @@ mod tests {
             restored_at: None,
         });
         ledger.save(&test_opts.ledger_path).unwrap();
+        // `mount_file`/`mount_folder` are still needed: the write-permission
+        // gate runs *before* `restore_inner` ever calls `acquire`. No
+        // `mount_download`, though — the fresh acquire's lock-free
+        // pre-check (issue #1690) refuses this before it ever authenticates
+        // or takes a backup, so `byte_backup`'s own download is never
+        // reached. This is now the common "did I already lease this?"
+        // case, not the narrow race that still spends a prompt.
         mount_file("file-1", "text/plain", &["parent-1"])
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
-        // The fresh acquire authenticates and takes its own backup *before*
-        // discovering the already-live lease at the ledger-insert step
-        // (`acquire.rs`'s own sequence) — that backup ends up orphaned, but
-        // still needs a mock, or the acquire fails earlier than the
-        // `AlreadyLeased` check this test means to exercise. No PATCH mock:
-        // reaching the restore write itself would mean the short-circuit
-        // failed to prevent it.
-        mount_download("file-1", b"orphaned backup content")
-            .mount(&server)
-            .await;
 
         let result = restore(
             &client,
             &sheets,
             &opts(dir.path(), &old_token),
-            &FakeAuthenticator(AuthOutcome::Authorized),
+            &PanicsIfCalled,
             &[allow_rule("parent-1")],
         )
         .await;
