@@ -1429,9 +1429,14 @@ mod tests {
             .await;
 
         let opts = replace_opts(false);
+        // Under `flock` (issue #1687), a busy lock now waits rather than
+        // hard-failing (`check_and_lock_lease` -> `acquire_waiting`), so a
+        // held `LedgerLock` no longer reproduces an immediate failure here.
+        // A directory at the lock path does: opening it for write fails
+        // outright with an I/O error, which is never retried.
         let mut lock_path = opts.ledger_path.clone().into_os_string();
         lock_path.push(".lock");
-        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+        std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
 
         let outcome = write(&drive, &docs, &opts, &[allow_rule("folder-1")]).await;
         assert!(matches!(outcome.result, WriteResult::Failed { .. }));

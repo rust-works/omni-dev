@@ -2399,9 +2399,14 @@ mod tests {
         mount_workbook(serde_json::json!([])).mount(&server).await;
         let rules = vec![allow_rule("folder-1")];
         let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        // Under `flock` (issue #1687), a busy lock now waits rather than
+        // hard-failing (`check_and_lock_lease` -> `acquire_waiting`), so a
+        // held `LedgerLock` no longer reproduces an immediate failure here.
+        // A directory at the lock path does: opening it for write fails
+        // outright with an I/O error, which is never retried.
         let mut lock_path = ledger_path.clone().into_os_string();
         lock_path.push(".lock");
-        std::fs::write(std::path::PathBuf::from(lock_path), b"").unwrap();
+        std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
 
         let opts = ProtectionOptions {
             spreadsheet_id: "sheet-1".to_string(),
