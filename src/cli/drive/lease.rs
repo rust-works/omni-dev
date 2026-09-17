@@ -446,8 +446,9 @@ fn print_restore_result(result: &RestoreResult) {
             if let Some(lease) = live_lease {
                 println!("{}", lease.token);
                 eprintln!(
-                    "That restore's own lease is still live (expires {}) — present it to \
-                     `--lease` rather than spending another prompt",
+                    "A lease is still live for this file (expires {}, not necessarily minted \
+                     by that earlier restore) — present it to `--lease` rather than spending \
+                     another prompt",
                     lease.expires_at
                 );
             }

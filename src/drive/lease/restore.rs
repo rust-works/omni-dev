@@ -597,29 +597,28 @@ async fn restore_inner(
             // from before the prompt" discipline as the mime-type re-check
             // above.
             match sheets_api.get_spreadsheet(&file_id).await {
-                Ok(live) if live.sheet_ids().contains(sheet_id) => {
-                    return record_failure(
-                        "a sheet with the same id already exists again in the live \
-                         spreadsheet; nothing to restore"
-                            .to_string(),
-                    );
+                Ok(live) => {
+                    let live_ids = live.sheet_ids();
+                    if live_ids.contains(sheet_id) {
+                        return record_failure(
+                            "a sheet with the same id already exists again in the live \
+                             spreadsheet; nothing to restore"
+                                .to_string(),
+                        );
+                    }
+                    // The same window can also have seen a *concurrent
+                    // restore* from this very backup land — free to check,
+                    // since the live workbook is already fetched here, and
+                    // the id it would have created is the one the
+                    // pre-prompt guard read (issue #1689).
+                    if previously_restored_sheet_id.is_some_and(|id| live_ids.contains(&id)) {
+                        return record_failure(
+                            "this backup's deleted sheet was already restored into the live \
+                             spreadsheet; nothing to restore"
+                                .to_string(),
+                        );
+                    }
                 }
-                // The same window can also have seen a *concurrent restore*
-                // from this very backup land — free to check, since the
-                // live workbook is already fetched here, and the id it
-                // would have created is the one the pre-prompt guard read
-                // (issue #1689).
-                Ok(live)
-                    if previously_restored_sheet_id
-                        .is_some_and(|id| live.sheet_ids().contains(&id)) =>
-                {
-                    return record_failure(
-                        "this backup's deleted sheet was already restored into the live \
-                         spreadsheet; nothing to restore"
-                            .to_string(),
-                    );
-                }
-                Ok(_) => {}
                 Err(err) => return record_failure(err.to_string()),
             }
             let copied = match sheets_api
@@ -686,7 +685,7 @@ async fn restore_inner(
 
 /// The sheet-restore payload shared verbatim by [`RestorePlan::Sheet`] and
 /// [`PreparedRestore::Sheet`] — a sheet present in `backup_spreadsheet_id`
-/// but missing from the live spreadsheet (see [`detect_deleted_sheet`]),
+/// but missing from the live spreadsheet (see [`detect_sheet_restore`]),
 /// pending its `spreadsheets.sheets.copyTo` restore. One struct rather than
 /// two field-for-field-identical enum variants, so a field added to one
 /// can't be forgotten in the other (unlike the `Bytes` variants, whose
@@ -704,7 +703,7 @@ struct SheetRestorePlan {
 }
 
 /// Which write `restore_inner` is about to perform, decided once from the
-/// backup's own shape (and, for a `DriveCopy` backup, [`detect_deleted_sheet`])
+/// backup's own shape (and, for a `DriveCopy` backup, [`detect_sheet_restore`])
 /// before the write-permission gate — kept as data rather than re-deciding
 /// at each later step, so the gate re-check and the write itself can never
 /// disagree about which path they're on.
@@ -1355,7 +1354,7 @@ mod tests {
     ) {
         // Covers issue #1676's "does the scope stay Sheets-only" question:
         // a Docs/Slides backup fails `spreadsheets.get` outright (wrong
-        // resource type), which `detect_deleted_sheet` folds into `None`
+        // resource type), which `detect_sheet_restore` folds into `None`
         // with no separate mime-type gate needed.
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
