@@ -6,7 +6,7 @@ updates:
       interval: "weekly"
       day: "monday"
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore(cargo)"
     labels:
       - "dependencies"
     open-pull-requests-limit: 10
