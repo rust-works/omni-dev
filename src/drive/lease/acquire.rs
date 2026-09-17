@@ -1721,6 +1721,7 @@ mod tests {
                     expires_at: Utc::now() + ChronoDuration::minutes(30),
                     released_at: None,
                     restored_at: None,
+                    restored_sheet_id: None,
                 });
             })
             .unwrap();
