@@ -27,7 +27,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    finish_leased_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
+    finish_leased_write, gate_optional_leased_write, record_failed_leased_write, LeaseGateRefusal,
     LeasedWrite,
 };
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -260,7 +260,10 @@ async fn edit_inner(
     // requirement (see `FileTargetDecision::requires_lease`'s doc comment)
     // — it must not be re-derived from `decision.decided_by` alone here,
     // which would only see the one parent whose decision happened to win
-    // the verdict.
+    // the verdict. `gate_optional_leased_write` treats `requires_lease:
+    // false` as relaxing the *requirement*, not the *meaning* — a `--lease`
+    // presented anyway is still validated, consumed and audited (ADR-0080
+    // §13).
     //
     // The staleness check below is re-fetched fresh here rather than
     // reusing `target.version` from the very first `get_metadata` call:
@@ -287,17 +290,20 @@ async fn edit_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.file_id,
     };
-    let lease_grant = if requires_lease {
-        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(grant) => Some(grant),
-            Err(LeaseGateRefusal::NoLease) => return gated(EditResult::RefusedNoLease),
-            Err(LeaseGateRefusal::Expired) => return gated(EditResult::RefusedLeaseExpired),
-            Err(LeaseGateRefusal::WrongFile) => return gated(EditResult::RefusedLeaseWrongFile),
-            Err(LeaseGateRefusal::Stale) => return gated(EditResult::RefusedLeaseStale),
-            Err(LeaseGateRefusal::Failed(detail)) => return gated(EditResult::Failed { detail }),
-        }
-    } else {
-        None
+    let lease_grant = match gate_optional_leased_write(
+        leased,
+        &files_api,
+        requires_lease,
+        opts.lease_token.as_deref(),
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(LeaseGateRefusal::NoLease) => return gated(EditResult::RefusedNoLease),
+        Err(LeaseGateRefusal::Expired) => return gated(EditResult::RefusedLeaseExpired),
+        Err(LeaseGateRefusal::WrongFile) => return gated(EditResult::RefusedLeaseWrongFile),
+        Err(LeaseGateRefusal::Stale) => return gated(EditResult::RefusedLeaseStale),
+        Err(LeaseGateRefusal::Failed(detail)) => return gated(EditResult::Failed { detail }),
     };
 
     let result = match files_api
@@ -1178,7 +1184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_lease_false_skips_the_lease_check_entirely() {
+    async fn require_lease_false_writes_without_a_lease() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         mount_file("file-1", "text/plain", &["parent-1"])
@@ -1201,6 +1207,91 @@ mod tests {
         // No lease token presented at all, and no ledger exists.
         let outcome = edit(&client, &opts(false), &[rule]).await;
         assert!(matches!(outcome.result, EditResult::Edited));
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_still_refuses_a_stale_lease_if_one_is_presented() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a token volunteered anyway is checked exactly
+        // like a required one, including staleness.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // mount_file always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No PATCH mock mounted — a refusal must make zero mutating calls.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "file-1", "0");
+        let rule = FolderPermissionRule::folder("parent-1")
+            .allowing([DriveOperation::Edit])
+            .requiring_lease(false);
+
+        let opts = EditOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..opts_for("file-1", false)
+        };
+        let outcome = edit(&client, &opts, &[rule]).await;
+        assert!(
+            matches!(outcome.result, EditResult::RefusedLeaseStale),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_still_refreshes_the_ledger_for_a_presented_lease() {
+        // The issue's own named consequence: a volunteered lease that goes
+        // unvalidated still moves Drive's `version`, leaving its ledger row
+        // stale so a *later* required-lease write on the same file refuses
+        // `RefusedLeaseStale` because of this write. Enforcing the lease
+        // (ADR-0080 §13) closes that by refreshing the row like any other
+        // successful leased write.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "2",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "file-1", "1");
+        let rule = FolderPermissionRule::folder("parent-1")
+            .allowing([DriveOperation::Edit])
+            .requiring_lease(false);
+
+        let opts = EditOptions {
+            lease_token: Some(token.clone()),
+            ledger_path: ledger_path.clone(),
+            ..opts_for("file-1", false)
+        };
+        let outcome = edit(&client, &opts, &[rule]).await;
+        assert!(
+            matches!(outcome.result, EditResult::Edited),
+            "{:?}",
+            outcome.result
+        );
+
+        let ledger = LeaseLedger::load(&ledger_path).unwrap();
+        let record = ledger
+            .get(&token)
+            .expect("the lease is still in the ledger");
+        assert_eq!(record.version, "2");
     }
 
     #[tokio::test]

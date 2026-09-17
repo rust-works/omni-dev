@@ -341,6 +341,42 @@ pub(crate) async fn gate_leased_write(
     }
 }
 
+/// [`gate_leased_write`], but honouring `requires_lease` (ADR-0080 §13/§9):
+/// the deciding folder rule's `require_lease` governs whether a lease is
+/// *mandatory*, not whether a presented one is *honoured*. When the rule
+/// does not require a lease and the caller presented none either, this
+/// short-circuits to `Ok(None)` before issuing `files.get` — an unleased
+/// write under a `require_lease: false` rule costs exactly the zero extra
+/// round-trips it costs today. In every other case — the rule requires a
+/// lease, or the caller presented a token anyway — this defers to
+/// [`gate_leased_write`] unchanged, so a volunteered token under a
+/// non-requiring rule is validated, consumed and audited exactly like a
+/// required one, including refusing a stale/wrong-file/expired token
+/// outright rather than silently dropping it.
+///
+/// Centralised here rather than duplicated as an `if requires_lease` guard
+/// in each of the seven engines, for the same reason [`gate_leased_write`]
+/// itself is centralised: a bug in this policy fixed in one copy but not
+/// the others is worse than one copy reviewed six times.
+///
+/// `--dry-run` callers never reach this function at all (every engine's
+/// `dry_run` early return precedes the lease check), so `--dry-run --lease`
+/// still validates nothing — nothing is mutated, so there is nothing to
+/// consume.
+pub(crate) async fn gate_optional_leased_write(
+    write: LeasedWrite<'_>,
+    files_api: &FilesApi<'_>,
+    requires_lease: bool,
+    lease_token: Option<&str>,
+) -> Result<Option<LeaseGrant>, LeaseGateRefusal> {
+    if !requires_lease && lease_token.is_none() {
+        return Ok(None);
+    }
+    gate_leased_write(write, files_api, lease_token)
+        .await
+        .map(Some)
+}
+
 /// The fields every one of this module's audit records shares. `command`
 /// is `["drive", <operation>]`, byte-for-byte what
 /// `request_log::build_drive_mutation_record` writes for the same write.
@@ -653,6 +689,94 @@ mod tests {
                 .map(String::as_str),
             Some("2026-09-12T00:00:00Z")
         );
+    }
+
+    // ── `gate_optional_leased_write` (ADR-0080 §13) ─────────────────────
+
+    #[tokio::test]
+    async fn an_unrequired_write_with_no_token_skips_the_gate_entirely() {
+        // No `files.get` mock is mounted at all — a `require_lease: false`
+        // write presenting no token must never touch the network, exactly
+        // as costly as the old `if requires_lease { .. } else { None }`
+        // branch it replaces.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let files_api = FilesApi::new(&client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+
+        let outcome = gate_optional_leased_write(
+            leased("edit", &ledger_path, "file-1"),
+            &files_api,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn an_unrequired_write_with_a_valid_token_is_gated_like_a_required_one() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a presented token is validated and granted.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "1",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        let outcome = gate_optional_leased_write(
+            leased("edit", &ledger_path, "file-1"),
+            &files_api,
+            false,
+            Some("tok-1"),
+        )
+        .await;
+        assert!(matches!(outcome, Ok(Some(_))));
+        assert_eq!(audit.verdicts(), [verdict::PENDING]);
+    }
+
+    #[tokio::test]
+    async fn an_unrequired_write_still_refuses_a_stale_presented_token() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "1",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        // Seeded at version "0"; the live file (above) is at "1".
+        seed_lease(&ledger_path, "tok-1", "file-1", "0");
+
+        let outcome = gate_optional_leased_write(
+            leased("edit", &ledger_path, "file-1"),
+            &files_api,
+            false,
+            Some("tok-1"),
+        )
+        .await;
+        assert!(matches!(outcome, Err(LeaseGateRefusal::Stale)));
+        assert_eq!(audit.verdicts(), [verdict::REFUSED_LEASE_STALE]);
     }
 
     // ── the write's own audit trail (ADR-0080 §11) ─────────────────────

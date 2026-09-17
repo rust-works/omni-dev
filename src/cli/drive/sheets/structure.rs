@@ -55,7 +55,8 @@ pub struct AddSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -86,7 +87,8 @@ pub struct RenameSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -122,7 +124,8 @@ pub struct InsertRowsCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -157,7 +160,8 @@ pub struct InsertColumnsCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -193,7 +197,8 @@ pub struct DeleteSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -232,7 +237,8 @@ pub struct DeleteRowsCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -270,7 +276,8 @@ pub struct DeleteColumnsCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -346,7 +353,8 @@ pub struct DeleteRangeCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -386,7 +394,8 @@ pub struct DuplicateSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -417,7 +426,8 @@ pub struct ReorderSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -444,7 +454,8 @@ pub struct HideSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
@@ -471,7 +482,8 @@ pub struct ShowSheetCommand {
     pub dry_run: bool,
 
     /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false`
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
     /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]

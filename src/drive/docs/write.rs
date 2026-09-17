@@ -40,8 +40,8 @@ use crate::drive::docs::write_types::DocsRequest;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
-    LeasedWrite,
+    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
+    LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::types::{GOOGLE_DOC_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -499,27 +499,30 @@ async fn write_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.document_id,
     };
-    let lease_grant = if requires_lease {
-        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(grant) => Some(grant),
-            Err(LeaseGateRefusal::NoLease) => {
-                return gated(WriteResult::RefusedNoLease, Some(revision_id))
-            }
-            Err(LeaseGateRefusal::Expired) => {
-                return gated(WriteResult::RefusedLeaseExpired, Some(revision_id))
-            }
-            Err(LeaseGateRefusal::WrongFile) => {
-                return gated(WriteResult::RefusedLeaseWrongFile, Some(revision_id))
-            }
-            Err(LeaseGateRefusal::Stale) => {
-                return gated(WriteResult::RefusedLeaseStale, Some(revision_id))
-            }
-            Err(LeaseGateRefusal::Failed(detail)) => {
-                return gated(WriteResult::Failed { detail }, Some(revision_id))
-            }
+    let lease_grant = match gate_optional_leased_write(
+        leased,
+        &files_api,
+        requires_lease,
+        opts.lease_token.as_deref(),
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(LeaseGateRefusal::NoLease) => {
+            return gated(WriteResult::RefusedNoLease, Some(revision_id))
         }
-    } else {
-        None
+        Err(LeaseGateRefusal::Expired) => {
+            return gated(WriteResult::RefusedLeaseExpired, Some(revision_id))
+        }
+        Err(LeaseGateRefusal::WrongFile) => {
+            return gated(WriteResult::RefusedLeaseWrongFile, Some(revision_id))
+        }
+        Err(LeaseGateRefusal::Stale) => {
+            return gated(WriteResult::RefusedLeaseStale, Some(revision_id))
+        }
+        Err(LeaseGateRefusal::Failed(detail)) => {
+            return gated(WriteResult::Failed { detail }, Some(revision_id))
+        }
     };
 
     // ── The mutation ───────────────────────────────────────────────────
@@ -1565,7 +1568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_lease_false_skips_the_lease_check_entirely() {
+    async fn require_lease_false_writes_without_a_lease() {
         let server = MockServer::start().await;
         let (drive, docs) = clients(&server).await;
         mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
@@ -1598,6 +1601,47 @@ mod tests {
         };
         let outcome = write(&drive, &docs, &opts, &[rule]).await;
         assert!(matches!(outcome.result, WriteResult::Replaced { .. }));
+    }
+
+    #[tokio::test]
+    async fn require_lease_false_still_refuses_a_stale_lease_if_one_is_presented() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a token volunteered anyway is checked exactly
+        // like a required one, including staleness.
+        let server = MockServer::start().await;
+        let (drive, docs) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_document(Some("rev-1"), "Q3 report")
+            .mount(&server)
+            .await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+        let rule = FolderPermissionRule {
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::DocsWrite).collect(),
+            deny: HashSet::default(),
+            require_lease: false,
+        };
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "doc-1", "0");
+
+        let opts = WriteOptions {
+            lease_token: Some(token),
+            ledger_path,
+            ..replace_opts(false)
+        };
+        let outcome = write(&drive, &docs, &opts, &[rule]).await;
+        assert!(matches!(outcome.result, WriteResult::RefusedLeaseStale));
     }
 
     #[test]

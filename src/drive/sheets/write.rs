@@ -28,8 +28,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_leased_write, record_failed_leased_write, LeaseGateRefusal,
-    LeasedWrite,
+    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
+    LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueInputOption};
@@ -374,17 +374,20 @@ async fn write_inner(
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
     };
-    let lease_grant = if requires_lease {
-        match gate_leased_write(leased, &files_api, opts.lease_token.as_deref()).await {
-            Ok(grant) => Some(grant),
-            Err(LeaseGateRefusal::NoLease) => return gated(WriteResult::RefusedNoLease),
-            Err(LeaseGateRefusal::Expired) => return gated(WriteResult::RefusedLeaseExpired),
-            Err(LeaseGateRefusal::WrongFile) => return gated(WriteResult::RefusedLeaseWrongFile),
-            Err(LeaseGateRefusal::Stale) => return gated(WriteResult::RefusedLeaseStale),
-            Err(LeaseGateRefusal::Failed(detail)) => return gated(WriteResult::Failed { detail }),
-        }
-    } else {
-        None
+    let lease_grant = match gate_optional_leased_write(
+        leased,
+        &files_api,
+        requires_lease,
+        opts.lease_token.as_deref(),
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(LeaseGateRefusal::NoLease) => return gated(WriteResult::RefusedNoLease),
+        Err(LeaseGateRefusal::Expired) => return gated(WriteResult::RefusedLeaseExpired),
+        Err(LeaseGateRefusal::WrongFile) => return gated(WriteResult::RefusedLeaseWrongFile),
+        Err(LeaseGateRefusal::Stale) => return gated(WriteResult::RefusedLeaseStale),
+        Err(LeaseGateRefusal::Failed(detail)) => return gated(WriteResult::Failed { detail }),
     };
 
     // ── The mutation ───────────────────────────────────────────────────
@@ -1299,6 +1302,33 @@ mod tests {
         o.lease_token = None;
         let outcome = write(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
         assert!(matches!(outcome.result, WriteResult::Written { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_still_refuses_a_stale_one_if_presented() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a token volunteered anyway is checked exactly
+        // like a required one, including staleness.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // Live version "1" (`mount_file`'s default) but the lease was
+        // acquired at "0" — the file has moved since.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No PUT mock mounted — a refusal must make zero mutating calls.
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(WriteVerb::Write, false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = write(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedLeaseStale);
     }
 
     // ── describing an outcome ──────────────────────────────────────────
