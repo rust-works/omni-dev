@@ -470,18 +470,27 @@ leased-write lifecycle, landing across that same issue's phases.
 
 **`drive lease acquire`** writes one record per attempt, `command: ["drive",
 "lease-acquire"]`, regardless of outcome — `verdict` is `acquired`,
+`acquired-headless-waiver` (ADR-0080 §8/§13, issue #1677: proceeded under the
+headless opt-out, no human ever prompted), `already-leased`,
 `refused-native-document`, `denied`, `unavailable`, or `failed`, matching
-`AcquireResult`'s own kebab-case status. An `acquired` record additionally
-carries `lease_id` (the token), `version_after`/`modified_time_after` (the
-Drive state actually recorded into the ledger — re-read after the backup,
-not the pre-authentication snapshot, for the same TOCTOU reason the ledger
-itself does), `backup_location` (a local path for a byte backup, or the
-backup copy's own file id for a native-document backup),
+`AcquireResult`'s own kebab-case status — plus, on `already-leased`/`failed`,
+the `-backup-orphaned` suffix (issue #1690): this attempt took a real backup
+before discovering it isn't referenced by any ledger row, and reclaiming
+that backup itself then failed, so it is now truly orphaned (`drive lease
+prune` cannot see it either). An `acquired` record additionally carries
+`lease_id` (the token), `version_after`/`modified_time_after` (the Drive
+state actually recorded into the ledger — re-read after the backup, not the
+pre-authentication snapshot, for the same TOCTOU reason the ledger itself
+does), `backup_location` (a local path for a byte backup, or the backup
+copy's own file id for a native-document backup),
 `backup_sha256`/`backup_size` (byte backups only), and `auth_policy`
-(`device-owner` or `biometrics-only`). Unlike a leased *write*'s own record
-(below), this one is best-effort rather than write-ahead/fail-closed:
-acquiring mutates no Drive content — by the time the record is written the
-consent, the backup and the ledger row have already durably happened, so a
+(`device-owner` or `biometrics-only`). An `already-leased`/`failed` record
+also carries `backup_location` whenever this attempt took a backup, whether
+or not reclaiming it succeeded — the `-backup-orphaned` suffix is what
+distinguishes the two. Unlike a leased *write*'s own record (below), this
+one is best-effort rather than write-ahead/fail-closed: acquiring mutates no
+Drive content — by the time the record is written the consent, the backup
+and the ledger row have already durably happened, so a
 logging failure is warned and does not turn a successful acquisition into a
 reported failure.
 

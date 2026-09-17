@@ -4,7 +4,13 @@
 //! a Google-native document (Sheet/Doc/Slide) backs up as a lossless
 //! Drive-side `files.copy` into the account's configured backup folder
 //! (§3's fidelity split) — refused outright, before authenticating at all,
-//! when no backup folder is configured for this account.
+//! when no backup folder is configured for this account, or when a live
+//! lease already covers the target file (issue #1690). The latter refusal
+//! is a fast path, not the authoritative gate — see [`acquire_inner`] — so
+//! the narrow remaining race still spends a prompt and a backup; that
+//! backup is then reclaimed (deleted/trashed) rather than left orphaned,
+//! since `drive lease prune` can only ever see backups a ledger row
+//! points at.
 
 use std::path::{Path, PathBuf};
 
@@ -78,8 +84,12 @@ pub enum AcquireResult {
     /// second writer silently clobber the first's write (issue #1664
     /// review finding) — see
     /// [`LeaseLedger::live_lease_for_file`](super::ledger::LeaseLedger::live_lease_for_file)'s
-    /// doc comment. A fresh Touch ID prompt was already spent finding this
-    /// out; the backup this attempt took (if any) is orphaned.
+    /// doc comment. A lock-free pre-check in [`acquire_inner`] refuses most
+    /// of these *before* authenticating at all (issue #1690); only the
+    /// narrow remaining race — another process inserting its own lease
+    /// between that pre-check and the authoritative, lock-held check —
+    /// still spends a prompt and a backup first, and that backup is
+    /// reclaimed (deleted/trashed) automatically rather than left orphaned.
     AlreadyLeased {
         /// The existing lease's token — present this to `--lease` instead.
         token: String,
@@ -132,8 +142,8 @@ pub async fn acquire(
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
 ) -> AcquireResult {
-    let result = acquire_inner(client, opts, authenticator).await;
-    record_attempt(opts, &result);
+    let (result, disposition) = acquire_inner(client, opts, authenticator).await;
+    record_attempt(opts, &result, disposition.as_ref());
     result
 }
 
@@ -148,42 +158,104 @@ pub(crate) const MIN_EXPIRY_MINUTES: i64 = 1;
 /// See [`MIN_EXPIRY_MINUTES`].
 pub(crate) const MAX_EXPIRY_MINUTES: i64 = 24 * 60;
 
+/// What became of a backup this attempt took, once [`finish_acquisition`]
+/// decided it is referenced by no ledger row — the belt-and-braces half of
+/// issue #1690's fix, for the narrow race the lock-free pre-check in
+/// [`acquire_inner`] cannot close. `None` everywhere in
+/// [`acquire_inner`]'s return value means this attempt never took a
+/// backup at all (refused/denied/unavailable before ever reaching step 2).
+enum BackupDisposition {
+    /// Deleted (bytes) or trashed (Drive copy) before returning.
+    Reclaimed(LeaseBackup),
+    /// Reclaiming it itself failed; the backup is still on disk/Drive,
+    /// now truly orphaned — `drive lease prune` cannot see it either,
+    /// since no ledger row points at it. Carried so the audit record can
+    /// still name its location for a human to clean up.
+    ReclaimFailed(LeaseBackup),
+}
+
 async fn acquire_inner(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
-) -> AcquireResult {
+) -> (AcquireResult, Option<BackupDisposition>) {
     let expiry_minutes = opts.expiry.num_minutes();
     if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&expiry_minutes) {
-        return AcquireResult::Failed {
-            detail: format!(
-                "expiry must be between {MIN_EXPIRY_MINUTES} and {MAX_EXPIRY_MINUTES} minutes, \
-                 got {expiry_minutes}"
-            ),
-        };
+        return (
+            AcquireResult::Failed {
+                detail: format!(
+                    "expiry must be between {MIN_EXPIRY_MINUTES} and {MAX_EXPIRY_MINUTES} \
+                     minutes, got {expiry_minutes}"
+                ),
+            },
+            None,
+        );
     }
 
     let files_api = FilesApi::new(client);
     let target = match files_api.get_metadata(&opts.file_id).await {
         Ok(target) => target,
         Err(err) => {
-            return AcquireResult::Failed {
-                detail: err.to_string(),
-            }
+            return (
+                AcquireResult::Failed {
+                    detail: err.to_string(),
+                },
+                None,
+            )
         }
     };
 
     let is_native = target.is_google_native();
     if is_native && opts.native_backup_folder_id.is_none() {
-        return AcquireResult::RefusedNativeDocument;
+        return (AcquireResult::RefusedNativeDocument, None);
     }
 
     if target.version.is_none() {
-        return AcquireResult::Failed {
-            detail: "Drive did not return a `version` for this file; refusing to lease it \
-                     without a staleness check"
-                .to_string(),
-        };
+        return (
+            AcquireResult::Failed {
+                detail: "Drive did not return a `version` for this file; refusing to lease it \
+                         without a staleness check"
+                    .to_string(),
+            },
+            None,
+        );
+    }
+
+    // Lock-free live-lease pre-check (issue #1690): cheap, and
+    // deliberately *not* the authoritative gate — `insert_record`, taken
+    // under the ledger lock inside `finish_acquisition` below, remains
+    // that (see its own doc comment). This one's only job is refusing
+    // *before* spending the (up to 120s) Touch ID prompt and a real
+    // backup on the common case this closes: a second `acquire` on a
+    // file that already has a live lease — a "did I already lease this?"
+    // retry, a lost token — not merely a rare race. A lease that goes
+    // live or expires in the window between this check and the
+    // authoritative one is still decided correctly there either way: this
+    // fast path can only ever be *more* conservative than the real gate
+    // (refusing a lease that in fact expires a moment later, which just
+    // means the caller retries), never less, so the two can never
+    // disagree in the direction that would matter.
+    let pre_check = tokio::task::block_in_place(|| LeaseLedger::load(&opts.ledger_path));
+    match pre_check {
+        Ok(ledger) => {
+            if let Some(existing) = ledger.live_lease_for_file(&opts.file_id, Utc::now()) {
+                return (
+                    AcquireResult::AlreadyLeased {
+                        token: existing.token.clone(),
+                        expires_at: existing.expires_at,
+                    },
+                    None,
+                );
+            }
+        }
+        Err(err) => {
+            return (
+                AcquireResult::Failed {
+                    detail: err.to_string(),
+                },
+                None,
+            )
+        }
     }
 
     // 1. Authenticate — consent gates the action, not merely possession of
@@ -212,7 +284,7 @@ async fn acquire_inner(
         tokio::task::block_in_place(|| authenticator.authenticate(&reason, opts.auth_policy));
     let headless_waiver = match auth_outcome {
         AuthOutcome::Authorized => false,
-        AuthOutcome::Denied(detail) => return AcquireResult::Denied { detail },
+        AuthOutcome::Denied(detail) => return (AcquireResult::Denied { detail }, None),
         AuthOutcome::Unavailable(detail) => {
             // ADR-0080 §8/§13: an explicit, per-installation opt-out lets
             // this proceed with no human ever having been prompted, rather
@@ -220,7 +292,7 @@ async fn acquire_inner(
             // `Acquired` result (and so the audit record) is what makes
             // this waiver durably visible.
             if !opts.allow_headless {
-                return AcquireResult::Unavailable { detail };
+                return (AcquireResult::Unavailable { detail }, None);
             }
             true
         }
@@ -234,22 +306,50 @@ async fn acquire_inner(
         match native_backup(&files_api, &opts.file_id, folder_id, &target.name).await {
             Ok(backup) => backup,
             Err(err) => {
-                return AcquireResult::Failed {
-                    detail: err.to_string(),
-                }
+                return (
+                    AcquireResult::Failed {
+                        detail: err.to_string(),
+                    },
+                    None,
+                )
             }
         }
     } else {
         match byte_backup(&files_api, &opts.file_id, &opts.backup_dir, &target.name).await {
             Ok(backup) => backup,
             Err(err) => {
-                return AcquireResult::Failed {
-                    detail: err.to_string(),
-                }
+                return (
+                    AcquireResult::Failed {
+                        detail: err.to_string(),
+                    },
+                    None,
+                )
             }
         }
     };
 
+    // From here on a backup exists, so every remaining exit must account
+    // for it: `Acquired` because a ledger row now references it, every
+    // other outcome by reclaiming it (issue #1690's belt-and-braces half,
+    // for the pre-check's narrow remaining race).
+    let result = finish_acquisition(&files_api, opts, backup.clone(), headless_waiver).await;
+    if matches!(result, AcquireResult::Acquired { .. }) {
+        return (result, None);
+    }
+    let disposition = reclaim_backup(&files_api, backup).await;
+    (result, Some(disposition))
+}
+
+/// Steps 3–4: re-fetches metadata, checks the file's live lease under the
+/// ledger lock, and mints the lease. Split out of `acquire_inner` so every
+/// exit past the backup step shares that function's one reclaim wrapper —
+/// this function only ever decides mint-or-refuse, never reclaims.
+async fn finish_acquisition(
+    files_api: &FilesApi<'_>,
+    opts: &AcquireOptions,
+    backup: LeaseBackup,
+    headless_waiver: bool,
+) -> AcquireResult {
     // 3. Ledger record. `version`/`modified_time` are re-fetched here
     // rather than reused from the `target` metadata read at the very top —
     // that read happened before the (up to 120s) Touch ID prompt and
@@ -296,13 +396,13 @@ async fn acquire_inner(
     // the `authenticate` call above documents.
     match tokio::task::block_in_place(|| insert_record(record, &opts.ledger_path)) {
         Ok(InsertOutcome::Inserted) => {}
-        // Refuse rather than mint a second, independent lease on a file
-        // that already has a live one — see `AcquireResult::AlreadyLeased`'s
-        // doc comment. The backup just taken above is orphaned: it was
-        // never inserted into the ledger, so `drive lease prune` (#1678,
-        // which only ever iterates existing ledger rows) cannot discover
-        // or reclaim it — a known gap this race leaves open, distinct from
-        // the expired/released-row growth `lease prune` does bound.
+        // Refuse rather than mint a second, independent lease — see
+        // `AcquireResult::AlreadyLeased`'s and `insert_record`'s own doc
+        // comments for why this stays the authoritative gate even with
+        // the lock-free pre-check in `acquire_inner`. Reclaiming the
+        // backup this attempt just took happens there, once it sees this
+        // isn't `Acquired` — not here, since this function's only job is
+        // deciding mint-or-refuse.
         Ok(InsertOutcome::AlreadyLeased(existing)) => {
             return AcquireResult::AlreadyLeased {
                 token: existing.token,
@@ -322,6 +422,38 @@ async fn acquire_inner(
         expires_at,
         backup,
         headless_waiver,
+    }
+}
+
+/// Deletes/trashes a backup this attempt itself just took, once
+/// `acquire_inner` has decided it ends up referenced by no ledger row —
+/// the belt-and-braces half of issue #1690's fix, for the narrow race the
+/// lock-free pre-check above cannot close by itself. Reuses
+/// [`super::prune::clear_backup`], which already handles both
+/// [`LeaseBackup`] variants and tolerates an already-absent backup. Safe
+/// specifically because `backup` is always one this very call just
+/// created moments ago under a fresh identity — `write_backup`'s
+/// `create_new`/`O_EXCL` open, or `native_backup`'s brand-new `files.copy`
+/// id — never one an existing ledger row (live, expired, or already
+/// pruned) could still point at.
+///
+/// A reclamation failure is warned, not surfaced: the primary outcome
+/// (`AlreadyLeased`/`Failed`) is unaffected either way, and the orphan's
+/// location still ends up in the best-effort audit record
+/// ([`record_attempt`]) for `drive lease prune` — or a human — to find.
+async fn reclaim_backup(files_api: &FilesApi<'_>, backup: LeaseBackup) -> BackupDisposition {
+    match super::prune::clear_backup(files_api, &backup).await {
+        Ok(()) => BackupDisposition::Reclaimed(backup),
+        Err(err) => {
+            let (location, ..) = backup.audit_fields();
+            tracing::warn!(
+                "drive lease acquire: failed to reclaim an orphaned backup at {}: {err} — \
+                 `drive lease prune` cannot see it either, since no ledger row references it; \
+                 remove it manually",
+                location.unwrap_or_default()
+            );
+            BackupDisposition::ReclaimFailed(backup)
+        }
     }
 }
 
@@ -449,10 +581,38 @@ fn insert_record(record: LeaseRecord, ledger_path: &Path) -> anyhow::Result<Inse
     })
 }
 
+/// Whether `disposition` names a backup this attempt took and, if
+/// reclaiming it failed, extends `base_verdict` to `<base>-backup-orphaned`
+/// so an operator can grep for a leaked backup `drive lease prune` cannot
+/// see (issue #1690) — see [`BackupDisposition`]. Returns `base_verdict`
+/// unchanged, with no `backup_location`, when this attempt never took a
+/// backup at all.
+fn orphan_verdict(
+    base_verdict: &str,
+    disposition: Option<&BackupDisposition>,
+) -> (String, Option<String>) {
+    let backup = match disposition {
+        None => return (base_verdict.to_string(), None),
+        Some(BackupDisposition::Reclaimed(backup)) => backup,
+        Some(BackupDisposition::ReclaimFailed(backup)) => {
+            let (location, ..) = backup.audit_fields();
+            return (format!("{base_verdict}-backup-orphaned"), location);
+        }
+    };
+    let (location, ..) = backup.audit_fields();
+    (base_verdict.to_string(), location)
+}
+
 /// Builds and writes the `kind: "audit"` record for one acquire attempt.
 /// See [`acquire`]'s own doc comment for why this is best-effort rather than
-/// write-ahead/fail-closed.
-fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
+/// write-ahead/fail-closed. `disposition` is `Some` only when this attempt
+/// took a backup that turned out to be reclaimed or orphaned rather than
+/// referenced by a ledger row (issue #1690) — see [`BackupDisposition`].
+fn record_attempt(
+    opts: &AcquireOptions,
+    result: &AcquireResult,
+    disposition: Option<&BackupDisposition>,
+) {
     let auth_policy = Some(
         match opts.auth_policy {
             AuthPolicy::DeviceOwner => "device-owner",
@@ -467,14 +627,7 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
             expires_at: _,
             headless_waiver,
         } => {
-            let (backup_location, backup_sha256, backup_size) = match backup {
-                LeaseBackup::Bytes { path, sha256, size } => (
-                    Some(path.display().to_string()),
-                    Some(sha256.clone()),
-                    Some(*size),
-                ),
-                LeaseBackup::DriveCopy { file_id } => (Some(file_id.clone()), None, None),
-            };
+            let (backup_location, backup_sha256, backup_size) = backup.audit_fields();
             // Re-read the just-written ledger row for the version/
             // modified_time actually recorded, rather than widening
             // `AcquireResult::Acquired` (a public, `--output json` wire
@@ -511,15 +664,19 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
                 ..Default::default()
             }
         }
-        AcquireResult::AlreadyLeased { token, .. } => crate::request_log::AuditOutcome {
-            command: vec!["drive".to_string(), "lease-acquire".to_string()],
-            integration: "drive",
-            file_id: opts.file_id.clone(),
-            lease_id: Some(token.clone()),
-            verdict: "already-leased".to_string(),
-            auth_policy,
-            ..Default::default()
-        },
+        AcquireResult::AlreadyLeased { token, .. } => {
+            let (verdict, backup_location) = orphan_verdict("already-leased", disposition);
+            crate::request_log::AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: opts.file_id.clone(),
+                lease_id: Some(token.clone()),
+                verdict,
+                backup_location,
+                auth_policy,
+                ..Default::default()
+            }
+        }
         AcquireResult::RefusedNativeDocument => crate::request_log::AuditOutcome {
             command: vec!["drive".to_string(), "lease-acquire".to_string()],
             integration: "drive",
@@ -546,15 +703,19 @@ fn record_attempt(opts: &AcquireOptions, result: &AcquireResult) {
             auth_policy,
             ..Default::default()
         },
-        AcquireResult::Failed { detail } => crate::request_log::AuditOutcome {
-            command: vec!["drive".to_string(), "lease-acquire".to_string()],
-            integration: "drive",
-            file_id: opts.file_id.clone(),
-            verdict: "failed".to_string(),
-            error: Some(detail.clone()),
-            auth_policy,
-            ..Default::default()
-        },
+        AcquireResult::Failed { detail } => {
+            let (verdict, backup_location) = orphan_verdict("failed", disposition);
+            crate::request_log::AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: opts.file_id.clone(),
+                verdict,
+                error: Some(detail.clone()),
+                backup_location,
+                auth_policy,
+                ..Default::default()
+            }
+        }
     };
     if let Err(err) = crate::request_log::record_audit_event(outcome) {
         tracing::warn!("drive lease acquire: failed to write audit record: {err}");
@@ -842,7 +1003,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_ledger_insert_failure_is_reported_as_failed() {
+    async fn a_ledger_insert_failure_reclaims_the_backup_just_taken() {
+        // A concurrent lease op (or a leftover lock from a crash) holds the
+        // ledger lock across this attempt's own `insert_record` — the
+        // routine, non-race way `Failed` still follows a full backup
+        // (issue #1690): the lock-free pre-check can't see this, since it
+        // takes no lock itself. The lock file is pre-created here, mirroring
+        // `LedgerLock`'s own `<ledger_path>.lock` naming, so
+        // `LedgerLock::acquire` fails exactly like it would against a
+        // genuinely concurrent holder.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -864,9 +1033,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
-        // A directory in place of the ledger file makes `LeaseLedger::load`
-        // fail, which `insert_record` surfaces as an `anyhow::Error`.
-        std::fs::create_dir_all(&test_opts.ledger_path).unwrap();
+        let mut lock_name = test_opts.ledger_path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        std::fs::write(PathBuf::from(lock_name), b"").unwrap();
 
         let result = acquire(
             &client,
@@ -876,6 +1045,24 @@ mod tests {
         .await;
 
         assert!(matches!(result, AcquireResult::Failed { .. }));
+        assert!(
+            std::fs::read_dir(&test_opts.backup_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "the backup this attempt took must be reclaimed, not left orphaned"
+        );
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("failed"),
+            "a successfully reclaimed backup takes no verdict suffix"
+        );
+        assert!(
+            rec.context.contains_key("backup_location"),
+            "a reclaimed backup's location must still be audited"
+        );
     }
 
     #[test]
@@ -1197,6 +1384,13 @@ mod tests {
             !test_opts.ledger_path.exists(),
             "no ledger row must be written"
         );
+        assert!(
+            std::fs::read_dir(&test_opts.backup_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "the backup this attempt took must be reclaimed, not left orphaned (issue #1690)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1237,6 +1431,13 @@ mod tests {
         assert!(
             !test_opts.ledger_path.exists(),
             "no ledger row must be written"
+        );
+        assert!(
+            std::fs::read_dir(&test_opts.backup_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "the backup this attempt took must be reclaimed, not left orphaned (issue #1690)"
         );
     }
 
@@ -1417,7 +1618,10 @@ mod tests {
         // acquired leases on the same file would otherwise each capture the
         // same version and each pass their own staleness check against it,
         // letting the second writer's write silently clobber the first's.
-        // Refusing to mint the second lease at all closes that gap.
+        // Refusing to mint the second lease at all closes that gap. The
+        // second attempt's authenticator panics if called at all — proving
+        // the lock-free pre-check (issue #1690) refuses it before ever
+        // spending a Touch ID prompt, not merely before minting.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -1454,23 +1658,28 @@ mod tests {
             panic!("expected Acquired, got {first:?}");
         };
 
-        // A distinct `backup_dir` for the second attempt: `backup_name`'s
-        // timestamp has only whole-second precision (see `write_backup`'s
-        // own doc comment), so two backups of the same file within one
-        // test's runtime would otherwise collide on the same path.
         let mut second_opts = test_opts.clone();
         second_opts.backup_dir = root.path().join("backups2");
 
-        let second = acquire(
-            &client,
-            &second_opts,
-            &FakeAuthenticator(AuthOutcome::Authorized),
-        )
-        .await;
+        struct PanicsIfCalled;
+        impl Authenticator for PanicsIfCalled {
+            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+                panic!(
+                    "must not authenticate: the lock-free pre-check must refuse a second \
+                     live lease before spending a prompt"
+                );
+            }
+        }
+
+        let second = acquire(&client, &second_opts, &PanicsIfCalled).await;
         let AcquireResult::AlreadyLeased { token, .. } = second else {
             panic!("expected AlreadyLeased, got {second:?}");
         };
         assert_eq!(token, first_token);
+        assert!(
+            !second_opts.backup_dir.exists(),
+            "the pre-check must refuse before ever taking a backup"
+        );
 
         // Only the first lease is live in the ledger.
         let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
@@ -1479,6 +1688,196 @@ mod tests {
                 .live_lease_for_file("f1", Utc::now())
                 .map(|r| &r.token),
             Some(&first_token)
+        );
+    }
+
+    // ── the belt-and-braces reclaim for the pre-check's narrow race (#1690) ──
+
+    /// An authenticator that, as a side effect of authenticating, inserts a
+    /// live lease for `file_id` into the ledger at `ledger_path` — used to
+    /// simulate another process's `acquire` winning the race between this
+    /// attempt's lock-free pre-check and its own `insert_record`, which the
+    /// pre-check is not designed to close (only to make rare).
+    struct InsertsALiveLeaseDuringAuth {
+        ledger_path: PathBuf,
+        file_id: String,
+    }
+    impl Authenticator for InsertsALiveLeaseDuringAuth {
+        fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+            LeaseLedger::mutate_locked(&self.ledger_path, |ledger| {
+                ledger.insert(LeaseRecord {
+                    token: "racer".to_string(),
+                    file_id: self.file_id.clone(),
+                    version: "1".to_string(),
+                    modified_time: None,
+                    backup: LeaseBackup::DriveCopy {
+                        file_id: "racer-backup".to_string(),
+                    },
+                    acquired_at: Utc::now(),
+                    expires_at: Utc::now() + ChronoDuration::minutes(30),
+                    released_at: None,
+                    restored_at: None,
+                });
+            })
+            .unwrap();
+            AuthOutcome::Authorized
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_inserted_during_the_prompt_reclaims_this_attempts_bytes_backup() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "report.pdf", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let test_opts = opts(root.path());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &InsertsALiveLeaseDuringAuth {
+                ledger_path: test_opts.ledger_path.clone(),
+                file_id: test_opts.file_id.clone(),
+            },
+        )
+        .await;
+
+        let AcquireResult::AlreadyLeased { token, .. } = result else {
+            panic!("expected AlreadyLeased, got {result:?}");
+        };
+        assert_eq!(token, "racer");
+        assert!(
+            std::fs::read_dir(&test_opts.backup_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "this attempt's own now-orphaned backup must be reclaimed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_inserted_during_the_prompt_reclaims_this_attempts_native_backup() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"trashed": true}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-1", "name": "backup", "trashed": true,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &InsertsALiveLeaseDuringAuth {
+                ledger_path: test_opts.ledger_path.clone(),
+                file_id: test_opts.file_id.clone(),
+            },
+        )
+        .await;
+
+        let AcquireResult::AlreadyLeased { token, .. } = result else {
+            panic!("expected AlreadyLeased, got {result:?}");
+        };
+        assert_eq!(token, "racer");
+        // The PATCH mock's `.expect(1)` above is the real assertion:
+        // reclaiming this attempt's own orphaned Drive-copy backup means
+        // trashing it.
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reclamation_failure_is_audited_as_backup_orphaned_but_still_reports_already_leased()
+    {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "f1", "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet",
+                "version": "7"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &InsertsALiveLeaseDuringAuth {
+                ledger_path: test_opts.ledger_path.clone(),
+                file_id: test_opts.file_id.clone(),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, AcquireResult::AlreadyLeased { .. }));
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("already-leased-backup-orphaned")
+        );
+        assert_eq!(
+            rec.context.get("backup_location").map(String::as_str),
+            Some("copy-1")
         );
     }
 

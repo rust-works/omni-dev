@@ -104,10 +104,19 @@ fn is_drive_not_found(err: &anyhow::Error) -> bool {
     )
 }
 
-/// Deletes/trashes one candidate's backup. `Ok(())` means the row's backup
-/// is gone (deleted just now, or already absent) and the row may be
-/// dropped; an `Err` means it is left in place for a future prune.
-async fn clear_backup(files_api: &FilesApi<'_>, backup: &LeaseBackup) -> Result<()> {
+/// Deletes/trashes a backup by path/id: a local file for [`LeaseBackup::Bytes`]
+/// (`std::fs::remove_file`), a Drive Trash move for [`LeaseBackup::DriveCopy`]
+/// ([`FilesApi::trash`]). `Ok(())` means the backup is gone (deleted just
+/// now, or already absent); an `Err` means it is left in place.
+///
+/// Two callers: `prune`, for a row's backup once that row is a removal
+/// candidate, and `acquire::reclaim_backup`, for a backup an acquire
+/// attempt itself just took but that turned out to be referenced by no
+/// ledger row (issue #1690). Both callers hold the same invariant that
+/// makes deleting *by path* safe here: they only ever pass a backup they
+/// have just proven, by their own logic, to be unreferenced by any
+/// surviving ledger row — never one merely believed to be unused.
+pub(super) async fn clear_backup(files_api: &FilesApi<'_>, backup: &LeaseBackup) -> Result<()> {
     match backup {
         LeaseBackup::Bytes { path, .. } => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -140,14 +149,7 @@ fn account_removal(outcome: &mut PruneOutcome, backup: &LeaseBackup) {
 /// since the destructive step (the backup already cleared, or refused to
 /// be) has already happened by the time this is called.
 fn record_prune_attempt(rec: &LeaseRecord, verdict: &str, error: Option<String>) {
-    let (backup_location, backup_sha256, backup_size) = match &rec.backup {
-        LeaseBackup::Bytes { path, sha256, size } => (
-            Some(path.display().to_string()),
-            Some(sha256.clone()),
-            Some(*size),
-        ),
-        LeaseBackup::DriveCopy { file_id } => (Some(file_id.clone()), None, None),
-    };
+    let (backup_location, backup_sha256, backup_size) = rec.backup.audit_fields();
     let outcome = crate::request_log::AuditOutcome {
         command: vec!["drive".to_string(), "lease-prune".to_string()],
         integration: "drive",
