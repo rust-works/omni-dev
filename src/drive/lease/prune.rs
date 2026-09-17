@@ -402,6 +402,7 @@ mod tests {
             expires_at,
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         }
     }
 
@@ -418,6 +419,7 @@ mod tests {
             expires_at,
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         }
     }
 

@@ -427,6 +427,31 @@ fn print_restore_result(result: &RestoreResult) {
                 );
             }
         }
+        RestoreResult::SheetAlreadyRestored {
+            spreadsheet_id,
+            sheet_id,
+            sheet_title,
+            restored_at,
+            live_lease,
+        } => {
+            let when = restored_at.map_or_else(String::new, |at| format!(" on {at}"));
+            eprintln!(
+                "Refused: this backup's deleted sheet was already restored{when} into \
+                 spreadsheet {} as '{}' (id {sheet_id}), which is still there — restoring \
+                 again would only add a second copy. Delete that sheet first if you do want \
+                 another one. No fresh lease was minted, no Touch ID was spent.",
+                sanitize_for_terminal(spreadsheet_id),
+                sanitize_for_terminal(sheet_title)
+            );
+            if let Some(lease) = live_lease {
+                println!("{}", lease.token);
+                eprintln!(
+                    "That restore's own lease is still live (expires {}) — present it to \
+                     `--lease` rather than spending another prompt",
+                    lease.expires_at
+                );
+            }
+        }
         RestoreResult::NoSuchBackupToken => {
             eprintln!(
                 "Refused: no lease in this ledger was ever acquired with that token — check it \
@@ -708,6 +733,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&ledger_path).unwrap();
 
@@ -764,6 +790,25 @@ mod tests {
                 sheet_id: 999,
                 sheet_title: "Deleted".to_string(),
                 headless_waiver: false,
+            },
+            // Both halves of the #1689 refusal: with a live lease to name,
+            // and without one (the common case, once it has expired).
+            RestoreResult::SheetAlreadyRestored {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet_id: 999,
+                sheet_title: "Deleted".to_string(),
+                restored_at: Some(chrono::Utc::now()),
+                live_lease: Some(restore::LiveLease {
+                    token: "tok-6".to_string(),
+                    expires_at: chrono::Utc::now(),
+                }),
+            },
+            RestoreResult::SheetAlreadyRestored {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet_id: 999,
+                sheet_title: "Deleted".to_string(),
+                restored_at: None,
+                live_lease: None,
             },
             RestoreResult::NoSuchBackupToken,
             RestoreResult::NoTypedRestorePath {
@@ -1069,6 +1114,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::days(9),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&ledger_path).unwrap();
 
@@ -1120,6 +1166,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::hours(2),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.insert(crate::drive::lease::ledger::LeaseRecord {
             token: "new-token".to_string(),
@@ -1135,6 +1182,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&ledger_path).unwrap();
 
@@ -1183,6 +1231,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::days(9),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&ledger_path).unwrap();
 

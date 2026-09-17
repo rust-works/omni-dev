@@ -433,6 +433,7 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(ledger_path).unwrap();
         token
@@ -1048,6 +1049,7 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
             restored_at: None,
+            restored_sheet_id: None,
         });
         ledger.save(&ledger_path).unwrap();
 
