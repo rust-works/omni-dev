@@ -677,6 +677,19 @@ async fn structure_inner(
         return gated(StructureResult::WouldChange { sheet, sheet_count });
     }
 
+    // ── The request ────────────────────────────────────────────────────
+    // Built before the gate, not after: a sheet that resolved by title but
+    // reported no `sheetId` (a server contract violation `build_request`
+    // refuses on) is the one fallible step between here and the mutating
+    // call, and the gate must be the *last* fallible step before it (see
+    // `gate_leased_write`'s doc comment) — otherwise a request that was
+    // always going to fail to build would still fsync a `pending` audit
+    // record for a write that never happens (#1688).
+    let request = match build_request(&opts.verb, sheet.as_ref()) {
+        Ok(request) => request,
+        Err(detail) => return gated(StructureResult::Failed { detail }),
+    };
+
     // The lease check (ADR-0080 §9) sits here: after the permission gate
     // and the `--dry-run` branch, before the mutating call — see
     // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
@@ -707,12 +720,6 @@ async fn structure_inner(
         }
     } else {
         None
-    };
-
-    // ── The mutation ───────────────────────────────────────────────────
-    let request = match build_request(&opts.verb, sheet.as_ref()) {
-        Ok(request) => request,
-        Err(detail) => return gated(StructureResult::Failed { detail }),
     };
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
@@ -5185,5 +5192,55 @@ mod tests {
         // this write's `drivemutation` record carries, so an auditor can
         // see which verb ran without joining back to `log.jsonl`.
         assert_eq!(records[0].command, ["drive", "sheets-rename-sheet"]);
+    }
+
+    /// #1688: a sheet that resolved by title but reported no `sheetId` (a
+    /// server contract violation, see [`build_request_fails_rather_than_guessing_a_missing_sheet_id`])
+    /// is exactly the case `build_request` refuses on — and it must never
+    /// open a `pending` audit record for a write that can never be issued.
+    /// `build_request_fails_rather_than_guessing_a_missing_sheet_id` covers
+    /// the pure function; this covers the engine path through it, which was
+    /// untested before this fix (the bug this test guards against left the
+    /// `pending` record unconcluded).
+    #[tokio::test]
+    async fn a_missing_sheet_id_fails_before_opening_the_audit_pair() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"title": "Q2", "index": 0}}
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No batchUpdate mock mounted: `build_request`'s own missing-`sheetId`
+        // check is the one that must catch this, before any mutating call.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(rename(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        match outcome.result {
+            StructureResult::Failed { detail } => {
+                assert!(detail.contains("sheetId"), "{detail}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(audit.records().is_empty(), "{:?}", audit.records());
     }
 }

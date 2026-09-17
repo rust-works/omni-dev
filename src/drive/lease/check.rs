@@ -305,6 +305,15 @@ pub(crate) enum LeaseGateRefusal {
 /// it alive across the mutating call and into [`finish_leased_write`]/
 /// [`finish_leased_native_write`]) inside its [`LeaseGrant`], or the
 /// reason for refusal.
+///
+/// A caller must build its mutating request *before* calling this — this
+/// must be the last fallible step before the mutating call itself. A
+/// success here fsyncs the write-ahead `pending` audit record, and nothing
+/// else concludes it except the mutating call's own `allowed`/`failed`
+/// outcome; a fallible step still ahead of the caller (building the
+/// request, resolving its target) can refuse *after* that record is
+/// written, leaving it orphaned as though the process had died mid-write
+/// (#1688).
 pub(crate) async fn gate_leased_write(
     write: LeasedWrite<'_>,
     files_api: &FilesApi<'_>,
