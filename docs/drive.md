@@ -1688,7 +1688,7 @@ what it actually does today: deleting exactly one sheet is the one typed
 path it restores automatically, via `spreadsheets.sheets.copyTo` (see
 [Restore](#restore) below) — every other shape here (multiple sheets,
 rows, columns or a range) it only *locates* the copy for, restoring it
-into the live spreadsheet still a manual Drive-UI copy-back.
+into the live spreadsheet is still a manual Drive-UI copy-back.
 
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
 `--at`/`--count` (or the range bounds) must name rows/columns/cells that
