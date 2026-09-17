@@ -10,7 +10,9 @@
 //!
 //! - **Best effort.** [`record`] swallows every error (logging only at
 //!   `tracing::debug`); a logging failure can never change the program's exit
-//!   code. Honors `OMNI_DEV_LOG_DISABLE=1` for an absolute opt-out.
+//!   code. Honors `OMNI_DEV_LOG_DISABLE=1` for an absolute opt-out of this
+//!   log only — [`record_audit`]'s fail-closed sink is deliberately exempt
+//!   (see its own doc comment).
 //! - **No secrets.** Auth headers/tokens are never written; only a non-secret
 //!   `auth_principal` identity is kept. Headers are redacted centrally
 //!   ([`redact_headers`]), secret-bearing URL query/fragment parameter values
