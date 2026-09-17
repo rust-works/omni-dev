@@ -24,6 +24,8 @@ use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
+#[cfg(test)]
+use crate::drive::lease::ledger::LedgerLock;
 use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
 
 /// Per-call options for `drive lease acquire`.
@@ -1008,10 +1010,11 @@ mod tests {
         // ledger lock across this attempt's own `insert_record` — the
         // routine, non-race way `Failed` still follows a full backup
         // (issue #1690): the lock-free pre-check can't see this, since it
-        // takes no lock itself. The lock file is pre-created here, mirroring
-        // `LedgerLock`'s own `<ledger_path>.lock` naming, so
-        // `LedgerLock::acquire` fails exactly like it would against a
-        // genuinely concurrent holder.
+        // takes no lock itself. A held `LedgerLock`, not a bare
+        // `File::create` on the lock path (issue #1687): under `flock`,
+        // the file's mere existence holds nothing — only an actual lock
+        // does, and `flock` conflicts against a second `open()` even from
+        // this same process.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -1033,9 +1036,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
-        let mut lock_name = test_opts.ledger_path.as_os_str().to_owned();
-        lock_name.push(".lock");
-        std::fs::write(PathBuf::from(lock_name), b"").unwrap();
+        let _held = LedgerLock::acquire(&test_opts.ledger_path).unwrap();
 
         let result = acquire(
             &client,
