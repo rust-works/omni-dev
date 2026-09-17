@@ -181,14 +181,17 @@ pub(crate) fn parse_since(s: &str) -> Result<DateTime<Utc>> {
         .parse()
         .with_context(|| format!("invalid duration: {s} (expected e.g. 30m, 2h, 1d)"))?;
     let dur = match unit {
-        "s" => Duration::seconds(n),
-        "m" => Duration::minutes(n),
-        "h" => Duration::hours(n),
-        "d" => Duration::days(n),
-        "w" => Duration::weeks(n),
+        "s" => Duration::try_seconds(n),
+        "m" => Duration::try_minutes(n),
+        "h" => Duration::try_hours(n),
+        "d" => Duration::try_days(n),
+        "w" => Duration::try_weeks(n),
         other => bail!("invalid duration unit: {other} (use s, m, h, d, or w)"),
-    };
-    Ok(Utc::now() - dur)
+    }
+    .with_context(|| format!("invalid duration: {s} (out of range)"))?;
+    Utc::now()
+        .checked_sub_signed(dur)
+        .with_context(|| format!("invalid duration: {s} (out of range)"))
 }
 
 /// Parses an RFC3339 timestamp into UTC, or `None` if absent/unparseable.
@@ -585,6 +588,12 @@ mod tests {
         assert!(parse_time_bound("1w").is_ok());
         assert!(parse_time_bound("10x").is_err());
         assert!(parse_time_bound("h").is_err());
+    }
+
+    #[test]
+    fn since_rejects_oversized_duration() {
+        assert!(parse_since("100000000d").is_err()); // subtraction overflow
+        assert!(parse_since("9999999999999999w").is_err()); // construction overflow
     }
 
     #[test]
