@@ -408,6 +408,138 @@ pub fn audit_file_path() -> Option<PathBuf> {
         .or_else(default_audit_file_path)
 }
 
+/// Collapses `.`/`..` components **syntactically**, with no filesystem
+/// access — so `a/sub/../b` becomes `a/b` even when `sub` does not exist on
+/// disk. [`normalize`] needs this pass before it ever calls
+/// [`std::fs::canonicalize`]: canonicalizing a parent directory (its
+/// fallback for a path that doesn't exist yet) itself requires that parent
+/// to exist, and a `..` segment routed through a nonexistent intermediate
+/// directory would otherwise never resolve — exactly the `..`-spelling
+/// [`same_file()`] exists to catch. A leading `..` (or one immediately after
+/// a root/prefix) has nothing to pop, so it is kept as-is.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Bounds how many symlinks [`normalize`] follows by hand, purely so a
+/// symlink cycle can't loop forever; a real cycle already fails
+/// `canonicalize` and is vanishingly unlikely to matter here, but the
+/// budget makes termination structural rather than assumed.
+const MAX_HAND_FOLLOWED_SYMLINK_HOPS: u32 = 8;
+
+/// Resolves `path` as close to a canonical form as possible without
+/// requiring it to exist. Lexically collapses `.`/`..` first
+/// ([`lexically_normalize`]), then tries [`std::fs::canonicalize`] (an
+/// existing file, with every symlink in the chain followed); a target that
+/// does not exist yet fails that outright, so a symlink is then followed by
+/// hand — load-bearing for a `OMNI_DEV_LOG_FILE` symlink whose target
+/// `audit.jsonl` has not been created yet, since a plain "canonicalize the
+/// parent" would otherwise compare the link's own name against the target's
+/// and answer "different" right up until the first write creates the target
+/// through the link. Falls back to canonicalizing the parent and rejoining
+/// the file name, and finally to the lexically-normalized path unchanged
+/// when even that has nothing to canonicalize (`file_name()` is `None` for
+/// `/`, `.`, a bare `..`, …).
+///
+/// This only exists for [`same_file()`]'s not-yet-existing-target fallback —
+/// when both paths already exist, `same_file::is_same_file` handles
+/// symlinks (and Windows file identity) itself and this is never reached.
+fn normalize(path: &Path) -> PathBuf {
+    normalize_with_budget(&lexically_normalize(path), MAX_HAND_FOLLOWED_SYMLINK_HOPS)
+}
+
+/// The recursive body of [`normalize`]. `path` is always already lexically
+/// normalized on entry (both the initial call and the recursive one below
+/// maintain that). Each `if let Ok(..)` below falls through to the next,
+/// weaker resolution strategy on any error — expected and unremarkable here
+/// (`NotFound` is the common case, since this only runs once
+/// `same_file::is_same_file` has already failed to resolve one side), so
+/// none of them are worth logging.
+fn normalize_with_budget(path: &Path, hops: u32) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    if hops > 0 {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(path) {
+                    let resolved = if target.is_absolute() {
+                        target
+                    } else {
+                        path.parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(target)
+                    };
+                    return normalize_with_budget(&lexically_normalize(&resolved), hops - 1);
+                }
+            }
+        }
+    }
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::canonicalize(parent) {
+        Ok(canon_parent) => canon_parent.join(file_name),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Whether `a` and `b` name the same file, robust to `..` segments,
+/// relative-vs-absolute spellings, and symlinks — unlike a raw `PathBuf`
+/// compare, which [`record_audit`]'s collision guard used to rely on and
+/// which all three pass straight through.
+///
+/// Delegates to the [`same_file`](mod@same_file) crate's `is_same_file`
+/// first — real file-identity comparison (inode on unix, a file handle on
+/// Windows), rather than a hand-rolled `(dev, ino)` check that would have
+/// no non-unix equivalent. That call requires both paths to exist, though,
+/// so it fails for the case that actually motivated this function: a
+/// `OMNI_DEV_LOG_FILE` symlink whose target `audit.jsonl` has not been
+/// created yet. [`normalize`] is the fallback for exactly that gap.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if let Ok(same) = same_file::is_same_file(a, b) {
+        return same;
+    }
+    normalize(a) == normalize(b)
+}
+
+/// Whether `path` resolves to the same file as [`audit_file_path`] — the
+/// check [`prune`] and [`append_with_rotation`] refuse on, so neither
+/// destructive operation can be pointed at the fail-closed audit sink by a
+/// `..`-spelled, relative, or symlinked `OMNI_DEV_LOG_FILE` (ADR-0080 §11).
+///
+/// Both callers check this once, before reading/rewriting `path`, not
+/// through a handle held across the whole operation — a symlink at `path`
+/// repointed to the audit file in the narrow window between this check and
+/// the subsequent read still slips through (an attacker able to time that
+/// swap already needs write access to the log directory, i.e. this same
+/// user's own account). This narrows that window, it does not close it —
+/// the same "narrows, does not close" shape as
+/// [`crate::daemon::paths::try_lock_file_exclusive`]'s own inode re-check.
+fn resolves_to_audit_file(path: &Path) -> bool {
+    audit_file_path().is_some_and(|audit| same_file(path, &audit))
+}
+
 /// Release builds have no per-thread override.
 #[cfg(not(test))]
 fn test_audit_file_override() -> Option<PathBuf> {
@@ -548,9 +680,15 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// keeps.
 ///
 /// Refuses outright if `entry.kind` isn't [`RecordKind::Audit`], or if
-/// [`audit_file_path`] resolves to the same path as [`log_file_path`] (an env
+/// [`audit_file_path`] resolves to the same file as [`log_file_path`] (an env
 /// override misconfiguration that would otherwise silently blend the
-/// fail-closed sink into the best-effort, prunable one).
+/// fail-closed sink into the best-effort, prunable one) — compared via
+/// [`same_file()`], not a raw path equality, so a `..` segment, a
+/// relative-vs-absolute spelling, or a symlink can't slip past the check.
+/// This only stops the write *into* the request log; it does not stop the
+/// reverse (`OMNI_DEV_LOG_FILE` naming the audit file lets best-effort
+/// records land there too) — see [`prune`] and [`append_with_rotation`] for
+/// the guards that protect the audit file itself.
 ///
 /// The appended line is `fsync`ed (`sync_data`, then the parent directory
 /// on unix so a freshly created file's entry is durable too) before this
@@ -572,7 +710,7 @@ pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
     let path = audit_file_path().context("could not resolve the audit log file path")?;
     if let Some(log_path) = log_file_path() {
         ensure!(
-            path != log_path,
+            !same_file(&path, &log_path),
             "the audit log path resolves to the same file as the request log ({}); set \
              OMNI_DEV_AUDIT_LOG_FILE and/or OMNI_DEV_LOG_FILE to distinct paths",
             path.display()
@@ -844,9 +982,20 @@ fn rotate(path: &Path, keep_files: u32) -> anyhow::Result<()> {
 /// itself rotated — stat the log, rotate if this line would push a non-empty
 /// file past the cap, then append to the (possibly fresh) file. A rotation
 /// failure is logged at debug and the line is still appended (best effort).
+///
+/// Never rotates when `path` [resolves to the audit
+/// file](resolves_to_audit_file) — checked first, before the `<path>.lock`
+/// sibling below is created next to it — falling back to the plain
+/// never-rotates append instead (ADR-0080 §11). The line is still appended:
+/// this only withholds rotation, matching [`record`]'s best-effort, always
+/// try to write it contract.
 #[cfg(unix)]
 fn append_with_rotation(path: &Path, line: &str, cfg: &RotationConfig) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
+
+    if resolves_to_audit_file(path) {
+        return append_line_no_rotation(path, line);
+    }
 
     let lock_path = sibling(path, ".lock");
     let lock_file = std::fs::OpenOptions::new()
@@ -910,8 +1059,23 @@ pub struct PruneOutcome {
 /// atomically renamed over the original, so a reader never sees a half-written
 /// file. A missing log is a no-op; a no-change prune skips the rewrite (leaving
 /// the file's inode — and any concurrent appends — untouched).
+///
+/// Refuses outright when `path` [resolves to the audit file](resolves_to_audit_file)
+/// — regardless of who computed `path`, since `--audit`'s own refusal
+/// (`src/cli/log/prune.rs`) only catches that one flag, not a
+/// `OMNI_DEV_LOG_FILE` override spelled to name `audit.jsonl` directly, via
+/// `..`, or via a symlink. Exemption from pruning is the point (ADR-0080
+/// §11); this applies even under `dry_run`, since `omni-dev log --audit` is
+/// the supported way to read the file.
 pub fn prune(path: &Path, opts: &PruneOptions) -> anyhow::Result<PruneOutcome> {
     use anyhow::Context as _;
+
+    anyhow::ensure!(
+        !resolves_to_audit_file(path),
+        "refusing to prune {}: it resolves to the audit log, which is exempt from pruning by \
+         design (ADR-0080 §11); read it with `omni-dev log --audit` instead",
+        path.display()
+    );
 
     let data = match std::fs::read(path) {
         Ok(data) => data,
@@ -3552,6 +3716,108 @@ mod tests {
         assert!(parse_size(&"9".repeat(400)).is_err());
     }
 
+    // --- same_file / normalize / lexically_normalize (issue #1694) ---
+
+    #[test]
+    fn same_file_matches_identical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        assert!(same_file(&path, &path));
+    }
+
+    #[test]
+    fn same_file_matches_a_dot_dot_spelling_routed_through_a_nonexistent_directory() {
+        // `metadata` fails for the dotted spelling (it must traverse the
+        // nonexistent `sub` to apply `..`), forcing the fallback through
+        // `lexically_normalize`, which collapses the `..` with no filesystem
+        // access before canonicalizing what remains.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        std::fs::write(&audit, "{}\n").unwrap();
+        let dotted = dir.path().join("sub/../audit.jsonl");
+        assert!(same_file(&audit, &dotted));
+    }
+
+    #[test]
+    fn same_file_matches_a_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("audit.jsonl");
+        std::fs::write(&original, "{}\n").unwrap();
+        let linked = dir.path().join("linked.jsonl");
+        std::fs::hard_link(&original, &linked).unwrap();
+        assert!(same_file(&original, &linked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_matches_a_symlink_to_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("audit.jsonl");
+        std::fs::write(&original, "{}\n").unwrap();
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        assert!(same_file(&original, &link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_matches_a_symlink_to_a_not_yet_existing_target() {
+        // `fs::metadata` follows symlinks, so a link whose target does not
+        // exist yet fails both `metadata` calls; the fallback must resolve
+        // the link by hand rather than comparing the link's own name against
+        // the target's, which would answer "different" right up until the
+        // first write creates the target through the link.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("audit.jsonl"); // never created
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(same_file(&target, &link));
+    }
+
+    #[test]
+    fn same_file_rejects_two_distinct_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        assert!(!same_file(&a, &b));
+    }
+
+    #[test]
+    fn same_file_rejects_two_distinct_paths_that_both_do_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        assert!(!same_file(&a, &b));
+    }
+
+    #[test]
+    fn lexically_normalize_collapses_dot_dot_without_touching_disk() {
+        assert_eq!(
+            lexically_normalize(Path::new("a/sub/../b")),
+            PathBuf::from("a/b")
+        );
+        assert_eq!(
+            lexically_normalize(Path::new("./a/./b")),
+            PathBuf::from("a/b")
+        );
+        // A leading `..` has nothing to pop, and must be kept rather than
+        // dropped or turned into an error.
+        assert_eq!(
+            lexically_normalize(Path::new("../a")),
+            PathBuf::from("../a")
+        );
+    }
+
+    #[test]
+    fn normalize_returns_the_lexical_form_unchanged_when_there_is_nothing_left_to_canonicalize() {
+        // An empty path has no file name and does not canonicalize; the
+        // defensive fallback must return it unchanged rather than panicking
+        // on a `None` `file_name()`.
+        assert_eq!(normalize(Path::new("")), PathBuf::new());
+    }
+
     #[test]
     fn prune_surfaces_a_read_error() {
         // Reading a directory as the log yields an error other than NotFound,
@@ -3566,6 +3832,106 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prune_refuses_the_audit_file_by_direct_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let audit_path = dir.path().join("audit.jsonl");
+        std::fs::write(&audit_path, "{}\n").unwrap();
+
+        let err = prune(
+            &audit_path,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: false,
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+        assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn prune_refuses_a_dot_dot_spelling_of_the_audit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let audit_path = dir.path().join("audit.jsonl");
+        std::fs::write(&audit_path, "{}\n").unwrap();
+        let dotted = dir.path().join("sub/../audit.jsonl");
+
+        let err = prune(
+            &dotted,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: false,
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+        assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn prune_refuses_the_audit_file_even_under_dry_run() {
+        // Exemption from pruning is the point, and `omni-dev log --audit` is
+        // the supported way to read the file — a read-only dry run is not a
+        // carve-out.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let audit_path = dir.path().join("audit.jsonl");
+        std::fs::write(&audit_path, "{}\n").unwrap();
+
+        let err = prune(
+            &audit_path,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: true,
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_with_rotation_refuses_to_rotate_the_audit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let audit_path = dir.path().join("audit.jsonl");
+        // Seed a file already over the cap so a request-log path would rotate.
+        std::fs::write(&audit_path, "0123456789012345\n").unwrap();
+        let cfg = RotationConfig {
+            max_size: 5,
+            keep_files: 1,
+        };
+
+        append_with_rotation(&audit_path, "new-line\n", &cfg).unwrap();
+
+        assert!(
+            !sibling(&audit_path, ".1").exists(),
+            "the audit file must never be rotated"
+        );
+        assert!(
+            !sibling(&audit_path, ".lock").exists(),
+            "a refused rotation must not create a lock file next to the audit file"
+        );
+        assert!(
+            std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .contains("new-line"),
+            "the line is still appended (best effort)"
+        );
     }
 
     #[cfg(unix)]
