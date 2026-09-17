@@ -9,8 +9,10 @@ search/read/dedupe; rename/move need the opt-in `drive.metadata` scope
 covers `files.update` on `name`/`parents` only, with no file-content access
 at all. Content mutation needs a broader grant still: `--write-file`
 (`drive.file`, app-created files only) or `--write-full` (the unrestricted
-`drive` scope, needed to edit any pre-existing file). There is still no
-trash/share/permission-mutation capability anywhere in this surface.
+`drive` scope, needed to edit any pre-existing file). `drive lease prune`
+has a trash capability now ([`FilesApi::trash`](#lease), see
+[Prune](#prune)); share/permission-mutation is still absent anywhere in
+this surface.
 
 **Move is security-gated.** Moving a file can change who can see it — Drive
 resolves a file's effective visibility from both direct permissions on the
@@ -1654,9 +1656,10 @@ omni-dev drive sheets delete-range <ID> --sheet Q2 \
   --start-row 2 --end-row 4 --start-column 2 --end-column 3 --shift rows
 ```
 
-Every real (non-`--dry-run`) delete says how to recover, since there is no
-`files.delete` or undo anywhere in this integration. The `--lease` these
-verbs require ([ADR-0080](adrs/adr-0080.md) §9) backed the whole
+Every real (non-`--dry-run`) delete says how to recover — there is still
+no `files.delete` in this integration, and `drive lease restore` (below)
+is only a partial undo. The `--lease` these verbs require
+([ADR-0080](adrs/adr-0080.md) §9) backed the whole
 spreadsheet up as a Drive copy when it was acquired, so that copy — named
 by its file id, not Drive's own version history — is the primary recovery
 path:
@@ -1681,10 +1684,11 @@ recovery path`` rather than pointing at a copy that does not exist. The
 `--output json` outcome carries the same copy as a `backup` field
 (`{"kind": "drive_copy", "file_id": …}`), omitted when none was taken.
 `drive lease restore` ([ADR-0080](adrs/adr-0080.md) §10) is named here for
-what it actually does today: for a native document like this one, it only
-*locates* the copy (no typed sheet-restore path exists yet, see
-[Restore](#restore) below) — restoring it into the live spreadsheet is
-still a manual Drive-UI copy-back.
+what it actually does today: deleting exactly one sheet is the one typed
+path it restores automatically, via `spreadsheets.sheets.copyTo` (see
+[Restore](#restore) below) — every other shape here (multiple sheets,
+rows, columns or a range) it only *locates* the copy for, restoring it
+into the live spreadsheet still a manual Drive-UI copy-back.
 
 The same bounds-checking as `insert-rows`/`insert-columns` applies, inverted:
 `--at`/`--count` (or the range bounds) must name rows/columns/cells that
