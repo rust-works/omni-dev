@@ -70,9 +70,16 @@ impl Spreadsheet {
     /// future change to what counts as "the same title" (e.g.
     /// case-insensitive) lands in one place rather than drifting between
     /// two hand-written copies.
+    ///
+    /// A sheet with no `properties` never matches, not even `""` — it has no
+    /// title at all, so `Sheet::title()`'s `""` fallback (meant for display)
+    /// would otherwise falsely collide with an explicit empty-title request.
     #[must_use]
     pub fn has_sheet_titled(&self, title: &str) -> bool {
-        self.sheets.iter().any(|sheet| sheet.title() == title)
+        self.sheets
+            .iter()
+            .filter_map(|sheet| sheet.properties.as_ref())
+            .any(|props| props.title == title)
     }
 }
 
@@ -1109,6 +1116,23 @@ mod tests {
         let parsed: Spreadsheet = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(parsed.title(), "");
         assert!(parsed.sheet_titles().is_empty());
+    }
+
+    #[test]
+    fn has_sheet_titled_skips_a_property_less_sheet() {
+        // A sheet with no `properties` must never match, not even "" — it
+        // has no title at all, unlike `Sheet::title()`'s `""` display
+        // fallback (issue #1702).
+        let json = serde_json::json!({
+            "sheets": [
+                {},
+                {"properties": {"title": "Q1"}},
+            ],
+        });
+        let parsed: Spreadsheet = serde_json::from_value(json).unwrap();
+        assert!(!parsed.has_sheet_titled(""));
+        assert!(parsed.has_sheet_titled("Q1"));
+        assert!(!parsed.has_sheet_titled("nonexistent"));
     }
 
     #[test]
