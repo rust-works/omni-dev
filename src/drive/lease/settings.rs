@@ -131,6 +131,20 @@ pub(crate) fn resolve_expiry_minutes(
     Ok(value)
 }
 
+/// Resolves `dir` to an absolute path against the current working
+/// directory, without touching the filesystem or requiring `dir` to exist —
+/// a relative `--backup-dir`/env/settings.json value must not be stored
+/// relative in the ledger, since a later `prune`/`restore` can run from a
+/// different cwd (issue #1692).
+fn absolutize(dir: PathBuf) -> Result<PathBuf> {
+    std::path::absolute(&dir).with_context(|| {
+        format!(
+            "Failed to resolve backup directory {} to an absolute path",
+            dir.display()
+        )
+    })
+}
+
 /// Resolves `--backup-dir`.
 pub(crate) fn resolve_backup_dir(
     explicit: Option<PathBuf>,
@@ -138,13 +152,13 @@ pub(crate) fn resolve_backup_dir(
     settings: &LeaseSettings,
 ) -> Result<PathBuf> {
     if let Some(dir) = explicit {
-        return Ok(dir);
+        return absolutize(dir);
     }
     if let Some(dir) = non_empty_var(env, LEASE_BACKUP_DIR_ENV) {
-        return Ok(PathBuf::from(dir));
+        return absolutize(PathBuf::from(dir));
     }
     if let Some(dir) = settings.backup_dir.clone() {
-        return Ok(dir);
+        return absolutize(dir);
     }
     default_backup_dir()
 }
@@ -314,6 +328,39 @@ mod tests {
     fn backup_dir_falls_back_to_hardcoded_default() {
         let resolved = resolve_backup_dir(None, &MapEnv::new(), &settings()).unwrap();
         assert!(resolved.ends_with("omni-dev/drive-backups"));
+    }
+
+    #[test]
+    fn backup_dir_explicit_relative_is_absolutized() {
+        let resolved = resolve_backup_dir(
+            Some(PathBuf::from("relative/cli")),
+            &MapEnv::new(),
+            &settings(),
+        )
+        .unwrap();
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.ends_with("relative/cli"), "{}", resolved.display());
+    }
+
+    #[test]
+    fn backup_dir_env_relative_is_absolutized() {
+        let env = MapEnv::new().with(LEASE_BACKUP_DIR_ENV, "relative/env");
+        let resolved = resolve_backup_dir(None, &env, &settings()).unwrap();
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.ends_with("relative/env"), "{}", resolved.display());
+    }
+
+    #[test]
+    fn backup_dir_settings_relative_is_absolutized() {
+        let mut s = settings();
+        s.backup_dir = Some(PathBuf::from("relative/settings"));
+        let resolved = resolve_backup_dir(None, &MapEnv::new(), &s).unwrap();
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(
+            resolved.ends_with("relative/settings"),
+            "{}",
+            resolved.display()
+        );
     }
 
     // ── resolve_auth_policy ──
