@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -317,54 +318,136 @@ fn lock_path_for(ledger_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// An advisory, call-scoped lock (`create_new`, so two processes racing to
-/// create it see exactly one winner) guarding against two overlapping
-/// `drive lease acquire`/leased-write invocations against the same ledger:
+/// Env var overriding [`default_lock_wait_timeout`]. Value is whole
+/// seconds; a missing, non-numeric, or non-positive value falls back to the
+/// derived default.
+const LEASE_LOCK_WAIT_ENV_VAR: &str = "OMNI_DEV_LEASE_LOCK_WAIT_SECS";
+
+/// How long [`LedgerLock::acquire_waiting`] waits for a busy lock before
+/// giving up, absent [`LEASE_LOCK_WAIT_ENV_VAR`].
+///
+/// Derived from [`crate::utils::http::read_timeout`] rather than a fixed
+/// constant: a held lock can legitimately span several HTTP round trips
+/// (`drive lease restore`'s `copyTo`, `edit_content`,
+/// `rename_back_if_free` and a final `files.get`), and that timeout
+/// resets on every successful read — a hardcoded wait budget here would
+/// start producing spurious timeouts the moment the HTTP timeout is
+/// tuned up. The ×4 headroom covers a restore's several sequential calls
+/// against one read-timeout budget.
+fn default_lock_wait_timeout() -> Duration {
+    crate::utils::settings::get_env_var(LEASE_LOCK_WAIT_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or_else(
+            || crate::utils::http::read_timeout() * 4,
+            Duration::from_secs,
+        )
+}
+
+/// An advisory lock guarding against two overlapping `drive lease
+/// acquire`/leased-write invocations against the same ledger:
 /// [`LeaseLedger::save`] rewrites the whole file, so a second call's
 /// rewrite racing the first would silently discard whichever lease state
-/// lost the race. Held for the call's duration and removed on drop —
-/// mirrors `gmail insert`'s `LedgerLock` exactly.
+/// lost the race.
+///
+/// Backed by [`crate::daemon::paths::FileLock`] (`flock(2)` on Unix):
+/// kernel-released on process death, so — unlike the `create_new` marker
+/// this replaced — a crashed or SIGKILLed holder never leaves a stale
+/// lock, and `Drop` never unlinks the lock file. That matters: the old
+/// Drop-unlinks-by-path shape let a second acquirer's "remove the lock
+/// file and retry" (issued while the first holder was still live) create
+/// a new marker that the first holder's own `Drop` would then delete by
+/// path with no identity check, reopening a lease-token double-spend
+/// (issue #1687). Nothing in this module ever tells an operator to delete
+/// this file.
 #[derive(Debug)]
 pub(crate) struct LedgerLock {
-    path: PathBuf,
+    #[allow(dead_code)] // Held only for its Drop (releases the flock); never read.
+    inner: crate::daemon::paths::FileLock,
 }
 
 impl LedgerLock {
-    /// Acquires the lock guarding `ledger_path`. Production code passes
-    /// [`ledger_path`]'s own result; tests pass a path under a `tempdir` so
-    /// they never touch the real ledger or its lock.
+    /// Acquires the lock guarding `ledger_path` without waiting. Production
+    /// code passes [`ledger_path`]'s own result; tests pass a path under a
+    /// `tempdir` so they never touch the real ledger or its lock. Used by
+    /// the best-effort `mark_backup_restored` path and by `prune`'s
+    /// candidate-selection scan, neither of which should block on another
+    /// operation.
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
-        crate::daemon::paths::create_new_file_0600(&path).map_err(|err| {
-            // Distinguish a genuine collision (the lock file already
-            // existed) from the file being created fine but the follow-up
-            // `fchmod` safety net failing — the latter is an unrelated
-            // permissions/filesystem problem that "remove the stale lock
-            // and retry" would misdiagnose (issue #1664 review finding).
-            if crate::daemon::paths::is_already_exists_error(&err) {
-                err.context(format!(
-                    "another `drive lease` operation appears to already be in progress ({} \
-                     exists) — concurrent access would clobber the ledger. If you're sure no \
-                     other operation is active (e.g. after a crash), remove the lock file and \
-                     retry",
-                    path.display()
-                ))
-            } else {
-                err.context(format!(
-                    "failed to create the lease lock file at {} — the file did not already \
-                     exist, so this is not a stale lock; check filesystem permissions",
-                    path.display()
-                ))
-            }
-        })?;
-        Ok(Self { path })
+        match crate::daemon::paths::try_lock_file_exclusive(&path) {
+            Ok(inner) => Ok(Self { inner }),
+            Err(crate::daemon::paths::FileLockError::Busy) => anyhow::bail!(
+                "another `drive lease` operation appears to already be in progress ({} is \
+                 locked) — concurrent access would clobber the ledger",
+                path.display()
+            ),
+            Err(crate::daemon::paths::FileLockError::Io(err)) => Err(err.context(format!(
+                "failed to lock the lease lock file at {}",
+                path.display()
+            ))),
+        }
     }
-}
 
-impl Drop for LedgerLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    /// [`Self::acquire`], but waits for a busy lock instead of refusing
+    /// immediately — used by every leased write via
+    /// [`super::check::check_and_lock_lease`], where a concurrent write to
+    /// an *unrelated* file should queue rather than hard-fail (issue
+    /// #1687 point 1; the lock remains ledger-global, so this only
+    /// changes hard-fail into wait, it does not add per-file scope).
+    /// Polls with capped exponential backoff and emits a one-line notice
+    /// on the first collision, so a human waiting on the CLI knows why
+    /// nothing is happening yet.
+    pub(crate) async fn acquire_waiting(ledger_path: &Path) -> Result<Self> {
+        Self::acquire_waiting_with_timeout(ledger_path, default_lock_wait_timeout()).await
+    }
+
+    /// [`Self::acquire_waiting`] with an explicit wait budget — the seam
+    /// that lets tests exercise the timeout in milliseconds without
+    /// mutating the process environment.
+    pub(crate) async fn acquire_waiting_with_timeout(
+        ledger_path: &Path,
+        max_wait: Duration,
+    ) -> Result<Self> {
+        let path = lock_path_for(ledger_path);
+        crate::daemon::paths::ensure_parent_dir_0700(&path)?;
+
+        let start = std::time::Instant::now();
+        let mut delay = Duration::from_millis(50);
+        let mut announced = false;
+        loop {
+            match crate::daemon::paths::try_lock_file_exclusive(&path) {
+                Ok(inner) => return Ok(Self { inner }),
+                Err(crate::daemon::paths::FileLockError::Busy) => {
+                    if !announced {
+                        tracing::info!(
+                            "drive lease: waiting for another `drive lease` operation to \
+                             finish ({} is locked)",
+                            path.display()
+                        );
+                        announced = true;
+                    }
+                    if start.elapsed() >= max_wait {
+                        anyhow::bail!(
+                            "timed out after {max_wait:?} waiting for another `drive lease` \
+                             operation to finish ({} is locked) — concurrent access would \
+                             clobber the ledger",
+                            path.display()
+                        );
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(crate::daemon::paths::FileLockError::Io(err)) => {
+                    return Err(err.context(format!(
+                        "failed to lock the lease lock file at {}",
+                        path.display()
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -561,26 +644,6 @@ mod tests {
     }
 
     #[test]
-    fn ledger_lock_acquire_refuses_while_held() {
-        // Exercises the lock against an explicit path rather than the real
-        // state dir, by constructing the lock file directly — mirrors
-        // `LedgerLock`'s own `create_new` semantics without depending on
-        // `dirs::state_dir()` in a test.
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("held.lock");
-        let _held = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .unwrap();
-        let second = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path);
-        assert!(second.is_err());
-    }
-
-    #[test]
     fn ledger_lock_acquire_creates_a_missing_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("nested").join("lease-ledger.jsonl");
@@ -611,6 +674,14 @@ mod tests {
     fn ledger_lock_acquire_reports_a_non_collision_failure_distinctly() {
         use std::os::unix::fs::PermissionsExt;
 
+        // A permission failure only arises from the lock file's *first*
+        // creation (a persistent lock file needs dir-write only then) —
+        // exercised here against a lock path that does not yet exist, in a
+        // directory with no write permission, so `open(..., O_CREAT)`
+        // itself fails rather than the `flock` call. That makes it
+        // structurally distinct from `FileLockError::Busy` (which only
+        // ever comes from a contended `flock`), not merely a different
+        // message.
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -619,7 +690,11 @@ mod tests {
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(err.to_string().contains("not a stale lock"), "{err:?}");
+        assert!(err.to_string().contains("failed to lock"), "{err:?}");
+        assert!(
+            !err.to_string().contains("already be in progress"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -673,19 +748,85 @@ mod tests {
     }
 
     #[test]
-    fn ledger_lock_removes_its_file_on_drop() {
+    fn ledger_lock_file_persists_after_drop_and_is_re_lockable() {
+        // Unlike the old `create_new` marker, `Drop` must not unlink the
+        // lock file — a holder unlinking-by-path is exactly what let a
+        // second acquirer's marker be deleted out from under it (issue
+        // #1687 point 2). The file staying put is what makes that
+        // impossible; what actually releases the lock is the flock itself.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("held.lock");
-        {
-            let lock = LedgerLock { path: path.clone() };
-            assert!(!path.exists());
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .unwrap();
-            drop(lock);
-        }
-        assert!(!path.exists());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let lock_path = dir.path().join("lease-ledger.jsonl.lock");
+
+        let lock = LedgerLock::acquire(&ledger_path).unwrap();
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "the lock file must survive its own drop"
+        );
+
+        // And immediately re-lockable — no stale-lock error, no leftover
+        // exclusion.
+        LedgerLock::acquire(&ledger_path).unwrap();
+    }
+
+    #[test]
+    fn ledger_lock_is_released_by_plain_fd_close_with_no_explicit_unlock() {
+        // The direct regression test for issue #1687 point 3: a SIGKILLed
+        // holder never runs `Flock`'s own `Drop` (which issues an explicit
+        // `LOCK_UN`) — the kernel just closes its file descriptors. Locking
+        // via the deprecated free `flock()` function (rather than the
+        // `Flock<T>` RAII wrapper) and then dropping the plain `File`
+        // reproduces exactly that: the fd closes via ordinary `File::drop`,
+        // with no explicit unlock call ever issued, and the lock must still
+        // be gone afterwards.
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let lock_path = dir.path().join("lease-ledger.jsonl.lock");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        #[allow(deprecated)]
+        nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive).unwrap();
+        drop(file);
+
+        LedgerLock::acquire(&ledger_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ledger_lock_acquire_waiting_waits_for_a_concurrent_holder_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+
+        LedgerLock::acquire_waiting_with_timeout(&ledger_path, Duration::from_secs(5))
+            .await
+            .unwrap();
+        releaser.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ledger_lock_acquire_waiting_times_out_when_never_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let _held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let err =
+            LedgerLock::acquire_waiting_with_timeout(&ledger_path, Duration::from_millis(150))
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:?}");
     }
 }

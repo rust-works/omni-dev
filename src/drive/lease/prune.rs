@@ -192,15 +192,17 @@ fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
 /// dropping each removed row together with the backup it points at.
 ///
 /// The ledger lock is held only briefly, not for this whole call: once to
-/// decide the removal candidates (below), then once per row (via
-/// [`LeaseLedger::mutate_locked`]) to persist that row's own removal —
-/// mirroring the brief load-mutate-save hold every other lease command
-/// uses, rather than one continuous lock for a potentially long batch of
-/// sequential Drive `trash` calls. Nothing else in this codebase ever
-/// removes a ledger row, so re-removing a candidate's token by name from
-/// whatever the ledger looks like at that later moment is always safe,
-/// even if a concurrent `acquire`/`restore` changed unrelated rows in the
-/// gap between the snapshot and this row's own turn.
+/// decide the removal candidates (below), then once per row, held across
+/// both that row's backup deletion *and* its ledger removal (issue #1687
+/// point 4 — the lock is taken before the backup is touched, so a
+/// collision leaves the row and its backup both untouched rather than
+/// stranding one without the other) — rather than one continuous lock for
+/// a potentially long batch of sequential Drive `trash` calls. Nothing
+/// else in this codebase ever removes a ledger row, so re-removing a
+/// candidate's token by name from whatever the ledger looks like at that
+/// later moment is always safe, even if a concurrent `acquire`/`restore`
+/// changed unrelated rows in the gap between the snapshot and this row's
+/// own turn.
 pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOutcome> {
     let now = Utc::now();
 
@@ -269,6 +271,34 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
 
     let files_api = FilesApi::new(client);
     for rec in &removed {
+        // Secure the lock *before* touching the backup (issue #1687 point
+        // 4) and hold it across both the backup deletion and the ledger
+        // removal below, via `LeaseLedger::mutate` — never `mutate_locked`,
+        // which would try to acquire this same lock again and self-deadlock
+        // (`flock` conflicts against a second `open()` in the *same*
+        // process, even from the same caller). A collision here is fully
+        // recoverable: nothing has been deleted yet, so this row is simply
+        // left for a future prune, exactly like a `clear_backup` failure
+        // below — unlike the crash window `LeaseLedger::mutate`'s own
+        // failure (after the backup import *is* already gone) can still
+        // strand a row, which is a separate, unavoidable failure mode
+        // across two storage systems, not a locking bug.
+        let lock = match LedgerLock::acquire(&opts.ledger_path) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!(
+                    "drive lease prune: failed to lock the ledger to remove lease {} (file \
+                     {}): {err:#}; leaving it for a future prune",
+                    rec.token,
+                    rec.file_id
+                );
+                record_prune_attempt(rec, "prune-failed", Some(err.to_string()));
+                outcome.failed += 1;
+                outcome.kept += 1;
+                continue;
+            }
+        };
+
         match clear_backup(&files_api, &rec.backup).await {
             Ok(()) => {
                 // The backup is already gone (or was found already gone),
@@ -281,14 +311,13 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
                 // silently leaving a dangling row: name the stranded token
                 // and stop, rather than compounding the same failure
                 // across every remaining candidate.
-                if let Err(err) = LeaseLedger::mutate_locked(&opts.ledger_path, |ledger| {
+                if let Err(err) = LeaseLedger::mutate(&opts.ledger_path, |ledger| {
                     ledger.remove(&rec.token);
                 }) {
                     return Err(err.context(format!(
                         "drive lease prune: cleared the backup for lease {} but failed to \
                          persist its ledger removal — that row may now dangle, pointing at a \
-                         backup that no longer exists; remove it from the ledger by hand once \
-                         the underlying issue is fixed",
+                         backup that no longer exists; remove it from the ledger by hand",
                         rec.token
                     )));
                 }
@@ -307,6 +336,7 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
                 outcome.kept += 1;
             }
         }
+        drop(lock);
     }
 
     Ok(outcome)
@@ -1208,11 +1238,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         // An artificial delay on the `trash` response gives the background
         // thread below a wide window to break the ledger directory's
-        // writability *after* this run's own initial (candidate-selection)
-        // lock has already been acquired and released, but *before* the
-        // per-row removal reaches its own `mutate_locked` call — the exact
-        // gap `prune`'s own doc comment calls out as the one case a crash
-        // (or, here, a filesystem fault) can strand a row.
+        // writability *after* this row's own lock has already been
+        // acquired (so the lock file, created during candidate selection,
+        // just needs re-opening — no dir-write required) but *before*
+        // `LeaseLedger::mutate`'s save reaches its temp-file creation,
+        // which does need dir-write — the exact gap `prune`'s own doc
+        // comment calls out as the one case a crash (or, here, a
+        // filesystem fault) can still strand a row even with the lock
+        // held throughout.
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .and(wiremock::matchers::path("/drive/v3/files/drive-copy-1"))
             .respond_with(
