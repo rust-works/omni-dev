@@ -27,6 +27,7 @@ use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
 #[cfg(test)]
 use crate::drive::lease::ledger::LedgerLock;
 use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, ReleaseOutcome};
+use crate::drive::types::DriveFile;
 
 /// Per-call options for `drive lease acquire`.
 #[derive(Debug, Clone)]
@@ -357,7 +358,26 @@ async fn acquire_inner(
     let needs_version_pin = is_native || target.sha256_checksum.is_none();
     let pre_backup_version = if needs_version_pin {
         match files_api.get_metadata(&opts.file_id).await {
-            Ok(pre_backup) => pre_backup.version,
+            // Refused *here*, not left for `backup_is_pinned`'s
+            // no-proof arm: that arm would refuse just the same, but only
+            // after the backup — a download of up to 500 MB or a
+            // `files.copy` — had been taken and reclaimed for nothing.
+            // Mirrors the pre-auth read's own missing-`version` refusal.
+            Ok(DriveFile {
+                version: Some(version),
+                ..
+            }) => Some(version),
+            Ok(_) => {
+                return (
+                    AcquireResult::Failed {
+                        detail: "Drive did not return a `version` for this file immediately \
+                                 before the backup; refusing to take a backup that could not \
+                                 be pinned to one"
+                            .to_string(),
+                    },
+                    None,
+                )
+            }
             Err(err) => {
                 return (
                     AcquireResult::Failed {
@@ -593,11 +613,13 @@ fn backup_is_pinned(
         // Reached only when the target's digest vanished between the
         // pre-auth read (which decided no sandwich was needed) and the
         // post-backup one — or if `acquire_inner`'s decision and this
-        // function's arms are ever changed out of step. Either way nothing
-        // is recorded unproven.
+        // function's arms are ever changed out of step. (A sandwich read
+        // that returned no `version` never gets this far: `acquire_inner`
+        // refuses that before taking the backup.) Either way nothing is
+        // recorded unproven.
         None => Err(format!(
             "no proof available that the backup matches version {post_version}: Drive reported \
-             no checksum for the file after the backup and no pre-backup version was read to \
+             no checksum for the file after the backup and no pre-backup version was taken to \
              fall back on. No lease was minted and the backup was discarded — retry."
         )),
     }
@@ -1690,6 +1712,56 @@ mod tests {
         assert!(detail.contains("version 1"), "{detail}");
         assert!(detail.contains("2 immediately after"), "{detail}");
         assert_nothing_minted(&test_opts);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sandwich_read_without_a_version_refuses_before_taking_the_backup() {
+        // The pre-auth read carries a `version`, so the acquisition
+        // proceeds past the prompt; the pre-backup sandwich read then comes
+        // back without one. `backup_is_pinned`'s no-proof arm would refuse
+        // this too — but only after the download — so `acquire_inner`
+        // refuses first. The download mock's `.expect(0)` is the assertion.
+        let server = wiremock::MockServer::start().await;
+        mount_metadata_drift(
+            &server,
+            serde_json::json!({
+                "id": "f1", "name": "report.pdf", "mimeType": "application/pdf", "version": "1"
+            }),
+            1,
+            serde_json::json!({
+                "id": "f1", "name": "report.pdf", "mimeType": "application/pdf"
+            }),
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let test_opts = opts(root.path());
+
+        let result = acquire(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+        )
+        .await;
+
+        let AcquireResult::Failed { detail } = result else {
+            panic!("expected Failed, got {result:?}");
+        };
+        assert!(detail.contains("immediately before the backup"), "{detail}");
+        assert!(!test_opts.ledger_path.exists(), "no ledger row");
+        assert!(
+            !test_opts.backup_dir.exists()
+                || std::fs::read_dir(&test_opts.backup_dir).is_ok_and(|mut d| d.next().is_none()),
+            "no backup may have been taken"
+        );
     }
 
     /// The native-document shape of the sandwich tests: a spreadsheet
