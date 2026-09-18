@@ -178,22 +178,22 @@ fn write_outcome(outcome: &EditOutcome, out: &mut dyn std::io::Write) -> std::io
             }
         }
         EditResult::RefusedNoLease => {
-            for line in LeaseGateRefusal::NoLease.describe_lines(&file_id, &file_id) {
+            if let Some(line) = LeaseGateRefusal::NoLease.describe_line(&file_id, &file_id) {
                 writeln!(out, "{line}")?;
             }
         }
         EditResult::RefusedLeaseExpired => {
-            for line in LeaseGateRefusal::Expired.describe_lines(&file_id, &file_id) {
+            if let Some(line) = LeaseGateRefusal::Expired.describe_line(&file_id, &file_id) {
                 writeln!(out, "{line}")?;
             }
         }
         EditResult::RefusedLeaseWrongFile => {
-            for line in LeaseGateRefusal::WrongFile.describe_lines(&file_id, &file_id) {
+            if let Some(line) = LeaseGateRefusal::WrongFile.describe_line(&file_id, &file_id) {
                 writeln!(out, "{line}")?;
             }
         }
         EditResult::RefusedLeaseStale => {
-            for line in LeaseGateRefusal::Stale.describe_lines(&file_id, &file_id) {
+            if let Some(line) = LeaseGateRefusal::Stale.describe_line(&file_id, &file_id) {
                 writeln!(out, "{line}")?;
             }
         }

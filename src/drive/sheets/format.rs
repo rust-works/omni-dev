@@ -41,8 +41,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
@@ -308,6 +308,24 @@ pub enum FormatResult {
         /// A human-readable summary of what failed.
         detail: String,
     },
+}
+
+impl FromLeaseRefusal for FormatResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
 }
 
 impl FormatResult {
@@ -641,30 +659,25 @@ async fn format_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(FormatResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(FormatResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(FormatResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(FormatResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(FormatResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
-    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
-        Ok(_response) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
-            FormatResult::Changed {
-                summary,
-                discarded_cells,
-            }
-        }
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            FormatResult::Failed { detail }
-        }
+    let result = match conclude_native_leased_write(
+        leased,
+        &lease_grant,
+        &files_api,
+        api.batch_update(&opts.spreadsheet_id, vec![request]).await,
+        |err| format!("{err:#}"),
+    )
+    .await
+    {
+        Ok(_response) => FormatResult::Changed {
+            summary,
+            discarded_cells,
+        },
+        Err(err) => FormatResult::Failed {
+            detail: format!("{err:#}"),
+        },
     };
     drop(lease_grant);
     gated(result)
@@ -1107,18 +1120,22 @@ pub fn describe_lines(outcome: &FormatOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
-        FormatResult::RefusedNoLease => {
-            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        FormatResult::RefusedLeaseExpired => {
-            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        FormatResult::RefusedLeaseWrongFile => {
-            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        FormatResult::RefusedLeaseStale => {
-            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
-        }
+        FormatResult::RefusedNoLease => LeaseGateRefusal::NoLease
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        FormatResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        FormatResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        FormatResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
         FormatResult::Changed { summary, .. } => {
             vec![format!("{}: {summary} in {book}", capitalize(verb.label()))]
         }
