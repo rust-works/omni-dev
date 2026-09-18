@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::env::{EnvSource, SystemEnv};
+
 /// Default log file name under the runtime directory.
 const LOG_FILE_NAME: &str = "log.jsonl";
 
@@ -341,31 +343,40 @@ where
 
 /// Whether logging is disabled entirely (`OMNI_DEV_LOG_DISABLE=1`).
 pub fn disabled() -> bool {
-    env_flag("OMNI_DEV_LOG_DISABLE")
+    disabled_with(&SystemEnv)
+}
+
+/// [`disabled`], reading through an injected [`EnvSource`] (STYLE-0028).
+fn disabled_with(env: &impl EnvSource) -> bool {
+    env_flag_with(env, "OMNI_DEV_LOG_DISABLE")
 }
 
 /// Whether request/response bodies may be recorded (`OMNI_DEV_LOG_BODIES=1`).
 pub fn bodies_enabled() -> bool {
-    env_flag("OMNI_DEV_LOG_BODIES")
+    bodies_enabled_with(&SystemEnv)
+}
+
+/// [`bodies_enabled`], reading through an injected [`EnvSource`] (STYLE-0028).
+fn bodies_enabled_with(env: &impl EnvSource) -> bool {
+    env_flag_with(env, "OMNI_DEV_LOG_BODIES")
 }
 
 /// Whether (redacted) headers may be recorded (`OMNI_DEV_LOG_HEADERS=1`).
 pub fn headers_enabled() -> bool {
-    env_flag("OMNI_DEV_LOG_HEADERS")
+    env_flag_with(&SystemEnv, "OMNI_DEV_LOG_HEADERS")
 }
 
 /// Reads a boolean-ish env var (`1`/`true`/`yes`, case-insensitive).
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| {
+fn env_flag_with(env: &impl EnvSource, name: &str) -> bool {
+    env.var(name).is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes"
     })
 }
 
 /// The `env_var` override of a runtime log path, if set and non-empty.
-fn env_path_override(env_var: &str) -> Option<PathBuf> {
-    std::env::var(env_var)
-        .ok()
+fn env_path_override_with(env: &impl EnvSource, env_var: &str) -> Option<PathBuf> {
+    env.var(env_var)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
 }
@@ -384,7 +395,15 @@ pub(crate) fn omni_dev_state_subpath(component: &str) -> Option<PathBuf> {
 /// Resolves the log file path: `OMNI_DEV_LOG_FILE` override, else
 /// `state_dir` (falling back to `data_dir`) joined with `omni-dev/log.jsonl`.
 pub fn log_file_path() -> Option<PathBuf> {
-    env_path_override("OMNI_DEV_LOG_FILE").or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))
+    log_file_path_with(&SystemEnv)
+}
+
+/// [`log_file_path`], reading through an injected [`EnvSource`]
+/// (STYLE-0028). `pub(crate)` rather than private: `cli::log`'s
+/// `LogCommand::resolve_path_with` needs it for its own env-injected test.
+pub(crate) fn log_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
+    env_path_override_with(env, "OMNI_DEV_LOG_FILE")
+        .or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))
 }
 
 /// Resolves the audit log file path.
@@ -405,9 +424,18 @@ pub fn log_file_path() -> Option<PathBuf> {
 /// real default, so no test can pollute another's file — or the machine's
 /// — by omission.
 pub fn audit_file_path() -> Option<PathBuf> {
-    test_audit_file_override()
-        .or_else(|| env_path_override("OMNI_DEV_AUDIT_LOG_FILE"))
-        .or_else(default_audit_file_path)
+    test_audit_file_override().or_else(|| audit_file_path_with(&SystemEnv))
+}
+
+/// The pure override-or-default half of [`audit_file_path`]: honors
+/// `OMNI_DEV_AUDIT_LOG_FILE` through an injected [`EnvSource`] (STYLE-0028),
+/// deliberately **not** consulting [`TEST_AUDIT_ROUTE`] — that per-thread
+/// routing is a test-build-only safety net for the *ambient* entry point,
+/// orthogonal to this function's own override-or-default algorithm.
+/// `pub(crate)` rather than private: `cli::log`'s `LogCommand::resolve_path_with`
+/// needs it for its own env-injected test.
+pub(crate) fn audit_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
+    env_path_override_with(env, "OMNI_DEV_AUDIT_LOG_FILE").or_else(default_audit_file_path)
 }
 
 /// Collapses `.`/`..` components **syntactically**, with no filesystem
@@ -548,33 +576,20 @@ fn test_audit_file_override() -> Option<PathBuf> {
     None
 }
 
-/// How the current test thread's audit writes are routed
-/// (`crate::test_support::AuditLogGuard` / `AuditEnvRouteGuard` set it).
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) enum TestAuditRoute {
-    /// This thread's own isolated file — a test that reads its records back.
-    Path(PathBuf),
-    /// Release-build semantics: `OMNI_DEV_AUDIT_LOG_FILE`, else the
-    /// scratch default — a test of the env override itself.
-    Env,
-}
-
-/// The per-thread routing a test build applies before the env override.
+/// The per-thread routing a test build applies before falling back to the
+/// scratch default (`crate::test_support::AuditLogGuard` sets it).
 ///
-/// Per thread rather than via the env var, and defaulting to the scratch
-/// file rather than to "consult the env var", both on purpose. The env
-/// var is process-global, and dozens of engine tests exercise a leased
-/// write without caring about the audit record it writes; if those fell
-/// through to the env var, any of them running concurrently with a test
-/// that had *set* it — under `REQUEST_LOG_ENV_MUTEX`, which the engine
-/// tests never take — would append into that test's file (a `trailing
-/// characters` parse failure there, seen in practice) or, when the
-/// setter names a real path, onto the machine. So an un-opted thread is
-/// pinned to the scratch file unconditionally, and only a thread that
-/// declared [`TestAuditRoute::Env`] can see the env var at all. The
-/// isolation is therefore symmetric: a redirecting test cannot be written
-/// into by a non-redirecting one, and an env-routing test cannot either.
+/// Per thread rather than via an env var, and defaulting to the scratch
+/// file rather than to the real machine default, both on purpose. Dozens of
+/// engine tests exercise a leased write without caring about the audit
+/// record it writes; if those fell through to the real default, any of them
+/// would silently write into the machine's actual `audit.jsonl`. So an
+/// un-opted thread is pinned to the scratch file unconditionally, and only
+/// a thread holding an [`crate::test_support::AuditLogGuard`] sees its own
+/// isolated path. A test that wants to observe `OMNI_DEV_AUDIT_LOG_FILE`
+/// honoring an override calls [`audit_file_path_with`] directly with an
+/// injected [`EnvSource`] instead of going through this ambient routing at
+/// all (STYLE-0028).
 ///
 /// Being per-thread does mean the writes a test wants to observe must
 /// happen on the test's own thread: `#[tokio::test]`'s current-thread
@@ -583,16 +598,14 @@ pub(crate) enum TestAuditRoute {
 /// shared scratch file instead.
 #[cfg(test)]
 fn test_audit_file_override() -> Option<PathBuf> {
-    match TEST_AUDIT_ROUTE.with(|slot| slot.borrow().clone()) {
-        Some(TestAuditRoute::Path(path)) => Some(path),
-        Some(TestAuditRoute::Env) => None,
-        None => default_audit_file_path(),
-    }
+    TEST_AUDIT_ROUTE
+        .with(|slot| slot.borrow().clone())
+        .or_else(default_audit_file_path)
 }
 
 #[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_AUDIT_ROUTE: std::cell::RefCell<Option<TestAuditRoute>> =
+    pub(crate) static TEST_AUDIT_ROUTE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -702,15 +715,42 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// exact gap the sink exists to make impossible. Two syncs per leased
 /// write are cheap; the best-effort request log deliberately pays neither.
 pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::{ensure, Context};
+    use anyhow::Context;
+
+    let path = audit_file_path().context("could not resolve the audit log file path")?;
+    record_audit_to(path, log_file_path(), entry)
+}
+
+/// [`record_audit`], reading through an injected [`EnvSource`] (STYLE-0028)
+/// instead of the ambient, thread-local-routed [`audit_file_path`] /
+/// [`log_file_path`] — a `MapEnv`-driven seam for tests that want to assert
+/// on the write itself without process-global env mutation or the
+/// scratch-file safety net getting in the way. No production caller needs
+/// this: every ambient caller wants the scratch-pin safety net, so this
+/// seam only exists for direct unit testing.
+#[cfg(test)]
+fn record_audit_with(env: &impl EnvSource, entry: &LogRecord) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let path = audit_file_path_with(env).context("could not resolve the audit log file path")?;
+    record_audit_to(path, log_file_path_with(env), entry)
+}
+
+/// Shared write path for [`record_audit`] and [`record_audit_with`]: `path`
+/// and `log_path` are already resolved, so this only validates and appends.
+fn record_audit_to(
+    path: PathBuf,
+    log_path: Option<PathBuf>,
+    entry: &LogRecord,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
 
     ensure!(
         entry.kind == RecordKind::Audit,
         "record_audit() requires a RecordKind::Audit entry, got {:?}",
         entry.kind
     );
-    let path = audit_file_path().context("could not resolve the audit log file path")?;
-    if let Some(log_path) = log_file_path() {
+    if let Some(log_path) = log_path {
         ensure!(
             !same_file(&path, &log_path),
             "the audit log path resolves to the same file as the request log ({}); set \
@@ -1676,6 +1716,13 @@ pub fn record_audit_event(outcome: AuditOutcome) -> anyhow::Result<()> {
     record_audit(&build_audit_record(outcome, current_context()))
 }
 
+/// [`record_audit_event`], reading through an injected [`EnvSource`]
+/// (STYLE-0028) — see [`record_audit_with`].
+#[cfg(test)]
+fn record_audit_event_with(env: &impl EnvSource, outcome: AuditOutcome) -> anyhow::Result<()> {
+    record_audit_with(env, &build_audit_record(outcome, current_context()))
+}
+
 /// Builds the `kind: "audit"` record for `outcome` under `ctx`. Split out
 /// from [`record_audit_event`] so the record shape is unit-testable without
 /// touching the filesystem, mirroring [`build_drive_mutation_record`].
@@ -2154,6 +2201,7 @@ fn whitelisted_env() -> BTreeMap<String, String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
 
     #[test]
     fn record_round_trips_through_json() {
@@ -2870,24 +2918,22 @@ mod tests {
 
     #[test]
     fn record_audit_event_writes_to_the_audit_sink() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
 
-        let result = record_audit_event(AuditOutcome {
-            command: vec!["drive".to_string(), "lease-acquire".to_string()],
-            integration: "drive",
-            file_id: "f1".to_string(),
-            verdict: "acquired".to_string(),
-            ..Default::default()
-        });
+        record_audit_event_with(
+            &env,
+            AuditOutcome {
+                command: vec!["drive".to_string(), "lease-acquire".to_string()],
+                integration: "drive",
+                file_id: "f1".to_string(),
+                verdict: "acquired".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-        result.unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
         assert_eq!(back.kind, RecordKind::Audit);
@@ -2914,16 +2960,11 @@ mod tests {
 
     #[test]
     fn audit_file_path_honors_env_override() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
+        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
         assert_eq!(
-            audit_file_path(),
+            audit_file_path_with(&env),
             Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl"))
         );
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
     }
 
     #[test]
@@ -2936,22 +2977,19 @@ mod tests {
         // scratch path — stable across calls (so it's memoized once, not
         // re-created per call) and never the real
         // `dirs::state_dir()`/`dirs::data_dir()`-based default the
-        // non-test build resolves to — whether the thread routes through
-        // the env var or not.
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        // non-test build resolves to, whether resolved through the pure
+        // `audit_file_path_with` seam or the ambient `audit_file_path`.
         let real_default = dirs::state_dir()
             .or_else(dirs::data_dir)
             .unwrap()
             .join("omni-dev")
             .join(AUDIT_FILE_NAME);
 
-        let unrouted = audit_file_path().unwrap();
+        let unset = MapEnv::new();
+        let unrouted = audit_file_path_with(&unset).unwrap();
         assert_eq!(
             unrouted,
-            audit_file_path().unwrap(),
+            audit_file_path_with(&unset).unwrap(),
             "the fallback path must be stable across calls"
         );
         assert_ne!(
@@ -2959,43 +2997,18 @@ mod tests {
             "must never fall back to the real machine's default audit log path in a test build"
         );
 
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
         assert_eq!(
             audit_file_path().unwrap(),
             unrouted,
-            "an env-routing thread with the var unset lands on the same scratch file"
-        );
-    }
-
-    #[test]
-    fn an_unrouted_test_thread_never_sees_the_audit_env_override() {
-        // The other half of the isolation: a test that did not opt into
-        // the env route (every engine test that merely goes through a
-        // lease) must be pinned to the scratch file even while some other
-        // thread has the env var set — otherwise it would append into
-        // that thread's file, mutex or no mutex.
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
-        let resolved = audit_file_path();
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-        assert_ne!(
-            resolved,
-            Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl")),
-            "an unrouted thread must not resolve to another test's env override"
+            "the ambient entry point with no thread-local route lands on the same scratch file"
         );
     }
 
     #[test]
     fn record_audit_writes_a_line_that_round_trips() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
 
         let rec = LogRecord {
             kind: RecordKind::Audit,
@@ -3003,9 +3016,7 @@ mod tests {
             invocation_id: new_id(),
             ..LogRecord::default()
         };
-        record_audit(&rec).unwrap();
-
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        record_audit_with(&env, &rec).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
@@ -3019,51 +3030,24 @@ mod tests {
         // path (an advisory `flock` around the write) inside
         // `append_line_unrotated`; `record_audit`'s `sync=true` additionally
         // exercises the `sync_data` call on the locked handle.
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = std::env::var("OMNI_DEV_LOG_BODIES").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let env = MapEnv::new()
+            .with("OMNI_DEV_LOG_BODIES", "1")
+            .with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
+        assert!(bodies_enabled_with(&env));
 
-        // The restore below has two arms depending on whether a value
-        // existed beforehand; run the cycle once from unset and once from a
-        // prior value so both the `None` and `Some(v)` arms are exercised.
-        for preset in [None, Some("0")] {
-            match &preset {
-                Some(v) => std::env::set_var("OMNI_DEV_LOG_BODIES", v),
-                None => std::env::remove_var("OMNI_DEV_LOG_BODIES"),
-            }
-            let prior = std::env::var("OMNI_DEV_LOG_BODIES").ok();
-            std::env::set_var("OMNI_DEV_LOG_BODIES", "1");
-            assert!(bodies_enabled());
+        let rec = LogRecord {
+            kind: RecordKind::Audit,
+            id: new_id(),
+            invocation_id: new_id(),
+            ..LogRecord::default()
+        };
+        record_audit_with(&env, &rec).unwrap();
 
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("audit.jsonl");
-            std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
-            let rec = LogRecord {
-                kind: RecordKind::Audit,
-                id: new_id(),
-                invocation_id: new_id(),
-                ..LogRecord::default()
-            };
-            let result = record_audit(&rec);
-
-            std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-            match prior {
-                Some(v) => std::env::set_var("OMNI_DEV_LOG_BODIES", v),
-                None => std::env::remove_var("OMNI_DEV_LOG_BODIES"),
-            }
-
-            result.unwrap();
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
-            assert_eq!(back.id, rec.id);
-        }
-
-        match original {
-            Some(v) => std::env::set_var("OMNI_DEV_LOG_BODIES", v),
-            None => std::env::remove_var("OMNI_DEV_LOG_BODIES"),
-        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(back.id, rec.id);
     }
 
     #[test]
@@ -3085,35 +3069,21 @@ mod tests {
 
     #[test]
     fn record_audit_is_exempt_from_omni_dev_log_disable() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Simulate a pre-existing value so the restore below exercises the
-        // `Some(v)` arm rather than only ever `remove_var`.
-        std::env::set_var("OMNI_DEV_LOG_DISABLE", "0");
-        let prior = std::env::var("OMNI_DEV_LOG_DISABLE").ok();
-        std::env::set_var("OMNI_DEV_LOG_DISABLE", "1");
-        assert!(disabled());
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &path);
+        let env = MapEnv::new()
+            .with("OMNI_DEV_LOG_DISABLE", "1")
+            .with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
+        assert!(disabled_with(&env));
+
         let rec = LogRecord {
             kind: RecordKind::Audit,
             id: new_id(),
             invocation_id: new_id(),
             ..LogRecord::default()
         };
-        let result = record_audit(&rec);
+        record_audit_with(&env, &rec).unwrap();
 
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
-        match prior {
-            Some(v) => std::env::set_var("OMNI_DEV_LOG_DISABLE", v),
-            None => std::env::remove_var("OMNI_DEV_LOG_DISABLE"),
-        }
-
-        result.unwrap();
         assert!(path.exists());
     }
 
@@ -3131,12 +3101,11 @@ mod tests {
 
     #[test]
     fn record_audit_refuses_a_non_audit_kind_entry() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", dir.path().join("audit.jsonl"));
+        let env = MapEnv::new().with(
+            "OMNI_DEV_AUDIT_LOG_FILE",
+            dir.path().join("audit.jsonl").to_str().unwrap(),
+        );
 
         let rec = LogRecord {
             kind: RecordKind::Invocation,
@@ -3144,22 +3113,19 @@ mod tests {
             invocation_id: new_id(),
             ..LogRecord::default()
         };
-        let err = record_audit(&rec).unwrap_err();
+        let err = record_audit_with(&env, &rec).unwrap_err();
 
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
         assert!(err.to_string().contains("RecordKind::Audit"), "{err}");
     }
 
     #[test]
     fn record_audit_refuses_when_the_audit_path_collides_with_the_log_path() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("shared.jsonl");
-        std::env::set_var("OMNI_DEV_LOG_FILE", &shared);
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", &shared);
+        let shared_str = shared.to_str().unwrap();
+        let env = MapEnv::new()
+            .with("OMNI_DEV_LOG_FILE", shared_str)
+            .with("OMNI_DEV_AUDIT_LOG_FILE", shared_str);
 
         let rec = LogRecord {
             kind: RecordKind::Audit,
@@ -3167,10 +3133,7 @@ mod tests {
             invocation_id: new_id(),
             ..LogRecord::default()
         };
-        let err = record_audit(&rec).unwrap_err();
-
-        std::env::remove_var("OMNI_DEV_LOG_FILE");
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
+        let err = record_audit_with(&env, &rec).unwrap_err();
 
         assert!(
             err.to_string().contains("same file as the request log"),
@@ -3467,14 +3430,19 @@ mod tests {
 
     #[test]
     fn env_flag_parses_truthy_values() {
-        std::env::set_var("OMNI_DEV_TEST_FLAG_ABC", "1");
-        assert!(env_flag("OMNI_DEV_TEST_FLAG_ABC"));
-        std::env::set_var("OMNI_DEV_TEST_FLAG_ABC", "TRUE");
-        assert!(env_flag("OMNI_DEV_TEST_FLAG_ABC"));
-        std::env::set_var("OMNI_DEV_TEST_FLAG_ABC", "0");
-        assert!(!env_flag("OMNI_DEV_TEST_FLAG_ABC"));
-        std::env::remove_var("OMNI_DEV_TEST_FLAG_ABC");
-        assert!(!env_flag("OMNI_DEV_TEST_FLAG_ABC"));
+        assert!(env_flag_with(
+            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "1"),
+            "OMNI_DEV_TEST_FLAG_ABC"
+        ));
+        assert!(env_flag_with(
+            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "TRUE"),
+            "OMNI_DEV_TEST_FLAG_ABC"
+        ));
+        assert!(!env_flag_with(
+            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "0"),
+            "OMNI_DEV_TEST_FLAG_ABC"
+        ));
+        assert!(!env_flag_with(&MapEnv::new(), "OMNI_DEV_TEST_FLAG_ABC"));
     }
 
     #[test]

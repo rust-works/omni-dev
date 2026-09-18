@@ -21,22 +21,10 @@
 /// own independent mutex) in issue #1465.
 pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Process-wide mutex serialising every test that mutates
-/// `OMNI_DEV_LOG_FILE`, `OMNI_DEV_AUDIT_LOG_FILE` or `OMNI_DEV_LOG_DISABLE` —
-/// `crate::request_log`'s own path-resolution and fail-closed-audit tests,
-/// and `crate::cli::log`'s `--audit` flag-selection test. Same rationale as
-/// [`HOME_ENV_MUTEX`]: these are shared, process-wide env vars, so two tests
-/// mutating them under independent locks (or no lock) can still interleave
-/// and race. Does **not** cover every existing `OMNI_DEV_LOG_FILE` mutation
-/// in the crate (e.g. `daemon::services::worktrees`'s poller tests predate
-/// this lock) — new tests should take it; retrofitting older ones is a
-/// follow-up, not a blocker.
-pub(crate) static REQUEST_LOG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Redirects the audit log into an isolated tempdir for the life of one
 /// test — for this thread only, through `request_log::TEST_AUDIT_ROUTE`,
-/// not the process-global `OMNI_DEV_AUDIT_LOG_FILE` — so it needs no
-/// [`REQUEST_LOG_ENV_MUTEX`] and tests holding one run fully in parallel.
+/// not the process-global `OMNI_DEV_AUDIT_LOG_FILE` — so it needs no lock
+/// and tests holding one run fully in parallel.
 ///
 /// Every Drive lease-check/acquire test that reaches a live lease or a
 /// refusal triggers a best-effort or write-ahead audit write (ADR-0080
@@ -58,9 +46,7 @@ pub(crate) struct AuditLogGuard {
 impl AuditLogGuard {
     pub(crate) fn redirect(dir: &std::path::Path) -> Self {
         let path = dir.join("audit.jsonl");
-        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| {
-            *slot.borrow_mut() = Some(crate::request_log::TestAuditRoute::Path(path.clone()));
-        });
+        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
         Self { path }
     }
 
@@ -123,29 +109,6 @@ mod audit_log_guard_tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.records()));
         assert!(result.is_err());
-    }
-}
-
-/// Opts the current test thread into release-build audit path resolution
-/// — `OMNI_DEV_AUDIT_LOG_FILE` if set, else the scratch default — for the
-/// life of one test. The counterpart of [`AuditLogGuard`] for the handful
-/// of tests *of* the env override itself; a thread holding neither is
-/// pinned to the scratch file and cannot see the env var. Anything that
-/// sets the env var must still hold [`REQUEST_LOG_ENV_MUTEX`], since the
-/// var itself remains process-global among the threads that opted in.
-pub(crate) struct AuditEnvRouteGuard;
-
-impl AuditEnvRouteGuard {
-    pub(crate) fn take() -> Self {
-        crate::request_log::TEST_AUDIT_ROUTE
-            .with(|slot| *slot.borrow_mut() = Some(crate::request_log::TestAuditRoute::Env));
-        Self
-    }
-}
-
-impl Drop for AuditEnvRouteGuard {
-    fn drop(&mut self) {
-        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = None);
     }
 }
 

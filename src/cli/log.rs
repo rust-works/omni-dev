@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::request_log;
+use crate::utils::env::{EnvSource, SystemEnv};
 use query::Filter;
 
 /// Shared relative-duration parser, also reused by `drive lease prune`'s own
@@ -164,10 +165,17 @@ impl LogCommand {
     /// `--audit` is set, else the ordinary `log.jsonl` — the entire effect
     /// of the flag ([ADR-0080](../../docs/adrs/adr-0080.md) §11).
     fn resolve_path(&self) -> Result<std::path::PathBuf> {
+        self.resolve_path_with(&SystemEnv)
+    }
+
+    /// [`Self::resolve_path`], reading through an injected [`EnvSource`]
+    /// (STYLE-0028).
+    fn resolve_path_with(&self, env: &impl EnvSource) -> Result<std::path::PathBuf> {
         if self.audit {
-            request_log::audit_file_path().context("could not resolve the audit log file path")
+            request_log::audit_file_path_with(env)
+                .context("could not resolve the audit log file path")
         } else {
-            request_log::log_file_path().context("could not resolve the log file path")
+            request_log::log_file_path_with(env).context("could not resolve the log file path")
         }
     }
 }
@@ -239,6 +247,7 @@ pub(crate) fn run_search_capture(req: SearchRequest<'_>) -> Result<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
 
     #[derive(Parser)]
     struct Wrapper {
@@ -276,26 +285,20 @@ mod tests {
 
     #[test]
     fn resolve_path_reads_audit_jsonl_only_when_the_flag_is_set() {
-        let _route = crate::test_support::AuditEnvRouteGuard::take();
-        let _guard = crate::test_support::REQUEST_LOG_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
+        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
 
         // Without `--audit`, this resolves through `log_file_path` — some
-        // path other than the audit override, whatever this machine's
-        // default (or an `OMNI_DEV_LOG_FILE` set outside this test) happens
-        // to be. With `--audit`, it must be exactly the override above.
+        // path other than the audit override (`OMNI_DEV_LOG_FILE` is unset
+        // in `env`, so it falls to the state/data-dir default). With
+        // `--audit`, it must be exactly the override above.
         assert_ne!(
-            parse(&[]).resolve_path().unwrap(),
+            parse(&[]).resolve_path_with(&env).unwrap(),
             std::path::PathBuf::from("/tmp/omni-dev-test-audit.jsonl")
         );
         assert_eq!(
-            parse(&["--audit"]).resolve_path().unwrap(),
+            parse(&["--audit"]).resolve_path_with(&env).unwrap(),
             std::path::PathBuf::from("/tmp/omni-dev-test-audit.jsonl")
         );
-
-        std::env::remove_var("OMNI_DEV_AUDIT_LOG_FILE");
     }
 
     #[test]
