@@ -174,10 +174,41 @@ impl<'a> MarkdownParser<'a> {
     /// pre-existing "any 2-space-indented line" rule so that continuation
     /// paragraphs and fenced blocks written at the marker's own column still
     /// belong to the item.
+    ///
+    /// A bare blank line (no 2-space prefix at all) does not by itself end
+    /// the item: CommonMark only ends a list item at a blank line when the
+    /// line that follows it is *not* indented to the item's content column.
+    /// So a run of one or more bare blank lines is looked ahead past — the
+    /// run is only consumed (as empty sub-lines, which the nested parser
+    /// treats as paragraph separators) when the first non-blank line after
+    /// it still belongs to this item; otherwise the blanks are left
+    /// untouched for the enclosing block loop, ending the item exactly as
+    /// before (issue #1732). A whitespace-only line that already carries the
+    /// 2-space prefix is unaffected and keeps falling through to the
+    /// existing paragraph-separator path below.
     fn collect_item_sub_lines(&mut self, marker_indent: usize) -> Vec<String> {
         let mut sub_lines: Vec<String> = Vec::new();
         while !self.at_end() {
             let next = self.current_line();
+            if next.trim().is_empty() && next.strip_prefix("  ").is_none() {
+                let mut lookahead = self.pos;
+                while lookahead < self.lines.len() && self.lines[lookahead].trim().is_empty() {
+                    lookahead += 1;
+                }
+                let continues = lookahead < self.lines.len() && {
+                    let after = self.lines[lookahead];
+                    after.strip_prefix("  ").is_some()
+                        && !(is_list_start(after) && leading_spaces(after) < marker_indent + 2)
+                };
+                if !continues {
+                    break;
+                }
+                while self.pos < lookahead {
+                    sub_lines.push(String::new());
+                    self.advance();
+                }
+                continue;
+            }
             let Some(stripped) = next.strip_prefix("  ") else {
                 break;
             };
@@ -5634,6 +5665,185 @@ mod tests {
         assert_eq!(parent.len(), 2);
         assert_eq!(parent[1].node_type, "bulletList");
         assert_eq!(item_text(&outer[1]), "Next");
+    }
+
+    // ── blank line before indented content (issue #1732) ────────────
+
+    /// A bare blank line followed by content indented to the item's column
+    /// does not end the item: the nested list stays nested and the
+    /// following top-level sibling is not swallowed as its own content.
+    #[test]
+    fn blank_line_before_nested_ordered_list_keeps_it_nested() {
+        let md = "1. Родитель:\n\n    1. А\n    2. Б\n2. Следующий";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2, "outer items: {outer:?}");
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2, "first item content: {first:?}");
+        assert_eq!(first[0].node_type, "paragraph");
+        assert_eq!(item_text(&outer[0]), "Родитель:");
+        assert_eq!(first[1].node_type, "orderedList");
+        let nested_items = first[1].content.as_ref().unwrap();
+        assert_eq!(nested_items.len(), 2, "nested items: {nested_items:?}");
+        assert_eq!(item_text(&nested_items[0]), "А");
+        assert_eq!(item_text(&nested_items[1]), "Б");
+        // The second top-level item was not swallowed as sub-content of
+        // the nested list and carries no leaked indentation.
+        let second = outer[1].content.as_ref().unwrap();
+        assert_eq!(second.len(), 1, "second item content: {second:?}");
+        assert_eq!(item_text(&outer[1]), "Следующий");
+    }
+
+    /// A bare blank line followed by an indented plain paragraph is a
+    /// continuation paragraph of the same list item, not a top-level
+    /// paragraph with leaked indentation.
+    #[test]
+    fn blank_line_before_continuation_paragraph_stays_in_item() {
+        let md = "- a\n\n  second paragraph\n- b";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1, "top-level blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        let first = items[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2, "first item content: {first:?}");
+        assert_eq!(first[0].node_type, "paragraph");
+        assert_eq!(item_text(&items[0]), "a");
+        assert_eq!(first[1].node_type, "paragraph");
+        assert_eq!(
+            first[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("second paragraph")
+        );
+        assert_eq!(item_text(&items[1]), "b");
+    }
+
+    /// A blank line followed by a non-indented line still ends the list —
+    /// unchanged from before #1732.
+    #[test]
+    fn blank_line_before_unindented_line_still_ends_list() {
+        let md = "- a\n\nPara";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2, "top-level blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(item_text(&items[0]), "a");
+        assert_eq!(doc.content[1].node_type, "paragraph");
+        assert_eq!(
+            doc.content[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("Para")
+        );
+    }
+
+    /// Two or more consecutive bare blank lines before indented content are
+    /// collected the same way as a single blank line.
+    #[test]
+    fn multiple_blank_lines_before_continuation_paragraph_stay_in_item() {
+        let md = "- a\n\n\n  second paragraph";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1, "top-level blocks: {:?}", doc.content);
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        let first = items[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2, "first item content: {first:?}");
+        assert_eq!(
+            first[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("second paragraph")
+        );
+    }
+
+    /// Sibling detection at a deeper nesting level still applies with a
+    /// blank line before the deepest level's content (mirrors
+    /// `nested_list_three_levels_sibling_stays_sibling`).
+    #[test]
+    fn blank_line_before_deepest_level_keeps_siblings() {
+        let md = "1. L1\n    1. L2a\n\n        1. L3a\n        2. L3b\n    2. L2b\n2. L1b";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let l1 = outer[0].content.as_ref().unwrap();
+        assert_eq!(l1.len(), 2);
+        let level2 = l1[1].content.as_ref().unwrap();
+        assert_eq!(level2.len(), 2);
+        assert_eq!(item_text(&level2[0]), "L2a");
+        assert_eq!(item_text(&level2[1]), "L2b");
+        let l2a = level2[0].content.as_ref().unwrap();
+        assert_eq!(l2a.len(), 2, "L2a content: {l2a:?}");
+        let level3 = l2a[1].content.as_ref().unwrap();
+        assert_eq!(level3.len(), 2, "level3 items: {level3:?}");
+        assert_eq!(item_text(&level3[0]), "L3a");
+        assert_eq!(item_text(&level3[1]), "L3b");
+        assert_eq!(level2[1].content.as_ref().unwrap().len(), 1);
+        assert_eq!(outer[1].content.as_ref().unwrap().len(), 1);
+        assert_eq!(item_text(&outer[1]), "L1b");
+    }
+
+    /// A blank line before an indented nested task list produces the same
+    /// sibling-taskList shape (#506) as the two-space-blank form.
+    #[test]
+    fn blank_line_before_nested_task_list_matches_two_space_form() {
+        let with_bare_blank = markdown_to_adf("- [ ] t\n\n  - [ ] sub").unwrap();
+        let with_two_space_blank = markdown_to_adf("- [ ] t\n  \n  - [ ] sub").unwrap();
+        assert_eq!(
+            serde_json::to_value(&with_bare_blank).unwrap(),
+            serde_json::to_value(&with_two_space_blank).unwrap()
+        );
+        let items = with_bare_blank.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        assert_eq!(items[0].node_type, "taskItem");
+        assert_eq!(items[1].node_type, "taskList");
+        let sub_items = items[1].content.as_ref().unwrap();
+        assert_eq!(sub_items.len(), 1);
+        assert_eq!(sub_items[0].node_type, "taskItem");
+    }
+
+    /// A blank line followed by a same-indent sibling marker is a loose
+    /// list (CommonMark), not sub-content — left alone for issue #1729.
+    /// This pins today's two-separate-lists shape so a future #1729 fix
+    /// changes it deliberately.
+    #[test]
+    fn blank_line_then_sibling_marker_not_consumed() {
+        let md = "- a\n\n- b";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2, "top-level blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+        assert_eq!(item_text(&doc.content[0].content.as_ref().unwrap()[0]), "a");
+        assert_eq!(item_text(&doc.content[1].content.as_ref().unwrap()[0]), "b");
+    }
+
+    /// Round-trip pin: a listItem with two paragraphs renders with a
+    /// blank (two-space) separator line, and re-parsing it must reproduce
+    /// the same document — the renderer is untouched by #1732.
+    #[test]
+    fn round_trip_blank_line_separated_paragraphs_in_list_item() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"bulletList","content":[
+                {"type":"listItem","content":[
+                    {"type":"paragraph","content":[{"type":"text","text":"a"}]},
+                    {"type":"paragraph","content":[{"type":"text","text":"b"}]}
+                ]}
+            ]}]}"#,
+            "- a\n  \n  b\n",
+        );
+    }
+
+    /// Round-trip pin: a listItem with a nested bulletList renders with no
+    /// blank separator line, and re-parsing it must reproduce the same
+    /// document.
+    #[test]
+    fn round_trip_nested_list_no_blank_separator() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"bulletList","content":[
+                {"type":"listItem","content":[
+                    {"type":"paragraph","content":[{"type":"text","text":"p"}]},
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}
+                    ]}
+                ]}
+            ]}]}"#,
+            "- p\n  - x\n",
+        );
     }
 
     #[test]
