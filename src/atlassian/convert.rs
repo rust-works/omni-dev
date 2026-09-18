@@ -552,10 +552,15 @@ impl<'a> MarkdownParser<'a> {
 
     fn parse_bullet_list(&mut self) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
-        let mut is_task_list = false;
         // The column of this list's first marker.  A loose-list continuation
         // must sit at exactly this indent to be an item of *this* list.
         let first_marker_indent = leading_spaces(self.current_line());
+        // The list's kind is decided by its first item; a later marker whose
+        // task-ness differs ends this list rather than joining it (issue #1736).
+        let is_task_list = {
+            let trimmed = self.current_line().trim_start();
+            try_parse_task_marker(trimmed[2..].trim_start()).is_some()
+        };
 
         while !self.at_end() {
             let line = self.current_line();
@@ -585,9 +590,17 @@ impl<'a> MarkdownParser<'a> {
 
             let after_marker = trimmed[2..].trim_start();
 
+            // A checkbox marker opens a `taskList` and a bare bullet a
+            // `bulletList`; the two are never items of the same list — a
+            // mismatch here ends this list, leaving the line for the
+            // enclosing block loop to start a second, adjacent one
+            // (issue #1736).
+            if try_parse_task_marker(after_marker).is_some() != is_task_list {
+                break;
+            }
+
             // Detect task list items: - [ ] or - [x]
             if let Some((state, text)) = try_parse_task_marker(after_marker) {
-                is_task_list = true;
                 self.advance();
                 // Collect hardBreak continuation lines so that a trailing
                 // {localId=…} on the last continuation line is found by
@@ -6299,6 +6312,72 @@ mod tests {
         assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
         assert_eq!(doc.content[0].node_type, "bulletList");
         assert_eq!(doc.content[1].node_type, "taskList");
+    }
+
+    /// The tight (no blank line) form of [`loose_bullet_then_task_list_not_merged`]:
+    /// without the marker-mismatch break, `parse_bullet_list` used to mix a
+    /// `listItem` into a `taskList` and produce invalid ADF (issue #1736).
+    #[test]
+    fn tight_bullet_then_task_list_not_merged() {
+        let doc = markdown_to_adf("- b\n- [ ] t\n").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "taskList");
+        assert_eq!(item_text(&doc.content[0].content.as_ref().unwrap()[0]), "b");
+        let task_items = doc.content[1].content.as_ref().unwrap();
+        assert_eq!(task_items[0].node_type, "taskItem");
+        assert_eq!(
+            task_items[0].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("t")
+        );
+    }
+
+    /// The reverse of [`tight_bullet_then_task_list_not_merged`].
+    #[test]
+    fn tight_task_then_bullet_list_not_merged() {
+        let doc = markdown_to_adf("- [ ] t\n- b\n").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "taskList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+        let task_items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(task_items[0].node_type, "taskItem");
+        assert_eq!(
+            task_items[0].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("t")
+        );
+        assert_eq!(item_text(&doc.content[1].content.as_ref().unwrap()[0]), "b");
+    }
+
+    /// A tight run of only bullets is unaffected by the #1736 fix.
+    #[test]
+    fn tight_bullet_run_unchanged() {
+        let doc = markdown_to_adf("- a\n- b\n").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 2);
+    }
+
+    /// A tight run of only task items is unaffected by the #1736 fix.
+    #[test]
+    fn tight_task_run_unchanged() {
+        let doc = markdown_to_adf("- [ ] a\n- [ ] b\n").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "taskList");
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 2);
+    }
+
+    /// The #1736 fix applies inside a list item's sub-content too, since
+    /// nested content is parsed by the same recursive `parse_blocks`.
+    #[test]
+    fn tight_bullet_then_task_list_not_merged_in_list_item() {
+        let doc = markdown_to_adf("- x\n  - b\n  - [ ] t\n").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        let outer_items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer_items.len(), 1, "outer items: {outer_items:?}");
+        let children = outer_items[0].content.as_ref().unwrap();
+        assert_eq!(children.len(), 3, "children: {children:?}");
+        assert_eq!(children[1].node_type, "bulletList");
+        assert_eq!(children[2].node_type, "taskList");
     }
 
     /// A genuine restart keeps the author's number: CommonMark would fuse
