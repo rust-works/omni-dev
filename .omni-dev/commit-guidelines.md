@@ -55,6 +55,7 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 
 - `atlassian` - Atlassian JIRA/Confluence integration and API client
 - `browser` - Browser bridge: drive authenticated requests through a browser tab
+- `changelog` - CHANGELOG.md entries
 - `ci` - CI/CD pipelines and GitHub Actions workflows
 - `claude` - Claude AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
