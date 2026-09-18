@@ -98,8 +98,33 @@ impl<'a> MarkdownParser<'a> {
     /// `parse_inline`, which converts the `\\\n` or `  \n` sequences back
     /// into `hardBreak` nodes.
     fn collect_hardbreak_continuations(&mut self, full_text: &mut String) {
+        // Outside a list item nothing is a sibling marker: no line is
+        // indented less than zero.
+        self.collect_hardbreak_continuations_with_content_indent(full_text, 0);
+    }
+
+    /// [`Self::collect_hardbreak_continuations`] for a list item whose
+    /// marker starts at `marker_indent` spaces.
+    ///
+    /// A list marker indented less than the item's content column is the
+    /// next sibling item, not continuation text, and ends the paragraph
+    /// (issue #1727).  One *at* the content column is still continuation
+    /// text (issue #402: `1. First\` + `  2. Second` is one paragraph).
+    fn collect_item_hardbreak_continuations(
+        &mut self,
+        full_text: &mut String,
+        marker_indent: usize,
+    ) {
+        self.collect_hardbreak_continuations_with_content_indent(full_text, marker_indent + 2);
+    }
+
+    fn collect_hardbreak_continuations_with_content_indent(
+        &mut self,
+        full_text: &mut String,
+        content_indent: usize,
+    ) {
         while has_trailing_hard_break(full_text) && !self.at_end() {
-            if !self.try_append_hardbreak_continuation(full_text) {
+            if !self.try_append_hardbreak_continuation(full_text, content_indent) {
                 break;
             }
         }
@@ -111,14 +136,22 @@ impl<'a> MarkdownParser<'a> {
     ///
     /// Split out from `collect_hardbreak_continuations` so the body appears
     /// as its own function in coverage reports (issue #552 PR coverage gap).
-    fn try_append_hardbreak_continuation(&mut self, full_text: &mut String) -> bool {
+    fn try_append_hardbreak_continuation(
+        &mut self,
+        full_text: &mut String,
+        content_indent: usize,
+    ) -> bool {
         // Skip indented block-level siblings — mediaSingle (`![` — issue
         // #490), fenced code blocks (```` ``` ```` — issue #552), and
         // container directives (`:::`).  They must stay available for their
         // dedicated block handlers instead of being merged into paragraph
-        // text.
-        match self
-            .current_line()
+        // text.  A list marker indented below the item's content column is
+        // a sibling item (issue #1727).
+        let line = self.current_line();
+        if is_list_start(line) && leading_spaces(line) < content_indent {
+            return false;
+        }
+        match line
             .strip_prefix("  ")
             .filter(|s| !is_block_level_continuation_marker(s.trim_start()))
         {
@@ -130,6 +163,31 @@ impl<'a> MarkdownParser<'a> {
             }
             None => false,
         }
+    }
+
+    /// Collects the 2-space-indented sub-content lines of the current list
+    /// item, stripping the two spaces.
+    ///
+    /// A list marker indented less than two spaces deeper than the item's
+    /// own marker is a sibling item, not sub-content, and is left for the
+    /// enclosing item loop (issue #1727).  Non-marker lines keep the
+    /// pre-existing "any 2-space-indented line" rule so that continuation
+    /// paragraphs and fenced blocks written at the marker's own column still
+    /// belong to the item.
+    fn collect_item_sub_lines(&mut self, marker_indent: usize) -> Vec<String> {
+        let mut sub_lines: Vec<String> = Vec::new();
+        while !self.at_end() {
+            let next = self.current_line();
+            let Some(stripped) = next.strip_prefix("  ") else {
+                break;
+            };
+            if is_list_start(next) && leading_spaces(next) < marker_indent + 2 {
+                break;
+            }
+            sub_lines.push(stripped.to_string());
+            self.advance();
+        }
+        sub_lines
     }
 
     fn parse_blocks(&mut self) -> Result<Vec<AdfNode>> {
@@ -342,7 +400,7 @@ impl<'a> MarkdownParser<'a> {
                 // {localId=…} on the last continuation line is found by
                 // extract_trailing_local_id (issue #507).
                 let mut full_text = text.to_string();
-                self.collect_hardbreak_continuations(&mut full_text);
+                self.collect_item_hardbreak_continuations(&mut full_text, leading_spaces(line));
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
                 let inline_nodes = parse_inline(item_text);
                 // If a paraLocalId marker is present the original ADF had a
@@ -367,12 +425,7 @@ impl<'a> MarkdownParser<'a> {
                 // Collect indented sub-content (e.g. nested task lists
                 // from malformed ADF where taskItem contains taskItem
                 // children directly — issue #489).
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() && self.current_line().starts_with("  ") {
-                    let stripped = &self.current_line()[2..];
-                    sub_lines.push(stripped.to_string());
-                    self.advance();
-                }
+                let sub_lines = self.collect_item_sub_lines(leading_spaces(line));
                 if !sub_lines.is_empty() {
                     let sub_text = sub_lines.join("\n");
                     let mut nested =
@@ -426,21 +479,12 @@ impl<'a> MarkdownParser<'a> {
                 let first_line = &trimmed[2..];
                 self.advance();
                 let mut full_text = first_line.to_string();
-                self.collect_hardbreak_continuations(&mut full_text);
+                self.collect_item_hardbreak_continuations(&mut full_text, leading_spaces(line));
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
                 // Collect indented sub-content lines (2-space prefix).
                 // This captures both nested lists and continuation
                 // paragraphs that belong to the same list item.
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() {
-                    let next = self.current_line();
-                    if let Some(stripped) = next.strip_prefix("  ") {
-                        sub_lines.push(stripped.to_string());
-                        self.advance();
-                        continue;
-                    }
-                    break;
-                }
+                let sub_lines = self.collect_item_sub_lines(leading_spaces(line));
                 let item_content = parse_list_item_first_line(
                     item_text,
                     sub_lines,
@@ -472,19 +516,10 @@ impl<'a> MarkdownParser<'a> {
                 let first_line = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
                 self.advance();
                 let mut full_text = first_line.to_string();
-                self.collect_hardbreak_continuations(&mut full_text);
+                self.collect_item_hardbreak_continuations(&mut full_text, leading_spaces(line));
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
                 // Collect indented sub-content lines (2-space prefix).
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() {
-                    let next = self.current_line();
-                    if let Some(stripped) = next.strip_prefix("  ") {
-                        sub_lines.push(stripped.to_string());
-                        self.advance();
-                        continue;
-                    }
-                    break;
-                }
+                let sub_lines = self.collect_item_sub_lines(leading_spaces(line));
                 let item_content = parse_list_item_first_line(
                     item_text,
                     sub_lines,
@@ -1408,6 +1443,14 @@ fn is_list_start(line: &str) -> bool {
         || trimmed.starts_with("* ")
         || trimmed.starts_with("+ ")
         || parse_ordered_list_marker(trimmed).is_some()
+}
+
+/// Number of leading ASCII spaces — the parser's unit of list indentation.
+/// Deliberately not `trim_start()`-based: that would count the bytes of any
+/// Unicode whitespace (an NBSP is two), which is not what the 2-space
+/// nesting convention measures.
+fn leading_spaces(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b' ').count()
 }
 
 /// Escapes asterisk and underscore sequences in text that would otherwise be
@@ -5379,6 +5422,278 @@ mod tests {
         assert_eq!(doc.content[0].node_type, "orderedList");
         let items = doc.content[0].content.as_ref().unwrap();
         assert_eq!(items.len(), 3);
+    }
+
+    // ── nested list sibling detection (issue #1727) ─────────────────
+
+    /// Returns the text of a list item's first paragraph.
+    fn item_text(item: &AdfNode) -> &str {
+        item.content.as_ref().unwrap()[0].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap()
+    }
+
+    /// Regression: a sibling item of a nested list (same indent as the
+    /// preceding nested item) must stay a sibling instead of becoming a
+    /// child of the preceding item, which rendered as a "staircase" in
+    /// Jira (first sub-item letters, the rest roman numerals).
+    #[test]
+    fn nested_ordered_list_sibling_stays_sibling() {
+        let md = "1. Родитель:\n    1. Пункт А\n    2. Пункт Б\n2. Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        // First item: paragraph plus one nested orderedList with two
+        // sibling items.
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].node_type, "paragraph");
+        assert_eq!(first[1].node_type, "orderedList");
+        // A start-at-1 nested list carries no `order` attr.
+        assert!(first[1].attrs.is_none());
+        let nested_items = first[1].content.as_ref().unwrap();
+        assert_eq!(nested_items.len(), 2);
+        assert_eq!(item_text(&nested_items[0]), "Пункт А");
+        assert_eq!(item_text(&nested_items[1]), "Пункт Б");
+        // The sibling line was not swallowed as sub-content of «Пункт А»:
+        // the second top-level item is a plain single-paragraph listItem.
+        let second = outer[1].content.as_ref().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    #[test]
+    fn nested_unordered_list_sibling_stays_sibling() {
+        let md = "- Родитель:\n    - Пункт А\n    - Пункт Б\n- Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].node_type, "bulletList");
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    #[test]
+    fn mixed_nested_list_ordered_outer_unordered_inner() {
+        let md = "1. Родитель:\n    - Пункт А\n    - Пункт Б\n2. Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first[1].node_type, "bulletList");
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    #[test]
+    fn mixed_nested_list_unordered_outer_ordered_inner() {
+        let md = "- Родитель:\n    1. Пункт А\n    2. Пункт Б\n- Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first[1].node_type, "orderedList");
+        assert!(first[1].attrs.is_none());
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    /// Top-level numbering continues after the nested block: following
+    /// items stay at the outer level with their own numbers.
+    #[test]
+    fn top_level_numbering_continues_after_nested_block() {
+        let md = "1. Первый\n    1. Вложенный\n    2. Тоже вложенный\n2. Второй\n3. Третий";
+        let doc = markdown_to_adf(md).unwrap();
+        let list = &doc.content[0];
+        assert!(list.attrs.is_none());
+        let outer = list.content.as_ref().unwrap();
+        assert_eq!(outer.len(), 3);
+        assert_eq!(item_text(&outer[1]), "Второй");
+        assert_eq!(item_text(&outer[2]), "Третий");
+        // Each trailing item is a plain single-paragraph listItem.
+        for item in &outer[1..] {
+            assert_eq!(item.content.as_ref().unwrap().len(), 1);
+        }
+    }
+
+    /// Sibling detection works at any nesting depth: the deepest level
+    /// keeps its two items as siblings inside one list.
+    #[test]
+    fn nested_list_three_levels_sibling_stays_sibling() {
+        let md = "1. L1\n    1. L2a\n        1. L3a\n        2. L3b\n    2. L2b\n2. L1b";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        // Level 2.
+        let l1 = outer[0].content.as_ref().unwrap();
+        assert_eq!(l1.len(), 2);
+        let level2 = l1[1].content.as_ref().unwrap();
+        assert_eq!(level2.len(), 2);
+        assert_eq!(item_text(&level2[0]), "L2a");
+        assert_eq!(item_text(&level2[1]), "L2b");
+        // Level 3: two siblings under L2a.
+        let l2a = level2[0].content.as_ref().unwrap();
+        assert_eq!(l2a.len(), 2);
+        let level3 = l2a[1].content.as_ref().unwrap();
+        assert_eq!(level3.len(), 2);
+        assert_eq!(item_text(&level3[0]), "L3a");
+        assert_eq!(item_text(&level3[1]), "L3b");
+        // L2b and L1b stay plain single-paragraph listItems.
+        assert_eq!(level2[1].content.as_ref().unwrap().len(), 1);
+        assert_eq!(outer[1].content.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nested_task_list_sibling_stays_sibling() {
+        let md = "- [ ] Родитель\n    - [ ] Подзадача А\n    - [ ] Подзадача Б";
+        let doc = markdown_to_adf(md).unwrap();
+        let items = doc.content[0].content.as_ref().unwrap();
+        // The indented taskList becomes a sibling of the parent taskItem
+        // (issue #506) and keeps both sub-items as siblings.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].node_type, "taskList");
+        let sub_items = items[1].content.as_ref().unwrap();
+        assert_eq!(sub_items.len(), 2);
+        assert_eq!(sub_items[0].node_type, "taskItem");
+        assert_eq!(sub_items[1].node_type, "taskItem");
+    }
+
+    /// A nested item whose text ends in a hardBreak marker (two trailing
+    /// spaces) must not swallow the next sibling as continuation text.
+    #[test]
+    fn nested_item_ending_in_hardbreak_keeps_next_sibling() {
+        let md = "1. Родитель:\n    1. Пункт А  \n    2. Пункт Б\n2. Следующий";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let nested = outer[0].content.as_ref().unwrap()[1]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(nested.len(), 2, "nested items: {nested:?}");
+        assert_eq!(item_text(&nested[1]), "Пункт Б");
+    }
+
+    /// A continuation paragraph written at the nested marker's own column
+    /// still belongs to that nested item (unchanged from before #1727).
+    #[test]
+    fn nested_item_continuation_paragraph_stays_in_item() {
+        let md = "1. Parent:\n    1. Child one\n    Continuation of child one";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 1);
+        let parent = outer[0].content.as_ref().unwrap();
+        assert_eq!(parent.len(), 2, "parent content: {parent:?}");
+        let child = parent[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(child.len(), 2);
+        assert_eq!(child[1].node_type, "paragraph");
+        assert_eq!(
+            child[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("Continuation of child one")
+        );
+    }
+
+    /// A fenced code block written at the nested marker's own column still
+    /// belongs to that nested item (unchanged from before #1727).
+    #[test]
+    fn nested_item_fenced_code_block_stays_in_item() {
+        let md = "- Parent\n    - Child\n    ```bash\n    echo hi\n    ```";
+        let doc = markdown_to_adf(md).unwrap();
+        let parent = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let child = parent[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(child.len(), 2, "child content: {child:?}");
+        assert_eq!(child[1].node_type, "codeBlock");
+        assert_eq!(
+            child[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("echo hi")
+        );
+    }
+
+    /// Indentation is counted in ASCII spaces: an NBSP before the parent
+    /// marker (common in text pasted from Confluence) must not push the
+    /// sibling threshold out and un-nest genuine 2-space children.
+    #[test]
+    fn nbsp_before_marker_keeps_children_nested() {
+        let md = "\u{a0}- Parent\n  - Child\n- Next";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2, "outer items: {outer:?}");
+        let parent = outer[0].content.as_ref().unwrap();
+        assert_eq!(parent.len(), 2);
+        assert_eq!(parent[1].node_type, "bulletList");
+        assert_eq!(item_text(&outer[1]), "Next");
+    }
+
+    #[test]
+    fn leading_spaces_counts_ascii_spaces_only() {
+        assert_eq!(leading_spaces(""), 0);
+        assert_eq!(leading_spaces("- a"), 0);
+        assert_eq!(leading_spaces("    - a"), 4);
+        assert_eq!(leading_spaces("\t- a"), 0);
+        assert_eq!(leading_spaces("\u{a0}- a"), 0);
+        assert_eq!(leading_spaces("  \u{a0} - a"), 2);
+    }
+
+    /// Round-trip helper: ADF JSON → markdown → ADF must reproduce the
+    /// original document exactly.
+    fn assert_round_trip(json: &str, expected_md: &str) {
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md, expected_md);
+        let doc2 = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            serde_json::to_value(&doc2).unwrap(),
+            serde_json::to_value(&doc).unwrap(),
+            "round trip changed the document; markdown was:\n{md}"
+        );
+    }
+
+    #[test]
+    fn round_trip_nested_list_siblings() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"orderedList","content":[
+                {"type":"listItem","content":[
+                    {"type":"paragraph","content":[{"type":"text","text":"Родитель:"}]},
+                    {"type":"orderedList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Пункт А"}]}]},
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Пункт Б"}]}]}
+                    ]}
+                ]},
+                {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Следующий"}]}]}
+            ]}]}"#,
+            "1. Родитель:\n  1. Пункт А\n  2. Пункт Б\n2. Следующий\n",
+        );
+    }
+
+    /// Issue #402's rule is unchanged by #1727: a marker-shaped line at
+    /// exactly the item's content indent after a hardBreak is continuation
+    /// text, not a nested list — only a marker at *sibling* level ends the
+    /// item.
+    #[test]
+    fn hardbreak_continuation_at_content_indent_is_still_text() {
+        let md = "- first line  \n  2. continued\n- second";
+        let doc = markdown_to_adf(md).unwrap();
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        let inlines = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some("2. continued"));
     }
 
     #[test]
