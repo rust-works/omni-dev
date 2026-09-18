@@ -1158,7 +1158,17 @@ exactly that reason. One command, one prompt — the same `--backup-dir`/
 apply to this fresh lease. The backup lease's `<TOKEN>` works whether it has
 expired or not — an expired-but-kept row is the expected common case,
 since a restore is almost always wanted after the fact, once a bad write
-has been noticed.
+has been noticed — and whether it is still **live** or not: the fresh lease
+*supersedes* it, releasing its row in the same locked ledger write that
+records the new one, so restoring the moment a bad write is noticed never
+refuses itself by naming the very token you passed (issue #1685). The file
+is covered by exactly one live lease throughout — the backup lease until
+the instant the fresh one replaces it — and a denied or failed prompt
+leaves the backup lease exactly as it was. Releasing it costs nothing a
+successful restore had not already spent: the restore write moves the
+file's Drive `version` on under the *fresh* token, so the backup lease
+would fail the staleness check on any later write regardless. Its row and
+backup are kept, and it can be restored from again.
 
 **Binary files restore in full**, by re-uploading the backed-up bytes —
 verified against the backup's recorded SHA-256 first, so a backup that has
@@ -1237,7 +1247,72 @@ against the now-native file.
 dropped) alongside the fresh lease's new row — both remain findable by
 token in the ledger and in `audit.jsonl`, which records both tokens on a
 restore (`lease_id` the fresh one, `restored_from_lease_id` the backup one
-read from) — see [docs/log.md](log.md#audit-log).
+read from), and the supersede on the internal acquire's own record
+(`superseded_lease_id`) — see [docs/log.md](log.md#audit-log).
+
+**If the restore write fails after the fresh lease was minted**, that fresh
+token is still printed — it is real and live (Touch ID was answered, a
+backup taken, a ledger row written) and must not be lost. Present it to
+`--lease` for an ordinary write, but **do not restore from it**: its backup
+is the file's *pre-restore* content, which is exactly what you were undoing.
+Because it now covers the file, a second `restore` against the original
+backup token is refused until it is stood down, which is what
+[`drive lease release`](#release) is for:
+
+```bash
+$ omni-dev drive lease restore lease-abc123...
+lease-def456...
+Failed: the write-permission gate no longer allows this write, re-checked after the fresh lease's authentication prompt
+A fresh lease was minted before the failure and is still live (expires 2026-09-12 00:30:00 UTC) — present it to `--lease` for an ordinary write.
+Do not restore from it: its backup is this file's pre-restore content, which is what you were undoing.
+To retry the restore, stand it down first:
+  omni-dev drive lease release lease-def456...
+  omni-dev drive lease restore <the original backup token>
+```
+
+A `restore` can otherwise only be refused by a live lease that is *not* the
+one you passed — one acquired independently, or minted by an earlier
+restore attempt whose write failed. Its token is printed so you can present
+it to `--lease`, release it, or wait for it to expire.
+
+### Release
+
+```bash
+$ omni-dev drive lease release lease-def456...
+Released lease-def456... (covered file 1ExistingFileId, would have expired 2026-09-12 00:30:00 UTC). Its backup is kept — `omni-dev drive lease restore lease-def456...` still works.
+```
+
+`drive lease release <TOKEN>` ends a lease's write window early, without
+waiting for it to expire — the counterpart to the absolute expiry `acquire`
+fixes, which can be up to 24 hours away. It **prompts for nothing and makes
+no Drive call**: releasing only ever *reduces* what a token can do, so
+spending a Touch ID prompt to give up authority would be backwards (and
+would leave a headless installation unable to stand a lease down at all).
+It is a pure ledger mutation, and the one `drive lease` verb that needs no
+Drive client.
+
+**The backup is kept.** Release ends the lease's authority to write, not its
+usefulness: `drive lease restore <TOKEN>` looks a row up by token and never
+requires it to be live, so a released lease's content stays recoverable
+until [`drive lease prune`](#prune) drops the row and its backup together.
+One knock-on effect worth knowing: a *live* row never enters `prune
+--max-size`'s budget, so releasing a lease before its expiry adds its local
+backup bytes to that budget straight away — bounded by the window the lease
+had left, and never at the released row's own expense (it sorts
+newest-expiring-first, so it is the last candidate evicted). `--older-than`
+is unaffected: it compares `expires_at`, which release never moves.
+
+An already-expired or already-released token is reported rather than
+silently re-stamped, so an earlier release's timestamp is never overwritten:
+
+```bash
+$ omni-dev drive lease release lease-def456...
+Nothing to do: lease lease-def456... is not live — it was already released on 2026-09-12 00:05:00 UTC. Its backup is unaffected and still restorable.
+```
+
+Every attempt writes a best-effort `audit.jsonl` record (`verdict:
+"released"`/`"release-not-live"`/`"release-no-such-token"`/`"failed"`,
+`lease_id` the token presented) — see [docs/log.md](log.md#audit-log).
 
 ### Prune
 

@@ -556,6 +556,23 @@ matches `drive lease restore`'s own reported status: `restored`,
 `blocked`, `already-leased`, `refused-native-document`, `denied`,
 `unavailable`, `failed`, or `fresh-lease-but-write-failed`.
 
+Restore *supersedes* the backup lease it restores from (issue #1685): the
+internal fresh-lease acquisition releases that row in the same ledger write
+that records the new one, so its `command: ["drive", "lease-acquire"]`
+record additionally carries `superseded_lease_id` — the backup token — on
+the `acquired` verdict, and only when a row was actually released. It is
+the record to look for to answer "when did this lease stop being live?"
+when that happened without a `release`.
+
+**`drive lease release <TOKEN>`** writes one best-effort record per
+attempt, `command: ["drive", "lease-release"]`, with `lease_id` the token
+presented (even on a refusal, so a presented-but-dead token is greppable)
+and `verdict` matching the command's own status: `released`,
+`release-not-live` (already expired or already released; the row is left
+untouched), `release-no-such-token`, or `failed` carrying the error. A
+release makes no Drive call, so there is no `drivemutation` record to join
+against.
+
 ## Redaction posture
 
 No secret material is ever written, under any code path:

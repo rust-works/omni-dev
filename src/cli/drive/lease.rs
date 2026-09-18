@@ -13,6 +13,7 @@ use crate::drive::lease::acquire::{
 use crate::drive::lease::authenticate::{self, AuthPolicy};
 use crate::drive::lease::ledger::{self, LeaseBackup};
 use crate::drive::lease::prune::{self, PruneOptions};
+use crate::drive::lease::release::{self, ReleaseOptions, ReleaseResult};
 use crate::drive::lease::restore::{self, RestoreOptions, RestoreResult};
 use crate::drive::lease::settings as lease_settings;
 use crate::drive::sheets::client::SheetsClient;
@@ -54,6 +55,9 @@ enum LeaseAction {
     /// Restores a file from a backup lease's recorded content, minting a
     /// fresh lease of its own before writing.
     Restore(RestoreCommand),
+    /// Ends a lease's write window early, without waiting for it to expire
+    /// (issue #1685). Keeps the backup, which stays restorable.
+    Release(ReleaseCommand),
     /// Bounds the ledger's and the backup directory/folder's growth by
     /// dropping expired rows together with the backups they point at
     /// (ADR-0080 Consequences fast-follow, #1678).
@@ -65,6 +69,9 @@ impl LeaseCommand {
         match self.action {
             LeaseAction::Acquire(cmd) => cmd.execute(client).await,
             LeaseAction::Restore(cmd) => cmd.execute(client).await,
+            // The one lease verb that makes no Drive call at all, so the
+            // resolved client is not threaded into it.
+            LeaseAction::Release(cmd) => cmd.execute(),
             LeaseAction::Prune(cmd) => cmd.execute(client).await,
         }
     }
@@ -188,6 +195,9 @@ impl AcquireCommand {
             auth_policy: resolved.auth_policy,
             ledger_path,
             allow_headless: resolved.allow_headless,
+            // Only `drive lease restore` supersedes a lease; a plain
+            // acquire is refused by a live one (issue #1664/#1685).
+            supersedes: None,
         };
         let authenticator = authenticate::platform_authenticator();
         let result = acquire::acquire(client, &opts, authenticator.as_ref()).await;
@@ -240,6 +250,49 @@ impl RestoreCommand {
             return Ok(());
         }
         print_restore_result(&result);
+        Ok(())
+    }
+}
+
+/// Ends a lease's write window early (issue #1685). The counterpart to the
+/// absolute expiry `acquire` fixes: a lease normally stays live until it
+/// expires, which can be up to 24 hours away.
+///
+/// Prompts for nothing — releasing only ever *reduces* what a token can do,
+/// so spending a Touch ID prompt to give up authority would be backwards (and
+/// would leave a headless installation unable to stand a lease down at all).
+/// Makes no Drive API call either: it is a pure ledger mutation.
+///
+/// The backup is **kept**: `drive lease restore <TOKEN>` looks a row up by
+/// token and never requires it to be live, so a released lease's content
+/// stays recoverable until `drive lease prune` drops the row and its backup
+/// together.
+///
+/// No `LeaseFlags` here, same as `prune`: there is no backup to write, no
+/// expiry to set and no authentication policy to satisfy.
+#[derive(Parser)]
+pub struct ReleaseCommand {
+    /// The lease token to release (from `drive lease acquire` or `drive
+    /// lease restore`).
+    pub token: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl ReleaseCommand {
+    pub fn execute(self) -> Result<()> {
+        let ledger_path = ledger::ledger_path()?;
+        let opts = ReleaseOptions {
+            token: self.token,
+            ledger_path,
+        };
+        let result = release::release(&opts);
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
+        print_release_result(&result);
         Ok(())
     }
 }
@@ -503,10 +556,15 @@ fn print_restore_result(result: &RestoreResult) {
             }
         }
         RestoreResult::AlreadyLeased { token, expires_at } => {
+            // Never the token the caller passed — restore supersedes its own
+            // backup lease (issue #1685) — so this is some other lease, and
+            // "re-run once it expires" is no longer the only way out.
             println!("{token}");
             eprintln!(
-                "A live lease already covers this file (expires {expires_at}) — reusing its \
-                 token rather than minting a second one; re-run once it expires to restore"
+                "Refused: a different live lease already covers this file (expires \
+                 {expires_at}) — its token is printed above. Present it to `--lease`, or stand \
+                 it down with `omni-dev drive lease release {}` and re-run this restore.",
+                sanitize_for_terminal(token)
             );
         }
         RestoreResult::RefusedNativeDocument => {
@@ -529,12 +587,61 @@ fn print_restore_result(result: &RestoreResult) {
             // must not be surfaced nowhere the caller could ever find it
             // again.
             println!("{token}");
+            // Pointedly does *not* suggest restoring from this token (issue
+            // #1685): its backup is the file's pre-restore state, so doing
+            // that would re-upload exactly the content being undone. It also
+            // now covers the file, which is why retrying needs the release
+            // first.
             eprintln!(
                 "Failed: {detail}\nA fresh lease was minted before the failure and is still \
-                 live (expires {expires_at}) — present it to `--lease`, or re-run `drive lease \
-                 restore` with it, rather than spending another prompt"
+                 live (expires {expires_at}) — present it to `--lease` for an ordinary write.\n\
+                 Do not restore from it: its backup is this file's pre-restore content, which \
+                 is what you were undoing.\nTo retry the restore, stand it down first:\n  \
+                 omni-dev drive lease release {}\n  omni-dev drive lease restore <the original \
+                 backup token>",
+                sanitize_for_terminal(token)
             );
         }
+    }
+}
+
+fn print_release_result(result: &ReleaseResult) {
+    match result {
+        ReleaseResult::Released {
+            token,
+            file_id,
+            expires_at,
+        } => {
+            eprintln!(
+                "Released {} (covered file {}, would have expired {expires_at}). Its backup is \
+                 kept — `omni-dev drive lease restore {}` still works.",
+                sanitize_for_terminal(token),
+                sanitize_for_terminal(file_id),
+                sanitize_for_terminal(token)
+            );
+        }
+        ReleaseResult::NotLive {
+            token,
+            expires_at,
+            released_at,
+        } => {
+            let cause = match released_at {
+                Some(at) => format!("it was already released on {at}"),
+                None => format!("it expired on {expires_at}"),
+            };
+            eprintln!(
+                "Nothing to do: lease {} is not live — {cause}. Its backup is unaffected and \
+                 still restorable.",
+                sanitize_for_terminal(token)
+            );
+        }
+        ReleaseResult::NoSuchToken => {
+            eprintln!(
+                "Refused: no lease in this ledger was ever acquired with that token — check it \
+                 was copied correctly from `drive lease acquire`'s own output"
+            );
+        }
+        ReleaseResult::Failed { detail } => eprintln!("Failed: {detail}"),
     }
 }
 
@@ -859,6 +966,78 @@ mod tests {
     }
 
     #[test]
+    fn print_release_result_does_not_panic_for_any_variant() {
+        for result in [
+            ReleaseResult::Released {
+                token: "tok-1".to_string(),
+                file_id: "file-1".to_string(),
+                expires_at: chrono::Utc::now(),
+            },
+            // Both causes of "not live": an earlier release, and plain expiry.
+            ReleaseResult::NotLive {
+                token: "tok-2".to_string(),
+                expires_at: chrono::Utc::now(),
+                released_at: Some(chrono::Utc::now()),
+            },
+            ReleaseResult::NotLive {
+                token: "tok-3".to_string(),
+                expires_at: chrono::Utc::now(),
+                released_at: None,
+            },
+            ReleaseResult::NoSuchToken,
+            ReleaseResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ] {
+            print_release_result(&result);
+        }
+    }
+
+    /// `release` through the top-level `LeaseCommand::execute` dispatch,
+    /// with the default `Table` output — it is the one lease verb that takes
+    /// no client, so this pins that the dispatch arm really does not need
+    /// one to have been resolvable for anything.
+    #[tokio::test]
+    async fn release_command_dispatches_through_lease_command_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
+        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
+        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
+            token: "live-token".to_string(),
+            file_id: "file-1".to_string(),
+            version: "1".to_string(),
+            modified_time: None,
+            backup: LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+            acquired_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            released_at: None,
+            restored_at: None,
+            restored_sheet_id: None,
+        });
+        ledger.save(&ledger_path).unwrap();
+
+        let cmd = LeaseCommand {
+            action: LeaseAction::Release(ReleaseCommand {
+                token: "live-token".to_string(),
+                output: OutputFormat::Table,
+            }),
+        };
+        cmd.execute(&client).await.unwrap();
+
+        let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        let record = reloaded.get("live-token").expect("the row is kept");
+        assert!(record.released_at.is_some());
+        assert!(!record.is_live(chrono::Utc::now()));
+    }
+
+    #[test]
     fn default_backup_dir_ends_with_the_expected_suffix() {
         // `LeaseFlags::resolve` delegates the whole chain to
         // `lease_settings::resolve_backup_dir`, whose own precedence tiers
@@ -998,7 +1177,7 @@ mod tests {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Acquire(acquire) => acquire,
                 // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes an acquire subcommand"
-                LeaseAction::Restore(_) | LeaseAction::Prune(_) => {
+                LeaseAction::Restore(_) | LeaseAction::Release(_) | LeaseAction::Prune(_) => {
                     panic!("expected an Acquire command")
                 } // omni-dev: coverage end
             },
@@ -1012,7 +1191,7 @@ mod tests {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Prune(prune) => prune,
                 // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes a prune subcommand"
-                LeaseAction::Acquire(_) | LeaseAction::Restore(_) => {
+                LeaseAction::Acquire(_) | LeaseAction::Restore(_) | LeaseAction::Release(_) => {
                     panic!("expected a Prune command")
                 } // omni-dev: coverage end
             },
@@ -1118,6 +1297,28 @@ mod tests {
         assert_eq!(cmd.flags.expiry_minutes, Some(10));
         assert!(cmd.flags.biometrics_only);
         assert!(cmd.flags.allow_headless);
+    }
+
+    // ── release ──────────────────────────────────────────────────────
+
+    #[test]
+    fn release_parses_its_token_and_output_format() {
+        let mut full = vec!["omni-dev", "lease"];
+        full.extend_from_slice(&["release", "tok-1", "-o", "json"]);
+        let Wrapped::Lease(cmd) = Wrapper::try_parse_from(full).unwrap().cmd;
+        let LeaseAction::Release(release) = cmd.action else {
+            panic!("expected a Release command");
+        };
+        assert_eq!(release.token, "tok-1");
+        assert!(matches!(release.output, OutputFormat::Json));
+    }
+
+    #[test]
+    fn release_takes_no_lease_flags() {
+        // `--expiry-minutes` and friends belong to acquire/restore only:
+        // there is nothing for release to resolve them against.
+        let err = parse_err(&["release", "tok-1", "--expiry-minutes", "5"]);
+        assert!(err.contains("unexpected argument"), "{err}");
     }
 
     // ── prune ────────────────────────────────────────────────────────

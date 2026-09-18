@@ -12,6 +12,19 @@
 //! reversible by the same verb, and prints the new token for exactly that
 //! reason. One command, one prompt.
 //!
+//! That fresh lease **supersedes** `<TOKEN>`'s own row (issue #1685): both
+//! cover the same file, so without it the internal acquire would refuse the
+//! restore by naming the very token the caller passed, whenever the backup
+//! lease is still live — which is precisely the "I noticed the bad write
+//! straight away" case. The supersede releases `<TOKEN>` in the *same* locked
+//! ledger rewrite that inserts the fresh row, so at most one live lease per
+//! file still holds at every instant, and a denied or failed prompt leaves
+//! `<TOKEN>` live and untouched. Releasing it costs nothing a successful
+//! restore had not already spent: the restore write bumps the file's Drive
+//! version under the *fresh* token, which leaves `<TOKEN>`'s recorded version
+//! behind and so would fail the staleness check on any later write anyway.
+//! The row itself is kept, and stays restorable from.
+//!
 //! **One typed native-document path: a deleted sheet** (issue #1676). A
 //! native document's backup is a whole-file Drive copy, taken once at lease
 //! *acquire* time — so a `delete-sheet` write made under that lease leaves
@@ -195,8 +208,12 @@ pub enum RestoreResult {
         decided_by: Option<DecidingRule>,
     },
     /// A live lease already covers the file — bubbled from the internal
-    /// [`acquire`] step. Present its token to `--lease` instead; re-running
-    /// `restore` once it expires will proceed.
+    /// [`acquire`] step. Never the backup token this restore was asked for,
+    /// which is superseded rather than treated as a blocker (issue #1685):
+    /// this is some *other* lease, either acquired independently or minted
+    /// by an earlier restore attempt whose write failed. Present its token
+    /// to `--lease`, or stand it down with `drive lease release` and re-run;
+    /// waiting for it to expire also works, but can take up to 24 hours.
     AlreadyLeased {
         /// The existing lease's token.
         token: String,
@@ -240,8 +257,18 @@ pub enum RestoreResult {
     /// prompt up to two minutes after it's presented, ADR-0080 §7, and a
     /// permission change landing in that window must not be ignored), now
     /// refuses it, or the mutating call itself failed. `token` is real and
-    /// live regardless: present it to a later `--lease`, or re-run `drive
-    /// lease restore token` to use it rather than spending another prompt.
+    /// live regardless, so it is surfaced rather than lost — present it to a
+    /// later `--lease`.
+    ///
+    /// Deliberately **not** "re-run `restore` with it" (issue #1685): this
+    /// lease's backup is the file's *pre-restore* state, which is exactly
+    /// what the caller was undoing, so restoring from it would re-upload the
+    /// content they were trying to get rid of. Retrying means releasing this
+    /// lease — `drive lease release`, since it now covers the file and so
+    /// blocks a second restore — and re-running against the *original*
+    /// backup token. Nor is `token` promised to be *usable*: a failure to
+    /// refresh the row's recorded version after the write can leave the
+    /// fresh lease live but stale.
     FreshLeaseButWriteFailed {
         /// The fresh lease's token — not orphaned, even though this
         /// attempt did not use it to write anything.
@@ -453,6 +480,14 @@ async fn restore_inner(
         auth_policy: opts.auth_policy,
         ledger_path: opts.ledger_path.clone(),
         allow_headless: opts.allow_headless,
+        // The backup token is *superseded*, not merely ignored (issue
+        // #1685): restoring from a lease that is still live — the "I noticed
+        // the bad write straight away" case — would otherwise be refused by
+        // this very acquire, naming the token the caller just passed. Its
+        // row is released in the same locked rewrite that inserts the fresh
+        // one, so the file is never covered by two live leases nor by none,
+        // and a denied or failed prompt leaves it live and untouched.
+        supersedes: Some(opts.token.clone()),
     };
     let (new_token, expires_at, fresh_backup, headless_waiver) =
         match acquire::acquire(client, &acquire_opts, authenticator).await {
@@ -820,7 +855,10 @@ async fn detect_sheet_restore(
 /// decoration on a refusal already decided, never itself a gate.
 fn live_lease_for(ledger_path: &Path, file_id: &str) -> Option<LiveLease> {
     let ledger = LeaseLedger::load(ledger_path).ok()?;
-    let record = ledger.live_lease_for_file(file_id, Utc::now())?;
+    // No exclusion: this is a report of whatever is live, not an acquire's
+    // gate, so the backup token's own row is exactly as worth naming here as
+    // any other.
+    let record = ledger.live_lease_for_file(file_id, Utc::now(), None)?;
     Some(LiveLease {
         token: record.token.clone(),
         expires_at: record.expires_at,
@@ -1241,9 +1279,28 @@ mod tests {
         }
     }
 
-    /// Seeds `ledger_path` with a lease for `file_id` whose backup is
-    /// `backup`, returning its token.
+    /// Seeds `ledger_path` with an *expired* lease for `file_id` whose
+    /// backup is `backup`, returning its token — the ordinary case, since a
+    /// restore is usually wanted after the fact.
     fn seed_backup_lease(ledger_path: &Path, file_id: &str, backup: LeaseBackup) -> String {
+        seed_backup_lease_expiring(
+            ledger_path,
+            file_id,
+            backup,
+            Utc::now() - ChronoDuration::hours(1),
+        )
+    }
+
+    /// [`seed_backup_lease`] with an explicit `expires_at`, so a test can
+    /// seed a backup lease that is still **live** — the case issue #1685 was
+    /// about, which the internal acquire used to refuse by naming this very
+    /// token.
+    fn seed_backup_lease_expiring(
+        ledger_path: &Path,
+        file_id: &str,
+        backup: LeaseBackup,
+        expires_at: DateTime<Utc>,
+    ) -> String {
         let token = "backup-token".to_string();
         let mut ledger = LeaseLedger::default();
         ledger.insert(LeaseRecord {
@@ -1253,7 +1310,7 @@ mod tests {
             modified_time: None,
             backup,
             acquired_at: Utc::now() - ChronoDuration::hours(2),
-            expires_at: Utc::now() - ChronoDuration::hours(1),
+            expires_at,
             released_at: None,
             restored_at: None,
             restored_sheet_id: None,
@@ -2500,6 +2557,140 @@ mod tests {
             .get(&new_token)
             .expect("fresh lease must be recorded");
         assert!(new_record.is_live(Utc::now()));
+    }
+
+    /// Issue #1685's headline case: the bad write was noticed *immediately*,
+    /// so the backup lease is still live. Restore must supersede it rather
+    /// than refuse itself by naming the very token the caller passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_still_live_backup_token_is_superseded_rather_than_refusing_the_restore() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease_expiring(
+            &test_opts.ledger_path,
+            "file-1",
+            backup,
+            Utc::now() + ChronoDuration::minutes(29),
+        );
+
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the wrongly-written content")
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "2",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::Restored { new_token, .. } = result else {
+            panic!("expected Restored, got {result:?}");
+        };
+
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        let old_record = ledger.get(&old_token).expect("old row must be kept");
+        assert!(
+            old_record.released_at.is_some(),
+            "the superseded backup lease must be released"
+        );
+        assert!(
+            !old_record.is_live(Utc::now()),
+            "a superseded lease must stop authorising writes even though its expiry is still \
+             in the future"
+        );
+        assert!(
+            old_record.restored_at.is_some(),
+            "releasing it must not skip marking it restored-from"
+        );
+        // Exactly one live lease still covers the file — the invariant
+        // (#1664) supersede must preserve, not weaken.
+        assert_eq!(
+            ledger
+                .live_lease_for_file("file-1", Utc::now(), None)
+                .map(|r| r.token.clone()),
+            Some(new_token),
+        );
+        // The release is a ledger state change, so ADR-0080 §11 wants it in
+        // the audit trail: the internal acquire's record names the lease it
+        // ended, not only the one it minted.
+        let acquire_record = audit
+            .records()
+            .into_iter()
+            .find(|r| r.command == vec!["drive".to_string(), "lease-acquire".to_string()])
+            .expect("the internal acquire writes its own audit record");
+        assert_eq!(
+            acquire_record
+                .context
+                .get("superseded_lease_id")
+                .map(String::as_str),
+            Some(old_token.as_str())
+        );
+    }
+
+    /// The supersede is atomic with the insert, so a prompt that is never
+    /// answered must leave the backup lease exactly as it was — otherwise a
+    /// denied restore would silently cost the caller their live lease.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_prompt_leaves_a_still_live_backup_token_untouched() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease_expiring(
+            &test_opts.ledger_path,
+            "file-1",
+            backup,
+            Utc::now() + ChronoDuration::minutes(29),
+        );
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+
+        let result = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Denied("nope".to_string())),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(matches!(result, RestoreResult::Denied { .. }));
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        let old_record = ledger.get(&old_token).expect("old row must be kept");
+        assert!(
+            old_record.released_at.is_none(),
+            "nothing replaced it, so the backup lease must still be live"
+        );
+        assert!(old_record.is_live(Utc::now()));
     }
 
     #[test]
