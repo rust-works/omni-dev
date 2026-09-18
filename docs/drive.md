@@ -1058,7 +1058,7 @@ lease exists — re-run `acquire` once the file is quiet:
 
 ```bash
 $ omni-dev drive lease acquire 1ExistingFileId
-Refused: the file changed while its backup was being taken: Drive reports checksum 9f86…0a08 at version 8, but the bytes backed up hash to 2cf2…9824. No lease was minted and the backup was discarded — retry.
+Refused: the file changed while its backup was being taken: Drive reports checksum 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 at version 8, but the bytes backed up hash to 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824. No lease was minted and the backup was discarded — retry.
 ```
 
 A rename, move or permission change mid-backup bumps `version` without
