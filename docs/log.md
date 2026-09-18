@@ -480,9 +480,12 @@ leased-write lifecycle, landing across that same issue's phases.
 "lease-acquire"]`, regardless of outcome — `verdict` is `acquired`,
 `acquired-headless-waiver` (ADR-0080 §8/§13, issue #1677: proceeded under the
 headless opt-out, no human ever prompted), `already-leased`,
-`refused-native-document`, `denied`, `unavailable`, or `failed`, matching
-`AcquireResult`'s own kebab-case status — plus, on `already-leased`/`failed`,
-the `-backup-orphaned` suffix (issue #1690): this attempt took a real backup
+`refused-native-document`, `refused-concurrent-change` (issue #1693: the
+file changed while its backup was being taken, so no lease could vouch for
+that backup — `error` names what moved), `denied`, `unavailable`, or
+`failed`, matching `AcquireResult`'s own kebab-case status — plus, on
+`already-leased`/`refused-concurrent-change`/`failed`, the
+`-backup-orphaned` suffix (issue #1690): this attempt took a real backup
 before discovering it isn't referenced by any ledger row, and reclaiming
 that backup itself then failed, so it is now truly orphaned (`drive lease
 prune` cannot see it either). An `acquired` record additionally carries
@@ -492,10 +495,11 @@ pre-authentication snapshot, for the same TOCTOU reason the ledger itself
 does), `backup_location` (a local path for a byte backup, or the backup
 copy's own file id for a native-document backup),
 `backup_sha256`/`backup_size` (byte backups only), and `auth_policy`
-(`device-owner` or `biometrics-only`). An `already-leased`/`failed` record
-also carries `backup_location` whenever this attempt took a backup, whether
-or not reclaiming it succeeded — the `-backup-orphaned` suffix is what
-distinguishes the two. Unlike a leased *write*'s own record (below), this
+(`device-owner` or `biometrics-only`). An
+`already-leased`/`refused-concurrent-change`/`failed` record also carries
+`backup_location` whenever this attempt took a backup (a
+`refused-concurrent-change` always did), whether or not reclaiming it
+succeeded — the `-backup-orphaned` suffix is what distinguishes the two. Unlike a leased *write*'s own record (below), this
 one is best-effort rather than write-ahead/fail-closed: acquiring mutates no
 Drive content — by the time the record is written the consent, the backup
 and the ledger row have already durably happened, so a
@@ -553,8 +557,9 @@ matches `drive lease restore`'s own reported status: `restored`,
 `restored-sheet-headless-waiver`, `sheet-already-restored`,
 `no-such-backup-token`, `no-typed-restore-path`,
 `backup-too-large-for-simple-upload`, `refused-no-visible-parents`,
-`blocked`, `already-leased`, `refused-native-document`, `denied`,
-`unavailable`, `failed`, or `fresh-lease-but-write-failed`.
+`blocked`, `already-leased`, `refused-native-document`,
+`refused-concurrent-change`, `denied`, `unavailable`, `failed`, or
+`fresh-lease-but-write-failed`.
 
 Restore *supersedes* the backup lease it restores from (issue #1685): the
 internal fresh-lease acquisition releases that row in the same ledger write
