@@ -53,6 +53,15 @@ impl<T: EnvSource + ?Sized> EnvSource for &T {
     }
 }
 
+/// Returns `var`'s value when it is set and non-empty.
+///
+/// The docs promise resolution "stopping at the first non-empty value", and
+/// treating `VAR=` as unset lets users neutralise an exported variable for a
+/// single invocation.
+pub(crate) fn non_empty_var(env: &impl EnvSource, key: &str) -> Option<String> {
+    env.var(key).filter(|v| !v.is_empty())
+}
+
 /// RAII guard that sets a process env var for the duration of a scope,
 /// restoring (or removing) whatever was there before when the guard drops —
 /// so a caller that mutates process env can be invoked more than once per

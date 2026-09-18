@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 
 use crate::drive::lease::acquire::{MAX_EXPIRY_MINUTES, MIN_EXPIRY_MINUTES};
 use crate::drive::lease::authenticate::AuthPolicy;
-use crate::utils::env::EnvSource;
+use crate::utils::env::{non_empty_var, EnvSource};
 use crate::utils::settings::LeaseSettings;
 
 /// Default lease expiry when no layer sets one (ADR-0080 §5).
@@ -44,12 +44,6 @@ pub(crate) const LEASE_BIOMETRICS_ONLY_ENV: &str = "OMNI_DEV_DRIVE_LEASE_BIOMETR
 /// Env var enabling the headless/off-macOS opt-out (ADR-0080 §8). Same
 /// truthy-value convention as [`LEASE_BIOMETRICS_ONLY_ENV`].
 pub(crate) const LEASE_ALLOW_HEADLESS_ENV: &str = "OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS";
-
-/// Returns `var`'s value when it is set and non-empty — see
-/// `crate::claude::backend::non_empty_var`, which this mirrors.
-fn non_empty_var(env: &impl EnvSource, key: &str) -> Option<String> {
-    env.var(key).filter(|v| !v.is_empty())
-}
 
 /// Parses `var` as a truthy boolean: `1`, `true`, or `yes` (trimmed,
 /// case-insensitive) is `true`; `0`, `false`, or `no` is `false`; unset or

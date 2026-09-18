@@ -34,7 +34,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::claude::model_config::ModelRegistry;
-use crate::utils::env::EnvSource;
+use crate::utils::env::{non_empty_var, EnvSource};
 
 /// Env var selecting the AI backend (`default`, `claude-cli`, `openai`,
 /// `ollama`, `bedrock`); set by the global `--ai-backend` flag.
@@ -132,15 +132,6 @@ impl AiBackend {
             _ => None,
         }
     }
-}
-
-/// Returns `var`'s value when it is set and non-empty.
-///
-/// The docs promise resolution "stopping at the first non-empty value", and
-/// treating `VAR=` as unset lets users neutralise an exported variable for a
-/// single invocation.
-fn non_empty_var(env: &impl EnvSource, key: &str) -> Option<String> {
-    env.var(key).filter(|v| !v.is_empty())
 }
 
 /// Resolves which AI backend to use from the environment.
