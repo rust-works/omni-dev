@@ -165,20 +165,6 @@ pub struct ClearCommand {
     pub output: OutputFormat,
 }
 
-/// Resolves the lease ledger path for one of this module's commands.
-///
-/// A dry run never checks a lease (`write_inner` returns `WouldWrite`
-/// before the ledger is ever touched, mirroring `drive edit`'s own
-/// `--dry-run` reasoning) — resolving a real path here would make a purely
-/// read-only preview depend on the state directory existing at all.
-fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
-    if dry_run {
-        Ok(std::path::PathBuf::new())
-    } else {
-        crate::drive::lease::ledger::ledger_path()
-    }
-}
-
 impl WriteCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -192,7 +178,7 @@ impl WriteCommand {
             input: self.input.into(),
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -211,7 +197,7 @@ impl AppendCommand {
             input: self.input.into(),
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -229,7 +215,7 @@ impl ClearCommand {
             input: ValueInputOption::default(),
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
     }
@@ -300,18 +286,6 @@ async fn run_write(client: &DriveClient, opts: &WriteOptions, output: &OutputFor
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
-        // A dry run short-circuits to an empty path (tested via `execute`
-        // with `--dry-run`); a real run delegates to the shared resolver.
-        let path = resolve_ledger_path(false).unwrap();
-        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
-        assert_eq!(
-            resolve_ledger_path(true).unwrap(),
-            std::path::PathBuf::new()
-        );
-    }
 
     #[test]
     fn input_arg_maps_onto_the_engine_option() {

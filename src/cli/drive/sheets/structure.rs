@@ -507,7 +507,7 @@ impl AddSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -524,7 +524,7 @@ impl RenameSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -542,7 +542,7 @@ impl InsertRowsCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -560,7 +560,7 @@ impl InsertColumnsCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -574,7 +574,7 @@ impl DeleteSheetCommand {
             verb: StructureVerb::DeleteSheet { sheet: self.sheet },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -592,7 +592,7 @@ impl DeleteRowsCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -610,7 +610,7 @@ impl DeleteColumnsCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -631,7 +631,7 @@ impl DeleteRangeCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -649,7 +649,7 @@ impl DuplicateSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -666,7 +666,7 @@ impl ReorderSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -683,7 +683,7 @@ impl HideSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
     }
@@ -700,23 +700,9 @@ impl ShowSheetCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
-    }
-}
-
-/// Resolves the lease ledger path for one of this module's commands.
-///
-/// A dry run never checks a lease (`structure_inner` returns `WouldChange`
-/// before the ledger is ever touched, mirroring `drive edit`'s own
-/// `--dry-run` reasoning) — resolving a real path here would make a
-/// purely read-only preview depend on the state directory existing at all.
-fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
-    if dry_run {
-        Ok(std::path::PathBuf::new())
-    } else {
-        crate::drive::lease::ledger::ledger_path()
     }
 }
 
@@ -775,18 +761,6 @@ mod tests {
 
     fn line(s: &str) -> Vec<String> {
         vec![s.to_string()]
-    }
-
-    #[test]
-    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
-        // A dry run short-circuits to an empty path (tested via `execute`
-        // with `--dry-run`); a real run delegates to the shared resolver.
-        let path = resolve_ledger_path(false).unwrap();
-        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
-        assert_eq!(
-            resolve_ledger_path(true).unwrap(),
-            std::path::PathBuf::new()
-        );
     }
 
     #[test]

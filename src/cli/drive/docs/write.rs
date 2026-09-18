@@ -99,7 +99,7 @@ impl ReplaceCommand {
             },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         let rules = helpers::active_account_rules()?;
         run_write(client, &docs, &opts, &rules, &self.output).await
@@ -121,24 +121,10 @@ impl AppendCommand {
             payload: WritePayload::Append { text },
             dry_run: self.dry_run,
             lease_token: self.lease,
-            ledger_path: resolve_ledger_path(self.dry_run)?,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         let rules = helpers::active_account_rules()?;
         run_write(client, &docs, &opts, &rules, &self.output).await
-    }
-}
-
-/// Resolves the lease ledger path for one of this module's commands.
-///
-/// A dry run never checks a lease (`write_inner` returns a preview before
-/// the ledger is ever touched, mirroring `drive edit`'s own `--dry-run`
-/// reasoning) — resolving a real path here would make a purely read-only
-/// preview depend on the state directory existing at all.
-fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
-    if dry_run {
-        Ok(std::path::PathBuf::new())
-    } else {
-        crate::drive::lease::ledger::ledger_path()
     }
 }
 
@@ -203,18 +189,6 @@ async fn run_write(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
-        // A dry run short-circuits to an empty path (tested via `execute`
-        // with `--dry-run`); a real run delegates to the shared resolver.
-        let path = resolve_ledger_path(false).unwrap();
-        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
-        assert_eq!(
-            resolve_ledger_path(true).unwrap(),
-            std::path::PathBuf::new()
-        );
-    }
 
     #[test]
     fn read_text_reads_a_file() {
