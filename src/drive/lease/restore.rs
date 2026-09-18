@@ -1041,7 +1041,7 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 /// Best-effort: stamps `token`'s row with `restored_at` and, for a sheet
 /// restore, the id `copyTo` created live (ADR-0080 §4, issue #1689).
 ///
-/// Goes through [`LeaseLedger::mutate`], not [`LeaseLedger::mutate_locked`]
+/// Goes through [`LeaseLedger::mutate`], not `LeaseLedger::mutate_locked`
 /// — the caller (`restore_inner`) is still holding `grant`'s lock (acquired
 /// via `gate_leased_write` for the *fresh* lease's row) when it calls this,
 /// so acquiring a second lock here would be redundant at best and, since

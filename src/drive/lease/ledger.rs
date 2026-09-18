@@ -374,7 +374,7 @@ impl LeaseLedger {
     /// release it early by re-acquiring here — that caller uses this
     /// function directly. `_lock` is the proof it is held, so an unlocked
     /// rewrite does not compile. A caller that has not already taken the
-    /// lock should use [`Self::mutate_locked`] instead.
+    /// lock acquires one first, normally via [`LedgerLock::acquire_waiting`].
     pub(crate) fn mutate<R>(
         _lock: &LedgerLock,
         path: &Path,
