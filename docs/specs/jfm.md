@@ -518,7 +518,35 @@ Block-level attributes can follow a block on a separate line:
 {align=center breakout=wide}
 ```
 
-Supported attributes: `align`, `indent`, `breakout`.
+Supported attributes: `align`, `indent`, `breakout`, `localId`, and — on
+`orderedList`/`bulletList` only — `order` and `list`.
+
+#### `list=separate`
+
+A CommonMark *loose* list (items separated by blank lines) is one list, so
+JFM fuses two adjacent lists of the same type back together when parsing.
+Two ADF lists that are genuinely separate siblings are therefore rendered
+with a `{list=separate}` marker on the second (and on each subsequent one),
+which suppresses that fusion:
+
+```markdown
+- first list
+
+- second list
+{list=separate}
+```
+
+The marker composes onto the same attrs line as the others, e.g.
+`{order=1 list=separate}`, and for a nested list it is indented with the list
+it belongs to. It never appears in the resulting ADF. `taskList` is excluded
+on both sides: task lists and items carry their own `localId`s, so adjacent
+ones already round-trip and are never fused.
+
+Two adjacent ordered lists fuse only when the second continues the first's
+numbering or restarts at `1.`. A genuine restart — `1. a`, `2. b`, blank,
+`5. c` — stays two lists so the authored `5` survives; this is a deliberate
+deviation from CommonMark, which would fuse them and renumber the item to
+`3`.
 
 ### Inline Attribute Marks
 

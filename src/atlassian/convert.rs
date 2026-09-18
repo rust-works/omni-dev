@@ -29,6 +29,15 @@ use crate::atlassian::directive::{
 /// nest well under 20 levels.
 const MAX_NESTING_DEPTH: usize = 64;
 
+/// The JFM block-attr key that keeps two adjacent same-type lists separate
+/// (`{list=separate}`); see [`merge_adjacent_lists`] (issue #1729).
+const LIST_SEPARATE_ATTR: &str = "list";
+
+/// Transient attr key set by the parser when a list carried
+/// `{list=separate}`.  It never reaches a caller: [`strip_merge_markers`]
+/// removes it before [`markdown_to_adf`] returns.
+const LIST_SEPARATE_MARKER: &str = "__list_separate";
+
 /// Converts a markdown string to an ADF document.
 pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
     debug!(
@@ -38,7 +47,8 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
     );
     let mut doc = AdfDocument::new();
     let mut parser = MarkdownParser::new(markdown);
-    doc.content = parser.parse_blocks()?;
+    doc.content = merge_adjacent_lists(parser.parse_blocks()?);
+    strip_merge_markers(&mut doc.content);
     let split = split_emphasis_code_marks(&mut doc.content);
     if split > 0 {
         debug!(
@@ -51,6 +61,127 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
         doc.content.len()
     );
     Ok(doc)
+}
+
+/// Returns the 1-based start number of an `orderedList`, defaulting to 1 when
+/// `attrs.order` is absent.
+fn ordered_list_start(node: &AdfNode) -> u32 {
+    node.attrs
+        .as_ref()
+        .and_then(|a| a.get("order"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1)
+}
+
+/// Returns `true` when a list carries an explicit `{order=1}` attr.
+///
+/// A start number other than 1 is carried by the list marker itself (`5.`),
+/// so `{order=1}` (issue #547) is the *only* order attr a JFM author can have
+/// written by hand — and, before issue #1729 added `{list=separate}`, it was
+/// also the only thing that could keep two adjacent lists apart.  Honouring it
+/// as a separator keeps markdown rendered by older versions round-tripping.
+fn has_explicit_order_one(node: &AdfNode) -> bool {
+    node.attrs
+        .as_ref()
+        .and_then(|a| a.get("order"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+}
+
+/// Returns `true` when the parser tagged this list with `{list=separate}`.
+fn is_marked_separate(node: &AdfNode) -> bool {
+    node.attrs
+        .as_ref()
+        .and_then(|a| a.get(LIST_SEPARATE_MARKER))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Returns `true` when `second`'s numbering continues `first`'s, so the two
+/// are one CommonMark loose list that the line-oriented parser split apart.
+///
+/// A *restart* — `1. a\n2. b\n\n5. c` — deliberately stays two lists so the
+/// author's `5` survives the round trip.  CommonMark would fuse them and
+/// renumber the item to `3`, dropping the `5`; this is a deliberate JFM
+/// deviation, since ADF can represent the restart and silently discarding an
+/// authored number is worse than an extra list node.
+fn ordered_lists_continue(first: &AdfNode, second: &AdfNode) -> bool {
+    if has_explicit_order_one(first) || has_explicit_order_one(second) {
+        return false;
+    }
+    let first_start = ordered_list_start(first);
+    let second_start = ordered_list_start(second);
+    let first_len = u32::try_from(first.content.as_ref().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+    // Either the numbering runs on (`1. 2.` then `3.`) or the author restarted
+    // at 1, which CommonMark numbers by position rather than by marker.
+    second_start == first_start.saturating_add(first_len) || second_start == 1
+}
+
+/// Fuses adjacent same-type lists that a CommonMark *loose* list (items
+/// separated by a blank line) split into siblings (issue #1729).
+///
+/// Adapted from #1731 by Nord1cWarr1or.
+///
+/// Applied recursively to every `content` array, so it only ever fuses
+/// siblings of the same parent and never reaches across a `listItem`
+/// boundary.  A pair is left alone when the second list carries the
+/// `{list=separate}` marker the renderer emits between two genuinely separate
+/// ADF lists, when either side carries an explicit `{order=1}`, when the
+/// numbering does not continue, or when the two types differ.  `taskList` is
+/// never fused: each task list and item carries its own `localId`, so adjacent
+/// ones already round-trip.
+fn merge_adjacent_lists(nodes: Vec<AdfNode>) -> Vec<AdfNode> {
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        if let Some(content) = node.content.as_mut() {
+            *content = merge_adjacent_lists(std::mem::take(content));
+        }
+    }
+
+    let mut merged: Vec<AdfNode> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let fuses = merged.last().is_some_and(|prev| {
+            !is_marked_separate(&node)
+                && match (prev.node_type.as_str(), node.node_type.as_str()) {
+                    ("bulletList", "bulletList") => true,
+                    ("orderedList", "orderedList") => ordered_lists_continue(prev, &node),
+                    _ => false,
+                }
+        });
+        if fuses {
+            // The surviving node keeps its own attrs and appends the items.
+            if let (Some(prev), Some(next_items)) = (merged.last_mut(), node.content) {
+                if let Some(items) = prev.content.as_mut() {
+                    items.extend(next_items);
+                }
+            }
+        } else {
+            merged.push(node);
+        }
+    }
+    merged
+}
+
+/// Removes the transient [`LIST_SEPARATE_MARKER`] attr from every node.
+///
+/// `attrs` is cleared only when removing the marker emptied it, so a
+/// legitimately-empty attrs object (e.g. on a `tableCell`) survives.
+fn strip_merge_markers(nodes: &mut [AdfNode]) {
+    for node in nodes.iter_mut() {
+        let emptied = match node.attrs.as_mut() {
+            Some(serde_json::Value::Object(map)) => {
+                map.remove(LIST_SEPARATE_MARKER).is_some() && map.is_empty()
+            }
+            _ => false,
+        };
+        if emptied {
+            node.attrs = None;
+        }
+        if let Some(content) = node.content.as_mut() {
+            strip_merge_markers(content);
+        }
+    }
 }
 
 /// Line-oriented state machine for parsing markdown into ADF block nodes.
@@ -610,7 +741,12 @@ impl<'a> MarkdownParser<'a> {
             None
         };
 
-        let has_attrs = !marks.is_empty() || local_id.is_some() || order.is_some();
+        // `{list=separate}` keeps this list from fusing with the preceding
+        // same-type sibling (issue #1729).
+        let list_separate = attrs.get(LIST_SEPARATE_ATTR) == Some("separate")
+            && is_fusable_list_type(&node.node_type);
+
+        let has_attrs = !marks.is_empty() || local_id.is_some() || order.is_some() || list_separate;
         if has_attrs {
             if !marks.is_empty() {
                 let existing = node.marks.get_or_insert_with(Vec::new);
@@ -623,6 +759,10 @@ impl<'a> MarkdownParser<'a> {
             if let Some(n) = order {
                 let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
                 node_attrs["order"] = serde_json::json!(n);
+            }
+            if list_separate {
+                let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
+                node_attrs[LIST_SEPARATE_MARKER] = serde_json::Value::Bool(true);
             }
             self.advance(); // consume the attrs line
         }
@@ -3008,14 +3148,7 @@ pub fn adf_to_markdown(doc: &AdfDocument) -> Result<String> {
 /// Converts an ADF document to a markdown string with options.
 pub fn adf_to_markdown_with_options(doc: &AdfDocument, opts: &RenderOptions) -> Result<String> {
     let mut output = String::new();
-
-    for (i, node) in doc.content.iter().enumerate() {
-        if i > 0 {
-            output.push('\n');
-        }
-        render_block_node(node, &mut output, opts);
-    }
-
+    render_block_children(&doc.content, &mut output, opts);
     Ok(output)
 }
 
@@ -3208,13 +3341,33 @@ fn maybe_push_local_id(attrs: &serde_json::Value, parts: &mut Vec<String>, opts:
     }
 }
 
+/// Returns `true` for the list types that [`merge_adjacent_lists`] fuses on
+/// re-parse, and which therefore need an explicit `{list=separate}` marker
+/// when two of them are genuinely separate ADF siblings (issue #1729).
+///
+/// `taskList` is deliberately excluded: it carries no list marker of its own
+/// and every `taskList`/`taskItem` carries a `localId`, so adjacent task
+/// lists already round-trip and are never fused.
+fn is_fusable_list_type(node_type: &str) -> bool {
+    matches!(node_type, "bulletList" | "orderedList")
+}
+
+/// Returns `true` when `node` must be rendered with a trailing
+/// `{list=separate}` marker because its immediately preceding sibling is a
+/// list of the same type — without the marker the two would fuse into one
+/// list on re-parse (issue #1729).
+fn needs_list_separator(prev: Option<&AdfNode>, node: &AdfNode) -> bool {
+    is_fusable_list_type(&node.node_type) && prev.is_some_and(|p| p.node_type == node.node_type)
+}
+
 /// Renders a sequence of block nodes with blank-line separators between them.
 fn render_block_children(children: &[AdfNode], output: &mut String, opts: &RenderOptions) {
     for (i, child) in children.iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
-        render_block_node(child, output, opts);
+        let separate = needs_list_separator(i.checked_sub(1).map(|p| &children[p]), child);
+        render_block_node_separated(child, output, opts, separate);
     }
 }
 
@@ -3267,6 +3420,24 @@ fn fmt_numeric_attr(v: &serde_json::Value) -> Option<String> {
 
 /// Renders a block-level ADF node to markdown.
 fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
+    render_block_node_separated(node, output, opts, false);
+}
+
+/// Renders a block-level ADF node to markdown, optionally tagging it with the
+/// `{list=separate}` marker.
+///
+/// `separate_from_previous` is set by the sibling-rendering loops when this
+/// node is a `bulletList`/`orderedList` whose previous sibling is a list of
+/// the same type.  The marker is emitted through the same trailing-attrs line
+/// as `{order=1}` / `{localId=…}`, so they compose onto one line
+/// (`{order=1 list=separate}`) and so that a nested list's marker is indented
+/// with the list it belongs to.
+fn render_block_node_separated(
+    node: &AdfNode,
+    output: &mut String,
+    opts: &RenderOptions,
+    separate_from_previous: bool,
+) {
     match node.node_type.as_str() {
         "paragraph" => {
             let is_empty = node.content.as_ref().is_none_or(Vec::is_empty);
@@ -3779,6 +3950,12 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             }
         }
     }
+    // Two adjacent same-type lists are separated by a single blank line, which
+    // a hand-written CommonMark loose list also produces — so the parser fuses
+    // them unless this marker says they are genuinely separate (issue #1729).
+    if separate_from_previous && is_fusable_list_type(&node.node_type) {
+        parts.push(format!("{LIST_SEPARATE_ATTR}=separate"));
+    }
     if !parts.is_empty() {
         output.push_str(&format!("{{{}}}\n", parts.join(" ")));
     }
@@ -3924,23 +4101,20 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     }
     let rest = &content[rest_start..];
     for (i, child) in rest.iter().enumerate() {
+        // The previous sibling of `rest[0]` is the node rendered on the
+        // item's first line (above).
+        let prev = if i == 0 { first } else { &rest[i - 1] };
+        let separate = needs_list_separator(Some(prev), child);
         // Separate consecutive paragraph siblings with a blank indented
         // line so they re-parse as distinct paragraphs rather than being
-        // merged into one (issue #522).
-        if child.node_type == "paragraph" {
-            let prev_is_para = if i == 0 {
-                // First rest child — check whether the first-line node
-                // (rendered above) was a paragraph.
-                first.node_type == "paragraph"
-            } else {
-                rest[i - 1].node_type == "paragraph"
-            };
-            if prev_is_para {
-                output.push_str("  \n");
-            }
+        // merged into one (issue #522).  Two adjacent same-type lists need
+        // the same blank line, or their items re-parse as one list before
+        // the `{list=separate}` marker below can keep them apart (#1729).
+        if separate || (child.node_type == "paragraph" && prev.node_type == "paragraph") {
+            output.push_str("  \n");
         }
         let mut nested = String::new();
-        render_block_node(child, &mut nested, opts);
+        render_block_node_separated(child, &mut nested, opts, separate);
         for line in nested.lines() {
             output.push_str("  ");
             output.push_str(line);
@@ -5798,18 +5972,18 @@ mod tests {
     }
 
     /// A blank line followed by a same-indent sibling marker is a loose
-    /// list (CommonMark), not sub-content — left alone for issue #1729.
-    /// This pins today's two-separate-lists shape so a future #1729 fix
-    /// changes it deliberately.
+    /// list (CommonMark): the parser splits it into two lists and
+    /// [`merge_adjacent_lists`] fuses them back into one (issue #1729).
     #[test]
-    fn blank_line_then_sibling_marker_not_consumed() {
+    fn blank_line_then_sibling_marker_becomes_one_list() {
         let md = "- a\n\n- b";
         let doc = markdown_to_adf(md).unwrap();
-        assert_eq!(doc.content.len(), 2, "top-level blocks: {:?}", doc.content);
+        assert_eq!(doc.content.len(), 1, "top-level blocks: {:?}", doc.content);
         assert_eq!(doc.content[0].node_type, "bulletList");
-        assert_eq!(doc.content[1].node_type, "bulletList");
-        assert_eq!(item_text(&doc.content[0].content.as_ref().unwrap()[0]), "a");
-        assert_eq!(item_text(&doc.content[1].content.as_ref().unwrap()[0]), "b");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        assert_eq!(item_text(&items[0]), "a");
+        assert_eq!(item_text(&items[1]), "b");
     }
 
     /// Round-trip pin: a listItem with two paragraphs renders with a
@@ -5843,6 +6017,325 @@ mod tests {
                 ]}
             ]}]}"#,
             "- p\n  - x\n",
+        );
+    }
+
+    // ── loose lists fuse; `{list=separate}` keeps them apart (issue #1729) ──
+    // Parser cases adapted from #1731 by Nord1cWarr1or.
+
+    /// A CommonMark loose ordered list — items separated by blank lines —
+    /// is one list, not one list per item.
+    #[test]
+    fn loose_ordered_list_merges_into_one() {
+        let doc = markdown_to_adf("1. а\n\n2. б\n\n3. в").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert!(doc.content[0].attrs.is_none(), "{:?}", doc.content[0].attrs);
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 3, "items: {items:?}");
+        assert_eq!(item_text(&items[0]), "а");
+        assert_eq!(item_text(&items[1]), "б");
+        assert_eq!(item_text(&items[2]), "в");
+    }
+
+    /// The bullet form of [`loose_ordered_list_merges_into_one`].
+    #[test]
+    fn loose_bullet_list_merges_into_one() {
+        let doc = markdown_to_adf("- а\n\n- б\n\n- в").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert!(doc.content[0].attrs.is_none());
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 3, "items: {items:?}");
+    }
+
+    /// A genuine restart keeps the author's number: CommonMark would fuse
+    /// and renumber `5.` to `3.`, which is a deliberate JFM deviation.
+    #[test]
+    fn ordered_lists_with_numbering_restart_not_merged() {
+        let doc = markdown_to_adf("1. а\n2. б\n\n5. в").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            doc.content[1].attrs.as_ref().and_then(|a| a.get("order")),
+            Some(&serde_json::json!(5))
+        );
+    }
+
+    /// Repeated `1.` markers are one list — CommonMark numbers ordered list
+    /// items by position, not by the marker digit.
+    #[test]
+    fn ordered_lists_both_starting_at_one_merge() {
+        let doc = markdown_to_adf("1. а\n2. б\n\n1. в\n2. г").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 4, "items: {items:?}");
+        assert_eq!(item_text(&items[3]), "г");
+    }
+
+    /// Lists of different types are never fused.
+    #[test]
+    fn ordered_and_bullet_lists_not_merged() {
+        let doc = markdown_to_adf("1. а\n\n- б").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+    }
+
+    /// Only *adjacent* siblings fuse — a paragraph between them is a wall.
+    #[test]
+    fn lists_separated_by_paragraph_not_merged() {
+        let doc = markdown_to_adf("- а\n\nтекст\n\n- б").unwrap();
+        assert_eq!(doc.content.len(), 3, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "paragraph");
+        assert_eq!(doc.content[2].node_type, "bulletList");
+    }
+
+    /// The pass recurses into every `content` array, so a loose *nested*
+    /// list fuses inside its list item without reaching across the item
+    /// boundary to the following top-level item.
+    #[test]
+    fn nested_loose_list_merges_inside_list_item() {
+        let md = "1. Родитель:\n    1. А\n\n    2. Б\n2. Следующий";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        assert_eq!(item_text(&items[0]), "Родитель:");
+        assert_eq!(item_text(&items[1]), "Следующий");
+        let first_children = items[0].content.as_ref().unwrap();
+        assert_eq!(first_children.len(), 2, "children: {first_children:?}");
+        assert_eq!(first_children[1].node_type, "orderedList");
+        let nested = first_children[1].content.as_ref().unwrap();
+        assert_eq!(nested.len(), 2, "nested items: {nested:?}");
+        assert_eq!(item_text(&nested[0]), "А");
+        assert_eq!(item_text(&nested[1]), "Б");
+    }
+
+    /// `{order=1}` (issue #547) was the only separator older versions could
+    /// emit, so it still keeps two lists apart.
+    #[test]
+    fn explicit_order_one_marks_separate_list_not_merged() {
+        let doc = markdown_to_adf("1. а\n{order=1}\n\n1. б").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(
+            doc.content[0].attrs.as_ref().and_then(|a| a.get("order")),
+            Some(&serde_json::json!(1))
+        );
+        assert!(doc.content[1].attrs.is_none(), "{:?}", doc.content[1].attrs);
+    }
+
+    /// The `{list=separate}` marker keeps two lists apart and leaves no
+    /// attrs of its own behind.
+    #[test]
+    fn list_separate_marker_keeps_lists_separate() {
+        let doc = markdown_to_adf("- а\n\n- б\n{list=separate}").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+        assert!(doc.content[0].attrs.is_none(), "{:?}", doc.content[0].attrs);
+        assert!(doc.content[1].attrs.is_none(), "{:?}", doc.content[1].attrs);
+        assert_eq!(item_text(&doc.content[0].content.as_ref().unwrap()[0]), "а");
+        assert_eq!(item_text(&doc.content[1].content.as_ref().unwrap()[0]), "б");
+    }
+
+    /// The transient merge marker must never reach a caller.
+    #[test]
+    fn no_merge_marker_leaks_into_output() {
+        for md in [
+            "- а\n\n- б\n{list=separate}",
+            "- а\n\n- б",
+            "1. а\n{order=1}\n\n1. б\n{list=separate}",
+            "- p\n  - x\n  \n  - y\n  {list=separate}",
+        ] {
+            let doc = markdown_to_adf(md).unwrap();
+            let json = serde_json::to_string(&doc).unwrap();
+            assert!(
+                !json.contains(LIST_SEPARATE_MARKER),
+                "marker leaked for {md:?}: {json}"
+            );
+        }
+    }
+
+    /// Task lists are excluded from the merge on both sides: each carries
+    /// its own `localId`, so adjacent ones already round-trip.
+    #[test]
+    fn loose_task_lists_stay_separate() {
+        let doc = markdown_to_adf("- [ ] а\n\n- [ ] б").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "taskList");
+        assert_eq!(doc.content[1].node_type, "taskList");
+    }
+
+    /// An empty attrs object (here on `tableCell`) is not collateral damage
+    /// of stripping the merge marker.
+    #[test]
+    fn strip_merge_markers_keeps_legitimately_empty_attrs() {
+        let mut nodes = vec![AdfNode {
+            node_type: "tableCell".to_string(),
+            attrs: Some(serde_json::json!({})),
+            content: Some(vec![AdfNode {
+                node_type: "bulletList".to_string(),
+                attrs: Some(serde_json::json!({ LIST_SEPARATE_MARKER: true })),
+                content: None,
+                text: None,
+                marks: None,
+                local_id: None,
+                parameters: None,
+            }]),
+            text: None,
+            marks: None,
+            local_id: None,
+            parameters: None,
+        }];
+        strip_merge_markers(&mut nodes);
+        assert_eq!(nodes[0].attrs, Some(serde_json::json!({})));
+        assert!(nodes[0].content.as_ref().unwrap()[0].attrs.is_none());
+    }
+
+    /// Two genuinely separate ADF `bulletList`s survive the round trip.
+    #[test]
+    fn round_trip_adjacent_bullet_lists() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]}
+            ]}"#,
+            "- a\n\n- b\n{list=separate}\n",
+        );
+    }
+
+    /// Two separate `orderedList`s whose numbering would have continued.
+    #[test]
+    fn round_trip_adjacent_ordered_lists() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"orderedList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]},
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]},
+                {"type":"orderedList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
+                ]}
+            ]}"#,
+            "1. a\n2. b\n\n1. c\n{list=separate}\n",
+        );
+    }
+
+    /// The second list's `order` rides the list marker; `{list=separate}`
+    /// still has to say the two are not one loose list.
+    #[test]
+    fn round_trip_adjacent_ordered_lists_with_explicit_order() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"orderedList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]},
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]},
+                {"type":"orderedList","attrs":{"order":3},"content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
+                ]}
+            ]}"#,
+            "1. a\n2. b\n\n3. c\n{list=separate}\n",
+        );
+    }
+
+    /// The issue #547 shape: `{order=1}` and `{list=separate}` compose onto
+    /// separate lines because they belong to different lists.
+    #[test]
+    fn round_trip_adjacent_ordered_lists_explicit_order_one() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"orderedList","attrs":{"order":1},"content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"orderedList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]}
+            ]}"#,
+            "1. a\n{order=1}\n\n1. b\n{list=separate}\n",
+        );
+    }
+
+    /// Two adjacent lists *inside* a list item: the blank separator line
+    /// keeps the items apart and the marker line is indented with the list
+    /// it belongs to.
+    #[test]
+    fn round_trip_adjacent_bullet_lists_in_list_item() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"bulletList","content":[
+                {"type":"listItem","content":[
+                    {"type":"paragraph","content":[{"type":"text","text":"p"}]},
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}
+                    ]},
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"y"}]}]}
+                    ]}
+                ]}
+            ]}]}"#,
+            "- p\n  - x\n  \n  - y\n  {list=separate}\n",
+        );
+    }
+
+    /// The same, inside a table cell — whose empty `attrs` object must also
+    /// survive the marker strip.
+    #[test]
+    fn round_trip_adjacent_bullet_lists_in_table_cell() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"table","content":[
+                {"type":"tableRow","content":[
+                    {"type":"tableCell","attrs":{},"content":[
+                        {"type":"bulletList","content":[
+                            {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                        ]},
+                        {"type":"bulletList","content":[
+                            {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                        ]}
+                    ]}
+                ]}
+            ]}]}"#,
+            "::::table\n:::tr\n:::td{}\n- a\n\n- b\n{list=separate}\n:::\n:::\n::::\n",
+        );
+    }
+
+    /// Adjacent task lists are untouched: no marker on either side.
+    #[test]
+    fn round_trip_adjacent_task_lists() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"taskList","attrs":{"localId":"l1"},"content":[
+                    {"type":"taskItem","attrs":{"localId":"t1","state":"TODO"},"content":[{"type":"text","text":"a"}]}
+                ]},
+                {"type":"taskList","attrs":{"localId":"l2"},"content":[
+                    {"type":"taskItem","attrs":{"localId":"t2","state":"TODO"},"content":[{"type":"text","text":"b"}]}
+                ]}
+            ]}"#,
+            "- [ ] a {localId=t1}\n{localId=l1}\n\n- [ ] b {localId=t2}\n{localId=l2}\n",
+        );
+    }
+
+    /// Three in a row: every list after the first carries the marker.
+    #[test]
+    fn round_trip_three_adjacent_bullet_lists() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]},
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
+                ]}
+            ]}"#,
+            "- a\n\n- b\n{list=separate}\n\n- c\n{list=separate}\n",
         );
     }
 
