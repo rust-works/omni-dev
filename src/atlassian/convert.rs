@@ -29,14 +29,14 @@ use crate::atlassian::directive::{
 /// nest well under 20 levels.
 const MAX_NESTING_DEPTH: usize = 64;
 
-/// The JFM block-attr key that keeps two adjacent same-type lists separate
-/// (`{list=separate}`); see [`merge_adjacent_lists`] (issue #1729).
+/// The JFM block-attr key that keeps two adjacent lists from being read as
+/// one CommonMark loose list (`{list=separate}`); see
+/// [`needs_list_separator`] (issue #1729).
+///
+/// It carries no ADF meaning.  The parser recognises it only so the line is
+/// consumed rather than becoming a paragraph — the *mechanism* is that any
+/// trailing attrs line ends the list loop.
 const LIST_SEPARATE_ATTR: &str = "list";
-
-/// Transient attr key set by the parser when a list carried
-/// `{list=separate}`.  It never reaches a caller: [`strip_merge_markers`]
-/// removes it before [`markdown_to_adf`] returns.
-const LIST_SEPARATE_MARKER: &str = "__list_separate";
 
 /// Converts a markdown string to an ADF document.
 pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
@@ -47,8 +47,7 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
     );
     let mut doc = AdfDocument::new();
     let mut parser = MarkdownParser::new(markdown);
-    doc.content = merge_adjacent_lists(parser.parse_blocks()?);
-    strip_merge_markers(&mut doc.content);
+    doc.content = parser.parse_blocks()?;
     let split = split_emphasis_code_marks(&mut doc.content);
     if split > 0 {
         debug!(
@@ -74,114 +73,21 @@ fn ordered_list_start(node: &AdfNode) -> u32 {
         .unwrap_or(1)
 }
 
-/// Returns `true` when a list carries an explicit `{order=1}` attr.
-///
-/// A start number other than 1 is carried by the list marker itself (`5.`),
-/// so `{order=1}` (issue #547) is the *only* order attr a JFM author can have
-/// written by hand — and, before issue #1729 added `{list=separate}`, it was
-/// also the only thing that could keep two adjacent lists apart.  Honouring it
-/// as a separator keeps markdown rendered by older versions round-tripping.
-fn has_explicit_order_one(node: &AdfNode) -> bool {
-    node.attrs
-        .as_ref()
-        .and_then(|a| a.get("order"))
-        .and_then(serde_json::Value::as_u64)
-        == Some(1)
+/// Returns the number of items a list node renders.
+fn list_item_count(node: &AdfNode) -> usize {
+    node.content.as_ref().map_or(0, Vec::len)
 }
 
-/// Returns `true` when the parser tagged this list with `{list=separate}`.
-fn is_marked_separate(node: &AdfNode) -> bool {
-    node.attrs
-        .as_ref()
-        .and_then(|a| a.get(LIST_SEPARATE_MARKER))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+/// Returns `true` for the three ADF list node types.
+fn is_list_node_type(node_type: &str) -> bool {
+    matches!(node_type, "bulletList" | "orderedList" | "taskList")
 }
 
-/// Returns `true` when `second`'s numbering continues `first`'s, so the two
-/// are one CommonMark loose list that the line-oriented parser split apart.
-///
-/// A *restart* — `1. a\n2. b\n\n5. c` — deliberately stays two lists so the
-/// author's `5` survives the round trip.  CommonMark would fuse them and
-/// renumber the item to `3`, dropping the `5`; this is a deliberate JFM
-/// deviation, since ADF can represent the restart and silently discarding an
-/// authored number is worse than an extra list node.
-fn ordered_lists_continue(first: &AdfNode, second: &AdfNode) -> bool {
-    if has_explicit_order_one(first) || has_explicit_order_one(second) {
-        return false;
-    }
-    let first_start = ordered_list_start(first);
-    let second_start = ordered_list_start(second);
-    let first_len = u32::try_from(first.content.as_ref().map_or(0, Vec::len)).unwrap_or(u32::MAX);
-    // Either the numbering runs on (`1. 2.` then `3.`) or the author restarted
-    // at 1, which CommonMark numbers by position rather than by marker.
-    second_start == first_start.saturating_add(first_len) || second_start == 1
-}
-
-/// Fuses adjacent same-type lists that a CommonMark *loose* list (items
-/// separated by a blank line) split into siblings (issue #1729).
-///
-/// Adapted from #1731 by Nord1cWarr1or.
-///
-/// Applied recursively to every `content` array, so it only ever fuses
-/// siblings of the same parent and never reaches across a `listItem`
-/// boundary.  A pair is left alone when the second list carries the
-/// `{list=separate}` marker the renderer emits between two genuinely separate
-/// ADF lists, when either side carries an explicit `{order=1}`, when the
-/// numbering does not continue, or when the two types differ.  `taskList` is
-/// never fused: each task list and item carries its own `localId`, so adjacent
-/// ones already round-trip.
-fn merge_adjacent_lists(nodes: Vec<AdfNode>) -> Vec<AdfNode> {
-    let mut nodes = nodes;
-    for node in &mut nodes {
-        if let Some(content) = node.content.as_mut() {
-            *content = merge_adjacent_lists(std::mem::take(content));
-        }
-    }
-
-    let mut merged: Vec<AdfNode> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let fuses = merged.last().is_some_and(|prev| {
-            !is_marked_separate(&node)
-                && match (prev.node_type.as_str(), node.node_type.as_str()) {
-                    ("bulletList", "bulletList") => true,
-                    ("orderedList", "orderedList") => ordered_lists_continue(prev, &node),
-                    _ => false,
-                }
-        });
-        if fuses {
-            // The surviving node keeps its own attrs and appends the items.
-            if let (Some(prev), Some(next_items)) = (merged.last_mut(), node.content) {
-                if let Some(items) = prev.content.as_mut() {
-                    items.extend(next_items);
-                }
-            }
-        } else {
-            merged.push(node);
-        }
-    }
-    merged
-}
-
-/// Removes the transient [`LIST_SEPARATE_MARKER`] attr from every node.
-///
-/// `attrs` is cleared only when removing the marker emptied it, so a
-/// legitimately-empty attrs object (e.g. on a `tableCell`) survives.
-fn strip_merge_markers(nodes: &mut [AdfNode]) {
-    for node in nodes.iter_mut() {
-        let emptied = match node.attrs.as_mut() {
-            Some(serde_json::Value::Object(map)) => {
-                map.remove(LIST_SEPARATE_MARKER).is_some() && map.is_empty()
-            }
-            _ => false,
-        };
-        if emptied {
-            node.attrs = None;
-        }
-        if let Some(content) = node.content.as_mut() {
-            strip_merge_markers(content);
-        }
-    }
+/// Returns `true` when `line` is a list marker belonging to an enclosing
+/// list rather than to the item whose content starts at `content_indent`
+/// (issue #1727).
+fn is_sibling_marker(line: &str, content_indent: usize) -> bool {
+    is_list_start(line) && leading_spaces(line) < content_indent
 }
 
 /// Line-oriented state machine for parsing markdown into ADF block nodes.
@@ -279,7 +185,7 @@ impl<'a> MarkdownParser<'a> {
         // text.  A list marker indented below the item's content column is
         // a sibling item (issue #1727).
         let line = self.current_line();
-        if is_list_start(line) && leading_spaces(line) < content_indent {
+        if is_sibling_marker(line, content_indent) {
             return false;
         }
         match line
@@ -329,7 +235,7 @@ impl<'a> MarkdownParser<'a> {
                 let continues = lookahead < self.lines.len() && {
                     let after = self.lines[lookahead];
                     after.strip_prefix("  ").is_some()
-                        && !(is_list_start(after) && leading_spaces(after) < marker_indent + 2)
+                        && !is_sibling_marker(after, marker_indent + 2)
                 };
                 if !continues {
                     break;
@@ -343,7 +249,7 @@ impl<'a> MarkdownParser<'a> {
             let Some(stripped) = next.strip_prefix("  ") else {
                 break;
             };
-            if is_list_start(next) && leading_spaces(next) < marker_indent + 2 {
+            if is_sibling_marker(next, marker_indent + 2) {
                 break;
             }
             sub_lines.push(stripped.to_string());
@@ -537,12 +443,90 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
+    /// Returns the index of the first non-blank line at or after the cursor,
+    /// or `None` when only blank lines remain.  Does not advance.
+    fn peek_past_blank_run(&self) -> Option<usize> {
+        let mut i = self.pos;
+        while i < self.lines.len() && self.lines[i].trim().is_empty() {
+            i += 1;
+        }
+        (i < self.lines.len()).then_some(i)
+    }
+
+    /// Consumes the run of blank lines at the cursor.
+    fn skip_blank_run(&mut self) {
+        while !self.at_end() && self.current_line().trim().is_empty() {
+            self.advance();
+        }
+    }
+
+    /// Returns `true` when the first non-blank line after the blank run at
+    /// the cursor is another item of the bullet/task list being parsed — a
+    /// marker at the list's own indent whose task-ness matches (issue #1729).
+    fn loose_bullet_item_follows(&self, first_marker_indent: usize, is_task_list: bool) -> bool {
+        let Some(idx) = self.peek_past_blank_run() else {
+            return false;
+        };
+        let after = self.lines[idx];
+        if leading_spaces(after) != first_marker_indent {
+            return false;
+        }
+        let trimmed = after.trim_start();
+        if !(trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")) {
+            return false;
+        }
+        // A checkbox marker opens a `taskList` and a bare bullet a
+        // `bulletList`; the two are never items of the same list.
+        try_parse_task_marker(trimmed[2..].trim_start()).is_some() == is_task_list
+    }
+
+    /// The [`Self::loose_bullet_item_follows`] counterpart for ordered lists:
+    /// the next marker must also continue this list's numbering (or restart
+    /// at `1.`); see [`Self::parse_ordered_list`].
+    fn loose_ordered_item_follows(
+        &self,
+        first_marker_indent: usize,
+        start: u32,
+        seen: usize,
+    ) -> bool {
+        let Some(idx) = self.peek_past_blank_run() else {
+            return false;
+        };
+        let after = self.lines[idx];
+        if leading_spaces(after) != first_marker_indent {
+            return false;
+        }
+        let Some((n, _)) = parse_ordered_list_marker(after.trim_start()) else {
+            return false;
+        };
+        let seen = u32::try_from(seen).unwrap_or(u32::MAX);
+        n == start.saturating_add(seen) || n == 1
+    }
+
     fn parse_bullet_list(&mut self) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
         let mut is_task_list = false;
+        // The column of this list's first marker.  A loose-list continuation
+        // must sit at exactly this indent to be an item of *this* list.
+        let first_marker_indent = leading_spaces(self.current_line());
 
         while !self.at_end() {
             let line = self.current_line();
+
+            // CommonMark *loose* list: a blank line between two items does
+            // not end the list.  Look ahead past the run of blanks; when the
+            // next non-blank line is an item this very loop would parse,
+            // consume the blanks and carry on.  Otherwise leave them
+            // untouched for the enclosing block loop, ending the list exactly
+            // as before (issue #1729).
+            if line.trim().is_empty() {
+                if !self.loose_bullet_item_follows(first_marker_indent, is_task_list) {
+                    break;
+                }
+                self.skip_blank_run();
+                continue;
+            }
+
             let trimmed = line.trim_start();
 
             if !(trimmed.starts_with("- ")
@@ -667,11 +651,32 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
+    /// Parses an ordered list starting at `start`.
+    ///
+    /// A blank line between two items does not end the list when the next
+    /// marker continues the numbering — or restarts at `1.`, which CommonMark
+    /// treats as a "don't-care" number (`1. 1. 1.` is the idiomatic way to
+    /// write an ordered list whose items are numbered by position).  A
+    /// restart at any *other* number — `1. a`, `2. b`, blank, `5. c` — is
+    /// read as authored and stays a second list, so the `5` survives the
+    /// round trip.  That is a deliberate JFM deviation: CommonMark would fuse
+    /// the two and renumber the item to `3`, discarding the authored number
+    /// (issue #1729).
     fn parse_ordered_list(&mut self, start: u32) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
+        let first_marker_indent = leading_spaces(self.current_line());
 
         while !self.at_end() {
             let line = self.current_line();
+
+            if line.trim().is_empty() {
+                if !self.loose_ordered_item_follows(first_marker_indent, start, items.len()) {
+                    break;
+                }
+                self.skip_blank_run();
+                continue;
+            }
+
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
@@ -741,10 +746,12 @@ impl<'a> MarkdownParser<'a> {
             None
         };
 
-        // `{list=separate}` keeps this list from fusing with the preceding
-        // same-type sibling (issue #1729).
-        let list_separate = attrs.get(LIST_SEPARATE_ATTR) == Some("separate")
-            && is_fusable_list_type(&node.node_type);
+        // `{list=separate}` carries no ADF meaning: reaching this function at
+        // all already means the attrs line ended the list, which is the whole
+        // mechanism.  It is recognised only so the line is consumed instead of
+        // becoming a literal paragraph (issue #1729).
+        let list_separate =
+            attrs.get(LIST_SEPARATE_ATTR) == Some("separate") && is_list_node_type(&node.node_type);
 
         let has_attrs = !marks.is_empty() || local_id.is_some() || order.is_some() || list_separate;
         if has_attrs {
@@ -759,10 +766,6 @@ impl<'a> MarkdownParser<'a> {
             if let Some(n) = order {
                 let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
                 node_attrs["order"] = serde_json::json!(n);
-            }
-            if list_separate {
-                let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
-                node_attrs[LIST_SEPARATE_MARKER] = serde_json::Value::Bool(true);
             }
             self.advance(); // consume the attrs line
         }
@@ -3341,23 +3344,47 @@ fn maybe_push_local_id(attrs: &serde_json::Value, parts: &mut Vec<String>, opts:
     }
 }
 
-/// Returns `true` for the list types that [`merge_adjacent_lists`] fuses on
-/// re-parse, and which therefore need an explicit `{list=separate}` marker
-/// when two of them are genuinely separate ADF siblings (issue #1729).
-///
-/// `taskList` is deliberately excluded: it carries no list marker of its own
-/// and every `taskList`/`taskItem` carries a `localId`, so adjacent task
-/// lists already round-trip and are never fused.
-fn is_fusable_list_type(node_type: &str) -> bool {
-    matches!(node_type, "bulletList" | "orderedList")
-}
-
 /// Returns `true` when `node` must be rendered with a trailing
-/// `{list=separate}` marker because its immediately preceding sibling is a
-/// list of the same type — without the marker the two would fuse into one
-/// list on re-parse (issue #1729).
-fn needs_list_separator(prev: Option<&AdfNode>, node: &AdfNode) -> bool {
-    is_fusable_list_type(&node.node_type) && prev.is_some_and(|p| p.node_type == node.node_type)
+/// `{list=separate}` marker because the very next sibling is a list the
+/// parser's list loop would otherwise swallow as more items of `node`
+/// (issue #1729).
+///
+/// The marker goes on the list that *ends*, not the one that starts, because
+/// the mechanism is that a trailing attrs line terminates the list loop.
+///
+/// It mirrors the parser's fusing rule exactly, so nothing is emitted that
+/// would make no difference:
+///
+/// * a bullet or task list followed by a bullet or task list — one
+///   `parse_bullet_list` call runs them together (and would flip a
+///   `bulletList` to a `taskList`, producing invalid ADF);
+/// * an ordered list followed by an ordered list whose start continues the
+///   numbering or restarts at `1.`  A restart at any other number is already
+///   read as a second list, so it needs no marker.
+///
+/// A list that renders no items at all needs no marker either — there is
+/// nothing to fuse, and the bare attrs line would only be re-read as a
+/// paragraph.
+fn needs_list_separator(node: &AdfNode, next: Option<&AdfNode>) -> bool {
+    if !is_list_node_type(&node.node_type) || list_item_count(node) == 0 {
+        return false;
+    }
+    let Some(next) = next else {
+        return false;
+    };
+    if list_item_count(next) == 0 {
+        return false;
+    }
+    match (node.node_type.as_str(), next.node_type.as_str()) {
+        ("bulletList" | "taskList", "bulletList" | "taskList") => true,
+        ("orderedList", "orderedList") => {
+            let start = ordered_list_start(node);
+            let len = u32::try_from(list_item_count(node)).unwrap_or(u32::MAX);
+            let next_start = ordered_list_start(next);
+            next_start == start.saturating_add(len) || next_start == 1
+        }
+        _ => false,
+    }
 }
 
 /// Renders a sequence of block nodes with blank-line separators between them.
@@ -3366,7 +3393,7 @@ fn render_block_children(children: &[AdfNode], output: &mut String, opts: &Rende
         if i > 0 {
             output.push('\n');
         }
-        let separate = needs_list_separator(i.checked_sub(1).map(|p| &children[p]), child);
+        let separate = needs_list_separator(child, children.get(i + 1));
         render_block_node_separated(child, output, opts, separate);
     }
 }
@@ -3418,6 +3445,27 @@ fn fmt_numeric_attr(v: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Returns `true` when a paragraph's rendered inline content must be emitted
+/// as `::paragraph[…]{attrs}` rather than as a plain line.
+///
+/// Two cases need it:
+///
+/// * whitespace-only content (e.g. a lone NBSP), which a plain line loses;
+/// * content whose first character is a space or tab.  A plain line would
+///   drop the indent — and after a list it is worse than lossy, because the
+///   parser reads an indented line as the preceding item's own sub-content
+///   and pulls the paragraph into the list (`"  # nope"` even becomes a
+///   heading inside the item).
+///
+/// The directive is a single-line form, so a paragraph containing hardBreaks
+/// cannot use it and keeps the plain rendering.
+fn paragraph_needs_directive_form(buf: &str) -> bool {
+    if buf.trim().is_empty() {
+        return !buf.is_empty();
+    }
+    buf.starts_with([' ', '\t']) && !buf.contains('\n')
+}
+
 /// Renders a block-level ADF node to markdown.
 fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     render_block_node_separated(node, output, opts, false);
@@ -3426,17 +3474,16 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
 /// Renders a block-level ADF node to markdown, optionally tagging it with the
 /// `{list=separate}` marker.
 ///
-/// `separate_from_previous` is set by the sibling-rendering loops when this
-/// node is a `bulletList`/`orderedList` whose previous sibling is a list of
-/// the same type.  The marker is emitted through the same trailing-attrs line
-/// as `{order=1}` / `{localId=…}`, so they compose onto one line
-/// (`{order=1 list=separate}`) and so that a nested list's marker is indented
-/// with the list it belongs to.
+/// `separate_from_next` is computed by the sibling-rendering loops from
+/// [`needs_list_separator`].  The marker is emitted through the same
+/// trailing-attrs line as `{order=1}` / `{localId=…}`, so they compose onto
+/// one line (`{order=1 list=separate}`) and so that a nested list's marker is
+/// indented with the list it belongs to.
 fn render_block_node_separated(
     node: &AdfNode,
     output: &mut String,
     opts: &RenderOptions,
-    separate_from_previous: bool,
+    separate_from_next: bool,
 ) {
     match node.node_type.as_str() {
         "paragraph" => {
@@ -3459,9 +3506,7 @@ fn render_block_node_separated(
                 // Render to a buffer first to check if content is whitespace-only
                 let mut buf = String::new();
                 render_inline_content(node, &mut buf, opts);
-                if buf.trim().is_empty() && !buf.is_empty() {
-                    // Whitespace-only content (e.g. NBSP) would be lost as a plain
-                    // line — use the ::paragraph[content]{attrs} directive form
+                if paragraph_needs_directive_form(&buf) {
                     output.push_str(&format!("::paragraph[{buf}]{dir_attrs}\n"));
                 } else {
                     // Escape a leading list-marker pattern so paragraph
@@ -3555,7 +3600,8 @@ fn render_block_node_separated(
                         output.push_str(">\n");
                     }
                     let mut inner = String::new();
-                    render_block_node(child, &mut inner, opts);
+                    let separate = needs_list_separator(child, content.get(i + 1));
+                    render_block_node_separated(child, &mut inner, opts, separate);
                     for line in inner.lines() {
                         output.push_str("> ");
                         output.push_str(line);
@@ -3582,12 +3628,7 @@ fn render_block_node_separated(
             }
         }
         "orderedList" => {
-            let start = node
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("order"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(1);
+            let start = u64::from(ordered_list_start(node));
             if let Some(ref items) = node.content {
                 for (i, item) in items.iter().enumerate() {
                     let num = start + i as u64;
@@ -3931,7 +3972,7 @@ fn render_block_node_separated(
         } else {
             let mut buf = String::new();
             render_inline_content(node, &mut buf, opts);
-            buf.trim().is_empty() && !buf.is_empty()
+            paragraph_needs_directive_form(&buf)
         }
     };
     if !matches!(node.node_type.as_str(), "expand" | "nestedExpand") && !para_used_directive {
@@ -3950,11 +3991,13 @@ fn render_block_node_separated(
             }
         }
     }
-    // Two adjacent same-type lists are separated by a single blank line, which
-    // a hand-written CommonMark loose list also produces — so the parser fuses
-    // them unless this marker says they are genuinely separate (issue #1729).
-    if separate_from_previous && is_fusable_list_type(&node.node_type) {
-        parts.push(format!("{LIST_SEPARATE_ATTR}=separate"));
+    // A blank line between two lists is also what a CommonMark loose list
+    // looks like, so the parser would read the next one as more items of this
+    // one.  This marker ends the list: any trailing attrs line does, and the
+    // key is recognised only so the line is not re-read as a paragraph
+    // (issue #1729).
+    if separate_from_next && is_list_node_type(&node.node_type) {
+        parts.push(format_kv(LIST_SEPARATE_ATTR, "separate"));
     }
     if !parts.is_empty() {
         output.push_str(&format!("{{{}}}\n", parts.join(" ")));
@@ -4052,7 +4095,7 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         let bare = AdfNode::text("");
         emit_list_item_local_ids(item, &bare, output, opts);
         output.push('\n');
-        for child in content {
+        for (i, child) in content.iter().enumerate() {
             if child.node_type == "taskItem" {
                 let state = child
                     .attrs
@@ -4066,7 +4109,8 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
                 render_list_item_content(child, output, opts);
             } else {
                 let mut nested = String::new();
-                render_block_node(child, &mut nested, opts);
+                let separate = needs_list_separator(child, content.get(i + 1));
+                render_block_node_separated(child, &mut nested, opts, separate);
                 for line in nested.lines() {
                     output.push_str("  ");
                     output.push_str(line);
@@ -4082,7 +4126,10 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         //  2. Indent continuation lines so multi-line blocks stay inside
         //     the list item (issue #511)
         let mut buf = String::new();
-        render_block_node(first, &mut buf, opts);
+        // A block-level first child can itself be a list that the next
+        // sibling would fuse with (issue #1729).
+        let separate = needs_list_separator(first, content.get(1));
+        render_block_node_separated(first, &mut buf, opts, separate);
         let bare = AdfNode::text("");
         let mut is_first = true;
         for line in buf.lines() {
@@ -4101,18 +4148,15 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     }
     let rest = &content[rest_start..];
     for (i, child) in rest.iter().enumerate() {
-        // The previous sibling of `rest[0]` is the node rendered on the
-        // item's first line (above).
-        let prev = if i == 0 { first } else { &rest[i - 1] };
-        let separate = needs_list_separator(Some(prev), child);
         // Separate consecutive paragraph siblings with a blank indented
         // line so they re-parse as distinct paragraphs rather than being
-        // merged into one (issue #522).  Two adjacent same-type lists need
-        // the same blank line, or their items re-parse as one list before
-        // the `{list=separate}` marker below can keep them apart (#1729).
-        if separate || (child.node_type == "paragraph" && prev.node_type == "paragraph") {
+        // merged into one (issue #522).  The previous sibling of `rest[0]`
+        // is the node rendered on the item's first line (above).
+        let prev = if i == 0 { first } else { &rest[i - 1] };
+        if child.node_type == "paragraph" && prev.node_type == "paragraph" {
             output.push_str("  \n");
         }
+        let separate = needs_list_separator(child, rest.get(i + 1));
         let mut nested = String::new();
         render_block_node_separated(child, &mut nested, opts, separate);
         for line in nested.lines() {
@@ -6049,6 +6093,29 @@ mod tests {
         assert_eq!(items.len(), 3, "items: {items:?}");
     }
 
+    /// Task lists fuse like bullet lists — the blank line is the author's
+    /// spacing, not a list boundary.
+    #[test]
+    fn loose_task_list_merges_into_one() {
+        let doc = markdown_to_adf("- [ ] а\n\n- [x] б").unwrap();
+        assert_eq!(doc.content.len(), 1, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "taskList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        assert_eq!(items[0].node_type, "taskItem");
+        assert_eq!(items[1].node_type, "taskItem");
+    }
+
+    /// A checkbox marker opens a different kind of list, so it ends the
+    /// bullet list rather than continuing it.
+    #[test]
+    fn loose_bullet_then_task_list_not_merged() {
+        let doc = markdown_to_adf("- а\n\n- [ ] б").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "taskList");
+    }
+
     /// A genuine restart keeps the author's number: CommonMark would fuse
     /// and renumber `5.` to `3.`, which is a deliberate JFM deviation.
     #[test]
@@ -6062,8 +6129,8 @@ mod tests {
         );
     }
 
-    /// Repeated `1.` markers are one list — CommonMark numbers ordered list
-    /// items by position, not by the marker digit.
+    /// Repeated `1.` markers are one list — CommonMark treats `1.` as a
+    /// "don't-care" number and numbers items by position.
     #[test]
     fn ordered_lists_both_starting_at_one_merge() {
         let doc = markdown_to_adf("1. а\n2. б\n\n1. в\n2. г").unwrap();
@@ -6082,7 +6149,8 @@ mod tests {
         assert_eq!(doc.content[1].node_type, "bulletList");
     }
 
-    /// Only *adjacent* siblings fuse — a paragraph between them is a wall.
+    /// Only an item of the *same* list continues it — a paragraph between
+    /// two lists is a wall.
     #[test]
     fn lists_separated_by_paragraph_not_merged() {
         let doc = markdown_to_adf("- а\n\nтекст\n\n- б").unwrap();
@@ -6092,9 +6160,9 @@ mod tests {
         assert_eq!(doc.content[2].node_type, "bulletList");
     }
 
-    /// The pass recurses into every `content` array, so a loose *nested*
-    /// list fuses inside its list item without reaching across the item
-    /// boundary to the following top-level item.
+    /// The loose-list rule lives in the list loop, so a nested loose list
+    /// fuses inside its own item without reaching across the item boundary
+    /// to the following top-level item.
     #[test]
     fn nested_loose_list_merges_inside_list_item() {
         let md = "1. Родитель:\n    1. А\n\n    2. Б\n2. Следующий";
@@ -6113,24 +6181,10 @@ mod tests {
         assert_eq!(item_text(&nested[1]), "Б");
     }
 
-    /// `{order=1}` (issue #547) was the only separator older versions could
-    /// emit, so it still keeps two lists apart.
-    #[test]
-    fn explicit_order_one_marks_separate_list_not_merged() {
-        let doc = markdown_to_adf("1. а\n{order=1}\n\n1. б").unwrap();
-        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
-        assert_eq!(
-            doc.content[0].attrs.as_ref().and_then(|a| a.get("order")),
-            Some(&serde_json::json!(1))
-        );
-        assert!(doc.content[1].attrs.is_none(), "{:?}", doc.content[1].attrs);
-    }
-
-    /// The `{list=separate}` marker keeps two lists apart and leaves no
-    /// attrs of its own behind.
+    /// The `{list=separate}` marker sits on the list that ends.
     #[test]
     fn list_separate_marker_keeps_lists_separate() {
-        let doc = markdown_to_adf("- а\n\n- б\n{list=separate}").unwrap();
+        let doc = markdown_to_adf("- а\n{list=separate}\n\n- б").unwrap();
         assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
         assert_eq!(doc.content[0].node_type, "bulletList");
         assert_eq!(doc.content[1].node_type, "bulletList");
@@ -6140,58 +6194,69 @@ mod tests {
         assert_eq!(item_text(&doc.content[1].content.as_ref().unwrap()[0]), "б");
     }
 
-    /// The transient merge marker must never reach a caller.
+    /// The marker carries no ADF meaning, but it must still be consumed so
+    /// it never shows up as a literal paragraph.
     #[test]
-    fn no_merge_marker_leaks_into_output() {
+    fn list_separate_line_is_consumed_not_a_paragraph() {
         for md in [
-            "- а\n\n- б\n{list=separate}",
-            "- а\n\n- б",
-            "1. а\n{order=1}\n\n1. б\n{list=separate}",
-            "- p\n  - x\n  \n  - y\n  {list=separate}",
+            "- а\n{list=separate}\n\n- б",
+            "1. а\n{list=separate}\n\n1. б",
+            "- [ ] а\n{list=separate}\n\n- [ ] б",
         ] {
             let doc = markdown_to_adf(md).unwrap();
-            let json = serde_json::to_string(&doc).unwrap();
             assert!(
-                !json.contains(LIST_SEPARATE_MARKER),
-                "marker leaked for {md:?}: {json}"
+                doc.content.iter().all(|n| n.node_type != "paragraph"),
+                "stray paragraph for {md:?}: {:?}",
+                doc.content
             );
+            let json = serde_json::to_string(&doc).unwrap();
+            assert!(!json.contains("list=separate"), "leaked for {md:?}: {json}");
         }
     }
 
-    /// Task lists are excluded from the merge on both sides: each carries
-    /// its own `localId`, so adjacent ones already round-trip.
+    /// Any trailing attrs line ends a list — that, not a transient marker,
+    /// is what keeps two lists apart.  The attrs belong to the first list
+    /// alone and must not be inherited by the second.
     #[test]
-    fn loose_task_lists_stay_separate() {
-        let doc = markdown_to_adf("- [ ] а\n\n- [ ] б").unwrap();
+    fn block_attrs_line_ends_a_list() {
+        let doc = markdown_to_adf("- a\n{align=center}\n- b").unwrap();
         assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
-        assert_eq!(doc.content[0].node_type, "taskList");
-        assert_eq!(doc.content[1].node_type, "taskList");
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+        assert!(doc.content[0].marks.is_some(), "{:?}", doc.content[0]);
+        assert!(doc.content[1].marks.is_none(), "{:?}", doc.content[1]);
     }
 
-    /// An empty attrs object (here on `tableCell`) is not collateral damage
-    /// of stripping the merge marker.
+    /// The same, for `localId`: neither list's id may be lost.
     #[test]
-    fn strip_merge_markers_keeps_legitimately_empty_attrs() {
-        let mut nodes = vec![AdfNode {
-            node_type: "tableCell".to_string(),
-            attrs: Some(serde_json::json!({})),
-            content: Some(vec![AdfNode {
-                node_type: "bulletList".to_string(),
-                attrs: Some(serde_json::json!({ LIST_SEPARATE_MARKER: true })),
-                content: None,
-                text: None,
-                marks: None,
-                local_id: None,
-                parameters: None,
-            }]),
-            text: None,
-            marks: None,
-            local_id: None,
-            parameters: None,
-        }];
-        strip_merge_markers(&mut nodes);
-        assert_eq!(nodes[0].attrs, Some(serde_json::json!({})));
-        assert!(nodes[0].content.as_ref().unwrap()[0].attrs.is_none());
+    fn local_id_attrs_line_ends_a_list_keeping_both_ids() {
+        let doc = markdown_to_adf("- a\n{localId=L1}\n- b\n{localId=L2}").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(
+            doc.content[0].attrs.as_ref().and_then(|a| a.get("localId")),
+            Some(&serde_json::json!("L1"))
+        );
+        assert_eq!(
+            doc.content[1].attrs.as_ref().and_then(|a| a.get("localId")),
+            Some(&serde_json::json!("L2"))
+        );
+    }
+
+    /// `{order=1}` (issue #547) ends the list like any other attrs line, so
+    /// the numbering that follows starts a second list even though it would
+    /// otherwise have continued.
+    #[test]
+    fn explicit_order_one_attrs_line_ends_a_list() {
+        let doc = markdown_to_adf("1. a\n{order=1}\n\n2. b").unwrap();
+        assert_eq!(doc.content.len(), 2, "blocks: {:?}", doc.content);
+        assert_eq!(
+            doc.content[0].attrs.as_ref().and_then(|a| a.get("order")),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            doc.content[1].attrs.as_ref().and_then(|a| a.get("order")),
+            Some(&serde_json::json!(2))
+        );
     }
 
     /// Two genuinely separate ADF `bulletList`s survive the round trip.
@@ -6206,7 +6271,7 @@ mod tests {
                     {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
                 ]}
             ]}"#,
-            "- a\n\n- b\n{list=separate}\n",
+            "- a\n{list=separate}\n\n- b\n",
         );
     }
 
@@ -6223,12 +6288,13 @@ mod tests {
                     {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
                 ]}
             ]}"#,
-            "1. a\n2. b\n\n1. c\n{list=separate}\n",
+            "1. a\n2. b\n{list=separate}\n\n1. c\n",
         );
     }
 
-    /// The second list's `order` rides the list marker; `{list=separate}`
-    /// still has to say the two are not one loose list.
+    /// The second list's `order` rides the list marker, but `3.` is exactly
+    /// where the first list's numbering would have carried on — so the
+    /// marker is still needed.
     #[test]
     fn round_trip_adjacent_ordered_lists_with_explicit_order() {
         assert_round_trip(
@@ -6241,12 +6307,30 @@ mod tests {
                     {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
                 ]}
             ]}"#,
-            "1. a\n2. b\n\n3. c\n{list=separate}\n",
+            "1. a\n2. b\n{list=separate}\n\n3. c\n",
+        );
+    }
+
+    /// A restart the parser would never fuse needs no marker — emitting one
+    /// would be pure churn.
+    #[test]
+    fn round_trip_adjacent_ordered_lists_restart_needs_no_marker() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"orderedList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]},
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]},
+                {"type":"orderedList","attrs":{"order":5},"content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
+                ]}
+            ]}"#,
+            "1. a\n2. b\n\n5. c\n",
         );
     }
 
     /// The issue #547 shape: `{order=1}` and `{list=separate}` compose onto
-    /// separate lines because they belong to different lists.
+    /// one attrs line because both belong to the first list.
     #[test]
     fn round_trip_adjacent_ordered_lists_explicit_order_one() {
         assert_round_trip(
@@ -6258,13 +6342,13 @@ mod tests {
                     {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
                 ]}
             ]}"#,
-            "1. a\n{order=1}\n\n1. b\n{list=separate}\n",
+            "1. a\n{order=1 list=separate}\n\n1. b\n",
         );
     }
 
-    /// Two adjacent lists *inside* a list item: the blank separator line
-    /// keeps the items apart and the marker line is indented with the list
-    /// it belongs to.
+    /// Two adjacent lists *inside* a list item: the marker line is indented
+    /// with the list it ends, and no blank line is needed because the attrs
+    /// line is itself the terminator.
     #[test]
     fn round_trip_adjacent_bullet_lists_in_list_item() {
         assert_round_trip(
@@ -6279,12 +6363,49 @@ mod tests {
                     ]}
                 ]}
             ]}]}"#,
-            "- p\n  - x\n  \n  - y\n  {list=separate}\n",
+            "- p\n  - x\n  {list=separate}\n  - y\n",
         );
     }
 
-    /// The same, inside a table cell — whose empty `attrs` object must also
-    /// survive the marker strip.
+    /// A `bulletList` followed by a `taskList` inside one item: without the
+    /// marker `parse_bullet_list` flips the whole run to a task list and
+    /// produces a `listItem` under a `taskList` — invalid ADF.
+    #[test]
+    fn round_trip_bullet_then_task_list_in_list_item() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"bulletList","content":[
+                {"type":"listItem","content":[
+                    {"type":"paragraph","content":[{"type":"text","text":"x"}]},
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                    ]},
+                    {"type":"taskList","attrs":{"localId":"l1"},"content":[
+                        {"type":"taskItem","attrs":{"localId":"t1","state":"TODO"},"content":[{"type":"text","text":"t"}]}
+                    ]}
+                ]}
+            ]}]}"#,
+            "- x\n  - b\n  {list=separate}\n  - [ ] t {localId=t1}\n  {localId=l1}\n",
+        );
+    }
+
+    /// The blockquote arm renders siblings itself, so it needs the marker
+    /// too.
+    #[test]
+    fn round_trip_blockquote_adjacent_bullet_lists() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[{"type":"blockquote","content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                ]}
+            ]}]}"#,
+            "> - a\n> {list=separate}\n> - b\n",
+        );
+    }
+
+    /// The same, inside a table cell — whose empty `attrs` object survives.
     #[test]
     fn round_trip_adjacent_bullet_lists_in_table_cell() {
         assert_round_trip(
@@ -6300,15 +6421,16 @@ mod tests {
                     ]}
                 ]}
             ]}]}"#,
-            "::::table\n:::tr\n:::td{}\n- a\n\n- b\n{list=separate}\n:::\n:::\n::::\n",
+            "::::table\n:::tr\n:::td{}\n- a\n{list=separate}\n\n- b\n:::\n:::\n::::\n",
         );
     }
 
-    /// Adjacent task lists are untouched: no marker on either side.
+    /// Adjacent task lists now fuse too, so they need the marker — which
+    /// composes onto the `taskList`'s own `{localId=…}` line.
     #[test]
     fn round_trip_adjacent_task_lists() {
         assert_round_trip(
-            r#"{"type":"doc","version":1,"content":[
+        r#"{"type":"doc","version":1,"content":[
                 {"type":"taskList","attrs":{"localId":"l1"},"content":[
                     {"type":"taskItem","attrs":{"localId":"t1","state":"TODO"},"content":[{"type":"text","text":"a"}]}
                 ]},
@@ -6316,11 +6438,11 @@ mod tests {
                     {"type":"taskItem","attrs":{"localId":"t2","state":"TODO"},"content":[{"type":"text","text":"b"}]}
                 ]}
             ]}"#,
-            "- [ ] a {localId=t1}\n{localId=l1}\n\n- [ ] b {localId=t2}\n{localId=l2}\n",
-        );
+        "- [ ] a {localId=t1}\n{localId=l1 list=separate}\n\n- [ ] b {localId=t2}\n{localId=l2}\n",
+    );
     }
 
-    /// Three in a row: every list after the first carries the marker.
+    /// Three in a row: every list but the last carries the marker.
     #[test]
     fn round_trip_three_adjacent_bullet_lists() {
         assert_round_trip(
@@ -6335,7 +6457,86 @@ mod tests {
                     {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"c"}]}]}
                 ]}
             ]}"#,
-            "- a\n\n- b\n{list=separate}\n\n- c\n{list=separate}\n",
+            "- a\n{list=separate}\n\n- b\n{list=separate}\n\n- c\n",
+        );
+    }
+
+    /// A list with no items renders nothing, so there is nothing to fuse
+    /// with and no marker is emitted — a bare `{list=separate}` line would
+    /// otherwise come back as a literal paragraph.
+    #[test]
+    fn empty_second_bullet_list_renders_without_a_marker() {
+        let doc: AdfDocument = serde_json::from_str(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"bulletList","content":[]}
+            ]}"#,
+        )
+        .unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md, "- a\n\n");
+        let reparsed = markdown_to_adf(&md).unwrap();
+        assert_eq!(reparsed.content.len(), 1, "{:?}", reparsed.content);
+        assert_eq!(reparsed.content[0].node_type, "bulletList");
+    }
+
+    /// A subtree preserved verbatim in an ```` ```adf-unsupported ```` block
+    /// is never rewritten: its inner lists keep their shape and an attrs key
+    /// that happens to look like an internal marker survives.
+    #[test]
+    fn adf_unsupported_subtree_round_trips_verbatim() {
+        let doc: AdfDocument = serde_json::from_str(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"mysteryBlock","attrs":{"__list_separate":true},"content":[
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                    ]},
+                    {"type":"bulletList","content":[
+                        {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}
+                    ]}
+                ]}
+            ]}"#,
+        )
+        .unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(!md.contains("list=separate"), "md: {md}");
+        let reparsed = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reparsed).unwrap(),
+            serde_json::to_value(&doc).unwrap(),
+            "markdown was:\n{md}"
+        );
+    }
+
+    /// A paragraph whose text starts with spaces must not be pulled into the
+    /// list above it as indented sub-content (issue #1732).
+    #[test]
+    fn round_trip_paragraph_with_leading_spaces_after_list() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"paragraph","content":[{"type":"text","text":"  hello"}]}
+            ]}"#,
+            "- a\n\n::paragraph[  hello]\n",
+        );
+    }
+
+    /// The same text starting with `#` would otherwise become a heading
+    /// *inside* the list item.
+    #[test]
+    fn round_trip_paragraph_with_leading_hash_after_list() {
+        assert_round_trip(
+            r#"{"type":"doc","version":1,"content":[
+                {"type":"bulletList","content":[
+                    {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}
+                ]},
+                {"type":"paragraph","content":[{"type":"text","text":"  # nope"}]}
+            ]}"#,
+            "- a\n\n::paragraph[  # nope]\n",
         );
     }
 
