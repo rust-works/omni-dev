@@ -20,7 +20,7 @@
 //! an intent record that reads as an interrupted write, so the two halves
 //! are deliberately the *only* way to conclude a leased write.
 //!
-//! What stays with each caller: mapping [`LeaseCheckOutcome`] onto that
+//! What stays with each caller: mapping [`LeaseGateRefusal`] onto that
 //! engine's own `*Result` enum (`EditResult`/`WriteResult`/
 //! `StructureResult`/`ProtectionResult`/`DocsWriteResult` and friends all
 //! carry their own `RefusedNoLease`/`RefusedLeaseExpired`/
@@ -70,37 +70,12 @@ pub(crate) mod verdict {
 /// from the engine assuming one exists (a `require_lease: false` rule
 /// reaches the mutating call with no lease and no backup at all).
 pub(crate) struct LeaseGrant {
-    /// See [`LeaseCheckOutcome::Ok`] for why this must outlive the write.
+    /// See [`check_and_lock_lease`]'s "On success" doc for why this must
+    /// outlive the write.
     pub(crate) lock: LedgerLock,
     /// The backup recorded at `drive lease acquire` time — bytes on disk
     /// for a binary file, a Drive copy for a native document (ADR-0080 §3).
     pub(crate) backup: LeaseBackup,
-}
-
-/// The result of checking a presented `--lease` token against the ledger.
-pub(crate) enum LeaseCheckOutcome {
-    /// The token is present, live, bound to `file_id`, and not stale. The
-    /// [`LeaseGrant`]'s still-held [`LedgerLock`] must be kept alive by the
-    /// caller across the mutating call and into [`finish_leased_write`] —
-    /// see that function's doc comment for why releasing it early reopens
-    /// the double-spend window this lock exists to close.
-    Ok(LeaseGrant),
-    /// No `--lease` was presented at all.
-    NoLease,
-    /// The ledger could not be read, the token is not in it, or it has
-    /// expired — folded into one outcome per [`check_and_lock_lease`]'s
-    /// fail-closed reasoning.
-    Expired,
-    /// The presented lease is bound to a different file id.
-    WrongFile,
-    /// The file has moved since the lease's recorded `version`.
-    Stale,
-    /// Acquiring the ledger lock itself failed (another `drive lease`
-    /// operation genuinely in progress), or the write-ahead audit record
-    /// could not be written. Says nothing about the token's validity — the
-    /// caller should report this as an operational failure, not fold it
-    /// into `Expired`.
-    Failed(String),
 }
 
 /// Identifies one leased write to [`check_and_lock_lease`] and the two
@@ -137,7 +112,7 @@ pub(crate) struct LeasedWrite<'a> {
 /// recorded alongside it as `modified_time_before`; it takes no part in
 /// the check itself.
 ///
-/// On success, the returned [`LeaseCheckOutcome::Ok`] holds the still-live
+/// On success, the returned [`Ok`]'s [`LeaseGrant`] holds the still-live
 /// [`LedgerLock`] — the caller must keep it alive across the mutating call
 /// and into [`finish_leased_write`], not drop it right away, or two
 /// concurrent writes presenting the same token could each load the ledger
@@ -146,8 +121,8 @@ pub(crate) struct LeasedWrite<'a> {
 /// every refusal, no lock is held (either none was ever taken, or it is
 /// dropped before returning).
 ///
-/// A ledger load failure reports [`LeaseCheckOutcome::Expired`] rather than
-/// [`LeaseCheckOutcome::Failed`] — an unreadable ledger means "no token in
+/// A ledger load failure reports [`LeaseGateRefusal::Expired`] rather than
+/// [`LeaseGateRefusal::Failed`] — an unreadable ledger means "no token in
 /// it can be verified," which is exactly what that refusal already
 /// communicates, and it avoids a corrupt/missing ledger being mistaken for
 /// an API or validation error. It is still logged at `warn` (distinct from
@@ -163,7 +138,7 @@ pub(crate) struct LeasedWrite<'a> {
 /// logging failure changes nothing about the refusal. A lease that checks
 /// out writes the write-ahead `pending` intent record instead, and that
 /// one is fail-closed: if it cannot be written the write is refused as
-/// [`LeaseCheckOutcome::Failed`]. This is the one point in the whole
+/// [`LeaseGateRefusal::Failed`]. This is the one point in the whole
 /// leased-write path the ADR requires it — everything before it refuses
 /// without touching Drive content, and everything after it is the
 /// content-mutating act the record exists to make un-auditable-by-omission
@@ -175,7 +150,7 @@ pub(crate) async fn check_and_lock_lease(
     lease_token: Option<&str>,
     live_version: Option<&str>,
     live_modified_time: Option<&str>,
-) -> LeaseCheckOutcome {
+) -> Result<LeaseGrant, LeaseGateRefusal> {
     let LeasedWrite {
         log_prefix,
         ledger_path,
@@ -196,7 +171,7 @@ pub(crate) async fn check_and_lock_lease(
 
     let Some(token) = lease_token else {
         refuse(None, verdict::REFUSED_NO_LEASE, None);
-        return LeaseCheckOutcome::NoLease;
+        return Err(LeaseGateRefusal::NoLease);
     };
     // Waits rather than refusing outright: a concurrent leased write to an
     // *unrelated* file must not hard-fail just because the ledger lock is
@@ -211,7 +186,7 @@ pub(crate) async fn check_and_lock_lease(
         Ok(lock) => lock,
         Err(err) => {
             refuse(Some(token), verdict::FAILED, Some(err.to_string()));
-            return LeaseCheckOutcome::Failed(err.to_string());
+            return Err(LeaseGateRefusal::Failed(err.to_string()));
         }
     };
     // Every exit below refuses unless the token is verified live, bound to
@@ -243,46 +218,46 @@ pub(crate) async fn check_and_lock_lease(
                     "lease ledger at {ledger_path} could not be read: {err}"
                 )),
             );
-            return LeaseCheckOutcome::Expired;
+            return Err(LeaseGateRefusal::Expired);
         }
     };
     let Some(record) = ledger.get(token) else {
         refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
-        return LeaseCheckOutcome::Expired;
+        return Err(LeaseGateRefusal::Expired);
     };
     if !record.is_live(chrono::Utc::now()) {
         refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
-        return LeaseCheckOutcome::Expired;
+        return Err(LeaseGateRefusal::Expired);
     }
     if record.file_id != file_id {
         refuse(Some(token), verdict::REFUSED_LEASE_WRONG_FILE, None);
-        return LeaseCheckOutcome::WrongFile;
+        return Err(LeaseGateRefusal::WrongFile);
     }
     if live_version != Some(record.version.as_str()) {
         refuse(Some(token), verdict::REFUSED_LEASE_STALE, None);
-        return LeaseCheckOutcome::Stale;
+        return Err(LeaseGateRefusal::Stale);
     }
 
     // The write-ahead intent record — fail-closed, see the doc comment.
     let intent = before(Some(token), verdict::PENDING);
     if let Err(err) = crate::request_log::record_audit_event(intent) {
-        return LeaseCheckOutcome::Failed(format!(
+        return Err(LeaseGateRefusal::Failed(format!(
             "failed to write the write-ahead audit record: {err}"
-        ));
+        )));
     }
 
-    LeaseCheckOutcome::Ok(LeaseGrant {
+    Ok(LeaseGrant {
         lock,
         backup: record.backup.clone(),
     })
 }
 
-/// The reason a leased write was refused, folding a failure fetching the
-/// live version (the one step every engine must take before it can even
-/// call [`check_and_lock_lease`]) together with that function's own four
-/// refusal variants. Returned by [`gate_leased_write`] so a caller maps
-/// exactly one enum onto its own `Refused*`/`Failed` result variants,
-/// instead of two.
+/// The reason a leased write was refused: [`check_and_lock_lease`]'s own
+/// four token-verdict variants, plus `Failed` for an operational failure —
+/// including [`gate_leased_write`]'s own live-version fetch, the one step
+/// every engine must take before it can even call `check_and_lock_lease`.
+/// A caller maps exactly one enum onto its own `Refused*`/`Failed` result
+/// variants, instead of two.
 pub(crate) enum LeaseGateRefusal {
     /// No `--lease` was presented at all.
     NoLease,
@@ -324,21 +299,13 @@ pub(crate) async fn gate_leased_write(
         .await
         .map(|fresh| (fresh.version, fresh.modified_time))
         .map_err(|err| LeaseGateRefusal::Failed(err.to_string()))?;
-    match check_and_lock_lease(
+    check_and_lock_lease(
         write,
         lease_token,
         live_version.as_deref(),
         live_modified_time.as_deref(),
     )
     .await
-    {
-        LeaseCheckOutcome::Ok(grant) => Ok(grant),
-        LeaseCheckOutcome::NoLease => Err(LeaseGateRefusal::NoLease),
-        LeaseCheckOutcome::Expired => Err(LeaseGateRefusal::Expired),
-        LeaseCheckOutcome::WrongFile => Err(LeaseGateRefusal::WrongFile),
-        LeaseCheckOutcome::Stale => Err(LeaseGateRefusal::Stale),
-        LeaseCheckOutcome::Failed(detail) => Err(LeaseGateRefusal::Failed(detail)),
-    }
 }
 
 /// [`gate_leased_write`], but honouring `requires_lease` (ADR-0080 §13/§9):
@@ -595,7 +562,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(outcome, LeaseCheckOutcome::Expired));
+        assert!(matches!(outcome, Err(LeaseGateRefusal::Expired)));
 
         // Refused as expired like an unknown token, but the audit record
         // keeps the systemic reason an auditor needs to tell them apart.
@@ -795,7 +762,7 @@ mod tests {
             Some("2026-09-12T00:00:00Z"),
         )
         .await;
-        assert!(matches!(outcome, LeaseCheckOutcome::Ok(_)));
+        assert!(matches!(outcome, Ok(_)));
 
         let records = audit.records();
         assert_eq!(audit.verdicts(), [verdict::PENDING], "{records:?}");
@@ -846,7 +813,7 @@ mod tests {
             None,
         )
         .await;
-        let LeaseCheckOutcome::Failed(detail) = outcome else {
+        let Err(LeaseGateRefusal::Failed(detail)) = outcome else {
             panic!("expected Failed, got a lock/refusal instead");
         };
         assert!(detail.contains("write-ahead"), "{detail}");
@@ -875,7 +842,7 @@ mod tests {
                 None
             )
             .await,
-            LeaseCheckOutcome::NoLease
+            Err(LeaseGateRefusal::NoLease)
         ));
         // Unknown token.
         assert!(matches!(
@@ -886,7 +853,7 @@ mod tests {
                 None
             )
             .await,
-            LeaseCheckOutcome::Expired
+            Err(LeaseGateRefusal::Expired)
         ));
         // Bound to a different file.
         assert!(matches!(
@@ -897,7 +864,7 @@ mod tests {
                 None
             )
             .await,
-            LeaseCheckOutcome::WrongFile
+            Err(LeaseGateRefusal::WrongFile)
         ));
         // Stale version.
         assert!(matches!(
@@ -908,7 +875,7 @@ mod tests {
                 None
             )
             .await,
-            LeaseCheckOutcome::Stale
+            Err(LeaseGateRefusal::Stale)
         ));
 
         // One verdict per engine-reported refusal, so an auditor can tell a
@@ -1047,7 +1014,7 @@ mod tests {
                 None
             )
             .await,
-            LeaseCheckOutcome::NoLease
+            Err(LeaseGateRefusal::NoLease)
         ));
         record_failed_leased_write(leased("edit", &ledger_path, "file-1"), "tok-1", "boom");
         let lock = LedgerLock::acquire(&ledger_path).unwrap();
@@ -1097,7 +1064,7 @@ mod tests {
 
         std::fs::set_permissions(&ledger_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(matches!(outcome, LeaseCheckOutcome::Failed(_)));
+        assert!(matches!(outcome, Err(LeaseGateRefusal::Failed(_))));
 
         // An operational failure, not a verdict about the token: `failed`,
         // with the reason, and no `pending` record since no mutating call
@@ -1134,7 +1101,7 @@ mod tests {
         releaser.join().unwrap();
 
         assert!(
-            matches!(outcome, LeaseCheckOutcome::Ok(_)),
+            matches!(outcome, Ok(_)),
             "waited holder should have released the lock"
         );
         assert_eq!(audit.verdicts(), [verdict::PENDING]);
