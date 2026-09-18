@@ -1397,14 +1397,17 @@ stale lock. **Never delete this lock file by hand** — it is not a marker
 of anything being wrong, and nothing in this codebase ever advises
 deleting it. (This holds on Unix; on non-Unix platforms, where `flock`
 isn't available, the lock falls back to the older create-and-delete
-marker scheme, so a crashed holder there can still leave a stale lock.) A leased write waits for a busy lock rather than failing
-outright (printing a one-line notice while it does), up to
+marker scheme, so a crashed holder there can still leave a stale lock.) A leased write, `drive lease acquire` and `drive lease release`
+each wait for a busy lock rather than failing outright (printing a
+one-line notice while they do), up to
 `OMNI_DEV_LEASE_LOCK_WAIT_SECS` (default: four times the HTTP read
 timeout, since a held lock can span several sequential Drive calls, e.g.
 `drive lease restore`'s copy-then-edit-then-rename sequence). The lock
 is **ledger-global**, not per-file: a write to one file and a concurrent
 write to a *different* file still serialize against each other, they
-just wait instead of hard-failing.
+just wait instead of hard-failing. `drive lease prune` is the exception:
+it does not wait, and a row whose lock it cannot take is simply left
+for a future prune.
 
 ```bash
 $ omni-dev drive lease prune --older-than 30d
