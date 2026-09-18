@@ -12,6 +12,7 @@ use crate::cli::drive::upload::read_local_content;
 use crate::drive::client::DriveClient;
 use crate::drive::content_edit::{self, EditOptions, EditOutcome, EditResult};
 use crate::drive::files_api::{check_upload_size, MAX_UPLOAD_BYTES};
+use crate::drive::lease::check::LeaseGateRefusal;
 use crate::drive::write_gate::FolderPermissionRule;
 
 /// MIME type used when `--mime-type` is omitted — Drive's own fallback for
@@ -191,33 +192,24 @@ fn write_outcome(outcome: &EditOutcome, out: &mut dyn std::io::Write) -> std::io
             }
         }
         EditResult::RefusedNoLease => {
-            writeln!(
-                out,
-                "Refused: {file_id} requires a Drive write lease — run `omni-dev drive lease \
-                 acquire {file_id}` and pass the printed token via `--lease`."
-            )?;
+            for line in LeaseGateRefusal::NoLease.describe_lines(&file_id, &file_id) {
+                writeln!(out, "{line}")?;
+            }
         }
         EditResult::RefusedLeaseExpired => {
-            writeln!(
-                out,
-                "Refused: the presented lease is expired, released, or unknown to this ledger \
-                 — run `omni-dev drive lease acquire {file_id}` again."
-            )?;
+            for line in LeaseGateRefusal::Expired.describe_lines(&file_id, &file_id) {
+                writeln!(out, "{line}")?;
+            }
         }
         EditResult::RefusedLeaseWrongFile => {
-            writeln!(
-                out,
-                "Refused: the presented lease was acquired for a different file — run \
-                 `omni-dev drive lease acquire {file_id}` for this one."
-            )?;
+            for line in LeaseGateRefusal::WrongFile.describe_lines(&file_id, &file_id) {
+                writeln!(out, "{line}")?;
+            }
         }
         EditResult::RefusedLeaseStale => {
-            writeln!(
-                out,
-                "Refused: {file_id} changed since the lease was acquired (or last written \
-                 under) — re-run `omni-dev drive lease acquire {file_id}` to lease the current \
-                 version."
-            )?;
+            for line in LeaseGateRefusal::Stale.describe_lines(&file_id, &file_id) {
+                writeln!(out, "{line}")?;
+            }
         }
         EditResult::Edited => writeln!(out, "Edited: {file_id}")?,
         EditResult::Failed { detail } => {
