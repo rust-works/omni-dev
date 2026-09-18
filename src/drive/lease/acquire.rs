@@ -13,6 +13,7 @@
 //! points at.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -25,7 +26,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
 use crate::drive::lease::ledger::{
-    LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock, ReleaseOutcome,
+    default_lock_wait_timeout, LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock, ReleaseOutcome,
 };
 use crate::drive::types::DriveFile;
 
@@ -184,7 +185,20 @@ pub async fn acquire(
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
 ) -> AcquireResult {
-    let (result, disposition) = acquire_inner(client, opts, authenticator).await;
+    acquire_with_lock_wait(client, opts, authenticator, default_lock_wait_timeout()).await
+}
+
+/// [`acquire`] with an explicit wait budget for its ledger insert's lock —
+/// the same test seam as [`LedgerLock::acquire_waiting_blocking_with_timeout`],
+/// so the busy-lock timeout arm, and the backup reclaim that follows it, can
+/// be driven in milliseconds.
+pub(crate) async fn acquire_with_lock_wait(
+    client: &DriveClient,
+    opts: &AcquireOptions,
+    authenticator: &dyn Authenticator,
+    lock_wait: Duration,
+) -> AcquireResult {
+    let (result, disposition) = acquire_inner(client, opts, authenticator, lock_wait).await;
     record_attempt(opts, &result, disposition.as_ref());
     result
 }
@@ -220,6 +234,7 @@ async fn acquire_inner(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
+    lock_wait: Duration,
 ) -> (AcquireResult, Option<BackupDisposition>) {
     let expiry_minutes = opts.expiry.num_minutes();
     if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&expiry_minutes) {
@@ -431,6 +446,7 @@ async fn acquire_inner(
         backup.clone(),
         headless_waiver,
         pre_backup_version.as_deref(),
+        lock_wait,
     )
     .await;
     if matches!(result, AcquireResult::Acquired { .. }) {
@@ -455,6 +471,7 @@ async fn finish_acquisition(
     backup: LeaseBackup,
     headless_waiver: bool,
     pre_backup_version: Option<&str>,
+    lock_wait: Duration,
 ) -> AcquireResult {
     // 3. Ledger record. `version`/`modified_time` are re-fetched here
     // rather than reused from the `target` metadata read at the very top —
@@ -518,7 +535,12 @@ async fn finish_acquisition(
     // to the runtime's other workers for the duration, the same reasoning
     // the `authenticate` call above documents.
     let superseded = match tokio::task::block_in_place(|| {
-        insert_record(record, &opts.ledger_path, opts.supersedes.as_deref())
+        insert_record(
+            record,
+            &opts.ledger_path,
+            opts.supersedes.as_deref(),
+            lock_wait,
+        )
     }) {
         Ok(InsertOutcome::Inserted { superseded }) => superseded,
         // Refuse rather than mint a second, independent lease — see
@@ -776,11 +798,11 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// at once (see [`LeaseLedger::live_lease_for_file`]'s doc comment) — unlike
 /// a check made before taking the lock, nothing can race it.
 ///
-/// Waits for a busy lock rather than refusing (issue #1738): by now this
-/// attempt has spent the Touch ID prompt and a full backup, so hard-failing
-/// behind an unrelated lease operation would throw both away. Blocking is
-/// safe here because the one production caller, `finish_acquisition`,
-/// already runs this under `block_in_place`.
+/// Waits up to `lock_wait` for a busy lock rather than refusing (issue
+/// #1738): by now this attempt has spent the Touch ID prompt and a full
+/// backup, so hard-failing behind an unrelated lease operation would throw
+/// both away. Blocking is safe here because the one production caller,
+/// `finish_acquisition`, already runs this under `block_in_place`.
 ///
 /// `supersedes` names a lease this insert replaces
 /// ([`AcquireOptions::supersedes`]), released here in the *same* rewrite that
@@ -790,8 +812,9 @@ fn insert_record(
     record: LeaseRecord,
     ledger_path: &Path,
     supersedes: Option<&str>,
+    lock_wait: Duration,
 ) -> anyhow::Result<InsertOutcome> {
-    let lock = LedgerLock::acquire_waiting_blocking(ledger_path)?;
+    let lock = LedgerLock::acquire_waiting_blocking_with_timeout(ledger_path, lock_wait)?;
     LeaseLedger::mutate(&lock, ledger_path, |ledger| {
         let now = Utc::now();
         // Order is load-bearing: check, then release, then insert.
@@ -1057,6 +1080,11 @@ mod tests {
         }
     }
 
+    /// A ledger-lock wait budget for tests: long enough that a holder
+    /// released after ~100ms is always waited out, short enough that a
+    /// regression into a hang fails in seconds rather than minutes.
+    const TEST_LOCK_WAIT: Duration = Duration::from_secs(5);
+
     #[tokio::test(flavor = "multi_thread")]
     async fn denied_authentication_takes_no_backup_and_writes_no_ledger_row() {
         let server = wiremock::MockServer::start().await;
@@ -1277,14 +1305,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ledger_insert_failure_reclaims_the_backup_just_taken() {
-        // The ledger lock cannot be taken at this attempt's own
-        // `insert_record` — the way `Failed` still follows a full backup
-        // (issue #1690): the lock-free pre-check can't see this, since it
-        // takes no lock itself. A directory at the lock path, not a held
-        // `LedgerLock`: `insert_record` now waits out a busy lock (issue
-        // #1738), so holding one would stall this test for the whole wait
-        // budget, whereas opening a directory for write is an I/O error,
-        // which is never retried.
+        // A concurrent lease op holds the ledger lock across this attempt's
+        // own `insert_record` for longer than its wait budget — the routine,
+        // non-race way `Failed` still follows a full backup (issue #1690):
+        // the lock-free pre-check can't see this, since it takes no lock
+        // itself. `insert_record` waits out a busy lock (issue #1738), so
+        // the budget is shortened through `acquire_with_lock_wait` rather
+        // than spending the default's minutes. A held `LedgerLock`, not a
+        // bare `File::create` on the lock path (issue #1687): under `flock`,
+        // the file's mere existence holds nothing — only an actual lock
+        // does, and `flock` conflicts against a second `open()` even from
+        // this same process.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -1306,18 +1337,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
-        let mut lock_path = test_opts.ledger_path.clone().into_os_string();
-        lock_path.push(".lock");
-        std::fs::create_dir(PathBuf::from(lock_path)).unwrap();
+        let _held = LedgerLock::acquire(&test_opts.ledger_path).unwrap();
 
-        let result = acquire(
+        let result = acquire_with_lock_wait(
             &client,
             &test_opts,
             &FakeAuthenticator(AuthOutcome::Authorized),
+            Duration::from_millis(150),
         )
         .await;
 
-        assert!(matches!(result, AcquireResult::Failed { .. }));
+        assert!(
+            matches!(&result, AcquireResult::Failed { detail } if detail.contains("timed out")),
+            "{result:?}"
+        );
         assert!(
             std::fs::read_dir(&test_opts.backup_dir)
                 .unwrap()
@@ -2612,7 +2645,8 @@ mod tests {
             drop(held);
         });
 
-        let outcome = insert_record(live_row("new", "f1"), &ledger_path, None).unwrap();
+        let outcome =
+            insert_record(live_row("new", "f1"), &ledger_path, None, TEST_LOCK_WAIT).unwrap();
         releaser.join().unwrap();
 
         assert!(matches!(
@@ -2660,7 +2694,13 @@ mod tests {
         let ledger_path = root.path().join("lease-ledger.jsonl");
         seed(&ledger_path, vec![live_row("old", "f1")]);
 
-        let outcome = insert_record(live_row("new", "f1"), &ledger_path, Some("old")).unwrap();
+        let outcome = insert_record(
+            live_row("new", "f1"),
+            &ledger_path,
+            Some("old"),
+            TEST_LOCK_WAIT,
+        )
+        .unwrap();
 
         assert!(matches!(
             outcome,
@@ -2686,8 +2726,13 @@ mod tests {
         let ledger_path = root.path().join("lease-ledger.jsonl");
         seed(&ledger_path, vec![live_row("elsewhere", "f2")]);
 
-        let outcome =
-            insert_record(live_row("new", "f1"), &ledger_path, Some("elsewhere")).unwrap();
+        let outcome = insert_record(
+            live_row("new", "f1"),
+            &ledger_path,
+            Some("elsewhere"),
+            TEST_LOCK_WAIT,
+        )
+        .unwrap();
 
         assert!(
             matches!(outcome, InsertOutcome::Inserted { superseded: false }),
@@ -2712,7 +2757,13 @@ mod tests {
             vec![live_row("old", "f1"), live_row("third-party", "f1")],
         );
 
-        let outcome = insert_record(live_row("new", "f1"), &ledger_path, Some("old")).unwrap();
+        let outcome = insert_record(
+            live_row("new", "f1"),
+            &ledger_path,
+            Some("old"),
+            TEST_LOCK_WAIT,
+        )
+        .unwrap();
 
         assert!(
             matches!(&outcome, InsertOutcome::AlreadyLeased(rec) if rec.token == "third-party"),
@@ -2738,7 +2789,13 @@ mod tests {
         old.released_at = Some(first_release);
         seed(&ledger_path, vec![old]);
 
-        let outcome = insert_record(live_row("new", "f1"), &ledger_path, Some("old")).unwrap();
+        let outcome = insert_record(
+            live_row("new", "f1"),
+            &ledger_path,
+            Some("old"),
+            TEST_LOCK_WAIT,
+        )
+        .unwrap();
 
         assert!(matches!(
             outcome,
