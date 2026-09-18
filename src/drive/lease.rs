@@ -7,16 +7,19 @@
 //! ([`acquire`]) reads and writes; [`check`] is the shared "does this
 //! presented `--lease` token authorise this write" gate every
 //! content-mutating engine (`drive edit`, every Sheets/Docs write verb)
-//! calls; [`restore`] is `drive lease restore` (ADR-0080 §10); [`settings`]
-//! resolves the global CLI-flag/env-var/`settings.json` policy layer
-//! (ADR-0080 §13, issue #1677); [`prune`] is `drive lease prune`, the
-//! ADR-0080 Consequences fast-follow (#1678) that bounds the ledger's and
-//! the backup directory/folder's unbounded growth.
+//! calls; [`restore`] is `drive lease restore` (ADR-0080 §10); [`release`] ends
+//! a lease's window early (issue #1685), the counterpart to the expiry
+//! [`acquire`] fixes; [`settings`] resolves the global
+//! CLI-flag/env-var/`settings.json` policy layer (ADR-0080 §13, issue
+//! #1677); [`prune`] is `drive lease prune`, the ADR-0080 Consequences
+//! fast-follow (#1678) that bounds the ledger's and the backup
+//! directory/folder's unbounded growth.
 
 pub(crate) mod acquire;
 pub(crate) mod authenticate;
 pub(crate) mod check;
 pub(crate) mod ledger;
 pub(crate) mod prune;
+pub(crate) mod release;
 pub(crate) mod restore;
 pub(crate) mod settings;

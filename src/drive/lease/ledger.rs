@@ -108,9 +108,13 @@ pub(crate) struct LeaseRecord {
     /// ADR-0080 §5: the only way to get a fresh window is a fresh
     /// `drive lease acquire`, which means a fresh prompt.
     pub(crate) expires_at: DateTime<Utc>,
-    /// Set by an explicit release (a later phase's verb, not yet
-    /// implemented) — distinct from expiry, which needs no write to take
-    /// effect.
+    /// When this lease's window was ended early — distinct from expiry,
+    /// which needs no write to take effect. Set by `drive lease release`
+    /// ([`super::release`]), and by `drive lease restore` superseding the
+    /// very backup lease it restores from (issue #1685). Ends the row's
+    /// authority to *write*, never its usefulness as a backup: a released
+    /// row is still restorable from, and is still kept until
+    /// [`super::prune`] drops it together with its backup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) released_at: Option<DateTime<Utc>>,
     /// Set once `drive lease restore <TOKEN>` successfully restores from
@@ -155,6 +159,28 @@ impl LeaseRecord {
 /// differs from `InsertLedger`.
 #[derive(Debug, Default)]
 pub(crate) struct LeaseLedger(BTreeMap<String, LeaseRecord>);
+
+/// What [`LeaseLedger::release`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    /// The row was live and is now released.
+    Released {
+        /// The file the released lease covered.
+        file_id: String,
+        /// When it would otherwise have expired on its own.
+        expires_at: DateTime<Utc>,
+    },
+    /// The row exists but was already expired or already released — left
+    /// untouched.
+    NotLive {
+        /// Its expiry, whether or not that is what ended it.
+        expires_at: DateTime<Utc>,
+        /// When an earlier release ended it, if that is what did.
+        released_at: Option<DateTime<Utc>>,
+    },
+    /// No row in this ledger carries that token.
+    NotFound,
+}
 
 impl LeaseLedger {
     /// Loads `lease-ledger.jsonl`. An absent file is an empty ledger (no
@@ -235,15 +261,59 @@ impl LeaseLedger {
     /// on the same file closes that gap: only one token can ever be
     /// checked against the file's true current state at a time.
     ///
+    /// `exclude` names one token whose own row does not count as a blocker —
+    /// `drive lease restore`'s supersede (issue #1685), and nothing else.
+    /// Restore mints its fresh lease on the *same* file the backup token
+    /// already covers, so without this the internal acquire refuses the
+    /// restore by naming the very token the user presented, with no way out
+    /// but waiting for it to expire. This is not a general bypass: the
+    /// exclusion is scoped to a single named token, and the `file_id` filter
+    /// below means it can only ever exempt a row already bound to this same
+    /// file. `insert_record` pairs it with releasing that row in the same
+    /// locked rewrite, so at most one live lease per file still holds at
+    /// every instant.
+    ///
     /// [`check_and_lock_lease`]: super::check::check_and_lock_lease
     pub(crate) fn live_lease_for_file(
         &self,
         file_id: &str,
         now: DateTime<Utc>,
+        exclude: Option<&str>,
     ) -> Option<&LeaseRecord> {
-        self.0
-            .values()
-            .find(|record| record.file_id == file_id && record.is_live(now))
+        self.0.values().find(|record| {
+            record.file_id == file_id
+                && record.is_live(now)
+                && Some(record.token.as_str()) != exclude
+        })
+    }
+
+    /// Ends `token`'s write authority early, stamping `released_at` with
+    /// `at`. The row itself is kept — a released lease's backup stays
+    /// restorable, and only [`super::prune`] ever drops a row (together with
+    /// its backup).
+    ///
+    /// Idempotent in effect but not in report: an already-released or
+    /// already-expired row is left exactly as it is and reported as
+    /// [`ReleaseOutcome::NotLive`], so `drive lease release` can tell the
+    /// operator that its token was already dead rather than silently
+    /// claiming to have done something. Re-stamping such a row would
+    /// overwrite the original release's timestamp, losing audit fidelity for
+    /// no gain.
+    pub(crate) fn release(&mut self, token: &str, at: DateTime<Utc>) -> ReleaseOutcome {
+        let Some(rec) = self.0.get_mut(token) else {
+            return ReleaseOutcome::NotFound;
+        };
+        if !rec.is_live(at) {
+            return ReleaseOutcome::NotLive {
+                expires_at: rec.expires_at,
+                released_at: rec.released_at,
+            };
+        }
+        rec.released_at = Some(at);
+        ReleaseOutcome::Released {
+            file_id: rec.file_id.clone(),
+            expires_at: rec.expires_at,
+        }
     }
 
     /// Marks `token`'s row as having been restored from (ADR-0080 §4/§10),

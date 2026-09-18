@@ -1696,6 +1696,19 @@ pub struct AuditOutcome {
     /// is audit-logged carrying both tokens"). `None` for every other
     /// event.
     pub restored_from_lease_id: Option<String>,
+    /// The lease this event ended early, when it ended one as a side effect
+    /// of doing something else: `drive lease acquire`'s supersede, set only
+    /// by `drive lease restore` naming the backup token it restores from
+    /// (issue #1685). Distinct from [`Self::lease_id`], the token the
+    /// acquire itself minted, and from a `drive lease release` record, whose
+    /// released token *is* its `lease_id`. `None` for every other event.
+    ///
+    /// A field rather than a verdict — unlike the headless waiver, which is
+    /// a flag and so became `acquired-headless-waiver` — because this
+    /// carries an identifier, exactly as [`Self::restored_from_lease_id`]
+    /// does, and a third verdict axis would multiply combinatorially with
+    /// the existing `-headless-waiver`/`-backup-orphaned` suffixes.
+    pub superseded_lease_id: Option<String>,
     /// The error, when the event itself failed (an API/filesystem/ledger
     /// error — distinct from an ordinary refusal, which is a `verdict`, not
     /// an `error`).
@@ -1765,6 +1778,9 @@ fn build_audit_record(outcome: AuditOutcome, ctx: RequestLogContext) -> LogRecor
     }
     if let Some(restored_from) = outcome.restored_from_lease_id {
         context.insert("restored_from_lease_id".to_string(), restored_from);
+    }
+    if let Some(superseded) = outcome.superseded_lease_id {
+        context.insert("superseded_lease_id".to_string(), superseded);
     }
     rec.context = context;
     rec

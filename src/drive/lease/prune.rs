@@ -492,6 +492,67 @@ mod tests {
         assert_eq!(LeaseLedger::load(&ledger_path).unwrap().iter().count(), 1);
     }
 
+    /// The knock-on effect of `drive lease release`/restore's supersede
+    /// (issue #1685): a live row never enters the `--max-size` budget at
+    /// all, so releasing one *before* its expiry adds its bytes to the
+    /// budget and can evict an older row that previously fit. The released
+    /// row itself is safe — it sorts newest-`expires_at`-first, so it is the
+    /// last candidate evicted — and `--older-than` is untouched either way,
+    /// since release never moves `expires_at`.
+    #[tokio::test]
+    async fn releasing_a_row_early_puts_its_bytes_into_the_max_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let released_backup = dir.path().join("released-backup");
+        let older_backup = dir.path().join("older-backup");
+        std::fs::write(&released_backup, b"xx").unwrap();
+        std::fs::write(&older_backup, b"xx").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        // Unexpired, but released — so non-live, and a candidate.
+        let mut released = bytes_record(
+            "released",
+            Utc::now() + ChronoDuration::hours(1),
+            2,
+            released_backup.clone(),
+        );
+        released.released_at = Some(Utc::now());
+        ledger.insert(released);
+        ledger.insert(bytes_record(
+            "older",
+            Utc::now() - ChronoDuration::hours(1),
+            2,
+            older_backup.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: None,
+                // Room for exactly one of the two 2-byte backups.
+                max_size: Some(2),
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(
+            released_backup.exists(),
+            "the released row expires furthest in the future, so it is the last evicted"
+        );
+        assert!(
+            !older_backup.exists(),
+            "the released row's bytes now count against the budget, evicting the older row"
+        );
+    }
+
     #[tokio::test]
     async fn older_than_alone_drops_only_rows_past_the_cutoff() {
         let dir = tempfile::tempdir().unwrap();
