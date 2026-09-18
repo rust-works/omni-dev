@@ -1175,7 +1175,7 @@ mod tests {
             older_than: Some(Utc::now()),
             max_size: None,
             dry_run: true,
-            ledger_path: ledger_path.clone(),
+            ledger_path,
         };
         let outcome = plan(&opts).unwrap();
 
