@@ -173,6 +173,8 @@ pub(crate) enum ReleaseOutcome {
     /// The row exists but was already expired or already released — left
     /// untouched.
     NotLive {
+        /// The file the row covers.
+        file_id: String,
         /// Its expiry, whether or not that is what ended it.
         expires_at: DateTime<Utc>,
         /// When an earlier release ended it, if that is what did.
@@ -305,6 +307,7 @@ impl LeaseLedger {
         };
         if !rec.is_live(at) {
             return ReleaseOutcome::NotLive {
+                file_id: rec.file_id.clone(),
                 expires_at: rec.expires_at,
                 released_at: rec.released_at,
             };
