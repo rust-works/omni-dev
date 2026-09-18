@@ -65,27 +65,20 @@ enum LeaseAction {
 }
 
 impl LeaseCommand {
-    /// Splits off `release`, the one lease verb that touches only the
-    /// ledger, so `DriveCommand::execute` can run it *before* resolving a
-    /// Drive client — otherwise a logged-out account (or `--account` naming
-    /// one with no credentials) fails on `CredentialsNotFound` before the
-    /// ledger is ever read, leaving a lease nobody can stand down and no
-    /// audit record of the attempt. Every other leaf needs the client, so it
-    /// is handed back for the shared eager resolution.
-    pub fn into_release(self) -> std::result::Result<ReleaseCommand, Self> {
+    /// Dispatches to the selected leaf, resolving a Drive client lazily
+    /// and only where a leaf actually needs one (issue #1743): `release`
+    /// never calls `client` at all (it must work with no credentials — it's
+    /// how a lease gets stood down after `drive auth logout`, issue #1685),
+    /// and `prune --dry-run` doesn't either (it's a pure ledger read).
+    /// `client` is a thunk rather than an already-resolved client so a leaf
+    /// that never needs one never pays for credential resolution — in
+    /// production `DriveCommand::execute` passes the bare
+    /// `helpers::create_client` fn item; tests pass a closure that hands
+    /// back an already-constructed wiremock client.
+    pub async fn execute(self, client: impl FnOnce() -> Result<DriveClient>) -> Result<()> {
         match self.action {
-            LeaseAction::Release(cmd) => Ok(cmd),
-            action => Err(Self { action }),
-        }
-    }
-
-    pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        match self.action {
-            LeaseAction::Acquire(cmd) => cmd.execute(client).await,
-            LeaseAction::Restore(cmd) => cmd.execute(client).await,
-            // Reachable only by a caller that resolved a client it did not
-            // need — `DriveCommand::execute` peels this off via
-            // [`Self::into_release`] first.
+            LeaseAction::Acquire(cmd) => cmd.execute(&client()?).await,
+            LeaseAction::Restore(cmd) => cmd.execute(&client()?).await,
             LeaseAction::Release(cmd) => cmd.execute(),
             LeaseAction::Prune(cmd) => cmd.execute(client).await,
         }
@@ -115,6 +108,17 @@ impl LeaseCommand {
                     biometrics_only: false,
                     allow_headless: false,
                 },
+                output: OutputFormat::Table,
+            }),
+        }
+    }
+
+    pub(crate) fn prune_for_test(older_than: &str, dry_run: bool) -> Self {
+        Self {
+            action: LeaseAction::Prune(PruneCommand {
+                older_than: Some(older_than.to_string()),
+                max_size: None,
+                dry_run,
                 output: OutputFormat::Table,
             }),
         }
@@ -376,7 +380,10 @@ pub struct PruneCommand {
 }
 
 impl PruneCommand {
-    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+    /// `client` is resolved lazily and only for a live run — `--dry-run` is
+    /// a pure ledger read ([`prune::plan`]) that never invokes it, so it
+    /// needs no Drive credentials at all (issue #1743).
+    pub async fn execute(self, client: impl FnOnce() -> Result<DriveClient>) -> Result<()> {
         if self.older_than.is_none() && self.max_size.is_none() {
             anyhow::bail!("nothing to prune: pass --older-than <DUR> and/or --max-size <SIZE>");
         }
@@ -402,7 +409,11 @@ impl PruneCommand {
             dry_run: self.dry_run,
             ledger_path,
         };
-        let outcome = prune::prune(client, &opts).await?;
+        let outcome = if opts.dry_run {
+            prune::plan(&opts)?
+        } else {
+            prune::prune(&client()?, &opts).await?
+        };
         if output_as(&outcome, &self.output)? {
             return Ok(());
         }
@@ -780,7 +791,7 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        cmd.execute(&client).await.unwrap();
+        cmd.execute(move || Ok(client)).await.unwrap();
     }
 
     #[tokio::test]
@@ -828,7 +839,7 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        cmd.execute(&client).await.unwrap();
+        cmd.execute(move || Ok(client)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1089,7 +1100,7 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        cmd.execute(&client).await.unwrap();
+        cmd.execute(move || Ok(client)).await.unwrap();
 
         let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
         let record = reloaded.get("live-token").expect("the row is kept");
@@ -1411,7 +1422,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let cmd = parse_prune(&["prune"]);
-        let err = cmd.execute(&client).await.unwrap_err();
+        let err = cmd.execute(move || Ok(client)).await.unwrap_err();
         assert!(err.to_string().contains("nothing to prune"), "{err}");
     }
 
@@ -1423,7 +1434,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let cmd = parse_prune(&["prune", "--older-than", "not-a-duration"]);
-        let err = cmd.execute(&client).await.unwrap_err();
+        let err = cmd.execute(move || Ok(client)).await.unwrap_err();
         assert!(err.to_string().contains("invalid --older-than"), "{err}");
     }
 
@@ -1463,7 +1474,7 @@ mod tests {
             dry_run: false,
             output: OutputFormat::Json,
         };
-        cmd.execute(&client).await.unwrap();
+        cmd.execute(move || Ok(client)).await.unwrap();
 
         assert!(!backup_path.exists());
         let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
@@ -1533,7 +1544,7 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        lease_cmd.execute(&client).await.unwrap();
+        lease_cmd.execute(move || Ok(client)).await.unwrap();
 
         assert!(!old_backup.exists());
         assert!(new_backup.exists());
@@ -1580,7 +1591,7 @@ mod tests {
             dry_run: true,
             output: OutputFormat::Table,
         };
-        cmd.execute(&client).await.unwrap();
+        cmd.execute(move || Ok(client)).await.unwrap();
 
         assert!(backup_path.exists(), "dry-run must not delete the backup");
         let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();

@@ -98,9 +98,11 @@ pub enum DriveSubcommands {
 
 impl DriveCommand {
     /// Executes the Drive command. `auth`/`account` must run without a
-    /// resolved client (they manage credentials/account selection); every
-    /// other subcommand resolves one shared client **once** here and
-    /// threads it down via [`DriveSubcommands::dispatch`].
+    /// resolved client (they manage credentials/account selection);
+    /// `Permissions` and `Lease` resolve their own client lazily, per leaf
+    /// (see the comments below); every other subcommand resolves one
+    /// shared client **once** here and threads it down via
+    /// [`DriveSubcommands::dispatch`].
     pub async fn execute(self) -> Result<()> {
         // Propagates --account to DRIVE_ACCOUNT_ENV for the duration of this
         // call only (crate::drive::account::resolve_account reads it),
@@ -123,17 +125,17 @@ impl DriveCommand {
             // API) — like Auth, it resolves its own client lazily per leaf
             // rather than sharing the single eager resolution below.
             DriveSubcommands::Permissions(cmd) => cmd.execute().await,
-            // `lease release` is a pure ledger mutation (issue #1685) and
-            // must work with no credentials at all — it is how a lease gets
-            // stood down after `drive auth logout`. Its siblings take the
-            // shared eager resolution below.
-            DriveSubcommands::Lease(cmd) => match cmd.into_release() {
-                Ok(release) => release.execute(),
-                Err(cmd) => {
-                    let client = helpers::create_client()?;
-                    cmd.execute(&client).await
-                }
-            },
+            // `Lease`'s four leaves have mixed client needs: `acquire`/
+            // `restore` always call the Drive API, `release` never does
+            // (issue #1685 — it must work with no credentials at all, since
+            // it's how a lease gets stood down after `drive auth logout`),
+            // and `prune --dry-run` is a pure ledger read that doesn't
+            // either (issue #1743). Like `Permissions`, it resolves its own
+            // client lazily per leaf rather than sharing the eager
+            // resolution below — `helpers::create_client` is passed as a
+            // thunk so a leaf that never needs one never pays for
+            // credential resolution.
+            DriveSubcommands::Lease(cmd) => cmd.execute(helpers::create_client).await,
             command => {
                 let client = helpers::create_client()?;
                 command.dispatch(&client).await
@@ -143,9 +145,9 @@ impl DriveCommand {
 }
 
 impl DriveSubcommands {
-    /// Routes a non-`Auth`/`Account`/`Permissions` subcommand against the
-    /// shared client. Those three arms are unreachable: all are handled
-    /// before client resolution in [`DriveCommand::execute`].
+    /// Routes a non-`Auth`/`Account`/`Permissions`/`Lease` subcommand
+    /// against the shared client. Those four arms are unreachable: all are
+    /// handled before client resolution in [`DriveCommand::execute`].
     async fn dispatch(self, client: &DriveClient) -> Result<()> {
         match self {
             Self::Auth(_) => unreachable!("Auth is dispatched before client resolution"),
@@ -153,13 +155,13 @@ impl DriveSubcommands {
             Self::Permissions(_) => {
                 unreachable!("Permissions is dispatched before client resolution")
             }
+            Self::Lease(_) => unreachable!("Lease is dispatched before client resolution"),
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
             Self::Create(cmd) => cmd.execute(client).await,
             Self::Upload(cmd) => cmd.execute(client).await,
             Self::Edit(cmd) => cmd.execute(client).await,
-            Self::Lease(cmd) => cmd.execute(client).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
             Self::Docs(cmd) => cmd.execute(client).await,
@@ -222,8 +224,7 @@ mod tests {
     }
 
     /// `lease release` must reach the ledger with no credentials configured
-    /// (issue #1685) — it is dispatched ahead of the eager client resolution
-    /// that every other lease leaf goes through.
+    /// (issue #1685) — it never calls the lazily-resolved client at all.
     #[tokio::test]
     async fn execute_lease_release_needs_no_credentials() {
         let guard = crate::drive::test_support::EnvGuard::take();
@@ -241,8 +242,23 @@ mod tests {
         assert_eq!(audit.verdicts(), vec!["release-no-such-token".to_string()]);
     }
 
-    /// The other lease leaves still go through the shared eager resolution,
-    /// so a missing credential is reported before any prompt is spent.
+    /// `lease prune --dry-run` is a pure ledger read and must work with no
+    /// credentials configured (issue #1743), the same way `release` does —
+    /// it never calls the lazily-resolved client either.
+    #[tokio::test]
+    async fn execute_lease_prune_dry_run_needs_no_credentials() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Lease(lease::LeaseCommand::prune_for_test("1h", true)),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    /// `acquire` always needs the Drive API, so it still resolves a client
+    /// lazily on first use and a missing credential is reported then.
     #[tokio::test]
     async fn execute_lease_acquire_still_errors_when_credentials_missing() {
         let guard = crate::drive::test_support::EnvGuard::take();

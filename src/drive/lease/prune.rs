@@ -190,74 +190,99 @@ fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
     keep
 }
 
+/// The ledger-only half of [`prune`]: computes removal candidates by age
+/// and/or size, never touching Drive. Shared by `prune`'s live path and by
+/// [`plan`] (`--dry-run`, issue #1743) so their accounting can never drift
+/// apart — both must treat "this row is a removal candidate" identically.
+///
+/// The ledger lock is held only briefly, not for the whole `prune` call:
+/// just long enough to decide the removal candidates here — `prune` itself
+/// takes it again once per row when it actually removes one (issue #1687
+/// point 4).
+fn compute_removals(opts: &PruneOptions) -> Result<(usize, Vec<LeaseRecord>)> {
+    let now = Utc::now();
+    let _lock = LedgerLock::acquire(&opts.ledger_path)?;
+    let ledger = LeaseLedger::load(&opts.ledger_path)?;
+
+    let (live_count, non_live): (usize, Vec<LeaseRecord>) = {
+        let mut live_count = 0usize;
+        let mut non_live = Vec::new();
+        for rec in ledger.iter() {
+            if rec.is_live(now) {
+                live_count += 1;
+            } else {
+                non_live.push(rec.clone());
+            }
+        }
+        (live_count, non_live)
+    };
+
+    // Age filter: a non-live row survives into the size filter unless
+    // it's strictly past the `--older-than` cutoff (no cutoff means
+    // every non-live row proceeds to the size filter, mirroring
+    // `request_log::prune` with `older_than: None`; a row expiring
+    // exactly at the cutoff survives, mirroring
+    // `request_log::keep_by_age`'s `>=`).
+    let (mut age_survivors, mut removed): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
+        non_live.into_iter().partition(|rec| match opts.older_than {
+            Some(cutoff) => rec.expires_at >= cutoff,
+            None => true,
+        });
+
+    // Size filter, applied only to the `Bytes`-backed age survivors —
+    // a `DriveCopy` contributes zero local bytes and must stay
+    // reachable only through `--older-than`, so it is set aside first
+    // and always kept here regardless of position, never dropped as
+    // collateral damage from an oversized `Bytes` backup sorted ahead
+    // of it in the same budget.
+    if let Some(max) = opts.max_size {
+        let (mut bytes_survivors, copy_survivors): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
+            age_survivors
+                .into_iter()
+                .partition(|rec| matches!(rec.backup, LeaseBackup::Bytes { .. }));
+        bytes_survivors.sort_by_key(|rec| std::cmp::Reverse(rec.expires_at));
+        let refs: Vec<&LeaseRecord> = bytes_survivors.iter().collect();
+        let keep = keep_count_by_size(&refs, max);
+        removed.extend(bytes_survivors.split_off(keep));
+        age_survivors = bytes_survivors;
+        age_survivors.extend(copy_survivors);
+    }
+
+    Ok((live_count + age_survivors.len(), removed))
+}
+
+/// What a [`prune`] run with `opts.dry_run` set would do — the ledger-only
+/// half of `prune`, needing no Drive client at all (issue #1743), so
+/// `drive lease prune --dry-run` works with no credentials configured.
+pub fn plan(opts: &PruneOptions) -> Result<PruneOutcome> {
+    let (kept, removed) = compute_removals(opts)?;
+    let mut outcome = PruneOutcome {
+        kept,
+        ..Default::default()
+    };
+    for rec in &removed {
+        account_removal(&mut outcome, &rec.backup);
+    }
+    Ok(outcome)
+}
+
 /// Prunes the lease ledger at `opts.ledger_path` by age and/or size,
 /// dropping each removed row together with the backup it points at.
 ///
 /// The ledger lock is held only briefly, not for this whole call: once to
-/// decide the removal candidates (below), then once per row, held across
-/// both that row's backup deletion *and* its ledger removal (issue #1687
-/// point 4 — the lock is taken before the backup is touched, so a
-/// collision leaves the row and its backup both untouched rather than
-/// stranding one without the other) — rather than one continuous lock for
-/// a potentially long batch of sequential Drive `trash` calls. Nothing
-/// else in this codebase ever removes a ledger row, so re-removing a
-/// candidate's token by name from whatever the ledger looks like at that
-/// later moment is always safe, even if a concurrent `acquire`/`restore`
-/// changed unrelated rows in the gap between the snapshot and this row's
-/// own turn.
+/// decide the removal candidates (via [`compute_removals`]), then once per
+/// row, held across both that row's backup deletion *and* its ledger
+/// removal (issue #1687 point 4 — the lock is taken before the backup is
+/// touched, so a collision leaves the row and its backup both untouched
+/// rather than stranding one without the other) — rather than one
+/// continuous lock for a potentially long batch of sequential Drive
+/// `trash` calls. Nothing else in this codebase ever removes a ledger row,
+/// so re-removing a candidate's token by name from whatever the ledger
+/// looks like at that later moment is always safe, even if a concurrent
+/// `acquire`/`restore` changed unrelated rows in the gap between the
+/// snapshot and this row's own turn.
 pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOutcome> {
-    let now = Utc::now();
-
-    let (kept_after_filters, removed) = {
-        let _lock = LedgerLock::acquire(&opts.ledger_path)?;
-        let ledger = LeaseLedger::load(&opts.ledger_path)?;
-
-        let (live_count, non_live): (usize, Vec<LeaseRecord>) = {
-            let mut live_count = 0usize;
-            let mut non_live = Vec::new();
-            for rec in ledger.iter() {
-                if rec.is_live(now) {
-                    live_count += 1;
-                } else {
-                    non_live.push(rec.clone());
-                }
-            }
-            (live_count, non_live)
-        };
-
-        // Age filter: a non-live row survives into the size filter unless
-        // it's strictly past the `--older-than` cutoff (no cutoff means
-        // every non-live row proceeds to the size filter, mirroring
-        // `request_log::prune` with `older_than: None`; a row expiring
-        // exactly at the cutoff survives, mirroring
-        // `request_log::keep_by_age`'s `>=`).
-        let (mut age_survivors, mut removed): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
-            non_live.into_iter().partition(|rec| match opts.older_than {
-                Some(cutoff) => rec.expires_at >= cutoff,
-                None => true,
-            });
-
-        // Size filter, applied only to the `Bytes`-backed age survivors —
-        // a `DriveCopy` contributes zero local bytes and must stay
-        // reachable only through `--older-than`, so it is set aside first
-        // and always kept here regardless of position, never dropped as
-        // collateral damage from an oversized `Bytes` backup sorted ahead
-        // of it in the same budget.
-        if let Some(max) = opts.max_size {
-            let (mut bytes_survivors, copy_survivors): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
-                age_survivors
-                    .into_iter()
-                    .partition(|rec| matches!(rec.backup, LeaseBackup::Bytes { .. }));
-            bytes_survivors.sort_by_key(|rec| std::cmp::Reverse(rec.expires_at));
-            let refs: Vec<&LeaseRecord> = bytes_survivors.iter().collect();
-            let keep = keep_count_by_size(&refs, max);
-            removed.extend(bytes_survivors.split_off(keep));
-            age_survivors = bytes_survivors;
-            age_survivors.extend(copy_survivors);
-        }
-
-        (live_count + age_survivors.len(), removed)
-    };
+    let (kept_after_filters, removed) = compute_removals(opts)?;
 
     let mut outcome = PruneOutcome {
         kept: kept_after_filters,
@@ -1123,6 +1148,41 @@ mod tests {
         assert!(backup_path.exists(), "dry-run must not delete the backup");
         let after = std::fs::read(&ledger_path).unwrap();
         assert_eq!(before, after, "dry-run must not modify the ledger");
+    }
+
+    #[test]
+    fn plan_matches_prune_dry_run_outcome_without_a_client() {
+        // `plan` is the ledger-only half of `prune`'s dry-run branch
+        // (issue #1743) — it must agree with `prune(..., dry_run: true)`
+        // exactly, and it must do so without ever constructing a
+        // `DriveClient`, unlike every test above.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let backup_path = dir.path().join("backup");
+        std::fs::write(&backup_path, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let opts = PruneOptions {
+            older_than: Some(Utc::now()),
+            max_size: None,
+            dry_run: true,
+            ledger_path: ledger_path.clone(),
+        };
+        let outcome = plan(&opts).unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.kept, 0);
+        assert_eq!(outcome.bytes_freed, 1);
+        assert!(backup_path.exists(), "plan must not delete the backup");
     }
 
     #[tokio::test]
