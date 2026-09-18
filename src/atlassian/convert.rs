@@ -132,6 +132,32 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
+    /// Collects the indented sub-content lines of the current list item.
+    ///
+    /// Only lines indented at least two spaces deeper than the item's own
+    /// marker belong to the item — a line at the marker's indent is a
+    /// sibling item of the same list and must be left for the enclosing
+    /// item loop.  Stripping only the two spaces that exceed the parent
+    /// marker preserves the relative indentation for the nested parser.
+    fn collect_item_sub_lines(&mut self, marker_indent: usize) -> Vec<String> {
+        let mut sub_lines: Vec<String> = Vec::new();
+        while !self.at_end() {
+            let next = self.current_line();
+            let next_indent = next.len() - next.trim_start().len();
+            if next_indent < marker_indent + 2 {
+                break;
+            }
+            match next.strip_prefix("  ") {
+                Some(stripped) => sub_lines.push(stripped.to_string()),
+                // The indent is not plain leading spaces (e.g. a tab) —
+                // leave the line for the enclosing loop.
+                None => break,
+            }
+            self.advance();
+        }
+        sub_lines
+    }
+
     fn parse_blocks(&mut self) -> Result<Vec<AdfNode>> {
         if self.depth > MAX_NESTING_DEPTH {
             bail!(
@@ -320,7 +346,6 @@ impl<'a> MarkdownParser<'a> {
     fn parse_bullet_list(&mut self) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
         let mut is_task_list = false;
-
         while !self.at_end() {
             let line = self.current_line();
             let trimmed = line.trim_start();
@@ -331,7 +356,6 @@ impl<'a> MarkdownParser<'a> {
             {
                 break;
             }
-
             let after_marker = trimmed[2..].trim_start();
 
             // Detect task list items: - [ ] or - [x]
@@ -367,12 +391,8 @@ impl<'a> MarkdownParser<'a> {
                 // Collect indented sub-content (e.g. nested task lists
                 // from malformed ADF where taskItem contains taskItem
                 // children directly — issue #489).
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() && self.current_line().starts_with("  ") {
-                    let stripped = &self.current_line()[2..];
-                    sub_lines.push(stripped.to_string());
-                    self.advance();
-                }
+                let marker_indent = line.len() - trimmed.len();
+                let sub_lines = self.collect_item_sub_lines(marker_indent);
                 if !sub_lines.is_empty() {
                     let sub_text = sub_lines.join("\n");
                     let mut nested =
@@ -430,17 +450,10 @@ impl<'a> MarkdownParser<'a> {
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
                 // Collect indented sub-content lines (2-space prefix).
                 // This captures both nested lists and continuation
-                // paragraphs that belong to the same list item.
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() {
-                    let next = self.current_line();
-                    if let Some(stripped) = next.strip_prefix("  ") {
-                        sub_lines.push(stripped.to_string());
-                        self.advance();
-                        continue;
-                    }
-                    break;
-                }
+                // paragraphs that belong to the same list item, stopping
+                // at same-indent sibling items.
+                let marker_indent = line.len() - trimmed.len();
+                let sub_lines = self.collect_item_sub_lines(marker_indent);
                 let item_content = parse_list_item_first_line(
                     item_text,
                     sub_lines,
@@ -463,7 +476,6 @@ impl<'a> MarkdownParser<'a> {
 
     fn parse_ordered_list(&mut self, start: u32) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
-
         while !self.at_end() {
             let line = self.current_line();
             let trimmed = line.trim_start();
@@ -474,17 +486,10 @@ impl<'a> MarkdownParser<'a> {
                 let mut full_text = first_line.to_string();
                 self.collect_hardbreak_continuations(&mut full_text);
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
-                // Collect indented sub-content lines (2-space prefix).
-                let mut sub_lines: Vec<String> = Vec::new();
-                while !self.at_end() {
-                    let next = self.current_line();
-                    if let Some(stripped) = next.strip_prefix("  ") {
-                        sub_lines.push(stripped.to_string());
-                        self.advance();
-                        continue;
-                    }
-                    break;
-                }
+                // Collect indented sub-content lines (2-space prefix),
+                // stopping at same-indent sibling items.
+                let marker_indent = line.len() - trimmed.len();
+                let sub_lines = self.collect_item_sub_lines(marker_indent);
                 let item_content = parse_list_item_first_line(
                     item_text,
                     sub_lines,
@@ -5379,6 +5384,140 @@ mod tests {
         assert_eq!(doc.content[0].node_type, "orderedList");
         let items = doc.content[0].content.as_ref().unwrap();
         assert_eq!(items.len(), 3);
+    }
+
+    /// Returns the text of a list item's first paragraph.
+    fn item_text(item: &AdfNode) -> &str {
+        item.content.as_ref().unwrap()[0].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Regression: a sibling item of a nested list (same indent as the
+    /// preceding nested item) must stay a sibling instead of becoming a
+    /// child of the preceding item, which rendered as a "staircase" in
+    /// Jira (first sub-item letters, the rest roman numerals).
+    #[test]
+    fn nested_ordered_list_sibling_stays_sibling() {
+        let md = "1. Родитель:\n    1. Пункт А\n    2. Пункт Б\n2. Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        // First item: paragraph plus one nested orderedList with two
+        // sibling items.
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].node_type, "paragraph");
+        assert_eq!(first[1].node_type, "orderedList");
+        // A start-at-1 nested list carries no `order` attr.
+        assert!(first[1].attrs.is_none());
+        let nested_items = first[1].content.as_ref().unwrap();
+        assert_eq!(nested_items.len(), 2);
+        assert_eq!(item_text(&nested_items[0]), "Пункт А");
+        assert_eq!(item_text(&nested_items[1]), "Пункт Б");
+        // The sibling line was not swallowed as sub-content of «Пункт А»:
+        // the second top-level item is a plain single-paragraph listItem.
+        let second = outer[1].content.as_ref().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    #[test]
+    fn nested_unordered_list_sibling_stays_sibling() {
+        let md = "- Родитель:\n    - Пункт А\n    - Пункт Б\n- Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].node_type, "bulletList");
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    #[test]
+    fn mixed_nested_list_sibling_stays_sibling() {
+        // Ordered outer, unordered inner.
+        let md = "1. Родитель:\n    - Пункт А\n    - Пункт Б\n2. Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first[1].node_type, "bulletList");
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+
+        // Unordered outer, ordered inner.
+        let md = "- Родитель:\n    1. Пункт А\n    2. Пункт Б\n- Следующий пункт";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first[1].node_type, "orderedList");
+        assert!(first[1].attrs.is_none());
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&outer[1]), "Следующий пункт");
+    }
+
+    /// Top-level numbering continues after the nested block: following
+    /// items stay at the outer level with their own numbers.
+    #[test]
+    fn top_level_numbering_continues_after_nested_block() {
+        let md = "1. Первый\n    1. Вложенный\n    2. Тоже вложенный\n2. Второй\n3. Третий";
+        let doc = markdown_to_adf(md).unwrap();
+        let list = &doc.content[0];
+        assert!(list.attrs.is_none());
+        let outer = list.content.as_ref().unwrap();
+        assert_eq!(outer.len(), 3);
+        assert_eq!(item_text(&outer[1]), "Второй");
+        assert_eq!(item_text(&outer[2]), "Третий");
+        // Each trailing item is a plain single-paragraph listItem.
+        for item in &outer[1..] {
+            assert_eq!(item.content.as_ref().unwrap().len(), 1);
+        }
+    }
+
+    /// Sibling detection works at any nesting depth: the deepest level
+    /// keeps its two items as siblings inside one list.
+    #[test]
+    fn nested_list_three_levels_sibling_stays_sibling() {
+        let md = "1. L1\n    1. L2a\n        1. L3a\n        2. L3b\n    2. L2b\n2. L1b";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        // Level 2.
+        let l1 = outer[0].content.as_ref().unwrap();
+        assert_eq!(l1.len(), 2);
+        let level2 = l1[1].content.as_ref().unwrap();
+        assert_eq!(level2.len(), 2);
+        assert_eq!(item_text(&level2[0]), "L2a");
+        assert_eq!(item_text(&level2[1]), "L2b");
+        // Level 3: two siblings under L2a.
+        let l2a = level2[0].content.as_ref().unwrap();
+        assert_eq!(l2a.len(), 2);
+        let level3 = l2a[1].content.as_ref().unwrap();
+        assert_eq!(level3.len(), 2);
+        assert_eq!(item_text(&level3[0]), "L3a");
+        assert_eq!(item_text(&level3[1]), "L3b");
+        // L2b and L1b stay plain single-paragraph listItems.
+        assert_eq!(level2[1].content.as_ref().unwrap().len(), 1);
+        assert_eq!(outer[1].content.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nested_task_list_sibling_stays_sibling() {
+        let md = "- [ ] Родитель\n    - [ ] Подзадача А\n    - [ ] Подзадача Б";
+        let doc = markdown_to_adf(md).unwrap();
+        let items = doc.content[0].content.as_ref().unwrap();
+        // The indented taskList becomes a sibling of the parent taskItem
+        // (issue #506) and keeps both sub-items as siblings.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].node_type, "taskList");
+        let sub_items = items[1].content.as_ref().unwrap();
+        assert_eq!(sub_items.len(), 2);
+        assert_eq!(sub_items[0].node_type, "taskItem");
+        assert_eq!(sub_items[1].node_type, "taskItem");
     }
 
     #[test]
