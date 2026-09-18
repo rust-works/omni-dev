@@ -773,6 +773,16 @@ mod tests {
         }
     }
 
+    /// An [`Authenticator`] that panics if ever called, carrying its own
+    /// panic message — for tests asserting that a refusal short-circuits
+    /// before any authentication prompt is issued.
+    struct PanicsIfCalled(&'static str);
+    impl Authenticator for PanicsIfCalled {
+        fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+            panic!("{}", self.0);
+        }
+    }
+
     /// Builds options rooted at `dir` (a `tempdir`), so a test never
     /// touches the real backup directory or the real lease ledger.
     fn opts(dir: &Path) -> AcquireOptions {
@@ -901,14 +911,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate when metadata lookup already failed");
-            }
-        }
-
-        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &PanicsIfCalled("must not authenticate when metadata lookup already failed"),
+        )
+        .await;
         assert!(matches!(result, AcquireResult::Failed { .. }));
     }
 
@@ -1110,14 +1118,12 @@ mod tests {
         // An authenticator that panics if called at all — proves the
         // native-document refusal happens before authentication, per the
         // module doc ("mirroring drive edit's identical refusal").
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate for a Google-native document");
-            }
-        }
-
-        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &PanicsIfCalled("must not authenticate for a Google-native document"),
+        )
+        .await;
         assert!(matches!(result, AcquireResult::RefusedNativeDocument));
     }
 
@@ -1137,14 +1143,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate without a version to lease against");
-            }
-        }
-
-        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &PanicsIfCalled("must not authenticate without a version to lease against"),
+        )
+        .await;
         assert!(matches!(result, AcquireResult::Failed { .. }));
     }
 
@@ -1516,14 +1520,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate with no backup folder configured");
-            }
-        }
-
-        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &PanicsIfCalled("must not authenticate with no backup folder configured"),
+        )
+        .await;
 
         assert!(matches!(result, AcquireResult::RefusedNativeDocument));
 
@@ -1551,14 +1553,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate with no backup folder configured");
-            }
-        }
-
-        let result = acquire(&client, &opts(root.path()), &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &PanicsIfCalled("must not authenticate with no backup folder configured"),
+        )
+        .await;
         assert!(matches!(result, AcquireResult::RefusedNativeDocument));
     }
 
@@ -1576,14 +1576,12 @@ mod tests {
         let mut test_opts = opts(root.path());
         test_opts.expiry = ChronoDuration::minutes(0);
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate with an out-of-range expiry");
-            }
-        }
-
-        let result = acquire(&client, &test_opts, &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &test_opts,
+            &PanicsIfCalled("must not authenticate with an out-of-range expiry"),
+        )
+        .await;
         let AcquireResult::Failed { detail } = result else {
             panic!("expected Failed, got {result:?}");
         };
@@ -1599,14 +1597,12 @@ mod tests {
         let mut test_opts = opts(root.path());
         test_opts.expiry = ChronoDuration::minutes(MAX_EXPIRY_MINUTES + 1);
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!("must not authenticate with an out-of-range expiry");
-            }
-        }
-
-        let result = acquire(&client, &test_opts, &PanicsIfCalled).await;
+        let result = acquire(
+            &client,
+            &test_opts,
+            &PanicsIfCalled("must not authenticate with an out-of-range expiry"),
+        )
+        .await;
         let AcquireResult::Failed { detail } = result else {
             panic!("expected Failed, got {result:?}");
         };
@@ -1665,17 +1661,15 @@ mod tests {
         let mut second_opts = test_opts.clone();
         second_opts.backup_dir = root.path().join("backups2");
 
-        struct PanicsIfCalled;
-        impl Authenticator for PanicsIfCalled {
-            fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-                panic!(
-                    "must not authenticate: the lock-free pre-check must refuse a second \
-                     live lease before spending a prompt"
-                );
-            }
-        }
-
-        let second = acquire(&client, &second_opts, &PanicsIfCalled).await;
+        let second = acquire(
+            &client,
+            &second_opts,
+            &PanicsIfCalled(
+                "must not authenticate: the lock-free pre-check must refuse a second live \
+                 lease before spending a prompt",
+            ),
+        )
+        .await;
         let AcquireResult::AlreadyLeased { token, .. } = second else {
             panic!("expected AlreadyLeased, got {second:?}");
         };
