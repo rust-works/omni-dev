@@ -162,13 +162,22 @@ async fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
 /// `--query 'file_id:<id>'` over the audit log sees a presented-but-dead
 /// token too; only an unknown token has no file to name, and then the token
 /// itself is all an auditor has to go on.
+///
+/// A `Failed` release (typically a lock wait that timed out) never read the
+/// ledger under the lock, so its file is looked up here by a lock-free read
+/// instead (issue #1738) — safe because [`LeaseLedger::save`] replaces the
+/// file atomically, and a guess is all it is: an unreadable ledger or a
+/// token it doesn't hold leaves `file_id` empty, as before.
 fn record_attempt(opts: &ReleaseOptions, result: &ReleaseResult) {
     let (file_id, error) = match result {
         ReleaseResult::Released { file_id, .. } | ReleaseResult::NotLive { file_id, .. } => {
             (file_id.clone(), None)
         }
         ReleaseResult::NoSuchToken => (String::new(), None),
-        ReleaseResult::Failed { detail } => (String::new(), Some(detail.clone())),
+        ReleaseResult::Failed { detail } => (
+            file_id_for_token(&opts.ledger_path, &opts.token).unwrap_or_default(),
+            Some(detail.clone()),
+        ),
     };
     let outcome = crate::request_log::AuditOutcome {
         command: vec!["drive".to_string(), "lease-release".to_string()],
@@ -185,6 +194,15 @@ fn record_attempt(opts: &ReleaseOptions, result: &ReleaseResult) {
     if let Err(err) = crate::request_log::record_audit_event(outcome) {
         tracing::warn!("drive lease release: failed to write audit record: {err}");
     }
+}
+
+/// The file `token`'s row covers, read without the ledger lock — see
+/// [`record_attempt`].
+fn file_id_for_token(ledger_path: &std::path::Path, token: &str) -> Option<String> {
+    LeaseLedger::load(ledger_path)
+        .ok()?
+        .get(token)
+        .map(|record| record.file_id.clone())
 }
 
 #[cfg(test)]
@@ -375,6 +393,37 @@ mod tests {
         assert!(
             matches!(result, ReleaseResult::Released { .. }),
             "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_release_audits_the_file_its_token_covers() {
+        // Issue #1738: the lock wait timed out, so the release never read
+        // the ledger under the lock — but the audit record must still name
+        // the file, or a `file_id:` query misses the attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "live-token");
+        seed(
+            &test_opts.ledger_path,
+            "live-token",
+            Utc::now() + ChronoDuration::minutes(30),
+            None,
+        );
+
+        record_attempt(
+            &test_opts,
+            &ReleaseResult::Failed {
+                detail: "timed out".to_string(),
+            },
+        );
+
+        let records = audit.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].context.get("file_id").map(String::as_str),
+            Some("file-1"),
+            "{records:?}"
         );
     }
 
