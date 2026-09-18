@@ -3102,6 +3102,29 @@ mod tests {
     }
 
     #[test]
+    fn the_audit_write_path_never_gates_on_log_disable() {
+        // The exemption test above pins `record_audit_with`, the injected-env
+        // test seam — never the ambient `record_audit`/`record_audit_to` that
+        // production actually calls. This closes that gap by grepping their
+        // real source: a regression that added `if disabled() { return Ok(()) }`
+        // to either, mirroring `record`'s own pattern, would fail here even
+        // though it slips past the env-injected test above.
+        let source = include_str!("request_log.rs");
+        let start = source
+            .find("pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {")
+            .expect("record_audit signature not found");
+        let end = source[start..]
+            .find("/// Serializes `entry` and appends it to `path` via `append`,")
+            .expect("append_record_to doc comment not found")
+            + start;
+        let audit_write_path = &source[start..end];
+        assert!(
+            !audit_write_path.contains("disabled"),
+            "the fail-closed audit sink must never gate on OMNI_DEV_LOG_DISABLE:\n{audit_write_path}"
+        );
+    }
+
+    #[test]
     fn try_record_refuses_an_audit_kind_entry() {
         let rec = LogRecord {
             kind: RecordKind::Audit,
