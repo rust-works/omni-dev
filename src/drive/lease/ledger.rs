@@ -560,9 +560,10 @@ impl LedgerLock {
     /// busy lock just leaves a row for a future prune. Everything whose
     /// failure would waste work or strand a user — a leased write,
     /// `acquire`'s insert, `release` — waits instead, via
-    /// [`Self::acquire_waiting`] or [`Self::acquire_waiting_blocking`];
-    /// `restore`'s restored-from stamp needs no lock of its own, since it
-    /// runs under the grant's (issue #1737).
+    /// [`Self::acquire_waiting`] or
+    /// [`Self::acquire_waiting_blocking_with_timeout`]; `restore`'s
+    /// restored-from stamp needs no lock of its own, since it runs under
+    /// the grant's (issue #1737).
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
@@ -635,22 +636,18 @@ impl LedgerLock {
         }
     }
 
-    /// [`Self::acquire_waiting`]'s synchronous twin, for a ledger mutation
-    /// that runs outside an `async fn` — `drive lease acquire`'s insert
-    /// (issue #1738). Same wait budget,
-    /// same backoff, same notice ([`LockWait`]); it only sleeps the thread
-    /// instead of yielding.
+    /// [`Self::acquire_waiting_with_timeout`]'s synchronous twin, for a
+    /// ledger mutation that runs outside an `async fn` — `drive lease
+    /// acquire`'s insert (issue #1738). Same backoff, same notice
+    /// ([`LockWait`]); it only sleeps the thread instead of yielding. Takes
+    /// its budget explicitly because its one caller threads it down from
+    /// `acquire`'s own test seam; production passes
+    /// [`default_lock_wait_timeout`].
     ///
     /// **The caller must already be on a thread where blocking is
     /// acceptable**: inside a `block_in_place` region, a `spawn_blocking`
     /// task, or outside any runtime. Called bare from an async task, it
     /// would stall that worker for the whole wait.
-    pub(crate) fn acquire_waiting_blocking(ledger_path: &Path) -> Result<Self> {
-        Self::acquire_waiting_blocking_with_timeout(ledger_path, default_lock_wait_timeout())
-    }
-
-    /// [`Self::acquire_waiting_blocking`] with an explicit wait budget —
-    /// the same test seam as [`Self::acquire_waiting_with_timeout`].
     pub(crate) fn acquire_waiting_blocking_with_timeout(
         ledger_path: &Path,
         max_wait: Duration,
