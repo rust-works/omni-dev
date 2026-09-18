@@ -56,13 +56,8 @@ pub struct ProtectRangeCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -83,7 +78,7 @@ impl ProtectRangeCommand {
                 editors: self.editors,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_protection(client, &opts, &self.output).await
@@ -138,13 +133,8 @@ pub struct UpdateProtectionCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -166,7 +156,7 @@ impl UpdateProtectionCommand {
                 remove_editors: self.remove_editors,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_protection(client, &opts, &self.output).await
@@ -203,13 +193,8 @@ pub struct UnprotectRangeCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -227,7 +212,7 @@ impl UnprotectRangeCommand {
                 whole_sheet: self.whole_sheet,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_protection(client, &opts, &self.output).await

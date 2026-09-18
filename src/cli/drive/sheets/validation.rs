@@ -64,13 +64,8 @@ pub struct SetDataValidationCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -100,7 +95,7 @@ impl SetDataValidationCommand {
                 show_warning: self.show_warning,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_validation(client, &opts, &self.output).await
@@ -127,13 +122,8 @@ pub struct ClearDataValidationCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -150,7 +140,7 @@ impl ClearDataValidationCommand {
                 range: self.range,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_validation(client, &opts, &self.output).await
@@ -208,7 +198,7 @@ mod tests {
             input_message: None,
             show_warning: false,
             dry_run: false,
-            lease: None,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
             output: crate::cli::drive::format::OutputFormat::Table,
         }
     }

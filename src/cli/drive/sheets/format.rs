@@ -229,13 +229,8 @@ pub struct FormatCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -276,7 +271,7 @@ impl FormatCellsCommand {
                 format,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
@@ -326,13 +321,8 @@ pub struct UpdateBordersCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -366,7 +356,7 @@ impl UpdateBordersCommand {
                 color: self.color,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
@@ -398,13 +388,8 @@ pub struct MergeCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -422,7 +407,7 @@ impl MergeCellsCommand {
                 merge_type: self.r#type.wire().to_string(),
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
@@ -448,13 +433,8 @@ pub struct UnmergeCellsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -471,7 +451,7 @@ impl UnmergeCellsCommand {
                 range: self.range,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
@@ -505,13 +485,8 @@ pub struct AutoResizeDimensionCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -530,7 +505,7 @@ impl AutoResizeDimensionCommand {
                 end: self.end,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await
@@ -568,13 +543,8 @@ pub struct UpdateDimensionPropertiesCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -594,7 +564,7 @@ impl UpdateDimensionPropertiesCommand {
                 pixel_size: self.pixel_size,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_format(client, &opts, &self.output).await

@@ -54,13 +54,8 @@ pub struct AddSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -86,13 +81,8 @@ pub struct RenameSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -123,13 +113,8 @@ pub struct InsertRowsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -159,13 +144,8 @@ pub struct InsertColumnsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -196,13 +176,8 @@ pub struct DeleteSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -236,13 +211,8 @@ pub struct DeleteRowsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -275,13 +245,8 @@ pub struct DeleteColumnsCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -352,13 +317,8 @@ pub struct DeleteRangeCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -393,13 +353,8 @@ pub struct DuplicateSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -425,13 +380,8 @@ pub struct ReorderSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -453,13 +403,8 @@ pub struct HideSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -481,13 +426,8 @@ pub struct ShowSheetCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -506,7 +446,7 @@ impl AddSheetCommand {
                 columns: self.columns,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -523,7 +463,7 @@ impl RenameSheetCommand {
                 new_title: self.title,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -541,7 +481,7 @@ impl InsertRowsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -559,7 +499,7 @@ impl InsertColumnsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -573,7 +513,7 @@ impl DeleteSheetCommand {
             spreadsheet_id: self.spreadsheet_id,
             verb: StructureVerb::DeleteSheet { sheet: self.sheet },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -591,7 +531,7 @@ impl DeleteRowsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -609,7 +549,7 @@ impl DeleteColumnsCommand {
                 count: self.count,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -630,7 +570,7 @@ impl DeleteRangeCommand {
                 shift: self.shift.into(),
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -648,7 +588,7 @@ impl DuplicateSheetCommand {
                 index: self.index,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -665,7 +605,7 @@ impl ReorderSheetCommand {
                 index: self.index,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -682,7 +622,7 @@ impl HideSheetCommand {
                 hidden: true,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await
@@ -699,7 +639,7 @@ impl ShowSheetCommand {
                 hidden: false,
             },
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_structure(client, &opts, &self.output).await

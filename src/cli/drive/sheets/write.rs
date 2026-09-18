@@ -75,13 +75,8 @@ pub struct WriteCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -120,13 +115,8 @@ pub struct AppendCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -152,13 +142,8 @@ pub struct ClearCommand {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// The lease token from `drive lease acquire`, required unless the
-    /// deciding write-permission rule sets `require_lease: false` — a
-    /// token presented anyway is still validated and consumed
-    /// ([ADR-0080](../../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
-    /// needed with `--dry-run`.
-    #[arg(long, value_name = "TOKEN")]
-    pub lease: Option<String>,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
@@ -177,7 +162,7 @@ impl WriteCommand {
             values,
             input: self.input.into(),
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
@@ -196,7 +181,7 @@ impl AppendCommand {
             values,
             input: self.input.into(),
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
@@ -214,7 +199,7 @@ impl ClearCommand {
             values: Vec::new(),
             input: ValueInputOption::default(),
             dry_run: self.dry_run,
-            lease_token: self.lease,
+            lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
         };
         run_write(client, &opts, &self.output).await
@@ -545,7 +530,7 @@ mod tests {
             values_format: ValuesFormat::Auto,
             input: InputArg::UserEntered,
             dry_run: false,
-            lease,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease },
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();
@@ -598,7 +583,7 @@ mod tests {
             values_format: ValuesFormat::Auto,
             input: InputArg::UserEntered,
             dry_run: false,
-            lease,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease },
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();
@@ -644,7 +629,7 @@ mod tests {
             range: Some("A1:B2".to_string()),
             sheet: None,
             dry_run: false,
-            lease,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease },
             output: OutputFormat::Table,
         };
         cmd.execute(&client).await.unwrap();

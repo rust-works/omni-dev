@@ -1,12 +1,27 @@
 //! Shared helpers for Drive CLI commands.
 
 use anyhow::Result;
+use clap::Parser;
 
 use crate::drive::account::ResolvedAccount;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
 use crate::drive::write_gate::FolderPermissionRule;
 use crate::utils::settings::{DriveAccountSettings, Settings};
+
+/// The `--lease` flag, flattened into every Drive write command that needs
+/// a lease token (ADR-0080 §1/§9/§13) — previously each of the seven
+/// reimplemented the identical arg and doc comment by hand.
+#[derive(Parser)]
+pub struct LeaseTokenArg {
+    /// The lease token from `drive lease acquire`, required unless the
+    /// deciding write-permission rule sets `require_lease: false` — a
+    /// token presented anyway is still validated and consumed
+    /// ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never
+    /// needed with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    pub lease: Option<String>,
+}
 
 /// Creates an authenticated Drive API client from environment/settings-resolved credentials.
 pub fn create_client() -> Result<DriveClient> {
