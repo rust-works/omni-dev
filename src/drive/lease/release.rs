@@ -65,6 +65,8 @@ pub enum ReleaseResult {
     NotLive {
         /// The token looked up.
         token: String,
+        /// The file it covers.
+        file_id: String,
         /// Its expiry, whether or not that is what ended it.
         expires_at: DateTime<Utc>,
         /// When an earlier release ended it, if that is what did.
@@ -129,10 +131,12 @@ fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
             expires_at,
         },
         Ok(ReleaseOutcome::NotLive {
+            file_id,
             expires_at,
             released_at,
         }) => ReleaseResult::NotLive {
             token: opts.token.clone(),
+            file_id,
             expires_at,
             released_at,
         },
@@ -145,13 +149,16 @@ fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
 
 /// Builds and writes the `kind: "audit"` record for one release attempt.
 ///
-/// `file_id` is only known when a row was actually found and released — the
-/// refusals below carry the token instead, which is all an auditor needs to
-/// join this record to the acquire that minted it.
+/// `file_id` is carried whenever a row was found, released or not, so a
+/// `--query 'file_id:<id>'` over the audit log sees a presented-but-dead
+/// token too; only an unknown token has no file to name, and then the token
+/// itself is all an auditor has to go on.
 fn record_attempt(opts: &ReleaseOptions, result: &ReleaseResult) {
     let (file_id, error) = match result {
-        ReleaseResult::Released { file_id, .. } => (file_id.clone(), None),
-        ReleaseResult::NotLive { .. } | ReleaseResult::NoSuchToken => (String::new(), None),
+        ReleaseResult::Released { file_id, .. } | ReleaseResult::NotLive { file_id, .. } => {
+            (file_id.clone(), None)
+        }
+        ReleaseResult::NoSuchToken => (String::new(), None),
         ReleaseResult::Failed { detail } => (String::new(), Some(detail.clone())),
     };
     let outcome = crate::request_log::AuditOutcome {
@@ -272,7 +279,7 @@ mod tests {
     #[test]
     fn an_expired_lease_is_reported_as_not_live_without_being_stamped() {
         let dir = tempfile::tempdir().unwrap();
-        let _audit = AuditLogGuard::redirect(dir.path());
+        let audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "expired-token");
         seed(
             &test_opts.ledger_path,
@@ -294,6 +301,18 @@ mod tests {
         assert!(
             ledger.get("expired-token").unwrap().released_at.is_none(),
             "expiry already ended this lease; release must not claim credit for it"
+        );
+        // The row was found, so its file is named even though nothing
+        // changed — a `file_id:` query over the audit log must see this
+        // attempt too.
+        let record = audit.records().pop().unwrap();
+        assert_eq!(
+            record.context.get("verdict").map(String::as_str),
+            Some("release-not-live")
+        );
+        assert_eq!(
+            record.context.get("file_id").map(String::as_str),
+            Some("file-1")
         );
     }
 

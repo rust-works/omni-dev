@@ -123,6 +123,17 @@ impl DriveCommand {
             // API) — like Auth, it resolves its own client lazily per leaf
             // rather than sharing the single eager resolution below.
             DriveSubcommands::Permissions(cmd) => cmd.execute().await,
+            // `lease release` is a pure ledger mutation (issue #1685) and
+            // must work with no credentials at all — it is how a lease gets
+            // stood down after `drive auth logout`. Its siblings take the
+            // shared eager resolution below.
+            DriveSubcommands::Lease(cmd) => match cmd.into_release() {
+                Ok(release) => release.execute(),
+                Err(cmd) => {
+                    let client = helpers::create_client()?;
+                    cmd.execute(&client).await
+                }
+            },
             command => {
                 let client = helpers::create_client()?;
                 command.dispatch(&client).await
@@ -208,6 +219,43 @@ mod tests {
         };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    /// `lease release` must reach the ledger with no credentials configured
+    /// (issue #1685) — it is dispatched ahead of the eager client resolution
+    /// that every other lease leaf goes through.
+    #[tokio::test]
+    async fn execute_lease_release_needs_no_credentials() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Lease(lease::LeaseCommand::release_for_test(
+                "no-such-token".to_string(),
+            )),
+        };
+        cmd.execute().await.unwrap();
+
+        assert_eq!(audit.verdicts(), vec!["release-no-such-token".to_string()]);
+    }
+
+    /// The other lease leaves still go through the shared eager resolution,
+    /// so a missing credential is reported before any prompt is spent.
+    #[tokio::test]
+    async fn execute_lease_acquire_still_errors_when_credentials_missing() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveCommand {
+            account: None,
+            command: DriveSubcommands::Lease(lease::LeaseCommand::acquire_for_test(
+                "file-1".to_string(),
+            )),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
     }
 
     #[tokio::test]

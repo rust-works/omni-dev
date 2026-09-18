@@ -1289,7 +1289,8 @@ no Drive call**: releasing only ever *reduces* what a token can do, so
 spending a Touch ID prompt to give up authority would be backwards (and
 would leave a headless installation unable to stand a lease down at all).
 It is a pure ledger mutation, and the one `drive lease` verb that needs no
-Drive client.
+Drive client — it is dispatched before credentials are even resolved, so it
+works after `drive auth logout` or for an `--account` with none configured.
 
 **The backup is kept.** Release ends the lease's authority to write, not its
 usefulness: `drive lease restore <TOKEN>` looks a row up by token and never

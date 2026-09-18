@@ -65,14 +65,58 @@ enum LeaseAction {
 }
 
 impl LeaseCommand {
+    /// Splits off `release`, the one lease verb that touches only the
+    /// ledger, so `DriveCommand::execute` can run it *before* resolving a
+    /// Drive client — otherwise a logged-out account (or `--account` naming
+    /// one with no credentials) fails on `CredentialsNotFound` before the
+    /// ledger is ever read, leaving a lease nobody can stand down and no
+    /// audit record of the attempt. Every other leaf needs the client, so it
+    /// is handed back for the shared eager resolution.
+    pub fn into_release(self) -> std::result::Result<ReleaseCommand, Self> {
+        match self.action {
+            LeaseAction::Release(cmd) => Ok(cmd),
+            action => Err(Self { action }),
+        }
+    }
+
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         match self.action {
             LeaseAction::Acquire(cmd) => cmd.execute(client).await,
             LeaseAction::Restore(cmd) => cmd.execute(client).await,
-            // The one lease verb that makes no Drive call at all, so the
-            // resolved client is not threaded into it.
+            // Reachable only by a caller that resolved a client it did not
+            // need — `DriveCommand::execute` peels this off via
+            // [`Self::into_release`] first.
             LeaseAction::Release(cmd) => cmd.execute(),
             LeaseAction::Prune(cmd) => cmd.execute(client).await,
+        }
+    }
+}
+
+/// Constructors for `crate::cli::drive`'s dispatch tests, which cannot name
+/// the private `LeaseAction` from outside this module.
+#[cfg(test)]
+impl LeaseCommand {
+    pub(crate) fn release_for_test(token: String) -> Self {
+        Self {
+            action: LeaseAction::Release(ReleaseCommand {
+                token,
+                output: OutputFormat::Table,
+            }),
+        }
+    }
+
+    pub(crate) fn acquire_for_test(file_id: String) -> Self {
+        Self {
+            action: LeaseAction::Acquire(AcquireCommand {
+                file_id,
+                flags: LeaseFlags {
+                    backup_dir: None,
+                    expiry_minutes: None,
+                    biometrics_only: false,
+                    allow_headless: false,
+                },
+                output: OutputFormat::Table,
+            }),
         }
     }
 }
@@ -625,6 +669,7 @@ fn print_release_result(result: &ReleaseResult) {
         }
         ReleaseResult::NotLive {
             token,
+            file_id,
             expires_at,
             released_at,
         } => {
@@ -633,9 +678,10 @@ fn print_release_result(result: &ReleaseResult) {
                 None => format!("it expired on {expires_at}"),
             };
             eprintln!(
-                "Nothing to do: lease {} is not live — {cause}. Its backup is unaffected and \
-                 still restorable.",
-                sanitize_for_terminal(token)
+                "Nothing to do: lease {} (covered file {}) is not live — {cause}. Its backup is \
+                 unaffected and still restorable.",
+                sanitize_for_terminal(token),
+                sanitize_for_terminal(file_id)
             );
         }
         ReleaseResult::NoSuchToken => {
@@ -979,11 +1025,13 @@ mod tests {
             // Both causes of "not live": an earlier release, and plain expiry.
             ReleaseResult::NotLive {
                 token: "tok-2".to_string(),
+                file_id: "file-1".to_string(),
                 expires_at: chrono::Utc::now(),
                 released_at: Some(chrono::Utc::now()),
             },
             ReleaseResult::NotLive {
                 token: "tok-3".to_string(),
+                file_id: "file-1".to_string(),
                 expires_at: chrono::Utc::now(),
                 released_at: None,
             },
