@@ -132,10 +132,14 @@ pub(crate) fn resolve_expiry_minutes(
 /// different cwd (issue #1692).
 fn absolutize(dir: PathBuf) -> Result<PathBuf> {
     std::path::absolute(&dir).with_context(|| {
-        format!(
-            "Failed to resolve backup directory {} to an absolute path",
-            dir.display()
-        )
+        if dir.as_os_str().is_empty() {
+            "Failed to resolve backup directory to an absolute path: path is empty".to_string()
+        } else {
+            format!(
+                "Failed to resolve backup directory {} to an absolute path",
+                dir.display()
+            )
+        }
     })
 }
 
@@ -151,7 +155,11 @@ pub(crate) fn resolve_backup_dir(
     if let Some(dir) = non_empty_var(env, LEASE_BACKUP_DIR_ENV) {
         return absolutize(PathBuf::from(dir));
     }
-    if let Some(dir) = settings.backup_dir.clone() {
+    if let Some(dir) = settings
+        .backup_dir
+        .clone()
+        .filter(|d| !d.as_os_str().is_empty())
+    {
         return absolutize(dir);
     }
     default_backup_dir()
@@ -321,6 +329,14 @@ mod tests {
     #[test]
     fn backup_dir_falls_back_to_hardcoded_default() {
         let resolved = resolve_backup_dir(None, &MapEnv::new(), &settings()).unwrap();
+        assert!(resolved.ends_with("omni-dev/drive-backups"));
+    }
+
+    #[test]
+    fn backup_dir_empty_settings_is_treated_as_unset() {
+        let mut s = settings();
+        s.backup_dir = Some(PathBuf::from(""));
+        let resolved = resolve_backup_dir(None, &MapEnv::new(), &s).unwrap();
         assert!(resolved.ends_with("omni-dev/drive-backups"));
     }
 
