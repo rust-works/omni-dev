@@ -496,6 +496,9 @@ async fn restore_inner(
                 expires_at,
                 backup,
                 headless_waiver,
+                // Already on the internal acquire's own audit record, which
+                // is where the release is answerable for (§11).
+                superseded_lease_id: _,
             } => (token, expires_at, backup, headless_waiver),
             AcquireResult::AlreadyLeased { token, expires_at } => {
                 return RestoreResult::AlreadyLeased { token, expires_at }

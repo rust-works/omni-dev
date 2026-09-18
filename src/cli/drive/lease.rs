@@ -387,6 +387,9 @@ fn print_result(result: &AcquireResult) {
             expires_at,
             backup,
             headless_waiver,
+            // Only ever `Some` for the acquire `drive lease restore` makes
+            // internally, and that verb prints its own summary.
+            superseded_lease_id: _,
         } => {
             println!("{token}");
             // The backup path embeds the file's Drive name (`backup_name`
@@ -1131,6 +1134,7 @@ mod tests {
                     size: 0,
                 },
                 headless_waiver: false,
+                superseded_lease_id: None,
             },
             AcquireResult::Acquired {
                 token: "tok-2".to_string(),
@@ -1139,6 +1143,7 @@ mod tests {
                     file_id: "copy-1".to_string(),
                 },
                 headless_waiver: true,
+                superseded_lease_id: None,
             },
             AcquireResult::AlreadyLeased {
                 token: "tok-3".to_string(),

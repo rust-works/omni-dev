@@ -26,7 +26,7 @@ use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
 #[cfg(test)]
 use crate::drive::lease::ledger::LedgerLock;
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, ReleaseOutcome};
 
 /// Per-call options for `drive lease acquire`.
 #[derive(Debug, Clone)]
@@ -96,6 +96,17 @@ pub enum AcquireResult {
         /// record ([`record_attempt`]) so a waived acquisition is durably
         /// distinguishable from a normally-authorised one.
         headless_waiver: bool,
+        /// The lease this acquisition released in the same locked rewrite
+        /// that minted it ([`AcquireOptions::supersedes`], issue #1685) —
+        /// `Some` only when [`insert_record`] actually released a live row,
+        /// so a supersede that found no row, another file's row, or an
+        /// already-dead row is reported as `None`. Carried out of the locked
+        /// closure as a fact rather than re-derived afterwards from ledger
+        /// timestamps, and into the audit record as `superseded_lease_id`.
+        /// Omitted from the JSON shape when `None`, so a plain acquire's
+        /// output is unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        superseded_lease_id: Option<String>,
     },
     /// A live lease already covers this file — its token is returned for
     /// reuse rather than minting a second, independent one. Two leases
@@ -417,10 +428,10 @@ async fn finish_acquisition(
     // current thread — `block_in_place` hands its other queued tasks off
     // to the runtime's other workers for the duration, the same reasoning
     // the `authenticate` call above documents.
-    match tokio::task::block_in_place(|| {
+    let superseded = match tokio::task::block_in_place(|| {
         insert_record(record, &opts.ledger_path, opts.supersedes.as_deref())
     }) {
-        Ok(InsertOutcome::Inserted) => {}
+        Ok(InsertOutcome::Inserted { superseded }) => superseded,
         // Refuse rather than mint a second, independent lease — see
         // `AcquireResult::AlreadyLeased`'s and `insert_record`'s own doc
         // comments for why this stays the authoritative gate even with
@@ -439,7 +450,7 @@ async fn finish_acquisition(
                 detail: err.to_string(),
             };
         }
-    }
+    };
 
     // 4. Print the token (the caller's job) and exit 0.
     AcquireResult::Acquired {
@@ -447,6 +458,7 @@ async fn finish_acquisition(
         expires_at,
         backup,
         headless_waiver,
+        superseded_lease_id: opts.supersedes.clone().filter(|_| superseded),
     }
 }
 
@@ -484,8 +496,11 @@ async fn reclaim_backup(files_api: &FilesApi<'_>, backup: LeaseBackup) -> Backup
 
 /// What [`insert_record`] did.
 enum InsertOutcome {
-    /// The record was inserted; the lease is minted.
-    Inserted,
+    /// The record was inserted; the lease is minted. `superseded` is whether
+    /// the `supersedes` token's row was live and got released in this same
+    /// rewrite — `false` when it named no row, another file's row, or a row
+    /// already expired or released, none of which this insert touched.
+    Inserted { superseded: bool },
     /// A live lease already covered this record's `file_id` — nothing was
     /// inserted or overwritten. Carries that existing record so the caller
     /// can return its token instead — boxed, since it otherwise dwarfs the
@@ -622,16 +637,14 @@ fn insert_record(
         // file's token can never release it — the exclusion above is
         // likewise `file_id`-filtered, so the two agree on what "supersede"
         // can reach.
-        if let Some(token) = supersedes {
-            if ledger
+        let superseded = supersedes.is_some_and(|token| {
+            ledger
                 .get(token)
                 .is_some_and(|r| r.file_id == record.file_id)
-            {
-                ledger.release(token, now);
-            }
-        }
+                && matches!(ledger.release(token, now), ReleaseOutcome::Released { .. })
+        });
         ledger.insert(record);
-        InsertOutcome::Inserted
+        InsertOutcome::Inserted { superseded }
     })
 }
 
@@ -680,6 +693,7 @@ fn record_attempt(
             backup,
             expires_at: _,
             headless_waiver,
+            superseded_lease_id,
         } => {
             let (backup_location, backup_sha256, backup_size) = backup.audit_fields();
             // Re-read the just-written ledger row for the version/
@@ -687,33 +701,16 @@ fn record_attempt(
             // `AcquireResult::Acquired` (a public, `--output json` wire
             // shape) with fields that exist only for this best-effort audit
             // record. A read failure here just omits them — the acquisition
-            // itself already fully succeeded.
-            // The same read also settles whether the supersede actually took
-            // effect: `insert_record` ignores a token bound to another file
-            // and leaves an already-dead row alone, so reporting
-            // `opts.supersedes` verbatim would claim a release that never
-            // happened. Only a row whose `released_at` is no earlier than
-            // this lease's own `acquired_at` is named — both are stamped
-            // inside the one locked rewrite, the release strictly after
-            // (issue #1685).
-            let ledger = LeaseLedger::load(&opts.ledger_path).ok();
-            let fresh = ledger
-                .as_ref()
-                .and_then(|ledger| ledger.get(token).cloned());
-            let (version_after, modified_time_after) =
-                fresh.as_ref().map_or((None, None), |record| {
-                    (Some(record.version.clone()), record.modified_time.clone())
+            // itself already fully succeeded. (`superseded_lease_id` is the
+            // deliberate exception: it is a fact of what the locked rewrite
+            // did, not state a later read can recover, so it rides the
+            // result — skip-serialized when `None`.)
+            let (version_after, modified_time_after) = LeaseLedger::load(&opts.ledger_path)
+                .ok()
+                .and_then(|ledger| ledger.get(token).cloned())
+                .map_or((None, None), |record| {
+                    (Some(record.version), record.modified_time)
                 });
-            let superseded_lease_id = opts.supersedes.as_ref().filter(|superseded| {
-                let released_at = ledger
-                    .as_ref()
-                    .and_then(|ledger| ledger.get(superseded))
-                    .and_then(|record| record.released_at);
-                match (released_at, fresh.as_ref()) {
-                    (Some(released_at), Some(fresh)) => released_at >= fresh.acquired_at,
-                    _ => false,
-                }
-            });
             crate::request_log::AuditOutcome {
                 command: vec!["drive".to_string(), "lease-acquire".to_string()],
                 integration: "drive",
@@ -735,7 +732,11 @@ fn record_attempt(
                 backup_sha256,
                 backup_size,
                 auth_policy,
-                superseded_lease_id: superseded_lease_id.cloned(),
+                // `Some` only when `insert_record` really released a row
+                // (issue #1685) — `AcquireResult::Acquired` carries that
+                // fact out of the locked rewrite, so this never claims a
+                // release the supersede did not make.
+                superseded_lease_id: superseded_lease_id.clone(),
                 ..Default::default()
             }
         }
@@ -1162,6 +1163,7 @@ mod tests {
                 size: 0,
             },
             headless_waiver: false,
+            superseded_lease_id: None,
         }
         .write_jsonl(&mut buf)
         .unwrap();
@@ -2057,7 +2059,10 @@ mod tests {
 
         let outcome = insert_record(live_row("new", "f1"), &ledger_path, Some("old")).unwrap();
 
-        assert!(matches!(outcome, InsertOutcome::Inserted));
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Inserted { superseded: true }
+        ));
         let ledger = LeaseLedger::load(&ledger_path).unwrap();
         assert!(
             ledger.get("old").unwrap().released_at.is_some(),
@@ -2081,7 +2086,10 @@ mod tests {
         let outcome =
             insert_record(live_row("new", "f1"), &ledger_path, Some("elsewhere")).unwrap();
 
-        assert!(matches!(outcome, InsertOutcome::Inserted));
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted { superseded: false }),
+            "a row this insert did not release must not be reported as superseded"
+        );
         let ledger = LeaseLedger::load(&ledger_path).unwrap();
         assert!(
             ledger.get("elsewhere").unwrap().released_at.is_none(),
@@ -2115,19 +2123,42 @@ mod tests {
         assert!(ledger.get("new").is_none());
     }
 
-    /// Drives `record_attempt` for an `Acquired` result over a ledger seeded
-    /// with the fresh row and (optionally) the superseded one, returning the
-    /// audit record's `superseded_lease_id`.
-    fn superseded_lease_id_on_record(
-        root: &Path,
-        superseded: Option<LeaseRecord>,
-    ) -> Option<String> {
+    /// A supersede against a row that is already dead — expired or released
+    /// earlier — is left alone, and must be reported that way, or the audit
+    /// record would claim a release this insert never made.
+    #[test]
+    fn superseding_an_already_dead_row_is_not_reported_as_a_release() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger_path = root.path().join("lease-ledger.jsonl");
+        let mut old = live_row("old", "f1");
+        let first_release = Utc::now() - ChronoDuration::hours(1);
+        old.released_at = Some(first_release);
+        seed(&ledger_path, vec![old]);
+
+        let outcome = insert_record(live_row("new", "f1"), &ledger_path, Some("old")).unwrap();
+
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Inserted { superseded: false }
+        ));
+        assert_eq!(
+            LeaseLedger::load(&ledger_path)
+                .unwrap()
+                .get("old")
+                .unwrap()
+                .released_at,
+            Some(first_release),
+            "the earlier release's timestamp must survive untouched"
+        );
+    }
+
+    /// Drives `record_attempt` for an `Acquired` result carrying
+    /// `superseded_lease_id`, returning what the audit record says.
+    fn superseded_lease_id_on_record(root: &Path, superseded: Option<&str>) -> Option<String> {
         let audit = AuditGuard::redirect(root);
         let mut test_opts = opts(root);
         test_opts.supersedes = Some("old".to_string());
-        let mut rows = vec![live_row("new", "f1")];
-        rows.extend(superseded);
-        seed(&test_opts.ledger_path, rows);
+        seed(&test_opts.ledger_path, vec![live_row("new", "f1")]);
         record_attempt(
             &test_opts,
             &AcquireResult::Acquired {
@@ -2137,6 +2168,7 @@ mod tests {
                     file_id: "new-backup".to_string(),
                 },
                 headless_waiver: false,
+                superseded_lease_id: superseded.map(str::to_string),
             },
             None,
         );
@@ -2147,28 +2179,19 @@ mod tests {
     }
 
     #[test]
-    fn the_audit_record_names_a_lease_this_acquire_released() {
+    fn the_audit_record_names_the_lease_the_result_says_was_released() {
         let root = tempfile::tempdir().unwrap();
-        let mut old = live_row("old", "f1");
-        old.released_at = Some(Utc::now() + ChronoDuration::seconds(1));
         assert_eq!(
-            superseded_lease_id_on_record(root.path(), Some(old)),
+            superseded_lease_id_on_record(root.path(), Some("old")),
             Some("old".to_string())
         );
     }
 
-    /// A supersede against a row that was already dead is a no-op in
-    /// `insert_record`, so the audit record must not claim it as a release.
+    /// `opts.supersedes` alone is never enough: only the result's own
+    /// `superseded_lease_id` — the fact `insert_record` carried out of the
+    /// locked rewrite — puts the field on the record.
     #[test]
-    fn the_audit_record_does_not_claim_a_lease_released_before_this_acquire() {
-        let root = tempfile::tempdir().unwrap();
-        let mut old = live_row("old", "f1");
-        old.released_at = Some(Utc::now() - ChronoDuration::hours(1));
-        assert_eq!(superseded_lease_id_on_record(root.path(), Some(old)), None);
-    }
-
-    #[test]
-    fn the_audit_record_does_not_claim_a_supersede_that_found_no_row() {
+    fn the_audit_record_omits_the_field_when_nothing_was_released() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(superseded_lease_id_on_record(root.path(), None), None);
     }
