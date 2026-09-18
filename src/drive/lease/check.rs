@@ -277,6 +277,61 @@ pub(crate) enum LeaseGateRefusal {
     Failed(String),
 }
 
+impl LeaseGateRefusal {
+    /// The kebab-case `log_status`/audit `verdict` string for this refusal,
+    /// one-to-one with the `verdict::REFUSED_*`/[`verdict::FAILED`]
+    /// constants above — the single home for a string every leased engine
+    /// previously retyped by hand in its own `log_status()`.
+    pub(crate) fn log_status(&self) -> &'static str {
+        match self {
+            Self::NoLease => verdict::REFUSED_NO_LEASE,
+            Self::Expired => verdict::REFUSED_LEASE_EXPIRED,
+            Self::WrongFile => verdict::REFUSED_LEASE_WRONG_FILE,
+            Self::Stale => verdict::REFUSED_LEASE_STALE,
+            Self::Failed(_) => verdict::FAILED,
+        }
+    }
+
+    /// Renders this refusal's message as its constituent lines (never
+    /// containing a newline) — the single home for prose every leased
+    /// engine's `describe`/`describe_lines` previously retyped by hand.
+    ///
+    /// `id` is the id printed in the `drive lease acquire {id}` hint every
+    /// message carries. `target` is how the caller wants the file named in
+    /// the two variants (`NoLease`/`Stale`) that name it at all — already
+    /// rendered exactly as the caller wants it to read (e.g. `'Budget'` or
+    /// a bare, pre-sanitized id), since callers disagree on whether that
+    /// name is quoted. `Expired`/`WrongFile` reference no target at all, so
+    /// they ignore it.
+    ///
+    /// `Failed`'s detail is deliberately not rendered here: every caller
+    /// already has its own `Failed { detail }` arm for every non-lease
+    /// operational failure too, so folding it in here would just be a
+    /// second place that formats it.
+    pub(crate) fn describe_lines(&self, id: &str, target: &str) -> Vec<String> {
+        match self {
+            Self::NoLease => vec![format!(
+                "Refused: {target} requires a Drive write lease — run `omni-dev drive lease \
+                 acquire {id}` and pass the printed token via `--lease`."
+            )],
+            Self::Expired => vec![format!(
+                "Refused: the presented lease is expired, released, or unknown to this ledger \
+                 — run `omni-dev drive lease acquire {id}` again."
+            )],
+            Self::WrongFile => vec![format!(
+                "Refused: the presented lease was acquired for a different file — run \
+                 `omni-dev drive lease acquire {id}` for this one."
+            )],
+            Self::Stale => vec![format!(
+                "Refused: {target} changed since the lease was acquired (or last written \
+                 under) — re-run `omni-dev drive lease acquire {id}` to lease the current \
+                 version."
+            )],
+            Self::Failed(_) => vec![],
+        }
+    }
+}
+
 /// Fetches `write.file_id`'s live version/`modifiedTime` and checks
 /// `lease_token` against it via [`check_and_lock_lease`] — the "fetch, then
 /// check" sequence every leased-write engine repeats verbatim (ADR-0080
@@ -1110,5 +1165,72 @@ mod tests {
             "waited holder should have released the lock"
         );
         assert_eq!(audit.verdicts(), [verdict::PENDING]);
+    }
+
+    // ── `LeaseGateRefusal::log_status`/`describe_lines` ─────────────────
+
+    #[test]
+    fn log_status_matches_the_verdict_constants() {
+        assert_eq!(
+            LeaseGateRefusal::NoLease.log_status(),
+            verdict::REFUSED_NO_LEASE
+        );
+        assert_eq!(
+            LeaseGateRefusal::Expired.log_status(),
+            verdict::REFUSED_LEASE_EXPIRED
+        );
+        assert_eq!(
+            LeaseGateRefusal::WrongFile.log_status(),
+            verdict::REFUSED_LEASE_WRONG_FILE
+        );
+        assert_eq!(
+            LeaseGateRefusal::Stale.log_status(),
+            verdict::REFUSED_LEASE_STALE
+        );
+        assert_eq!(
+            LeaseGateRefusal::Failed("boom".to_string()).log_status(),
+            verdict::FAILED
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_the_target_and_id_where_each_variant_names_one() {
+        assert_eq!(
+            LeaseGateRefusal::NoLease.describe_lines("file-1", "'Budget'"),
+            vec![
+                "Refused: 'Budget' requires a Drive write lease — run `omni-dev drive lease \
+                 acquire file-1` and pass the printed token via `--lease`."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            LeaseGateRefusal::Expired.describe_lines("file-1", "'Budget'"),
+            vec![
+                "Refused: the presented lease is expired, released, or unknown to this ledger \
+                 — run `omni-dev drive lease acquire file-1` again."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            LeaseGateRefusal::WrongFile.describe_lines("file-1", "'Budget'"),
+            vec![
+                "Refused: the presented lease was acquired for a different file — run \
+                 `omni-dev drive lease acquire file-1` for this one."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            LeaseGateRefusal::Stale.describe_lines("file-1", "'Budget'"),
+            vec![
+                "Refused: 'Budget' changed since the lease was acquired (or last written \
+                 under) — re-run `omni-dev drive lease acquire file-1` to lease the current \
+                 version."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            LeaseGateRefusal::Failed("boom".to_string()).describe_lines("file-1", "'Budget'"),
+            Vec::<String>::new()
+        );
     }
 }
