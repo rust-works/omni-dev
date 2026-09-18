@@ -598,6 +598,14 @@ impl LedgerLock {
     /// [`Self::acquire_waiting`] with an explicit wait budget — the seam
     /// that lets tests exercise the timeout in milliseconds without
     /// mutating the process environment.
+    ///
+    /// Each attempt's synchronous open/fchmod/stat/flock runs on the
+    /// blocking pool via `spawn_blocking`, not on the calling task, so a
+    /// long wait cannot starve other tasks on a shared runtime (issue
+    /// #1714). Deliberately not `block_in_place`, which the rest of this
+    /// module uses: that panics on a current-thread runtime, and every
+    /// leased write reaches this loop — including from the many
+    /// current-thread `#[tokio::test]`s across the Drive engines.
     pub(crate) async fn acquire_waiting_with_timeout(
         ledger_path: &Path,
         max_wait: Duration,
@@ -607,7 +615,12 @@ impl LedgerLock {
 
         let mut wait = LockWait::new(&path, max_wait);
         loop {
-            match Self::try_acquire_once(&path)? {
+            let attempt_path = path.clone();
+            let attempt =
+                tokio::task::spawn_blocking(move || Self::try_acquire_once(&attempt_path))
+                    .await
+                    .context("the ledger lock attempt did not complete")??;
+            match attempt {
                 Some(lock) => return Ok(lock),
                 None => tokio::time::sleep(wait.next_delay()?).await,
             }
@@ -988,6 +1001,8 @@ mod tests {
         LedgerLock::acquire(&ledger_path).unwrap();
     }
 
+    // Current-thread on purpose, like the test below: it pins that the
+    // waiting loop never reaches for `block_in_place`, which panics here.
     #[tokio::test]
     async fn ledger_lock_acquire_waiting_waits_for_a_concurrent_holder_then_succeeds() {
         let dir = tempfile::tempdir().unwrap();
