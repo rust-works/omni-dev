@@ -364,7 +364,8 @@ impl LeaseLedger {
     /// this module used to hand-roll independently (issue #1664 review
     /// finding: three near-identical copies of this sequence risked
     /// drifting from one another, ironically right after one of them —
-    /// `drive lease restore`'s own `mark_backup_restored` — was fixed to
+    /// `drive lease restore`'s own then-`mark_backup_restored` (since
+    /// folded into `stamp_backup_restored`, issue #1737) — was fixed to
     /// close a lost-update race).
     ///
     /// Deliberately does **not** acquire [`LedgerLock`] itself: a leased
@@ -492,9 +493,11 @@ impl LedgerLock {
     /// Acquires the lock guarding `ledger_path` without waiting. Production
     /// code passes [`ledger_path`]'s own result; tests pass a path under a
     /// `tempdir` so they never touch the real ledger or its lock. Used by
-    /// the best-effort `mark_backup_restored` path and by `prune`'s
-    /// candidate-selection scan, neither of which should block on another
-    /// operation.
+    /// `prune`'s candidate-selection scan, which should not block on
+    /// another operation (issue #1737 moved the restore module's own
+    /// non-waiting use of this — the best-effort restored-from stamp —
+    /// onto the already-held grant lock instead; see #1738 for the
+    /// remaining non-waiting callers).
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
