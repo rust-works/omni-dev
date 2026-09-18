@@ -251,7 +251,7 @@ pub enum WriteResult {
 
 impl WriteResult {
     /// The kebab-case status for the request log.
-    const fn log_status(&self) -> &'static str {
+    fn log_status(&self) -> &'static str {
         match self {
             Self::WouldReplace { .. } => "would-replace",
             Self::WouldAppend { .. } => "would-append",
@@ -260,10 +260,10 @@ impl WriteResult {
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::RefusedNoRevisionId => "refused-no-revision-id",
             Self::Blocked { .. } => "blocked",
-            Self::RefusedNoLease => "refused-no-lease",
-            Self::RefusedLeaseExpired => "refused-lease-expired",
-            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
-            Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
+            Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
+            Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
+            Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Replaced { .. } => "replaced",
             Self::Appended { .. } => "appended",
             Self::StaleRevision { .. } => "stale-revision",
@@ -704,26 +704,18 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             ),
             None => format!("Blocked: '{name}' — refused by default policy (no matching rule)"),
         },
-        WriteResult::RefusedNoLease => format!(
-            "Refused: '{name}' requires a Drive write lease — run `omni-dev drive lease \
-             acquire {}` and pass the printed token via `--lease`.",
-            outcome.document_id
-        ),
-        WriteResult::RefusedLeaseExpired => format!(
-            "Refused: the presented lease is expired, released, or unknown to this ledger — \
-             run `omni-dev drive lease acquire {}` again.",
-            outcome.document_id
-        ),
-        WriteResult::RefusedLeaseWrongFile => format!(
-            "Refused: the presented lease was acquired for a different file — run `omni-dev \
-             drive lease acquire {}` for this one.",
-            outcome.document_id
-        ),
-        WriteResult::RefusedLeaseStale => format!(
-            "Refused: '{name}' changed since the lease was acquired (or last written under) \
-             — re-run `omni-dev drive lease acquire {}` to lease the current version.",
-            outcome.document_id
-        ),
+        WriteResult::RefusedNoLease => LeaseGateRefusal::NoLease
+            .describe_lines(&outcome.document_id, &format!("'{name}'"))
+            .join("\n"),
+        WriteResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+            .describe_lines(&outcome.document_id, &format!("'{name}'"))
+            .join("\n"),
+        WriteResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+            .describe_lines(&outcome.document_id, &format!("'{name}'"))
+            .join("\n"),
+        WriteResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+            .describe_lines(&outcome.document_id, &format!("'{name}'"))
+            .join("\n"),
         WriteResult::Replaced {
             occurrences_changed,
         } => format!("Replaced: {occurrences_changed} occurrence(s) in '{name}'"),
