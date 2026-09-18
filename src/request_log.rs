@@ -429,7 +429,7 @@ pub fn audit_file_path() -> Option<PathBuf> {
 
 /// The pure override-or-default half of [`audit_file_path`]: honors
 /// `OMNI_DEV_AUDIT_LOG_FILE` through an injected [`EnvSource`] (STYLE-0028),
-/// deliberately **not** consulting [`TEST_AUDIT_ROUTE`] — that per-thread
+/// deliberately **not** consulting `TEST_AUDIT_ROUTE` — that per-thread
 /// routing is a test-build-only safety net for the *ambient* entry point,
 /// orthogonal to this function's own override-or-default algorithm.
 /// `pub(crate)` rather than private: `cli::log`'s `LogCommand::resolve_path_with`
@@ -734,7 +734,7 @@ fn record_audit_with(env: &impl EnvSource, entry: &LogRecord) -> anyhow::Result<
     record_audit_to(path, log_file_path_with(env), entry)
 }
 
-/// Shared write path for [`record_audit`] and [`record_audit_with`]: `path`
+/// Shared write path for [`record_audit`] and `record_audit_with`: `path`
 /// and `log_path` are already resolved, so this only validates and appends.
 fn record_audit_to(
     path: PathBuf,
