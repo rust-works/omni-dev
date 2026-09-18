@@ -28,8 +28,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueInputOption};
@@ -179,6 +179,24 @@ pub enum WriteResult {
         /// A human-readable summary of what failed.
         detail: String,
     },
+}
+
+impl FromLeaseRefusal for WriteResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
 }
 
 impl WriteResult {
@@ -383,11 +401,7 @@ async fn write_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(WriteResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(WriteResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(WriteResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(WriteResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(WriteResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
     // ── The mutation ───────────────────────────────────────────────────
@@ -412,21 +426,17 @@ async fn write_inner(
             }),
     };
 
-    let result = match result {
-        Ok(written) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
-            written
-        }
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            WriteResult::Failed { detail }
-        }
-    };
+    let result =
+        match conclude_native_leased_write(leased, &lease_grant, &files_api, result, |err| {
+            format!("{err:#}")
+        })
+        .await
+        {
+            Ok(written) => written,
+            Err(err) => WriteResult::Failed {
+                detail: format!("{err:#}"),
+            },
+        };
     drop(lease_grant);
 
     gated(result)
@@ -546,17 +556,17 @@ pub fn describe(outcome: &WriteOutcome) -> String {
             ),
         },
         WriteResult::RefusedNoLease => LeaseGateRefusal::NoLease
-            .describe_lines(&outcome.spreadsheet_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.spreadsheet_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
-            .describe_lines(&outcome.spreadsheet_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.spreadsheet_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
-            .describe_lines(&outcome.spreadsheet_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.spreadsheet_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseStale => LeaseGateRefusal::Stale
-            .describe_lines(&outcome.spreadsheet_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.spreadsheet_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::Written {
             updated_range,
             updated_cells,

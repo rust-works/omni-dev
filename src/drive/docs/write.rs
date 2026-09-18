@@ -40,8 +40,8 @@ use crate::drive::docs::write_types::DocsRequest;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::types::{GOOGLE_DOC_MIME_TYPE, GOOGLE_SHORTCUT_MIME_TYPE};
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -247,6 +247,24 @@ pub enum WriteResult {
         /// The error, verbatim.
         detail: String,
     },
+}
+
+impl FromLeaseRefusal for WriteResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
 }
 
 impl WriteResult {
@@ -508,50 +526,34 @@ async fn write_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => {
-            return gated(WriteResult::RefusedNoLease, Some(revision_id))
-        }
-        Err(LeaseGateRefusal::Expired) => {
-            return gated(WriteResult::RefusedLeaseExpired, Some(revision_id))
-        }
-        Err(LeaseGateRefusal::WrongFile) => {
-            return gated(WriteResult::RefusedLeaseWrongFile, Some(revision_id))
-        }
-        Err(LeaseGateRefusal::Stale) => {
-            return gated(WriteResult::RefusedLeaseStale, Some(revision_id))
-        }
-        Err(LeaseGateRefusal::Failed(detail)) => {
-            return gated(WriteResult::Failed { detail }, Some(revision_id))
-        }
+        Err(err) => return gated(err.into_result(), Some(revision_id)),
     };
 
     // ── The mutation ───────────────────────────────────────────────────
-    let result = match api
-        .batch_update(&opts.document_id, opts.payload.to_request(), &revision_id)
-        .await
+    let result = match conclude_native_leased_write(
+        leased,
+        &lease_grant,
+        &files_api,
+        api.batch_update(&opts.document_id, opts.payload.to_request(), &revision_id)
+            .await,
+        ToString::to_string,
+    )
+    .await
     {
-        Ok(response) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
-            match &opts.payload {
-                WritePayload::Replace { .. } => WriteResult::Replaced {
-                    occurrences_changed: response.occurrences_changed_for_replace(),
-                },
-                WritePayload::Append { text } => WriteResult::Appended {
-                    chars: text.chars().count(),
-                    bytes: text.len(),
-                },
-            }
-        }
+        Ok(response) => match &opts.payload {
+            WritePayload::Replace { .. } => WriteResult::Replaced {
+                occurrences_changed: response.occurrences_changed_for_replace(),
+            },
+            WritePayload::Append { text } => WriteResult::Appended {
+                chars: text.chars().count(),
+                bytes: text.len(),
+            },
+        },
         Err(err) => {
             // Either way the mutation did not happen — a `412` on
             // `writeControl.requiredRevisionId` included — so the intent
             // record gets a `failed` outcome carrying the reason.
             let detail = err.to_string();
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
             if is_stale_revision(&err) {
                 WriteResult::StaleRevision {
                     required_revision_id: revision_id.clone(),
@@ -705,17 +707,17 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             None => format!("Blocked: '{name}' — refused by default policy (no matching rule)"),
         },
         WriteResult::RefusedNoLease => LeaseGateRefusal::NoLease
-            .describe_lines(&outcome.document_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.document_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
-            .describe_lines(&outcome.document_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.document_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
-            .describe_lines(&outcome.document_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.document_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::RefusedLeaseStale => LeaseGateRefusal::Stale
-            .describe_lines(&outcome.document_id, &format!("'{name}'"))
-            .join("\n"),
+            .describe_line(&outcome.document_id, &format!("'{name}'"))
+            .unwrap_or_default(),
         WriteResult::Replaced {
             occurrences_changed,
         } => format!("Replaced: {occurrences_changed} occurrence(s) in '{name}'"),

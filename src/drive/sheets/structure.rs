@@ -58,8 +58,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
@@ -472,6 +472,24 @@ pub enum StructureResult {
     },
 }
 
+impl FromLeaseRefusal for StructureResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
+}
+
 impl StructureResult {
     /// The `status` string the request log records.
     ///
@@ -714,34 +732,28 @@ async fn structure_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(StructureResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(StructureResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(StructureResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(StructureResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(StructureResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
-    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
-        Ok(response) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
-            StructureResult::Changed {
-                sheet_id: added_sheet_id(&response)
-                    .or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
-                sheet,
-                backup: lease_grant
-                    .as_ref()
-                    .map(|grant| Box::new(grant.backup.clone())),
-            }
-        }
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            StructureResult::Failed { detail }
-        }
+    let result = match conclude_native_leased_write(
+        leased,
+        &lease_grant,
+        &files_api,
+        api.batch_update(&opts.spreadsheet_id, vec![request]).await,
+        |err| format!("{err:#}"),
+    )
+    .await
+    {
+        Ok(response) => StructureResult::Changed {
+            sheet_id: added_sheet_id(&response).or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
+            sheet,
+            backup: lease_grant
+                .as_ref()
+                .map(|grant| Box::new(grant.backup.clone())),
+        },
+        Err(err) => StructureResult::Failed {
+            detail: format!("{err:#}"),
+        },
     };
     drop(lease_grant);
     gated(result)
@@ -1442,18 +1454,22 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 ),
             }]
         }
-        StructureResult::RefusedNoLease => {
-            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        StructureResult::RefusedLeaseExpired => {
-            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        StructureResult::RefusedLeaseWrongFile => {
-            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        StructureResult::RefusedLeaseStale => {
-            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
-        }
+        StructureResult::RefusedNoLease => LeaseGateRefusal::NoLease
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        StructureResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        StructureResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        StructureResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
         StructureResult::Changed {
             sheet,
             sheet_id,

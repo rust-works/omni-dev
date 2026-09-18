@@ -27,7 +27,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
-    finish_leased_write, gate_optional_leased_write, record_failed_leased_write, LeaseGateRefusal,
+    conclude_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -100,6 +100,24 @@ pub enum EditResult {
         /// A human-readable summary of what failed.
         detail: String,
     },
+}
+
+impl FromLeaseRefusal for EditResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
 }
 
 impl EditResult {
@@ -299,36 +317,22 @@ async fn edit_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(EditResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(EditResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(EditResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(EditResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(EditResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
-    let result = match files_api
-        .edit_content(&opts.file_id, &opts.content, &opts.content_type)
-        .await
-    {
-        Ok(updated) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_write(
-                    leased,
-                    &grant.lock,
-                    &grant.token,
-                    updated.version,
-                    updated.modified_time,
-                );
-            }
-            EditResult::Edited
-        }
-        Err(err) => {
-            let detail = err.to_string();
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            EditResult::Failed { detail }
-        }
+    let result = match conclude_leased_write(
+        leased,
+        &lease_grant,
+        files_api
+            .edit_content(&opts.file_id, &opts.content, &opts.content_type)
+            .await,
+        |updated| (updated.version.clone(), updated.modified_time.clone()),
+        ToString::to_string,
+    ) {
+        Ok(_updated) => EditResult::Edited,
+        Err(err) => EditResult::Failed {
+            detail: err.to_string(),
+        },
     };
     drop(lease_grant);
     gated(result)

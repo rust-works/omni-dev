@@ -27,8 +27,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
@@ -224,6 +224,24 @@ pub enum ValidationResult {
     },
 }
 
+impl FromLeaseRefusal for ValidationResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
+}
+
 impl ValidationResult {
     fn log_status(&self) -> &'static str {
         match self {
@@ -403,6 +421,15 @@ async fn validation_inner(
         return gated(ValidationResult::WouldChange { summary });
     }
 
+    // Built before the gate, not after — unlike its siblings this is
+    // infallible today (`ValidationVerb::into_boolean_condition` is an
+    // exhaustive, panic-free match), but the gate must still be the *last*
+    // fallible step before the mutating call (see `gate_leased_write`'s doc
+    // comment and `structure.rs`'s identical comment) so a future fallible
+    // verb here cannot fsync a `pending` audit record for a write that never
+    // happens (#1688).
+    let request = build_request(&opts.verb, grid);
+
     // The lease check (ADR-0080 §9) sits here: after the permission gate
     // and the `--dry-run` branch, before the mutating call — see
     // `content_edit.rs::edit_inner`'s doc comment for the full reasoning,
@@ -426,28 +453,22 @@ async fn validation_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(ValidationResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(ValidationResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(ValidationResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(ValidationResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(ValidationResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
-    let request = build_request(&opts.verb, grid);
-    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
-        Ok(_response) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
-            ValidationResult::Changed { summary }
-        }
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            ValidationResult::Failed { detail }
-        }
+    let result = match conclude_native_leased_write(
+        leased,
+        &lease_grant,
+        &files_api,
+        api.batch_update(&opts.spreadsheet_id, vec![request]).await,
+        |err| format!("{err:#}"),
+    )
+    .await
+    {
+        Ok(_response) => ValidationResult::Changed { summary },
+        Err(err) => ValidationResult::Failed {
+            detail: format!("{err:#}"),
+        },
     };
     drop(lease_grant);
     gated(result)
@@ -617,18 +638,22 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
-        ValidationResult::RefusedNoLease => {
-            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ValidationResult::RefusedLeaseExpired => {
-            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ValidationResult::RefusedLeaseWrongFile => {
-            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ValidationResult::RefusedLeaseStale => {
-            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
-        }
+        ValidationResult::RefusedNoLease => LeaseGateRefusal::NoLease
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ValidationResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ValidationResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ValidationResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
         ValidationResult::Changed { summary } => {
             vec![format!("Applied: {summary} in {book}")]
         }

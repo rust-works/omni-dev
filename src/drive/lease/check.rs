@@ -20,13 +20,14 @@
 //! an intent record that reads as an interrupted write, so the two halves
 //! are deliberately the *only* way to conclude a leased write.
 //!
-//! What stays with each caller: mapping [`LeaseGateRefusal`] onto that
-//! engine's own `*Result` enum (`EditResult`/`WriteResult`/
-//! `StructureResult`/`ProtectionResult`/`DocsWriteResult` and friends all
-//! carry their own `RefusedNoLease`/`RefusedLeaseExpired`/
-//! `RefusedLeaseWrongFile`/`RefusedLeaseStale` variants, since each is a
-//! distinct wire type), and deciding *when* to call it and what
-//! `live_version` to check against — that differs by surface (§6).
+//! What stays with each caller: implementing [`FromLeaseRefusal`] once for
+//! its own `*Result` enum (`EditResult`/`WriteResult`/`StructureResult`/
+//! `ProtectionResult`/`DocsWriteResult` and friends all carry their own
+//! `RefusedNoLease`/`RefusedLeaseExpired`/`RefusedLeaseWrongFile`/
+//! `RefusedLeaseStale` variants, since each is a distinct wire type — the
+//! mapping itself is [`LeaseGateRefusal::into_result`]'s job, not each
+//! caller's), and deciding *when* to call it and what `live_version` to
+//! check against — that differs by surface (§6).
 
 use std::path::Path;
 
@@ -292,9 +293,9 @@ impl LeaseGateRefusal {
         }
     }
 
-    /// Renders this refusal's message as its constituent lines (never
-    /// containing a newline) — the single home for prose every leased
-    /// engine's `describe`/`describe_lines` previously retyped by hand.
+    /// Renders this refusal's message as a single line (never containing a
+    /// newline) — the single home for prose every leased engine's
+    /// `describe`/`describe_lines` previously retyped by hand.
     ///
     /// `id` is the id printed in the `drive lease acquire {id}` hint every
     /// message carries. `target` is how the caller wants the file named in
@@ -304,30 +305,67 @@ impl LeaseGateRefusal {
     /// name is quoted. `Expired`/`WrongFile` reference no target at all, so
     /// they ignore it.
     ///
-    /// `Failed`'s detail is deliberately not rendered here: every caller
-    /// already has its own `Failed { detail }` arm for every non-lease
-    /// operational failure too, so folding it in here would just be a
-    /// second place that formats it.
-    pub(crate) fn describe_lines(&self, id: &str, target: &str) -> Vec<String> {
+    /// Returns [`None`] for `Failed`, whose detail is deliberately not
+    /// rendered here: every caller already has its own `Failed { detail }`
+    /// arm for every non-lease operational failure too, so folding it in
+    /// here would just be a second place that formats it. Never more than
+    /// one line, so `Option<String>` rather than `Vec<String>` — a caller
+    /// wanting a `Vec` (an engine's own multi-line `describe_lines`) gets
+    /// one back via `Option`'s own `IntoIterator`.
+    pub(crate) fn describe_line(&self, id: &str, target: &str) -> Option<String> {
         match self {
-            Self::NoLease => vec![format!(
+            Self::NoLease => Some(format!(
                 "Refused: {target} requires a Drive write lease — run `omni-dev drive lease \
                  acquire {id}` and pass the printed token via `--lease`."
-            )],
-            Self::Expired => vec![format!(
+            )),
+            Self::Expired => Some(format!(
                 "Refused: the presented lease is expired, released, or unknown to this ledger \
                  — run `omni-dev drive lease acquire {id}` again."
-            )],
-            Self::WrongFile => vec![format!(
+            )),
+            Self::WrongFile => Some(format!(
                 "Refused: the presented lease was acquired for a different file — run \
                  `omni-dev drive lease acquire {id}` for this one."
-            )],
-            Self::Stale => vec![format!(
+            )),
+            Self::Stale => Some(format!(
                 "Refused: {target} changed since the lease was acquired (or last written \
                  under) — re-run `omni-dev drive lease acquire {id}` to lease the current \
                  version."
-            )],
-            Self::Failed(_) => vec![],
+            )),
+            Self::Failed(_) => None,
+        }
+    }
+}
+
+/// Converts a [`LeaseGateRefusal`] into an engine's own `*Result` enum —
+/// implemented once per engine (`EditResult`/`WriteResult`/
+/// `StructureResult`/`ProtectionResult`/`FormatResult`/`ValidationResult`/
+/// `DocsWriteResult`, one `RefusedNoLease`/`RefusedLeaseExpired`/
+/// `RefusedLeaseWrongFile`/`RefusedLeaseStale`/`Failed { detail }` arm each)
+/// so [`LeaseGateRefusal::into_result`] collapses the five-arm match every
+/// engine previously repeated verbatim at its own call site into one call.
+pub(crate) trait FromLeaseRefusal {
+    /// No `--lease` was presented at all.
+    fn from_no_lease() -> Self;
+    /// The token is unknown, has expired, or the ledger was unreadable.
+    fn from_lease_expired() -> Self;
+    /// The token is bound to a different file id.
+    fn from_lease_wrong_file() -> Self;
+    /// The file has moved since the lease's recorded `version`.
+    fn from_lease_stale() -> Self;
+    /// An operational failure, not a verdict on the token.
+    fn from_lease_failed(detail: String) -> Self;
+}
+
+impl LeaseGateRefusal {
+    /// Maps this refusal onto `T`'s own equivalent variant — see
+    /// [`FromLeaseRefusal`].
+    pub(crate) fn into_result<T: FromLeaseRefusal>(self) -> T {
+        match self {
+            Self::NoLease => T::from_no_lease(),
+            Self::Expired => T::from_lease_expired(),
+            Self::WrongFile => T::from_lease_wrong_file(),
+            Self::Stale => T::from_lease_stale(),
+            Self::Failed(detail) => T::from_lease_failed(detail),
         }
     }
 }
@@ -530,6 +568,72 @@ pub(crate) async fn finish_leased_native_write(
         }
     };
     finish_leased_write(write, lock, token, version, modified_time);
+}
+
+/// Concludes a leased write against a surface whose mutating call itself
+/// returns the file's post-write version/modified time (Drive's
+/// `files.update` does) — calls [`finish_leased_write`] on `Ok`,
+/// [`record_failed_leased_write`] on `Err`, and returns `outcome` unchanged
+/// either way. `version_and_modified_time` extracts the pair from the
+/// success value; `detail` renders the error for the audit record —
+/// callers disagree on `Display` (`{err}`) vs. the alternate, full-chain
+/// form (`{err:#}`), so this takes their existing formatting rather than
+/// picking one for them.
+///
+/// Every leased-write engine previously repeated this "finish on success,
+/// record on failure" bookkeeping by hand around its own mutating call —
+/// this collapses it to one call, leaving only the per-engine construction
+/// of its own success/failure result variant at the call site. The caller
+/// still owns `lease_grant`'s lifetime (see [`check_and_lock_lease`]'s doc
+/// comment for why it must outlive the mutating call) and must still drop
+/// it once its own result is built.
+pub(crate) fn conclude_leased_write<T, E>(
+    write: LeasedWrite<'_>,
+    lease_grant: &Option<LeaseGrant>,
+    outcome: Result<T, E>,
+    version_and_modified_time: impl FnOnce(&T) -> (Option<String>, Option<String>),
+    detail: impl FnOnce(&E) -> String,
+) -> Result<T, E> {
+    match &outcome {
+        Ok(value) => {
+            if let Some(grant) = lease_grant {
+                let (version, modified_time) = version_and_modified_time(value);
+                finish_leased_write(write, &grant.lock, &grant.token, version, modified_time);
+            }
+        }
+        Err(err) => {
+            if let Some(grant) = lease_grant {
+                record_failed_leased_write(write, &grant.token, &detail(err));
+            }
+        }
+    }
+    outcome
+}
+
+/// [`conclude_leased_write`] for a surface whose mutating call returns no
+/// Drive metadata of its own (Sheets/Docs `batchUpdate`) — calls
+/// [`finish_leased_native_write`] on `Ok`, [`record_failed_leased_write`] on
+/// `Err`, and returns `outcome` unchanged either way.
+pub(crate) async fn conclude_native_leased_write<T, E>(
+    write: LeasedWrite<'_>,
+    lease_grant: &Option<LeaseGrant>,
+    files_api: &FilesApi<'_>,
+    outcome: Result<T, E>,
+    detail: impl FnOnce(&E) -> String,
+) -> Result<T, E> {
+    match &outcome {
+        Ok(_) => {
+            if let Some(grant) = lease_grant {
+                finish_leased_native_write(write, &grant.lock, &grant.token, files_api).await;
+            }
+        }
+        Err(err) => {
+            if let Some(grant) = lease_grant {
+                record_failed_leased_write(write, &grant.token, &detail(err));
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -1168,7 +1272,7 @@ mod tests {
         assert_eq!(audit.verdicts(), [verdict::PENDING]);
     }
 
-    // ── `LeaseGateRefusal::log_status`/`describe_lines` ─────────────────
+    // ── `LeaseGateRefusal::log_status`/`describe_line` ──────────────────
 
     #[test]
     fn log_status_matches_the_verdict_constants() {
@@ -1195,43 +1299,43 @@ mod tests {
     }
 
     #[test]
-    fn describe_lines_renders_the_target_and_id_where_each_variant_names_one() {
+    fn describe_line_renders_the_target_and_id_where_each_variant_names_one() {
         assert_eq!(
-            LeaseGateRefusal::NoLease.describe_lines("file-1", "'Budget'"),
-            vec![
+            LeaseGateRefusal::NoLease.describe_line("file-1", "'Budget'"),
+            Some(
                 "Refused: 'Budget' requires a Drive write lease — run `omni-dev drive lease \
                  acquire file-1` and pass the printed token via `--lease`."
                     .to_string()
-            ]
+            )
         );
         assert_eq!(
-            LeaseGateRefusal::Expired.describe_lines("file-1", "'Budget'"),
-            vec![
+            LeaseGateRefusal::Expired.describe_line("file-1", "'Budget'"),
+            Some(
                 "Refused: the presented lease is expired, released, or unknown to this ledger \
                  — run `omni-dev drive lease acquire file-1` again."
                     .to_string()
-            ]
+            )
         );
         assert_eq!(
-            LeaseGateRefusal::WrongFile.describe_lines("file-1", "'Budget'"),
-            vec![
+            LeaseGateRefusal::WrongFile.describe_line("file-1", "'Budget'"),
+            Some(
                 "Refused: the presented lease was acquired for a different file — run \
                  `omni-dev drive lease acquire file-1` for this one."
                     .to_string()
-            ]
+            )
         );
         assert_eq!(
-            LeaseGateRefusal::Stale.describe_lines("file-1", "'Budget'"),
-            vec![
+            LeaseGateRefusal::Stale.describe_line("file-1", "'Budget'"),
+            Some(
                 "Refused: 'Budget' changed since the lease was acquired (or last written \
                  under) — re-run `omni-dev drive lease acquire file-1` to lease the current \
                  version."
                     .to_string()
-            ]
+            )
         );
         assert_eq!(
-            LeaseGateRefusal::Failed("boom".to_string()).describe_lines("file-1", "'Budget'"),
-            Vec::<String>::new()
+            LeaseGateRefusal::Failed("boom".to_string()).describe_line("file-1", "'Budget'"),
+            None
         );
     }
 }

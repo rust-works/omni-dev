@@ -36,8 +36,8 @@ use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::check::{
-    finish_leased_native_write, gate_optional_leased_write, record_failed_leased_write,
-    LeaseGateRefusal, LeasedWrite,
+    conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
+    LeasedWrite,
 };
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
@@ -246,6 +246,24 @@ pub enum ProtectionResult {
         /// A human-readable summary of what failed.
         detail: String,
     },
+}
+
+impl FromLeaseRefusal for ProtectionResult {
+    fn from_no_lease() -> Self {
+        Self::RefusedNoLease
+    }
+    fn from_lease_expired() -> Self {
+        Self::RefusedLeaseExpired
+    }
+    fn from_lease_wrong_file() -> Self {
+        Self::RefusedLeaseWrongFile
+    }
+    fn from_lease_stale() -> Self {
+        Self::RefusedLeaseStale
+    }
+    fn from_lease_failed(detail: String) -> Self {
+        Self::Failed { detail }
+    }
 }
 
 impl ProtectionResult {
@@ -516,31 +534,28 @@ async fn protection_inner(
     .await
     {
         Ok(grant) => grant,
-        Err(LeaseGateRefusal::NoLease) => return gated(ProtectionResult::RefusedNoLease),
-        Err(LeaseGateRefusal::Expired) => return gated(ProtectionResult::RefusedLeaseExpired),
-        Err(LeaseGateRefusal::WrongFile) => return gated(ProtectionResult::RefusedLeaseWrongFile),
-        Err(LeaseGateRefusal::Stale) => return gated(ProtectionResult::RefusedLeaseStale),
-        Err(LeaseGateRefusal::Failed(detail)) => return gated(ProtectionResult::Failed { detail }),
+        Err(err) => return gated(err.into_result()),
     };
 
-    let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
+    let result = match conclude_native_leased_write(
+        leased,
+        &lease_grant,
+        &files_api,
+        api.batch_update(&opts.spreadsheet_id, vec![request]).await,
+        |err| format!("{err:#}"),
+    )
+    .await
+    {
         Ok(response) => {
-            if let Some(grant) = &lease_grant {
-                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
-            }
             let protected_range_id = added_protected_range_id(&response).or(existing_id);
             ProtectionResult::Changed {
                 summary,
                 protected_range_id,
             }
         }
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(grant) = &lease_grant {
-                record_failed_leased_write(leased, &grant.token, &detail);
-            }
-            ProtectionResult::Failed { detail }
-        }
+        Err(err) => ProtectionResult::Failed {
+            detail: format!("{err:#}"),
+        },
     };
     drop(lease_grant);
     gated(result)
@@ -898,18 +913,22 @@ pub fn describe_lines(outcome: &ProtectionOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
-        ProtectionResult::RefusedNoLease => {
-            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ProtectionResult::RefusedLeaseExpired => {
-            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ProtectionResult::RefusedLeaseWrongFile => {
-            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
-        }
-        ProtectionResult::RefusedLeaseStale => {
-            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
-        }
+        ProtectionResult::RefusedNoLease => LeaseGateRefusal::NoLease
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ProtectionResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ProtectionResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
+        ProtectionResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+            .describe_line(&outcome.spreadsheet_id, &book)
+            .into_iter()
+            .collect(),
         ProtectionResult::Changed {
             summary,
             protected_range_id,
