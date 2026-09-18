@@ -591,6 +591,7 @@ pub fn describe(outcome: &WriteOutcome) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::drive::test_support::seed_lease;
 
     /// Every `describe` arm renders to exactly one line, for every verb.
     ///
@@ -797,34 +798,6 @@ mod tests {
             lease_token: Some(token),
             ledger_path,
         }
-    }
-
-    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
-    /// `version`, returning its token.
-    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
-        // A fixed token, not a random one: every call gets its own
-        // isolated ledger (a fresh tempdir), so uniqueness across tests is
-        // never a concern.
-        let token = "test-lease-token".to_string();
-        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
-        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
-            token: token.clone(),
-            file_id: spreadsheet_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
-        token
     }
 
     // ── refusals that must precede the gate and the network ────────────
