@@ -1298,9 +1298,12 @@ until [`drive lease prune`](#prune) drops the row and its backup together.
 One knock-on effect worth knowing: a *live* row never enters `prune
 --max-size`'s budget, so releasing a lease before its expiry adds its local
 backup bytes to that budget straight away — bounded by the window the lease
-had left, and never at the released row's own expense (it sorts
-newest-expiring-first, so it is the last candidate evicted). `--older-than`
-is unaffected: it compares `expires_at`, which release never moves.
+had left. It cannot cost the released row its own backup in favour of an
+*expired* one: candidates sort newest-`expires_at`-first, and a released
+row's expiry is still in the future, so every expired row is evicted before
+it. Only another early-released row can outrank it, by expiring later.
+`--older-than` is unaffected: it compares `expires_at`, which release never
+moves.
 
 An already-expired or already-released token is reported rather than
 silently re-stamped, so an earlier release's timestamp is never overwritten:
