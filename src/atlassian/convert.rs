@@ -224,6 +224,30 @@ impl<'a> MarkdownParser<'a> {
     /// before (issue #1732). A whitespace-only line that already carries the
     /// 2-space prefix is unaffected and keeps falling through to the
     /// existing paragraph-separator path below.
+    ///
+    /// Content indented *deeper* than the mandatory 2-space column (e.g. 3
+    /// spaces under a `1. ` marker, or hand-formatted 4-space nesting) keeps
+    /// its surplus after the strip above. Remove it by dedenting the item's
+    /// own *leading run* — the maximal prefix of `sub_lines` before the
+    /// first entry that is itself a nested list marker — by that run's own
+    /// minimum indent over non-blank-content entries (issue #1735).
+    ///
+    /// This is deliberately scoped to the leading run rather than the whole
+    /// returned block: a marker line's *residual* indentation is load-bearing
+    /// for the recursive parse one level down, which re-derives its own
+    /// `marker_indent` from `leading_spaces` on that very line. Dedenting a
+    /// marker line here would corrupt that derivation. Concretely, a fence
+    /// written at a nested item's own marker column (issue #1727's
+    /// "leniency": `- Child` and its fence at the *same* indent) relies on
+    /// each recursion level stripping only the mandatory 2 spaces from the
+    /// marker line for the residual to reach exactly 0 by the time the fence
+    /// needs recognizing at column 0 — a whole-block minimum computed across
+    /// the marker line too would strip too much from it and drop the fence's
+    /// content out of the item's scope entirely. Everything from the first
+    /// marker line onward is therefore left untouched; the recursive parse of
+    /// that nested content applies this same rule to *its own* leading run
+    /// when it recurses, so multi-level surplus is removed by induction one
+    /// level at a time.
     fn collect_item_sub_lines(&mut self, marker_indent: usize) -> Vec<String> {
         let mut sub_lines: Vec<String> = Vec::new();
         while !self.at_end() {
@@ -256,6 +280,28 @@ impl<'a> MarkdownParser<'a> {
             sub_lines.push(stripped.to_string());
             self.advance();
         }
+
+        // Dedent the surplus indentation ahead of the first nested marker
+        // (issue #1735); see the doc comment above for why the dedent stops
+        // there instead of covering the whole block.
+        let boundary = sub_lines
+            .iter()
+            .position(|l| is_list_start(l))
+            .unwrap_or(sub_lines.len());
+        let extra = sub_lines[..boundary]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| leading_spaces(l))
+            .min()
+            .unwrap_or(0);
+        if extra > 0 {
+            for line in &mut sub_lines[..boundary] {
+                if !line.trim().is_empty() {
+                    line.replace_range(..extra, "");
+                }
+            }
+        }
+
         sub_lines
     }
 
@@ -5904,6 +5950,124 @@ mod tests {
         assert_eq!(parent.len(), 2);
         assert_eq!(parent[1].node_type, "bulletList");
         assert_eq!(item_text(&outer[1]), "Next");
+    }
+
+    // ── surplus continuation indent (issue #1735) ────────────
+
+    /// Continuation text written at CommonMark's natural column for a `1. `
+    /// marker (3 spaces) must not keep the surplus space as literal text.
+    #[test]
+    fn ordered_item_continuation_at_natural_column_no_surplus() {
+        let md = "1. a\n   more\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(item.len(), 2, "item content: {item:?}");
+        assert_eq!(
+            item[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("more")
+        );
+    }
+
+    /// Same as above, with the #1732 blank-line lookahead routing the
+    /// continuation through the blank-line branch instead of the main loop.
+    #[test]
+    fn ordered_item_continuation_after_blank_at_natural_column_no_surplus() {
+        let md = "1. a\n\n   more\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(item.len(), 2, "item content: {item:?}");
+        assert_eq!(
+            item[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("more")
+        );
+    }
+
+    /// A bullet item's continuation indented deeper than the mandatory
+    /// 2-space column (4 spaces here) must not keep any surplus.
+    #[test]
+    fn bullet_item_continuation_deep_indent_no_surplus() {
+        let md = "- a\n    deep\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(item.len(), 2, "item content: {item:?}");
+        assert_eq!(
+            item[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("deep")
+        );
+    }
+
+    /// A fence written one column deeper than the item's natural content
+    /// column: before this fix it isn't even recognized as a fence (the
+    /// opener keeps a leading space and fails the column-0 check); the
+    /// dedent both removes the surplus and lets the fence be recognized.
+    #[test]
+    fn item_fence_one_column_deeper_than_natural_is_recognized_and_dedented() {
+        let md = "- a\n   ```bash\n   echo hi\n   ```";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(item.len(), 2, "item content: {item:?}");
+        assert_eq!(item[1].node_type, "codeBlock");
+        assert_eq!(
+            item[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("echo hi")
+        );
+    }
+
+    /// Surplus indentation is removed independently at every nesting depth
+    /// for a hand-formatted 4-space-per-level list with a genuine
+    /// continuation line before each nested marker.
+    #[test]
+    fn surplus_indent_removed_at_every_nesting_depth() {
+        let md = "- L1\n    text1\n    - L2\n        text2\n        - L3\n            text3\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let l1 = doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(l1.len(), 3, "L1 content: {l1:?}");
+        assert_eq!(
+            l1[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("text1")
+        );
+        let l2 = l1[2].content.as_ref().unwrap()[0].content.as_ref().unwrap();
+        assert_eq!(l2.len(), 3, "L2 content: {l2:?}");
+        assert_eq!(
+            l2[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("text2")
+        );
+        let l3 = l2[2].content.as_ref().unwrap()[0].content.as_ref().unwrap();
+        assert_eq!(l3.len(), 2, "L3 content: {l3:?}");
+        assert_eq!(
+            l3[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("text3")
+        );
+    }
+
+    /// Same fix at the task-list call site.
+    #[test]
+    fn task_item_continuation_at_natural_column_no_surplus() {
+        let md = "- [ ] a\n   deep\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = &doc.content[0].content.as_ref().unwrap()[0];
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(content.len(), 2, "task item content: {content:?}");
+        assert_eq!(content[1].node_type, "paragraph");
+        assert_eq!(
+            content[1].content.as_ref().unwrap()[0].text.as_deref(),
+            Some("deep")
+        );
     }
 
     // ── blank line before indented content (issue #1732) ────────────
