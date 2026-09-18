@@ -617,9 +617,7 @@ fn default_audit_file_path() -> Option<PathBuf> {
 
 /// Test-build variant of the function above: one shared scratch path for
 /// the whole test binary's process lifetime, never the real machine's
-/// default. Reached both for an un-opted thread (from
-/// `test_audit_file_override`, unconditionally) and for a
-/// `TestAuditRoute::Env` thread whose env var is unset.
+/// default. Reached for any un-opted thread, via `test_audit_file_override`.
 ///
 /// ADR-0080 §9/§11 made `check_and_lock_lease` (and `drive lease acquire`)
 /// write an audit record on essentially every lease-checking code path, so
