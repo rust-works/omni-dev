@@ -1140,14 +1140,24 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
-        // No PATCH mock mounted — a refusal must make zero mutating calls.
         let dir = tempfile::tempdir().unwrap();
         let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         let token = seed_lease(&ledger_path, "file-1", "1");
+        // Under flock (issue #1687), a busy lock now waits rather than
+        // hard-failing (`check_and_lock_lease` -> `acquire_waiting`), so a
+        // held `LedgerLock` no longer reproduces an immediate failure here.
+        // A directory at the lock path does: opening it for write fails
+        // outright with an I/O error, which is never retried.
         let mut lock_path = ledger_path.clone().into_os_string();
         lock_path.push(".lock");
-        std::fs::File::create(std::path::PathBuf::from(lock_path)).unwrap();
+        std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
 
         let opts = EditOptions {
             lease_token: Some(token),
