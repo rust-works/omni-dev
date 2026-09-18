@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
-use crate::cli::drive::helpers::active_account_rules;
+use crate::cli::drive::helpers::{active_account_rules, resolve_ledger_path};
 use crate::cli::drive::upload::read_local_content;
 use crate::drive::client::DriveClient;
 use crate::drive::content_edit::{self, EditOptions, EditOutcome, EditResult};
@@ -67,16 +67,7 @@ impl EditCommand {
         let content_type = self
             .mime_type
             .unwrap_or_else(|| DEFAULT_CONTENT_MIME_TYPE.to_string());
-        // A dry run never checks a lease (see the `--dry-run` flag's own
-        // doc comment) — `content_edit::edit` returns `WouldEdit` before
-        // the ledger is ever touched, so resolving a real path here would
-        // make a purely read-only preview depend on the state directory
-        // existing at all.
-        let ledger_path = if self.dry_run {
-            std::path::PathBuf::new()
-        } else {
-            crate::drive::lease::ledger::ledger_path()?
-        };
+        let ledger_path = resolve_ledger_path(self.dry_run)?;
         let opts = EditOptions {
             file_id: self.file_id,
             content,

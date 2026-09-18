@@ -73,6 +73,25 @@ pub fn active_account_lease_backup_folder_id() -> Result<Option<String>> {
     active_account_field(|a| a.lease_backup_folder_id.clone())
 }
 
+/// Resolves the lease ledger path for a leased Drive write command.
+///
+/// A dry run never checks a lease (every leased command's `*_inner`
+/// returns its preview outcome before the ledger is ever touched,
+/// mirroring `drive edit`'s own `--dry-run` reasoning) — resolving a real
+/// path here would make a purely read-only preview depend on the state
+/// directory existing at all.
+///
+/// Shared by `drive edit`/`sheets write`/`sheets format`/`sheets
+/// protection`/`sheets structure`/`sheets validation`/`docs write` —
+/// previously each of the seven reimplemented this identically.
+pub fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
+    if dry_run {
+        Ok(std::path::PathBuf::new())
+    } else {
+        crate::drive::lease::ledger::ledger_path()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -215,6 +234,20 @@ mod tests {
         assert_eq!(
             active_account_lease_backup_folder_id().unwrap().as_deref(),
             Some("backup-folder-1")
+        );
+    }
+
+    // ── resolve_ledger_path ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_ledger_path_for_a_real_run_resolves_the_ledger_path() {
+        // A dry run short-circuits to an empty path; a real run delegates
+        // to the shared ledger path resolver.
+        let path = resolve_ledger_path(false).unwrap();
+        assert!(path.ends_with("lease-ledger.jsonl"), "{}", path.display());
+        assert_eq!(
+            resolve_ledger_path(true).unwrap(),
+            std::path::PathBuf::new()
         );
     }
 }
