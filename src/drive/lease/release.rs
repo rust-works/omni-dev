@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::cli::drive::format::JsonlSerialize;
-use crate::drive::lease::ledger::{LeaseLedger, ReleaseOutcome};
+use crate::drive::lease::ledger::{LeaseLedger, LedgerLock, ReleaseOutcome};
 
 /// Per-call options for `drive lease release`.
 #[derive(Debug, Clone)]
@@ -111,16 +111,25 @@ impl ReleaseResult {
 /// and the ledger write is already durable by the time this returns. Turning
 /// a genuine release into a reported failure because a follow-up log write
 /// failed would make the tool's own output less trustworthy, not more.
-pub fn release(opts: &ReleaseOptions) -> ReleaseResult {
-    let result = release_inner(opts);
+pub async fn release(opts: &ReleaseOptions) -> ReleaseResult {
+    let result = release_inner(opts).await;
     record_attempt(opts, &result);
     result
 }
 
-fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
-    let outcome = LeaseLedger::mutate_locked(&opts.ledger_path, |ledger| {
-        ledger.release(&opts.token, Utc::now())
-    });
+/// Waits for a busy ledger lock rather than failing (issue #1738): a
+/// release mutates no Drive content and is always safe to queue, and it is
+/// the verb a failed restore tells the user to run next, so a hard-fail
+/// there leaves them stuck. Async so it can share the leased-write gate's
+/// [`LedgerLock::acquire_waiting`], which runs on any runtime flavor.
+async fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
+    let outcome = async {
+        let lock = LedgerLock::acquire_waiting(&opts.ledger_path).await?;
+        LeaseLedger::mutate(&lock, &opts.ledger_path, |ledger| {
+            ledger.release(&opts.token, Utc::now())
+        })
+    }
+    .await;
     match outcome {
         Ok(ReleaseOutcome::Released {
             file_id,
@@ -226,15 +235,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_live_lease_is_released_and_its_row_is_kept() {
+    #[tokio::test]
+    async fn a_live_lease_is_released_and_its_row_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         let _audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "live-token");
         let expires_at = Utc::now() + ChronoDuration::minutes(30);
         seed(&test_opts.ledger_path, "live-token", expires_at, None);
 
-        let result = release(&test_opts);
+        let result = release(&test_opts).await;
 
         assert!(matches!(
             &result,
@@ -249,8 +258,8 @@ mod tests {
         assert!(!record.is_live(Utc::now()));
     }
 
-    #[test]
-    fn an_already_released_lease_keeps_its_original_timestamp() {
+    #[tokio::test]
+    async fn an_already_released_lease_keeps_its_original_timestamp() {
         let dir = tempfile::tempdir().unwrap();
         let _audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "released-token");
@@ -262,7 +271,7 @@ mod tests {
             Some(first_release),
         );
 
-        let result = release(&test_opts);
+        let result = release(&test_opts).await;
 
         assert!(matches!(
             &result,
@@ -276,8 +285,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_expired_lease_is_reported_as_not_live_without_being_stamped() {
+    #[tokio::test]
+    async fn an_expired_lease_is_reported_as_not_live_without_being_stamped() {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "expired-token");
@@ -288,7 +297,7 @@ mod tests {
             None,
         );
 
-        let result = release(&test_opts);
+        let result = release(&test_opts).await;
 
         assert!(matches!(
             &result,
@@ -316,30 +325,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unknown_token_is_reported_rather_than_silently_succeeding() {
+    #[tokio::test]
+    async fn an_unknown_token_is_reported_rather_than_silently_succeeding() {
         let dir = tempfile::tempdir().unwrap();
         let _audit = AuditLogGuard::redirect(dir.path());
 
-        let result = release(&opts(dir.path(), "no-such-token"));
+        let result = release(&opts(dir.path(), "no-such-token")).await;
 
         assert!(matches!(result, ReleaseResult::NoSuchToken));
     }
 
-    #[test]
-    fn an_unreadable_ledger_is_reported_as_failed() {
+    #[tokio::test]
+    async fn an_unreadable_ledger_is_reported_as_failed() {
         let dir = tempfile::tempdir().unwrap();
         let _audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "any-token");
         std::fs::write(&test_opts.ledger_path, "{not json}\n").unwrap();
 
-        let result = release(&test_opts);
+        let result = release(&test_opts).await;
 
         assert!(matches!(result, ReleaseResult::Failed { .. }));
     }
 
-    #[test]
-    fn a_release_writes_an_audit_record_naming_the_token() {
+    // Current-thread on purpose: `release` is dispatched from one in
+    // `cli::drive`'s tests, so it must not reach for `block_in_place`.
+    #[tokio::test]
+    async fn a_release_waits_for_a_concurrent_holder_then_releases() {
+        // Issue #1738: an unrelated lease operation holding the ledger lock
+        // must delay a release, not fail it.
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "live-token");
+        seed(
+            &test_opts.ledger_path,
+            "live-token",
+            Utc::now() + ChronoDuration::minutes(30),
+            None,
+        );
+        let held = LedgerLock::acquire(&test_opts.ledger_path).unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+
+        let result = release(&test_opts).await;
+        releaser.join().unwrap();
+
+        assert!(
+            matches!(result, ReleaseResult::Released { .. }),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_writes_an_audit_record_naming_the_token() {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
         let test_opts = opts(dir.path(), "live-token");
@@ -350,7 +390,7 @@ mod tests {
             None,
         );
 
-        let result = release(&test_opts);
+        let result = release(&test_opts).await;
         assert!(matches!(result, ReleaseResult::Released { .. }));
 
         let records = audit.records();

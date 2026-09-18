@@ -79,7 +79,7 @@ impl LeaseCommand {
         match self.action {
             LeaseAction::Acquire(cmd) => cmd.execute(&client()?).await,
             LeaseAction::Restore(cmd) => cmd.execute(&client()?).await,
-            LeaseAction::Release(cmd) => cmd.execute(),
+            LeaseAction::Release(cmd) => cmd.execute().await,
             LeaseAction::Prune(cmd) => cmd.execute(client).await,
         }
     }
@@ -330,13 +330,13 @@ pub struct ReleaseCommand {
 }
 
 impl ReleaseCommand {
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         let ledger_path = ledger::ledger_path()?;
         let opts = ReleaseOptions {
             token: self.token,
             ledger_path,
         };
-        let result = release::release(&opts);
+        let result = release::release(&opts).await;
         if output_as(&result, &self.output)? {
             return Ok(());
         }

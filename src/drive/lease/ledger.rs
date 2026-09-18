@@ -387,12 +387,12 @@ impl LeaseLedger {
     }
 
     /// [`Self::mutate`], additionally acquiring [`LedgerLock`] first and
-    /// holding it for the call's duration — the fully self-contained
-    /// "acquire, load, mutate, save" sequence used by every ledger update
-    /// that does not need to hold the lock across additional work beyond
-    /// the mutation itself (e.g. `drive lease acquire`'s own
-    /// check-then-insert, or `drive lease restore`'s best-effort
-    /// mark-as-restored-from).
+    /// holding it for the call's duration — a self-contained "acquire,
+    /// load, mutate, save" for tests that seed or adjust ledger state.
+    /// Test-only: it takes the *non-waiting* lock, and every production
+    /// update now either waits for the lock itself (`acquire`'s insert,
+    /// `release`) or already holds one (issue #1738, #1737).
+    #[cfg(test)]
     pub(crate) fn mutate_locked<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
         let lock = LedgerLock::acquire(path)?;
         Self::mutate(&lock, path, f)
@@ -554,12 +554,15 @@ pub(crate) struct LedgerLock {
 impl LedgerLock {
     /// Acquires the lock guarding `ledger_path` without waiting. Production
     /// code passes [`ledger_path`]'s own result; tests pass a path under a
-    /// `tempdir` so they never touch the real ledger or its lock. Used by
-    /// `prune`'s candidate-selection scan, which should not block on
-    /// another operation (issue #1737 moved the restore module's own
-    /// non-waiting use of this — the best-effort restored-from stamp —
-    /// onto the already-held grant lock instead; see #1738 for the
-    /// remaining non-waiting callers).
+    /// `tempdir` so they never touch the real ledger or its lock.
+    ///
+    /// Reserved for `prune`'s candidate scan and per-row removal, where a
+    /// busy lock just leaves a row for a future prune. Everything whose
+    /// failure would waste work or strand a user — a leased write,
+    /// `acquire`'s insert, `release` — waits instead, via
+    /// [`Self::acquire_waiting`] or [`Self::acquire_waiting_blocking`];
+    /// `restore`'s restored-from stamp needs no lock of its own, since it
+    /// runs under the grant's (issue #1737).
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
@@ -628,6 +631,38 @@ impl LedgerLock {
             match attempt {
                 Some(lock) => return Ok(lock),
                 None => tokio::time::sleep(wait.next_delay()?).await,
+            }
+        }
+    }
+
+    /// [`Self::acquire_waiting`]'s synchronous twin, for a ledger mutation
+    /// that runs outside an `async fn` — `drive lease acquire`'s insert
+    /// (issue #1738). Same wait budget,
+    /// same backoff, same notice ([`LockWait`]); it only sleeps the thread
+    /// instead of yielding.
+    ///
+    /// **The caller must already be on a thread where blocking is
+    /// acceptable**: inside a `block_in_place` region, a `spawn_blocking`
+    /// task, or outside any runtime. Called bare from an async task, it
+    /// would stall that worker for the whole wait.
+    pub(crate) fn acquire_waiting_blocking(ledger_path: &Path) -> Result<Self> {
+        Self::acquire_waiting_blocking_with_timeout(ledger_path, default_lock_wait_timeout())
+    }
+
+    /// [`Self::acquire_waiting_blocking`] with an explicit wait budget —
+    /// the same test seam as [`Self::acquire_waiting_with_timeout`].
+    pub(crate) fn acquire_waiting_blocking_with_timeout(
+        ledger_path: &Path,
+        max_wait: Duration,
+    ) -> Result<Self> {
+        let path = lock_path_for(ledger_path);
+        crate::daemon::paths::ensure_parent_dir_0700(&path)?;
+
+        let mut wait = LockWait::new(&path, max_wait);
+        loop {
+            match Self::try_acquire_once(&path)? {
+                Some(lock) => return Ok(lock),
+                None => std::thread::sleep(wait.next_delay()?),
             }
         }
     }
@@ -1037,5 +1072,57 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err:?}");
+    }
+
+    #[test]
+    fn ledger_lock_acquire_waiting_blocking_waits_for_a_concurrent_holder_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+
+        LedgerLock::acquire_waiting_blocking_with_timeout(&ledger_path, Duration::from_secs(5))
+            .unwrap();
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn ledger_lock_acquire_waiting_blocking_times_out_when_never_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let _held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let err = LedgerLock::acquire_waiting_blocking_with_timeout(
+            &ledger_path,
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:?}");
+    }
+
+    #[test]
+    fn ledger_lock_acquire_waiting_blocking_does_not_retry_an_io_failure() {
+        // A directory at the lock path fails to open for write — an I/O
+        // error, not a busy lock — so it must surface at once rather than
+        // spend the (here generous) wait budget.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        std::fs::create_dir(lock_path_for(&ledger_path)).unwrap();
+
+        let start = Instant::now();
+        let err = LedgerLock::acquire_waiting_blocking_with_timeout(
+            &ledger_path,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to lock"), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an I/O failure was retried"
+        );
     }
 }
