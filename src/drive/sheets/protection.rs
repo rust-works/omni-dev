@@ -525,8 +525,8 @@ async fn protection_inner(
 
     let result = match api.batch_update(&opts.spreadsheet_id, vec![request]).await {
         Ok(response) => {
-            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
-                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
+            if let Some(grant) = &lease_grant {
+                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
             }
             let protected_range_id = added_protected_range_id(&response).or(existing_id);
             ProtectionResult::Changed {
@@ -536,8 +536,8 @@ async fn protection_inner(
         }
         Err(err) => {
             let detail = format!("{err:#}");
-            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
-                record_failed_leased_write(leased, token, &detail);
+            if let Some(grant) = &lease_grant {
+                record_failed_leased_write(leased, &grant.token, &detail);
             }
             ProtectionResult::Failed { detail }
         }

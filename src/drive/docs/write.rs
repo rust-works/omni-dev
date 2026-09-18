@@ -531,8 +531,8 @@ async fn write_inner(
         .await
     {
         Ok(response) => {
-            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
-                finish_leased_native_write(leased, &grant.lock, token, &files_api).await;
+            if let Some(grant) = &lease_grant {
+                finish_leased_native_write(leased, &grant.lock, &grant.token, &files_api).await;
             }
             match &opts.payload {
                 WritePayload::Replace { .. } => WriteResult::Replaced {
@@ -549,8 +549,8 @@ async fn write_inner(
             // `writeControl.requiredRevisionId` included — so the intent
             // record gets a `failed` outcome carrying the reason.
             let detail = err.to_string();
-            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
-                record_failed_leased_write(leased, token, &detail);
+            if let Some(grant) = &lease_grant {
+                record_failed_leased_write(leased, &grant.token, &detail);
             }
             if is_stale_revision(&err) {
                 WriteResult::StaleRevision {

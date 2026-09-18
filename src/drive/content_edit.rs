@@ -311,11 +311,11 @@ async fn edit_inner(
         .await
     {
         Ok(updated) => {
-            if let (Some(token), Some(grant)) = (&opts.lease_token, &lease_grant) {
+            if let Some(grant) = &lease_grant {
                 finish_leased_write(
                     leased,
                     &grant.lock,
-                    token,
+                    &grant.token,
                     updated.version,
                     updated.modified_time,
                 );
@@ -324,8 +324,8 @@ async fn edit_inner(
         }
         Err(err) => {
             let detail = err.to_string();
-            if let (Some(token), Some(_grant)) = (&opts.lease_token, &lease_grant) {
-                record_failed_leased_write(leased, token, &detail);
+            if let Some(grant) = &lease_grant {
+                record_failed_leased_write(leased, &grant.token, &detail);
             }
             EditResult::Failed { detail }
         }

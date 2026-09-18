@@ -76,6 +76,10 @@ pub(crate) struct LeaseGrant {
     /// The backup recorded at `drive lease acquire` time — bytes on disk
     /// for a binary file, a Drive copy for a native document (ADR-0080 §3).
     pub(crate) backup: LeaseBackup,
+    /// The `--lease` token this grant validated — carried so a caller
+    /// doesn't have to zip a separately-held `Option<&str>` token against
+    /// `Option<&LeaseGrant>` to reconstruct what this grant already proved.
+    pub(crate) token: String,
 }
 
 /// Identifies one leased write to [`check_and_lock_lease`] and the two
@@ -249,6 +253,7 @@ pub(crate) async fn check_and_lock_lease(
     Ok(LeaseGrant {
         lock,
         backup: record.backup.clone(),
+        token: token.to_string(),
     })
 }
 
