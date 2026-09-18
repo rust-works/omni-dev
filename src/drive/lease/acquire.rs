@@ -24,9 +24,9 @@ use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
-#[cfg(test)]
-use crate::drive::lease::ledger::LedgerLock;
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, ReleaseOutcome};
+use crate::drive::lease::ledger::{
+    LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock, ReleaseOutcome,
+};
 use crate::drive::types::DriveFile;
 
 /// Per-call options for `drive lease acquire`.
@@ -769,13 +769,18 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inserts `record` into the ledger at `ledger_path` under
-/// [`LeaseLedger::mutate_locked`]'s lock, loading and saving it in full —
-/// the atomic-rewrite contract [`LeaseLedger`] documents. This lock-held
-/// check-then-insert is the
+/// Inserts `record` into the ledger at `ledger_path` under the ledger lock,
+/// loading and saving it in full — the atomic-rewrite contract
+/// [`LeaseLedger`] documents. This lock-held check-then-insert is the
 /// authoritative gate against two leases ever being live on the same file
 /// at once (see [`LeaseLedger::live_lease_for_file`]'s doc comment) — unlike
 /// a check made before taking the lock, nothing can race it.
+///
+/// Waits for a busy lock rather than refusing (issue #1738): by now this
+/// attempt has spent the Touch ID prompt and a full backup, so hard-failing
+/// behind an unrelated lease operation would throw both away. Blocking is
+/// safe here because the one production caller, `finish_acquisition`,
+/// already runs this under `block_in_place`.
 ///
 /// `supersedes` names a lease this insert replaces
 /// ([`AcquireOptions::supersedes`]), released here in the *same* rewrite that
@@ -786,10 +791,11 @@ fn insert_record(
     ledger_path: &Path,
     supersedes: Option<&str>,
 ) -> anyhow::Result<InsertOutcome> {
-    LeaseLedger::mutate_locked(ledger_path, |ledger| {
+    let lock = LedgerLock::acquire_waiting_blocking(ledger_path)?;
+    LeaseLedger::mutate(&lock, ledger_path, |ledger| {
         let now = Utc::now();
         // Order is load-bearing: check, then release, then insert.
-        // `mutate_locked` saves whatever the closure leaves behind even when
+        // `mutate` saves whatever the closure leaves behind even when
         // it returns a refusal, so releasing before this check would end the
         // superseded lease's window on a path that mints nothing to replace
         // it — losing the caller's lease to a *third* lease's race.
@@ -1271,15 +1277,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ledger_insert_failure_reclaims_the_backup_just_taken() {
-        // A concurrent lease op (or a leftover lock from a crash) holds the
-        // ledger lock across this attempt's own `insert_record` — the
-        // routine, non-race way `Failed` still follows a full backup
+        // The ledger lock cannot be taken at this attempt's own
+        // `insert_record` — the way `Failed` still follows a full backup
         // (issue #1690): the lock-free pre-check can't see this, since it
-        // takes no lock itself. A held `LedgerLock`, not a bare
-        // `File::create` on the lock path (issue #1687): under `flock`,
-        // the file's mere existence holds nothing — only an actual lock
-        // does, and `flock` conflicts against a second `open()` even from
-        // this same process.
+        // takes no lock itself. A directory at the lock path, not a held
+        // `LedgerLock`: `insert_record` now waits out a busy lock (issue
+        // #1738), so holding one would stall this test for the whole wait
+        // budget, whereas opening a directory for write is an I/O error,
+        // which is never retried.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -1301,7 +1306,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
-        let _held = LedgerLock::acquire(&test_opts.ledger_path).unwrap();
+        let mut lock_path = test_opts.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::create_dir(PathBuf::from(lock_path)).unwrap();
 
         let result = acquire(
             &client,
@@ -2589,6 +2596,33 @@ mod tests {
             panic!("expected Acquired, got {second:?}");
         };
         assert_ne!(second_token, first_token);
+    }
+
+    #[test]
+    fn insert_record_waits_for_a_concurrent_holder_then_inserts() {
+        // Issue #1738: an unrelated lease operation holding the ledger lock
+        // must delay this insert, not fail it — by now the attempt has
+        // already spent the prompt and the backup.
+        let root = tempfile::tempdir().unwrap();
+        let ledger_path = root.path().join("lease-ledger.jsonl");
+        let held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+
+        let outcome = insert_record(live_row("new", "f1"), &ledger_path, None).unwrap();
+        releaser.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Inserted { superseded: false }
+        ));
+        assert!(LeaseLedger::load(&ledger_path)
+            .unwrap()
+            .get("new")
+            .is_some());
     }
 
     // ── supersede: `drive lease restore` replacing its own backup lease (#1685) ──
