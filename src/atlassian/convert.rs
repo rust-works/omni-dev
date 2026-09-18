@@ -39,6 +39,8 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
     let mut doc = AdfDocument::new();
     let mut parser = MarkdownParser::new(markdown);
     doc.content = parser.parse_blocks()?;
+    doc.content = merge_adjacent_lists(doc.content);
+    strip_merge_markers(&mut doc.content);
     let split = split_emphasis_code_marks(&mut doc.content);
     if split > 0 {
         debug!(
@@ -51,6 +53,141 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
         doc.content.len()
     );
     Ok(doc)
+}
+
+/// Effective start number of an orderedList node (attrs.order, default 1).
+fn ordered_list_start(node: &AdfNode) -> u32 {
+    node.attrs
+        .as_ref()
+        .and_then(|a| a.get("order"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1)
+}
+
+/// Transient attr key carrying the source indentation of a parsed list.  Used
+/// only by the loose-list merge pass and stripped before the document is
+/// returned, so it never leaks into the produced ADF.
+const LIST_SRC_INDENT_KEY: &str = "__src_indent";
+
+/// Records the source indentation of a freshly parsed list.
+fn tag_list_indent(node: &mut AdfNode, indent: Option<usize>) {
+    if let Some(indent) = indent {
+        let attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
+        attrs[LIST_SRC_INDENT_KEY] = serde_json::json!(indent);
+    }
+}
+
+/// Source indentation recorded by [`tag_list_indent`], if any.
+fn list_indent(node: &AdfNode) -> Option<usize> {
+    node.attrs
+        .as_ref()?
+        .get(LIST_SRC_INDENT_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+/// Removes the transient source-indent marker from every node's attrs.  Only
+/// attrs that actually carried the marker are touched — legitimately empty
+/// attrs objects (e.g. on tableCell) must survive.
+fn strip_merge_markers(nodes: &mut [AdfNode]) {
+    for node in nodes {
+        if let Some(attrs) = node.attrs.as_mut() {
+            if let Some(obj) = attrs.as_object_mut() {
+                if obj.remove(LIST_SRC_INDENT_KEY).is_some() && obj.is_empty() {
+                    node.attrs = None;
+                }
+            }
+        }
+        if let Some(content) = node.content.as_mut() {
+            strip_merge_markers(content);
+        }
+    }
+}
+
+/// True when the node carries an explicit `order` attr (e.g. restored from an
+/// `{order=1}` markdown signal) rather than an implicit start.
+fn has_explicit_order(node: &AdfNode) -> bool {
+    node.attrs
+        .as_ref()
+        .is_some_and(|a| a.get("order").is_some())
+}
+
+/// True when two adjacent orderedLists represent one continuous CommonMark list:
+/// the second starts right after the first's last item, or both start at 1.
+/// A genuine numbering restart (the second start lands elsewhere) keeps the
+/// lists separate, and so does an explicit `order: 1` attr on either side —
+/// that signal marks a deliberately separate list (issue #547 round-trip
+/// byte-fidelity), which fusing would swallow.
+fn ordered_lists_continue(first: &AdfNode, second: &AdfNode) -> bool {
+    // An explicit `order: 1` on either side is a deliberate "separate list"
+    // signal (issue #547 round-trip byte-fidelity) — fusing would swallow
+    // the marker, so such runs never fuse even when the numbers continue.
+    if has_explicit_order(first) && ordered_list_start(first) == 1 {
+        return false;
+    }
+    if has_explicit_order(second) && ordered_list_start(second) == 1 {
+        return false;
+    }
+    let first_start = ordered_list_start(first);
+    let second_start = ordered_list_start(second);
+    let first_len = first.content.as_ref().map_or(0, Vec::len) as u32;
+    second_start == first_start + first_len || (first_start == 1 && second_start == 1)
+}
+
+/// Fuses runs of adjacent sibling list nodes into single lists — markdown
+/// "loose" lists (blank-line-separated items).  The block parser ends a list at
+/// the first blank line, so a loose list arrives as several sibling lists,
+/// while CommonMark treats it as ONE list.  Adjacent runs only merge when they
+/// belong to the same source indentation AND continue each other:
+///
+///   - bulletList + bulletList   → always merged;
+///   - orderedList + orderedList → merged when the numbering continues (the
+///     second's start equals the first's start + its item count) or both start
+///     at 1; a restart keeps them separate;
+///   - orderedList ↔ bulletList  → never merged;
+///   - anything between the two  → never merged (no longer one list).
+///
+/// The indentation check matters because a blank line also makes the parser
+/// spill an indented (nested) list up to the current content level — without it
+/// a parent item's list would fuse with its escaped nested list.  The pass runs
+/// per content array (recursively), so it only ever fuses same-parent siblings
+/// and never crosses listItem boundaries.
+fn merge_adjacent_lists(nodes: Vec<AdfNode>) -> Vec<AdfNode> {
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        if let Some(content) = node.content.as_mut() {
+            *content = merge_adjacent_lists(std::mem::take(content));
+        }
+    }
+    let mut merged: Vec<AdfNode> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let fuses = merged.last().is_some_and(|prev| {
+            let same_indent =
+                list_indent(prev).is_some() && list_indent(prev) == list_indent(&node);
+            match (prev.node_type.as_str(), node.node_type.as_str()) {
+                ("bulletList", "bulletList") => same_indent,
+                ("orderedList", "orderedList") => {
+                    same_indent && ordered_lists_continue(prev, &node)
+                }
+                _ => false,
+            }
+        });
+        if fuses {
+            // The surviving node keeps its own attrs: a start-at-1 run stays
+            // start-at-1, a continued run keeps its explicit start.
+            if let Some(prev) = merged.last_mut() {
+                if let Some(next_items) = node.content {
+                    if let Some(items) = prev.content.as_mut() {
+                        items.extend(next_items);
+                    }
+                }
+            }
+        } else {
+            merged.push(node);
+        }
+    }
+    merged
 }
 
 /// Line-oriented state machine for parsing markdown into ADF block nodes.
@@ -378,6 +515,9 @@ impl<'a> MarkdownParser<'a> {
     fn parse_bullet_list(&mut self) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
         let mut is_task_list = false;
+        // Source indentation of the list's first marker — a transient tag for
+        // the loose-list merge pass (stripped before the document is returned).
+        let mut first_marker_indent: Option<usize> = None;
 
         while !self.at_end() {
             let line = self.current_line();
@@ -388,6 +528,9 @@ impl<'a> MarkdownParser<'a> {
                 || trimmed.starts_with("+ "))
             {
                 break;
+            }
+            if first_marker_indent.is_none() {
+                first_marker_indent = Some(leading_spaces(line));
             }
 
             let after_marker = trimmed[2..].trim_start();
@@ -499,20 +642,30 @@ impl<'a> MarkdownParser<'a> {
         if items.is_empty() {
             Ok(None)
         } else if is_task_list {
-            Ok(Some(AdfNode::task_list(items)))
+            let mut list = AdfNode::task_list(items);
+            tag_list_indent(&mut list, first_marker_indent);
+            Ok(Some(list))
         } else {
-            Ok(Some(AdfNode::bullet_list(items)))
+            let mut list = AdfNode::bullet_list(items);
+            tag_list_indent(&mut list, first_marker_indent);
+            Ok(Some(list))
         }
     }
 
     fn parse_ordered_list(&mut self, start: u32) -> Result<Option<AdfNode>> {
         let mut items = Vec::new();
+        // Source indentation of the list's first marker — a transient tag for
+        // the loose-list merge pass (stripped before the document is returned).
+        let mut first_marker_indent: Option<usize> = None;
 
         while !self.at_end() {
             let line = self.current_line();
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
+                if first_marker_indent.is_none() {
+                    first_marker_indent = Some(leading_spaces(line));
+                }
                 let first_line = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
                 self.advance();
                 let mut full_text = first_line.to_string();
@@ -537,7 +690,9 @@ impl<'a> MarkdownParser<'a> {
             Ok(None)
         } else {
             let order = if start == 1 { None } else { Some(start) };
-            Ok(Some(AdfNode::ordered_list(items, order)))
+            let mut list = AdfNode::ordered_list(items, order);
+            tag_list_indent(&mut list, first_marker_indent);
+            Ok(Some(list))
         }
     }
 
@@ -5694,6 +5849,148 @@ mod tests {
         let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
         assert_eq!(types, vec!["text", "hardBreak", "text"]);
         assert_eq!(inlines[2].text.as_deref(), Some("2. continued"));
+    }
+
+    /// Markdown "loose" lists (blank line between items) arrive from the block
+    /// parser as several sibling lists; the post-pass must fuse them back into
+    /// one CommonMark list with per-item paragraph content.
+    #[test]
+    fn loose_ordered_list_merges_into_one() {
+        let md = "1. а\n\n2. б\n\n3. в";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1);
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        assert!(list.attrs.is_none());
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert_eq!(item.content.as_ref().unwrap().len(), 1);
+            assert_eq!(item.content.as_ref().unwrap()[0].node_type, "paragraph");
+        }
+    }
+
+    #[test]
+    fn loose_bullet_list_merges_into_one() {
+        let md = "- а\n\n- б\n\n- в";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1);
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        assert_eq!(list.content.as_ref().unwrap().len(), 3);
+    }
+
+    /// An orderedList whose start does not continue the previous list is a
+    /// genuine numbering restart by the author — the lists stay separate.
+    #[test]
+    fn ordered_lists_with_numbering_restart_not_merged() {
+        let md = "1. а\n2. б\n\n5. в";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "orderedList");
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 2);
+        let attrs = doc.content[1].attrs.as_ref().unwrap();
+        assert_eq!(attrs["order"], 5);
+        assert_eq!(doc.content[1].content.as_ref().unwrap().len(), 1);
+    }
+
+    /// Two runs both starting at 1 continue each other (CommonMark numbers by
+    /// position and ignores the repeated literal "1.").
+    #[test]
+    fn ordered_lists_both_starting_at_one_merge() {
+        let md = "1. а\n2. б\n\n1. в\n2. г";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1);
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        assert!(list.attrs.is_none());
+        assert_eq!(list.content.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn ordered_and_bullet_lists_not_merged() {
+        let md = "1. а\n\n- б";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "bulletList");
+    }
+
+    #[test]
+    fn lists_separated_by_paragraph_not_merged() {
+        let md = "1. а\n\nТекст между списками.\n\n2. б";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 3);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "paragraph");
+        assert_eq!(doc.content[2].node_type, "orderedList");
+    }
+
+    /// A loose nested list inside a list item fuses within that item.  The
+    /// blank lines between the nested items carry the item's indentation — a
+    /// bare blank line would end the item's sub-content (and spill the nested
+    /// list up a level; see the spilled-by-blank-line test below).
+    #[test]
+    fn nested_loose_list_merges_inside_list_item() {
+        let md = "1. Родитель:\n    1. А\n    \n    2. Б\n    \n2. Следующий";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(outer.len(), 2);
+        let first = outer[0].content.as_ref().unwrap();
+        assert_eq!(first.len(), 2); // paragraph + ONE merged nested list
+        assert_eq!(first[1].node_type, "orderedList");
+        assert_eq!(first[1].content.as_ref().unwrap().len(), 2);
+        assert_eq!(item_text(&first[1].content.as_ref().unwrap()[0]), "А");
+        assert_eq!(item_text(&first[1].content.as_ref().unwrap()[1]), "Б");
+        assert_eq!(item_text(&outer[1]), "Следующий");
+    }
+
+    /// A blank line before an indented item spills the nested list up to the
+    /// document level; there it must stay separate from the parent list
+    /// (different source indentation), not fuse with it.
+    #[test]
+    fn nested_list_spilled_by_blank_line_not_merged_with_parent() {
+        let md = "1. Родитель:\n\n    1. А";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "orderedList");
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 1);
+        assert_eq!(doc.content[1].content.as_ref().unwrap().len(), 1);
+    }
+
+    /// No transient merge marker ever leaks into the produced ADF, merged or not.
+    #[test]
+    fn no_src_indent_marker_leaks_into_output() {
+        for md in [
+            "1. а\n\n2. б",
+            "- а\n\n- б",
+            "1. а\n2. б\n\n5. в",
+            "- [ ] таск\n\n- [ ] таск2",
+        ] {
+            let doc = markdown_to_adf(md).unwrap();
+            let json = serde_json::to_string(&doc).unwrap();
+            assert!(!json.contains("__src_indent"), "marker leaked for {md:?}");
+        }
+    }
+
+    /// An explicit `order: 1` attr (rendered as an `{order=1}` line) marks a
+    /// deliberately separate list — the runs must not fuse (issue #547
+    /// round-trip byte-fidelity).
+    #[test]
+    fn explicit_order_one_marks_separate_list_not_merged() {
+        // `{order=1}` is emitted as a trailing attrs line after the list it
+        // belongs to (as the renderer does for adjacent [ol{order:1}, ol{}]).
+        let md = "1. а\n{order=1}\n\n1. б";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 2);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        assert_eq!(doc.content[1].node_type, "orderedList");
+        assert_eq!(doc.content[0].attrs.as_ref().unwrap()["order"], 1);
+        assert!(doc.content[1].attrs.is_none());
+        assert_eq!(doc.content[0].content.as_ref().unwrap().len(), 1);
+        assert_eq!(doc.content[1].content.as_ref().unwrap().len(), 1);
     }
 
     #[test]
