@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -465,6 +465,63 @@ fn default_lock_wait_timeout() -> Duration {
         )
 }
 
+/// The backoff before the second attempt on a busy lock; each further busy
+/// attempt doubles it, up to [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+
+/// The ceiling [`INITIAL_BACKOFF`]'s doubling settles at.
+const MAX_BACKOFF: Duration = Duration::from_millis(500);
+
+/// The wait policy every waiting [`LedgerLock`] acquisition steps: the
+/// backoff schedule, the one-line notice on the first collision, and the
+/// timeout message. Kept in one place so the drivers that step it differ
+/// only in *how* they sleep and cannot drift on anything else.
+struct LockWait<'a> {
+    path: &'a Path,
+    start: Instant,
+    delay: Duration,
+    max_wait: Duration,
+    announced: bool,
+}
+
+impl<'a> LockWait<'a> {
+    fn new(path: &'a Path, max_wait: Duration) -> Self {
+        Self {
+            path,
+            start: Instant::now(),
+            delay: INITIAL_BACKOFF,
+            max_wait,
+            announced: false,
+        }
+    }
+
+    /// Called after each busy attempt: announces the first collision, so a
+    /// human waiting on the CLI knows why nothing is happening yet, then
+    /// returns how long to sleep before the next attempt — or the timeout
+    /// error once `max_wait` is spent.
+    fn next_delay(&mut self) -> Result<Duration> {
+        if !self.announced {
+            tracing::warn!(
+                "drive lease: waiting for another `drive lease` operation to finish ({} is \
+                 locked)",
+                self.path.display()
+            );
+            self.announced = true;
+        }
+        if self.start.elapsed() >= self.max_wait {
+            anyhow::bail!(
+                "timed out after {:?} waiting for another `drive lease` operation to finish ({} \
+                 is locked) — concurrent access would clobber the ledger",
+                self.max_wait,
+                self.path.display()
+            );
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(MAX_BACKOFF);
+        Ok(delay)
+    }
+}
+
 /// An advisory lock guarding against two overlapping `drive lease
 /// acquire`/leased-write invocations against the same ledger:
 /// [`LeaseLedger::save`] rewrites the whole file, so a second call's
@@ -501,13 +558,24 @@ impl LedgerLock {
     pub(crate) fn acquire(ledger_path: &Path) -> Result<Self> {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
-        match crate::daemon::paths::try_lock_file_exclusive(&path) {
-            Ok(inner) => Ok(Self { inner }),
-            Err(crate::daemon::paths::FileLockError::Busy) => anyhow::bail!(
+        match Self::try_acquire_once(&path)? {
+            Some(lock) => Ok(lock),
+            None => anyhow::bail!(
                 "another `drive lease` operation appears to already be in progress ({} is \
                  locked) — concurrent access would clobber the ledger",
                 path.display()
             ),
+        }
+    }
+
+    /// One attempt on the lock file at `path` (already the `.lock` sibling,
+    /// not the ledger): `Some` when taken, `None` when another holder has
+    /// it. An I/O failure is an `Err`, and no caller retries it — only
+    /// `None` is worth waiting out.
+    fn try_acquire_once(path: &Path) -> Result<Option<Self>> {
+        match crate::daemon::paths::try_lock_file_exclusive(path) {
+            Ok(inner) => Ok(Some(Self { inner })),
+            Err(crate::daemon::paths::FileLockError::Busy) => Ok(None),
             Err(crate::daemon::paths::FileLockError::Io(err)) => Err(err.context(format!(
                 "failed to lock the lease lock file at {}",
                 path.display()
@@ -522,8 +590,7 @@ impl LedgerLock {
     /// #1687 point 1; the lock remains ledger-global, so this only
     /// changes hard-fail into wait, it does not add per-file scope).
     /// Polls with capped exponential backoff and emits a one-line notice
-    /// on the first collision, so a human waiting on the CLI knows why
-    /// nothing is happening yet.
+    /// on the first collision (see [`LockWait`]).
     pub(crate) async fn acquire_waiting(ledger_path: &Path) -> Result<Self> {
         Self::acquire_waiting_with_timeout(ledger_path, default_lock_wait_timeout()).await
     }
@@ -538,38 +605,11 @@ impl LedgerLock {
         let path = lock_path_for(ledger_path);
         crate::daemon::paths::ensure_parent_dir_0700(&path)?;
 
-        let start = std::time::Instant::now();
-        let mut delay = Duration::from_millis(50);
-        let mut announced = false;
+        let mut wait = LockWait::new(&path, max_wait);
         loop {
-            match crate::daemon::paths::try_lock_file_exclusive(&path) {
-                Ok(inner) => return Ok(Self { inner }),
-                Err(crate::daemon::paths::FileLockError::Busy) => {
-                    if !announced {
-                        tracing::warn!(
-                            "drive lease: waiting for another `drive lease` operation to \
-                             finish ({} is locked)",
-                            path.display()
-                        );
-                        announced = true;
-                    }
-                    if start.elapsed() >= max_wait {
-                        anyhow::bail!(
-                            "timed out after {max_wait:?} waiting for another `drive lease` \
-                             operation to finish ({} is locked) — concurrent access would \
-                             clobber the ledger",
-                            path.display()
-                        );
-                    }
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_millis(500));
-                }
-                Err(crate::daemon::paths::FileLockError::Io(err)) => {
-                    return Err(err.context(format!(
-                        "failed to lock the lease lock file at {}",
-                        path.display()
-                    )))
-                }
+            match Self::try_acquire_once(&path)? {
+                Some(lock) => return Ok(lock),
+                None => tokio::time::sleep(wait.next_delay()?).await,
             }
         }
     }
