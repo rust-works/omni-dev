@@ -822,7 +822,7 @@ mod tests {
             Some("2026-09-12T00:00:00Z"),
         )
         .await;
-        assert!(matches!(outcome, Ok(_)));
+        assert!(outcome.is_ok());
 
         let records = audit.records();
         assert_eq!(audit.verdicts(), [verdict::PENDING], "{records:?}");
@@ -1161,7 +1161,7 @@ mod tests {
         releaser.join().unwrap();
 
         assert!(
-            matches!(outcome, Ok(_)),
+            outcome.is_ok(),
             "waited holder should have released the lock"
         );
         assert_eq!(audit.verdicts(), [verdict::PENDING]);
