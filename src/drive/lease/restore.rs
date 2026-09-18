@@ -463,8 +463,11 @@ async fn restore_inner(
     // hands this worker thread's other queued tasks off to the runtime's
     // other workers for the duration, the same reasoning `acquire.rs`'s own
     // `write_backup`/`insert_record` calls document (issue #1664 review
-    // finding: this call and `mark_backup_restored`'s below were the two
-    // synchronous calls in this module not already following that pattern).
+    // finding: this call and the restored-from stamp below were the two
+    // synchronous calls in this module not already following that pattern
+    // — the stamp itself no longer needs the wrapper since issue #1737
+    // folded it into the same unwrapped ledger write `finish_leased_write`
+    // already does under this same held lock).
     // Only `RestorePlan::Bytes` needs this: a sheet restore's content read
     // *is* the `copyTo` write itself, done later. Consumes `plan` into a
     // `PreparedRestore` so a `Bytes` write can hold real bytes rather than
@@ -706,7 +709,6 @@ async fn restore_inner(
             }
         }
     };
-    drop(grant);
 
     // Mark the backup lease's own row as consumed (ADR-0080 §4's
     // "transition"), best-effort — the restore itself already succeeded or
@@ -715,6 +717,18 @@ async fn restore_inner(
     // A sheet restore also records the id `copyTo` just created, which is
     // the only thing that lets a later run tell "already restored" from "a
     // live sheet that merely shares the title" (issue #1689).
+    //
+    // Done here, before `drop(grant)`, rather than after: `grant`'s lock is
+    // ledger-global (`LeaseLedger::save` rewrites the whole file), so this
+    // stamp is just as exposed as the fresh lease's own row to a concurrent,
+    // unrelated ledger write racing a load-then-save — the same class of
+    // bug a lock exists to prevent everywhere else in this module. Stamping
+    // while `grant` is still held reuses that already-held lock instead of
+    // releasing it and racing to get it back (issue #1737: the previous
+    // post-drop re-acquisition went through the *non-waiting*
+    // `LedgerLock::acquire`, so it could lose the stamp to ordinary
+    // contention — routine since #1687, since every leased write holds this
+    // same lock across its whole HTTP call).
     let restored_sheet_id = match &result {
         RestoreResult::RestoredSheet { sheet_id, .. } => Some(*sheet_id),
         _ => None,
@@ -723,16 +737,10 @@ async fn restore_inner(
         result,
         RestoreResult::Restored { .. } | RestoreResult::RestoredSheet { .. }
     ) {
-        // Synchronous ledger I/O (lock, load, save) on the async runtime's
-        // current thread — `block_in_place` hands its other queued tasks
-        // off to the runtime's other workers for the duration, the same
-        // reasoning `acquire.rs`'s own ledger writes document (issue #1664
-        // review finding).
-        tokio::task::block_in_place(|| {
-            mark_backup_restored(&opts.ledger_path, &opts.token, restored_sheet_id);
-        });
+        stamp_backup_restored(&opts.ledger_path, &opts.token, restored_sheet_id);
     }
 
+    drop(grant);
     result
 }
 
@@ -1028,21 +1036,25 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 /// Best-effort: stamps `token`'s row with `restored_at` and, for a sheet
 /// restore, the id `copyTo` created live (ADR-0080 §4, issue #1689).
 ///
-/// Goes through [`LeaseLedger::mutate_locked`] — this runs after
-/// `restore_inner` has already released its own lock (acquired via
-/// `gate_leased_write`/`finish_leased_write` for the *fresh* lease's row),
-/// so without a fresh lock here this load-then-save could race a
-/// concurrent, unrelated `drive lease acquire`/write on a *different*
-/// file: `LeaseLedger::save` rewrites the whole file, so whichever of the
-/// two calls saves last would silently discard the other's change (issue
-/// #1664 review finding) — exactly the class of bug the lock exists to
-/// prevent everywhere else in this module.
-fn mark_backup_restored(ledger_path: &Path, token: &str, restored_sheet_id: Option<i64>) {
-    let result = LeaseLedger::mutate_locked(ledger_path, |ledger| {
+/// Goes through [`LeaseLedger::mutate`], not [`LeaseLedger::mutate_locked`]
+/// — the caller (`restore_inner`) is still holding `grant`'s lock (acquired
+/// via `gate_leased_write` for the *fresh* lease's row) when it calls this,
+/// so acquiring a second lock here would be redundant at best and, since
+/// `LedgerLock` isn't reentrant, would `Busy` against itself. `mutate`'s own
+/// doc comment spells out this "caller already holds the lock" contract.
+/// Previously this ran *after* the lock was dropped and re-acquired it
+/// itself via `mutate_locked`'s non-waiting `LedgerLock::acquire`, which
+/// could lose the stamp to ordinary contention on `Busy` (issue #1737) —
+/// routine since #1687, since every leased write holds this same lock
+/// across its whole HTTP call. A failure here is now `warn!`, not
+/// `debug!`: it can no longer be explained away as "someone else briefly
+/// had the lock".
+fn stamp_backup_restored(ledger_path: &Path, token: &str, restored_sheet_id: Option<i64>) {
+    let result = LeaseLedger::mutate(ledger_path, |ledger| {
         ledger.mark_restored(token, Utc::now(), restored_sheet_id);
     });
     if let Err(err) = result {
-        tracing::debug!(
+        tracing::warn!(
             "drive lease restore: failed to mark the backup lease as restored-from: {err}"
         );
     }
@@ -2717,35 +2729,38 @@ mod tests {
     }
 
     #[test]
-    fn mark_backup_restored_takes_its_own_lock_and_is_best_effort_when_unavailable() {
-        // Regression test for issue #1664's review finding: marking the
-        // backup lease as restored-from must take its own `LedgerLock`
-        // (closing a concurrent-save race with an unrelated
-        // acquire/write elsewhere in this module — `LeaseLedger::save`
-        // rewrites the whole file). Tested directly against the private
-        // function rather than through the full `restore()` flow: every
-        // step of that flow (the fresh lease's own acquire, its
-        // `gate_leased_write` check) shares the *same* lock path, so
-        // pre-holding it for the whole flow would block those legitimate
-        // acquisitions too, not just this one.
-        //
-        // A held `LedgerLock`, not a bare `File::create` on the lock path
-        // (issue #1687): under `flock`, the file's mere existence holds
-        // nothing — only an actual lock does, and `flock` conflicts against
-        // a second `open()` even from this same process.
+    fn stamp_backup_restored_succeeds_even_though_a_ledger_lock_is_held_elsewhere() {
+        // Regression test for issue #1737: the predecessor of this
+        // function, `mark_backup_restored`, re-acquired `LedgerLock` itself
+        // via `mutate_locked`'s non-waiting `LedgerLock::acquire`, so a
+        // `LedgerLock` held anywhere else at the moment it ran made it
+        // silently drop the stamp — routine contention once #1687 made
+        // every leased write hold this same lock across its whole HTTP
+        // call. `stamp_backup_restored` now goes through the lock-agnostic
+        // `LeaseLedger::mutate`, trusting its caller (`restore_inner`) to
+        // already be holding `grant`'s lock — so an unrelated `LedgerLock`
+        // held here (standing in for that already-held lock) must not
+        // block it. Tested directly against the private function rather
+        // than through the full `restore()` flow: every step of that flow
+        // (the fresh lease's own acquire, its `gate_leased_write` check)
+        // shares the *same* lock path via the *waiting*
+        // `LedgerLock::acquire_waiting`, so pre-holding it for the whole
+        // flow would just make the flow wait, not exercise this function's
+        // own contract.
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         seed_backup_lease(&ledger_path, "file-1", write_backup_file(dir.path(), b"x"));
         let _held = LedgerLock::acquire(&ledger_path).unwrap();
 
-        // Must not panic despite the lock already being held.
-        mark_backup_restored(&ledger_path, "backup-token", Some(999));
+        stamp_backup_restored(&ledger_path, "backup-token", Some(999));
 
         let ledger = LeaseLedger::load(&ledger_path).unwrap();
+        let record = ledger.get("backup-token").unwrap();
         assert!(
-            ledger.get("backup-token").unwrap().restored_at.is_none(),
-            "the lock was held, so the mark must not have landed"
+            record.restored_at.is_some(),
+            "must land despite the unrelated lock being held"
         );
+        assert_eq!(record.restored_sheet_id, Some(999));
     }
 
     #[tokio::test(flavor = "multi_thread")]
