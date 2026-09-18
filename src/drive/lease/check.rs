@@ -497,13 +497,13 @@ pub(crate) fn record_failed_leased_write(write: LeasedWrite<'_>, token: &str, er
 /// does); the audit record is written even when it did not, so the
 /// `pending` record always gets its outcome.
 ///
-/// Takes `_lock` (already held by the caller since
+/// Takes `lock` (already held by the caller since
 /// [`check_and_lock_lease`]) rather than acquiring its own — acquiring a
 /// second time here, in the same process, on the same path, would fail
 /// against the lock this call is still holding.
 pub(crate) fn finish_leased_write(
     write: LeasedWrite<'_>,
-    _lock: &LedgerLock,
+    lock: &LedgerLock,
     token: &str,
     version: Option<String>,
     modified_time: Option<String>,
@@ -524,7 +524,7 @@ pub(crate) fn finish_leased_write(
         );
         return;
     };
-    let result = LeaseLedger::mutate(ledger_path, |ledger| {
+    let result = LeaseLedger::mutate(lock, ledger_path, |ledger| {
         ledger.record_write(token, version, modified_time);
     });
     if let Err(err) = result {

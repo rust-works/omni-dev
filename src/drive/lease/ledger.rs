@@ -372,9 +372,14 @@ impl LeaseLedger {
     /// write's own conclusion ([`super::check::finish_leased_write`])
     /// already holds the lock across its mutating Drive call and must not
     /// release it early by re-acquiring here — that caller uses this
-    /// function directly. A caller that has not already taken the lock
-    /// should use [`Self::mutate_locked`] instead.
-    pub(crate) fn mutate<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+    /// function directly. `_lock` is the proof it is held, so an unlocked
+    /// rewrite does not compile. A caller that has not already taken the
+    /// lock should use [`Self::mutate_locked`] instead.
+    pub(crate) fn mutate<R>(
+        _lock: &LedgerLock,
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R> {
         let mut ledger = Self::load(path)?;
         let result = f(&mut ledger);
         ledger.save(path)?;
@@ -389,8 +394,8 @@ impl LeaseLedger {
     /// check-then-insert, or `drive lease restore`'s best-effort
     /// mark-as-restored-from).
     pub(crate) fn mutate_locked<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
-        let _lock = LedgerLock::acquire(path)?;
-        Self::mutate(path, f)
+        let lock = LedgerLock::acquire(path)?;
+        Self::mutate(&lock, path, f)
     }
 
     /// Atomically rewrites `lease-ledger.jsonl` in full — the same
@@ -883,7 +888,8 @@ mod tests {
         ledger.insert(sample_record("t1"));
         ledger.save(&path).unwrap();
 
-        let returned = LeaseLedger::mutate(&path, |ledger| {
+        let lock = LedgerLock::acquire(&path).unwrap();
+        let returned = LeaseLedger::mutate(&lock, &path, |ledger| {
             ledger.mark_restored("t1", Utc::now(), Some(999));
             "ok"
         })
