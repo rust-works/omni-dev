@@ -32,7 +32,7 @@ For each commit, write a corrected message that conforms to the guidelines. Cons
 
 - **Type and scope** must match the actual changes — read the diff if uncertain
 - **Scope** must be one of the values defined in `.omni-dev/scopes.yaml`
-- **Subject line** must be lowercase, imperative mood, no trailing period, ≤72 chars total
+- **Subject line** must be lowercase, imperative mood, no trailing period, ≤80 chars total
 - **No `Co-Authored-By` footers** — do not add AI attribution lines
 - **Body** required for changes >50 lines or architectural changes; wrap at 72 cols
 
@@ -68,6 +68,12 @@ omni-dev git commit message amend <ai.scratch>/amendments-<random-8-hex>.yaml
 - Use the **exact 40-character SHA** from the `commits[].hash` field. An abbreviated
   hash silently skips the amendment or errors.
 - If the message is already correct, do nothing and say so.
+
+## Enforcement
+
+`.github/workflows/commit-lint.yml` runs `omni-dev git commit message lint --strict` on every
+push/PR to `main` (non-required check), so a message this skill leaves non-conforming will still
+be caught in CI.
 
 ## Troubleshooting
 
