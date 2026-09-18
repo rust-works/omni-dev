@@ -58,6 +58,10 @@ Follow conventional commit format:
 
 Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`
 
+Enforced in CI by [`.github/workflows/commit-lint.yml`](.github/workflows/commit-lint.yml) (non-required,
+runs `omni-dev git commit message lint --strict` on every push/PR to `main`). Check locally before
+pushing with `omni-dev git commit message lint origin/main..HEAD`.
+
 ### Branch Strategy
 - `main` - Production-ready code
 - Feature branches - `feature/description` or `username/feature-description`

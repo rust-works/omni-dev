@@ -75,9 +75,13 @@ across sibling directories.
    cargo fmt
    ```
 
-7. **Commit your changes** with a clear commit message:
+7. **Commit your changes** following [conventional commit format](.omni-dev/commit-guidelines.md):
    ```bash
-   git commit -m "Add feature: your feature description"
+   git commit -m "feat(cli): add your feature description"
+   ```
+   This is enforced in CI by `.github/workflows/commit-lint.yml`. Check locally first:
+   ```bash
+   omni-dev git commit message lint origin/main..HEAD
    ```
 
 8. **Push to your fork** and create a pull request
