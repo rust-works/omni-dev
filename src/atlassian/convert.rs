@@ -120,6 +120,7 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn current_line(&self) -> &'a str {
+        debug_assert!(!self.at_end(), "current_line called at end of input");
         self.lines[self.pos]
     }
 
@@ -776,17 +777,20 @@ impl<'a> MarkdownParser<'a> {
         let Some((d, colon_count)) = try_parse_container_open(line) else {
             return Ok(None);
         };
+        let start_line = self.pos + 1; // 1-based line number of the opening fence
         self.advance(); // past opening fence
 
         // Collect inner lines until the matching close fence, tracking nesting
         let mut inner_lines = Vec::new();
         let mut depth: usize = 0;
+        let mut closed = false;
         while !self.at_end() {
             let current = self.current_line();
             if try_parse_container_open(current).is_some() {
                 depth += 1;
             } else if depth == 0 && is_container_close(current, colon_count) {
                 self.advance(); // past closing fence
+                closed = true;
                 break;
             } else if depth > 0 && is_container_close(current, 3) {
                 depth -= 1;
@@ -896,7 +900,24 @@ impl<'a> MarkdownParser<'a> {
                 }
                 node
             }
-            _ => return Ok(None),
+            _ => {
+                if !closed {
+                    // `td`/`tr`/`th` (valid only inside `:::table`) and `column`
+                    // (valid only inside `:::layout`), or any other name this
+                    // parser doesn't otherwise handle, reaching end-of-input
+                    // without a close fence. Recognized names above always
+                    // return `Some`, so this is the only path that can hit
+                    // `Ok(None)` after the scan has already consumed input —
+                    // erroring here (rather than silently returning `None`)
+                    // keeps that contract intact for `parse_blocks`'s callers
+                    // (issue #1734).
+                    bail!(
+                        "Unclosed `:::{}` directive at line {start_line} — add a matching `:::` close fence",
+                        d.name
+                    );
+                }
+                return Ok(None);
+            }
         };
 
         Ok(Some(node))
@@ -23619,6 +23640,49 @@ C
         }
         let err = markdown_to_adf(&md).unwrap_err();
         assert!(err.to_string().contains("maximum depth"));
+    }
+
+    // ── Unclosed container directives (issue #1734) ──
+    //
+    // A `:::name` container directive with no matching close fence must
+    // return a clean error naming the directive and its start line, not
+    // panic. `td`/`tr`/`th` and `column` are only meaningful nested inside
+    // `:::table`/`:::layout`, so they always fall through `try_container_directive`'s
+    // unhandled-name path when unclosed — previously that left the parser's
+    // position corrupted, causing an index-out-of-bounds panic in the next
+    // block-type parser tried.
+
+    #[test]
+    fn bare_td_directive_errors_without_panicking() {
+        let err = markdown_to_adf(":::td\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unclosed"));
+        assert!(msg.contains("td"));
+    }
+
+    #[test]
+    fn bare_tr_directive_errors_without_panicking() {
+        let err = markdown_to_adf(":::tr\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unclosed"));
+        assert!(msg.contains("tr"));
+    }
+
+    #[test]
+    fn bare_td_directive_after_blank_lines_errors() {
+        let err = markdown_to_adf("\n\t\n:::td\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unclosed"));
+        assert!(msg.contains("td"));
+        assert!(msg.contains("line 3"));
+    }
+
+    #[test]
+    fn bare_column_directive_errors_without_panicking() {
+        let err = markdown_to_adf(":::column\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unclosed"));
+        assert!(msg.contains("column"));
     }
 
     #[test]
