@@ -488,10 +488,10 @@ impl StructureResult {
             Self::RefusedSheetExists { .. } => "refused-sheet-exists",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::Blocked { .. } => "blocked",
-            Self::RefusedNoLease => "refused-no-lease",
-            Self::RefusedLeaseExpired => "refused-lease-expired",
-            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
-            Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
+            Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
+            Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
+            Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -1442,26 +1442,18 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 ),
             }]
         }
-        StructureResult::RefusedNoLease => vec![format!(
-            "Refused: {book} requires a Drive write lease — run `omni-dev drive lease acquire \
-             {}` and pass the printed token via `--lease`.",
-            outcome.spreadsheet_id
-        )],
-        StructureResult::RefusedLeaseExpired => vec![format!(
-            "Refused: the presented lease is expired, released, or unknown to this ledger — \
-             run `omni-dev drive lease acquire {}` again.",
-            outcome.spreadsheet_id
-        )],
-        StructureResult::RefusedLeaseWrongFile => vec![format!(
-            "Refused: the presented lease was acquired for a different file — run `omni-dev \
-             drive lease acquire {}` for this one.",
-            outcome.spreadsheet_id
-        )],
-        StructureResult::RefusedLeaseStale => vec![format!(
-            "Refused: {book} changed since the lease was acquired (or last written under) — \
-             re-run `omni-dev drive lease acquire {}` to lease the current version.",
-            outcome.spreadsheet_id
-        )],
+        StructureResult::RefusedNoLease => {
+            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        StructureResult::RefusedLeaseExpired => {
+            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        StructureResult::RefusedLeaseWrongFile => {
+            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        StructureResult::RefusedLeaseStale => {
+            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
+        }
         StructureResult::Changed {
             sheet,
             sheet_id,
