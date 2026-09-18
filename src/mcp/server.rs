@@ -7,7 +7,7 @@ use rmcp::{
     model::{
         CallToolResponse, Implementation, ListResourceTemplatesResult, ListResourcesResult,
         PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool_handler, ErrorData as McpError, RoleServer, ServerHandler,
@@ -109,8 +109,8 @@ impl ServerHandler for OmniDevServer {
             .await
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
