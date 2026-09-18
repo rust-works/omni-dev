@@ -518,35 +518,55 @@ Block-level attributes can follow a block on a separate line:
 {align=center breakout=wide}
 ```
 
-Supported attributes: `align`, `indent`, `breakout`, `localId`, and — on
-`orderedList`/`bulletList` only — `order` and `list`.
+Supported attributes: `align`, `indent`, `breakout`, `localId`, `order` (on
+`orderedList`), and `list` (on any list).
+
+**An attrs line ends a list.** A list runs until a line that is not one of
+its own items, and a trailing `{…}` line is such a line — so the attrs
+belong to the list above it and a list that follows starts fresh:
+
+```markdown
+- a
+{align=center}
+- b
+```
+
+is two `bulletList`s, the first centred.
 
 #### `list=separate`
 
-A CommonMark *loose* list (items separated by blank lines) is one list, so
-JFM fuses two adjacent lists of the same type back together when parsing.
-Two ADF lists that are genuinely separate siblings are therefore rendered
-with a `{list=separate}` marker on the second (and on each subsequent one),
-which suppresses that fusion:
+A CommonMark *loose* list — items separated by blank lines — is one list, so
+JFM reads a blank line between two items as the author's spacing and keeps
+parsing the same list. Two ADF lists that are genuinely separate siblings
+would otherwise come back as one, so the renderer ends the first of the pair
+with a `{list=separate}` marker:
 
 ```markdown
 - first list
+{list=separate}
 
 - second list
-{list=separate}
 ```
 
-The marker composes onto the same attrs line as the others, e.g.
-`{order=1 list=separate}`, and for a nested list it is indented with the list
-it belongs to. It never appears in the resulting ADF. `taskList` is excluded
-on both sides: task lists and items carry their own `localId`s, so adjacent
-ones already round-trip and are never fused.
+The marker sits on the list that **ends**, not the one that starts, because
+ending the list is what it does; it carries no ADF meaning of its own and
+never appears in the resulting ADF. It composes onto the same attrs line as
+the others, e.g. `{order=1 list=separate}` or `{localId=… list=separate}`,
+and for a nested list it is indented with the list it belongs to.
 
-Two adjacent ordered lists fuse only when the second continues the first's
-numbering or restarts at `1.`. A genuine restart — `1. a`, `2. b`, blank,
-`5. c` — stays two lists so the authored `5` survives; this is a deliberate
-deviation from CommonMark, which would fuse them and renumber the item to
-`3`.
+It is emitted only where the parser would in fact have fused the two: a
+bullet or task list followed by a bullet or task list (one list loop parses
+both, and a checkbox marker would flip a `bulletList` into a `taskList`), or
+an ordered list followed by one whose start continues its numbering or
+restarts at `1.`. A list that renders no items never gets a marker.
+
+Two adjacent ordered lists fuse when the second continues the first's
+numbering **or** restarts at `1.` — CommonMark treats `1.` as a "don't-care"
+number, and `1. 1. 1.` is the idiomatic way to write a list numbered by
+position. A restart at any other number — `1. a`, `2. b`, blank, `5. c` — is
+read as authored and stays two lists so the `5` survives. That is a
+deliberate deviation from CommonMark, which would fuse the two and renumber
+the item to `3`, discarding the authored number.
 
 ### Inline Attribute Marks
 
