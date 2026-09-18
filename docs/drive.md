@@ -1045,6 +1045,26 @@ $ omni-dev drive lease acquire 1SomeGoogleSheetId
 Refused: this is a Google-native document (Doc/Sheet/Slide) and no backup folder is configured for this account — set `lease_backup_folder_id` in settings.json to enable leasing native documents
 ```
 
+**The backup is proven to match the recorded `version` before any token is
+minted** ([ADR-0080](adrs/adr-0080.md) §2). A collaborator can edit the
+file while its backup is being taken — for a large binary file that window
+is the whole download — and neither backup kind can report which revision
+it captured. So a byte backup's own SHA-256 is compared against the
+`sha256Checksum` Drive reports for the file afterwards, and a native
+document's `version` is read immediately before *and* after its
+`files.copy` and must agree. If the proof fails the acquisition refuses
+(status `refused-concurrent-change`), the backup is discarded, and no
+lease exists — re-run `acquire` once the file is quiet:
+
+```bash
+$ omni-dev drive lease acquire 1ExistingFileId
+Refused: the file changed while its backup was being taken: Drive reports checksum 9f86…0a08 at version 8, but the bytes backed up hash to 2cf2…9824. No lease was minted and the backup was discarded — retry.
+```
+
+A rename, move or permission change mid-backup bumps `version` without
+touching the bytes, so a byte backup with a checksum is *not* refused for
+it; a native document, having no checksum to compare, conservatively is.
+
 **The token is an identifier, not a bearer credential** — safe to log or
 paste, since a write under it still needs this account's own OAuth
 credentials and folder-permission grant. Present it via `--lease`:

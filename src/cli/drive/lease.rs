@@ -470,6 +470,9 @@ fn print_result(result: &AcquireResult) {
                  settings.json to enable leasing native documents"
             );
         }
+        AcquireResult::RefusedConcurrentChange { detail } => {
+            eprintln!("Refused: {detail}");
+        }
         AcquireResult::Denied { detail } => eprintln!("Denied: {detail}"),
         AcquireResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
         AcquireResult::Failed { detail } => eprintln!("Failed: {detail}"),
@@ -619,6 +622,9 @@ fn print_restore_result(result: &RestoreResult) {
                 "Refused: this is a Google-native document and no backup folder is configured \
                  for this account — set `lease_backup_folder_id` in settings.json"
             );
+        }
+        RestoreResult::RefusedConcurrentChange { detail } => {
+            eprintln!("Refused: {detail}");
         }
         RestoreResult::Denied { detail } => eprintln!("Denied: {detail}"),
         RestoreResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
@@ -995,6 +1001,9 @@ mod tests {
                 expires_at: chrono::Utc::now(),
             },
             RestoreResult::RefusedNativeDocument,
+            RestoreResult::RefusedConcurrentChange {
+                detail: "moved".to_string(),
+            },
             RestoreResult::Denied {
                 detail: "no".to_string(),
             },
@@ -1198,6 +1207,9 @@ mod tests {
                 expires_at: chrono::Utc::now(),
             },
             AcquireResult::RefusedNativeDocument,
+            AcquireResult::RefusedConcurrentChange {
+                detail: "moved".to_string(),
+            },
             AcquireResult::Denied {
                 detail: "no".to_string(),
             },

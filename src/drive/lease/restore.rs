@@ -233,6 +233,17 @@ pub enum RestoreResult {
     /// [`Self::FreshLeaseButWriteFailed`] — see the mime-type re-check
     /// immediately before the restore write.
     RefusedNativeDocument,
+    /// The internal [`acquire`] step found the file changing underneath its
+    /// own backup, so it minted nothing (issue #1693). Kept distinct from
+    /// [`Self::Failed`] rather than folded into it because restore *is* the
+    /// recovery path: "the file is being edited right now, retry" is a
+    /// materially different instruction from "something broke", and
+    /// collapsing the two would hide it exactly when a caller is trying to
+    /// undo a bad write.
+    RefusedConcurrentChange {
+        /// What changed, and which evidence detected it.
+        detail: String,
+    },
     /// A human answered the fresh authentication prompt and refused, or it
     /// timed out.
     Denied {
@@ -323,6 +334,7 @@ impl RestoreResult {
             Self::Blocked { .. } => "blocked",
             Self::AlreadyLeased { .. } => "already-leased",
             Self::RefusedNativeDocument => "refused-native-document",
+            Self::RefusedConcurrentChange { .. } => "refused-concurrent-change",
             Self::Denied { .. } => "denied",
             Self::Unavailable { .. } => "unavailable",
             Self::Failed { .. } => "failed",
@@ -504,6 +516,9 @@ async fn restore_inner(
                 return RestoreResult::AlreadyLeased { token, expires_at }
             }
             AcquireResult::RefusedNativeDocument => return RestoreResult::RefusedNativeDocument,
+            AcquireResult::RefusedConcurrentChange { detail } => {
+                return RestoreResult::RefusedConcurrentChange { detail }
+            }
             AcquireResult::Denied { detail } => return RestoreResult::Denied { detail },
             AcquireResult::Unavailable { detail } => return RestoreResult::Unavailable { detail },
             AcquireResult::Failed { detail } => return RestoreResult::Failed { detail },
@@ -1085,7 +1100,8 @@ fn record_attempt(opts: &RestoreOptions, result: &RestoreResult) {
         | RestoreResult::BackupTooLargeForSimpleUpload { .. }
         | RestoreResult::RefusedNoVisibleParents
         | RestoreResult::Blocked { .. }
-        | RestoreResult::RefusedNativeDocument => (None, None),
+        | RestoreResult::RefusedNativeDocument
+        | RestoreResult::RefusedConcurrentChange { .. } => (None, None),
     };
     // Re-reads the backup token's own row for its `file_id` — cheap, and
     // avoids threading it through every `restore_inner` return path just
@@ -2351,12 +2367,13 @@ mod tests {
         mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
             .mount(&server)
             .await;
-        // The initial gate check, plus the fresh `acquire`'s own two
-        // (pre-auth and post-backup) fetches, all still see a spreadsheet —
-        // only the *fourth* fetch, the re-check right before the write,
-        // sees the change.
+        // The initial gate check, plus the fresh `acquire`'s own three
+        // (pre-auth, pre-backup and post-backup — a native target pins its
+        // backup with the version sandwich, issue #1693), all still see a
+        // spreadsheet — only the *fifth* fetch, the re-check right before
+        // the write, sees the change.
         mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
-            .up_to_n_times(3)
+            .up_to_n_times(4)
             .with_priority(1)
             .mount(&server)
             .await;
@@ -2513,9 +2530,12 @@ mod tests {
         let test_opts = opts(dir.path(), "");
         let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
 
-        // The gate check's own `files.get`, plus the fresh `acquire`'s two
-        // (pre-auth and post-backup) `files.get`s, plus `gate_leased_write`'s
-        // own live-version fetch — all the same mock, unbounded.
+        // The gate check's own `files.get`, plus the fresh `acquire`'s
+        // three (pre-auth, pre-backup and post-backup — `mount_file`
+        // reports no `sha256Checksum`, so acquire pins its backup with the
+        // version sandwich, issue #1693) `files.get`s, plus
+        // `gate_leased_write`'s own live-version fetch — all the same mock,
+        // unbounded.
         mount_file("file-1", "text/plain", &["parent-1"])
             .mount(&server)
             .await;
@@ -2756,12 +2776,12 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
-        // The fresh acquire's own two `files.get`s (pre-auth and
-        // post-backup) still see `parent-1` too — only the *third* fetch,
-        // the re-check right before the write, sees the new, unlisted
-        // parent.
+        // The fresh acquire's own three `files.get`s (pre-auth,
+        // pre-backup and post-backup) still see `parent-1` too — only the
+        // *fourth* fetch, the re-check right before the write, sees the
+        // new, unlisted parent.
         mount_file("file-1", "text/plain", &["parent-1"])
-            .up_to_n_times(2)
+            .up_to_n_times(3)
             .with_priority(2)
             .mount(&server)
             .await;
@@ -3336,11 +3356,12 @@ mod tests {
         let test_opts = opts(dir.path(), "");
         let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
 
-        // The gate check's own fetch, plus the fresh `acquire`'s two
-        // (pre-auth and post-backup) fetches — three total before the
-        // re-check.
+        // The gate check's own fetch, plus the fresh `acquire`'s three
+        // (pre-auth, pre-backup and post-backup — `mount_file` reports no
+        // `sha256Checksum`, so acquire pins its backup with the version
+        // sandwich, issue #1693) — four total before the re-check.
         mount_file("file-1", "text/plain", &["parent-1"])
-            .up_to_n_times(3)
+            .up_to_n_times(4)
             .with_priority(1)
             .mount(&server)
             .await;
@@ -3433,10 +3454,10 @@ mod tests {
         let test_opts = opts(dir.path(), "");
         let old_token = seed_backup_lease(&test_opts.ledger_path, "file-1", backup);
 
-        // Covers the gate check, the fresh acquire's two fetches, and the
-        // permission re-check — four calls, all still at version "1".
+        // Covers the gate check, the fresh acquire's three fetches, and
+        // the permission re-check — five calls, all still at version "1".
         mount_file("file-1", "text/plain", &["parent-1"])
-            .up_to_n_times(4)
+            .up_to_n_times(5)
             .with_priority(1)
             .mount(&server)
             .await;
