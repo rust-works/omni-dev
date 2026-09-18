@@ -79,6 +79,10 @@ scopes:
     description: "Documentation and planning"
     examples: ["docs: update twiddle plan", "docs: add context intelligence spec"]
     file_patterns: ["docs/**", "*.md", "README.md"]
+  - name: "changelog"
+    description: "CHANGELOG.md entries"
+    examples: ["changelog: document the backup-dir absolutize fix", "changelog: add v0.9.0 entry"]
+    file_patterns: ["CHANGELOG.md"]
   - name: "release"
     description: "Release process, versioning, and publishing"
     examples: ["release: bump version to 1.2.0", "release: update changelog"]
