@@ -234,10 +234,10 @@ impl ValidationResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::Blocked { .. } => "blocked",
-            Self::RefusedNoLease => "refused-no-lease",
-            Self::RefusedLeaseExpired => "refused-lease-expired",
-            Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
-            Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
+            Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
+            Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
+            Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -617,26 +617,18 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
                 verb.label()
             ),
         }],
-        ValidationResult::RefusedNoLease => vec![format!(
-            "Refused: {book} requires a Drive write lease — run `omni-dev drive lease acquire \
-             {}` and pass the printed token via `--lease`.",
-            outcome.spreadsheet_id
-        )],
-        ValidationResult::RefusedLeaseExpired => vec![format!(
-            "Refused: the presented lease is expired, released, or unknown to this ledger — \
-             run `omni-dev drive lease acquire {}` again.",
-            outcome.spreadsheet_id
-        )],
-        ValidationResult::RefusedLeaseWrongFile => vec![format!(
-            "Refused: the presented lease was acquired for a different file — run `omni-dev \
-             drive lease acquire {}` for this one.",
-            outcome.spreadsheet_id
-        )],
-        ValidationResult::RefusedLeaseStale => vec![format!(
-            "Refused: {book} changed since the lease was acquired (or last written under) — \
-             re-run `omni-dev drive lease acquire {}` to lease the current version.",
-            outcome.spreadsheet_id
-        )],
+        ValidationResult::RefusedNoLease => {
+            LeaseGateRefusal::NoLease.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        ValidationResult::RefusedLeaseExpired => {
+            LeaseGateRefusal::Expired.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        ValidationResult::RefusedLeaseWrongFile => {
+            LeaseGateRefusal::WrongFile.describe_lines(&outcome.spreadsheet_id, &book)
+        }
+        ValidationResult::RefusedLeaseStale => {
+            LeaseGateRefusal::Stale.describe_lines(&outcome.spreadsheet_id, &book)
+        }
         ValidationResult::Changed { summary } => {
             vec![format!("Applied: {summary} in {book}")]
         }
