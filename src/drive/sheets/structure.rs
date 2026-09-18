@@ -2009,6 +2009,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::test_support::{seed_lease, seed_lease_with_backup};
     use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
     use crate::drive::write_gate::Verdict;
     use crate::test_support::env::MapEnv;
@@ -2143,50 +2144,6 @@ mod tests {
             lease_token: Some(token),
             ledger_path,
         }
-    }
-
-    /// Seeds `ledger_path` with a fresh, live lease for `spreadsheet_id` at
-    /// `version`, returning its token. The backup is bytes at a fixed path;
-    /// [`seed_lease_with_backup`] takes the backup a test is about.
-    fn seed_lease(ledger_path: &std::path::Path, spreadsheet_id: &str, version: &str) -> String {
-        seed_lease_with_backup(
-            ledger_path,
-            spreadsheet_id,
-            version,
-            LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
-        )
-    }
-
-    /// [`seed_lease`], with the backup the lease records.
-    fn seed_lease_with_backup(
-        ledger_path: &std::path::Path,
-        spreadsheet_id: &str,
-        version: &str,
-        backup: LeaseBackup,
-    ) -> String {
-        // A fixed token, not a random one: every call gets its own
-        // isolated ledger (a fresh tempdir), so uniqueness across tests is
-        // never a concern.
-        let token = "test-lease-token".to_string();
-        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
-        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
-            token: token.clone(),
-            file_id: spreadsheet_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup,
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
-        token
     }
 
     fn rename() -> StructureVerb {

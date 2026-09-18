@@ -115,3 +115,69 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+// ── Lease ledger fixtures ────────────────────────────────────────────────
+
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord};
+
+/// The dummy backup every `seed_lease*` variant uses when the caller
+/// doesn't need to control it.
+fn dummy_lease_backup() -> LeaseBackup {
+    LeaseBackup::Bytes {
+        path: std::path::PathBuf::from("/tmp/test-backup"),
+        sha256: "deadbeef".to_string(),
+        size: 0,
+    }
+}
+
+/// Seeds `ledger_path` with a fresh, live lease for `file_id` at `version`
+/// using the fixed token `"test-lease-token"`, a dummy `Bytes` backup, and
+/// a 30-minute expiry, returning the token — the shape every lease-gated
+/// write engine's tests need.
+pub(crate) fn seed_lease(ledger_path: &std::path::Path, file_id: &str, version: &str) -> String {
+    seed_lease_with_backup(ledger_path, file_id, version, dummy_lease_backup())
+}
+
+/// [`seed_lease`], with an explicit `backup` instead of the dummy one — for
+/// tests that assert on the backup's own content/shape.
+pub(crate) fn seed_lease_with_backup(
+    ledger_path: &std::path::Path,
+    file_id: &str,
+    version: &str,
+    backup: LeaseBackup,
+) -> String {
+    seed_lease_full(
+        ledger_path,
+        "test-lease-token",
+        file_id,
+        version,
+        chrono::Duration::minutes(30),
+        backup,
+    )
+}
+
+/// The fully general form: explicit token and expiry as well as backup.
+pub(crate) fn seed_lease_full(
+    ledger_path: &std::path::Path,
+    token: &str,
+    file_id: &str,
+    version: &str,
+    expiry: chrono::Duration,
+    backup: LeaseBackup,
+) -> String {
+    let mut ledger = LeaseLedger::default();
+    ledger.insert(LeaseRecord {
+        token: token.to_string(),
+        file_id: file_id.to_string(),
+        version: version.to_string(),
+        modified_time: None,
+        backup,
+        acquired_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + expiry,
+        released_at: None,
+        restored_at: None,
+        restored_sheet_id: None,
+    });
+    ledger.save(ledger_path).unwrap();
+    token.to_string()
+}

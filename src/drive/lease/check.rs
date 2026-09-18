@@ -538,29 +538,30 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::client::DriveClient;
-    use crate::drive::lease::ledger::{LeaseLedger, LeaseRecord};
+    use crate::drive::lease::ledger::LeaseLedger;
     use crate::test_support::AuditLogGuard;
     use crate::utils::secret::Secret;
 
+    /// This module's own seeding needs a caller-supplied token (never
+    /// [`crate::drive::test_support::seed_lease`]'s fixed one — several
+    /// tests here seed several tokens in the same ledger) and a 1-hour
+    /// expiry (this module's own tests don't care about the 30-minute one
+    /// the shared helper's other callers assume), so it delegates to
+    /// [`crate::drive::test_support::seed_lease_full`] rather than the
+    /// simpler shared wrapper.
     fn seed_lease(ledger_path: &Path, token: &str, file_id: &str, version: &str) {
-        let mut ledger = LeaseLedger::default();
-        ledger.insert(LeaseRecord {
-            token: token.to_string(),
-            file_id: file_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup: LeaseBackup::Bytes {
+        crate::drive::test_support::seed_lease_full(
+            ledger_path,
+            token,
+            file_id,
+            version,
+            chrono::Duration::hours(1),
+            LeaseBackup::Bytes {
                 path: std::path::PathBuf::from("/tmp/test-backup"),
                 sha256: "deadbeef".to_string(),
                 size: 0,
             },
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
+        );
     }
 
     /// A [`LeasedWrite`] for one test; `operation` is the verb's

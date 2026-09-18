@@ -740,6 +740,8 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    use crate::drive::test_support::seed_lease;
+
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::docs::client::DOCS_API_URL;
     use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
@@ -794,34 +796,6 @@ mod tests {
                 "id": id, "name": id, "mimeType": mime_type, "parents": parents,
                 "version": "1",
             })))
-    }
-
-    /// Seeds `ledger_path` with a fresh, live lease for `document_id` at
-    /// `version`, returning its token.
-    fn seed_lease(ledger_path: &std::path::Path, document_id: &str, version: &str) -> String {
-        // A fixed token, not a random one: every call gets its own isolated
-        // ledger (a fresh tempdir), so uniqueness across tests is never a
-        // concern.
-        let token = "test-lease-token".to_string();
-        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
-        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
-            token: token.clone(),
-            file_id: document_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
-        token
     }
 
     /// A fresh, isolated ledger path holding a live lease for `document_id`

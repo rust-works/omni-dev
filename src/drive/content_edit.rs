@@ -369,6 +369,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::ledger::LeaseLedger;
+    use crate::drive::test_support::seed_lease;
     use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
     use crate::drive::write_gate::DriveOperation;
     use crate::test_support::AuditLogGuard;
@@ -417,32 +418,6 @@ mod tests {
                     "version": "1",
                 })),
             )
-    }
-
-    /// Seeds `ledger_path` with a fresh, live lease for `file_id` at
-    /// `version`, returning its token — for tests exercising the success
-    /// path, which now requires a valid lease (ADR-0080 §9).
-    fn seed_lease(ledger_path: &std::path::Path, file_id: &str, version: &str) -> String {
-        let token = "test-lease-token".to_string();
-        let mut ledger = LeaseLedger::default();
-        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
-            token: token.clone(),
-            file_id: file_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
-        token
     }
 
     fn mount_folder(id: &str) -> wiremock::Mock {
