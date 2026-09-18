@@ -459,7 +459,7 @@ const LEASE_LOCK_WAIT_ENV_VAR: &str = "OMNI_DEV_LEASE_LOCK_WAIT_SECS";
 /// start producing spurious timeouts the moment the HTTP timeout is
 /// tuned up. The ×4 headroom covers a restore's several sequential calls
 /// against one read-timeout budget.
-fn default_lock_wait_timeout() -> Duration {
+pub(super) fn default_lock_wait_timeout() -> Duration {
     crate::utils::settings::get_env_var(LEASE_LOCK_WAIT_ENV_VAR)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

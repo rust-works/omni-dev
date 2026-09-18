@@ -30,9 +30,12 @@
 //! check against — that differs by surface (§6).
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::drive::files_api::FilesApi;
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
+use crate::drive::lease::ledger::{
+    default_lock_wait_timeout, LeaseBackup, LeaseLedger, LedgerLock,
+};
 use crate::request_log::AuditOutcome;
 
 /// The `verdict` vocabulary of a leased write's audit records (ADR-0080
@@ -156,6 +159,26 @@ pub(crate) async fn check_and_lock_lease(
     live_version: Option<&str>,
     live_modified_time: Option<&str>,
 ) -> Result<LeaseGrant, LeaseGateRefusal> {
+    check_and_lock_lease_with_timeout(
+        write,
+        lease_token,
+        live_version,
+        live_modified_time,
+        default_lock_wait_timeout(),
+    )
+    .await
+}
+
+/// [`check_and_lock_lease`] with an explicit ledger-lock wait budget — the
+/// same test seam as [`LedgerLock::acquire_waiting_with_timeout`], so the
+/// busy-lock timeout arm can be driven in milliseconds.
+pub(crate) async fn check_and_lock_lease_with_timeout(
+    write: LeasedWrite<'_>,
+    lease_token: Option<&str>,
+    live_version: Option<&str>,
+    live_modified_time: Option<&str>,
+    max_wait: Duration,
+) -> Result<LeaseGrant, LeaseGateRefusal> {
     let LeasedWrite {
         log_prefix,
         ledger_path,
@@ -187,7 +210,7 @@ pub(crate) async fn check_and_lock_lease(
     // lock on `<log>.lock` (`request_log::record_audit_event`) — never the
     // reverse, or the two could deadlock against a caller doing the
     // opposite.
-    let lock = match LedgerLock::acquire_waiting(ledger_path).await {
+    let lock = match LedgerLock::acquire_waiting_with_timeout(ledger_path, max_wait).await {
         Ok(lock) => lock,
         Err(err) => {
             refuse(Some(token), verdict::FAILED, Some(err.to_string()));
@@ -1238,6 +1261,36 @@ mod tests {
         assert_eq!(audit.verdicts(), [verdict::FAILED], "{records:?}");
         let error = records[0].error.as_deref().unwrap_or_default();
         assert!(error.contains("failed to lock"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_ledger_lock_wait_timeout_writes_a_failed_record_carrying_the_error() {
+        // The Busy -> wait -> timeout arm (issue #1738): the lock is held
+        // for longer than the budget, so the waiting loop runs to
+        // exhaustion — unlike the test above, which never enters it.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+        let _held = LedgerLock::acquire(&ledger_path).unwrap();
+
+        let outcome = check_and_lock_lease_with_timeout(
+            leased("edit", &ledger_path, "file-1"),
+            Some("tok-1"),
+            Some("1"),
+            None,
+            Duration::from_millis(150),
+        )
+        .await;
+
+        assert!(
+            matches!(&outcome, Err(LeaseGateRefusal::Failed(detail)) if detail.contains("timed out")),
+            "expected a timed-out Failed refusal"
+        );
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), [verdict::FAILED], "{records:?}");
+        let error = records[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[tokio::test]
