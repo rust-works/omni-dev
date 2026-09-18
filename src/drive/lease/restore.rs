@@ -59,7 +59,7 @@ use crate::drive::lease::check::{
     finish_leased_native_write, finish_leased_write, gate_leased_write, record_failed_leased_write,
     LeaseGateRefusal, LeasedWrite,
 };
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger};
+use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
@@ -737,7 +737,12 @@ async fn restore_inner(
         result,
         RestoreResult::Restored { .. } | RestoreResult::RestoredSheet { .. }
     ) {
-        stamp_backup_restored(&opts.ledger_path, &opts.token, restored_sheet_id);
+        stamp_backup_restored(
+            &grant.lock,
+            &opts.ledger_path,
+            &opts.token,
+            restored_sheet_id,
+        );
     }
 
     drop(grant);
@@ -1040,8 +1045,8 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 /// — the caller (`restore_inner`) is still holding `grant`'s lock (acquired
 /// via `gate_leased_write` for the *fresh* lease's row) when it calls this,
 /// so acquiring a second lock here would be redundant at best and, since
-/// `LedgerLock` isn't reentrant, would `Busy` against itself. `mutate`'s own
-/// doc comment spells out this "caller already holds the lock" contract.
+/// `LedgerLock` isn't reentrant, would `Busy` against itself. `lock` is
+/// `grant`'s, passed through as `mutate`'s proof that it is held.
 /// Previously this ran *after* the lock was dropped and re-acquired it
 /// itself via `mutate_locked`'s non-waiting `LedgerLock::acquire`, which
 /// could lose the stamp to ordinary contention on `Busy` (issue #1737) —
@@ -1049,8 +1054,13 @@ fn verify_and_read_backup(path: &Path, expected_sha256: &str) -> Result<Vec<u8>,
 /// across its whole HTTP call. A failure here is now `warn!`, not
 /// `debug!`: it can no longer be explained away as "someone else briefly
 /// had the lock".
-fn stamp_backup_restored(ledger_path: &Path, token: &str, restored_sheet_id: Option<i64>) {
-    let result = LeaseLedger::mutate(ledger_path, |ledger| {
+fn stamp_backup_restored(
+    lock: &LedgerLock,
+    ledger_path: &Path,
+    token: &str,
+    restored_sheet_id: Option<i64>,
+) {
+    let result = LeaseLedger::mutate(lock, ledger_path, |ledger| {
         ledger.mark_restored(token, Utc::now(), restored_sheet_id);
     });
     if let Err(err) = result {
@@ -1799,7 +1809,7 @@ mod tests {
                 file_id: "copy-1".to_string(),
             },
         );
-        LeaseLedger::mutate(&test_opts.ledger_path, |ledger| {
+        LeaseLedger::mutate_locked(&test_opts.ledger_path, |ledger| {
             ledger.mark_restored(&old_token, Utc::now(), Some(999));
         })
         .unwrap();
@@ -1877,7 +1887,7 @@ mod tests {
                 file_id: "copy-1".to_string(),
             },
         );
-        LeaseLedger::mutate(&test_opts.ledger_path, |ledger| {
+        LeaseLedger::mutate_locked(&test_opts.ledger_path, |ledger| {
             ledger.mark_restored(&old_token, Utc::now(), Some(999));
         })
         .unwrap();
@@ -2750,9 +2760,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("lease-ledger.jsonl");
         seed_backup_lease(&ledger_path, "file-1", write_backup_file(dir.path(), b"x"));
-        let _held = LedgerLock::acquire(&ledger_path).unwrap();
+        let held = LedgerLock::acquire(&ledger_path).unwrap();
 
-        stamp_backup_restored(&ledger_path, "backup-token", Some(999));
+        stamp_backup_restored(&held, &ledger_path, "backup-token", Some(999));
 
         let ledger = LeaseLedger::load(&ledger_path).unwrap();
         let record = ledger.get("backup-token").unwrap();

@@ -338,7 +338,7 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
                 // silently leaving a dangling row: name the stranded token
                 // and stop, rather than compounding the same failure
                 // across every remaining candidate.
-                if let Err(err) = LeaseLedger::mutate(&opts.ledger_path, |ledger| {
+                if let Err(err) = LeaseLedger::mutate(&lock, &opts.ledger_path, |ledger| {
                     ledger.remove(&rec.token);
                 }) {
                     return Err(err.context(format!(
