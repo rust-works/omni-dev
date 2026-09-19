@@ -226,13 +226,8 @@ pub(crate) async fn run_sync_with_progress(
         // window used to be the only way back to a failed id, which meant a
         // chronically rate-limited account could never advance its watermark
         // and was pushed into a full-mailbox reconciliation (#1784).
-        let mut pending_seen = HashSet::new();
-        let pending_fetch = report
-            .errors
-            .iter()
-            .filter(|e| pending_seen.insert(e.id.as_str()))
-            .map(|e| e.id.clone())
-            .collect();
+        // No dedup needed: both fetch paths already fetch each id once.
+        let pending_fetch = report.errors.iter().map(|e| e.id.clone()).collect();
         state::save(
             &ArchiveState {
                 history_id,
