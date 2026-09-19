@@ -314,7 +314,7 @@ Arguments:
 Options:
       --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
       --instructions <INSTRUCTIONS>  What to choose and why
-      --option <NAME=DESC>           A `NAME=DESCRIPTION` option. Repeatable; at least one is required
+      --option <NAME=DESC>           A `NAME=DESCRIPTION` option. Repeatable; at least two are required
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
