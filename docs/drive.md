@@ -1176,9 +1176,14 @@ having used the waiver, so it stays visible after the fact.
 
 "Headless" means no prompt can reach a human at all: off-macOS, or a macOS
 session with no graphical access (an SSH login, a background launchd job,
-CI). Over SSH, `drive lease acquire` refuses immediately as `unavailable`
-instead of showing a prompt on the Mac's own screen, which macOS would
-otherwise do, to whoever happens to be sitting there. The waiver never
+CI). A `drive lease acquire` running in a plain SSH session refuses
+immediately as `unavailable` instead of showing a prompt on the Mac's own
+screen, which macOS would otherwise do, to whoever happens to be sitting
+there. The check follows the process's security session, not who is typing:
+a command inside a tmux/screen server started at the console and attached
+over SSH, or one launched into the console session with `osascript`, still
+prompts on the console. Treat it as a guard against accidental remote
+prompts, not a security boundary. The waiver never
 covers an **attended** Mac whose chosen policy cannot be met right now,
 such as Touch ID locked out after failed attempts, not enrolled, absent, or
 suspended by a closed lid under `biometrics_only`, or no passcode set.
