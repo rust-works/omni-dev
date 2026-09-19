@@ -233,13 +233,16 @@ pub enum RestoreResult {
     /// [`Self::FreshLeaseButWriteFailed`] — see the mime-type re-check
     /// immediately before the restore write.
     RefusedNativeDocument,
-    /// The internal [`acquire`] step found the file changing underneath its
-    /// own backup, so it minted nothing (issue #1693). Kept distinct from
-    /// [`Self::Failed`] rather than folded into it because restore *is* the
-    /// recovery path: "the file is being edited right now, retry" is a
-    /// materially different instruction from "something broke", and
+    /// The internal [`acquire`] step could not pin its backup to the
+    /// version it would record, so it minted nothing (issue #1693). Kept
+    /// distinct from [`Self::Failed`] rather than folded into it because
+    /// restore *is* the recovery path: "the file moved under the backup" is
+    /// a materially different instruction from "something broke", and
     /// collapsing the two would hide it exactly when a caller is trying to
-    /// undo a bad write.
+    /// undo a bad write. A moved `version` has already been retried inside
+    /// `acquire` (issue #1739), and when it moved on every attempt the
+    /// `detail` says waiting for a quiet file may not help — so this is not
+    /// unconditionally a "retry later" outcome.
     RefusedConcurrentChange {
         /// What changed, and which evidence detected it.
         detail: String,
