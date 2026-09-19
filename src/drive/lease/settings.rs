@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 
 use crate::drive::lease::acquire::{MAX_EXPIRY_MINUTES, MIN_EXPIRY_MINUTES};
 use crate::drive::lease::authenticate::AuthPolicy;
-use crate::utils::env::{non_empty_var, EnvSource};
+use crate::utils::env::{non_empty_var, truthy_var, EnvSource};
 use crate::utils::settings::LeaseSettings;
 
 /// Default lease expiry when no layer sets one (ADR-0080 §5).
@@ -44,31 +44,6 @@ pub(crate) const LEASE_BIOMETRICS_ONLY_ENV: &str = "OMNI_DEV_DRIVE_LEASE_BIOMETR
 /// Env var enabling the headless/off-macOS opt-out (ADR-0080 §8). Same
 /// truthy-value convention as [`LEASE_BIOMETRICS_ONLY_ENV`].
 pub(crate) const LEASE_ALLOW_HEADLESS_ENV: &str = "OMNI_DEV_DRIVE_LEASE_ALLOW_HEADLESS";
-
-/// Parses `var` as a truthy boolean: `1`, `true`, or `yes` (trimmed,
-/// case-insensitive) is `true`; `0`, `false`, or `no` is `false`; unset or
-/// empty is `false` with no warning (the ordinary "not set" case). Anything
-/// else — a typo like `treu` — is also treated as `false`, but logs a
-/// warning first: a silently-discarded, unrecognized value is exactly the
-/// broken-configuration case docs/STYLE_GUIDE.md's silent-discard rule
-/// warns against (issue #1677 review finding). Otherwise mirrors
-/// `crate::claude::backend::resolve_structured_output_disabled`.
-fn truthy_var(env: &impl EnvSource, key: &str) -> bool {
-    let Some(raw) = non_empty_var(env, key) else {
-        return false;
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => true,
-        "0" | "false" | "no" => false,
-        _ => {
-            tracing::warn!(
-                "{key}={raw:?} is not a recognized boolean (expected 1/true/yes or \
-                 0/false/no); treating it as unset"
-            );
-            false
-        }
-    }
-}
 
 /// `<state dir>/omni-dev/drive-backups` — a sibling of the request log and
 /// lease ledger, same posture. The hard-coded default at the bottom of

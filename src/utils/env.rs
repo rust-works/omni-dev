@@ -62,6 +62,30 @@ pub(crate) fn non_empty_var(env: &impl EnvSource, key: &str) -> Option<String> {
     env.var(key).filter(|v| !v.is_empty())
 }
 
+/// Parses `key`'s value as a truthy boolean: `1`, `true`, or `yes` (trimmed,
+/// case-insensitive) is `true`; `0`, `false`, or `no` is `false`; unset or
+/// empty is `false` with no warning (the ordinary "not set" case). Anything
+/// else — a typo like `treu` — is also treated as `false`, but logs a
+/// warning first: a silently-discarded, unrecognized value is exactly the
+/// broken-configuration case docs/STYLE_GUIDE.md's silent-discard rule
+/// warns against (issue #1677 review finding).
+pub(crate) fn truthy_var(env: &impl EnvSource, key: &str) -> bool {
+    let Some(raw) = non_empty_var(env, key) else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => true,
+        "0" | "false" | "no" => false,
+        _ => {
+            tracing::warn!(
+                "{key}={raw:?} is not a recognized boolean (expected 1/true/yes or \
+                 0/false/no); treating it as unset"
+            );
+            false
+        }
+    }
+}
+
 /// RAII guard that sets a process env var for the duration of a scope,
 /// restoring (or removing) whatever was there before when the guard drops —
 /// so a caller that mutates process env can be invoked more than once per
@@ -122,5 +146,25 @@ mod tests {
         }
         // &MapEnv must itself satisfy `impl EnvSource`.
         assert_eq!(read(&&env).as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn truthy_var_parses_truthy_and_falsy_values_case_insensitively() {
+        for v in ["1", "true", "TRUE", "yes", "YES"] {
+            assert!(truthy_var(&MapEnv::new().with("FLAG", v), "FLAG"), "{v:?}");
+        }
+        for v in ["0", "false", "FALSE", "no", "NO"] {
+            assert!(!truthy_var(&MapEnv::new().with("FLAG", v), "FLAG"), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn truthy_var_treats_unset_as_false() {
+        assert!(!truthy_var(&MapEnv::new(), "FLAG"));
+    }
+
+    #[test]
+    fn truthy_var_treats_unrecognized_value_as_false() {
+        assert!(!truthy_var(&MapEnv::new().with("FLAG", "treu"), "FLAG"));
     }
 }
