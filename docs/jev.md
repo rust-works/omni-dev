@@ -114,7 +114,10 @@ start with `{` would change what Jev sees.
 
 Pass `--state-json` to send **structured** state instead. The text is then
 parsed as YAML. YAML is a superset of JSON, so plain JSON works too, and the
-resulting object or array is sent as-is:
+resulting object or array is sent as-is. The API accepts only a string, an
+object or an array, so a state that parses to a number, boolean or `null`
+(`42`, `true`) is rejected before any request is sent. Drop `--state-json` to
+send such text as a literal string:
 
 ```bash
 # Literal string (default)
@@ -161,10 +164,10 @@ its shape depends on that type. The shapes are shown in the sections below.
 
 Picks exactly one of a labelled set of options.
 
-| Flag                    | Meaning                                               |
-|-------------------------|-------------------------------------------------------|
-| `--instructions <TEXT>` | What to choose and why (required).                    |
-| `--option <NAME=DESC>`  | One option. Repeatable, and at least one is required. |
+| Flag                    | Meaning                                                |
+|-------------------------|--------------------------------------------------------|
+| `--instructions <TEXT>` | What to choose and why (required).                     |
+| `--option <NAME=DESC>`  | One option. Repeatable, and at least two are required. |
 
 `--option` splits on the **first** `=` only, so `--option "eq=a = b"` keeps
 `a = b` as the description. An empty name is rejected, and so is a duplicate
@@ -287,8 +290,8 @@ the Jev wire shape, with a `type` of `choice`, `score` or `noul`:
 
 | `type`   | `criteria`                                                |
 |----------|-----------------------------------------------------------|
-| `choice` | Required map of option name to description.               |
-| `score`  | Required list of levels, low to high.                     |
+| `choice` | Required map of option name to description, at least two. |
+| `score`  | Required list of levels, low to high, at least two.       |
 | `noul`   | Optional map with `"true"` and/or `"false"` descriptions. |
 
 ```yaml
@@ -315,8 +318,9 @@ refund_requested:
     "false": Wants the problem fixed, not refunded
 ```
 
-Quote the `"true"`/`"false"` keys in YAML. Unquoted, they parse as booleans
-rather than strings.
+The `"true"`/`"false"` keys are quoted above for clarity and for other YAML
+tools, which may read bare `true`/`false` as booleans. omni-dev accepts them
+either way.
 
 ```bash
 $ omni-dev ai jev ask "Payouts failing 3 days, I want my money back NOW" \
@@ -363,7 +367,10 @@ $ omni-dev ai jev ask "Payouts failing 3 days, I want my money back NOW" \
 
 A file that defines no questions is rejected before any request is sent. So is
 a spec with an unknown `type` or a missing required field, which fails with
-`Failed to parse questions file <path>` plus the parser's reason.
+`Failed to parse questions file <path>` plus the parser's reason. Each spec is
+also held to the same minimums as the single-question subcommands: a `choice`
+with fewer than two options, or a `score` with fewer than two levels, fails
+with an error naming the question.
 
 ## Ordering caveats
 
@@ -458,11 +465,11 @@ Error: Jev API request failed: HTTP 422: <body>
 ```
 
 Jev understood the request but rejected its contents. omni-dev validates only
-what it can see locally (option names, level count, the shape of an `ask`
-file), so check the things it cannot: the model name passed to `--jev-model`
-or `TYPESAFE_MODEL`, and the values inside each question spec. The error body
-is undocumented upstream and is passed through as-is, so read it for
-specifics.
+what it can see locally: option names and count, level count, the shape of an
+`ask` file, and the `--state-json` type. Check the things it cannot: the model
+name passed to `--jev-model` or `TYPESAFE_MODEL`, and the wording inside each
+question spec. The error body is undocumented upstream and is passed through
+as-is, so read it for specifics.
 
 ### HTTP 429 / 529: retries exhausted
 
