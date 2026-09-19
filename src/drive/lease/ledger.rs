@@ -375,6 +375,18 @@ impl LeaseLedger {
     /// function directly. `_lock` is the proof it is held, so an unlocked
     /// rewrite does not compile. A caller that has not already taken the
     /// lock acquires one first, normally via [`LedgerLock::acquire_waiting`].
+    ///
+    /// **The load is deliberate even when the caller already holds a
+    /// ledger it loaded under this same lock** (issue #1697). `f` sees
+    /// every row, and [`Self::save`] rewrites the file whole, so what this
+    /// function writes back is only ever as current as what it read —
+    /// re-reading is what keeps a rewrite from being built on a snapshot
+    /// whose age nothing bounds. Threading a caller's copy through instead
+    /// would save one small read and make two views of one ledger
+    /// reachable under a single lock: [`super::restore`] stamps its backup
+    /// row through this function while a grant is still held, and is
+    /// correct today only because it runs *after*
+    /// `finish_leased_write`, not before.
     pub(crate) fn mutate<R>(
         _lock: &LedgerLock,
         path: &Path,
@@ -611,10 +623,21 @@ impl LedgerLock {
     /// Each attempt's synchronous open/fchmod/stat/flock runs on the
     /// blocking pool via `spawn_blocking`, not on the calling task, so a
     /// long wait cannot starve other tasks on a shared runtime (issue
-    /// #1714). Deliberately not `block_in_place`, which the rest of this
-    /// module uses: that panics on a current-thread runtime, and every
-    /// leased write reaches this loop — including from the many
-    /// current-thread `#[tokio::test]`s across the Drive engines.
+    /// #1714).
+    ///
+    /// Deliberately **not** [`offload_short_blocking_io`] (nor the
+    /// `block_in_place` it wraps), which the rest of this module uses for
+    /// its file I/O. That distinction is about duration, not mechanism:
+    /// `block_in_place` gives this worker's core away and takes it back
+    /// when the closure returns, which is the right trade for a read or an
+    /// `fsync` and the wrong one for a poll that can run to
+    /// [`default_lock_wait_timeout`]. Until issue #1697 added that helper,
+    /// `block_in_place`'s panic on a current-thread runtime enforced this
+    /// by accident — every leased write reaches this loop, including from
+    /// the many current-thread `#[tokio::test]`s across the Drive engines,
+    /// so a stray call could not survive a test run. The helper does not
+    /// panic, so the rule is now pinned by
+    /// `the_lock_wait_loop_never_offloads_to_a_runtime_worker` instead.
     pub(crate) async fn acquire_waiting_with_timeout(
         ledger_path: &Path,
         max_wait: Duration,
@@ -662,6 +685,51 @@ impl LedgerLock {
                 None => std::thread::sleep(wait.next_delay()?),
             }
         }
+    }
+}
+
+/// Runs `f` — a **short, bounded** piece of blocking file I/O — without
+/// pinning the async worker it was called on, where the runtime allows it
+/// (issue #1697).
+///
+/// A leased write's gate ([`super::check::check_and_lock_lease`] and the
+/// two functions that conclude it) reads the ledger, rewrites it in full,
+/// and `fsync`s two audit records, all from an async task. On the
+/// multi-thread runtime production actually runs (`src/main.rs`), and on
+/// the daemon/MCP runtime ADR-0080 names as a planned caller, that holds a
+/// worker across several `fsync`s. [`tokio::task::block_in_place`] hands
+/// this worker's other queued tasks off to the runtime's other workers for
+/// the duration, which is exactly the fix — but it **panics** outside a
+/// multi-thread runtime, so it cannot be called bare here, and this
+/// degrades to a plain call instead.
+///
+/// Three decisions worth not re-litigating:
+///
+/// * **Why not `spawn_blocking`.** In a test build `crate::request_log`
+///   routes the audit file through a *thread-local*, so a record written
+///   from a `spawn_blocking`/`tokio::spawn`ed closure lands in the shared
+///   scratch file rather than the test's own redirected one (see
+///   `request_log`'s `test_audit_file_override`). `block_in_place` runs
+///   `f` on the *calling* thread, so that routing survives. It also needs
+///   no `'static`/`Send` bound, so the gate keeps borrowing its paths.
+/// * **Why not bare `block_in_place`.** It panics on a current-thread
+///   runtime, and the gate is reached from several hundred current-thread
+///   `#[tokio::test]`s across the Drive engines. `Handle::try_current`
+///   returning `Err` (no runtime at all) also takes the plain-call arm;
+///   `block_in_place` would tolerate that case, but spelling it out costs
+///   nothing and keeps the match total.
+/// * **Short I/O only — never a wait.** [`Self::acquire_waiting_with_timeout`]
+///   must *not* use this: it polls for up to
+///   [`default_lock_wait_timeout`], and handing a worker's core away for
+///   that long is the starvation issue #1714 fixed by putting each attempt
+///   on `spawn_blocking` instead. A grep-guard test pins that, since the
+///   panic that used to enforce it no longer fires once this exists.
+pub(crate) fn offload_short_blocking_io<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 
@@ -1039,8 +1107,12 @@ mod tests {
         LedgerLock::acquire(&ledger_path).unwrap();
     }
 
-    // Current-thread on purpose, like the test below: it pins that the
-    // waiting loop never reaches for `block_in_place`, which panics here.
+    // Current-thread on purpose, like the test below: the waiting loop is
+    // reached from current-thread runtimes throughout the Drive engines, so
+    // it has to work on one. It no longer *pins* that the loop keeps off
+    // `block_in_place` — `offload_short_blocking_io` would not panic here —
+    // which is what `the_lock_wait_loop_never_offloads_to_a_runtime_worker`
+    // below is for (issue #1697).
     #[tokio::test]
     async fn ledger_lock_acquire_waiting_waits_for_a_concurrent_holder_then_succeeds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1069,6 +1141,66 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err:?}");
+    }
+
+    /// The rule `acquire_waiting_with_timeout`'s doc states: a poll that can
+    /// run to `default_lock_wait_timeout` must stay on the blocking pool,
+    /// never take a runtime worker's core (issue #1714). Before issue #1697
+    /// this was enforced by `block_in_place` panicking on the current-thread
+    /// runtimes the loop is reached from; `offload_short_blocking_io` does
+    /// not panic, so the enforcement moved here — greping the real source,
+    /// the same shape `request_log`'s own audit-path guard uses.
+    #[test]
+    fn the_lock_wait_loop_never_offloads_to_a_runtime_worker() {
+        let source = include_str!("ledger.rs");
+        let start = source
+            .find("pub(crate) async fn acquire_waiting_with_timeout(")
+            .expect("acquire_waiting_with_timeout signature not found");
+        let end = source[start..]
+            .find("/// [`Self::acquire_waiting_with_timeout`]'s synchronous twin")
+            .expect("acquire_waiting_blocking_with_timeout doc comment not found")
+            + start;
+        let wait_loop = &source[start..end];
+        // Pins the slice itself: if either anchor drifted so that this
+        // captured the wrong span (or none), the guard would pass
+        // vacuously rather than reporting that it had stopped guarding.
+        assert!(
+            wait_loop.contains("spawn_blocking"),
+            "the sliced span is not the wait loop — re-anchor this guard:\n{wait_loop}"
+        );
+        for forbidden in ["block_in_place", "offload_short_blocking_io"] {
+            assert!(
+                !wait_loop.contains(forbidden),
+                "the ledger-lock wait loop must not hand a runtime worker's core away for the \
+                 whole wait — it found `{forbidden}`:\n{wait_loop}"
+            );
+        }
+    }
+
+    /// The arm that does the work this helper exists for. `multi_thread` on
+    /// purpose: it is the only flavor that reaches `block_in_place`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offload_short_blocking_io_runs_the_closure_on_a_multi_thread_runtime() {
+        let thread = std::thread::current().id();
+        let (ran, ran_on) = offload_short_blocking_io(|| (true, std::thread::current().id()));
+        assert!(ran);
+        // Same thread, not the blocking pool — this is what keeps
+        // `request_log`'s thread-local audit routing working under the gate.
+        assert_eq!(ran_on, thread);
+    }
+
+    /// The whole reason the helper is not a bare `block_in_place`: a
+    /// current-thread runtime must get the closure, not a panic.
+    #[tokio::test]
+    async fn offload_short_blocking_io_does_not_panic_on_a_current_thread_runtime() {
+        assert!(offload_short_blocking_io(|| true));
+    }
+
+    /// The `Handle::try_current()` error arm — `finish_leased_write` is a
+    /// sync fn, so it is reachable with no runtime at all.
+    #[test]
+    fn offload_short_blocking_io_runs_the_closure_outside_any_runtime() {
+        assert!(offload_short_blocking_io(|| true));
     }
 
     #[test]

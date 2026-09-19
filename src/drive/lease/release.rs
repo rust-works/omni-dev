@@ -366,7 +366,10 @@ mod tests {
     }
 
     // Current-thread on purpose: `release` is dispatched from one in
-    // `cli::drive`'s tests, so it must not reach for `block_in_place`.
+    // `cli::drive`'s tests, so it has to work on one. Note this no longer
+    // *pins* that `release` keeps off `block_in_place` — since issue #1697
+    // the lease module offloads through `ledger::offload_short_blocking_io`,
+    // which degrades to a plain call here instead of panicking.
     #[tokio::test]
     async fn a_release_waits_for_a_concurrent_holder_then_releases() {
         // Issue #1738: an unrelated lease operation holding the ledger lock
