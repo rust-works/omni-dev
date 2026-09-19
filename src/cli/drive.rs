@@ -225,19 +225,27 @@ mod tests {
 
     /// `lease release` must reach the ledger with no credentials configured
     /// (issue #1685) — it never calls the lazily-resolved client at all.
+    ///
+    /// Drives `LeaseCommand::run` directly rather than through
+    /// `DriveCommand::execute` — this token resolves `NoSuchToken`, whose
+    /// exit code is non-zero (issue #1775), and `execute` would
+    /// `std::process::exit` on that, aborting the test binary. Calling
+    /// `run` with a panicking client thunk is also a strictly stronger
+    /// check of "never calls the lazily-resolved client" than the old
+    /// indirect proxy of "would fail if it tried, since credentials are
+    /// missing".
     #[tokio::test]
     async fn execute_lease_release_needs_no_credentials() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
 
-        let cmd = DriveCommand {
-            account: None,
-            command: DriveSubcommands::Lease(lease::LeaseCommand::release_for_test(
-                "no-such-token".to_string(),
-            )),
-        };
-        cmd.execute().await.unwrap();
+        let cmd = lease::LeaseCommand::release_for_test("no-such-token".to_string());
+        let code = cmd
+            .run(|| panic!("release must never resolve a client"))
+            .await
+            .unwrap();
+        assert_eq!(code, 1, "NoSuchToken must be a non-zero exit");
 
         assert_eq!(audit.verdicts(), vec!["release-no-such-token".to_string()]);
     }

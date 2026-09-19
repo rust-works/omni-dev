@@ -174,6 +174,23 @@ impl JsonlSerialize for AcquireResult {
     }
 }
 
+impl AcquireResult {
+    /// The CLI's exit code for this outcome (issue #1775): `0` when the
+    /// caller ends up holding a usable lease token — whether freshly minted
+    /// or reused via [`Self::AlreadyLeased`] — `1` for every refusal or
+    /// failure.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Acquired { .. } | Self::AlreadyLeased { .. } => 0,
+            Self::RefusedNativeDocument
+            | Self::RefusedConcurrentChange { .. }
+            | Self::Denied { .. }
+            | Self::Unavailable { .. }
+            | Self::Failed { .. } => 1,
+        }
+    }
+}
+
 /// Runs the four-step sequence ADR-0080 §2 specifies, in order, aborting at
 /// the first failure with nothing further attempted, then records the
 /// attempt to the audit sink regardless of outcome (ADR-0080 §11).
@@ -3433,5 +3450,63 @@ mod tests {
     fn the_audit_record_omits_the_field_when_nothing_was_released() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(superseded_lease_id_on_record(root.path(), None), None);
+    }
+
+    /// Pins the CLI exit-code classification (issue #1775) for every
+    /// variant — in particular that `AlreadyLeased` is `0`, since it hands
+    /// back a usable token for reuse rather than refusing outright.
+    #[test]
+    fn exit_code_matches_the_documented_classification() {
+        let cases: Vec<(AcquireResult, i32)> = vec![
+            (
+                AcquireResult::Acquired {
+                    token: "tok".to_string(),
+                    expires_at: Utc::now(),
+                    backup: LeaseBackup::Bytes {
+                        path: PathBuf::from("/tmp/backup"),
+                        sha256: "deadbeef".to_string(),
+                        size: 0,
+                    },
+                    headless_waiver: false,
+                    superseded_lease_id: None,
+                },
+                0,
+            ),
+            (
+                AcquireResult::AlreadyLeased {
+                    token: "tok".to_string(),
+                    expires_at: Utc::now(),
+                },
+                0,
+            ),
+            (AcquireResult::RefusedNativeDocument, 1),
+            (
+                AcquireResult::RefusedConcurrentChange {
+                    detail: "moved".to_string(),
+                },
+                1,
+            ),
+            (
+                AcquireResult::Denied {
+                    detail: "no".to_string(),
+                },
+                1,
+            ),
+            (
+                AcquireResult::Unavailable {
+                    detail: "no authenticator".to_string(),
+                },
+                1,
+            ),
+            (
+                AcquireResult::Failed {
+                    detail: "boom".to_string(),
+                },
+                1,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result.exit_code(), expected, "{result:?}");
+        }
     }
 }

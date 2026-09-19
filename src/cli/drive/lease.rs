@@ -76,11 +76,27 @@ impl LeaseCommand {
     /// `helpers::create_client` fn item; tests pass a closure that hands
     /// back an already-constructed wiremock client.
     pub async fn execute(self, client: impl FnOnce() -> Result<DriveClient>) -> Result<()> {
+        let code = self.run(client).await?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        Ok(())
+    }
+
+    /// The same dispatch as [`Self::execute`], but returns the exit code
+    /// (issue #1775) instead of calling `std::process::exit` on it — so a
+    /// test can observe a refusal's exit code without aborting the test
+    /// binary. `prune` is out of scope for #1775 and keeps its own
+    /// always-`Ok(())` shape, so its arm always contributes `0`. `pub(crate)`
+    /// rather than private: `crate::cli::drive`'s own tests need to drive a
+    /// `release`/`restore` refusal without going through `execute`'s
+    /// `std::process::exit`.
+    pub(crate) async fn run(self, client: impl FnOnce() -> Result<DriveClient>) -> Result<i32> {
         match self.action {
-            LeaseAction::Acquire(cmd) => cmd.execute(&client()?).await,
-            LeaseAction::Restore(cmd) => cmd.execute(&client()?).await,
-            LeaseAction::Release(cmd) => cmd.execute().await,
-            LeaseAction::Prune(cmd) => cmd.execute(client).await,
+            LeaseAction::Acquire(cmd) => cmd.run(&client()?).await,
+            LeaseAction::Restore(cmd) => cmd.run(&client()?).await,
+            LeaseAction::Release(cmd) => cmd.run().await,
+            LeaseAction::Prune(cmd) => cmd.execute(client).await.map(|()| 0),
         }
     }
 }
@@ -224,7 +240,11 @@ pub struct AcquireCommand {
 }
 
 impl AcquireCommand {
-    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+    /// Runs `acquire`, returning the outcome's exit code (issue #1775) —
+    /// `0` for [`AcquireResult::Acquired`]/[`AcquireResult::AlreadyLeased`],
+    /// `1` for every refusal or failure. [`LeaseCommand::execute`] is the
+    /// sole caller that turns a non-zero code into an actual process exit.
+    async fn run(self, client: &DriveClient) -> Result<i32> {
         let resolved = self.flags.resolve()?;
         let ledger_path = ledger::ledger_path()?;
         let native_backup_folder_id =
@@ -243,11 +263,12 @@ impl AcquireCommand {
         };
         let authenticator = authenticate::platform_authenticator();
         let result = acquire::acquire(client, &opts, authenticator.as_ref()).await;
+        let exit_code = result.exit_code();
         if output_as(&result, &self.output)? {
-            return Ok(());
+            return Ok(exit_code);
         }
         print_result(&result);
-        Ok(())
+        Ok(exit_code)
     }
 }
 
@@ -270,7 +291,13 @@ pub struct RestoreCommand {
 }
 
 impl RestoreCommand {
-    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+    /// Runs `restore`, returning the outcome's exit code (issue #1775) —
+    /// `0` for [`RestoreResult::Restored`]/[`RestoreResult::RestoredSheet`],
+    /// `1` for every refusal or failure (including `RestoreResult::
+    /// AlreadyLeased`, despite its name — see [`RestoreResult::exit_code`]).
+    /// [`LeaseCommand::execute`] is the sole caller that turns a non-zero
+    /// code into an actual process exit.
+    async fn run(self, client: &DriveClient) -> Result<i32> {
         let resolved = self.flags.resolve()?;
         let ledger_path = ledger::ledger_path()?;
         let native_backup_folder_id =
@@ -288,11 +315,12 @@ impl RestoreCommand {
         let sheets = SheetsClient::from_drive_client(client)?;
         let authenticator = authenticate::platform_authenticator();
         let result = restore::restore(client, &sheets, &opts, authenticator.as_ref(), &rules).await;
+        let exit_code = result.exit_code();
         if output_as(&result, &self.output)? {
-            return Ok(());
+            return Ok(exit_code);
         }
         print_restore_result(&result);
-        Ok(())
+        Ok(exit_code)
     }
 }
 
@@ -324,18 +352,24 @@ pub struct ReleaseCommand {
 }
 
 impl ReleaseCommand {
-    pub async fn execute(self) -> Result<()> {
+    /// Runs `release`, returning the outcome's exit code (issue #1775) —
+    /// `0` for [`ReleaseResult::Released`]/[`ReleaseResult::NotLive`] (an
+    /// idempotent no-op, not a failure), `1` for `NoSuchToken`/`Failed`.
+    /// [`LeaseCommand::execute`] is the sole caller that turns a non-zero
+    /// code into an actual process exit.
+    async fn run(self) -> Result<i32> {
         let ledger_path = ledger::ledger_path()?;
         let opts = ReleaseOptions {
             token: self.token,
             ledger_path,
         };
         let result = release::release(&opts).await;
+        let exit_code = result.exit_code();
         if output_as(&result, &self.output)? {
-            return Ok(());
+            return Ok(exit_code);
         }
         print_release_result(&result);
-        Ok(())
+        Ok(exit_code)
     }
 }
 
@@ -750,7 +784,7 @@ mod tests {
 
     /// A native-document target is refused before `acquire` ever calls the
     /// authenticator (see `acquire::tests::native_document_is_refused_before_authenticating`),
-    /// so this exercises `LeaseCommand::execute`/`AcquireCommand::execute`
+    /// so this exercises `LeaseCommand::run`/`AcquireCommand::run`
     /// end to end without risking a real Touch ID prompt in a test process.
     async fn native_document_server() -> wiremock::MockServer {
         let server = wiremock::MockServer::start().await;
@@ -791,7 +825,13 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        cmd.execute(move || Ok(client)).await.unwrap();
+        // `execute` would now `std::process::exit` on this refusal
+        // (issue #1775) — `run` returns the code as a plain value instead.
+        assert_eq!(
+            cmd.run(move || Ok(client)).await.unwrap(),
+            1,
+            "RefusedNativeDocument must be a non-zero exit"
+        );
     }
 
     #[tokio::test]
@@ -812,7 +852,11 @@ mod tests {
             },
             output: OutputFormat::Json,
         };
-        cmd.execute(&client).await.unwrap();
+        assert_eq!(
+            cmd.run(&client).await.unwrap(),
+            1,
+            "RefusedNativeDocument must be a non-zero exit"
+        );
     }
 
     #[tokio::test]
@@ -821,7 +865,7 @@ mod tests {
         // unconfigured account plus a token this fresh ledger has never
         // recorded resolves `NoSuchBackupToken` deterministically, with no
         // Drive call needed at all — cheap enough to double as "the
-        // subcommand routes to `RestoreCommand::execute`".
+        // subcommand routes to `RestoreCommand::run`".
         let guard = crate::drive::test_support::EnvGuard::take();
         let dir = guard.clear_credentials();
         let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
@@ -839,17 +883,21 @@ mod tests {
                 output: OutputFormat::Table,
             }),
         };
-        cmd.execute(move || Ok(client)).await.unwrap();
+        assert_eq!(
+            cmd.run(move || Ok(client)).await.unwrap(),
+            1,
+            "NoSuchBackupToken must be a non-zero exit"
+        );
     }
 
     #[tokio::test]
-    async fn restore_command_execute_reaches_the_gate_and_is_blocked() {
+    async fn restore_command_run_reaches_the_gate_and_is_blocked() {
         // Deliberately stops at the folder-permission gate, *before* the
         // internal fresh-`acquire` step would ever call
         // `authenticate::platform_authenticator()` — unlike every test in
         // `restore.rs` itself (which injects a fake `Authenticator`),
-        // `RestoreCommand::execute` always resolves the *real* one, exactly
-        // like `AcquireCommand::execute` already does. Actually reaching it
+        // `RestoreCommand::run` always resolves the *real* one, exactly
+        // like `AcquireCommand::run` already does. Actually reaching it
         // here would make this test depend on this machine's real
         // LocalAuthentication state (Touch ID enrolled and interactively
         // answered, or not) rather than being hermetic — precisely why
@@ -922,7 +970,7 @@ mod tests {
         ledger.save(&ledger_path).unwrap();
 
         // An explicit `--backup-dir` and `--biometrics-only`, exercising
-        // `RestoreCommand::execute`'s own option-resolution branches — the
+        // `RestoreCommand::run`'s own option-resolution branches — the
         // gate still blocks first, so neither ever reaches use.
         let cmd = RestoreCommand {
             token: "backup-token".to_string(),
@@ -934,7 +982,11 @@ mod tests {
             },
             output: OutputFormat::Json,
         };
-        cmd.execute(&client).await.unwrap();
+        assert_eq!(
+            cmd.run(&client).await.unwrap(),
+            1,
+            "Blocked must be a non-zero exit"
+        );
 
         let reloaded = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
         assert!(
