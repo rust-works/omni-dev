@@ -1054,7 +1054,8 @@ it captured. So a byte backup's own SHA-256 is compared against the
 document's `version` is read immediately before *and* after its
 `files.copy` and must agree. If the proof fails the acquisition refuses
 (status `refused-concurrent-change`), the backup is discarded, and no
-lease exists — re-run `acquire` once the file is quiet:
+lease exists — re-run `acquire` once the file is quiet (a native
+document's moved `version` is first retried automatically; see below):
 
 ```bash
 $ omni-dev drive lease acquire 1ExistingFileId
