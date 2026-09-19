@@ -156,13 +156,17 @@ pub(crate) fn seed_lease_with_backup(
     )
 }
 
-/// The fully general form: explicit token and expiry as well as backup.
-pub(crate) fn seed_lease_full(
+/// [`seed_lease_full`], but with explicit `acquired_at`/`expires_at`
+/// timestamps instead of a relative expiry — for tests that need to
+/// control staleness independent of "now" (e.g. a lease already expired,
+/// or held for a specific duration).
+pub(crate) fn seed_lease_at(
     ledger_path: &std::path::Path,
     token: &str,
     file_id: &str,
     version: &str,
-    expiry: chrono::Duration,
+    acquired_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
     backup: LeaseBackup,
 ) -> String {
     let mut ledger = LeaseLedger::default();
@@ -172,12 +176,33 @@ pub(crate) fn seed_lease_full(
         version: version.to_string(),
         modified_time: None,
         backup,
-        acquired_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + expiry,
+        acquired_at,
+        expires_at,
         released_at: None,
         restored_at: None,
         restored_sheet_id: None,
     });
     ledger.save(ledger_path).unwrap();
     token.to_string()
+}
+
+/// The fully general form: explicit token and expiry as well as backup.
+pub(crate) fn seed_lease_full(
+    ledger_path: &std::path::Path,
+    token: &str,
+    file_id: &str,
+    version: &str,
+    expiry: chrono::Duration,
+    backup: LeaseBackup,
+) -> String {
+    let now = chrono::Utc::now();
+    seed_lease_at(
+        ledger_path,
+        token,
+        file_id,
+        version,
+        now,
+        now + expiry,
+        backup,
+    )
 }

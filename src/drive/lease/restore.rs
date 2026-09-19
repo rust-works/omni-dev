@@ -1357,22 +1357,15 @@ mod tests {
         backup: LeaseBackup,
         expires_at: DateTime<Utc>,
     ) -> String {
-        let token = "backup-token".to_string();
-        let mut ledger = LeaseLedger::default();
-        ledger.insert(LeaseRecord {
-            token: token.clone(),
-            file_id: file_id.to_string(),
-            version: "1".to_string(),
-            modified_time: None,
-            backup,
-            acquired_at: Utc::now() - ChronoDuration::hours(2),
+        crate::drive::test_support::seed_lease_at(
+            ledger_path,
+            "backup-token",
+            file_id,
+            "1",
+            Utc::now() - ChronoDuration::hours(2),
             expires_at,
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(ledger_path).unwrap();
-        token
+            backup,
+        )
     }
 
     fn opts(dir: &Path, token: &str) -> RestoreOptions {
