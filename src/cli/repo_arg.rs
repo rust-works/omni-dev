@@ -72,6 +72,26 @@ mod tests {
         assert!(git_repo(&["omni-dev", "git", "commit", "message", "view"]).is_none());
     }
 
+    /// RULE 3: the repo location is a parameter, never a relocated global.
+    /// Unlike the other scoped-flag groups, `RepoArg` deliberately has no
+    /// `apply()` exporting it to an env var; this guard stops one being added
+    /// "to complete the pattern" by analogy with `AiBackendArgs`/`InstanceArg`.
+    #[test]
+    fn repo_arg_is_never_exported_to_the_environment() {
+        let source = include_str!("repo_arg.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first piece");
+        for forbidden in ["set_var", "fn apply"] {
+            assert!(
+                !production.contains(forbidden),
+                "repo_arg.rs must not `{forbidden}`: -C/--repo is threaded as a \
+                 parameter, never exported to an env var"
+            );
+        }
+    }
+
     /// The pre-#1778 placement — before the subcommand — no longer parses.
     #[test]
     fn rejected_before_the_subcommand_and_on_non_readers() {

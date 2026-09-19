@@ -395,6 +395,47 @@ mod tests {
                 "`{path}` should accept the global `--profile`"
             );
         }
+
+        // Every `global = true` flag declared anywhere in the (un-built) tree,
+        // pinned by the exact node that declares it — so a new global, under
+        // any name, cannot appear without being added here on purpose.
+        use std::collections::BTreeSet;
+        fn declared_globals(cmd: &clap::Command, path: &str, out: &mut BTreeSet<String>) {
+            for arg in cmd.get_arguments().filter(|a| a.is_global_set()) {
+                let long = arg.get_long().unwrap_or_else(|| arg.get_id().as_str());
+                out.insert(format!("{path} --{long}"));
+            }
+            for sub in cmd.get_subcommands() {
+                declared_globals(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut declared = BTreeSet::new();
+        declared_globals(&Cli::command(), "omni-dev", &mut declared);
+        let mut expected_globals: BTreeSet<String> = [
+            "omni-dev --profile",
+            "omni-dev git --repo",
+            "omni-dev coverage --repo",
+            "omni-dev config scopes --repo",
+            "omni-dev atlassian jira --instance",
+            "omni-dev atlassian confluence --instance",
+            "omni-dev atlassian auth status --instance",
+            // Pre-#1778 subtree globals, scoped the same way.
+            "omni-dev gmail --account",
+            "omni-dev drive --account",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        if cfg!(unix) {
+            // `RepoArg` is `global = true` even on these leaves (a no-op there).
+            expected_globals.insert("omni-dev worktrees rebase --repo".to_string());
+            expected_globals.insert("omni-dev worktrees push --repo".to_string());
+        }
+        assert_eq!(
+            declared, expected_globals,
+            "the set of `global = true` flags changed — apply the placement rule \
+             (#1778) and update this list"
+        );
     }
 
     /// Generalises the #1420 audit: no subcommand anywhere in the tree may
