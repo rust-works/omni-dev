@@ -745,8 +745,8 @@ mod tests {
         let file_path = temp_dir.path().join("body.md");
         fs::write(&file_path, "Plain body.\n").unwrap();
 
-        // Email/token from env; the instance comes from the global `--instance`
-        // flag, which `propagate_global_flags` exports as
+        // Email/token from env; the instance comes from the `--instance`
+        // flag, which `InstanceArg::apply` exports as
         // `OMNI_DEV_ATLASSIAN_INSTANCE` — here set directly to the mock server
         // (the `EnvGuard` snapshots and restores that var too). #1117.
         let guard = crate::atlassian::auth::test_util::EnvGuard::take();

@@ -142,11 +142,16 @@ fn run_logout(settings_path: &std::path::Path, profile: Option<&str>) -> Result<
 
 /// Shows the current authentication status.
 #[derive(Parser)]
-pub struct StatusCommand;
+pub struct StatusCommand {
+    /// `--instance` override for the tenant being checked.
+    #[command(flatten)]
+    pub instance: super::InstanceArg,
+}
 
 impl StatusCommand {
     /// Verifies credentials by calling the JIRA API.
     pub async fn execute(self) -> Result<()> {
+        self.instance.apply();
         let credentials = auth::load_credentials()?;
         let client = AtlassianClient::from_credentials(&credentials)?;
         run_auth_status(&client, &credentials.instance_url).await
@@ -206,7 +211,9 @@ mod tests {
     #[test]
     fn auth_command_status_dispatch() {
         let cmd = AuthCommand {
-            command: AuthSubcommands::Status(StatusCommand),
+            command: AuthSubcommands::Status(StatusCommand {
+                instance: crate::cli::atlassian::InstanceArg::default(),
+            }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
     }

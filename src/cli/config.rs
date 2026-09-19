@@ -2,8 +2,6 @@
 
 pub mod scopes;
 
-use std::path::Path;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -57,16 +55,12 @@ pub struct ShowCommand {
 }
 
 impl ConfigCommand {
-    /// Executes the config command.
-    ///
-    /// `repo` is the repository location resolved once at the CLI boundary
-    /// (`None` = current working directory); threaded explicitly into the
-    /// `Scopes` subtree, the first `config` leaf that reads git history.
-    /// `Models` ignores it — it never touches a repository.
-    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+    /// Executes the config command. `-C/--repo` belongs to the `Scopes`
+    /// subtree only — `Models` never touches a repository, so it rejects it.
+    pub fn execute(self) -> Result<()> {
         match self.command {
             ConfigSubcommands::Models(models_cmd) => models_cmd.execute(),
-            ConfigSubcommands::Scopes(scopes_cmd) => scopes_cmd.execute(repo),
+            ConfigSubcommands::Scopes(scopes_cmd) => scopes_cmd.execute(),
         }
     }
 }

@@ -62,6 +62,10 @@ pub struct GitCommand {
     /// Git subcommand to execute.
     #[command(subcommand)]
     pub command: GitSubcommands,
+
+    /// `-C/--repo`, inherited by every git subcommand.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 /// Git subcommands.
@@ -150,11 +154,13 @@ pub enum CreateSubcommands {
 impl GitCommand {
     /// Executes the git command.
     ///
-    /// `repo` is the repository location resolved once at the CLI boundary
-    /// (`None` = current working directory); it is threaded explicitly down to
-    /// each leaf command rather than read from the ambient CWD.
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
-        match self.command {
+    /// `-C/--repo` is resolved once here (`None` = current working directory)
+    /// and threaded explicitly down to each leaf command rather than read from
+    /// the ambient CWD.
+    pub async fn execute(self) -> Result<()> {
+        let Self { command, repo } = self;
+        let repo = repo.path();
+        match command {
             GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(repo).await,
             GitSubcommands::Branch(branch_cmd) => branch_cmd.execute(repo).await,
             GitSubcommands::Worktree(worktree_cmd) => worktree_cmd.execute(repo),

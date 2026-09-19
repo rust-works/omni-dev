@@ -29,6 +29,10 @@ pub struct ConfluenceCommand {
     /// The Confluence subcommand to execute.
     #[command(subcommand)]
     pub command: ConfluenceSubcommands,
+
+    /// `--instance`, inherited by every Confluence subcommand.
+    #[command(flatten)]
+    pub instance: super::InstanceArg,
 }
 
 /// Confluence subcommands.
@@ -90,6 +94,7 @@ pub enum ConfluenceSubcommands {
 impl ConfluenceCommand {
     /// Executes the Confluence command.
     pub async fn execute(self) -> Result<()> {
+        self.instance.apply();
         match self.command {
             ConfluenceSubcommands::Comment(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Read(cmd) => cmd.execute().await,
@@ -130,6 +135,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Comment(_)));
     }
@@ -144,6 +150,7 @@ mod tests {
                 format: ContentFormat::Jfm,
                 version: None,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Read(_)));
     }
@@ -158,6 +165,7 @@ mod tests {
                 force: false,
                 dry_run: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Write(_)));
     }
@@ -168,6 +176,7 @@ mod tests {
             command: ConfluenceSubcommands::Edit(edit::EditCommand {
                 id: "12345".to_string(),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Edit(_)));
     }
@@ -182,6 +191,7 @@ mod tests {
                 limit: 25,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Search(_)));
     }
@@ -197,6 +207,7 @@ mod tests {
                 parent: None,
                 dry_run: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Create(_)));
     }
@@ -210,6 +221,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Label(_)));
     }
@@ -225,6 +237,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Attachment(_)));
     }
@@ -238,6 +251,7 @@ mod tests {
                 dry_run: false,
                 purge: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
     }
@@ -250,6 +264,7 @@ mod tests {
                 target: "456".to_string(),
                 position: move_page::MovePosition::Append,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Move(_)));
     }
@@ -275,6 +290,7 @@ mod tests {
                 target: "456".to_string(),
                 position: move_page::MovePosition::Append,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -293,6 +309,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::User(_)));
     }
@@ -310,6 +327,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Space(_)));
     }
@@ -327,6 +345,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let other = ConfluenceCommand {
             command: ConfluenceSubcommands::Read(read::ReadCommand {
@@ -336,6 +355,7 @@ mod tests {
                 format: ContentFormat::Jfm,
                 version: None,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         // Single `matches!` site exercised against both a matching and
         // non-matching variant so both arms are covered at the same source
@@ -374,6 +394,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -392,6 +413,7 @@ mod tests {
                 max_depth: 0,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Children(_)));
     }
@@ -405,6 +427,7 @@ mod tests {
                 limit: 20,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::History(_)));
     }
@@ -432,6 +455,7 @@ mod tests {
                 limit: 20,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -465,6 +489,7 @@ mod tests {
                 max_depth: 0,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -495,6 +520,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -518,6 +544,7 @@ mod tests {
                 include_attachments: false,
                 on_conflict: download::OnConflict::Backup,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Download(_)));
     }
@@ -537,6 +564,7 @@ mod tests {
                 include_attachments: false,
                 on_conflict: download::OnConflict::Backup,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Download(_)));
     }
@@ -572,6 +600,7 @@ mod tests {
                     output: OutputFormat::Yaml,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -612,6 +641,7 @@ mod tests {
                 parent: "67890".to_string(),
                 title: "Copy".to_string(),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -634,6 +664,7 @@ mod tests {
                     account_id: None,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 
@@ -655,6 +686,7 @@ mod tests {
                     id: "12345".to_string(),
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         let _ = cmd.execute().await;
 

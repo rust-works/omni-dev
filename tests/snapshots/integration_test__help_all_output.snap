@@ -32,8 +32,6 @@ Commands:
 
 Options:
       --profile <NAME>  Selects a named credential/config profile from `~/.omni-dev/settings.json` (AWS-CLI style)
-      --instance <URL>  Overrides the Atlassian instance URL (e.g. `https://org.atlassian.net`) for every JIRA and Confluence command
-  -C, --repo <PATH>     Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help            Print help (see more with '--help')
   -V, --version         Print version
 
@@ -425,10 +423,11 @@ omni-dev atlassian auth status - Shows the current authentication status (mirror
 
 Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool)
 
-Usage: status
+Usage: status [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --instance <URL>  Overrides the Atlassian instance URL (e.g. `https://org.atlassian.net`) for this JIRA/Confluence command
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================
@@ -437,7 +436,7 @@ omni-dev atlassian confluence - Confluence page management, search, and more
 
 Confluence page management, search, and more
 
-Usage: confluence <COMMAND>
+Usage: confluence [OPTIONS] <COMMAND>
 
 Commands:
   comment      Manages comments on a Confluence page
@@ -462,7 +461,8 @@ Commands:
   help         Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+      --instance <URL>  Overrides the Atlassian instance URL (e.g. `https://org.atlassian.net`) for this JIRA/Confluence command
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================
@@ -1402,7 +1402,7 @@ omni-dev atlassian jira - JIRA issue management, search, agile boards, and more
 
 JIRA issue management, search, agile boards, and more
 
-Usage: jira <COMMAND>
+Usage: jira [OPTIONS] <COMMAND>
 
 Commands:
   read        Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON (mirrors the `jira_read` MCP tool)
@@ -1430,7 +1430,8 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+      --instance <URL>  Overrides the Atlassian instance URL (e.g. `https://org.atlassian.net`) for this JIRA/Confluence command
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================
@@ -3027,7 +3028,7 @@ omni-dev config scopes - Scope-taxonomy operations (scopes.yaml)
 
 Scope-taxonomy operations (scopes.yaml)
 
-Usage: scopes <COMMAND>
+Usage: scopes [OPTIONS] <COMMAND>
 
 Commands:
   usage  Tallies declared commit scopes against `scopes.yaml`, reporting unknown, unused, and scope-less commits
@@ -3035,7 +3036,8 @@ Commands:
   help   Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -C, --repo <PATH>  Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -h, --help         Print help (see more with '--help')
 
 
 ================================================================================
@@ -3080,14 +3082,15 @@ omni-dev coverage - Coverage: diff/patch coverage analysis for PR comments
 
 Coverage: diff/patch coverage analysis for PR comments
 
-Usage: coverage <COMMAND>
+Usage: coverage [OPTIONS] <COMMAND>
 
 Commands:
   diff  Analyses diff/patch coverage from a per-line report and a git diff
   help  Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -C, --repo <PATH>  Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -h, --help         Print help (see more with '--help')
 
 
 ================================================================================
@@ -5070,7 +5073,7 @@ omni-dev git - Git-related operations
 
 Git-related operations
 
-Usage: git <COMMAND>
+Usage: git [OPTIONS] <COMMAND>
 
 Commands:
   commit    Commit-related operations
@@ -5079,7 +5082,8 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -C, --repo <PATH>  Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -h, --help         Print help (see more with '--help')
 
 
 ================================================================================
@@ -6505,6 +6509,7 @@ Options:
       --dry-run          Report what would be published, but push nothing
   -y, --yes              Skip the interactive confirmation before pushing
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -C, --repo <PATH>      Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help             Print help (see more with '--help')
 
 
@@ -6527,6 +6532,7 @@ Options:
       --keep-conflicts   Leave a conflicting worktree mid-rebase to resolve in place, instead of aborting it back to its previous state
   -y, --yes              Skip the interactive confirmation before rebasing
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -C, --repo <PATH>      Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help             Print help (see more with '--help')
 
 

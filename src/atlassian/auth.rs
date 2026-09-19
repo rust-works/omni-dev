@@ -23,8 +23,8 @@ pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 
 /// Environment variable that overrides the Atlassian instance URL.
 ///
-/// Applies to **every** JIRA/Confluence command. Set by the global `--instance`
-/// flag via [`crate::cli::Cli`]'s `propagate_global_flags`; takes precedence
+/// Applies to **every** JIRA/Confluence command. Set by the `--instance` flag
+/// via [`crate::cli::atlassian::InstanceArg::apply`]; takes precedence
 /// over `ATLASSIAN_INSTANCE_URL` / settings.json. A caller-supplied override
 /// (e.g. via [`load_credentials_with_instance`]) still wins over it.
 pub const ATLASSIAN_INSTANCE_OVERRIDE_ENV: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
@@ -45,7 +45,7 @@ pub struct AtlassianCredentials {
 /// Loads Atlassian credentials from environment variables or settings.json.
 ///
 /// Checks environment variables first, then falls back to the settings file.
-/// The global `--instance` flag (propagated to [`ATLASSIAN_INSTANCE_OVERRIDE_ENV`])
+/// The `--instance` flag (propagated to [`ATLASSIAN_INSTANCE_OVERRIDE_ENV`])
 /// overrides the configured instance URL for every command; a blank value is
 /// ignored. Callers that carry their own explicit override should call
 /// [`load_credentials_with_instance`] directly.

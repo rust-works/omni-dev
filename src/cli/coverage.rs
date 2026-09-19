@@ -11,6 +11,10 @@ pub struct CoverageCommand {
     /// The coverage subcommand to execute.
     #[command(subcommand)]
     pub command: CoverageSubcommands,
+
+    /// `-C/--repo`, inherited by every coverage subcommand.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 /// Coverage subcommands.
@@ -23,9 +27,10 @@ pub enum CoverageSubcommands {
 impl CoverageCommand {
     /// Executes the coverage command.
     ///
-    /// `repo` is the repository location resolved at the CLI boundary
-    /// (`None` = current working directory).
-    pub fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+    /// `-C/--repo` is resolved here (`None` = current working directory) and
+    /// threaded explicitly to the leaf.
+    pub fn execute(self) -> Result<()> {
+        let repo = self.repo.path();
         match self.command {
             CoverageSubcommands::Diff(cmd) => cmd.execute(repo),
         }
@@ -63,8 +68,9 @@ mod tests {
                 head_sha: None,
                 commit_url: None,
             }),
+            repo: crate::cli::repo_arg::RepoArg::default(),
         };
         // Reaches the leaf command and fails on the missing report file.
-        assert!(cmd.execute(None).is_err());
+        assert!(cmd.execute().is_err());
     }
 }

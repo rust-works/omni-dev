@@ -26,6 +26,7 @@ pub mod git;
 pub mod gmail;
 pub mod help;
 pub mod log;
+pub mod repo_arg;
 pub mod resources;
 #[cfg(unix)]
 pub mod sessions;
@@ -42,10 +43,10 @@ pub use crate::claude::backend::AiBackend;
 /// Top-level clap-derived CLI struct; the library entry point for embedding
 /// omni-dev programmatically.
 ///
-/// Global flags (`--profile`, `--instance`) are propagated to environment
-/// variables read by downstream factories before dispatching to a
-/// [`Commands`] variant. The AI backend flags are per-command, via
-/// [`ai_backend_args::AiBackendArgs`] (#1778).
+/// The only global flag is `--profile`, the one flag every credentialed
+/// command reads; it is propagated to `OMNI_DEV_PROFILE` before dispatching to
+/// a [`Commands`] variant. Every other flag is declared only on the commands
+/// that read it — see the placement rule in [`ai_backend_args`] (#1778).
 #[derive(Parser)]
 #[command(name = "omni-dev")]
 #[command(
@@ -65,27 +66,6 @@ pub struct Cli {
     /// listing the known profiles.
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
-
-    /// Overrides the Atlassian instance URL (e.g.
-    /// `https://org.atlassian.net`) for every JIRA and Confluence command.
-    ///
-    /// Takes precedence over `ATLASSIAN_INSTANCE_URL` / settings.json (email
-    /// and API token still come from the environment/settings). Lets a
-    /// multi-site user target a specific tenant per invocation. Equivalent to
-    /// setting `OMNI_DEV_ATLASSIAN_INSTANCE`. Ignored by non-Atlassian
-    /// commands.
-    #[arg(long, global = true, value_name = "URL")]
-    pub instance: Option<String>,
-
-    /// Run as if omni-dev was started in `<PATH>` instead of the current
-    /// working directory.
-    ///
-    /// Resolved exactly once here and threaded explicitly to each command as a
-    /// parameter; deliberately **not** propagated to an environment variable
-    /// (unlike the flags above) so the repo location never becomes an ambient
-    /// global. Mirrors `git -C`.
-    #[arg(long = "repo", short = 'C', global = true, value_name = "PATH")]
-    pub repo: Option<std::path::PathBuf>,
 
     /// The main command to execute.
     #[command(subcommand)]
@@ -150,28 +130,16 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// Forwards global flags to the env vars that downstream factories
-    /// read. Extracted so it can be unit-tested without invoking a real
-    /// subcommand. Setting the env vars here (rather than threading extra
-    /// arguments through every command) keeps factory signatures stable.
-    fn propagate_global_flags(&self) {
+    /// Forwards `--profile` to the env var the settings readers discover the
+    /// active profile from. Extracted so it can be unit-tested without
+    /// invoking a real subcommand.
+    fn propagate_profile_flag(&self) {
         // The flag beats the env var: setting OMNI_DEV_PROFILE here means the
         // settings readers (which discover the active profile from that env
         // var) pick up the flag. When the flag is absent we leave any existing
         // OMNI_DEV_PROFILE untouched, so the env-var path still works.
         if let Some(profile) = &self.profile {
             std::env::set_var(crate::utils::settings::PROFILE_ENV_VAR, profile);
-        }
-
-        // The global `--instance` flag overrides the configured Atlassian
-        // instance for every JIRA/Confluence command. Propagated to the env var
-        // that `atlassian::auth::load_credentials` reads (#1117). When absent we
-        // leave any existing value untouched so the env-var path still works.
-        if let Some(instance) = &self.instance {
-            std::env::set_var(
-                crate::atlassian::auth::ATLASSIAN_INSTANCE_OVERRIDE_ENV,
-                instance,
-            );
         }
     }
 
@@ -203,7 +171,7 @@ impl Cli {
 
     /// Executes the CLI command.
     pub async fn execute(self) -> Result<()> {
-        self.propagate_global_flags();
+        self.propagate_profile_flag();
 
         // Validate the selected profile once, before dispatch, so a typo fails
         // fast rather than silently falling back to base credentials. The loader
@@ -214,14 +182,9 @@ impl Cli {
             Self::load_settings_or_default,
         )?;
 
-        // Resolve the repo location exactly once at this boundary, then thread
-        // it explicitly into each command. Nothing deeper reads the ambient CWD.
-        let Self { repo, command, .. } = self;
-        let repo = repo.as_deref();
-
-        match command {
+        match self.command {
             Commands::Ai(ai_cmd) => ai_cmd.execute().await,
-            Commands::Git(git_cmd) => git_cmd.execute(repo).await,
+            Commands::Git(git_cmd) => git_cmd.execute().await,
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Browser(cmd) => cmd.execute().await,
@@ -233,15 +196,15 @@ impl Cli {
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::Worktrees(cmd) => cmd.execute(repo).await,
+            Commands::Worktrees(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::Sessions(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::ClaudeWrap(cmd) => cmd.execute().await,
-            Commands::Coverage(cmd) => cmd.execute(repo),
+            Commands::Coverage(cmd) => cmd.execute(),
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),
-            Commands::Config(config_cmd) => config_cmd.execute(repo),
+            Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::Completions(completions_cmd) => completions_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
@@ -302,17 +265,15 @@ mod tests {
 
     /// A `global = true` arg is propagated by clap **arg id**, and the derive's
     /// id defaults to the field name — so a subcommand-local field named `repo`
-    /// displaced the global `-C/--repo` under `worktrees register` and its
-    /// `String` was copied back up into the root matches, panicking `Cli`'s
-    /// `PathBuf` read. Renaming the local field to `repo_name` (`--repo-name`)
-    /// separates the ids; both spellings must now parse side by side.
+    /// displaced the then-root-global `-C/--repo` under `worktrees register`
+    /// and panicked (#1420); the local field became `repo_name`
+    /// (`--repo-name`). Since #1778 `-C/--repo` is scoped to the commands that
+    /// read it, which `worktrees register` is not, so it now rejects `-C`
+    /// outright while `--repo-name` keeps parsing.
     #[cfg(unix)]
     #[test]
-    fn worktrees_register_repo_name_coexists_with_global_repo() {
-        let cli = Cli::try_parse_from([
-            "omni-dev",
-            "-C",
-            "/tmp/somerepo",
+    fn worktrees_register_takes_repo_name_but_not_repo() {
+        let register = [
             "worktrees",
             "register",
             "--key",
@@ -321,36 +282,119 @@ mod tests {
             "myrepo",
             "--folder",
             "/tmp",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.repo.as_deref(),
-            Some(std::path::Path::new("/tmp/somerepo"))
-        );
+        ];
+        let cli = Cli::try_parse_from(std::iter::once("omni-dev").chain(register)).unwrap();
         let Commands::Worktrees(worktrees::WorktreesCommand {
-            command: worktrees::WorktreesSubcommands::Register(register),
+            command: worktrees::WorktreesSubcommands::Register(register_cmd),
         }) = cli.command
         else {
             panic!("expected a `worktrees register` invocation");
         };
-        assert_eq!(register.key, "k1");
-        assert_eq!(register.repo_name.as_deref(), Some("myrepo"));
+        assert_eq!(register_cmd.key, "k1");
+        assert_eq!(register_cmd.repo_name.as_deref(), Some("myrepo"));
 
-        // The issue's exact repro, which panicked outright: the local flag with
-        // no global alongside it leaves the global unset rather than shadowed.
-        let cli = Cli::try_parse_from([
-            "omni-dev",
-            "worktrees",
-            "register",
-            "--key",
-            "k1",
-            "--repo-name",
-            "myrepo",
-            "--folder",
-            "/tmp",
-        ])
-        .unwrap();
-        assert!(cli.repo.is_none());
+        let with_repo = std::iter::once("omni-dev")
+            .chain(register)
+            .chain(["-C", "/tmp/somerepo"]);
+        assert!(Cli::try_parse_from(with_repo).is_err());
+    }
+
+    /// Pins which leaf commands accept each scoped flag (#1778). Every flag
+    /// except `--profile` is declared only on the commands that read it, so a
+    /// new command can only gain one on purpose — and a flag that silently
+    /// spreads to a command that ignores it fails here.
+    #[test]
+    fn scoped_flags_are_accepted_only_by_their_readers() {
+        use clap::CommandFactory;
+
+        fn leaves(cmd: &clap::Command, path: &str, out: &mut Vec<(String, Vec<String>)>) {
+            let subs: Vec<_> = cmd
+                .get_subcommands()
+                .filter(|s| s.get_name() != "help")
+                .collect();
+            if subs.is_empty() {
+                let longs = cmd
+                    .get_arguments()
+                    .filter_map(|a| a.get_long().map(str::to_string))
+                    .collect();
+                out.push((path.to_string(), longs));
+            }
+            for sub in subs {
+                leaves(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+
+        // `build` propagates every (subtree-)global arg into its descendants,
+        // so each leaf's argument list is exactly what it accepts.
+        let mut cmd = Cli::command();
+        cmd.build();
+        let mut all = Vec::new();
+        leaves(&cmd, "omni-dev", &mut all);
+
+        let under = |path: &str, owners: &[&str]| {
+            owners.iter().any(|o| {
+                let o = format!("omni-dev {o}");
+                path == o || path.starts_with(&format!("{o} "))
+            })
+        };
+        const AI: &[&str] = &[
+            "git commit message twiddle",
+            "git commit message check",
+            "git commit message staged",
+            "git branch create pr",
+            "ai chat",
+        ];
+        let expected: [(&str, Vec<&str>); 4] = [
+            ("ai-backend", AI.to_vec()),
+            ("models-yaml", [AI, &["config models show"]].concat()),
+            (
+                "repo",
+                vec![
+                    "git",
+                    "coverage",
+                    "config scopes",
+                    "worktrees rebase",
+                    "worktrees push",
+                ],
+            ),
+            (
+                "instance",
+                vec![
+                    "atlassian jira",
+                    "atlassian confluence",
+                    "atlassian auth status",
+                ],
+            ),
+        ];
+
+        for (flag, owners) in &expected {
+            let mut matched = 0;
+            for (path, longs) in &all {
+                let accepts = longs.iter().any(|l| l == flag);
+                let should = under(path, owners);
+                assert_eq!(
+                    accepts,
+                    should,
+                    "`{path}` {} `--{flag}`, but the placement table says it {}",
+                    if accepts { "accepts" } else { "rejects" },
+                    if should {
+                        "reads it"
+                    } else {
+                        "does not read it"
+                    },
+                );
+                matched += usize::from(accepts);
+            }
+            assert!(matched > 0, "no command accepts `--{flag}`");
+        }
+
+        // `--profile` stays global: every leaf accepts it.
+        for (path, longs) in &all {
+            assert!(
+                longs.iter().any(|l| l == "profile"),
+                "`{path}` should accept the global `--profile`"
+            );
+        }
     }
 
     /// Generalises the #1420 audit: no subcommand anywhere in the tree may
@@ -435,28 +479,29 @@ mod tests {
         walk(&cmd, &HashSet::new(), &HashSet::new(), "omni-dev");
     }
 
-    // ── propagate_global_flags() tests ──
+    // ── propagate_profile_flag() tests ──
     //
-    // These tests mutate process-global env vars, so they serialise on
-    // `crate::claude::ai::claude_cli::CLI_ENV_LOCK` (shared with claude-cli's
-    // own env-mutating tests to avoid cross-module races).
+    // These tests mutate `OMNI_DEV_PROFILE`, which `execute()` reads (via
+    // `validate_active_profile`) in the `execute_routes_*` tests above. Those
+    // hold `HOME_ENV_MUTEX` (through the Gmail/Drive `EnvGuard`s), so these
+    // serialise on the same mutex — otherwise a profile set here makes a
+    // concurrent routing test fail with "unknown profile".
 
     const PROFILE_VAR: &str = "OMNI_DEV_PROFILE";
-    const INSTANCE_VAR: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
 
     /// Locks the shared mutex and snapshots/restores every env var
-    /// `propagate_global_flags` may touch.
-    struct GlobalFlagsEnvGuard {
+    /// `propagate_profile_flag` may touch.
+    struct ProfileEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 2],
+        saved: [(&'static str, Option<String>); 1],
     }
 
-    impl GlobalFlagsEnvGuard {
+    impl ProfileEnvGuard {
         fn new() -> Self {
-            let lock = crate::claude::ai::claude_cli::CLI_ENV_LOCK
+            let lock = crate::test_support::HOME_ENV_MUTEX
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let names = [PROFILE_VAR, INSTANCE_VAR];
+            let names = [PROFILE_VAR];
             let saved = names.map(|n| (n, std::env::var(n).ok()));
             for (n, _) in &saved {
                 std::env::remove_var(n);
@@ -465,7 +510,7 @@ mod tests {
         }
     }
 
-    impl Drop for GlobalFlagsEnvGuard {
+    impl Drop for ProfileEnvGuard {
         fn drop(&mut self) {
             for (n, value) in &self.saved {
                 match value {
@@ -481,55 +526,10 @@ mod tests {
     }
 
     #[test]
-    fn propagate_global_flags_defaults_set_nothing() {
-        let _g = GlobalFlagsEnvGuard::new();
-        cli_with_defaults().propagate_global_flags();
+    fn propagate_profile_flag_defaults_set_nothing() {
+        let _g = ProfileEnvGuard::new();
+        cli_with_defaults().propagate_profile_flag();
         assert!(std::env::var(PROFILE_VAR).is_err());
-        assert!(std::env::var(INSTANCE_VAR).is_err());
-    }
-
-    #[test]
-    fn propagate_global_flags_sets_instance() {
-        let _g = GlobalFlagsEnvGuard::new();
-        let mut cli = cli_with_defaults();
-        cli.instance = Some("https://org.atlassian.net".to_string());
-        cli.propagate_global_flags();
-        assert_eq!(
-            std::env::var(INSTANCE_VAR).ok().as_deref(),
-            Some("https://org.atlassian.net")
-        );
-    }
-
-    #[test]
-    fn parses_repo_flag_long_and_short() {
-        let long = Cli::try_parse_from(["omni-dev", "--repo", "/tmp/r", "help-all"]).unwrap();
-        assert_eq!(
-            long.repo.as_deref(),
-            Some(std::path::Path::new("/tmp/r")),
-            "--repo should populate cli.repo"
-        );
-        let short = Cli::try_parse_from(["omni-dev", "-C", "/tmp/r", "help-all"]).unwrap();
-        assert_eq!(
-            short.repo.as_deref(),
-            Some(std::path::Path::new("/tmp/r")),
-            "-C should populate cli.repo"
-        );
-        let absent = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
-        assert!(absent.repo.is_none());
-    }
-
-    /// RULE 3: the repo location is a parameter, never a relocated global.
-    /// `propagate_global_flags` must not export it to any environment variable.
-    #[test]
-    fn repo_flag_is_not_propagated_to_env() {
-        let _g = GlobalFlagsEnvGuard::new();
-        let mut cli = cli_with_defaults();
-        cli.repo = Some(std::path::PathBuf::from("/tmp/some-repo"));
-        cli.propagate_global_flags();
-        assert!(
-            std::env::var("OMNI_DEV_REPO").is_err(),
-            "repo must not be exported to an env var"
-        );
     }
 
     #[test]
@@ -545,29 +545,29 @@ mod tests {
     }
 
     #[test]
-    fn propagate_global_flags_sets_profile() {
-        let _g = GlobalFlagsEnvGuard::new();
+    fn propagate_profile_flag_sets_profile() {
+        let _g = ProfileEnvGuard::new();
         let mut cli = cli_with_defaults();
         cli.profile = Some("work".to_string());
-        cli.propagate_global_flags();
+        cli.propagate_profile_flag();
         assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("work"));
     }
 
     #[test]
-    fn propagate_global_flags_profile_flag_beats_env_var() {
-        let _g = GlobalFlagsEnvGuard::new();
+    fn propagate_profile_flag_profile_flag_beats_env_var() {
+        let _g = ProfileEnvGuard::new();
         std::env::set_var(PROFILE_VAR, "personal");
         let mut cli = cli_with_defaults();
         cli.profile = Some("work".to_string());
-        cli.propagate_global_flags();
+        cli.propagate_profile_flag();
         assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("work"));
     }
 
     #[test]
-    fn propagate_global_flags_absent_profile_leaves_env_var() {
-        let _g = GlobalFlagsEnvGuard::new();
+    fn propagate_profile_flag_absent_profile_leaves_env_var() {
+        let _g = ProfileEnvGuard::new();
         std::env::set_var(PROFILE_VAR, "personal");
-        cli_with_defaults().propagate_global_flags();
+        cli_with_defaults().propagate_profile_flag();
         assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("personal"));
     }
 

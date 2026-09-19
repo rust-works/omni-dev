@@ -126,7 +126,7 @@ impl GmailCommand {
             command => {
                 // Propagates --account to the env var for the duration of
                 // this call only (`gmail::account::resolve_account` reads
-                // it, issue #1500), mirroring `Cli::propagate_global_flags`'s
+                // it, issue #1500), mirroring `Cli::propagate_profile_flag`'s
                 // pattern: only set when present, so an existing ambient
                 // OMNI_DEV_GMAIL_ACCOUNT still works when the flag is
                 // omitted. The guard restores/removes it on drop at the end

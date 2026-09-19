@@ -92,7 +92,7 @@ pub fn exported_by_cli_flag(key: &str) -> bool {
 ///
 /// Read from the **raw** process environment only (never through the profile
 /// fallback, which would be circular); the `--profile` flag propagates its value
-/// here in `Cli::propagate_global_flags`.
+/// here in `Cli::propagate_profile_flag`.
 pub const PROFILE_ENV_VAR: &str = "OMNI_DEV_PROFILE";
 
 /// A named credential/config bundle inside `settings.json` — its own `env` map,
