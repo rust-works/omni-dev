@@ -1426,18 +1426,24 @@ mod tests {
     }
 
     /// `multi_thread` on purpose — the only flavor on which the gate's
-    /// `offload_short_blocking_io` regions actually reach
-    /// `tokio::task::block_in_place` (issue #1697). Two things are pinned
-    /// at once: the gate still works there (a bare `block_in_place` would
-    /// have been fine here and panicked in every other test in this file),
-    /// and its audit records still land in *this* test's redirected route.
+    /// `offload_short_blocking_io` regions call
+    /// `tokio::task::block_in_place` at all (issue #1697). The body runs on
+    /// `block_on`'s thread rather than a runtime worker, so `block_in_place`
+    /// takes its run-in-place arm here; the worker hand-off itself is
+    /// covered by `ledger`'s
+    /// `offload_short_blocking_io_runs_the_closure_on_a_runtime_worker`,
+    /// since a spawned task could not see this test's thread-local audit
+    /// route. Two things are pinned at once: the gate still works there (a
+    /// bare `block_in_place` would have been fine here and panicked in
+    /// every other test in this file), and its audit records still land in
+    /// *this* test's redirected route.
     /// The second is the load-bearing half: `request_log` routes the audit
     /// file through a thread-local, so an offload that moved the write to
     /// another thread — `spawn_blocking` would — writes the forensic record
     /// somewhere else entirely, which no assertion on the refusal itself
     /// would catch.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_gate_writes_its_audit_records_on_the_calling_thread_when_it_offloads() {
+    async fn the_gate_writes_its_audit_records_on_the_calling_thread_on_a_multi_thread_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLogGuard::redirect(dir.path());
         let ledger_path = dir.path().join("lease-ledger.jsonl");

@@ -384,9 +384,10 @@ impl LeaseLedger {
     /// whose age nothing bounds. Threading a caller's copy through instead
     /// would save one small read and make two views of one ledger
     /// reachable under a single lock: [`super::restore`] stamps its backup
-    /// row through this function while a grant is still held, and is
-    /// correct today only because it runs *after*
-    /// `finish_leased_write`, not before.
+    /// row through this function while a grant is still held, so under a
+    /// cached copy it would be correct only while it happened to run
+    /// *after* `finish_leased_write` — with this re-read, the order does
+    /// not matter.
     pub(crate) fn mutate<R>(
         _lock: &LedgerLock,
         path: &Path,
@@ -718,8 +719,8 @@ impl LedgerLock {
 ///   returning `Err` (no runtime at all) also takes the plain-call arm;
 ///   `block_in_place` would tolerate that case, but spelling it out costs
 ///   nothing and keeps the match total.
-/// * **Short I/O only — never a wait.** [`Self::acquire_waiting_with_timeout`]
-///   must *not* use this: it polls for up to
+/// * **Short I/O only — never a wait.**
+///   [`LedgerLock::acquire_waiting_with_timeout`] must *not* use this: it polls for up to
 ///   [`default_lock_wait_timeout`], and handing a worker's core away for
 ///   that long is the starvation issue #1714 fixed by putting each attempt
 ///   on `spawn_blocking` instead. A grep-guard test pins that, since the
@@ -1178,15 +1179,33 @@ mod tests {
     }
 
     /// The arm that does the work this helper exists for. `multi_thread` on
-    /// purpose: it is the only flavor that reaches `block_in_place`.
+    /// purpose: it is the only flavor that reaches `block_in_place`. The
+    /// test body itself runs on `block_on`'s thread, which is *not* a
+    /// runtime worker — there `block_in_place` just calls the closure — so
+    /// the call is made from a `tokio::spawn`ed task, the only way to land
+    /// on a worker and exercise the real core hand-off. The nested call is
+    /// the shape the gate produces (`write_audit_best_effort` inside a
+    /// region) and must be a plain pass-through, not a panic.
     #[tokio::test(flavor = "multi_thread")]
-    async fn offload_short_blocking_io_runs_the_closure_on_a_multi_thread_runtime() {
-        let thread = std::thread::current().id();
-        let (ran, ran_on) = offload_short_blocking_io(|| (true, std::thread::current().id()));
-        assert!(ran);
-        // Same thread, not the blocking pool — this is what keeps
-        // `request_log`'s thread-local audit routing working under the gate.
-        assert_eq!(ran_on, thread);
+    async fn offload_short_blocking_io_runs_the_closure_on_a_runtime_worker() {
+        let (outer, inner, ran_on) = tokio::spawn(async {
+            let outer = std::thread::current().id();
+            let (inner, ran_on) = offload_short_blocking_io(|| {
+                let inner = std::thread::current().id();
+                (
+                    inner,
+                    offload_short_blocking_io(|| std::thread::current().id()),
+                )
+            });
+            (outer, inner, ran_on)
+        })
+        .await
+        .unwrap();
+        // Same thread throughout, not the blocking pool — this is what
+        // keeps `request_log`'s thread-local audit routing working under
+        // the gate.
+        assert_eq!(inner, outer);
+        assert_eq!(ran_on, outer);
     }
 
     /// The whole reason the helper is not a bare `block_in_place`: a
