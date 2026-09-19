@@ -388,26 +388,7 @@ mod tests {
     /// a parameter the way the engine-level tests do.
     fn seed_ledger_lease(spreadsheet_id: &str, version: &str) -> String {
         let ledger_path = crate::drive::lease::ledger::ledger_path().unwrap();
-        let token = "test-lease-token".to_string();
-        let mut ledger = crate::drive::lease::ledger::LeaseLedger::default();
-        ledger.insert(crate::drive::lease::ledger::LeaseRecord {
-            token: token.clone(),
-            file_id: spreadsheet_id.to_string(),
-            version: version.to_string(),
-            modified_time: None,
-            backup: crate::drive::lease::ledger::LeaseBackup::Bytes {
-                path: std::path::PathBuf::from("/tmp/test-backup"),
-                sha256: "deadbeef".to_string(),
-                size: 0,
-            },
-            acquired_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-            released_at: None,
-            restored_at: None,
-            restored_sheet_id: None,
-        });
-        ledger.save(&ledger_path).unwrap();
-        token
+        crate::drive::test_support::seed_lease(&ledger_path, spreadsheet_id, version)
     }
 
     fn mount_folder(id: &str) -> wiremock::Mock {
