@@ -590,12 +590,16 @@ use `is:` rather than `in:`; folding an arbitrary label id in reliably would
 need an extra `labels.list` lookup. Any other `--exclude-label` value still
 filters incremental runs (fully generally, by id), and a full/backfill pass
 prints a `Note` explaining it wasn't excluded on that pass — add it to
-`--query` yourself if you also want it gone from a `--full` re-run. One
-edge case, not solved: a message that arrives *already* carrying an
-excluded label is never archived, so if that label is later removed there's
-no manifest record for the `labelsRemoved` event to act on — it self-heals
-on the next `--full`/reconciliation pass, same as this section's other
-races.
+`--query` yourself if you also want it gone from a `--full` re-run. A
+message that falls out of a `SPAM`/`TRASH`-filtered listing on a full/
+backfill pass has its cached label set tagged with the label(s) that
+excluded it (even though it's never re-fetched), specifically so a later,
+unrelated label change on an incremental run can't be mistaken for the
+exclusion having lifted and resurrect it. One edge case, not solved: a
+message that arrives *already* carrying an excluded label is never
+archived, so if that label is later removed there's no manifest record for
+the `labelsRemoved` event to act on — it self-heals on the next
+`--full`/reconciliation pass, same as this section's other races.
 
 **Header fields:** `subject`/`from`/`to`/`rfc822_msgid`/`in_reply_to`/
 `references` in the manifest are parsed directly from the already-fetched

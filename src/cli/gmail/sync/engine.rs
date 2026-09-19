@@ -267,7 +267,7 @@ async fn run_full_sync(
     let (ids_tx, ids_rx) = mpsc::unbounded_channel::<String>();
     let messages_api = MessagesApi::new(client);
 
-    let effective_query = full_sync_query(opts, report);
+    let (effective_query, translated_exclude_labels) = full_sync_query(opts, report);
     let listing = messages_api.search_all_unbounded_streaming(
         effective_query.as_deref(),
         &[],
@@ -320,6 +320,13 @@ async fn run_full_sync(
         if opts.dry_run {
             report.actions.push(SyncAction::WouldDelete { id });
         } else {
+            // Tag first (#1780) — see `full_sync_query`'s doc comment for
+            // why an id that vanished from this listing needs its cached
+            // label_ids primed with the labels that excluded it, before
+            // `run_incremental` ever gets a chance to trust that cache.
+            if !translated_exclude_labels.is_empty() {
+                manifest.add_labels(&id, &translated_exclude_labels);
+            }
             manifest.mark_deleted(&id, Utc::now());
             report.actions.push(SyncAction::Deleted { id });
         }
@@ -350,18 +357,40 @@ const FULL_SYNC_EXCLUDABLE_LABELS: &[(&str, &str)] = &[("SPAM", "spam"), ("TRASH
 /// it going forward (it works generally, off `label_ids` rather than a
 /// query translation), but this pass won't retroactively exclude it unless
 /// the caller also sets `--query`.
-fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> Option<String> {
+///
+/// Also returns the subset of `exclude_labels` that *did* get a
+/// translation — [`run_full_sync`]'s stale-deletion pass tags a vanished
+/// record's cached `label_ids` with exactly these before marking it
+/// deleted (#1780), since a record can fall out of this listing without
+/// ever being fetched again (presence-on-disk skips it), so its cached
+/// labels would otherwise never learn about the exclusion that just
+/// happened. Without that tag, `run_incremental`'s labelsRemoved-triggered
+/// undelete — which trusts the cached label set — could be fooled by any
+/// unrelated later label change into resurrecting a message that is (as
+/// far as this tool can tell) still excluded.
+fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<String>, Vec<String>) {
     let mut query = opts.query.clone().unwrap_or_default();
+    // Tracks every `-in:<keyword>` token already in `query` — both ones
+    // `--query` already spelled out and ones this loop has itself added —
+    // so a repeated `--exclude-label` value, or one that duplicates
+    // `--query`'s own text, doesn't fold in the same `-in:` token twice.
+    let mut tokens: HashSet<String> = query.split_whitespace().map(str::to_string).collect();
+    let mut translated = Vec::new();
     for label in &opts.exclude_labels {
         match FULL_SYNC_EXCLUDABLE_LABELS
             .iter()
             .find(|(id, _)| *id == label)
         {
             Some((_, keyword)) => {
+                translated.push(label.clone());
+                let token = format!("-in:{keyword}");
+                if !tokens.insert(token.clone()) {
+                    continue;
+                }
                 if !query.is_empty() {
                     query.push(' ');
                 }
-                query.push_str(&format!("-in:{keyword}"));
+                query.push_str(&token);
             }
             None => report.actions.push(SyncAction::Note {
                 message: format!(
@@ -372,7 +401,7 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> Option<String
             }),
         }
     }
-    (!query.is_empty()).then_some(query)
+    ((!query.is_empty()).then_some(query), translated)
 }
 
 /// Applies `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
@@ -1732,6 +1761,35 @@ not-really-a-pdf\r\n\
     }
 
     #[tokio::test]
+    async fn run_full_sync_does_not_duplicate_an_in_token_already_named_by_query() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        // `--query "-in:spam"` and `--exclude-label SPAM` both name spam —
+        // the folded query must not repeat the `-in:spam` token.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("q", "-in:spam -in:trash"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let opts = SyncOptions {
+            query: Some("-in:spam".to_string()),
+            exclude_labels: vec!["SPAM".to_string(), "TRASH".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
     async fn run_full_sync_notes_an_exclude_label_it_cannot_translate_into_a_query() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1758,6 +1816,111 @@ not-really-a-pdf\r\n\
             a,
             SyncAction::Note { message } if message.contains("Label_16") && message.contains("--query")
         )));
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_tags_a_vanished_records_labels_so_incremental_cannot_bogus_undelete_it()
+    {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        // m1 is already archived, with label_ids that have never recorded
+        // SPAM — the state a mailbox's existing archive is in the moment
+        // `--exclude-label SPAM` first gets configured.
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "100").await;
+        // m1 no longer appears in the `-in:spam`-filtered listing — it's
+        // been spammed on the server, though this pass never fetches it to
+        // confirm that.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("q", "-in:spam"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Deleted { id } if id == "m1")));
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_some());
+        assert!(
+            record.label_ids.iter().any(|l| l == "SPAM"),
+            "the record's cached label_ids must learn the exclusion label it vanished under \
+             on this pass, or a later unrelated labelsRemoved event could bogus-undelete it \
+             (#1780)"
+        );
+
+        // An incremental run now observes a totally unrelated label change
+        // on the same message. Because the full-sync pass above tagged it
+        // with SPAM, run_incremental must not resurrect it.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "labelsRemoved": [
+                            {"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["IMPORTANT"]},
+                        ],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")),
+            "m1 is still excluded (SPAM) on the server; an unrelated label change must not \
+             resurrect it"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(manifest.get("m1").unwrap().deleted_at.is_some());
     }
 
     #[tokio::test]
