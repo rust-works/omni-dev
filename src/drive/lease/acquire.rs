@@ -136,9 +136,12 @@ pub enum AcquireResult {
     /// The file changed while the backup was being taken, so the backup
     /// cannot be pinned to the version that would have been recorded
     /// (issue #1693). Nothing was minted and no ledger row was written;
-    /// the backup this attempt took is reclaimed. Retrying is the intended
-    /// response — see [`finish_acquisition`] for how the two backup kinds
-    /// detect this.
+    /// every backup this attempt took is reclaimed. See
+    /// [`backup_is_pinned`] for how the two backup kinds detect this. A
+    /// version-sandwich refusal has already been retried internally
+    /// ([`SANDWICH_ATTEMPTS`], issue #1739), and its `detail` says so when
+    /// more than one attempt was made; any other is a one-shot refusal
+    /// that retrying the command is the intended response to.
     RefusedConcurrentChange {
         /// What changed, and which evidence detected it.
         detail: String,
@@ -185,20 +188,57 @@ pub async fn acquire(
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
 ) -> AcquireResult {
-    acquire_with_lock_wait(client, opts, authenticator, default_lock_wait_timeout()).await
+    acquire_with_timings(client, opts, authenticator, AcquireTimings::production()).await
 }
 
-/// [`acquire`] with an explicit wait budget for its ledger insert's lock —
-/// the same test seam as [`LedgerLock::acquire_waiting_blocking_with_timeout`],
-/// so the busy-lock timeout arm, and the backup reclaim that follows it, can
-/// be driven in milliseconds.
-pub(crate) async fn acquire_with_lock_wait(
+/// How many backups [`take_pinned_backup`] takes before a version-sandwich
+/// refusal stands (issue #1739). Whether `files.copy` itself bumps the
+/// *source* file's `version` is undocumented, and Drive defines `version`
+/// as reflecting "every change made to the file on the server, even those
+/// not visible to the user" — so a one-off bump unrelated to any edit is
+/// plausible. Retrying lets that self-heal after the prompt has already
+/// been answered, rather than handing the operator a refusal that reads
+/// exactly like a collaborator's edit. Deliberately small: every attempt
+/// is a full `files.copy` (or download) plus two metadata reads.
+const SANDWICH_ATTEMPTS: u32 = 3;
+
+/// The pause between two sandwich attempts — long enough for a transient
+/// server-side bump to settle, short enough to be invisible next to the
+/// Touch ID prompt that preceded it.
+const SANDWICH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The waits [`acquire_with_timings`] observes. Production uses
+/// [`AcquireTimings::production`]; tests shorten them so a busy-lock
+/// timeout, or a sandwich retry, runs in milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AcquireTimings {
+    /// Wait budget for the ledger insert's lock — the same seam as
+    /// [`LedgerLock::acquire_waiting_blocking_with_timeout`].
+    pub(crate) lock_wait: Duration,
+    /// Pause between version-sandwich attempts ([`SANDWICH_RETRY_DELAY`]).
+    pub(crate) sandwich_retry_delay: Duration,
+}
+
+impl AcquireTimings {
+    /// The timings [`acquire`] uses.
+    fn production() -> Self {
+        Self {
+            lock_wait: default_lock_wait_timeout(),
+            sandwich_retry_delay: SANDWICH_RETRY_DELAY,
+        }
+    }
+}
+
+/// [`acquire`] with explicit [`AcquireTimings`], so the busy-lock timeout
+/// arm, the backup reclaim that follows it, and the sandwich retry can be
+/// driven in milliseconds.
+pub(crate) async fn acquire_with_timings(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
-    lock_wait: Duration,
+    timings: AcquireTimings,
 ) -> AcquireResult {
-    let (result, disposition) = acquire_inner(client, opts, authenticator, lock_wait).await;
+    let (result, disposition) = acquire_inner(client, opts, authenticator, timings).await;
     record_attempt(opts, &result, disposition.as_ref());
     result
 }
@@ -214,7 +254,7 @@ pub(crate) const MIN_EXPIRY_MINUTES: i64 = 1;
 /// See [`MIN_EXPIRY_MINUTES`].
 pub(crate) const MAX_EXPIRY_MINUTES: i64 = 24 * 60;
 
-/// What became of a backup this attempt took, once [`finish_acquisition`]
+/// What became of a backup this attempt took, once [`acquire_inner`]
 /// decided it is referenced by no ledger row — the belt-and-braces half of
 /// issue #1690's fix, for the narrow race the lock-free pre-check in
 /// [`acquire_inner`] cannot close. `None` everywhere in
@@ -234,7 +274,7 @@ async fn acquire_inner(
     client: &DriveClient,
     opts: &AcquireOptions,
     authenticator: &dyn Authenticator,
-    lock_wait: Duration,
+    timings: AcquireTimings,
 ) -> (AcquireResult, Option<BackupDisposition>) {
     let expiry_minutes = opts.expiry.num_minutes();
     if !(MIN_EXPIRY_MINUTES..=MAX_EXPIRY_MINUTES).contains(&expiry_minutes) {
@@ -280,7 +320,7 @@ async fn acquire_inner(
 
     // Lock-free live-lease pre-check (issue #1690): cheap, and
     // deliberately *not* the authoritative gate — `insert_record`, taken
-    // under the ledger lock inside `finish_acquisition` below, remains
+    // under the ledger lock inside `mint` below, remains
     // that (see its own doc comment). This one's only job is refusing
     // *before* spending the (up to 120s) Touch ID prompt and a real
     // backup on the common case this closes: a second `acquire` on a
@@ -357,98 +397,40 @@ async fn acquire_inner(
         }
     };
 
-    // The backup below must end up pinned to the version
-    // `finish_acquisition` records, or the lease silently vouches for
-    // content it never captured (issue #1693). A byte backup proves that
-    // pinning by content — its SHA-256 against the post-backup
-    // `sha256Checksum` — and needs nothing extra here. Everything else has
-    // no checksum to compare (a native document has no byte content at
-    // all; a file old enough to predate Drive's SHA-256 field carries only
-    // the weaker digests, and adding an md5/sha1 ladder would mean a new
-    // hash dependency), so it falls back to sandwiching the backup between
-    // two `version` reads. This read is the near half of that sandwich:
-    // deliberately *after* the prompt, so the up-to-120s window a human
-    // spends deciding — during which the file may legitimately move — is
-    // outside the span being pinned.
+    // The backup below must end up pinned to the version `mint` records,
+    // or the lease silently vouches for content it never captured (issue
+    // #1693). A byte backup proves that pinning by content — its SHA-256
+    // against the post-backup `sha256Checksum` — and needs nothing extra
+    // here. Everything else has no checksum to compare, so it falls back to
+    // sandwiching the backup between two `version` reads: a native document
+    // has no byte content at all, and Drive omits `sha256Checksum` only for
+    // native and shortcut files, so a byte target without one is a
+    // defensive case rather than an expected one (adding an md5/sha1 ladder
+    // for it would mean a new hash dependency). The sandwich's near read is
+    // taken inside `take_pinned_backup`, deliberately *after* the prompt, so
+    // the up-to-120s window a human spends deciding — during which the file
+    // may legitimately move — is outside the span being pinned.
     let needs_version_pin = is_native || target.sha256_checksum.is_none();
-    let pre_backup_version = if needs_version_pin {
-        match files_api.get_metadata(&opts.file_id).await {
-            // Refused *here*, not left for `backup_is_pinned`'s
-            // no-proof arm: that arm would refuse just the same, but only
-            // after the backup — a download of up to 500 MB or a
-            // `files.copy` — had been taken and reclaimed for nothing.
-            // Mirrors the pre-auth read's own missing-`version` refusal.
-            Ok(DriveFile {
-                version: Some(version),
-                ..
-            }) => Some(version),
-            Ok(_) => {
-                return (
-                    AcquireResult::Failed {
-                        detail: "Drive did not return a `version` for this file immediately \
-                                 before the backup; refusing to take a backup that could not \
-                                 be pinned to one"
-                            .to_string(),
-                    },
-                    None,
-                )
-            }
-            Err(err) => {
-                return (
-                    AcquireResult::Failed {
-                        detail: err.to_string(),
-                    },
-                    None,
-                )
-            }
-        }
-    } else {
-        None
-    };
-
-    // 2. Backup — bytes for a binary file, a Drive-side copy for a native
-    // document (ADR-0080 §3). `native_backup_folder_id` is guaranteed
-    // `Some` here whenever `is_native`, by the refusal above.
-    let backup = if is_native {
-        let folder_id = opts.native_backup_folder_id.as_deref().unwrap_or_default();
-        match native_backup(&files_api, &opts.file_id, folder_id, &target.name).await {
-            Ok(backup) => backup,
-            Err(err) => {
-                return (
-                    AcquireResult::Failed {
-                        detail: err.to_string(),
-                    },
-                    None,
-                )
-            }
-        }
-    } else {
-        match byte_backup(&files_api, &opts.file_id, &opts.backup_dir, &target.name).await {
-            Ok(backup) => backup,
-            Err(err) => {
-                return (
-                    AcquireResult::Failed {
-                        detail: err.to_string(),
-                    },
-                    None,
-                )
-            }
-        }
-    };
-
-    // From here on a backup exists, so every remaining exit must account
-    // for it: `Acquired` because a ledger row now references it, every
-    // other outcome by reclaiming it (issue #1690's belt-and-braces half,
-    // for the pre-check's narrow remaining race).
-    let result = finish_acquisition(
+    let pinned = match take_pinned_backup(
         &files_api,
         opts,
-        backup.clone(),
-        headless_waiver,
-        pre_backup_version.as_deref(),
-        lock_wait,
+        &target.name,
+        is_native,
+        needs_version_pin,
+        timings.sandwich_retry_delay,
     )
-    .await;
+    .await
+    {
+        Ok(pinned) => pinned,
+        Err(refusal) => return *refusal,
+    };
+
+    // From here on a pinned backup exists, so every remaining exit must
+    // account for it: `Acquired` because a ledger row now references it,
+    // every other outcome by reclaiming it (issue #1690's belt-and-braces
+    // half, for the pre-check's narrow remaining race).
+    let backup = pinned.backup.clone();
+    let result = mint(opts, pinned, headless_waiver, timings.lock_wait);
     if matches!(result, AcquireResult::Acquired { .. }) {
         return (result, None);
     }
@@ -456,48 +438,202 @@ async fn acquire_inner(
     (result, Some(disposition))
 }
 
-/// Steps 3–4: re-fetches metadata, proves the backup is pinned to the
-/// version about to be recorded, checks the file's live lease under the
-/// ledger lock, and mints the lease. Split out of `acquire_inner` so every
-/// exit past the backup step shares that function's one reclaim wrapper —
-/// this function only ever decides mint-or-refuse, never reclaims.
+/// A backup [`take_pinned_backup`] has proven holds the content Drive
+/// reports at `version` — what [`mint`] records against it.
+struct PinnedBackup {
+    backup: LeaseBackup,
+    /// The file's `version`, read after the backup.
+    version: String,
+    /// The file's `modifiedTime`, from the same read as `version`.
+    modified_time: Option<String>,
+}
+
+/// Steps 2–3's proof: takes the backup — bytes for a binary file, a
+/// Drive-side copy for a native document (ADR-0080 §3) — and proves it is
+/// pinned to the version about to be recorded (see [`backup_is_pinned`]).
+///
+/// A version-sandwich refusal ([`PinFailure::VersionMoved`]) is retried up
+/// to [`SANDWICH_ATTEMPTS`] times, reclaiming each unpinned backup before
+/// the next is taken (issue #1739). Nothing else is retried: a checksum
+/// mismatch is positive proof the *content* moved, and each retry would
+/// re-download up to 500 MB to find out whether it stopped; a missing
+/// proof or an API error is not a race at all. Retrying also stops the
+/// moment a reclaim fails, so a run of attempts leaves at most one orphan
+/// — the one the returned disposition names for the audit record.
+///
+/// `Err` carries the finished outcome for `acquire_inner` to return: the
+/// refusal or failure, and what became of the last backup, if one was
+/// taken — boxed, since it otherwise dwarfs the `Ok` side
+/// (`clippy::result_large_err`).
+async fn take_pinned_backup(
+    files_api: &FilesApi<'_>,
+    opts: &AcquireOptions,
+    name: &str,
+    is_native: bool,
+    needs_version_pin: bool,
+    retry_delay: Duration,
+) -> Result<PinnedBackup, Box<(AcquireResult, Option<BackupDisposition>)>> {
+    let mut attempt = 1;
+    loop {
+        let pre_backup_version = if needs_version_pin {
+            let version = read_pre_backup_version(files_api, &opts.file_id)
+                .await
+                .map_err(|detail| Box::new((AcquireResult::Failed { detail }, None)))?;
+            Some(version)
+        } else {
+            None
+        };
+
+        let backup = take_backup(files_api, opts, name, is_native)
+            .await
+            .map_err(|err| {
+                Box::new((
+                    AcquireResult::Failed {
+                        detail: err.to_string(),
+                    },
+                    None,
+                ))
+            })?;
+
+        let failure = match prove_pinned(
+            files_api,
+            &opts.file_id,
+            &backup,
+            pre_backup_version.as_deref(),
+        )
+        .await
+        {
+            PinCheck::Pinned {
+                version,
+                modified_time,
+            } => {
+                return Ok(PinnedBackup {
+                    backup,
+                    version,
+                    modified_time,
+                })
+            }
+            PinCheck::Failed(detail) => {
+                let disposition = reclaim_backup(files_api, backup).await;
+                return Err(Box::new((
+                    AcquireResult::Failed { detail },
+                    Some(disposition),
+                )));
+            }
+            PinCheck::Unpinned(failure) => failure,
+        };
+
+        let disposition = reclaim_backup(files_api, backup).await;
+        let retry = failure.is_retryable()
+            && attempt < SANDWICH_ATTEMPTS
+            && matches!(disposition, BackupDisposition::Reclaimed(_));
+        if !retry {
+            return Err(Box::new((
+                AcquireResult::RefusedConcurrentChange {
+                    detail: failure.detail(attempt),
+                },
+                Some(disposition),
+            )));
+        }
+        tracing::info!(
+            "drive lease acquire: the file's version moved across its backup (attempt \
+             {attempt} of {SANDWICH_ATTEMPTS}); discarded that backup, retrying"
+        );
+        tokio::time::sleep(retry_delay).await;
+        attempt += 1;
+    }
+}
+
+/// The near half of the version sandwich: the file's `version` read
+/// immediately before the backup. `Err` is the operator-facing detail for
+/// [`AcquireResult::Failed`].
+async fn read_pre_backup_version(
+    files_api: &FilesApi<'_>,
+    file_id: &str,
+) -> Result<String, String> {
+    match files_api.get_metadata(file_id).await {
+        Ok(DriveFile {
+            version: Some(version),
+            ..
+        }) => Ok(version),
+        // Refused *here*, not left for `backup_is_pinned`'s no-proof arm:
+        // that arm would refuse just the same, but only after the backup —
+        // a download of up to 500 MB or a `files.copy` — had been taken and
+        // reclaimed for nothing. Mirrors the pre-auth read's own
+        // missing-`version` refusal.
+        Ok(_) => Err(
+            "Drive did not return a `version` for this file immediately before the \
+                      backup; refusing to take a backup that could not be pinned to one"
+                .to_string(),
+        ),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Step 2: a backup of the file as it stands now — bytes for a binary file,
+/// a Drive-side copy for a native document (ADR-0080 §3).
+/// `native_backup_folder_id` is guaranteed `Some` whenever `is_native`, by
+/// `acquire_inner`'s up-front refusal. `name` only labels the backup.
+async fn take_backup(
+    files_api: &FilesApi<'_>,
+    opts: &AcquireOptions,
+    name: &str,
+    is_native: bool,
+) -> anyhow::Result<LeaseBackup> {
+    if is_native {
+        let folder_id = opts.native_backup_folder_id.as_deref().unwrap_or_default();
+        native_backup(files_api, &opts.file_id, folder_id, name).await
+    } else {
+        byte_backup(files_api, &opts.file_id, &opts.backup_dir, name).await
+    }
+}
+
+/// What [`prove_pinned`] concluded about one backup.
+enum PinCheck {
+    /// The backup provably holds the content Drive reports at `version`.
+    Pinned {
+        version: String,
+        modified_time: Option<String>,
+    },
+    /// The backup cannot be pinned to the version that would be recorded.
+    Unpinned(PinFailure),
+    /// The post-backup read failed, or returned no `version` to record.
+    Failed(String),
+}
+
+/// Step 3's proof: re-fetches metadata and checks the backup against it.
+///
+/// `version`/`modified_time` are re-fetched here rather than reused from
+/// the `target` metadata read at the very top of `acquire_inner` — that
+/// read happened before the (up to 120s) Touch ID prompt and before the
+/// backup itself, so the file could have moved in the meantime. Recording
+/// that earlier, now-possibly-stale version would break the token's own
+/// invariant of being "bound to a specific backup and a specific Drive
+/// version" (ADR-0080 §2/§4): the backup reflects whatever the file was at
+/// backup time, so the recorded version must too, or the very next write
+/// under this lease could spuriously refuse as stale (or, worse, pass a
+/// staleness check against a version that doesn't match what was actually
+/// backed up).
 ///
 /// `pre_backup_version` is `Some` exactly when `acquire_inner` decided this
 /// target needs the version sandwich rather than the checksum proof — see
 /// [`backup_is_pinned`].
-async fn finish_acquisition(
+async fn prove_pinned(
     files_api: &FilesApi<'_>,
-    opts: &AcquireOptions,
-    backup: LeaseBackup,
-    headless_waiver: bool,
+    file_id: &str,
+    backup: &LeaseBackup,
     pre_backup_version: Option<&str>,
-    lock_wait: Duration,
-) -> AcquireResult {
-    // 3. Ledger record. `version`/`modified_time` are re-fetched here
-    // rather than reused from the `target` metadata read at the very top —
-    // that read happened before the (up to 120s) Touch ID prompt and
-    // before the backup itself, so the file could have moved in the
-    // meantime. Recording that earlier, now-possibly-stale version would
-    // break the token's own invariant of being "bound to a specific backup
-    // and a specific Drive version" (ADR-0080 §2/§4): the backup reflects
-    // whatever the file was at backup time, so the recorded version must
-    // too, or the very next write under this lease could spuriously refuse
-    // as stale (or, worse, pass a staleness check against a version that
-    // doesn't match what was actually backed up).
-    let post_backup = match files_api.get_metadata(&opts.file_id).await {
+) -> PinCheck {
+    let post_backup = match files_api.get_metadata(file_id).await {
         Ok(post_backup) => post_backup,
-        Err(err) => {
-            return AcquireResult::Failed {
-                detail: err.to_string(),
-            }
-        }
+        Err(err) => return PinCheck::Failed(err.to_string()),
     };
     let Some(version) = post_backup.version else {
-        return AcquireResult::Failed {
-            detail: "Drive did not return a `version` for this file after the backup; \
-                     refusing to record a lease without a staleness check"
+        return PinCheck::Failed(
+            "Drive did not return a `version` for this file after the backup; refusing to \
+             record a lease without a staleness check"
                 .to_string(),
-        };
+        );
     };
     // Re-fetching alone establishes only that `version` is current, never
     // that it is the version the backup above actually captured — the
@@ -506,15 +642,35 @@ async fn finish_acquisition(
     // byte backup the gap spans the download, the hash and a disk write of
     // up to 500 MB. Proving it is what stops a lease vouching for content
     // it never backed up (issue #1693).
-    if let Err(detail) = backup_is_pinned(
-        &backup,
+    match backup_is_pinned(
+        backup,
         post_backup.sha256_checksum.as_deref(),
         &version,
         pre_backup_version,
     ) {
-        return AcquireResult::RefusedConcurrentChange { detail };
+        Ok(()) => PinCheck::Pinned {
+            version,
+            modified_time: post_backup.modified_time,
+        },
+        Err(failure) => PinCheck::Unpinned(failure),
     }
+}
 
+/// Step 3's record and step 4's mint: checks the file's live lease under
+/// the ledger lock and inserts the row for `pinned`. Only ever decides
+/// mint-or-refuse — reclaiming the backup on a refusal is `acquire_inner`'s
+/// job, so every exit past the backup step shares its one reclaim wrapper.
+fn mint(
+    opts: &AcquireOptions,
+    pinned: PinnedBackup,
+    headless_waiver: bool,
+    lock_wait: Duration,
+) -> AcquireResult {
+    let PinnedBackup {
+        backup,
+        version,
+        modified_time,
+    } = pinned;
     let token = crate::request_log::new_id();
     let now = Utc::now();
     let expires_at = now + opts.expiry;
@@ -522,7 +678,7 @@ async fn finish_acquisition(
         token: token.clone(),
         file_id: opts.file_id.clone(),
         version,
-        modified_time: post_backup.modified_time,
+        modified_time,
         backup: backup.clone(),
         acquired_at: now,
         expires_at,
@@ -533,7 +689,7 @@ async fn finish_acquisition(
     // Synchronous ledger I/O (lock, load, save) on the async runtime's
     // current thread — `block_in_place` hands its other queued tasks off
     // to the runtime's other workers for the duration, the same reasoning
-    // the `authenticate` call above documents.
+    // the `authenticate` call in `acquire_inner` documents.
     let superseded = match tokio::task::block_in_place(|| {
         insert_record(
             record,
@@ -573,15 +729,77 @@ async fn finish_acquisition(
     }
 }
 
+/// Why [`backup_is_pinned`] could not pin a backup — one variant per arm,
+/// so [`take_pinned_backup`] can tell the one worth retrying from the rest
+/// without parsing the operator-facing text.
+#[derive(Debug)]
+enum PinFailure {
+    /// The bytes backed up hash to `local`, but Drive reports `remote` for
+    /// the file at `post_version`: the content moved under the download.
+    ChecksumMismatch {
+        remote: String,
+        post_version: String,
+        local: String,
+    },
+    /// The version sandwich's two reads disagree.
+    VersionMoved { pre: String, post: String },
+    /// Neither proof was available.
+    NoProof { post_version: String },
+}
+
+impl PinFailure {
+    /// Whether another attempt could plausibly succeed. Only a moved
+    /// `version` is: it cannot tell a content edit from a bump unrelated
+    /// to any edit, and the latter may well not recur (issue #1739).
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::VersionMoved { .. })
+    }
+
+    /// The operator-facing detail for
+    /// [`AcquireResult::RefusedConcurrentChange`], after `attempts`
+    /// backups. A version that moved on every one of several attempts gets
+    /// its own wording: "wait until the file is quiet" is the wrong advice
+    /// if the version moves for a reason no quiet period will cure.
+    fn detail(&self, attempts: u32) -> String {
+        match self {
+            Self::ChecksumMismatch {
+                remote,
+                post_version,
+                local,
+            } => format!(
+                "the file changed while its backup was being taken: Drive reports checksum \
+                 {remote} at version {post_version}, but the bytes backed up hash to {local}. \
+                 No lease was minted and the backup was discarded — retry."
+            ),
+            Self::VersionMoved { pre, post } if attempts > 1 => format!(
+                "the file's version changed across its backup on each of {attempts} attempts \
+                 (last: version {pre} immediately before, {post} immediately after). A version \
+                 that keeps moving may be changing for reasons unrelated to edits, so waiting \
+                 for the file to be quiet may not help. No lease was minted and the backups \
+                 were discarded."
+            ),
+            Self::VersionMoved { pre, post } => format!(
+                "the file changed while its backup was being taken: version {pre} immediately \
+                 before, {post} immediately after. No lease was minted and the backup was \
+                 discarded — retry."
+            ),
+            Self::NoProof { post_version } => format!(
+                "no proof available that the backup matches version {post_version}: Drive \
+                 reported no checksum for the file after the backup and no pre-backup version \
+                 was taken to fall back on. No lease was minted and the backup was discarded — \
+                 retry."
+            ),
+        }
+    }
+}
+
 /// Whether `backup` provably holds the content Drive reports at
 /// `post_version`, so that recording `post_version` against it cannot
-/// vouch for content the backup never captured (issue #1693). `Err` carries
-/// the operator-facing explanation for
-/// [`AcquireResult::RefusedConcurrentChange`].
+/// vouch for content the backup never captured (issue #1693). `Err` says
+/// why not — see [`PinFailure`].
 ///
 /// Two proofs, picked by what evidence Drive actually offers for this
-/// target — `pre_backup_version` is `Some` exactly when `acquire_inner`
-/// chose the second:
+/// target:
 ///
 /// 1. **By content, for a byte backup with a `sha256Checksum`.** The digest
 ///    of the bytes on disk against the digest Drive reports for the file
@@ -594,56 +812,60 @@ async fn finish_acquisition(
 ///    touching content, so the pin still holds and refusing would be
 ///    spurious.
 /// 2. **By sandwich, for everything else.** A native document has no byte
-///    content to hash and `files.copy` reports no digest; a file predating
-///    Drive's `sha256Checksum` carries only weaker digests. Both fall back
-///    to requiring the `version` read just before the backup to equal the
-///    one read just after. Sound but blunter: it cannot tell a content edit
+///    content to hash and `files.copy` reports no digest. It falls back to
+///    requiring the `version` read just before the backup to equal the one
+///    read just after. Sound but blunter: it cannot tell a content edit
 ///    from a metadata-only bump, so the latter refuses too. That
 ///    conservatism is the cost of having no checksum to compare, not a
-///    judgement that the backup is bad.
+///    judgement that the backup is bad — and why [`take_pinned_backup`]
+///    retries this arm.
 ///
-/// A byte backup whose target reported no digest before the backup reaches
-/// here with `pre_backup_version` set, so it takes the sandwich. The one
-/// way to arrive with *neither* proof is a byte target that reported a
-/// digest before the backup but none after it — a file that stopped being
-/// binary content in between, itself a concurrent change — and that
-/// refuses too: the two arms are exhaustive, never a silent pass.
+/// Which proof applies is decided by *this* function from the post-backup
+/// read, while whether a pre-backup version exists to sandwich with was
+/// decided by `acquire_inner` from the pre-auth read. For a native target
+/// the two always agree. For a byte target they can differ: one that
+/// reported no digest before the backup carries `pre_backup_version`, yet
+/// is proven by content if a digest appears after it — the stronger proof
+/// wins. (Drive omits `sha256Checksum` only for native and shortcut files,
+/// so a byte target reaching the sandwich at all is a defensive path.) The
+/// one way to arrive with *neither* proof is the reverse: a byte target
+/// that reported a digest before the backup but none after it — a file
+/// that stopped being binary content in between, itself a concurrent
+/// change — and that refuses too: the two arms are exhaustive, never a
+/// silent pass.
 fn backup_is_pinned(
     backup: &LeaseBackup,
     remote_sha256: Option<&str>,
     post_version: &str,
     pre_backup_version: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), PinFailure> {
     if let (LeaseBackup::Bytes { sha256, .. }, Some(remote)) = (backup, remote_sha256) {
         if !sha256.eq_ignore_ascii_case(remote) {
-            return Err(format!(
-                "the file changed while its backup was being taken: Drive reports checksum \
-                 {remote} at version {post_version}, but the bytes backed up hash to {sha256}. \
-                 No lease was minted and the backup was discarded — retry."
-            ));
+            return Err(PinFailure::ChecksumMismatch {
+                remote: remote.to_string(),
+                post_version: post_version.to_string(),
+                local: sha256.clone(),
+            });
         }
         return Ok(());
     }
 
     match pre_backup_version {
-        Some(pre) if pre != post_version => Err(format!(
-            "the file changed while its backup was being taken: version {pre} immediately \
-             before, {post_version} immediately after. No lease was minted and the backup was \
-             discarded — retry."
-        )),
+        Some(pre) if pre != post_version => Err(PinFailure::VersionMoved {
+            pre: pre.to_string(),
+            post: post_version.to_string(),
+        }),
         Some(_) => Ok(()),
         // Reached only when the target's digest vanished between the
         // pre-auth read (which decided no sandwich was needed) and the
         // post-backup one — or if `acquire_inner`'s decision and this
         // function's arms are ever changed out of step. (A sandwich read
-        // that returned no `version` never gets this far: `acquire_inner`
-        // refuses that before taking the backup.) Either way nothing is
-        // recorded unproven.
-        None => Err(format!(
-            "no proof available that the backup matches version {post_version}: Drive reported \
-             no checksum for the file after the backup and no pre-backup version was taken to \
-             fall back on. No lease was minted and the backup was discarded — retry."
-        )),
+        // that returned no `version` never gets this far:
+        // `read_pre_backup_version` refuses that before taking the
+        // backup.) Either way nothing is recorded unproven.
+        None => Err(PinFailure::NoProof {
+            post_version: post_version.to_string(),
+        }),
     }
 }
 
@@ -802,7 +1024,7 @@ fn write_backup(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// #1738): by now this attempt has spent the Touch ID prompt and a full
 /// backup, so hard-failing behind an unrelated lease operation would throw
 /// both away. Blocking is safe here because the one production caller,
-/// `finish_acquisition`, already runs this under `block_in_place`.
+/// `mint`, already runs this under `block_in_place`.
 ///
 /// `supersedes` names a lease this insert replaces
 /// ([`AcquireOptions::supersedes`]), released here in the *same* rewrite that
@@ -1085,6 +1307,14 @@ mod tests {
     /// regression into a hang fails in seconds rather than minutes.
     const TEST_LOCK_WAIT: Duration = Duration::from_secs(5);
 
+    /// [`AcquireTimings`] for tests: [`TEST_LOCK_WAIT`], and no pause
+    /// between sandwich attempts, so a retried acquisition runs in
+    /// milliseconds rather than seconds.
+    const FAST_TIMINGS: AcquireTimings = AcquireTimings {
+        lock_wait: TEST_LOCK_WAIT,
+        sandwich_retry_delay: Duration::ZERO,
+    };
+
     #[tokio::test(flavor = "multi_thread")]
     async fn denied_authentication_takes_no_backup_and_writes_no_ledger_row() {
         let server = wiremock::MockServer::start().await;
@@ -1310,7 +1540,7 @@ mod tests {
         // non-race way `Failed` still follows a full backup (issue #1690):
         // the lock-free pre-check can't see this, since it takes no lock
         // itself. `insert_record` waits out a busy lock (issue #1738), so
-        // the budget is shortened through `acquire_with_lock_wait` rather
+        // the budget is shortened through `acquire_with_timings` rather
         // than spending the default's minutes. A held `LedgerLock`, not a
         // bare `File::create` on the lock path (issue #1687): under `flock`,
         // the file's mere existence holds nothing — only an actual lock
@@ -1339,11 +1569,14 @@ mod tests {
         let test_opts = opts(root.path());
         let _held = LedgerLock::acquire(&test_opts.ledger_path).unwrap();
 
-        let result = acquire_with_lock_wait(
+        let result = acquire_with_timings(
             &client,
             &test_opts,
             &FakeAuthenticator(AuthOutcome::Authorized),
-            Duration::from_millis(150),
+            AcquireTimings {
+                lock_wait: Duration::from_millis(150),
+                ..FAST_TIMINGS
+            },
         )
         .await;
 
@@ -1624,7 +1857,9 @@ mod tests {
         // bytes hash to: the content moved under the download. The
         // metadata mock's `.expect(2)` is half the assertion — a byte
         // target *with* a checksum is pinned by content alone, so the
-        // pre-backup read the version sandwich needs must not be made.
+        // pre-backup read the version sandwich needs must not be made — and
+        // a checksum mismatch is never retried (issue #1739), so no second
+        // post-backup read follows either.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/f1"))
@@ -1716,11 +1951,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_byte_target_without_a_checksum_falls_back_to_the_version_sandwich() {
-        // No `sha256Checksum` at all (a file predating Drive's field), so
-        // there is no content proof — the backup is sandwiched between two
-        // `version` reads instead. Pre-auth and pre-backup both see "1";
-        // the post-backup read sees "2"; refused. The first mock's
-        // `.expect(2)` proves the pre-backup read *was* made on this path.
+        // No `sha256Checksum` at all (defensive: Drive omits it only for
+        // native and shortcut files), so there is no content proof — the
+        // backup is sandwiched between two `version` reads instead.
+        // Pre-auth and pre-backup both see "1"; the post-backup read sees
+        // "2", so that first backup is refused and discarded. The second
+        // attempt reads "2" on both sides and is pinned (issue #1739). The
+        // first mock's `.expect(2)` proves the pre-backup read *was* made
+        // on this path; the download count proves the retry took a second
+        // backup rather than reusing the first.
         let server = wiremock::MockServer::start().await;
         mount_metadata_drift(
             &server,
@@ -1733,25 +1972,36 @@ mod tests {
             }),
         )
         .await;
-        mount_hello_download(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param("alt", "media"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .expect(2)
+            .mount(&server)
+            .await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let test_opts = opts(root.path());
 
-        let result = acquire(
+        let result = acquire_with_timings(
             &client,
             &test_opts,
             &FakeAuthenticator(AuthOutcome::Authorized),
+            FAST_TIMINGS,
         )
         .await;
 
-        let AcquireResult::RefusedConcurrentChange { detail } = result else {
-            panic!("expected RefusedConcurrentChange, got {result:?}");
+        let AcquireResult::Acquired { token, .. } = result else {
+            panic!("expected Acquired, got {result:?}");
         };
-        assert!(detail.contains("version 1"), "{detail}");
-        assert!(detail.contains("2 immediately after"), "{detail}");
-        assert_nothing_minted(&test_opts);
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        assert_eq!(ledger.get(&token).unwrap().version, "2");
+        assert_eq!(
+            std::fs::read_dir(&test_opts.backup_dir).unwrap().count(),
+            1,
+            "the first attempt's backup must be reclaimed, leaving only the pinned one"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1806,8 +2056,10 @@ mod tests {
 
     /// The native-document shape of the sandwich tests: a spreadsheet
     /// target whose `files.copy` backup lands as `copy-1`, with the
-    /// metadata drifting from `"7"` to `"8"` on the post-backup read.
-    async fn mount_native_drift(server: &wiremock::MockServer) {
+    /// metadata drifting from `"7"` to `"8"` on the first post-backup read
+    /// and staying there — a one-off bump. `copies` is how many
+    /// `files.copy` calls the test expects.
+    async fn mount_native_drift(server: &wiremock::MockServer, copies: u64) {
         mount_metadata_drift(
             server,
             serde_json::json!({
@@ -1826,15 +2078,32 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
             })))
-            .expect(1)
+            .expect(copies)
             .mount(server)
             .await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_native_backup_whose_version_moved_during_the_copy_is_refused_and_the_copy_trashed() {
-        let server = wiremock::MockServer::start().await;
-        mount_native_drift(&server).await;
+    /// A metadata responder whose `version` moves on *every* read —
+    /// `base`'s other fields, with `version` counting up from `first`. The
+    /// shape a file whose `version` moves for reasons unrelated to edits
+    /// would present (issue #1739), which no number of retries can pin.
+    struct EverMovingVersion {
+        base: serde_json::Value,
+        next: std::sync::atomic::AtomicU64,
+    }
+
+    impl wiremock::Respond for EverMovingVersion {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let version = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut body = self.base.clone();
+            body["version"] = serde_json::Value::String(version.to_string());
+            wiremock::ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
+    /// Mounts a mock that trashes `copy-1` successfully, expecting
+    /// `times` calls.
+    async fn mount_trash_copy(server: &wiremock::MockServer, times: u64) {
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
             .and(wiremock::matchers::body_json(
@@ -1845,38 +2114,110 @@ mod tests {
                     "id": "copy-1", "name": "backup", "trashed": true,
                 })),
             )
-            .expect(1)
-            .mount(&server)
+            .expect(times)
+            .mount(server)
             .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_backup_whose_version_moved_once_is_retried_and_acquired() {
+        // The one-off bump issue #1739 is about: the first copy is
+        // sandwiched between "7" and "8" and discarded, the second between
+        // "8" and "8" and pinned. The copy mock's `.expect(2)` and the
+        // trash mock's `.expect(1)` are the retry and reclaim assertions.
+        let server = wiremock::MockServer::start().await;
+        mount_native_drift(&server, 2).await;
+        mount_trash_copy(&server, 1).await;
         let client = client_with_bootstrapped_token(&server).await;
         let root = tempfile::tempdir().unwrap();
         let _audit = AuditGuard::redirect(root.path());
         let mut test_opts = opts(root.path());
         test_opts.native_backup_folder_id = Some("backup-folder".to_string());
 
-        let result = acquire(
+        let result = acquire_with_timings(
             &client,
             &test_opts,
             &FakeAuthenticator(AuthOutcome::Authorized),
+            FAST_TIMINGS,
+        )
+        .await;
+
+        let AcquireResult::Acquired { token, .. } = result else {
+            panic!("expected Acquired, got {result:?}");
+        };
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        assert_eq!(ledger.get(&token).unwrap().version, "8");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_backup_whose_version_never_settles_is_refused_after_every_attempt() {
+        // `version` moves on every read, so every attempt is refused —
+        // each copy is trashed before the next is taken, and the final
+        // refusal says the version kept moving rather than asking the
+        // operator to wait for a quiet file. Reads: pre-auth "7", then
+        // ("8", "9"), ("10", "11"), ("12", "13").
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(EverMovingVersion {
+                base: serde_json::json!({
+                    "id": "f1", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.spreadsheet"
+                }),
+                next: std::sync::atomic::AtomicU64::new(7),
+            })
+            .expect(1 + 2 * u64::from(SANDWICH_ATTEMPTS))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
+            })))
+            .expect(u64::from(SANDWICH_ATTEMPTS))
+            .mount(&server)
+            .await;
+        mount_trash_copy(&server, u64::from(SANDWICH_ATTEMPTS)).await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire_with_timings(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            FAST_TIMINGS,
         )
         .await;
 
         let AcquireResult::RefusedConcurrentChange { detail } = result else {
             panic!("expected RefusedConcurrentChange, got {result:?}");
         };
-        assert!(detail.contains("version 7"), "{detail}");
-        assert!(detail.contains("8 immediately after"), "{detail}");
+        assert!(detail.contains("on each of 3 attempts"), "{detail}");
+        assert!(detail.contains("version 12"), "{detail}");
+        assert!(detail.contains("13 immediately after"), "{detail}");
+        assert!(detail.contains("unrelated to edits"), "{detail}");
         assert!(!test_opts.ledger_path.exists(), "no ledger row");
-        // The PATCH mock's `.expect(1)` is the reclaim assertion.
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("refused-concurrent-change")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_concurrent_change_whose_reclaim_fails_is_audited_as_backup_orphaned() {
-        // Same drift, but trashing the copy fails — the refusal stands and
-        // the audit verdict carries issue #1690's `-backup-orphaned` suffix
-        // so the leaked copy is greppable.
+        // A one-off drift, but trashing the copy fails — so retrying stops
+        // there rather than risk a second orphan (the copy mock's
+        // `.expect(1)` is that assertion, issue #1739). The refusal stands
+        // with the one-shot wording, and the audit verdict carries issue
+        // #1690's `-backup-orphaned` suffix so the leaked copy is greppable.
         let server = wiremock::MockServer::start().await;
-        mount_native_drift(&server).await;
+        mount_native_drift(&server, 1).await;
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
             .respond_with(wiremock::ResponseTemplate::new(500))
@@ -1929,7 +2270,32 @@ mod tests {
             size: 5,
         };
         let err = backup_is_pinned(&backup, None, "7", None).unwrap_err();
-        assert!(err.contains("no proof available"), "{err}");
+        assert!(matches!(err, PinFailure::NoProof { .. }), "{err:?}");
+        assert!(!err.is_retryable());
+        let detail = err.detail(1);
+        assert!(detail.contains("no proof available"), "{detail}");
+    }
+
+    #[test]
+    fn only_a_moved_version_is_retried_and_its_final_wording_names_the_attempts() {
+        let moved = PinFailure::VersionMoved {
+            pre: "7".to_string(),
+            post: "8".to_string(),
+        };
+        assert!(moved.is_retryable());
+        let once = moved.detail(1);
+        assert!(once.contains("version 7 immediately before"), "{once}");
+        assert!(once.ends_with("retry."), "{once}");
+        let exhausted = moved.detail(SANDWICH_ATTEMPTS);
+        assert!(exhausted.contains("on each of 3 attempts"), "{exhausted}");
+        assert!(!exhausted.contains("retry."), "{exhausted}");
+
+        let mismatch = PinFailure::ChecksumMismatch {
+            remote: "aa".to_string(),
+            post_version: "3".to_string(),
+            local: "bb".to_string(),
+        };
+        assert!(!mismatch.is_retryable());
     }
 
     #[test]
