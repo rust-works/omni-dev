@@ -135,11 +135,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 
 /// Runs `f` under a thread-local subscriber that captures every event at
 /// `level` or above, and returns everything it logged. `f` must be fully
-/// synchronous on this thread. The shared home for the `CaptureWriter`/
-/// `capture_warn`/`capture_info` pattern previously duplicated across
-/// `cli::drive::lease`, `gmail::chrome_profile`, `drive::chrome_profile`,
-/// `daemon::services::worktrees`, and `claude::ai::claude_cli` (issue #1744
-/// hoisted the first of those; the rest are a follow-up).
+/// synchronous on this thread. The one shared home for this capture
+/// pattern (issue #1744); per-module `capture_info`/`capture_warnings`
+/// helpers are thin aliases over it.
 pub(crate) fn capture_at(level: tracing::Level, f: impl FnOnce()) -> String {
     let writer = CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()

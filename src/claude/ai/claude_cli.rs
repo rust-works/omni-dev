@@ -1740,42 +1740,10 @@ mod tests {
     /// Thread-scoped log capture for asserting on emitted `warn!` lines.
     /// Installed via `tracing::subscriber::with_default`, so it never
     /// touches the global subscriber other tests may have initialised.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Runs `f` under a thread-local WARN-level subscriber and returns
-    /// everything it logged.
+    ///
+    /// Thin alias over [`crate::test_support::capture_at`] at `WARN`.
     fn capture_warnings(f: impl FnOnce()) -> String {
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let mut sink = writer.clone();
-        std::io::Write::flush(&mut sink).expect("flushing the capture buffer cannot fail");
-        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
-        logs
+        crate::test_support::capture_at(tracing::Level::WARN, f)
     }
 
     #[test]

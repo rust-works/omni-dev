@@ -10088,38 +10088,10 @@ mod tests {
     /// `spawn_blocking`), so the captured events fire on this thread where the
     /// subscriber lives — a `tracing` event emitted after a heavy `spawn_blocking`
     /// under the parallel suite is *not* reliably captured this way.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Runs `f` under a thread-local INFO-level subscriber and returns everything
-    /// it logged. `f` must be fully synchronous on this thread.
+    ///
+    /// Thin alias over [`crate::test_support::capture_at`] at `INFO`.
     fn capture_info(f: impl FnOnce()) -> String {
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
-        logs
+        crate::test_support::capture_at(tracing::Level::INFO, f)
     }
 
     // ── rebase op (#1415) ──────────────────────────────────────────────────
