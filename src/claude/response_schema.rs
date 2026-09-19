@@ -51,38 +51,6 @@ pub fn check_response_schema() -> &'static Value {
     schema_value::<AiCheckResponse>(&SLOT)
 }
 
-/// JSON Schema for the decision-comment statement splitter
-/// (`ai jev verify-decision`, #1779).
-///
-/// Hand-written, not derived via [`schema_value`]: the issue that specifies
-/// this command fixes this exact schema text as part of what was validated
-/// (a nullable-yet-required `cites` field), so this reproduces it verbatim
-/// rather than trusting `schemars` to emit an equivalent shape.
-pub fn split_statements_schema() -> &'static Value {
-    static SLOT: OnceLock<Value> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "statements": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "cites": {"type": ["string", "null"]}
-                        },
-                        "required": ["text", "cites"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["statements"],
-            "additionalProperties": false
-        })
-    })
-}
-
 /// Cached-schema getter signature, used by the golden-coverage test.
 #[cfg(test)]
 type SchemaGetter = fn() -> &'static Value;
@@ -93,7 +61,6 @@ const ALL_SCHEMAS: &[(&str, SchemaGetter)] = &[
     ("amendment_file", amendment_file_schema),
     ("pr_content", pr_content_schema),
     ("check_response", check_response_schema),
-    ("split_statements", split_statements_schema),
 ];
 
 #[cfg(test)]
@@ -264,34 +231,5 @@ mod tests {
             .expect("check_response schema should have a `required` array");
         let names: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert_eq!(names, vec!["checks"]);
-    }
-
-    /// Pins the hand-written schema byte-for-byte against the issue's
-    /// exact tested text: changing it is a deliberate edit, not drift.
-    #[test]
-    fn split_statements_schema_matches_the_tested_text() {
-        let value = split_statements_schema();
-        assert_eq!(
-            *value,
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "statements": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string"},
-                                "cites": {"type": ["string", "null"]}
-                            },
-                            "required": ["text", "cites"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["statements"],
-                "additionalProperties": false
-            })
-        );
     }
 }

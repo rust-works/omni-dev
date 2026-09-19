@@ -126,27 +126,6 @@ impl ClaudeClient {
         }
     }
 
-    /// Sends one structured call for a caller outside this module: adjusts
-    /// `system_prompt` for schema-capable backends and attaches `schema`
-    /// when supported, via [`send_with_optional_schema`](Self::send_with_optional_schema)
-    /// — so it inherits the schema-rejection retry/fallback (#1561) for
-    /// free. Used by `verify-decision`'s decision-comment splitter
-    /// (#1779), the first caller of this dispatch outside `claude::client`.
-    pub(crate) async fn send_structured(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-        schema: &serde_json::Value,
-    ) -> Result<String> {
-        let system_prompt = self.adjusted_system_prompt(system_prompt.to_string());
-        self.send_with_optional_schema(
-            &system_prompt,
-            user_prompt,
-            self.schema_if_supported(schema),
-        )
-        .await
-    }
-
     /// Strips the JSON-schema system-prompt suffix, recovering the YAML
     /// prompt byte-for-byte.
     ///
