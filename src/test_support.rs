@@ -112,6 +112,46 @@ mod audit_log_guard_tests {
     }
 }
 
+/// Thread-scoped log buffer backing [`capture_at`].
+#[derive(Clone, Default)]
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Runs `f` under a thread-local subscriber that captures every event at
+/// `level` or above, and returns everything it logged. `f` must be fully
+/// synchronous on this thread. The shared home for the `CaptureWriter`/
+/// `capture_warn`/`capture_info` pattern previously duplicated across
+/// `cli::drive::lease`, `gmail::chrome_profile`, `drive::chrome_profile`,
+/// `daemon::services::worktrees`, and `claude::ai::claude_cli` (issue #1744
+/// hoisted the first of those; the rest are a follow-up).
+pub(crate) fn capture_at(level: tracing::Level, f: impl FnOnce()) -> String {
+    let writer = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+    logs
+}
+
 pub(crate) mod failing_io {
     //! Writer fixture that always returns `ErrorKind::Other` from
     //! `write` and `flush`. Used to drive `?`-propagation Err branches

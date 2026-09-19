@@ -385,7 +385,7 @@ pub fn load_credentials() -> Result<DriveCredentials> {
 /// naturally fails loudly with [`DriveError::CredentialsNotFound`] (whose
 /// message names `drive auth login`) when there is nothing to load.
 pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<DriveCredentials> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.drive, explicit)? {
         ResolvedAccount::Unconfigured => {
             let profile = active_profile_from(&SystemEnv);
@@ -500,7 +500,7 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> DriveAuthS
 /// [`load_credentials_for`] instead.
 #[cfg(feature = "mcp")]
 pub(crate) fn status_for(explicit: Option<&str>) -> Result<DriveAuthStatus> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.drive, explicit)? {
         ResolvedAccount::Unconfigured => {
             let profile = active_profile_from(&SystemEnv);
@@ -534,7 +534,7 @@ fn status_from_named(drive: &DriveSettings, name: &str) -> DriveAuthStatus {
 /// already has an `email_address` — an explicit or previously-backfilled
 /// value is never overwritten (mirrors Gmail's issue #1505).
 pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     if settings
         .drive
         .accounts
@@ -647,7 +647,7 @@ pub(crate) fn remove_credentials_at(settings_path: &Path, profile: Option<&str>)
 /// `--account`/[`account::DRIVE_ACCOUNT_ENV`] override, if any. Removes the
 /// whole `drive.accounts.<name>` entry — an account is coherent as a unit.
 pub(crate) fn remove_credentials_for(explicit: Option<&str>) -> Result<bool> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.drive, explicit)? {
         ResolvedAccount::Unconfigured => remove_credentials_at(
             &Settings::get_settings_path()?,
@@ -1149,7 +1149,7 @@ pub(crate) async fn login_for(
     scope: DriveGrantedScopes,
     browser: &BrowserConfig,
 ) -> Result<DriveAuthStatus> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve_for_write(&settings.drive, explicit)? {
         ResolvedAccount::Unconfigured => {
             login_to(

@@ -176,7 +176,7 @@ impl SnowflakeEngineConfig {
     /// non-interactive method is missing its credential (see
     /// [`resolve_auth_method`]).
     pub fn from_env_and_settings() -> Result<Self> {
-        let settings = Settings::load().unwrap_or_default();
+        let settings = Settings::load_or_warn_default();
         let pool_size = settings
             .get_env_var(ENV_POOL_SIZE)
             .and_then(|s| s.trim().parse::<usize>().ok())

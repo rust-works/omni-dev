@@ -18,7 +18,7 @@ impl SetDefaultCommand {
     /// Validates `name` against the configured accounts, then writes
     /// `gmail.default_account`.
     pub fn execute(self) -> Result<()> {
-        let settings = Settings::load().unwrap_or_default();
+        let settings = Settings::load_or_warn_default();
         account::validate_account(&settings.gmail, &self.name)?;
         Settings::set_gmail_default_account(&Settings::get_settings_path()?, Some(&self.name))?;
         println!("Default Gmail account set to '{}'.", self.name);

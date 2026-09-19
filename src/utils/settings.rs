@@ -422,8 +422,9 @@ pub struct SettingsEnv {
 
 impl SettingsEnv {
     /// Loads settings from the default location, falling back to an empty
-    /// settings map if they are absent or unreadable (env-only behaviour). The
-    /// active profile is read from `OMNI_DEV_PROFILE`.
+    /// settings map if they are absent or unreadable (env-only behaviour),
+    /// warning first if the file exists but fails to parse (issue #1744).
+    /// The active profile is read from `OMNI_DEV_PROFILE`.
     pub fn load() -> Self {
         Self::load_with_profile(active_profile_from(&SystemEnv).as_deref())
     }
@@ -433,7 +434,7 @@ impl SettingsEnv {
     /// setting `OMNI_DEV_PROFILE` in the process environment.
     pub fn load_with_profile(profile: Option<&str>) -> Self {
         Self {
-            settings: Settings::load().unwrap_or_default(),
+            settings: Settings::load_or_warn_default(),
             active_profile: profile.map(str::to_string),
         }
     }
@@ -466,12 +467,28 @@ impl Settings {
         Self::load_from_path(&settings_path)
     }
 
-    /// Loads just the [`mcp`](McpSettings) section, falling back to its defaults
-    /// when the settings file is absent or unreadable — so the MCP server always
-    /// boots even with a malformed `settings.json` (issue #620). Mirrors the
-    /// graceful `unwrap_or_default` of [`SettingsEnv::load`].
+    /// Loads settings from the default location, warning and falling back to
+    /// [`Settings::default`] if the file exists but fails to read or parse —
+    /// the disk boundary every non-`Result` call site shares (issue #1744).
+    /// A *missing* file is not an error and never warns (see
+    /// [`Self::load_from_path`]).
+    pub fn load_or_warn_default() -> Self {
+        Self::load().unwrap_or_else(|e| {
+            tracing::warn!(
+                "{e:#}; falling back to default settings for this invocation — \
+                 any settings.json configuration is being ignored"
+            );
+            Self::default()
+        })
+    }
+
+    /// Loads just the [`mcp`](McpSettings) section, warning and falling back
+    /// to its defaults when the settings file is absent or unreadable — so
+    /// the MCP server always boots even with a malformed `settings.json`
+    /// (issue #620), same warn-then-default contract as
+    /// [`Self::load_or_warn_default`] (issue #1744).
     pub fn load_mcp() -> McpSettings {
-        Self::load().map(|s| s.mcp).unwrap_or_default()
+        Self::load_or_warn_default().mcp
     }
 
     /// Loads settings from a specific path.
@@ -1066,6 +1083,27 @@ mod tests {
         // Check env vars
         assert_eq!(settings.env.get("TEST_VAR").unwrap(), "test_value");
         assert_eq!(settings.env.get("CLAUDE_API_KEY").unwrap(), "test_api_key");
+    }
+
+    #[test]
+    fn load_or_warn_default_warns_and_falls_back_when_settings_json_fails_to_parse() {
+        // The shared loader every non-`Result` call site now uses (issue
+        // #1744) — a missing settings.json resolves to defaults with no
+        // warning (the ordinary case); this covers "file exists but doesn't
+        // parse", which must warn rather than silently drop configuration.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
+
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            let settings = Settings::load_or_warn_default();
+            assert!(settings.env.is_empty());
+            assert!(settings.profiles.is_empty());
+            assert!(settings.drive.accounts.is_empty());
+        });
+        assert!(logs.contains("settings.json"), "{logs}");
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl ImportLegacyCommand {
     /// `gmail.accounts.<name>`, and optionally removes the legacy copy.
     pub fn execute(self) -> Result<()> {
         let legacy = auth::load_credentials_legacy()?;
-        let settings = Settings::load().unwrap_or_default();
+        let settings = Settings::load_or_warn_default();
         let is_first_transition =
             account::is_first_legacy_to_named_transition(&settings.gmail, true);
 

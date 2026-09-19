@@ -88,7 +88,7 @@ pub fn import_client_credentials_for(
     let path = discover_client_secret_file(&SystemEnv, dirs::home_dir().as_deref(), explicit_path)?;
     let credentials = parse_client_secret_file(&path)?;
 
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match auth::resolve_for_write(&settings.gmail, explicit_account)? {
         ResolvedAccount::Legacy => save_client_credentials_to(
             &Settings::get_settings_path()?,

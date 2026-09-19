@@ -57,7 +57,7 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
 fn active_account_field<T>(
     f: impl FnOnce(&DriveAccountSettings) -> Option<T>,
 ) -> Result<Option<T>> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let resolved = auth::resolve(&settings.drive, None)?;
     Ok(match &resolved {
         ResolvedAccount::Named(name) => settings.drive.accounts.get(name).and_then(f),
@@ -201,6 +201,24 @@ mod tests {
         assert!(rules[0]
             .allow
             .contains(&crate::drive::write_gate::DriveOperation::Create));
+    }
+
+    #[test]
+    fn active_account_rules_warns_when_settings_json_fails_to_parse() {
+        // `active_account_field` re-parses settings.json independently of
+        // `LeaseFlags::resolve` (issue #1695's fix), so a broken file must
+        // warn here too rather than silently reading back an empty rule
+        // set — closing the gap named in issue #1744.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_dir = dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
+
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            assert!(active_account_rules().unwrap().is_empty());
+        });
+        assert!(logs.contains("settings.json"), "{logs}");
     }
 
     // ── active_account_lease_backup_folder_id ───────────────────────────
