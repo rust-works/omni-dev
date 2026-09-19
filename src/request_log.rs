@@ -849,21 +849,30 @@ fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyh
     crate::daemon::paths::ensure_handle_0600(&file)?;
 
     // Whether this append needs the parent-directory `fsync` below, decided
-    // from the handle we already hold: an empty file either did not exist a
-    // moment ago or has no content whose directory entry could already have
-    // been made durable, and once it has content the entry is long since on
-    // disk. Errs towards one spare `fsync` (an existing-but-empty file),
-    // never towards skipping a needed one. Before issue #1697 every append
-    // paid it, so a 2,000-row `drive lease prune` cost 2,000 directory
-    // syncs to persist one directory entry.
+    // from the handle we already hold: an empty file is one this call may
+    // just have created, so it pays for the sync; a file with content was
+    // created by an earlier append, which synced the directory itself.
+    // An existing-but-empty file costs one spare `fsync`. The one case
+    // where this skips a sync the entry still needs is the concurrent
+    // window described below. Before issue #1697 every append paid it, so
+    // a 2,000-row `drive lease prune` cost 2,000 directory syncs to persist
+    // one directory entry.
     //
     // Deliberately *not* an `O_CREAT | O_EXCL` probe, which would report
     // creation exactly rather than conservatively: `O_EXCL` refuses to
     // follow a symlink, so an `OMNI_DEV_AUDIT_LOG_FILE` pointing at one
     // would start failing `ENOENT` — and in a fail-closed sink a failed
     // append refuses the write it was auditing. Both approaches leave the
-    // same residue anyway (a previous creator that died between its data
-    // sync and its directory sync), so the exact answer buys nothing.
+    // same residue anyway, so the exact answer buys nothing. That residue
+    // is the window between the creating append's data sync and its
+    // directory sync: a creator that dies inside it leaves a file no later
+    // append re-syncs, and a *concurrent* appender (nothing serializes the
+    // whole append across processes) that lands inside it sees a non-empty
+    // file and returns before the entry is durable. Every-append syncing
+    // closed the second case; it is accepted here as a narrow window —
+    // milliseconds, since it spans the creator's own `sync_data`, which is
+    // `F_FULLFSYNC` on macOS — that matters only if the machine crashes
+    // inside it, once per audit file.
     let sync_parent = sync && file.metadata()?.len() == 0;
 
     if bodies_enabled() {
