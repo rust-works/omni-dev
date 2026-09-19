@@ -65,11 +65,17 @@ pub struct CheckCommand {
     /// Offers to apply suggested messages when issues are found.
     #[arg(long)]
     pub twiddle: bool,
+
+    /// AI backend selection (`--ai-backend`, `--model`, …).
+    #[command(flatten)]
+    pub ai: crate::cli::ai_backend_args::AiBackendArgs,
 }
 
 impl CheckCommand {
     /// Executes the check command, validating commit messages against guidelines.
     pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
+        self.ai.apply();
+
         // Resolve the repo root once; every git, config, and scratch read below
         // anchors to it (the CWD is the default when no path is injected).
         let repo_root = match repo {
@@ -92,9 +98,10 @@ impl CheckCommand {
         let output_format = self.output;
 
         // Preflight check: validate AI credentials before any processing.
-        // Model/beta-header selection uses the global `--model`/`--beta-header`
-        // flags (propagated as OMNI_DEV_MODEL/OMNI_DEV_BETA_HEADER) and the
-        // per-backend env chain.
+        // Model/beta-header selection uses this command's `--model`/
+        // `--beta-header` flags (propagated as OMNI_DEV_MODEL/
+        // OMNI_DEV_BETA_HEADER by `self.ai.apply()`) and the per-backend env
+        // chain.
         let ai_info = crate::utils::check_ai_command_prerequisites(None, repo_root)?;
         if !self.quiet && output_format == OutputFormat::Text {
             println!(
@@ -1449,6 +1456,7 @@ mod tests {
             no_coherence: false,
             no_suggestions: false,
             twiddle: false,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         };
         let report = CheckReport::new(vec![CommitCheckResult {
             hash: "abcdef1234567890".to_string(),
@@ -1513,6 +1521,7 @@ mod tests {
             no_coherence: true,
             no_suggestions: false,
             twiddle: false,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         }
     }
 

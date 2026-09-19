@@ -18,10 +18,12 @@ use crate::git::commit::FileChanges;
 
 /// `omni-dev git commit message staged` CLI command.
 ///
-/// Model/beta-header selection uses the global `--model`/`--beta-header`
-/// flags (propagated as `OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER`) and the
-/// per-backend env chain; the only subcommand-local flags are `--print-only`,
-/// `--context-dir`, and `--no-ai`.
+/// Backend, model, and beta-header selection use the flattened
+/// [`AiBackendArgs`] flags (`--ai-backend`, `--model`, `--beta-header`, …;
+/// propagated as `OMNI_DEV_AI_BACKEND`/`OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER`)
+/// and the per-backend env chain.
+///
+/// [`AiBackendArgs`]: crate::cli::ai_backend_args::AiBackendArgs
 #[derive(Parser)]
 pub struct StagedCommand {
     /// Print the generated message to stdout instead of committing.
@@ -43,6 +45,10 @@ pub struct StagedCommand {
     /// to commit.
     #[arg(long)]
     pub no_ai: bool,
+
+    /// AI backend selection (`--ai-backend`, `--model`, …).
+    #[command(flatten)]
+    pub ai: crate::cli::ai_backend_args::AiBackendArgs,
 }
 
 /// Outcome of a staged-commit run.
@@ -61,6 +67,8 @@ impl StagedCommand {
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+        self.ai.apply();
+
         let outcome = run_staged(
             self.print_only,
             self.no_ai,
@@ -590,6 +598,7 @@ mod tests {
             print_only: true,
             context_dir: None,
             no_ai: false,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         };
         let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
         let msg = format!("{err:#}");
@@ -816,6 +825,7 @@ mod tests {
             print_only: false,
             context_dir: Some(temp_dir.path().join(".omni-dev")),
             no_ai: true,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         };
         let result = cmd.execute(Some(temp_dir.path())).await;
         assert!(result.is_ok(), "expected clean exit, got: {result:?}");

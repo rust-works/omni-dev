@@ -1043,7 +1043,7 @@ async fn spawn_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<tokio::p
 /// by `claude-cli` (env vars and process-global config).
 ///
 /// Shared across this module's tests **and** `crate::cli`'s tests because
-/// `Cli::propagate_global_flags` forwards CLI flags to the same env vars
+/// `AiBackendArgs::apply` forwards CLI flags to the same env vars
 /// (`OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS`, `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP`,
 /// `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD`, `OMNI_DEV_AI_BACKEND`) that the
 /// guards below snapshot. A single shared mutex eliminates cross-module

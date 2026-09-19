@@ -33,7 +33,7 @@ use crate::utils::env::{EnvSource, SystemEnv};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvValueSource {
     /// Exported into the process environment by a command-line flag during
-    /// this invocation (see `Cli::propagate_global_flags`).
+    /// this invocation (see `AiBackendArgs::apply`).
     CliFlag,
     /// The process environment (a shell export or inherited variable).
     ProcessEnv,
@@ -59,7 +59,7 @@ impl fmt::Display for EnvValueSource {
     }
 }
 
-/// Env-var keys that `Cli::propagate_global_flags` exported from command-line
+/// Env-var keys that `AiBackendArgs::apply` exported from command-line
 /// flags this invocation. Additive-only, written once at startup, so readers
 /// can attribute a process-env hit to the flag that set it rather than to an
 /// ambient shell export. Not an env-mutation seam: tests exercise the sourced

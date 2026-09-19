@@ -715,13 +715,6 @@ async fn cli_execute_dispatches_git_commit_message_view() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        ai_backend: None,
-        model: None,
-        beta_header: None,
-        claude_cli_allow_tools: false,
-        claude_cli_allow_mcp: false,
-        claude_cli_max_budget_usd: None,
-        models_yaml: None,
         repo: None,
         profile: None,
         instance: None,
@@ -756,13 +749,6 @@ async fn cli_execute_dispatches_git_commit_message_lint() {
     use omni_dev::data::check::OutputFormat;
 
     let cli = Cli {
-        ai_backend: None,
-        model: None,
-        beta_header: None,
-        claude_cli_allow_tools: false,
-        claude_cli_allow_mcp: false,
-        claude_cli_max_budget_usd: None,
-        models_yaml: None,
         repo: None,
         profile: None,
         instance: None,
@@ -799,13 +785,6 @@ async fn cli_execute_dispatches_git_branch_info() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        ai_backend: None,
-        model: None,
-        beta_header: None,
-        claude_cli_allow_tools: false,
-        claude_cli_allow_mcp: false,
-        claude_cli_max_budget_usd: None,
-        models_yaml: None,
         repo: None,
         profile: None,
         instance: None,
@@ -829,13 +808,6 @@ async fn cli_execute_dispatches_claude_wrap() {
     // reach the terminal check or `std::process::exit`. That makes it the only
     // way to exercise the dispatch arm from a test at all.
     let cli = Cli {
-        ai_backend: None,
-        model: None,
-        beta_header: None,
-        claude_cli_allow_tools: false,
-        claude_cli_allow_mcp: false,
-        claude_cli_max_budget_usd: None,
-        models_yaml: None,
         repo: None,
         profile: None,
         instance: None,
@@ -854,18 +826,13 @@ async fn cli_execute_dispatches_ai_chat() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        ai_backend: None,
-        model: None,
-        beta_header: None,
-        claude_cli_allow_tools: false,
-        claude_cli_allow_mcp: false,
-        claude_cli_max_budget_usd: None,
-        models_yaml: None,
         repo: None,
         profile: None,
         instance: None,
         command: Commands::Ai(AiCommand {
-            command: AiSubcommands::Chat(ChatCommand {}),
+            command: AiSubcommands::Chat(ChatCommand {
+                ai: omni_dev::cli::ai_backend_args::AiBackendArgs::default(),
+            }),
         }),
     };
     // Without API credentials this returns Err at the preflight check;
