@@ -517,7 +517,8 @@ would just be a second, redundant dump.
 
 ```
 <output-dir>/
-  state.json                  # watermark (historyId) + account identity
+  state.json                  # watermark (historyId) + account identity +
+                                #   pending_fetch (ids that failed last run)
   manifest.jsonl               # one record per message: id, thread_id, label_ids,
                                 #   internal_date, subject, from, to, rfc822_msgid,
                                 #   in_reply_to, references, attachment_count,
@@ -556,17 +557,19 @@ watermark is purely an optimisation over that fallback, never a
 correctness requirement. (An incremental run's own `history.list` pass is
 not pipelined — it's typically a single page already, so there's little to
 overlap; only the full-listing path above gains concurrent
-listing+fetching.) A run that hits a per-item error never advances the
-watermark, so the next run safely re-examines the same range (already
--archived messages are skipped for free). One exception: a message that
-vanishes from the server in the window between being listed and being
-fetched (`messages.get` returns a 404 with reason `notFound`) is not an
-error — it's recorded as a `Vanished` action instead, since Gmail's
-`history.list` and `messages.get` aren't perfectly consistent and retrying
-that particular id can never succeed. Withholding the watermark for it
-would only wedge the account, re-discovering and re-failing on the same
-stale history event on every run for up to a week; see the Troubleshooting
-section below.
+listing+fetching.) A run that hits per-item errors still advances the
+watermark, but records the failed message ids in `state.json`'s
+`pending_fetch`; the next incremental run retries them directly, alongside
+the new history window, and drops any that are by then archived, deleted,
+or vanished. This means a mailbox that keeps hitting errors (for example a
+sustained `rateLimitExceeded`) never lets its watermark age past the
+one-week limit and fall back to a full listing (#1784). One exception: a
+message that vanishes from the server in the window between being listed
+and being fetched (`messages.get` returns a 404 with reason `notFound`) is
+not an error. It's recorded as a `Vanished` action instead and never added
+to `pending_fetch`, since Gmail's `history.list` and `messages.get` aren't
+perfectly consistent and retrying that particular id can never succeed;
+see the Troubleshooting section below.
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
 backfill/`--full`/reconciliation pass, but `history.list` has no query
@@ -1161,10 +1164,10 @@ individually stall long enough to trip the read timeout even though
 nothing is actually stuck. This is more likely the more of `--concurrency`
 is spent on large messages at once, not a sign of a broken connection.
 
-`sync` is safe to just re-run: a run with errors never advances the
-watermark, and presence-on-disk means already-archived messages are
-skipped, so a re-run only retries what failed. Two ways to make it
-succeed:
+`sync` is safe to just re-run: a run with errors records the failed ids in
+`state.json`'s `pending_fetch`, and presence-on-disk means already-archived
+messages are skipped, so a re-run only retries what failed. Two ways to
+make it succeed:
 
 - Lower `--concurrency` (even down to `1`) so each large download gets
   more of the available bandwidth to itself.
@@ -1188,12 +1191,11 @@ can be permanently deleted from the server in the window between being
 listed and being fetched — auto-filtered mail, a sent message recalled
 immediately, and similar routine churn. Unlike every other per-item
 failure, this can never succeed on retry, so it is not counted as an error
-(`report.errors` stays empty), does not withhold the watermark, and does
-not fail `sync`'s or `sync-all`'s exit code — only a message vanishing for
-any *other* reason (a 404 with a different `reason`, or any non-404
-failure) still surfaces as an ordinary error and still withholds the
-watermark. See [ADR-0064](adrs/adr-0064.md)'s 2026-08-06 amendment for
-#1509.
+(`report.errors` stays empty), is not added to `pending_fetch`, and does
+not fail `sync`'s or `sync-all`'s exit code. A message missing for any
+*other* reason (a 404 with a different `reason`, or any non-404 failure)
+still surfaces as an ordinary error and is retried on the next run. See
+[ADR-0064](adrs/adr-0064.md)'s 2026-08-06 amendment for #1509.
 
 ## See also
 
