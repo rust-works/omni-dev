@@ -67,6 +67,7 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `drive` - Google Drive integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
 - `git` - Git operations and repository analysis
 - `gmail` - Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
+- `jev` - TypeSafe Jev System One API client and CLI surface
 - `mcp` - MCP server implementation and tool handlers
 - `release` - Release process, versioning, and publishing
 - `request-log` - Local append-only invocation + HTTP request log and its reader
