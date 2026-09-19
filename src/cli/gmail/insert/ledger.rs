@@ -203,17 +203,13 @@ pub(crate) struct LedgerLock {
 impl LedgerLock {
     pub(crate) fn acquire(archive_dir: &Path) -> Result<Self> {
         let path = ledger_lock_path(archive_dir);
-        match crate::daemon::paths::try_lock_file_exclusive(&path) {
-            Ok(inner) => Ok(Self { inner }),
-            Err(crate::daemon::paths::FileLockError::Busy) => anyhow::bail!(
+        match crate::daemon::paths::try_lock_or_busy(&path, "the insert-ledger lock file")? {
+            Some(inner) => Ok(Self { inner }),
+            None => anyhow::bail!(
                 "another `gmail insert` run appears to already be in progress against this \
                  archive dir ({} is locked) — concurrent runs would clobber each other's ledger",
                 path.display()
             ),
-            Err(crate::daemon::paths::FileLockError::Io(err)) => Err(err.context(format!(
-                "failed to lock the insert-ledger lock file at {}",
-                path.display()
-            ))),
         }
     }
 }
