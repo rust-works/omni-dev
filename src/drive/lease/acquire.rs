@@ -53,10 +53,12 @@ pub struct AcquireOptions {
     /// ledger.
     pub ledger_path: PathBuf,
     /// The global headless/off-macOS opt-out (ADR-0080 §8/§13, issue
-    /// #1677): when `true`, an [`AuthOutcome::Unavailable`] outcome — no
-    /// authenticator exists in this context at all — is waived instead of
-    /// refusing the lease, and the acquisition proceeds without a human
-    /// ever having been prompted. Resolved by
+    /// #1677): when `true`, an [`AuthOutcome::NoAuthenticator`] outcome —
+    /// no prompt can reach a human in this context at all — is waived
+    /// instead of refusing the lease, and the acquisition proceeds without a
+    /// human ever having been prompted. An
+    /// [`AuthOutcome::PolicyUnsatisfiable`] outcome is never waived (issue
+    /// #1686). Resolved by
     /// `crate::drive::lease::settings::resolve_allow_headless`.
     pub allow_headless: bool,
     /// A lease this acquisition *replaces* — its row is released in the
@@ -151,10 +153,12 @@ pub enum AcquireResult {
         /// The platform's own message.
         detail: String,
     },
-    /// No authenticator is available in this context (ADR-0080 §8) — no
-    /// backup was taken and no ledger row was written.
+    /// No prompt could be presented (ADR-0080 §8): either no authenticator
+    /// exists in this context, or the requested policy cannot be satisfied
+    /// in it (issue #1686). No backup was taken and no ledger row was
+    /// written.
     Unavailable {
-        /// Why no authenticator is available.
+        /// Why no prompt could be presented.
         detail: String,
     },
     /// An API, filesystem, or ledger error.
@@ -387,7 +391,7 @@ async fn acquire_inner(
     let headless_waiver = match auth_outcome {
         AuthOutcome::Authorized => false,
         AuthOutcome::Denied(detail) => return (AcquireResult::Denied { detail }, None),
-        AuthOutcome::Unavailable(detail) => {
+        AuthOutcome::NoAuthenticator(detail) => {
             // ADR-0080 §8/§13: an explicit, per-installation opt-out lets
             // this proceed with no human ever having been prompted, rather
             // than refusing outright. `headless_waiver` on the eventual
@@ -397,6 +401,20 @@ async fn acquire_inner(
                 return (AcquireResult::Unavailable { detail }, None);
             }
             true
+        }
+        // Never waived, whatever `allow_headless` says (issue #1686): a
+        // human may be sitting right there with Touch ID locked out or the
+        // lid shut, and that is not headless (ADR-0080 §8).
+        AuthOutcome::PolicyUnsatisfiable(detail) => {
+            let detail = if opts.allow_headless {
+                format!(
+                    "{detail} — the headless opt-out does not apply: it waives only a context \
+                     with no authenticator at all, not a policy this session cannot satisfy"
+                )
+            } else {
+                detail
+            };
+            return (AcquireResult::Unavailable { detail }, None);
         }
     };
 
@@ -1430,6 +1448,81 @@ mod tests {
         };
         assert!(headless_waiver);
         assert!(root.path().join("backups").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_opt_out_never_waives_an_unsatisfiable_policy() {
+        // Issue #1686: Touch ID locked out, or the lid shut, on an attended
+        // Mac is not headless — `allow_headless: true` must still refuse,
+        // take no backup, and say why the opt-out did not apply.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+
+        let result = acquire(
+            &client,
+            &AcquireOptions {
+                allow_headless: true,
+                ..opts(root.path())
+            },
+            &FakeAuthenticator(AuthOutcome::PolicyUnsatisfiable(
+                "Biometry is locked out.".to_string(),
+            )),
+        )
+        .await;
+
+        let AcquireResult::Unavailable { detail } = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert!(detail.starts_with("Biometry is locked out."), "{detail}");
+        assert!(
+            detail.contains("headless opt-out does not apply"),
+            "{detail}"
+        );
+        assert!(!root.path().join("backups").exists());
+        assert!(!root.path().join("lease-ledger.jsonl").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsatisfiable_policy_without_the_opt_out_reports_the_platform_message() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "n", "mimeType": "application/pdf", "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+
+        let result = acquire(
+            &client,
+            &opts(root.path()),
+            &FakeAuthenticator(AuthOutcome::PolicyUnsatisfiable(
+                "Authentication canceled.".to_string(),
+            )),
+        )
+        .await;
+
+        let AcquireResult::Unavailable { detail } = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert_eq!(detail, "Authentication canceled.");
     }
 
     #[tokio::test]

@@ -19,6 +19,12 @@
 //! Accessibility). `drive lease acquire` is a synchronous CLI command, so
 //! [`LocalAuthenticator::authenticate`] bridges the async reply over a
 //! one-shot channel and blocks the calling thread on it.
+//!
+//! Before any of that, [`LocalAuthenticator::authenticate`] asks
+//! Security.framework's `SessionGetInfo` whether the caller's session can
+//! show UI at all (issue #1686). That one plain-C function *is* the
+//! Accessibility shape, so it is a hand-rolled `extern "C"` declaration
+//! rather than a second generated-framework dependency.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -28,7 +34,10 @@ use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
 use objc2_local_authentication::{LAContext, LAPolicy};
 
-use super::{AuthOutcome, AuthPolicy, Authenticator};
+use super::{
+    classify_preflight_error, classify_reply_error, classify_session, AuthOutcome, AuthPolicy,
+    Authenticator, LaError,
+};
 
 /// How long [`LocalAuthenticator::authenticate`] waits for a human to
 /// answer the system prompt before invalidating it and reporting denied.
@@ -36,11 +45,61 @@ use super::{AuthOutcome, AuthPolicy, Authenticator};
 /// `drive lease acquire` cannot hang a script indefinitely (ADR-0080 §7).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// `callerSecuritySession` from `AuthSession.h`: "the session of the
+/// calling process", as a `SecuritySessionId` argument.
+const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    /// `OSStatus SessionGetInfo(SecuritySessionId session,
+    /// SecuritySessionId *sessionId, SessionAttributeBits *attributes)`.
+    fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+}
+
+/// The calling process's `SessionAttributeBits`, or the failing `OSStatus`.
+fn caller_session_attributes() -> Result<u32, i32> {
+    let mut session_id = 0u32;
+    let mut attributes = 0u32;
+    #[allow(unsafe_code)]
+    // SAFETY: `SessionGetInfo` is a synchronous C function; both out-params
+    // point at live, writable, correctly-sized (`u32` = `SecuritySessionId`
+    // / `SessionAttributeBits`) locals that outlive the call, and it retains
+    // neither pointer.
+    let status = unsafe {
+        SessionGetInfo(
+            CALLER_SECURITY_SESSION,
+            &raw mut session_id,
+            &raw mut attributes,
+        )
+    };
+    if status == 0 {
+        Ok(attributes)
+    } else {
+        Err(status)
+    }
+}
+
+/// Flattens an `NSError` for the platform-independent classifiers.
+fn la_error(err: &NSError) -> LaError {
+    LaError {
+        domain: err.domain().to_string(),
+        code: err.code(),
+        description: err.localizedDescription().to_string(),
+    }
+}
+
 /// The real, human-present authenticator: `LAContext.evaluatePolicy`.
 pub(crate) struct LocalAuthenticator;
 
 impl Authenticator for LocalAuthenticator {
     fn authenticate(&self, reason: &str, policy: AuthPolicy) -> AuthOutcome {
+        // Gate first: from a session without graphical access macOS still
+        // renders the dialog — on the console — and never replies, so the
+        // only safe answer is to not create a prompt at all.
+        if let Some(outcome) = classify_session(caller_session_attributes()) {
+            return outcome;
+        }
+
         let la_policy = match policy {
             AuthPolicy::DeviceOwner => LAPolicy::DeviceOwnerAuthentication,
             AuthPolicy::BiometricsOnly => LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
@@ -58,10 +117,10 @@ impl Authenticator for LocalAuthenticator {
         // outside a reply block); `ctx` is a live, owned context.
         let preflight = unsafe { ctx.canEvaluatePolicy_error(la_policy) };
         if let Err(err) = preflight {
-            return AuthOutcome::Unavailable(err.localizedDescription().to_string());
+            return classify_preflight_error(la_error(&err));
         }
 
-        let (tx, rx) = mpsc::channel::<(bool, Option<String>)>();
+        let (tx, rx) = mpsc::channel::<(bool, Option<LaError>)>();
         let reply = RcBlock::new(move |success: Bool, error: *mut NSError| {
             let success = success.as_bool();
             let error_desc = if error.is_null() {
@@ -73,7 +132,7 @@ impl Authenticator for LocalAuthenticator {
                 // duration of this call, per Apple's documented contract for the
                 // `reply` parameter.
                 let error = unsafe { &*error };
-                Some(error.localizedDescription().to_string())
+                Some(la_error(error))
             };
             // The receiver may already be gone if `authenticate` timed out and
             // returned; a send into a dropped channel is a no-op error we
@@ -96,9 +155,7 @@ impl Authenticator for LocalAuthenticator {
 
         match rx.recv_timeout(PROMPT_TIMEOUT) {
             Ok((true, _)) => AuthOutcome::Authorized,
-            Ok((false, message)) => {
-                AuthOutcome::Denied(message.unwrap_or_else(|| "authentication failed".to_string()))
-            }
+            Ok((false, error)) => classify_reply_error(error),
             Err(_) => {
                 #[allow(unsafe_code)]
                 // SAFETY: `ctx` is still live (owned by this stack frame); `invalidate`
