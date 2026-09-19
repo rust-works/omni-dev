@@ -31,10 +31,11 @@ chat completion.
 8. [noul](#noul)
 9. [ask](#ask)
 10. [Ordering caveats](#ordering-caveats)
-11. [Retries and timeouts](#retries-and-timeouts)
-12. [Request log](#request-log)
-13. [Troubleshooting](#troubleshooting)
-14. [See also](#see-also)
+11. [Best practices](#best-practices)
+12. [Retries and timeouts](#retries-and-timeouts)
+13. [Request log](#request-log)
+14. [Troubleshooting](#troubleshooting)
+15. [See also](#see-also)
 
 ## Prerequisites
 
@@ -396,6 +397,198 @@ rely on. The cost is that insertion order is never preserved:
 - **`ask` answers are ordered by question name**, not by their order in the
   questions file.
 
+## Best practices
+
+The sections above cover how to *call* Jev. This one covers how to call it
+*well*: how to phrase a question, what to put in the state, and how to act on
+the answer. Most of it comes from TypeSafe's own documentation for
+`jev-1.13.0`. Jev is a young product, so check the
+[TypeSafe docs](https://docs.typesafe.ai) again when the model version you use
+changes.
+
+### Write questions Jev can take literally
+
+Jev answers the question you wrote, not the one you meant. Scoping words,
+negations and implied conditions are read at face value, so spell out every
+condition, including the boundary cases.
+
+- **Put the whole question in `--instructions`.** Don't rely on an option name
+  or a question name to carry meaning.
+- **Keep `--instructions` and the criteria consistent.** If the two ask for
+  different things, answers get worse.
+- **Give `choice` a way out.** Without an escape option, an input that fits
+  nothing is forced into the nearest wrong label.
+  Add one whenever your list might not cover every input:
+
+  ```bash
+  omni-dev ai jev choice "Do you ship to Iceland?" \
+      --instructions "Which team should handle this ticket?" \
+      --option billing="Payments, refunds, invoices" \
+      --option technical="Bugs, outages, errors" \
+      --option other="None of the above fit this ticket"
+  ```
+
+- **Pass the full list of options, not a shortlist.** Each option costs only a
+  few tokens.
+- **Describe `score` levels as situations, not degrees.** "Broken feature, but a
+  workaround exists" gives Jev something to match the state against.
+  "Moderately severe" does not.
+- **One dimension per question.** A `score` that mixes, say, urgency and
+  politeness has no right answer when the two disagree.
+
+### Decompose, then combine in code
+
+Don't hide several judgments inside one fuzzy question such as "how important
+is this ticket?". Ask each part as its own question in one `ask` file, then
+combine the answers with weights you control:
+
+```yaml
+# priority.yaml
+urgency:
+  type: score
+  instructions: How soon does the customer need this resolved?
+  criteria:
+    - No deadline mentioned
+    - Wants it this week
+    - Blocked right now, business impact stated
+angry:
+  type: noul
+  instructions: Is the customer angry?
+```
+
+```bash
+omni-dev ai jev ask --questions priority.yaml < ticket.txt \
+    | jq '0.7 * (.answers.urgency.score / 2) + 0.3 * .answers.angry.noul'
+```
+
+Each question stays narrow enough to answer well. Changing the weights is then
+a code change you can test, not a prompt rewrite.
+
+### Keep the state small and relevant
+
+Accuracy drops as the state fills with material that has nothing to do with
+the question, because irrelevant detail distracts the model. Retrieve and
+filter in code first, and send only the fields the questions need. Prefer a
+structured object with named fields (`--state-json`) over one large string, so
+each part of the state has a name the instructions can refer to.
+
+The request limits for `jev-1.13.0` are:
+
+| Limit                                 | `jev-1.13.0`                   |
+|---------------------------------------|--------------------------------|
+| Whole request (state + all questions) | 64k tokens                     |
+| State + the longest single question   | 32k tokens                     |
+| `choice` options                      | up to 255                      |
+| `score` levels                        | 2 to 10                        |
+
+The token limits come from TypeSafe's
+[Models](https://docs.typesafe.ai/models) page, which is the one to check for
+the version you use. TypeSafe's
+[Primitives](https://docs.typesafe.ai/primitives) page gives a lower figure,
+about 32k tokens for the whole request, so treat 32k as the safe budget until
+the two agree.
+
+omni-dev checks only the minimums locally (two options, two levels). It does
+not check the token limits or the 255-option and 10-level caps, so the API is
+what rejects an oversized request. If a `choice` needs more than 255 options,
+split it into two stages: first choose a group, then choose within that group.
+
+### Leave exact work to code
+
+Jev makes judgments. It does not calculate, and it does not write text. For
+`jev-1.13`, TypeSafe lists these as unreliable:
+
+- **Counting**: characters, occurrences of a term, or items in a long list.
+- **Dates**: which of two dates comes first, how far apart they are, or whether
+  one falls inside a window.
+- **Arithmetic** of any kind.
+- **Generating or extracting text**: summaries, replies, or pulling a value out
+  of free text.
+
+The pattern is to let Jev turn the input into bounded, typed fields and let
+code do the exact work. For example, ask a `choice` over the twelve months
+instead of asking whether an invoice is overdue, then compare dates in code.
+To extract a value, find candidates with a regex (or a chat model) and let Jev
+pick between them.
+
+### Batch related questions into one `ask`
+
+Jev answers every question in a request in parallel, so adding a question
+usually adds no latency. It adds tokens, which you pay for and can see in
+`usage.input_tokens`. Several single-question calls about the same state each
+pay the full round trip and send the state again.
+
+So when a script needs several judgments about one state, put them all in one
+`ask` file, including ones it might not end up using. This reverses the usual
+habit of making the cheapest call first and the rest only when needed. It also
+keeps you further from the rate limit (see
+[HTTP 429 / 529](#http-429--529-retries-exhausted)).
+
+### Gate actions on confidence
+
+A single global cutoff is the wrong tool. Set a threshold for **each action**,
+based on what it costs to get that action wrong. Applying a label that a person
+reviews anyway can act on a modest confidence. Refunding money or closing a
+ticket should demand a high one. Below the threshold, escalate instead of
+acting:
+
+```bash
+answer=$(omni-dev ai jev ask --questions triage.yaml < ticket.txt)
+if jq -e '.answers.department.confidence >= 0.9' <<<"$answer" > /dev/null; then
+    auto_route "$(jq -r .answers.department.choice <<<"$answer")"
+else
+    send_to_human
+fi
+```
+
+A `noul` answer has no `confidence` field. Gate on the probability itself,
+at both ends: `noul >= 0.9` to act as if true, `noul <= 0.1` to act as if
+false, and escalate anything in between.
+
+A flat distribution (a near 50/50 `choice`, or a `score` spread over several
+levels) usually means the *question* is ambiguous: the options overlap, the
+levels mix several dimensions, or the state lacks the facts. Reword the
+question before you lower a threshold to live with it.
+
+### Cascade: filter, judge, escalate
+
+Jev is cheap and fast enough to put in front of expensive work, not in place of
+it:
+
+1. **Filter.** Use a `noul` per candidate (a retrieved passage, a log line, a
+   file) as a relevance check, and send only the survivors on.
+2. **Judge.** Ask the real questions in one `ask` call.
+3. **Decide in code.** Keep control flow, deterministic rules and side effects
+   in your own code, not in the question.
+4. **Escalate.** Send only the low-confidence or flagged cases on to a full
+   chat model or to a person. Anything that needs prose goes there too.
+
+### Treat untrusted state as adversarial
+
+TypeSafe notes that content written to steer the model can move the answer.
+State built from content users control (email bodies, ticket text, PR
+descriptions) can argue for its own classification, just as it can inject
+instructions into a chat model.
+
+Before a pipeline acts on Jev's output automatically (auto-labeling,
+auto-routing, auto-closing), test it with crafted inputs that try to push the
+answer you would least want, and keep a confidence gate in front of every
+consequential action. Also remember that the state is part of the request
+body, so it appears in the [request log](#request-log) if you enable
+`OMNI_DEV_LOG_BODIES`.
+
+### Check calibration on your own data
+
+Jev's confidence is TypeSafe's own metric, and TypeSafe's calibration claims
+are its own measurements. Calibration also holds across a group of answers,
+not for any single one, so a 0.95 answer can still be wrong.
+
+Before trusting a threshold for a consequential action, run Jev over a set of
+examples from your own data whose answers you already know. Then check that
+high-confidence answers really are right more often. Pin the model with
+`--jev-model` while you do (see [Choosing a model](#choosing-a-model)), so a
+`jev-latest` release cannot move the numbers underneath your thresholds.
+
 ## Retries and timeouts
 
 Jev signals throttling with HTTP **429** and overload with HTTP **529**, and
@@ -516,3 +709,10 @@ This is expected. See [Choosing a model](#choosing-a-model). Use `--jev-model`.
 - [Request Log](log.md): querying and redaction.
 - [Issue #1760](https://github.com/rust-works/omni-dev/issues/1760): the
   original request and API notes.
+- TypeSafe's own guidance, which [Best practices](#best-practices) draws on
+  (as of `jev-1.13.0`, 2026-09-19):
+  [Primitives](https://docs.typesafe.ai/primitives),
+  [Confidence](https://docs.typesafe.ai/confidence),
+  [How to build with System One](https://docs.typesafe.ai/concepts/how-to-build-with-system-one),
+  [Jev 1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
+  (its known weak spots) and [Models](https://docs.typesafe.ai/models) (limits).
