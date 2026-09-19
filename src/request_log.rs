@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::utils::env::{EnvSource, SystemEnv};
+use crate::utils::env::{non_empty_var, truthy_var, EnvSource, SystemEnv};
 
 /// Default log file name under the runtime directory.
 const LOG_FILE_NAME: &str = "log.jsonl";
@@ -348,7 +348,7 @@ pub fn disabled() -> bool {
 
 /// [`disabled`], reading through an injected [`EnvSource`] (STYLE-0028).
 fn disabled_with(env: &impl EnvSource) -> bool {
-    env_flag_with(env, "OMNI_DEV_LOG_DISABLE")
+    truthy_var(env, "OMNI_DEV_LOG_DISABLE")
 }
 
 /// Whether request/response bodies may be recorded (`OMNI_DEV_LOG_BODIES=1`).
@@ -358,27 +358,12 @@ pub fn bodies_enabled() -> bool {
 
 /// [`bodies_enabled`], reading through an injected [`EnvSource`] (STYLE-0028).
 fn bodies_enabled_with(env: &impl EnvSource) -> bool {
-    env_flag_with(env, "OMNI_DEV_LOG_BODIES")
+    truthy_var(env, "OMNI_DEV_LOG_BODIES")
 }
 
 /// Whether (redacted) headers may be recorded (`OMNI_DEV_LOG_HEADERS=1`).
 pub fn headers_enabled() -> bool {
-    env_flag_with(&SystemEnv, "OMNI_DEV_LOG_HEADERS")
-}
-
-/// Reads a boolean-ish env var (`1`/`true`/`yes`, case-insensitive).
-fn env_flag_with(env: &impl EnvSource, name: &str) -> bool {
-    env.var(name).is_some_and(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "yes"
-    })
-}
-
-/// The `env_var` override of a runtime log path, if set and non-empty.
-fn env_path_override_with(env: &impl EnvSource, env_var: &str) -> Option<PathBuf> {
-    env.var(env_var)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    truthy_var(&SystemEnv, "OMNI_DEV_LOG_HEADERS")
 }
 
 /// The default location of an omni-dev runtime file: `state_dir` (falling
@@ -402,7 +387,8 @@ pub fn log_file_path() -> Option<PathBuf> {
 /// (STYLE-0028). `pub(crate)` rather than private: `cli::log`'s
 /// `LogCommand::resolve_path_with` needs it for its own env-injected test.
 pub(crate) fn log_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
-    env_path_override_with(env, "OMNI_DEV_LOG_FILE")
+    non_empty_var(env, "OMNI_DEV_LOG_FILE")
+        .map(PathBuf::from)
         .or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))
 }
 
@@ -435,7 +421,9 @@ pub fn audit_file_path() -> Option<PathBuf> {
 /// `pub(crate)` rather than private: `cli::log`'s `LogCommand::resolve_path_with`
 /// needs it for its own env-injected test.
 pub(crate) fn audit_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
-    env_path_override_with(env, "OMNI_DEV_AUDIT_LOG_FILE").or_else(default_audit_file_path)
+    non_empty_var(env, "OMNI_DEV_AUDIT_LOG_FILE")
+        .map(PathBuf::from)
+        .or_else(default_audit_file_path)
 }
 
 /// Collapses `.`/`..` components **syntactically**, with no filesystem
@@ -3568,23 +3556,6 @@ mod tests {
     fn empty_query_is_unchanged() {
         assert_eq!(redact_url("https://h/p?"), "https://h/p?");
         assert_eq!(redact_url("https://h/p?#f"), "https://h/p?#f");
-    }
-
-    #[test]
-    fn env_flag_parses_truthy_values() {
-        assert!(env_flag_with(
-            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "1"),
-            "OMNI_DEV_TEST_FLAG_ABC"
-        ));
-        assert!(env_flag_with(
-            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "TRUE"),
-            "OMNI_DEV_TEST_FLAG_ABC"
-        ));
-        assert!(!env_flag_with(
-            &MapEnv::new().with("OMNI_DEV_TEST_FLAG_ABC", "0"),
-            "OMNI_DEV_TEST_FLAG_ABC"
-        ));
-        assert!(!env_flag_with(&MapEnv::new(), "OMNI_DEV_TEST_FLAG_ABC"));
     }
 
     #[test]
