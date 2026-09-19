@@ -270,6 +270,7 @@ Commands:
   score   Rates the state against an ordered scale
   noul    Estimates the probability of a yes/no condition
   ask     Answers several questions about one state in a single pass, from a file
+  route   Routes issues to model classes for their design, implement and review stages
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -334,6 +335,29 @@ Options:
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev route - Routes issues to model classes for their design, implement and review stages
+
+Routes issues to model classes for their design, implement and review stages
+
+Usage: route [OPTIONS] [ISSUE]...
+
+Arguments:
+  [ISSUE]...  Issues to route: `#N` or `N` (in the current repository), `owner/repo#N`, or an issue URL
+
+Options:
+      --all-open                 Routes every open issue in the current repository
+      --tiers <FILE>             YAML file of model-class tiers, least capable first, replacing the defaults
+      --close-call <CONFIDENCE>  Confidence below which a stage is reported as a close call [default: 0.3]
+      --max-input-chars <CHARS>  Longest issue text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
+      --allow-closed             Routes closed issues instead of refusing them
+  -o, --output <OUTPUT>          Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>        Overrides the configured Jev model for this call
+  -C, --repo <PATH>              Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================

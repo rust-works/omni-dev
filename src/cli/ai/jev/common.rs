@@ -133,7 +133,7 @@ pub(super) fn format_multi(response: &SystemOneResponse, format: JevFormat) -> R
     format_output(&output, format)
 }
 
-fn format_output<T: Serialize>(value: &T, format: JevFormat) -> Result<String> {
+pub(super) fn format_output<T: Serialize>(value: &T, format: JevFormat) -> Result<String> {
     match format {
         JevFormat::Json => {
             let json = serde_json::to_string_pretty(value)

@@ -12,8 +12,10 @@
 //! - [`config`] — credential and base-URL resolution.
 //! - [`error`] — the [`error::JevError`] domain error type.
 //! - [`protocol`] — the request/response wire types.
+//! - [`route`] — stage routing of issues to model classes (`ai jev route`).
 
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod protocol;
+pub mod route;

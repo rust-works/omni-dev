@@ -355,6 +355,7 @@ mod tests {
                     "config scopes",
                     "worktrees rebase",
                     "worktrees push",
+                    "ai jev route",
                 ],
             ),
             (
@@ -416,6 +417,8 @@ mod tests {
             "omni-dev git --repo",
             "omni-dev coverage --repo",
             "omni-dev config scopes --repo",
+            // `RepoArg` is `global = true` even on this leaf (a no-op there).
+            "omni-dev ai jev route --repo",
             "omni-dev atlassian jira --instance",
             "omni-dev atlassian confluence --instance",
             "omni-dev atlassian auth status --instance",

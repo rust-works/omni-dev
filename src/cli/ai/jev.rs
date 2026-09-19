@@ -2,12 +2,15 @@
 //!
 //! Wraps [`crate::jev::client::JevClient`]'s single `system_one` call behind
 //! four subcommands: `choice`, `score`, `noul` (single-question) and `ask`
-//! (multi-question, from a file). See `docs/jev.md` for the operator guide.
+//! (multi-question, from a file), plus `route`, which asks the stage questions
+//! of [`crate::jev::route`] about GitHub issues. See `docs/jev.md` for the
+//! operator guide.
 
 mod ask;
 mod choice;
 mod common;
 mod noul;
+mod route;
 mod score;
 
 use anyhow::Result;
@@ -18,9 +21,10 @@ use clap::{Parser, Subcommand};
 #[command(
     long_about = "TypeSafe Jev typed judgments (choice, score, yes/no).\n\nJev is a \
 separate typed-judgment API, not a chat model, so jev subcommands do **not** accept \
-the AI backend flags (`--ai-backend`, `--model`, `--claude-cli-*`, ...) or `--repo` — \
-passing any of them is a clap error. An exported `OMNI_DEV_MODEL` is silently \
-ignored. Use `--jev-model` on each subcommand instead to override the Jev model."
+the AI backend flags (`--ai-backend`, `--model`, `--claude-cli-*`, ...) — passing any \
+of them is a clap error — and only `route` accepts `-C/--repo`. An exported \
+`OMNI_DEV_MODEL` is silently ignored. Use `--jev-model` on each subcommand instead to \
+override the Jev model."
 )]
 pub struct JevCommand {
     /// The jev subcommand to execute.
@@ -39,6 +43,8 @@ pub enum JevSubcommands {
     Noul(noul::NoulCommand),
     /// Answers several questions about one state in a single pass, from a file.
     Ask(ask::AskCommand),
+    /// Routes issues to model classes for their design, implement and review stages.
+    Route(route::RouteCommand),
 }
 
 impl JevCommand {
@@ -49,6 +55,7 @@ impl JevCommand {
             JevSubcommands::Score(cmd) => cmd.execute().await,
             JevSubcommands::Noul(cmd) => cmd.execute().await,
             JevSubcommands::Ask(cmd) => cmd.execute().await,
+            JevSubcommands::Route(cmd) => cmd.execute().await,
         }
     }
 }
