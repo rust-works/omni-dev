@@ -372,6 +372,11 @@ also held to the same minimums as the single-question subcommands: a `choice`
 with fewer than two options, or a `score` with fewer than two levels, fails
 with an error naming the question.
 
+These minimums are omni-dev's own rule, not the API's. The API accepts a
+one-option `choice` or a one-level `score`, but it can only answer either one
+with `confidence: 1.0`. Such a call costs money and tells you nothing, and it
+usually means the spec was mistyped.
+
 ## Ordering caveats
 
 Every map in the request and the response is kept **sorted by key**. This

@@ -82,9 +82,14 @@ pub const MIN_CHOICE_OPTIONS: usize = 2;
 pub const MIN_SCORE_LEVELS: usize = 2;
 
 impl Question {
-    /// Checks the constraints the API would otherwise reject with an opaque
-    /// `422`: a `choice` needs at least [`MIN_CHOICE_OPTIONS`] options and a
-    /// `score` at least [`MIN_SCORE_LEVELS`] levels. `noul` has none.
+    /// Rejects degenerate questions: a `choice` needs at least
+    /// [`MIN_CHOICE_OPTIONS`] options and a `score` at least
+    /// [`MIN_SCORE_LEVELS`] levels. `noul` has none.
+    ///
+    /// This is omni-dev policy, not an API constraint: the live API accepts a
+    /// one-option `choice` and a one-level `score` with `200`, but can only
+    /// ever answer them with `confidence: 1.0`, so the paid call carries no
+    /// information and almost always means a mistyped spec.
     ///
     /// Duplicate `choice` option names cannot be detected here — a
     /// [`BTreeMap`] has already collapsed them — so the `--option` parser
