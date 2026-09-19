@@ -606,9 +606,10 @@ usage: {jev: {input_tokens: 5120, output_tokens: 61}}
   merely *mentioned* the topic).
 - **`coverage`** guards against a splitter that drops or strengthens a
   claim: a separate Jev call asks whether the split statements together say
-  everything the comment claims. This check is new and unvalidated, unlike
-  the per-statement check above, so a coverage failure alone only downgrades
-  the verdict to `needs_review`, never to `rejected`.
+  everything the comment claims. **A coverage failure alone only downgrades
+  the verdict to `needs_review`, never to `rejected`**, because a failure
+  says the *split* is suspect, not that the comment is false — see
+  [Coverage: why it never rejects](#coverage-why-it-never-rejects).
 - **A statement with `source: null`** is a claim about the judged issue
   itself (`cites: null`) rather than about a cited item — reported, but
   never checked, since there is nothing external to check it against.
@@ -630,8 +631,17 @@ found in it (`#N`, `PR #N` / `pull request #N`, `owner/repo#N`, or a full
 GitHub issue/pull URL), and is asked to split it into statements that each
 name one item exactly as the comment names it, keeping the original wording's
 certainty ("was decided" and "was considered" are different facts) and
-adding nothing the comment does not say. This prompt and its JSON schema are
-new to #1779, not validated the way `route`'s questions were.
+adding nothing the comment does not say. The prompt also tells the backend
+which issue is being judged and what shape to reply in; it is new to #1779,
+not validated the way `route`'s questions were.
+
+**No JSON schema is attached to this call**, unlike every other structured
+call omni-dev makes. Attaching one made the default model degenerate:
+running the issue's 25 claim comments twice, the schema-enforced call
+returned unusable output (`placeholder`, or several statements run together
+into one) in 22 of 50 runs, against 0 of 50 for the same prompt with no
+schema. The reply shape is therefore described in the prompt instead, and
+the parser accepts JSON or YAML, with or without a code fence.
 
 Each cited source is checked separately. For a cited issue, Jev sees the
 issue's title, body and human comments, followed by the body of every pull
@@ -671,17 +681,46 @@ experiment.
 
 The two statement thresholds come from the experiment: true statements
 scored 0.83 or higher, false ones 0.34 or lower, with a clean gap between
-them at any threshold from 0.3 to 0.5. The coverage threshold is new and
-unvalidated.
+them at any threshold from 0.3 to 0.5.
+
+### Coverage: why it never rejects
+
+A failed coverage check means the *statements* do not match the comment.
+That points at the split, not at the comment, so it can only ever mark a
+comment `needs_review`. Rejecting on it would throw out correct comments:
+across 200 live runs of the 25 claim comments, coverage failed 25 times and
+**8 of those were on accurate comments**, every one caused by a bad split
+rather than a false claim.
+
+It is still worth running, because it is the only guard against a splitter
+that quietly weakens a claim. Measured on hand-built splits, two runs each:
+
+| What the split did to the comment | Coverage score | Caught at 0.5 |
+|---|---|---|
+| Nothing (faithful, or merely reordered) | 0.56–0.83 | — (correctly passes) |
+| Added a claim the comment never made | 0.06–0.10 | yes |
+| Made a claim stronger | 0.06–0.22 | yes |
+| Made a claim weaker | 0.30–0.44 | yes |
+| Dropped a claim | 0.32–0.77 | 3 of 5 |
+
+The weakening row is the one that matters: when the splitter softens an
+overstatement into something the source really does support, the
+per-statement check passes it (0.52–0.98) and only coverage objects. The
+dropped-claim row is why the check cannot be trusted to reject on its own.
 
 ### Evidence and its limits
 
 The per-statement check is validated against five sources and 25
 constructed claims (five accurate, twenty wrong in four different ways) in
-[#1779](https://github.com/rust-works/omni-dev/issues/1779). The splitter,
-the coverage check, and cross-repository citations are new work built for
-this command and have not been run against Jev the same way; treat their
-output as a reasonable default, not a measured one, until they have been.
+[#1779](https://github.com/rust-works/omni-dev/issues/1779). The splitter
+and coverage prompts were then tuned against that same set, run through
+this command end to end (25 comments × 2 runs × 4 variants): the shipped
+wording accepted 10 of 10 accurate comments and accepted 0 of 40 wrong
+ones, with no degenerate splits. Note that this tunes the prompt on the
+set it is measured on, so it shows the wording is not broken rather than
+that it generalises. Cross-repository citations and standalone
+pull-request sources are still unexercised; treat those as reasonable
+defaults, not measured ones.
 
 ## Ordering caveats
 

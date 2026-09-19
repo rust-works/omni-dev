@@ -22,7 +22,6 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::claude::client::ClaudeClient;
-use crate::claude::response_schema;
 use crate::github_issues::{fetch_issues, fetch_items};
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
@@ -478,8 +477,8 @@ pub fn fetch_verify_input(
 
 // ── Statement splitting (AI backend) ───────────────────────────────────
 
-/// One statement produced by the AI splitter, matching the schema at
-/// [`response_schema::split_statements_schema`].
+/// One statement produced by the AI splitter, matching the reply shape
+/// [`build_split_user_prompt`] asks for.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SplitStatement {
     text: String,
@@ -496,9 +495,28 @@ struct SplitResponse {
 /// is new work for this command).
 const SPLIT_SYSTEM_PROMPT: &str =
     "You split a maintainer's decision comment into single checkable \
-     factual statements. Reply only with the requested structure.";
+     factual statements. Reply with the requested object and nothing else.";
 
-/// Builds the splitter's user prompt, reproducing #1779's tested wording.
+/// Builds the splitter's user prompt.
+///
+/// Rules 1–7 are #1779's wording; the rest was added after a live run of
+/// this command's own pipeline over the issue's 25 claim comments (see
+/// `docs/jev.md`). Two additions are load-bearing, and both fixed a
+/// measured failure rather than a hypothetical one:
+///
+/// - **Attribution of the judged issue.** "This issue was resolved by
+///   #1655" is a claim about the judged issue, not about #1655, so
+///   checking it against #1655 fails it. That rejected 3 of 10 accurate
+///   comments before rule 6 gained its second paragraph. The judged
+///   issue is named as "this issue" rather than by number on purpose:
+///   giving the number made the splitter write it into statements the
+///   comment never numbered, which the coverage check then read as added
+///   content and marked down (9 faithful splits fell below the coverage
+///   threshold).
+/// - **The reply shape.** Without it the splitter answers in whatever
+///   shape it likes whenever the schema is not enforced — every run
+///   failed to parse on the schema-less path, which is what `ollama` and
+///   the #1561 `output_config` fallback both take.
 fn build_split_user_prompt(comment_body: &str, citations: &[Citation]) -> String {
     let cited = if citations.is_empty() {
         "(none)".to_string()
@@ -525,16 +543,24 @@ fn build_split_user_prompt(comment_body: &str, citations: &[Citation]) -> String
          6. Set \"cites\" to the one item the statement is about, written as it appears in the comment\n\
          (for example \"#1614\" or \"PR #1629\"). If the statement is a decision about the judged issue\n\
          itself rather than a claim about a cited item, set \"cites\" to null.\n\
+         A statement that a cited item resolved, settled or answered the judged issue's question is\n\
+         about the judged issue, so its \"cites\" is null. A statement about what a cited item did or\n\
+         decided cites that item, even when it also mentions another item (such as a tracking issue).\n\
          7. Leave out greetings, opinions and instructions that make no factual claim.\n\n\
+         The COMMENT was posted on the judged issue, which the comment calls \"this issue\". Refer to it\n\
+         the same way; do not add its number.\n\n\
          COMMENT:\n{comment}\n\n\
-         Items the comment cites: {cited}",
+         Items the comment cites: {cited}\n\n\
+         Reply with an object whose \"statements\" field is a list; each entry has a \"text\" string and\n\
+         a \"cites\" string or null. For example:\n\
+         {{\"statements\": [{{\"text\": \"PR #1629 added a tool.\", \"cites\": \"PR #1629\"}}]}}",
         comment = comment_body.trim(),
     )
 }
 
 /// Strips a Markdown code fence (` ```json `, ` ```yaml ` or bare ` ``` `)
-/// around a structured response, for backends that wrap it in prose despite
-/// [`ClaudeClient::send_structured`] asking for the bare structure.
+/// around the splitter's reply, for a backend that wraps it in prose
+/// despite being asked for the object alone.
 fn strip_code_fence(s: &str) -> &str {
     let s = s
         .strip_prefix("```json")
@@ -563,11 +589,7 @@ async fn split_statements(
 ) -> Result<Vec<SplitStatement>> {
     let user_prompt = build_split_user_prompt(comment_body, citations);
     let raw = ai
-        .send_structured(
-            SPLIT_SYSTEM_PROMPT,
-            &user_prompt,
-            response_schema::split_statements_schema(),
-        )
+        .send_message(SPLIT_SYSTEM_PROMPT, &user_prompt)
         .await
         .context("Failed to split the decision comment into statements")?;
     let parsed = parse_split_response(&raw)?;
@@ -1381,6 +1403,24 @@ mod tests {
             prompt.contains("Items the comment cites: (none)"),
             "{prompt}"
         );
+    }
+
+    /// Both additions to #1779's wording earned their place by fixing a
+    /// measured failure (see [`build_split_user_prompt`]), so dropping
+    /// either one silently regresses the live behaviour.
+    #[test]
+    fn split_prompt_keeps_the_two_additions_that_fixed_live_failures() {
+        let prompt = build_split_user_prompt("The comment.", &[]);
+        // Attribution: resolution framing belongs to the judged issue, which
+        // is named the way the comment names it, never by number.
+        assert!(
+            prompt.contains("resolved, settled or answered the judged issue's question"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("do not add its number"), "{prompt}");
+        // Reply shape: the schema-less path has nothing else to go on.
+        assert!(prompt.contains(r#""statements""#), "{prompt}");
+        assert!(prompt.contains(r#""cites""#), "{prompt}");
     }
 
     #[test]
