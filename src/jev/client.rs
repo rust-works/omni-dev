@@ -67,9 +67,9 @@ impl JevClient {
     ///
     /// Retries on `429` (rate limited) and `529` (overloaded); any other
     /// non-2xx status becomes [`JevError::ApiRequestFailed`]. A `2xx` body
-    /// that fails to parse (most likely an unrecognised `answers[*].type`
-    /// from a newer Jev API version) surfaces a context message suggesting
-    /// an omni-dev upgrade.
+    /// that fails to parse names each answer it could not read and that
+    /// answer's `type`, since the likeliest cause is a primitive added by a
+    /// newer Jev API version.
     pub async fn system_one(&self, req: &SystemOneRequest) -> Result<SystemOneResponse> {
         let url = format!("{}/v1/systemone", self.base_url);
         let response = retry_if(
@@ -97,9 +97,52 @@ impl JevClient {
             return Err(JevError::ApiRequestFailed { status, body }.into());
         }
 
-        response.json().await.context(
-            "Failed to parse Jev API response; this may mean the API returned an answer type \
-             this version of omni-dev does not recognise yet — try upgrading omni-dev",
+        let body = response
+            .bytes()
+            .await
+            .context("Failed to read Jev API response")?;
+        serde_json::from_slice(&body).map_err(|err| parse_error(&body, err))
+    }
+}
+
+/// Builds the error for a `2xx` body that failed to parse.
+///
+/// A typed-response failure alone doesn't say *which* answer broke, so this
+/// re-reads the body loosely and names each answer that doesn't fit
+/// [`Answer`](crate::jev::protocol::Answer), with its `type`. Trying each
+/// answer against the enum itself, rather than a list of known type names,
+/// keeps this from drifting when a variant is added.
+fn parse_error(body: &[u8], err: serde_json::Error) -> anyhow::Error {
+    let bad_answers: Vec<String> = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("answers"))
+        .and_then(serde_json::Value::as_object)
+        .map(|answers| {
+            answers
+                .iter()
+                .filter_map(|(name, answer)| {
+                    serde_json::from_value::<crate::jev::protocol::Answer>(answer.clone())
+                        .err()
+                        .map(|e| {
+                            let ty = answer
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("<missing>");
+                            format!("{name:?} (type {ty:?}: {e})")
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if bad_answers.is_empty() {
+        anyhow::Error::new(err).context("Failed to parse Jev API response")
+    } else {
+        anyhow::anyhow!(
+            "Jev API returned answers this version of omni-dev cannot read: {}; \
+             if the type is new, try upgrading omni-dev",
+            bad_answers.join(", ")
         )
     }
 }
@@ -148,6 +191,48 @@ mod tests {
         };
         let client = JevClient::from_config(&config).unwrap();
         assert_eq!(client.base_url(), "https://api.typesafe.ai");
+    }
+
+    async fn system_one_with_200_body(body: serde_json::Value) -> anyhow::Error {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "my-key").unwrap();
+        client.system_one(&sample_request()).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn unknown_answer_type_is_named_in_the_error() {
+        let err = system_one_with_200_body(serde_json::json!({
+            "model": "jev-2.0.0",
+            "answers": {
+                "refund": {"type": "noul", "noul": 0.5},
+                "sentiment": {"type": "range", "low": 0.1, "high": 0.4}
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .await;
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "\"sentiment\" (type \"range\": unknown variant `range`, \
+                 expected one of `choice`, `score`, `noul`)"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("\"refund\""), "{msg}");
+        assert!(msg.contains("try upgrading omni-dev"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn malformed_body_without_bad_answers_keeps_the_parse_reason() {
+        let err = system_one_with_200_body(serde_json::json!({"unexpected": true})).await;
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("Failed to parse Jev API response"), "{msg}");
+        assert!(msg.contains("missing field"), "{msg}");
+        assert!(!msg.contains("upgrading"), "{msg}");
     }
 
     #[tokio::test]

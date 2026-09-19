@@ -490,13 +490,18 @@ single-question calls: it is one request instead of many.
 ### Unrecognised answer
 
 ```
-Error: Failed to parse Jev API response; this may mean the API returned an answer type this version of omni-dev does not recognise yet — try upgrading omni-dev
+Error: Jev API returned answers this version of omni-dev cannot read: "sentiment" (type "range": unknown variant `range`, expected one of `choice`, `score`, `noul`); if the type is new, try upgrading omni-dev
 ```
 
-The API returned an answer `type` other than `choice`, `score` or `noul`.
+The error names every answer omni-dev could not read, together with its
+`type`. The usual cause is a `type` other than `choice`, `score` or `noul`.
 omni-dev is deliberately strict here rather than guessing at an unknown shape.
 A new *field* on a known answer type, by contrast, is ignored without error.
-Upgrade omni-dev.
+If the named type is new, upgrade omni-dev.
+
+When no individual answer is at fault (for example the body is missing
+`answers`), the error is `Failed to parse Jev API response` followed by the
+parser's reason instead.
 
 ### `--model` seems to have no effect
 
