@@ -724,6 +724,7 @@ fn mint(
         acquired_at: now,
         expires_at,
         released_at: None,
+        superseded_by: None,
         restored_at: None,
         restored_sheet_id: None,
     };
@@ -1097,6 +1098,7 @@ fn insert_record(
     lock_wait: Duration,
 ) -> anyhow::Result<InsertOutcome> {
     let lock = LedgerLock::acquire_waiting_blocking_with_timeout(ledger_path, lock_wait)?;
+    let new_token = record.token.clone();
     LeaseLedger::mutate(&lock, ledger_path, |ledger| {
         let now = Utc::now();
         // Order is load-bearing: check, then release, then insert.
@@ -1110,12 +1112,18 @@ fn insert_record(
         // Scoped to a row already covering this same file, so naming another
         // file's token can never release it — the exclusion above is
         // likewise `file_id`-filtered, so the two agree on what "supersede"
-        // can reach.
+        // can reach. `new_token` is stamped as `superseded_by` on the
+        // released row (issue #1768) — the durable marker `prune`'s
+        // `--max-size` filter uses to tell this deliberate supersede apart
+        // from a plain `drive lease release`.
         let superseded = supersedes.is_some_and(|token| {
             ledger
                 .get(token)
                 .is_some_and(|r| r.file_id == record.file_id)
-                && matches!(ledger.release(token, now), ReleaseOutcome::Released { .. })
+                && matches!(
+                    ledger.release(token, now, Some(new_token.as_str())),
+                    ReleaseOutcome::Released { .. }
+                )
         });
         ledger.insert(record);
         InsertOutcome::Inserted { superseded }
@@ -2992,6 +3000,7 @@ mod tests {
                     acquired_at: Utc::now(),
                     expires_at: Utc::now() + ChronoDuration::minutes(30),
                     released_at: None,
+                    superseded_by: None,
                     restored_at: None,
                     restored_sheet_id: None,
                 });
@@ -3270,6 +3279,7 @@ mod tests {
             acquired_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         }
@@ -3308,6 +3318,12 @@ mod tests {
             "the superseded row must be released"
         );
         assert_eq!(
+            ledger.get("old").unwrap().superseded_by.as_deref(),
+            Some("new"),
+            "the superseded row must durably record which lease replaced it \
+             (issue #1768), not just that it was released"
+        );
+        assert_eq!(
             ledger
                 .live_lease_for_file("f1", Utc::now(), None)
                 .map(|r| r.token.clone()),
@@ -3339,6 +3355,7 @@ mod tests {
             ledger.get("elsewhere").unwrap().released_at.is_none(),
             "naming another file's token must never release it"
         );
+        assert_eq!(ledger.get("elsewhere").unwrap().superseded_by, None);
     }
 
     /// `mutate_locked` saves whatever the closure leaves behind, refusal or

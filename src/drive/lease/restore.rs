@@ -3253,6 +3253,7 @@ mod tests {
             acquired_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });

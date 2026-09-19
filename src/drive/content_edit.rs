@@ -1041,6 +1041,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
