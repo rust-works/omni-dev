@@ -1,10 +1,9 @@
 //! Jev "System One" REST API client.
 //!
 //! Thin `reqwest` wrapper around the single `POST /v1/systemone` endpoint.
-//! Retries `429`/`529` responses via the shared
-//! [`retry_if`](crate::utils::http::retry_if) driver (honouring
-//! `Retry-After` / `X-RateLimit-Reset`) — `529` is Jev's own "Overloaded"
-//! status, so the literal-429 [`retry_429`](crate::utils::http::retry_429)
+//! Retries `429`/`529` responses via the shared `utils::http::retry_if`
+//! driver (honouring `Retry-After` / `X-RateLimit-Reset`) — `529` is Jev's
+//! own "Overloaded" status, so the literal-429 `utils::http::retry_429`
 //! driver would not retry it.
 
 use anyhow::{Context, Result};
@@ -34,7 +33,7 @@ impl JevClient {
     /// wiremock URL directly.
     ///
     /// Uses the shared REST-client connect/read timeout split
-    /// ([`connect_timeout`], [`read_timeout`]) rather than the AI backends'
+    /// (`connect_timeout`, `read_timeout`) rather than the AI backends'
     /// much longer `OMNI_DEV_AI_TIMEOUT_SECS` budget — Jev is a low-latency
     /// model, not a chat completion.
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
@@ -64,6 +63,8 @@ impl JevClient {
 
     /// Sends a `POST /v1/systemone` request and returns the parsed response.
     ///
+    /// `.json(req)` sets `Content-Type: application/json` itself.
+    ///
     /// Retries on `429` (rate limited) and `529` (overloaded); any other
     /// non-2xx status becomes [`JevError::ApiRequestFailed`]. A `2xx` body
     /// that fails to parse (most likely an unrecognised `answers[*].type`
@@ -79,7 +80,6 @@ impl JevClient {
                         "Authorization",
                         format!("Bearer {}", self.api_key.expose_secret()),
                     )
-                    .header("Content-Type", "application/json")
                     .json(req)
             },
             |started, result| {

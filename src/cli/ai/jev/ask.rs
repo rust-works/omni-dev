@@ -58,7 +58,7 @@ impl AskCommand {
             self.output,
         )
         .await?;
-        println!("{output}");
+        print!("{output}");
         Ok(())
     }
 }
@@ -66,7 +66,10 @@ impl AskCommand {
 /// Reads a `--questions` file through a **single** `serde_yaml` parse path.
 ///
 /// `serde_yaml` accepts JSON (YAML is a superset), so this covers both JSON
-/// and YAML question files without branching on file extension.
+/// and YAML question files without branching on file extension. Each spec
+/// is then checked with [`Question::validate`] — the same minimums the
+/// single-question subcommands enforce — so a malformed file fails locally,
+/// naming the offending question, rather than as an opaque `422`.
 fn read_questions(path: &Path) -> Result<BTreeMap<String, Question>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read questions file {}", path.display()))?;
@@ -74,6 +77,11 @@ fn read_questions(path: &Path) -> Result<BTreeMap<String, Question>> {
         .with_context(|| format!("Failed to parse questions file {}", path.display()))?;
     if questions.is_empty() {
         bail!("questions file {} defines no questions", path.display());
+    }
+    for (name, question) in &questions {
+        question
+            .validate()
+            .with_context(|| format!("question {name:?} in {}", path.display()))?;
     }
     Ok(questions)
 }
@@ -119,7 +127,7 @@ mod tests {
     #[test]
     fn read_questions_parses_yaml_file() {
         let file = write_temp(
-            "department:\n  type: choice\n  instructions: Route this\n  criteria:\n    billing: Payments\n",
+            "department:\n  type: choice\n  instructions: Route this\n  criteria:\n    billing: Payments\n    technical: Bugs\n",
         );
         let questions = read_questions(file.path()).unwrap();
         assert_eq!(questions.len(), 1);
@@ -139,6 +147,27 @@ mod tests {
         let file = write_temp("{}\n");
         let err = read_questions(file.path()).unwrap_err();
         assert!(err.to_string().contains("defines no questions"));
+    }
+
+    #[test]
+    fn read_questions_rejects_a_choice_with_one_option() {
+        let file = write_temp(
+            "department:\n  type: choice\n  instructions: Route this\n  criteria:\n    billing: Payments\n",
+        );
+        let err = read_questions(file.path()).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("question \"department\""), "{chain}");
+        assert!(chain.contains("at least 2 options, got 1"), "{chain}");
+    }
+
+    #[test]
+    fn read_questions_rejects_a_score_with_one_level() {
+        let file =
+            write_temp("urgency:\n  type: score\n  instructions: How urgent\n  criteria: [Low]\n");
+        let err = read_questions(file.path()).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("question \"urgency\""), "{chain}");
+        assert!(chain.contains("at least 2 levels, got 1"), "{chain}");
     }
 
     #[test]
