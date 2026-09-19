@@ -530,7 +530,10 @@ async fn take_pinned_backup(
         if !retry {
             return Err(Box::new((
                 AcquireResult::RefusedConcurrentChange {
-                    detail: failure.detail(attempt),
+                    detail: failure.detail(
+                        attempt,
+                        matches!(disposition, BackupDisposition::Reclaimed(_)),
+                    ),
                 },
                 Some(disposition),
             )));
@@ -757,39 +760,58 @@ impl PinFailure {
 
     /// The operator-facing detail for
     /// [`AcquireResult::RefusedConcurrentChange`], after `attempts`
-    /// backups. A version that moved on every one of several attempts gets
-    /// its own wording: "wait until the file is quiet" is the wrong advice
-    /// if the version moves for a reason no quiet period will cure.
-    fn detail(&self, attempts: u32) -> String {
-        match self {
+    /// backups, the last of which was `discarded` (reclaimed) or not.
+    ///
+    /// A version that moved on every one of the full [`SANDWICH_ATTEMPTS`]
+    /// gets its own wording: "wait until the file is quiet" is the wrong
+    /// advice if the version moves for a reason no quiet period will cure.
+    /// A last backup that could not be discarded is said so, never claimed
+    /// discarded — it is an orphan `drive lease prune` cannot see, and
+    /// retrying stopped early because of it (see [`take_pinned_backup`]).
+    fn detail(&self, attempts: u32, discarded: bool) -> String {
+        let what = match self {
             Self::ChecksumMismatch {
                 remote,
                 post_version,
                 local,
             } => format!(
                 "the file changed while its backup was being taken: Drive reports checksum \
-                 {remote} at version {post_version}, but the bytes backed up hash to {local}. \
-                 No lease was minted and the backup was discarded — retry."
+                 {remote} at version {post_version}, but the bytes backed up hash to {local}."
             ),
-            Self::VersionMoved { pre, post } if attempts > 1 => format!(
+            Self::VersionMoved { pre, post } if attempts > 1 && discarded => format!(
                 "the file's version changed across its backup on each of {attempts} attempts \
                  (last: version {pre} immediately before, {post} immediately after). A version \
                  that keeps moving may be changing for reasons unrelated to edits, so waiting \
-                 for the file to be quiet may not help. No lease was minted and the backups \
-                 were discarded."
+                 for the file to be quiet may not help."
+            ),
+            Self::VersionMoved { pre, post } if attempts > 1 => format!(
+                "the file's version changed across its backup on each of {attempts} attempts \
+                 (last: version {pre} immediately before, {post} immediately after)."
             ),
             Self::VersionMoved { pre, post } => format!(
                 "the file changed while its backup was being taken: version {pre} immediately \
-                 before, {post} immediately after. No lease was minted and the backup was \
-                 discarded — retry."
+                 before, {post} immediately after."
             ),
             Self::NoProof { post_version } => format!(
                 "no proof available that the backup matches version {post_version}: Drive \
                  reported no checksum for the file after the backup and no pre-backup version \
-                 was taken to fall back on. No lease was minted and the backup was discarded — \
-                 retry."
+                 was taken to fall back on."
             ),
-        }
+        };
+        let outcome = match (discarded, attempts > 1) {
+            (true, false) => "No lease was minted and the backup was discarded — retry.",
+            (true, true) => "No lease was minted and the backups were discarded.",
+            (false, false) => {
+                "No lease was minted, but the backup could not be discarded — its location is \
+                 in the audit log (`omni-dev log --audit`); remove it by hand, then retry."
+            }
+            (false, true) => {
+                "No lease was minted. Retrying stopped early because the last backup could not \
+                 be discarded — its location is in the audit log (`omni-dev log --audit`); \
+                 remove it by hand. Every earlier backup was discarded."
+            }
+        };
+        format!("{what} {outcome}")
     }
 }
 
@@ -2259,6 +2281,82 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reclaim_failing_mid_retry_stops_early_and_never_claims_the_backup_discarded() {
+        // `version` moves on every read; the first copy is trashed, but
+        // trashing the second fails. Retrying stops there — the copy
+        // mock's `.expect(2)` — and the refusal says the last backup could
+        // not be discarded rather than claiming all were, and does not
+        // claim the full retry budget was spent.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::query_param_is_missing("alt"))
+            .respond_with(EverMovingVersion {
+                base: serde_json::json!({
+                    "id": "f1", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.spreadsheet"
+                }),
+                next: std::sync::atomic::AtomicU64::new(7),
+            })
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1/copy"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "copy-1", "name": "backup", "mimeType": "application/vnd.google-apps.spreadsheet"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "copy-1", "name": "backup", "trashed": true,
+                })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/copy-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let root = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(root.path());
+        let mut test_opts = opts(root.path());
+        test_opts.native_backup_folder_id = Some("backup-folder".to_string());
+
+        let result = acquire_with_timings(
+            &client,
+            &test_opts,
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            FAST_TIMINGS,
+        )
+        .await;
+
+        let AcquireResult::RefusedConcurrentChange { detail } = result else {
+            panic!("expected RefusedConcurrentChange, got {result:?}");
+        };
+        assert!(detail.contains("on each of 2 attempts"), "{detail}");
+        assert!(detail.contains("stopped early"), "{detail}");
+        assert!(
+            !detail.contains("minted and the backups were discarded"),
+            "{detail}"
+        );
+        let contents = std::fs::read_to_string(root.path().join("audit.jsonl")).unwrap();
+        let rec: crate::request_log::LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("refused-concurrent-change-backup-orphaned")
+        );
+    }
+
     #[test]
     fn backup_is_pinned_refuses_when_neither_proof_is_available() {
         // A byte backup whose target reported a digest before the backup
@@ -2272,7 +2370,7 @@ mod tests {
         let err = backup_is_pinned(&backup, None, "7", None).unwrap_err();
         assert!(matches!(err, PinFailure::NoProof { .. }), "{err:?}");
         assert!(!err.is_retryable());
-        let detail = err.detail(1);
+        let detail = err.detail(1, true);
         assert!(detail.contains("no proof available"), "{detail}");
     }
 
@@ -2283,12 +2381,37 @@ mod tests {
             post: "8".to_string(),
         };
         assert!(moved.is_retryable());
-        let once = moved.detail(1);
+        let once = moved.detail(1, true);
         assert!(once.contains("version 7 immediately before"), "{once}");
-        assert!(once.ends_with("retry."), "{once}");
-        let exhausted = moved.detail(SANDWICH_ATTEMPTS);
+        assert!(once.ends_with("backup was discarded — retry."), "{once}");
+        let exhausted = moved.detail(SANDWICH_ATTEMPTS, true);
         assert!(exhausted.contains("on each of 3 attempts"), "{exhausted}");
+        assert!(exhausted.contains("unrelated to edits"), "{exhausted}");
         assert!(!exhausted.contains("retry."), "{exhausted}");
+
+        // A last backup that could not be reclaimed is never claimed
+        // discarded, and an early stop does not claim the version kept
+        // moving through the full retry budget.
+        let orphaned_once = moved.detail(1, false);
+        assert!(!orphaned_once.contains("was discarded"), "{orphaned_once}");
+        assert!(
+            orphaned_once.contains("could not be discarded"),
+            "{orphaned_once}"
+        );
+        let stopped_early = moved.detail(2, false);
+        assert!(
+            stopped_early.contains("on each of 2 attempts"),
+            "{stopped_early}"
+        );
+        assert!(stopped_early.contains("stopped early"), "{stopped_early}");
+        assert!(
+            !stopped_early.contains("minted and the backups were discarded"),
+            "{stopped_early}"
+        );
+        assert!(
+            !stopped_early.contains("unrelated to edits"),
+            "{stopped_early}"
+        );
 
         let mismatch = PinFailure::ChecksumMismatch {
             remote: "aa".to_string(),
