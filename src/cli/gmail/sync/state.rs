@@ -25,6 +25,14 @@ pub(crate) struct ArchiveState {
     /// incremental-sync scope limitation this does not solve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) query: Option<String>,
+    /// Message ids whose fetch failed on the run that wrote this state, to be
+    /// retried by the next incremental run (#1784). Carrying them here is what
+    /// lets `history_id` advance on every run: the failed ids no longer need
+    /// to be rediscovered by replaying a history window that would otherwise
+    /// age out of Gmail's ~1-week retention. Still disposable — losing this
+    /// file falls back to a full listing, which re-discovers them anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_fetch: Vec<String>,
 }
 
 /// The result of attempting to load `state.json`.
@@ -98,6 +106,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             query: None,
+            pending_fetch: Vec::new(),
         }
     }
 
@@ -148,6 +157,46 @@ mod tests {
             }
             _ => panic!("expected Present"),
         }
+    }
+
+    #[test]
+    fn load_present_with_pending_fetch_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = ArchiveState {
+            pending_fetch: vec!["m1".to_string(), "m2".to_string()],
+            ..sample_state()
+        };
+        save(&state, &path).unwrap();
+        match load(&path) {
+            LoadOutcome::Present(loaded) => assert_eq!(loaded.pending_fetch, ["m1", "m2"]),
+            _ => panic!("expected Present"),
+        }
+    }
+
+    #[test]
+    fn load_defaults_pending_fetch_for_a_state_written_before_it_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"history_id":"1000","email_address":"user@example.com","last_sync":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        match load(&path) {
+            LoadOutcome::Present(loaded) => assert!(loaded.pending_fetch.is_empty()),
+            _ => panic!("expected Present"),
+        }
+    }
+
+    #[test]
+    fn save_omits_an_empty_pending_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        save(&sample_state(), &path).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("pending_fetch"));
     }
 
     // ── validate_identity ──────────────────────────────────────────────

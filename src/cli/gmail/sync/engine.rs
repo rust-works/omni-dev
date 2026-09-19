@@ -141,7 +141,7 @@ pub(crate) async fn run_sync_with_progress(
             match run_incremental(
                 client,
                 &mut manifest,
-                &state.history_id,
+                &state,
                 opts,
                 &limiter,
                 &mut report,
@@ -219,23 +219,30 @@ pub(crate) async fn run_sync_with_progress(
         // deltas, soft-deletes) are independently safe to keep even when
         // this run also hit errors elsewhere.
         manifest.save(&manifest_path(&opts.output_dir))?;
-        // The watermark, in contrast, only advances on a clean run — an
-        // advanced watermark past a failed fetch would scroll that history
-        // event out of Gmail's retention window forever. Withholding it
-        // means the next run re-examines the same range for free (already
-        //-fetched messages/labels are skipped via presence-on-disk /
-        // idempotent mutation).
-        if report.errors.is_empty() {
-            state::save(
-                &ArchiveState {
-                    history_id,
-                    email_address: profile.email_address,
-                    last_sync: Utc::now(),
-                    query: opts.query.clone(),
-                },
-                &state_path(&opts.output_dir),
-            )?;
-        }
+        // The watermark advances even when this run hit errors: the failed
+        // ids are carried forward in `pending_fetch` for the next incremental
+        // run to retry directly, so no history event needs to stay within
+        // Gmail's ~1-week retention window for them to be found again. That
+        // window used to be the only way back to a failed id, which meant a
+        // chronically rate-limited account could never advance its watermark
+        // and was pushed into a full-mailbox reconciliation (#1784).
+        let mut pending_seen = HashSet::new();
+        let pending_fetch = report
+            .errors
+            .iter()
+            .filter(|e| pending_seen.insert(e.id.as_str()))
+            .map(|e| e.id.clone())
+            .collect();
+        state::save(
+            &ArchiveState {
+                history_id,
+                email_address: profile.email_address,
+                last_sync: Utc::now(),
+                query: opts.query.clone(),
+                pending_fetch,
+            },
+            &state_path(&opts.output_dir),
+        )?;
     }
     Ok(report)
 }
@@ -449,7 +456,7 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<Strin
 }
 
 /// Applies `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
-/// history events since `start_history_id`. A 404 (watermark past Gmail's
+/// history events since `previous.history_id`. A 404 (watermark past Gmail's
 /// retention window) propagates unchanged for [`run_sync`] to catch.
 ///
 /// A message can be added and deleted again within the same history
@@ -490,17 +497,26 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<Strin
 /// the next `--full`/reconciliation pass re-lists and fetches it fresh,
 /// the same "self-healing on the next full pass" framing this module
 /// already uses for a listing race (see [`run_full_sync`]'s doc comment).
+///
+/// `previous.pending_fetch` is the previous run's failed-fetch ids (#1784),
+/// retried here alongside this window's `messagesAdded` ids through the
+/// same presence-checked fetch: one that is
+/// already archived is skipped, one that 404s is [`SyncAction::Vanished`],
+/// and one deleted in this window is not fetched at all. Its exclusion state
+/// is decided from the labels the fetch itself returns, since the
+/// `messagesAdded` event that carried its labels was consumed by an earlier
+/// run.
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
-    start_history_id: &str,
+    previous: &ArchiveState,
     opts: &SyncOptions,
     limiter: &TokenBucket,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<String> {
     let history = HistoryApi::new(client)
-        .list_all_unbounded(start_history_id, &[], limiter)
+        .list_all_unbounded(&previous.history_id, &[], limiter)
         .await?;
 
     let deleted_ids: HashSet<String> = history
@@ -512,6 +528,21 @@ async fn run_incremental(
 
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
+    let mut pending_retried = Vec::new();
+    for id in &previous.pending_fetch {
+        if !deleted_ids.contains(id) && seen.insert(id.clone()) {
+            to_fetch.push(id.clone());
+            pending_retried.push(id.clone());
+        }
+    }
+    if !pending_retried.is_empty() {
+        report.actions.push(SyncAction::Note {
+            message: format!(
+                "retrying {} message(s) that failed on a previous run",
+                pending_retried.len()
+            ),
+        });
+    }
     // Every id touched by a labelsAdded/labelsRemoved event this window,
     // in first-seen order — reconciled against `--exclude-label` only
     // *after* the fetch phase (see this function's doc comment).
@@ -572,13 +603,17 @@ async fn run_incremental(
     fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report, progress)
         .await?;
 
-    for id in &labels_touched {
+    for id in labels_touched.iter().chain(
+        pending_retried
+            .iter()
+            .filter(|id| !labels_touched_seen.contains(*id)),
+    ) {
         reconcile_label_exclusion(manifest, report, id, &opts.exclude_labels);
     }
 
     Ok(history
         .history_id
-        .unwrap_or_else(|| start_history_id.to_string()))
+        .unwrap_or_else(|| previous.history_id.clone()))
 }
 
 /// Recomputes and applies `--exclude-label` state for `id` from its
@@ -1409,6 +1444,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1458,6 +1494,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1559,6 +1596,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1622,6 +1660,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1714,6 +1753,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1794,6 +1834,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1847,6 +1888,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -1924,6 +1966,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2435,6 +2478,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2517,6 +2561,7 @@ not-really-a-pdf\r\n\
                 email_address: "wrong@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2680,15 +2725,23 @@ not-really-a-pdf\r\n\
             .iter()
             .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
 
-        // The watermark must not advance past a run with outstanding errors.
-        assert!(!state_path(&output_dir).exists());
-        // But the successfully-fetched message's manifest entry survives.
+        // A backfill with an error still records its watermark, carrying
+        // the failed id forward, so the next run is incremental rather than
+        // another full-mailbox listing (#1784).
+        match state::load(&state_path(&output_dir)) {
+            LoadOutcome::Present(s) => {
+                assert_eq!(s.history_id, "999");
+                assert_eq!(s.pending_fetch, ["m2"]);
+            }
+            _ => panic!("expected state.json to be written"),
+        }
+        // And the successfully-fetched message's manifest entry survives.
         let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
         assert!(manifest.get("m1").is_some());
     }
 
     #[tokio::test]
-    async fn run_sync_leaves_the_watermark_untouched_after_an_incremental_failure() {
+    async fn run_sync_advances_the_watermark_and_carries_an_incremental_failure_forward() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let dir = tempfile::tempdir().unwrap();
@@ -2700,6 +2753,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2725,9 +2779,10 @@ not-really-a-pdf\r\n\
 
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {
-                assert_eq!(s.history_id, "100", "watermark must not advance");
+                assert_eq!(s.history_id, "200", "watermark must advance");
+                assert_eq!(s.pending_fetch, ["m1"], "the failure is carried forward");
             }
-            _ => panic!("expected the pre-existing state to survive"),
+            _ => panic!("expected state.json to be written"),
         }
     }
 
@@ -2739,8 +2794,8 @@ not-really-a-pdf\r\n\
         // the server before its own messages.get call runs — real once you
         // add concurrency to the fetch fan-out. Unlike an ordinary
         // per-message failure, this can never succeed on retry, so it must
-        // not withhold the watermark (unlike
-        // `run_sync_leaves_the_watermark_untouched_after_an_incremental_failure`
+        // not be carried forward in `pending_fetch` (unlike
+        // `run_sync_advances_the_watermark_and_carries_an_incremental_failure_forward`
         // above, whose 500 genuinely is worth retrying).
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -2753,6 +2808,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2809,7 +2865,7 @@ not-really-a-pdf\r\n\
         // The reason check must not fail open the way `is_history_not_found`
         // deliberately does for `history.list` — a 404 on messages.get for
         // any reason other than `notFound` is a real failure and must still
-        // withhold the watermark.
+        // be carried forward for retry.
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let dir = tempfile::tempdir().unwrap();
@@ -2821,6 +2877,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
@@ -2861,10 +2918,279 @@ not-really-a-pdf\r\n\
 
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {
-                assert_eq!(s.history_id, "100", "watermark must not advance");
+                assert_eq!(s.history_id, "300", "watermark must advance");
+                assert_eq!(
+                    s.pending_fetch,
+                    ["m1"],
+                    "a non-notFound 404 is retried next run"
+                );
             }
-            _ => panic!("expected the pre-existing state to survive"),
+            _ => panic!("expected state.json to be written"),
         }
+    }
+
+    // ── pending_fetch carry-forward (#1784) ─────────────────────────────
+
+    fn save_state_with_pending(output_dir: &Path, pending: &[&str]) {
+        std::fs::create_dir_all(output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+                pending_fetch: pending.iter().map(|id| (*id).to_string()).collect(),
+            },
+            &state_path(output_dir),
+        )
+        .unwrap();
+    }
+
+    async fn mount_history(server: &wiremock::MockServer, body: serde_json::Value) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_get_never_called(server: &wiremock::MockServer, id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/gmail/v1/users/me/messages/{id}"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    fn load_present(output_dir: &Path) -> ArchiveState {
+        match state::load(&state_path(output_dir)) {
+            LoadOutcome::Present(s) => s,
+            _ => panic!("expected state.json to be written"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sync_retries_a_pending_fetch_even_with_an_empty_history_window() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_raw_get(&server, "m1", "Retried").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
+        assert!(report.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Note { message } if message.contains("retrying 1 message")
+        )));
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(manifest.get("m1").is_some());
+        let s = load_present(&output_dir);
+        assert_eq!(s.history_id, "200");
+        assert!(s.pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_keeps_a_pending_fetch_that_fails_again_and_still_advances() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        let s = load_present(&output_dir);
+        assert_eq!(s.history_id, "200");
+        assert_eq!(s.pending_fetch, ["m1"]);
+    }
+
+    #[tokio::test]
+    async fn run_sync_drops_a_pending_fetch_that_has_since_vanished() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {"message": "Not Found", "errors": [{"reason": "notFound"}]}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Vanished { id } if id == "m1")));
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_does_not_refetch_a_pending_id_already_archived_on_disk() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+            excluded_labels: Vec::new(),
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_get_never_called(&server, "m1").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_does_not_fetch_a_pending_id_deleted_in_this_window() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(
+            &server,
+            serde_json::json!({
+                "history": [{
+                    "id": "150",
+                    "messagesDeleted": [{"message": {"id": "m1", "threadId": "t1"}}],
+                }],
+                "historyId": "200",
+            }),
+        )
+        .await;
+        mount_get_never_called(&server, "m1").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_soft_deletes_a_retried_pending_fetch_that_now_carries_an_excluded_label() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        // Not `mount_raw_get` (hardcoded to `labelIds: ["INBOX"]`): the
+        // label that moved it into SPAM arrived in a window an earlier run
+        // consumed, so only the fetch itself can tell this run about it.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "labelIds": ["INBOX", "SPAM"],
+                    "internalDate": "1700000000000",
+                    "historyId": "500",
+                    "raw": raw_message_body("m1", "Spammy"),
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_some());
+        assert_eq!(record.excluded_labels, ["SPAM"]);
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_replaces_pending_fetch_with_only_this_runs_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        // "gone" no longer exists server-side, so a full listing drops it;
+        // "m2" fails on this run and becomes the new pending set.
+        save_state_with_pending(&output_dir, &["gone"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1", "m2"]).await;
+        mount_raw_get(&server, "m1", "Good").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m2"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        mount_get_never_called(&server, "gone").await;
+
+        let opts = SyncOptions {
+            full: true,
+            ..opts(output_dir.clone())
+        };
+        run_sync(&client, &opts).await.unwrap();
+
+        let s = load_present(&output_dir);
+        assert_eq!(s.history_id, "999");
+        assert_eq!(s.pending_fetch, ["m2"]);
     }
 
     // ── --dry-run ──────────────────────────────────────────────────────
@@ -3576,6 +3902,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
+                pending_fetch: Vec::new(),
             },
             &state_path(&output_dir),
         )
