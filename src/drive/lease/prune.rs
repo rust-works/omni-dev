@@ -28,7 +28,13 @@
 //! than for the whole run, so a large batch never blocks a concurrent
 //! `drive lease acquire`/`restore`/write for longer than a single row's
 //! own local disk I/O — the same lock discipline every other lease command
-//! already uses.
+//! already uses. Each row's lock-acquire attempt and its ledger
+//! mutate-plus-audit are further routed through
+//! [`offload_short_blocking_io`] (issue #1766), the same helper #1697/#1765
+//! introduced for the identical problem in the leased-write gate, so a large
+//! batch no longer pins one async runtime worker across the whole run — a
+//! scheduling change only, the per-row locking and crash-safety design above
+//! is unchanged.
 
 use std::path::PathBuf;
 
@@ -40,7 +46,9 @@ use crate::cli::drive::format::JsonlSerialize;
 use crate::drive::client::DriveClient;
 use crate::drive::error::DriveError;
 use crate::drive::files_api::FilesApi;
-use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock};
+use crate::drive::lease::ledger::{
+    offload_short_blocking_io, LeaseBackup, LeaseLedger, LeaseRecord, LedgerLock,
+};
 
 /// Options controlling [`prune`].
 pub struct PruneOptions {
@@ -310,8 +318,21 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
         // failure (after the backup import *is* already gone) can still
         // strand a row, which is a separate, unavoidable failure mode
         // across two storage systems, not a locking bug.
-        let lock = match LedgerLock::acquire(&opts.ledger_path) {
-            Ok(lock) => lock,
+        //
+        // The lock attempt and the mutate-plus-audit step below are each
+        // wrapped in `offload_short_blocking_io`: both are short, bounded
+        // blocking file I/O (a single non-waiting `flock` attempt; a full
+        // ledger load-and-rewrite plus one fsynced audit append), never an
+        // unbounded wait, so each qualifies per that helper's own rule
+        // (issue #1766). They can't share one region the way the gate's
+        // does, because `clear_backup`'s `.await` sits between them and a
+        // `offload_short_blocking_io` closure can't contain an `.await`.
+        // Each closure also returns a plain value rather than doing
+        // `continue`/`return Err` itself — those target this `for` loop and
+        // `prune` itself, not the closure, so they're applied by ordinary
+        // code right after each closure returns.
+        let lock = offload_short_blocking_io(|| match LedgerLock::acquire(&opts.ledger_path) {
+            Ok(lock) => Some(lock),
             Err(err) => {
                 tracing::warn!(
                     "drive lease prune: failed to lock the ledger to remove lease {} (file \
@@ -320,10 +341,13 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
                     rec.file_id
                 );
                 record_prune_attempt(rec, "prune-failed", Some(err.to_string()));
-                outcome.failed += 1;
-                outcome.kept += 1;
-                continue;
+                None
             }
+        });
+        let Some(lock) = lock else {
+            outcome.failed += 1;
+            outcome.kept += 1;
+            continue;
         };
 
         match clear_backup(&files_api, &rec.backup).await {
@@ -338,27 +362,37 @@ pub async fn prune(client: &DriveClient, opts: &PruneOptions) -> Result<PruneOut
                 // silently leaving a dangling row: name the stranded token
                 // and stop, rather than compounding the same failure
                 // across every remaining candidate.
-                if let Err(err) = LeaseLedger::mutate(&lock, &opts.ledger_path, |ledger| {
-                    ledger.remove(&rec.token);
-                }) {
-                    return Err(err.context(format!(
-                        "drive lease prune: cleared the backup for lease {} but failed to \
-                         persist its ledger removal — that row may now dangle, pointing at a \
-                         backup that no longer exists; remove it from the ledger by hand",
-                        rec.token
-                    )));
+                let mutated = offload_short_blocking_io(|| {
+                    let result = LeaseLedger::mutate(&lock, &opts.ledger_path, |ledger| {
+                        ledger.remove(&rec.token);
+                    });
+                    if result.is_ok() {
+                        record_prune_attempt(rec, "pruned", None);
+                    }
+                    result
+                });
+                match mutated {
+                    Ok(()) => account_removal(&mut outcome, &rec.backup),
+                    Err(err) => {
+                        return Err(err.context(format!(
+                            "drive lease prune: cleared the backup for lease {} but failed to \
+                             persist its ledger removal — that row may now dangle, pointing at \
+                             a backup that no longer exists; remove it from the ledger by hand",
+                            rec.token
+                        )));
+                    }
                 }
-                account_removal(&mut outcome, &rec.backup);
-                record_prune_attempt(rec, "pruned", None);
             }
             Err(err) => {
-                tracing::warn!(
-                    "drive lease prune: failed to clear the backup for lease {} (file {}): \
-                     {err:#}; leaving it for a future prune",
-                    rec.token,
-                    rec.file_id
-                );
-                record_prune_attempt(rec, "prune-failed", Some(err.to_string()));
+                offload_short_blocking_io(|| {
+                    tracing::warn!(
+                        "drive lease prune: failed to clear the backup for lease {} (file {}): \
+                         {err:#}; leaving it for a future prune",
+                        rec.token,
+                        rec.file_id
+                    );
+                    record_prune_attempt(rec, "prune-failed", Some(err.to_string()));
+                });
                 outcome.failed += 1;
                 outcome.kept += 1;
             }
