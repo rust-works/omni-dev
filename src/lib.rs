@@ -49,6 +49,7 @@ pub mod data;
 pub mod datadog;
 pub mod drive;
 pub mod git;
+pub mod github_issues;
 pub mod github_metrics;
 pub mod github_rate_limit;
 pub mod gmail;
@@ -56,6 +57,7 @@ pub mod jev;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod pr_status;
+pub mod provider;
 pub mod request_log;
 pub mod resources;
 pub mod sessions;

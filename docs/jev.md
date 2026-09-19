@@ -17,8 +17,9 @@ JSON, and no model-registry token limit to fit into.
 Jev lives under `ai` but is deliberately **not** an [AI backend](ai-backends.md).
 Its subcommands do not accept the AI backend flags (`--ai-backend`, `--model`,
 `--beta-header`, `--claude-cli-*`, `--models-yaml`) — passing any of them is
-now a clap error, "unexpected argument" — nor `--repo`: a Jev call never
-investigates a repository, it judges only the `state` text you give it.
+now a clap error, "unexpected argument". Only [`route`](#route) accepts
+`-C/--repo`, and only to decide which repository `#N` means: every other Jev
+call judges only the `state` text you give it.
 Commit/PR generation never uses Jev, and its request shape (state plus a
 question map) has nothing in common with a chat completion.
 
@@ -33,17 +34,21 @@ question map) has nothing in common with a chat completion.
 7. [score](#score)
 8. [noul](#noul)
 9. [ask](#ask)
-10. [Ordering caveats](#ordering-caveats)
-11. [Best practices](#best-practices)
-12. [Retries and timeouts](#retries-and-timeouts)
-13. [Request log](#request-log)
-14. [Troubleshooting](#troubleshooting)
-15. [See also](#see-also)
+10. [route](#route)
+11. [Ordering caveats](#ordering-caveats)
+12. [Best practices](#best-practices)
+13. [Retries and timeouts](#retries-and-timeouts)
+14. [Request log](#request-log)
+15. [Troubleshooting](#troubleshooting)
+16. [See also](#see-also)
 
 ## Prerequisites
 
 - A TypeSafe account and a Jev **API key**. The same key works with
   TypeSafe's own SDKs, which read it from `TYPESAFE_API_KEY`.
+- For [`route`](#route) only: the GitHub CLI (`gh`), authenticated with read
+  access to the repositories whose issues you route. The token stays inside
+  `gh`; omni-dev never reads it.
 
 ## Authentication
 
@@ -382,6 +387,174 @@ one-option `choice` or a one-level `score`, but it can only answer either one
 with `confidence: 1.0`. Such a call costs money and tells you nothing, and it
 usually means the spec was mistyped.
 
+## route
+
+Asks which **model class** should handle each stage of the work on a GitHub
+issue: the **design** (choosing the approach and settling open questions), the
+**implementation** and the **review**. It makes one Jev call per issue, with
+three `choice` questions, and fetches the issues through `gh`.
+
+```bash
+omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
+omni-dev ai jev route https://github.com/rust-works/omni-dev/issues/1779
+omni-dev ai jev route --all-open -C ~/src/omni-dev
+```
+
+`<ISSUE>` is `#N` or `N` (in the current repository, which `-C/--repo`
+changes), `owner/repo#N`, or an issue URL. `--all-open` routes every open issue
+in the current repository instead. Quote `#N` in the shell, where an unquoted
+`#` starts a comment.
+
+```yaml
+model: jev-1.13.0
+issues:
+- ref: rust-works/omni-dev#1641
+  url: https://github.com/rust-works/omni-dev/issues/1641
+  title: ...
+  stages:
+    design:    {choice: fable,  confidence: 0.52, probabilities: {fable: 0.74, none: 0.01, opus: 0.24, sonnet: 0.01}}
+    implement: {choice: sonnet, confidence: 0.83, probabilities: {fable: 0.0, opus: 0.12, sonnet: 0.88}}
+    review:    {choice: opus,   confidence: 0.41, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
+  class: fable
+  close_calls: []
+usage: {input_tokens: 1432, output_tokens: 61}
+```
+
+- **`class`** is the higher of the design and implement choices. The most
+  capable class earns its cost in the design stage; once a plan exists, the
+  design answer usually becomes `none` and implementation drops to a cheaper
+  class. Review does not count towards the class.
+- **`close_calls`** lists the stages whose confidence is below `--close-call`
+  (default `0.3`, a working heuristic that has not been validated). Jev is
+  noisy on close calls: identical inputs changed the design answer in 2 of 19
+  cases, so treat a flagged stage as a judgement call, not an answer.
+- **`truncated: true`** appears when the issue was longer than
+  `--max-input-chars` (default 60,000 characters). The first and last halves
+  are kept, with a visible `[... truncated]` marker between them, and a
+  warning is logged. The end is kept on purpose: it holds the latest comments,
+  where a decision comment lands, and that is what moves the design stage
+  most. The longest input tested was about 48,000 characters, so no tested
+  input was ever cut and this policy is itself untested; Jev's own input limit
+  is undocumented.
+- **`model`** and **`usage`** are summed over every call and never stripped.
+- **`error`** replaces `stages`, `class` and `close_calls` on an issue whose
+  Jev call failed (after the usual 429/529 retries) or whose answer was
+  unusable. The other issues are still routed, so a long `--all-open` run
+  keeps the answers already paid for; the command prints the whole report and
+  then exits non-zero, naming how many issues failed. An authentication
+  failure (HTTP 401 or 403) would fail every issue, so it stops the run at
+  once instead.
+
+### What Jev sees
+
+Only the issue's title, body and **human** comments, oldest first. Bot
+comments (anything GitHub reports as a `Bot`, or whose login ends in `[bot]`)
+are dropped, and only the latest 100 comments are fetched. The format is the
+one the evidence below was gathered with, with one difference: the evaluation
+script kept bot comments.
+
+```
+# #<N> <title>
+
+<body>
+
+
+---
+
+## Comments on this issue
+
+
+**Comment by <author>:**
+
+<comment body>
+```
+
+Referenced issues and pull requests are **not** included. In the experiments
+they cost about twice the tokens, made agreement worse (12 of 16 fell to 9),
+and inflated small issues: an issue asking to update two constants was routed
+to the top class once it carried the whole of the issue it referenced. If an
+issue depends on a decision made elsewhere, write the decision into the issue
+as a comment (see below) rather than relying on the reference.
+
+### Closed issues
+
+`route` refuses a closed issue unless `--allow-closed` is given, because its
+comments often describe how the work was actually done, which leaks the
+answer. `--allow-closed` is for evaluation runs against issues whose outcome
+you already know.
+
+### Tiers
+
+The default tiers, least capable first, are `sonnet`, `opus` and `fable`, each
+described by what that class is reliable at. `--tiers FILE` replaces them, so
+other providers' model names work too:
+
+```yaml
+tiers:
+  - name: small
+    description: Reliable at executing a clear specification ...
+  - name: large
+    description: Strongest at open-ended design and research ...
+```
+
+A tiers file needs at least two tiers, unique non-empty names and
+descriptions, and no tier named `none`, which is reserved for "no design work
+remains". Rank comes from the order in the file.
+
+The default descriptions and the three stage questions are the exact text
+the evidence was gathered with. Every question ends with the same bar:
+*"Choose the least capable class likely to complete this stage correctly with
+no rework, about 9 times in 10. Judge the work that remains given the text, not
+the size of the text."* Rewording shifts answers across the board: an earlier
+"pick the cheapest class" pushed every answer down a tier, and adding an
+advisory instruction moved answers even on inputs it was not aimed at. Re-run
+the evaluation before trusting different wording or descriptions.
+
+### Decision comments
+
+Jev reacts to decisions stated **in the issue itself**. It cannot infer that a
+referenced issue settled a question, even with that issue and its closing pull
+request supplied. A comment that states how the open questions were resolved
+lowered the expected design tier by one to two and a half tiers, while a
+neutral comment of the same length, or a decoy "Decided:" comment settling only
+irrelevant details, moved it by no more than about a quarter of a tier.
+Write decisions like this:
+
+```markdown
+**Decision** (settled by #1614, closed by PR #1629):
+
+- PR #1629 added the read-only `drive_sheets_info` and `drive_sheets_read` MCP tools.
+- The Sheets write verbs stayed CLI-only and are tracked separately.
+
+For this issue: expose only `drive_docs_info` and `drive_docs_read`. The mutating
+verbs are out of scope here.
+```
+
+- Cite the item that settled the question.
+- State what the cited item did as separate bullets, one fact each.
+- Keep "for this issue" decisions separate from claims about the cited item.
+- Say what remains open, if anything. The design stage stays at the middle
+  class for work the decision does not cover, which is the desired behaviour.
+
+Because Jev trusts such comments, a comment that overstates what was decided
+would under-route the issue. After adding one, re-run `route` to check that the
+design work has actually gone away.
+
+### Evidence and its limits
+
+The design comes from experiments on this repository's issues with
+`jev-1.13.0` (September 2026), recorded in
+[#1779](https://github.com/rust-works/omni-dev/issues/1779) together with a
+script that reproduces them. Asking per stage agreed with hand-assigned labels
+on 10 of 12 fresh issues, against never choosing the top class for a single
+"which class should implement this?" question, and 3 of 12 for a rule built on
+eight factual questions. On full issues with their comments, the input `route`
+sends, agreement was 11–12 of 16.
+
+The sets are small (9, 12 and 16 issues), come from this one repository, and
+the labels are one person's judgement, not ground truth. A newer model behind
+`jev-latest` needs re-checking: note the `model` in the output.
+
 ## Ordering caveats
 
 Every map in the request and the response is kept **sorted by key**. This
@@ -710,8 +883,9 @@ error: unexpected argument '--model' found
 ```
 
 Jev subcommands accept none of the AI backend flags (`--ai-backend`,
-`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`) or `--repo` —
-clap rejects them outright rather than silently ignoring them (#1778). Use
+`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`), and only
+`route` accepts `-C/--repo` — clap rejects them outright rather than silently
+ignoring them (#1778). Use
 `--jev-model` instead; see [Choosing a model](#choosing-a-model). If instead
 an exported `OMNI_DEV_MODEL` seems to have no effect, that part is expected:
 see the footgun note above.
@@ -725,6 +899,8 @@ see the footgun note above.
 - [Request Log](log.md): querying and redaction.
 - [Issue #1760](https://github.com/rust-works/omni-dev/issues/1760): the
   original request and API notes.
+- [Issue #1779](https://github.com/rust-works/omni-dev/issues/1779): the
+  experiments behind `route`, and a script that reproduces them.
 - TypeSafe's own guidance, which [Best practices](#best-practices) draws on
   (as of `jev-1.13.0`, 2026-09-19):
   [Primitives](https://docs.typesafe.ai/primitives),

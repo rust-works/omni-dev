@@ -1,0 +1,22 @@
+# Default model-class tiers for `omni-dev ai jev route` (#1779).
+#
+# Tiers are listed from least to most capable; `route` ranks them by position.
+# The descriptions are the text validated against jev-1.13.0 — rewording them
+# shifts every answer, so re-run the evaluation before changing a word.
+# `--tiers FILE` replaces this list (at least two tiers, unique names; `none`
+# is reserved for the design stage).
+tiers:
+  - name: sonnet
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: opus
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+  - name: fable
+    description: >-
+      Strongest at open-ended design and research: choosing between architectures, working in
+      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
+      security-critical judgement.

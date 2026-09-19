@@ -557,7 +557,11 @@ fn resolve_gh_binary_from(
 
 /// Runs one `gh api graphql` call against `bin`. **Blocking** — callers must be on
 /// a blocking thread, never an async worker.
-fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
+///
+/// `pub(crate)`: shared with [`crate::github_issues`], which builds its own
+/// aliased query in the style of this module's [`build_query`] and runs it
+/// here rather than duplicating this subprocess wrapper.
+pub(crate) fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
     let query_arg = format!("query={query}");
     let output = crate::github_metrics::run_gh(
         bin,

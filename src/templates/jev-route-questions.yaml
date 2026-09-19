@@ -1,0 +1,33 @@
+# Stage questions for `omni-dev ai jev route` (#1779), as Jev `choice`
+# questions. `route` adds one criterion per tier (name -> description) to
+# each question; the `none` criterion below is the only fixed option.
+#
+# The wording is the text validated against jev-1.13.0. Every question ends
+# with the same bar sentence, which replaced an earlier "pick the cheapest
+# class" that pushed every answer down a tier. Rewording shifts answers across
+# the board, so re-run the evaluation before changing a word.
+stage_design:
+  type: choice
+  instructions: >-
+    Which class should do the design work that remains before implementation can start: choosing
+    the approach, settling open questions, and writing a plan? Choose the least capable class likely
+    to complete this stage correctly with no rework, about 9 times in 10. Judge the work that
+    remains given the text, not the size of the text.
+  criteria:
+    none: "No design work remains: the text already settles the approach and the open questions."
+stage_implement:
+  type: choice
+  instructions: >-
+    Assume any remaining design work has been completed well. Which class should write the code,
+    tests and docs? Choose the least capable class likely to complete this stage correctly with no
+    rework, about 9 times in 10. Judge the work that remains given the text, not the size of the
+    text.
+  criteria: {}
+stage_review:
+  type: choice
+  instructions: >-
+    Which class should review the finished change before merge, so that mistakes the automated
+    tests would miss are caught? Choose the least capable class likely to complete this stage
+    correctly with no rework, about 9 times in 10. Judge the work that remains given the text, not
+    the size of the text.
+  criteria: {}
