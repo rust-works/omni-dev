@@ -386,10 +386,32 @@ pub fn log_file_path() -> Option<PathBuf> {
 /// [`log_file_path`], reading through an injected [`EnvSource`]
 /// (STYLE-0028). `pub(crate)` rather than private: `cli::log`'s
 /// `LogCommand::resolve_path_with` needs it for its own env-injected test.
+///
+/// Refuses (returns `None`) when the resolved path names the same file as
+/// [`audit_file_path_with`] — an `OMNI_DEV_LOG_FILE` misconfiguration that
+/// would otherwise let ordinary best-effort records
+/// (`try_record`/`append_with_rotation`) and `prune` reach the fail-closed
+/// audit sink, since none of those consumers get a chance to guard against
+/// it themselves once a colliding path has already resolved
+/// ([#1747](https://github.com/rust-works/omni-dev/issues/1747), ADR-0080
+/// §11). Centralizing the refusal here — rather than relying on each
+/// consumer's own check, as `prune` and `append_with_rotation` still do for
+/// defense in depth against a caller that bypasses this resolver — means
+/// every future consumer of [`log_file_path`] is covered automatically.
 pub(crate) fn log_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
-    non_empty_var(env, "OMNI_DEV_LOG_FILE")
+    let path = non_empty_var(env, "OMNI_DEV_LOG_FILE")
         .map(PathBuf::from)
-        .or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))
+        .or_else(|| omni_dev_state_subpath(LOG_FILE_NAME))?;
+    if resolves_to_audit_file_with(&path, env) {
+        tracing::warn!(
+            "request_log: OMNI_DEV_LOG_FILE resolves to the audit log ({}); refusing to use it \
+             as the request log path — set OMNI_DEV_LOG_FILE and/or OMNI_DEV_AUDIT_LOG_FILE to \
+             distinct paths",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
 }
 
 /// Resolves the audit log file path.
@@ -558,6 +580,19 @@ fn resolves_to_audit_file(path: &Path) -> bool {
     audit_file_path().is_some_and(|audit| same_file(path, &audit))
 }
 
+/// [`resolves_to_audit_file`], reading the audit path through an injected
+/// [`EnvSource`] instead of the ambient [`audit_file_path`] — the
+/// [`log_file_path_with`] guard needs to compare against
+/// [`audit_file_path_with`] (same env, same test seam), not the ambient
+/// function's per-thread test override, which is orthogonal to this
+/// comparison. Deliberately does **not** short-circuit via `?` on a
+/// non-resolving audit path: an audit path that can't be resolved at all
+/// means there is nothing to collide with, not that the request-log path
+/// should be refused.
+fn resolves_to_audit_file_with(path: &Path, env: &impl EnvSource) -> bool {
+    audit_file_path_with(env).is_some_and(|audit| same_file(path, &audit))
+}
+
 /// Release builds have no per-thread override.
 #[cfg(not(test))]
 fn test_audit_file_override() -> Option<PathBuf> {
@@ -680,16 +715,14 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 /// deliberately best-effort contract every other record in this module
 /// keeps.
 ///
-/// Refuses outright if `entry.kind` isn't [`RecordKind::Audit`], or if
-/// [`audit_file_path`] resolves to the same file as [`log_file_path`] (an env
-/// override misconfiguration that would otherwise silently blend the
-/// fail-closed sink into the best-effort, prunable one) — compared via
-/// [`same_file()`], not a raw path equality, so a `..` segment, a
-/// relative-vs-absolute spelling, or a symlink can't slip past the check.
-/// This only stops the write *into* the request log; it does not stop the
-/// reverse (`OMNI_DEV_LOG_FILE` naming the audit file lets best-effort
-/// records land there too) — see [`prune`] and [`append_with_rotation`] for
-/// the guards that protect the audit file itself.
+/// Refuses outright if `entry.kind` isn't [`RecordKind::Audit`]. The reverse
+/// misconfiguration — `OMNI_DEV_LOG_FILE` naming the audit file, which would
+/// otherwise let best-effort records land in the fail-closed sink — no
+/// longer needs a check here: [`log_file_path`] itself now refuses to
+/// resolve a path that aliases [`audit_file_path`]
+/// ([#1747](https://github.com/rust-works/omni-dev/issues/1747), ADR-0080
+/// §11), so no request-log path this function could be handed ever collides
+/// with `path` in the first place.
 ///
 /// The appended line is `fsync`ed (`sync_data`, then the parent directory
 /// on unix so a freshly created file's entry is durable too) before this
@@ -704,7 +737,7 @@ pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let path = audit_file_path().context("could not resolve the audit log file path")?;
-    record_audit_to(path, log_file_path(), entry)
+    record_audit_to(path, entry)
 }
 
 /// [`record_audit`], reading through an injected [`EnvSource`] (STYLE-0028)
@@ -719,16 +752,12 @@ fn record_audit_with(env: &impl EnvSource, entry: &LogRecord) -> anyhow::Result<
     use anyhow::Context;
 
     let path = audit_file_path_with(env).context("could not resolve the audit log file path")?;
-    record_audit_to(path, log_file_path_with(env), entry)
+    record_audit_to(path, entry)
 }
 
-/// Shared write path for [`record_audit`] and `record_audit_with`: `path`
-/// and `log_path` are already resolved, so this only validates and appends.
-fn record_audit_to(
-    path: PathBuf,
-    log_path: Option<PathBuf>,
-    entry: &LogRecord,
-) -> anyhow::Result<()> {
+/// Shared write path for [`record_audit`] and `record_audit_with`: `path` is
+/// already resolved, so this only validates and appends.
+fn record_audit_to(path: PathBuf, entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::ensure;
 
     ensure!(
@@ -736,14 +765,6 @@ fn record_audit_to(
         "record_audit() requires a RecordKind::Audit entry, got {:?}",
         entry.kind
     );
-    if let Some(log_path) = log_path {
-        ensure!(
-            !same_file(&path, &log_path),
-            "the audit log path resolves to the same file as the request log ({}); set \
-             OMNI_DEV_AUDIT_LOG_FILE and/or OMNI_DEV_LOG_FILE to distinct paths",
-            path.display()
-        );
-    }
     append_record_to(&path, entry, append_line_synced)
 }
 
@@ -3175,7 +3196,39 @@ mod tests {
     }
 
     #[test]
-    fn record_audit_refuses_when_the_audit_path_collides_with_the_log_path() {
+    fn log_file_path_with_refuses_when_it_resolves_to_the_audit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared.jsonl");
+        let shared_str = shared.to_str().unwrap();
+        let env = MapEnv::new()
+            .with("OMNI_DEV_LOG_FILE", shared_str)
+            .with("OMNI_DEV_AUDIT_LOG_FILE", shared_str);
+
+        assert!(log_file_path_with(&env).is_none());
+    }
+
+    #[test]
+    fn log_file_path_with_refuses_a_dot_dot_spelling_of_the_audit_file() {
+        // Mirrors `same_file_matches_a_dot_dot_spelling_routed_through_a_nonexistent_directory`:
+        // the guard must compare by file identity, not raw spelling.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        std::fs::write(&audit, "{}\n").unwrap();
+        let dotted = dir.path().join("sub/../audit.jsonl");
+        let env = MapEnv::new()
+            .with("OMNI_DEV_LOG_FILE", dotted.to_str().unwrap())
+            .with("OMNI_DEV_AUDIT_LOG_FILE", audit.to_str().unwrap());
+
+        assert!(log_file_path_with(&env).is_none());
+    }
+
+    #[test]
+    fn record_audit_with_succeeds_when_the_log_file_env_aliases_the_audit_path() {
+        // Once `log_file_path_with` itself refuses to resolve an aliasing
+        // `OMNI_DEV_LOG_FILE`, `record_audit_to` has no colliding request-log
+        // path to compare against, so the write it exists to protect
+        // proceeds normally — the refusal moved to path resolution
+        // (#1747), it did not disappear.
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("shared.jsonl");
         let shared_str = shared.to_str().unwrap();
@@ -3189,13 +3242,10 @@ mod tests {
             invocation_id: new_id(),
             ..LogRecord::default()
         };
-        let err = record_audit_with(&env, &rec).unwrap_err();
+        record_audit_with(&env, &rec).unwrap();
 
-        assert!(
-            err.to_string().contains("same file as the request log"),
-            "{err}"
-        );
-        assert!(!shared.exists());
+        assert!(shared.exists());
+        assert!(log_file_path_with(&env).is_none());
     }
 
     #[test]
