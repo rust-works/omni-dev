@@ -68,8 +68,8 @@ impl AskCommand {
 /// `serde_yaml` accepts JSON (YAML is a superset), so this covers both JSON
 /// and YAML question files without branching on file extension. Each spec
 /// is then checked with [`Question::validate`] — the same minimums the
-/// single-question subcommands enforce — so a malformed file fails locally,
-/// naming the offending question, rather than as an opaque `422`.
+/// single-question subcommands enforce — so a degenerate spec fails locally,
+/// naming the offending question, before any paid request is sent.
 fn read_questions(path: &Path) -> Result<BTreeMap<String, Question>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read questions file {}", path.display()))?;
