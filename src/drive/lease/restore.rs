@@ -1167,6 +1167,7 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::{AuthOutcome, Unsupported};
     use crate::drive::lease::ledger::{LeaseRecord, LedgerLock};
+    use crate::drive::lease::release::{release, ReleaseOptions, ReleaseResult};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::drive::types::{
         GOOGLE_DOC_MIME_TYPE, GOOGLE_FOLDER_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE,
@@ -2808,6 +2809,175 @@ mod tests {
             "nothing replaced it, so the backup lease must still be live"
         );
         assert!(old_record.is_live(Utc::now()));
+    }
+
+    /// #1742: every existing `FreshLeaseButWriteFailed` test above seeds the
+    /// backup token T already-expired (`seed_backup_lease`). This is the
+    /// live-T variant of that family — combining
+    /// `a_still_live_backup_token_is_superseded_rather_than_refusing_the_restore`'s
+    /// "I noticed the bad write immediately" seeding with a write that then
+    /// fails — proving the release-before-write-*failure* path, not just
+    /// the release-before-write-success path, actually leaves T released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_backup_token_that_then_fails_to_write_reports_fresh_lease_but_write_failed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease_expiring(
+            &test_opts.ledger_path,
+            "file-1",
+            backup,
+            Utc::now() + ChronoDuration::minutes(29),
+        );
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let result = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        let RestoreResult::FreshLeaseButWriteFailed {
+            token: new_token, ..
+        } = result
+        else {
+            panic!("expected FreshLeaseButWriteFailed, got {result:?}");
+        };
+        assert_ne!(new_token, old_token);
+
+        let ledger = LeaseLedger::load(&test_opts.ledger_path).unwrap();
+        let old_record = ledger.get(&old_token).expect("old row must be kept");
+        assert!(
+            old_record.released_at.is_some(),
+            "T must be released even though the write that superseded it then failed"
+        );
+        assert!(
+            !old_record.is_live(Utc::now()),
+            "a superseded lease must stop authorising writes even though its expiry is still \
+             in the future"
+        );
+        let new_record = ledger
+            .get(&new_token)
+            .expect("the fresh lease must still be recorded and live");
+        assert!(new_record.is_live(Utc::now()));
+    }
+
+    /// #1742: the retry `cli/drive/lease.rs` documents for
+    /// `FreshLeaseButWriteFailed` (`release <N>`, then `restore` again with
+    /// the *original* backup token) had never been exercised end-to-end
+    /// from a live-T supersession — only reasoned about, since `restore`
+    /// looks tokens up by identity (`ledger.get`) with no liveness
+    /// requirement, so a released-but-present row stays reachable by its
+    /// own token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_the_fresh_lease_and_retrying_restores_the_original_after_a_write_failure() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let backup = write_backup_file(dir.path(), b"the original content");
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease_expiring(
+            &test_opts.ledger_path,
+            "file-1",
+            backup,
+            Utc::now() + ChronoDuration::minutes(29),
+        );
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_download("file-1", b"the current, about-to-be-overwritten content")
+            .mount(&server)
+            .await;
+        // The first `restore` call's write fails, exactly once; the retry's
+        // own write falls through to the success mock below.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/upload/drive/v3/files/file-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "version": "2",
+                })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let first = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let RestoreResult::FreshLeaseButWriteFailed {
+            token: fresh_token, ..
+        } = first
+        else {
+            panic!("expected FreshLeaseButWriteFailed, got {first:?}");
+        };
+
+        // The documented recovery: release the fresh lease the failed write
+        // minted, then restore again from the original backup token.
+        let release_result = release(&ReleaseOptions {
+            token: fresh_token,
+            ledger_path: test_opts.ledger_path.clone(),
+        })
+        .await;
+        assert!(
+            matches!(release_result, ReleaseResult::Released { .. }),
+            "{release_result:?}"
+        );
+
+        // The fresh acquire inside `restore` names its own backup file with
+        // whole-second precision (`acquire.rs::backup_name`) and refuses to
+        // overwrite a same-second collision outright (by design — see
+        // `write_backup`'s doc comment) rather than silently clobbering the
+        // first restore's backup. Crossing a second boundary here is a test
+        // concern only; production callers are never this close together.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let second = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &FakeAuthenticator(AuthOutcome::Authorized),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(second, RestoreResult::Restored { .. }),
+            "the documented recovery must actually succeed on retry: {second:?}"
+        );
     }
 
     #[test]

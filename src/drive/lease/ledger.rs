@@ -1054,6 +1054,10 @@ mod tests {
         assert!(err.to_string().contains("already be in progress"));
     }
 
+    // Unix-only: on non-unix, `crate::daemon::paths::FileLock::drop` falls
+    // back to a `create_new`-marker-plus-`Drop`-unlink scheme, so the lock
+    // file does *not* survive its own drop there (#1742).
+    #[cfg(unix)]
     #[test]
     fn ledger_lock_file_persists_after_drop_and_is_re_lockable() {
         // Unlike the old `create_new` marker, `Drop` must not unlink the

@@ -274,6 +274,14 @@ async fn edit_inner(
     // permission refusal above already made zero Drive API calls with the
     // lease never touched; a `--dry-run` never needs `--lease` at all.
     //
+    // No request-building step sits between the `--dry-run` branch and the
+    // gate below — `opts.content`/`opts.content_type` are already-validated
+    // caller-supplied bytes, passed straight to `edit_content` once the
+    // gate succeeds — so the build-before-gate invariant (`gate_leased_write`'s
+    // doc comment, `validation.rs`'s identical comment) is satisfied with
+    // nothing to build. A future fallible step added here must stay ahead
+    // of the gate, the same way (#1688/#1742).
+    //
     // `requires_lease` already folds in every legacy multi-parent's own
     // requirement (see `FileTargetDecision::requires_lease`'s doc comment)
     // — it must not be re-derived from `decision.decided_by` alone here,

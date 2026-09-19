@@ -2752,4 +2752,70 @@ mod tests {
         // see which verb ran without joining back to `log.jsonl`.
         assert_eq!(records[0].command, ["drive", "sheets-protect-range"]);
     }
+
+    /// #1688/#1742: `build_update`'s warning-only/editors conflict is
+    /// caught *after* the dry-run branch but *before* the lease gate (see
+    /// `build_request_fails_rather_than_guessing_a_missing_sheet_id`'s
+    /// analogue in `structure.rs` for the same shape of regression). Unlike
+    /// `update_protection_refuses_a_result_that_is_warning_only_with_editors`
+    /// above, this presents a real lease token, so the gate really is
+    /// reachable if the build step didn't refuse first — proving the
+    /// refusal never opens a `pending` audit record for a write that can
+    /// never be issued.
+    #[tokio::test]
+    async fn an_invalid_editor_update_fails_before_opening_the_audit_pair() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 20,
+            "range": {
+                "sheetId": 0,
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+            "editors": {"users": ["a@example.com"]},
+        }]))
+        .mount(&server)
+        .await;
+        // Deliberately no batchUpdate mock: proves the invalid combination
+        // is refused before any request is sent.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::UpdateProtection {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: Some(true),
+                add_editors: Vec::new(),
+                remove_editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("warning-only"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        assert!(audit.records().is_empty(), "{:?}", audit.records());
+    }
 }
