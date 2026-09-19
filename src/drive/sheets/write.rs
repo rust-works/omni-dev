@@ -385,6 +385,14 @@ async fn write_inner(
     // immediately before the values call, not a reuse of the metadata
     // `target_gate::resolve` fetched before the (potentially slow)
     // ancestor-chain walk above.
+    //
+    // No request-building step sits between the `--dry-run` branch and the
+    // gate below either — `opts.values`/`opts.input` are already-validated
+    // caller-supplied data, passed straight to `values_update`/
+    // `values_append`/`values_clear` once the gate succeeds — so the
+    // build-before-gate invariant is satisfied with nothing to build. A
+    // future fallible step added here must stay ahead of the gate, the same
+    // way (#1688/#1742).
     let files_api = FilesApi::new(drive);
     let leased = LeasedWrite {
         log_prefix: "drive sheets write",

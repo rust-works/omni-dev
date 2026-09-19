@@ -511,6 +511,12 @@ async fn write_inner(
     // Drive `version` (ADR-0080 §6). A fresh `files.get` immediately before
     // `batchUpdate`, not a reuse of the metadata fetched before the
     // (potentially slow) ancestor-chain walk and `documents.get` above.
+    //
+    // `opts.payload.to_request()` — the build-before-gate invariant's
+    // "build" step for this engine — is called below only *after* this
+    // gate succeeds (see the mutating call itself), which trivially
+    // satisfies the invariant: there is no pre-gate build to fail and
+    // orphan a `pending` record (#1688/#1742).
     let leased = LeasedWrite {
         log_prefix: "drive docs write",
         operation: opts.payload.verb().log_operation(),
