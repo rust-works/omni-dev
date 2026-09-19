@@ -456,6 +456,7 @@ mod tests {
         let cmd = GmailSubcommands::Sync(sync::SyncCommand {
             output_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
             query: None,
+            exclude_label: Vec::new(),
             full: false,
             concurrency: 4,
             dry_run: false,

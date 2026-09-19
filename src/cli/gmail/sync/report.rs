@@ -63,6 +63,13 @@ pub(crate) enum SyncAction {
     ///
     /// [`Deleted`]: SyncAction::Deleted
     Vanished { id: String },
+    /// A `messagesAdded` history event was skipped without fetching because
+    /// its label set matched `--exclude-label` (#1780) — a filter decision,
+    /// not a race, and unlike [`Vanished`] no manifest record is ever
+    /// created for it.
+    ///
+    /// [`Vanished`]: SyncAction::Vanished
+    Excluded { id: String },
     /// An informational note about the run (e.g. why reconciliation ran).
     Note { message: String },
 }
@@ -81,6 +88,7 @@ pub(crate) struct SyncSummary {
     pub(crate) fetched: usize,
     pub(crate) would_fetch: usize,
     pub(crate) vanished: usize,
+    pub(crate) excluded: usize,
     pub(crate) labels_updated: usize,
     pub(crate) deleted: usize,
     pub(crate) undeleted: usize,
@@ -109,6 +117,7 @@ impl SyncReport {
                 SyncAction::WouldDelete { .. } => summary.would_delete += 1,
                 SyncAction::WouldUndelete { .. } => summary.would_undelete += 1,
                 SyncAction::Vanished { .. } => summary.vanished += 1,
+                SyncAction::Excluded { .. } => summary.excluded += 1,
                 // Informational only — not part of the tally (#1488).
                 SyncAction::Note { .. } => {}
             }
@@ -154,6 +163,9 @@ mod tests {
                 SyncAction::Vanished {
                     id: "m8".to_string(),
                 },
+                SyncAction::Excluded {
+                    id: "m10".to_string(),
+                },
                 SyncAction::Note {
                     message: "one note".to_string(),
                 },
@@ -173,6 +185,7 @@ mod tests {
                 fetched: 1,
                 would_fetch: 1,
                 vanished: 1,
+                excluded: 1,
                 labels_updated: 1,
                 deleted: 1,
                 undeleted: 1,

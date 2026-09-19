@@ -59,6 +59,20 @@ pub struct SyncCommand {
     #[arg(long)]
     pub query: Option<String>,
 
+    /// Excludes messages carrying this label id from the archive (#1780).
+    /// Repeatable — e.g. `--exclude-label SPAM --exclude-label TRASH`.
+    /// Applied fully and generally on incremental passes (no extra API
+    /// calls; a `messagesAdded` history event matching this filter is never
+    /// fetched, and a `labelsAdded`/`labelsRemoved` event that crosses the
+    /// excluded boundary soft-deletes/undeletes the archived record). On
+    /// backfill/`--full`/reconciliation passes, only entries with a known
+    /// query translation take effect (currently `SPAM`/`TRASH` — folded
+    /// into the listing query as `-in:spam`/`-in:trash`); anything else
+    /// still filters future incremental runs, but won't be excluded
+    /// retroactively on this pass unless you also pass `--query`.
+    #[arg(long, value_name = "LABEL_ID")]
+    pub exclude_label: Vec<String>,
+
     /// Forces a full backfill/reconciliation pass even if a valid watermark
     /// exists.
     #[arg(long)]
@@ -106,6 +120,7 @@ impl SyncCommand {
             SyncOptions {
                 output_dir: self.output_dir,
                 query: self.query,
+                exclude_labels: self.exclude_label,
                 full: self.full,
                 concurrency: self.concurrency,
                 dry_run: self.dry_run,
@@ -285,6 +300,9 @@ fn render_report_text(
             SyncAction::Vanished { id } => {
                 format!("Vanished {id} (message no longer existed on the server; skipped, not an error)")
             }
+            SyncAction::Excluded { id } => {
+                format!("Excluded {id} (matches an excluded label; not archived)")
+            }
             SyncAction::Note { message } => format!("Note: {message}"),
         };
         writeln!(out, "{line}").context("Failed to write sync report")?;
@@ -314,6 +332,7 @@ pub(crate) fn format_summary_line(summary: &SyncSummary) -> String {
     push(summary.fetched, "fetched");
     push(summary.would_fetch, "would fetch");
     push(summary.vanished, "vanished");
+    push(summary.excluded, "excluded");
     push(summary.labels_updated, "labels updated");
     push(summary.deleted, "deleted");
     push(summary.undeleted, "undeleted");
@@ -460,6 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn render_report_text_formats_excluded_and_tallies_it_in_the_summary() {
+        let report = SyncReport {
+            actions: vec![SyncAction::Excluded {
+                id: "spam1".to_string(),
+            }],
+            errors: vec![],
+        };
+        let mut buf = Vec::new();
+        render_report_text(&report, &mut buf, true).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Excluded spam1"));
+        assert!(text.contains("1 excluded, 0 errors"));
+    }
+
+    #[test]
     fn render_report_text_summary_line_omits_zero_counts_under_dry_run() {
         let report = SyncReport {
             actions: vec![
@@ -581,6 +615,7 @@ mod tests {
             SyncOptions {
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: true,
@@ -628,6 +663,7 @@ mod tests {
             SyncOptions {
                 output_dir: dir.path().join("archive"),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: false,
@@ -666,6 +702,7 @@ mod tests {
         let cmd = SyncCommand {
             output_dir: dir.path().join("archive"),
             query: None,
+            exclude_label: Vec::new(),
             full: false,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,
@@ -757,6 +794,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             SyncOptions {
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: false,
@@ -786,6 +824,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             SyncOptions {
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: false,
