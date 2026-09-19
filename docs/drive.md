@@ -1396,6 +1396,24 @@ either bound — pruning can never invalidate a lease a write is still
 relying on. `--max-size` always keeps at least the single
 most-recently-expired row's backup, even if it alone exceeds the budget.
 
+A second case is exempted from the `--max-size` budget the same way a
+Drive-copy backup is (issue #1768): a row released because
+[`drive lease restore`](#restore) superseded it (ADR-0080 §10) stays
+exempt for as long as the restore that used it as its source never
+actually completed — the write failed after the fresh lease was
+minted (`FreshLeaseButWriteFailed`). Such a row remains the
+file's only real backup, while the superseding lease's own backup is a
+pre-restore snapshot nothing ever wrote over and is comparatively
+worthless — and the superseding lease's `expires_at` is always later,
+since it was minted after the row it replaced. Without the exemption, a
+tight budget could compete the two by raw `expires_at` and evict the
+wanted row in favor of the useless one. A row released by a *successful*
+restore keeps competing normally, since its content is live again and
+the superseding lease's own backup is now meaningful too; so does a row
+released by a plain `drive lease release` (the case discussed
+[above](#release)). Like the Drive-copy case, an exempt row is reachable
+only through `--older-than`.
+
 A row and the backup it points at are always dropped **together, never one
 without the other**: a byte backup is deleted from local disk, a
 Drive-copy backup is moved to Drive Trash (recoverable by hand for ~30
