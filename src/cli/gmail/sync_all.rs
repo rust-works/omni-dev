@@ -66,6 +66,10 @@ pub(crate) struct GmailSyncAccountEntry {
     /// Mirrors `gmail sync --query`, applied only to this account.
     #[serde(default)]
     pub(crate) query: Option<String>,
+    /// Mirrors `gmail sync --exclude-label`, applied only to this account
+    /// (#1780).
+    #[serde(default)]
+    pub(crate) exclude_labels: Vec<String>,
     /// Mirrors `gmail sync --extract-attachments`, applied only to this
     /// account. `None` behaves as `false`.
     #[serde(default)]
@@ -270,6 +274,7 @@ async fn run_sync_all(
         let opts = SyncOptions {
             output_dir,
             query: entry.query.clone(),
+            exclude_labels: entry.exclude_labels.clone(),
             full,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run,
@@ -476,6 +481,7 @@ accounts:
   - account: newhoggy
     output_dir: emails/newhoggy/
     query: "-in:spam"
+    exclude_labels: [SPAM, TRASH]
     extract_attachments: true
 "#,
         )
@@ -485,7 +491,12 @@ accounts:
         assert_eq!(config.concurrency, Some(5));
         assert_eq!(config.accounts.len(), 2);
         assert_eq!(config.accounts[0].account, "jky.greens");
+        assert!(config.accounts[0].exclude_labels.is_empty());
         assert_eq!(config.accounts[1].query.as_deref(), Some("-in:spam"));
+        assert_eq!(
+            config.accounts[1].exclude_labels,
+            vec!["SPAM".to_string(), "TRASH".to_string()]
+        );
         assert_eq!(config.accounts[1].extract_attachments, Some(true));
     }
 
@@ -535,6 +546,7 @@ accounts:
             account: account.to_string(),
             output_dir: PathBuf::from("out"),
             query: None,
+            exclude_labels: Vec::new(),
             extract_attachments: None,
         }
     }
@@ -681,12 +693,14 @@ accounts:
                     account: "acct-a".to_string(),
                     output_dir: output_a.clone(),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
                 GmailSyncAccountEntry {
                     account: "acct-b".to_string(),
                     output_dir: output_b.clone(),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
             ],
@@ -750,12 +764,14 @@ accounts:
                     account: "good".to_string(),
                     output_dir: output_good.clone(),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
                 GmailSyncAccountEntry {
                     account: "broken".to_string(),
                     output_dir: project_root.join("broken"),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
             ],
@@ -816,12 +832,14 @@ accounts:
                     account: "good".to_string(),
                     output_dir: output_good.clone(),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
                 GmailSyncAccountEntry {
                     account: "boom".to_string(),
                     output_dir: project_root.join("boom"),
                     query: None,
+                    exclude_labels: Vec::new(),
                     extract_attachments: None,
                 },
             ],
@@ -885,6 +903,7 @@ accounts:
                 account: "acct-a".to_string(),
                 output_dir: relative.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 extract_attachments: None,
             }],
         };
@@ -938,6 +957,7 @@ accounts:
                 account: "acct-a".to_string(),
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 extract_attachments: None,
             }],
         };
@@ -991,6 +1011,7 @@ accounts:
         let opts = SyncOptions {
             output_dir: dir.path().join("acct"),
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,

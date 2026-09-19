@@ -55,6 +55,13 @@ use super::state::{self, ArchiveState, LoadOutcome};
 pub(crate) struct SyncOptions {
     pub(crate) output_dir: PathBuf,
     pub(crate) query: Option<String>,
+    /// Label ids to exclude from the archive (#1780). Applied fully and
+    /// generally on incremental passes (`run_incremental`, via label data
+    /// history events already carry — no extra API calls); on full/backfill/
+    /// reconciliation passes only the entries with a known `-in:` query
+    /// translation take effect (currently `SPAM`/`TRASH`) — see
+    /// `full_sync_query`'s doc comment.
+    pub(crate) exclude_labels: Vec<String>,
     pub(crate) full: bool,
     pub(crate) concurrency: usize,
     pub(crate) dry_run: bool,
@@ -260,8 +267,9 @@ async fn run_full_sync(
     let (ids_tx, ids_rx) = mpsc::unbounded_channel::<String>();
     let messages_api = MessagesApi::new(client);
 
+    let effective_query = full_sync_query(opts, report);
     let listing = messages_api.search_all_unbounded_streaming(
-        opts.query.as_deref(),
+        effective_query.as_deref(),
         &[],
         limiter,
         ids_tx,
@@ -324,6 +332,49 @@ async fn run_full_sync(
     Ok(profile.history_id.clone())
 }
 
+/// Label ids with a well-known, safe `-in:<keyword>` exclusion translation
+/// for [`full_sync_query`]. Deliberately just these two, not every Gmail
+/// system label: `UNREAD`/`STARRED`/`IMPORTANT` are matched via `is:`, not
+/// `in:`, so guessing wrong would silently exclude nothing rather than
+/// erroring — `SPAM`/`TRASH` are what #1780 and docs/gmail.md's existing
+/// `--query "-in:spam"` example already name as the motivating case.
+const FULL_SYNC_EXCLUDABLE_LABELS: &[(&str, &str)] = &[("SPAM", "spam"), ("TRASH", "trash")];
+
+/// Folds `opts.exclude_labels` into the query used for [`run_full_sync`]'s
+/// listing pass, for whichever entries have a known translation (see
+/// [`FULL_SYNC_EXCLUDABLE_LABELS`]) — combined with `opts.query` via a
+/// plain space-joined `AND`. An entry with no known translation (a custom/
+/// user label, or a system label outside the allow-list) can't be reliably
+/// excluded server-side by id alone, so it's left out of the query and a
+/// [`SyncAction::Note`] is pushed instead: `run_incremental` still filters
+/// it going forward (it works generally, off `label_ids` rather than a
+/// query translation), but this pass won't retroactively exclude it unless
+/// the caller also sets `--query`.
+fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> Option<String> {
+    let mut query = opts.query.clone().unwrap_or_default();
+    for label in &opts.exclude_labels {
+        match FULL_SYNC_EXCLUDABLE_LABELS
+            .iter()
+            .find(|(id, _)| *id == label)
+        {
+            Some((_, keyword)) => {
+                if !query.is_empty() {
+                    query.push(' ');
+                }
+                query.push_str(&format!("-in:{keyword}"));
+            }
+            None => report.actions.push(SyncAction::Note {
+                message: format!(
+                    "--exclude-label {label} has no full-sync query translation; it only \
+                     filters incremental syncs going forward — add it to --query yourself to \
+                     also exclude it on this pass"
+                ),
+            }),
+        }
+    }
+    (!query.is_empty()).then_some(query)
+}
+
 /// Applies `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
 /// history events since `start_history_id`. A 404 (watermark past Gmail's
 /// retention window) propagates unchanged for [`run_sync`] to catch.
@@ -347,6 +398,22 @@ async fn run_full_sync(
 /// per-page updates — enough that `sync`'s progress bars don't sit frozen
 /// at their initial state for an incremental run's entire duration, without
 /// a second streaming primitive to get there.
+///
+/// `opts.exclude_labels` (#1780) filters this path fully and generally,
+/// off the label data history events already carry for free: a
+/// `messagesAdded` event for an excluded id is never fetched at all (no
+/// manifest record is ever created for it — see [`SyncAction::Excluded`]);
+/// a `labelsAdded`/`labelsRemoved` event that changes an already-archived
+/// record's current label set across the excluded boundary
+/// soft-deletes/undeletes it via the same [`Manifest::mark_deleted`]/
+/// [`Manifest::undelete`] machinery [`run_full_sync`]'s stale-deletion/
+/// undelete-on-reappearance passes use. One known gap, not solved here: a
+/// message that arrives already excluded is never archived, so if the
+/// excluded label is later removed there is no manifest record for the
+/// `labelsRemoved` event to act on — it stays un-archived until the next
+/// `--full`/reconciliation pass re-lists and fetches it fresh, the same
+/// "self-healing on the next full pass" framing this module already uses
+/// for a listing race (see [`run_full_sync`]'s doc comment).
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -372,6 +439,12 @@ async fn run_incremental(
     for record in &history.history {
         for added in &record.messages_added {
             if !deleted_ids.contains(&added.message.id) && seen.insert(added.message.id.clone()) {
+                if label_ids_excluded(&added.message.label_ids, &opts.exclude_labels) {
+                    report.actions.push(SyncAction::Excluded {
+                        id: added.message.id.clone(),
+                    });
+                    continue;
+                }
                 to_fetch.push(added.message.id.clone());
             }
         }
@@ -390,6 +463,20 @@ async fn run_incremental(
                 added: change.label_ids.clone(),
                 removed: Vec::new(),
             });
+            // Re-check the record's *current* label set (not just this
+            // event's delta) — correct under more than one configured
+            // exclude label, where a single labelsAdded event only ever
+            // carries one of them.
+            if let Some(record) = manifest.get(&change.message.id) {
+                if record.deleted_at.is_none()
+                    && label_ids_excluded(&record.label_ids, &opts.exclude_labels)
+                {
+                    manifest.mark_deleted(&change.message.id, Utc::now());
+                    report.actions.push(SyncAction::Deleted {
+                        id: change.message.id.clone(),
+                    });
+                }
+            }
         }
         for change in &record.labels_removed {
             manifest.remove_labels(&change.message.id, &change.label_ids);
@@ -398,6 +485,16 @@ async fn run_incremental(
                 added: Vec::new(),
                 removed: change.label_ids.clone(),
             });
+            if let Some(record) = manifest.get(&change.message.id) {
+                if record.deleted_at.is_some()
+                    && !label_ids_excluded(&record.label_ids, &opts.exclude_labels)
+                {
+                    manifest.undelete(&change.message.id);
+                    report.actions.push(SyncAction::Undeleted {
+                        id: change.message.id.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -415,6 +512,18 @@ async fn run_incremental(
     Ok(history
         .history_id
         .unwrap_or_else(|| start_history_id.to_string()))
+}
+
+/// Whether any of `label_ids` is in `exclude_labels` — the one check
+/// `run_incremental`'s label-set exclusion filter (#1780) is built from,
+/// applied both to a history event's own label set (deciding whether to
+/// fetch a new message at all) and to a manifest record's current label set
+/// (deciding whether an already-archived message should now be
+/// soft-deleted/undeleted).
+fn label_ids_excluded(label_ids: &[String], exclude_labels: &[String]) -> bool {
+    exclude_labels
+        .iter()
+        .any(|excluded| label_ids.iter().any(|l| l == excluded))
 }
 
 /// [`run_full_sync`]'s fetch/consumer side of the listing+fetch pipeline
@@ -1000,6 +1109,7 @@ mod tests {
         SyncOptions {
             output_dir,
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 4,
             dry_run: false,
@@ -1375,6 +1485,279 @@ not-really-a-pdf\r\n\
             manifest.get("churn1").is_none(),
             "a same-window add+delete should never create a manifest record"
         );
+    }
+
+    // ── --exclude-label (#1780) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_incremental_skips_fetching_a_new_message_with_an_excluded_label() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [{"message": {"id": "spam1", "threadId": "t1", "labelIds": ["SPAM"]}}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Deliberately no mock for GET .../messages/spam1 — fetching an
+        // excluded message at all is the bug this test guards against.
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Excluded { id } if id == "spam1")));
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(
+            manifest.get("spam1").is_none(),
+            "an excluded new message should never be archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_incremental_soft_deletes_an_archived_message_labeled_with_an_excluded_label() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "labelsAdded": [{"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["SPAM"]}],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Deleted { id } if id == "m1")));
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(manifest.get("m1").unwrap().deleted_at.is_some());
+        assert!(
+            shard_path(&output_dir, "m1", None).exists(),
+            "the .eml must survive a label-triggered soft-delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_incremental_undeletes_only_once_every_excluded_label_is_removed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        let mut manifest = Manifest::default();
+        for id in ["m1", "m2"] {
+            let path = shard_path(&output_dir, id, None);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("From: a@example.com\r\n\r\n{id} body")).unwrap();
+            manifest.upsert(ManifestRecord {
+                id: id.to_string(),
+                thread_id: Some("t1".to_string()),
+                label_ids: vec!["SPAM".to_string(), "TRASH".to_string()],
+                internal_date: None,
+                subject: None,
+                from: None,
+                to: None,
+                rfc822_msgid: None,
+                in_reply_to: None,
+                references: None,
+                attachment_count: 0,
+                attachment_filenames: Vec::new(),
+                path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+                size: std::fs::metadata(&path).unwrap().len(),
+                history_id: Some("50".to_string()),
+                deleted_at: Some(Utc::now()),
+            });
+        }
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        // m1 loses both excluded labels; m2 only loses SPAM
+                        // and still carries TRASH.
+                        "labelsRemoved": [
+                            {"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["SPAM", "TRASH"]},
+                            {"message": {"id": "m2", "threadId": "t1"}, "labelIds": ["SPAM"]},
+                        ],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string(), "TRASH".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")));
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m2")),
+            "m2 still carries an excluded label (TRASH) and must stay soft-deleted"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(manifest.get("m1").unwrap().deleted_at.is_none());
+        assert!(manifest.get("m2").unwrap().deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_folds_known_system_labels_into_the_listing_query() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("q", "-in:spam -in:trash"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string(), "TRASH".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_notes_an_exclude_label_it_cannot_translate_into_a_query() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let opts = SyncOptions {
+            exclude_labels: vec!["Label_16".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Note { message } if message.contains("Label_16") && message.contains("--query")
+        )));
     }
 
     #[tokio::test]
@@ -1839,6 +2222,7 @@ not-really-a-pdf\r\n\
             &SyncOptions {
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: true,
@@ -2029,6 +2413,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir: output_dir.clone(),
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 20,
             dry_run: false,
@@ -2118,6 +2503,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir: output_dir.clone(),
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 20,
             dry_run: false,
@@ -2193,6 +2579,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir: output_dir.clone(),
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 20,
             dry_run: false,
@@ -2485,6 +2872,7 @@ not-really-a-pdf\r\n\
             &SyncOptions {
                 output_dir: output_dir.clone(),
                 query: None,
+                exclude_labels: Vec::new(),
                 full: false,
                 concurrency: 4,
                 dry_run: true,
@@ -2599,6 +2987,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir: output_dir.clone(),
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             // A generous *local* concurrency: only the shared pool should
             // be the thing capping in-flight requests to 1 here.
@@ -2673,6 +3062,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir,
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 4,
             dry_run: false,
@@ -2718,6 +3108,7 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             output_dir,
             query: None,
+            exclude_labels: Vec::new(),
             full: false,
             concurrency: 4,
             dry_run: false,

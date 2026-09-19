@@ -480,6 +480,7 @@ $ omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
 $ omni-dev gmail sync --output-dir ~/mail-archive --full
 $ omni-dev gmail sync --output-dir ~/mail-archive --dry-run
 $ omni-dev gmail sync --output-dir ~/mail-archive --extract-attachments
+$ omni-dev gmail sync --output-dir ~/mail-archive --exclude-label SPAM --exclude-label TRASH
 ```
 
 Maintains a durable, greppable local archive of a mailbox — full-fidelity
@@ -571,6 +572,31 @@ would match your `--query` is only picked up by a later `--full` re-run. If
 you sync a query-scoped subset of your mailbox regularly, plan on an
 occasional `--full` pass.
 
+**`--exclude-label` (label-based exclusion, #1780):** for the common case of
+excluding spam/trash (or any other label) from the archive, prefer
+`--exclude-label LABEL_ID` (repeatable, e.g. `--exclude-label SPAM
+--exclude-label TRASH`) over `--query` — unlike `--query`, it's fully
+general and takes effect on **incremental** syncs too, since it works off
+the label data `history.list` events already carry for free rather than a
+server-side query string: a new message with an excluded label is never
+fetched, and a `labelsAdded`/`labelsRemoved` event that later moves an
+already-archived message across the excluded boundary soft-deletes/
+undeletes it (the same mechanism a message's real disappearance from the
+server uses). On backfill/`--full`/reconciliation passes, only labels with
+a well-known `-in:` query translation take effect this way — currently just
+`SPAM`/`TRASH`, since Gmail's `label:`/`in:` search operators match a
+label's *display name*, not its internal id, and most other system labels
+use `is:` rather than `in:`; folding an arbitrary label id in reliably would
+need an extra `labels.list` lookup. Any other `--exclude-label` value still
+filters incremental runs (fully generally, by id), and a full/backfill pass
+prints a `Note` explaining it wasn't excluded on that pass — add it to
+`--query` yourself if you also want it gone from a `--full` re-run. One
+edge case, not solved: a message that arrives *already* carrying an
+excluded label is never archived, so if that label is later removed there's
+no manifest record for the `labelsRemoved` event to act on — it self-heals
+on the next `--full`/reconciliation pass, same as this section's other
+races.
+
 **Header fields:** `subject`/`from`/`to`/`rfc822_msgid`/`in_reply_to`/
 `references` in the manifest are parsed directly from the already-fetched
 raw message bytes (no second network request), and are stored as their raw
@@ -613,8 +639,9 @@ already on disk, no re-fetch required.
 **Report summary:** every report — table/text and `-o json`/`-o yaml`/
 `-o yamls`/`-o jsonl` alike — ends with an at-a-glance tally, e.g.
 `5,794 fetched, 30 deleted, 0 errors` in text output, or an explicit
-`summary` field (`fetched`/`would_fetch`/`labels_updated`/`deleted`/
-`undeleted`/`would_delete`/`would_undelete`/`errors` counts) in the
+`summary` field (`fetched`/`would_fetch`/`vanished`/`excluded`/
+`labels_updated`/`deleted`/`undeleted`/`would_delete`/`would_undelete`/
+`errors` counts) in the
 structured formats. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl` always
 include the full per-action listing alongside `summary` too — the
 authoritative, complete record. Text output includes the per-action
@@ -663,6 +690,7 @@ accounts:
   - account: newhoggy
     output_dir: emails/newhoggy/
     query: "-in:spam"
+    exclude_labels: [SPAM, TRASH]
     extract_attachments: true
 ```
 
