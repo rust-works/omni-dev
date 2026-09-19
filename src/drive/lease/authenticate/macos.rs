@@ -22,9 +22,9 @@
 //!
 //! Before any of that, [`LocalAuthenticator::authenticate`] asks
 //! Security.framework's `SessionGetInfo` whether the caller's session can
-//! show UI at all (issue #1686). That one plain-C function *is* the
-//! Accessibility shape, so it is a hand-rolled `extern "C"` declaration
-//! rather than a second generated-framework dependency.
+//! show UI at all (issue #1686). That is a single plain-C function, so it
+//! uses the same hand-rolled `extern "C"` shape ADR-0058 §6 uses for the
+//! Accessibility API rather than a second generated-framework dependency.
 
 use std::sync::mpsc;
 use std::time::Duration;
