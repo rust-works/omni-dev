@@ -820,19 +820,21 @@ fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result
 
 /// [`append_line_no_rotation`] plus a `sync_data` on the handle before it
 /// closes, so the line is on disk (not merely in the page cache) when this
-/// returns, followed by an `fsync` of the parent directory: the first-ever
-/// append *creates* the file, and a data sync on the file does not persist
-/// the new directory entry — without the directory sync a crash right
-/// after the first leased write could lose the whole file, not just the
-/// line. The audit sink's appender — see [`record_audit`] for why it is
-/// the one writer that pays for either.
-#[cfg(unix)]
+/// returns, and — for the append that *created* the file — an `fsync` of
+/// the parent directory too: creating a file does not persist its new
+/// directory entry, so without that a crash right after the first leased
+/// write could lose the whole file, not just the line. The audit sink's
+/// appender — see [`record_audit`] for why it is the one writer that pays
+/// for either.
+///
+/// One function for both platforms, unlike its `append_line`/
+/// `append_line_no_rotation` neighbours: the platform difference (off unix
+/// there is no directory sync at all, since a directory cannot be opened as
+/// a `File` there) lives entirely in [`append_line_unrotated`], so a
+/// separate `#[cfg(not(unix))]` twin here would only be a second place to
+/// keep in step.
 fn append_line_synced(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_unrotated(path, line, true)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    append_line_unrotated(path, line, true)
 }
 
 #[cfg(unix)]
@@ -845,6 +847,24 @@ fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyh
         .mode(0o600)
         .open(path)?;
     crate::daemon::paths::ensure_handle_0600(&file)?;
+
+    // Whether this append needs the parent-directory `fsync` below, decided
+    // from the handle we already hold: an empty file either did not exist a
+    // moment ago or has no content whose directory entry could already have
+    // been made durable, and once it has content the entry is long since on
+    // disk. Errs towards one spare `fsync` (an existing-but-empty file),
+    // never towards skipping a needed one. Before issue #1697 every append
+    // paid it, so a 2,000-row `drive lease prune` cost 2,000 directory
+    // syncs to persist one directory entry.
+    //
+    // Deliberately *not* an `O_CREAT | O_EXCL` probe, which would report
+    // creation exactly rather than conservatively: `O_EXCL` refuses to
+    // follow a symlink, so an `OMNI_DEV_AUDIT_LOG_FILE` pointing at one
+    // would start failing `ENOENT` — and in a fail-closed sink a failed
+    // append refuses the write it was auditing. Both approaches leave the
+    // same residue anyway (a previous creator that died between its data
+    // sync and its directory sync), so the exact answer buys nothing.
+    let sync_parent = sync && file.metadata()?.len() == 0;
 
     if bodies_enabled() {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive) {
@@ -868,6 +888,12 @@ fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyh
             file.sync_data()?;
         }
     }
+
+    if sync_parent {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
     Ok(())
 }
 
@@ -887,13 +913,9 @@ fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result
     append_line_unrotated(path, line, false)
 }
 
-/// See the unix variant. No directory sync here: a directory cannot be
-/// opened as a `File` off unix, and the data sync is still applied.
-#[cfg(not(unix))]
-fn append_line_synced(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_unrotated(path, line, true)
-}
-
+/// See the unix variant. No directory sync here, whether or not this append
+/// created the file: a directory cannot be opened as a `File` off unix. The
+/// data sync is still applied.
 #[cfg(not(unix))]
 fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
@@ -3323,6 +3345,80 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// Issue #1697 made the parent-directory `fsync` conditional on the
+    /// append having created the file. The condition is not observable from
+    /// outside (an `fsync` leaves no trace), so what is pinned here is what
+    /// a mistake in it would actually break: the creating append and every
+    /// append after it must still land, in order, at `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn append_line_synced_appends_in_order_across_the_creating_and_later_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        append_line_synced(&path, "first\n").unwrap();
+        append_line_synced(&path, "second\n").unwrap();
+        append_line_synced(&path, "third\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first\nsecond\nthird\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// The re-tightening in `ensure_handle_0600` runs before the new
+    /// emptiness probe reads the same handle, so a pre-existing loose file
+    /// is still clamped on the synced path, not only on `append_line`'s.
+    #[cfg(unix)]
+    #[test]
+    fn append_line_synced_retightens_preexisting_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        append_line_synced(&path, "new\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// The synced appender's error arm. `record_audit_fails_closed_when_the_
+    /// write_errors` covers `append_line_no_rotation`'s, so without this the
+    /// one appender whose failure *refuses a Drive write* had none of its
+    /// own.
+    #[test]
+    fn append_line_synced_errors_when_the_target_is_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(append_line_synced(&path, "line\n").is_err());
+    }
+
+    /// An empty-but-existing file takes the conservative branch (one spare
+    /// directory `fsync`) rather than being mistaken for something that
+    /// cannot be appended to.
+    #[test]
+    fn append_line_synced_appends_to_an_existing_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        append_line_synced(&path, "line\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line\n");
     }
 
     #[test]

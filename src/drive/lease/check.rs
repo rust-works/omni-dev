@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::drive::files_api::FilesApi;
 use crate::drive::lease::ledger::{
-    default_lock_wait_timeout, LeaseBackup, LeaseLedger, LedgerLock,
+    default_lock_wait_timeout, offload_short_blocking_io, LeaseBackup, LeaseLedger, LedgerLock,
 };
 use crate::request_log::AuditOutcome;
 
@@ -217,67 +217,76 @@ pub(crate) async fn check_and_lock_lease_with_timeout(
             return Err(LeaseGateRefusal::Failed(err.to_string()));
         }
     };
-    // Every exit below refuses unless the token is verified live, bound to
-    // this file, and fresh — a `Result` failure anywhere in this lookup (an
-    // unreadable ledger, an absent token) must refuse, never fall through
-    // as "no refusal". `?` is deliberately not used on the ledger load: a
-    // stray `?` here would turn a read error into silent approval — the
-    // opposite of fail-closed.
-    let ledger = match LeaseLedger::load(ledger_path) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            // Bind the path so it is formatted whenever the branch runs —
-            // not only when a subscriber happens to be installed — so
-            // coverage sees it (the `daemon/services/worktrees.rs::
-            // load_pr_cache` pattern).
-            let ledger_path = ledger_path.display();
-            tracing::warn!(
-                "{log_prefix}: lease ledger at {ledger_path} could not be read ({err}); \
-                 refusing the presented lease as expired rather than trusting an unreadable \
-                 ledger"
-            );
-            // Refused as expired like an unknown token, but the record
-            // keeps the reason: an unreadable ledger is a systemic problem
-            // an auditor should be able to tell apart from a stale token.
-            refuse(
-                Some(token),
-                verdict::REFUSED_LEASE_EXPIRED,
-                Some(format!(
-                    "lease ledger at {ledger_path} could not be read: {err}"
-                )),
-            );
+    // Everything from here to the write-ahead record is straight-line
+    // blocking file I/O with no `.await` in it — a ledger read, then either
+    // one refusal record or the `fsync`ed intent write. One
+    // `offload_short_blocking_io` region covers the lot, rather than one
+    // per call: each region hands this worker's core away and takes it
+    // back, so three wraps would pay that three times for what is a single
+    // uninterrupted stretch of I/O (issue #1697).
+    offload_short_blocking_io(|| {
+        // Every exit below refuses unless the token is verified live, bound
+        // to this file, and fresh — a `Result` failure anywhere in this
+        // lookup (an unreadable ledger, an absent token) must refuse, never
+        // fall through as "no refusal". `?` is deliberately not used on the
+        // ledger load: a stray `?` here would turn a read error into silent
+        // approval — the opposite of fail-closed.
+        let ledger = match LeaseLedger::load(ledger_path) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                // Bind the path so it is formatted whenever the branch runs —
+                // not only when a subscriber happens to be installed — so
+                // coverage sees it (the `daemon/services/worktrees.rs::
+                // load_pr_cache` pattern).
+                let ledger_path = ledger_path.display();
+                tracing::warn!(
+                    "{log_prefix}: lease ledger at {ledger_path} could not be read ({err}); \
+                     refusing the presented lease as expired rather than trusting an unreadable \
+                     ledger"
+                );
+                // Refused as expired like an unknown token, but the record
+                // keeps the reason: an unreadable ledger is a systemic problem
+                // an auditor should be able to tell apart from a stale token.
+                refuse(
+                    Some(token),
+                    verdict::REFUSED_LEASE_EXPIRED,
+                    Some(format!(
+                        "lease ledger at {ledger_path} could not be read: {err}"
+                    )),
+                );
+                return Err(LeaseGateRefusal::Expired);
+            }
+        };
+        let Some(record) = ledger.get(token) else {
+            refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
+            return Err(LeaseGateRefusal::Expired);
+        };
+        if !record.is_live(chrono::Utc::now()) {
+            refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
             return Err(LeaseGateRefusal::Expired);
         }
-    };
-    let Some(record) = ledger.get(token) else {
-        refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
-        return Err(LeaseGateRefusal::Expired);
-    };
-    if !record.is_live(chrono::Utc::now()) {
-        refuse(Some(token), verdict::REFUSED_LEASE_EXPIRED, None);
-        return Err(LeaseGateRefusal::Expired);
-    }
-    if record.file_id != file_id {
-        refuse(Some(token), verdict::REFUSED_LEASE_WRONG_FILE, None);
-        return Err(LeaseGateRefusal::WrongFile);
-    }
-    if live_version != Some(record.version.as_str()) {
-        refuse(Some(token), verdict::REFUSED_LEASE_STALE, None);
-        return Err(LeaseGateRefusal::Stale);
-    }
+        if record.file_id != file_id {
+            refuse(Some(token), verdict::REFUSED_LEASE_WRONG_FILE, None);
+            return Err(LeaseGateRefusal::WrongFile);
+        }
+        if live_version != Some(record.version.as_str()) {
+            refuse(Some(token), verdict::REFUSED_LEASE_STALE, None);
+            return Err(LeaseGateRefusal::Stale);
+        }
 
-    // The write-ahead intent record — fail-closed, see the doc comment.
-    let intent = before(Some(token), verdict::PENDING);
-    if let Err(err) = crate::request_log::record_audit_event(intent) {
-        return Err(LeaseGateRefusal::Failed(format!(
-            "failed to write the write-ahead audit record: {err}"
-        )));
-    }
+        // The write-ahead intent record — fail-closed, see the doc comment.
+        let intent = before(Some(token), verdict::PENDING);
+        if let Err(err) = crate::request_log::record_audit_event(intent) {
+            return Err(LeaseGateRefusal::Failed(format!(
+                "failed to write the write-ahead audit record: {err}"
+            )));
+        }
 
-    Ok(LeaseGrant {
-        lock,
-        backup: record.backup.clone(),
-        token: token.to_string(),
+        Ok(LeaseGrant {
+            lock,
+            backup: record.backup.clone(),
+            token: token.to_string(),
+        })
     })
 }
 
@@ -483,9 +492,17 @@ fn audit_outcome(write: LeasedWrite<'_>, lease_id: Option<&str>, verdict: &str) 
 /// surfaced. Every record in this module goes through here except the
 /// write-ahead intent record, whose failure [`check_and_lock_lease`]
 /// refuses the write on.
+///
+/// The append is `fsync`ed, so it goes through
+/// [`offload_short_blocking_io`] here rather than at each call site — this
+/// is the module's single audit-write choke point, so a refusal path added
+/// later cannot forget it. Nested inside a caller that already opened its
+/// own region the helper is a no-op, which is why the two big regions
+/// below can still cover their whole stretch of I/O in one hand-off.
 fn write_audit_best_effort(log_prefix: &str, outcome: AuditOutcome) {
     let verdict = outcome.verdict.clone();
-    if let Err(err) = crate::request_log::record_audit_event(outcome) {
+    if let Err(err) = offload_short_blocking_io(|| crate::request_log::record_audit_event(outcome))
+    {
         tracing::warn!("{log_prefix}: failed to write the `{verdict}` audit record: {err}");
     }
 }
@@ -524,6 +541,16 @@ pub(crate) fn record_failed_leased_write(write: LeasedWrite<'_>, token: &str, er
 /// [`check_and_lock_lease`]) rather than acquiring its own — acquiring a
 /// second time here, in the same process, on the same path, would fail
 /// against the lock this call is still holding.
+///
+/// It takes a bare [`LedgerLock`], not the [`LeaseGrant`] the lock came
+/// from, and `LeaseLedger::mutate` re-reads the ledger [`check_and_lock_lease`]
+/// already read under that same lock. Both are deliberate (issue #1697):
+/// `mutate`'s own doc comment has the reasoning, the short version being
+/// that the rewrite it performs covers every row, so building it on a
+/// caller's older snapshot would trade one small read for two views of one
+/// ledger under a single lock. [`finish_leased_native_write`] and this
+/// module's tests also call in with a lock and no grant, so the narrower
+/// parameter is what they need.
 pub(crate) fn finish_leased_write(
     write: LeasedWrite<'_>,
     lock: &LedgerLock,
@@ -536,25 +563,31 @@ pub(crate) fn finish_leased_write(
         ledger_path,
         ..
     } = write;
-    let mut outcome = audit_outcome(write, Some(token), verdict::ALLOWED);
-    outcome.version_after.clone_from(&version);
-    outcome.modified_time_after.clone_from(&modified_time);
-    write_audit_best_effort(log_prefix, outcome);
+    // One region for both halves — an `fsync`ed audit append and a full
+    // ledger rewrite — for the same reason the gate itself takes one (issue
+    // #1697). This is a sync fn reachable with no runtime at all, which
+    // `offload_short_blocking_io` handles by just running the closure.
+    offload_short_blocking_io(|| {
+        let mut outcome = audit_outcome(write, Some(token), verdict::ALLOWED);
+        outcome.version_after.clone_from(&version);
+        outcome.modified_time_after.clone_from(&modified_time);
+        write_audit_best_effort(log_prefix, outcome);
 
-    let Some(version) = version else {
-        tracing::debug!(
-            "{log_prefix}: write response carried no `version`; lease ledger not refreshed"
-        );
-        return;
-    };
-    let result = LeaseLedger::mutate(lock, ledger_path, |ledger| {
-        ledger.record_write(token, version, modified_time);
+        let Some(version) = version else {
+            tracing::debug!(
+                "{log_prefix}: write response carried no `version`; lease ledger not refreshed"
+            );
+            return;
+        };
+        let result = LeaseLedger::mutate(lock, ledger_path, |ledger| {
+            ledger.record_write(token, version, modified_time);
+        });
+        if let Err(err) = result {
+            tracing::debug!(
+                "{log_prefix}: failed to refresh lease ledger after a successful write: {err}"
+            );
+        }
     });
-    if let Err(err) = result {
-        tracing::debug!(
-            "{log_prefix}: failed to refresh lease ledger after a successful write: {err}"
-        );
-    }
 }
 
 /// [`finish_leased_write`] for a surface whose mutating call itself
@@ -1390,5 +1423,96 @@ mod tests {
             LeaseGateRefusal::Failed("boom".to_string()).describe_line("file-1", "'Budget'"),
             None
         );
+    }
+
+    /// `multi_thread` on purpose — the only flavor on which the gate's
+    /// `offload_short_blocking_io` regions actually reach
+    /// `tokio::task::block_in_place` (issue #1697). Two things are pinned
+    /// at once: the gate still works there (a bare `block_in_place` would
+    /// have been fine here and panicked in every other test in this file),
+    /// and its audit records still land in *this* test's redirected route.
+    /// The second is the load-bearing half: `request_log` routes the audit
+    /// file through a thread-local, so an offload that moved the write to
+    /// another thread — `spawn_blocking` would — writes the forensic record
+    /// somewhere else entirely, which no assertion on the refusal itself
+    /// would catch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gate_writes_its_audit_records_on_the_calling_thread_when_it_offloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        // `LeaseGateRefusal` is deliberately not `Debug`, so no `expect`.
+        let Ok(grant) = check_and_lock_lease(
+            leased("edit", &ledger_path, "file-1"),
+            Some("tok-1"),
+            Some("1"),
+            Some("2026-09-11T00:00:00Z"),
+        )
+        .await
+        else {
+            panic!("a live, correctly-bound, fresh lease must be granted");
+        };
+
+        finish_leased_write(
+            leased("edit", &ledger_path, "file-1"),
+            &grant.lock,
+            &grant.token,
+            Some("2".to_string()),
+            None,
+        );
+        drop(grant);
+
+        assert_eq!(
+            audit.verdicts(),
+            [verdict::PENDING, verdict::ALLOWED],
+            "{:?}",
+            audit.records()
+        );
+        let reloaded = LeaseLedger::load(&ledger_path).unwrap();
+        assert_eq!(reloaded.get("tok-1").unwrap().version, "2");
+    }
+
+    /// Pins the reload issue #1697 proposed removing. `finish_leased_write`
+    /// goes through `LeaseLedger::mutate`, which re-reads the ledger rather
+    /// than rewriting a copy loaded earlier under the same lock — so a row
+    /// changed in between survives. `drive lease restore` depends on exactly
+    /// this shape, stamping its backup row through the grant's own lock; it
+    /// stamps *after* `finish_leased_write` today, but nothing in the type
+    /// system says it must, and a cached ledger would silently drop the
+    /// stamp if that order ever flipped.
+    #[test]
+    fn finish_leased_write_preserves_a_ledger_change_made_under_the_same_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let lock = LedgerLock::acquire(&ledger_path).unwrap();
+        seed_lease(&ledger_path, "tok-1", "file-1", "1");
+
+        // What `restore::stamp_backup_restored` does: another row's update,
+        // through the lock this write is already holding.
+        LeaseLedger::mutate(&lock, &ledger_path, |ledger| {
+            ledger.mark_restored("tok-1", chrono::Utc::now(), Some(42));
+        })
+        .unwrap();
+
+        finish_leased_write(
+            leased("edit", &ledger_path, "file-1"),
+            &lock,
+            "tok-1",
+            Some("2".to_string()),
+            None,
+        );
+
+        let reloaded = LeaseLedger::load(&ledger_path).unwrap();
+        let record = reloaded.get("tok-1").unwrap();
+        assert_eq!(record.version, "2", "the write's own refresh must land");
+        assert_eq!(
+            record.restored_sheet_id,
+            Some(42),
+            "the change made under the same lock must survive the refresh"
+        );
+        assert!(record.restored_at.is_some());
     }
 }
