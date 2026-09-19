@@ -15,6 +15,10 @@ scopes:
     description: "Datadog monitoring integration and REST API client"
     examples: ["datadog: add get_parsed to DatadogClient", "datadog: implement monitor search"]
     file_patterns: ["src/datadog.rs", "src/datadog/**", "src/cli/datadog.rs", "src/cli/datadog/**"]
+  - name: "jev"
+    description: "TypeSafe Jev System One API client and CLI surface"
+    examples: ["jev: add system-one REST client", "jev: implement choice/score/noul commands"]
+    file_patterns: ["src/jev.rs", "src/jev/**", "src/cli/ai/jev.rs", "src/cli/ai/jev/**"]
   - name: "cli"
     description: "Command-line interface and argument parsing"
     examples: ["cli: add twiddle contextual options", "cli: improve help text"]
