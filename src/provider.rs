@@ -56,6 +56,10 @@ pub struct Comment {
     pub author: String,
     /// The comment body (raw markdown, as authored).
     pub body: String,
+    /// The comment's GitHub database id, used by `verify-decision`'s
+    /// `--comment ID` to select one. `None` in hand-built test fixtures.
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 /// A reference to another issue or change request, e.g. one cited by a

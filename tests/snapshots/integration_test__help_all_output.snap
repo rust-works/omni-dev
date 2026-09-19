@@ -266,12 +266,13 @@ TypeSafe Jev typed judgments (choice, score, yes/no)
 Usage: jev <COMMAND>
 
 Commands:
-  choice  Picks one of a labelled set of options
-  score   Rates the state against an ordered scale
-  noul    Estimates the probability of a yes/no condition
-  ask     Answers several questions about one state in a single pass, from a file
-  route   Routes issues to model classes for their design, implement and review stages
-  help    Print this message or the help of the given subcommand(s)
+  choice           Picks one of a labelled set of options
+  score            Rates the state against an ordered scale
+  noul             Estimates the probability of a yes/no condition
+  ask              Answers several questions about one state in a single pass, from a file
+  route            Routes issues to model classes for their design, implement and review stages
+  verify-decision  Checks a decision comment against the issues or pull requests it cites
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -378,6 +379,54 @@ Options:
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev verify-decision - Checks a decision comment against the issues or pull requests it cites
+
+Checks a decision comment against the issues or pull requests it cites
+
+Usage: verify-decision [OPTIONS] <ISSUE>
+
+Arguments:
+  <ISSUE>  The issue whose decision comment should be checked: `#N` or `N` (in the current repository), `owner/repo#N`, or an issue URL
+
+Options:
+      --comment <ID|latest>
+          The comment to check: `latest` (the most recent comment that cites another issue or pull request), a numeric comment id, or an issue-comment URL [default: latest]
+      --threshold <PROBABILITY>
+          Threshold above which a statement counts as supported [default: 0.5]
+      --reject-below <PROBABILITY>
+          Threshold below which a statement rejects the comment outright [default: 0.3]
+      --coverage-threshold <PROBABILITY>
+          Threshold below which low statement coverage becomes a review reason [default: 0.5]
+      --max-input-chars <CHARS>
+          Longest source text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
+  -o, --output <OUTPUT>
+          Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>
+          Overrides the configured Jev model for this call
+  -C, --repo <PATH>
+          Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -h, --help
+          Print help (see more with '--help')
+
+AI backend:
+      --ai-backend <AI_BACKEND>
+          Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
+      --model <MODEL>
+          AI model to use for this command
+      --beta-header <KEY:VALUE>
+          Beta header to send with AI API requests (format: key:value)
+      --claude-cli-allow-tools
+          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default built-in tools (Read, Edit, Write, Bash, Glob, Grep)
+      --claude-cli-allow-mcp
+          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to load MCP servers from `~/.claude/settings.json`
+      --claude-cli-max-budget-usd <AMOUNT>
+          Per-invocation spending cap in USD for the `claude-cli` backend
+      --models-yaml <PATH>
+          Path to a single user-side `models.yaml` that short-circuits the standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml` lookup. The file is still merged over the embedded catalog. Equivalent to setting `OMNI_DEV_MODELS_YAML`
 
 
 ================================================================================

@@ -47,7 +47,7 @@ impl ModelsYamlArg {
 
 /// The AI backend flags, flattened onto every command that builds an AI
 /// client (`git commit message {twiddle,check,staged}`, `git branch create pr`,
-/// `ai chat`).
+/// `ai chat`, `ai jev verify-decision`).
 #[derive(Args, Debug, Clone, Default)]
 #[command(next_help_heading = "AI backend")]
 pub struct AiBackendArgs {
@@ -270,6 +270,7 @@ mod tests {
             &["git", "commit", "message", "staged"],
             &["git", "branch", "create", "pr"],
             &["ai", "chat"],
+            &["ai", "jev", "verify-decision", "#1"],
         ] {
             let argv: Vec<&str> = std::iter::once("omni-dev")
                 .chain(leaf.iter().copied())

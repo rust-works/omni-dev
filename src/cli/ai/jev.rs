@@ -3,8 +3,9 @@
 //! Wraps [`crate::jev::client::JevClient`]'s single `system_one` call behind
 //! four subcommands: `choice`, `score`, `noul` (single-question) and `ask`
 //! (multi-question, from a file), plus `route`, which asks the stage questions
-//! of [`crate::jev::route`] about GitHub issues. See `docs/jev.md` for the
-//! operator guide.
+//! of [`crate::jev::route`] about GitHub issues, and `verify-decision`, which
+//! checks a decision comment against the sources it cites
+//! ([`crate::jev::verify`]). See `docs/jev.md` for the operator guide.
 
 mod ask;
 mod choice;
@@ -12,6 +13,7 @@ mod common;
 mod noul;
 mod route;
 mod score;
+mod verify_decision;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -20,11 +22,13 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     long_about = "TypeSafe Jev typed judgments (choice, score, yes/no).\n\nJev is a \
-separate typed-judgment API, not a chat model, so jev subcommands do **not** accept \
+separate typed-judgment API, not a chat model, so most jev subcommands do **not** accept \
 the AI backend flags (`--ai-backend`, `--model`, `--claude-cli-*`, ...) — passing any \
-of them is a clap error — and only `route` accepts `-C/--repo`. An exported \
-`OMNI_DEV_MODEL` is silently ignored. Use `--jev-model` on each subcommand instead to \
-override the Jev model."
+of them is a clap error on those leaves. `route` and `verify-decision` are the two \
+exceptions to `-C/--repo`, and `verify-decision` is the one subcommand that also accepts \
+the AI backend flags, since it uses an AI backend to split a decision comment into \
+statements before checking them with Jev. An exported `OMNI_DEV_MODEL` is silently ignored \
+by every Jev call. Use `--jev-model` on each subcommand instead to override the Jev model."
 )]
 pub struct JevCommand {
     /// The jev subcommand to execute.
@@ -45,6 +49,8 @@ pub enum JevSubcommands {
     Ask(ask::AskCommand),
     /// Routes issues to model classes for their design, implement and review stages.
     Route(route::RouteCommand),
+    /// Checks a decision comment against the issues or pull requests it cites.
+    VerifyDecision(verify_decision::VerifyDecisionCommand),
 }
 
 impl JevCommand {
@@ -56,6 +62,7 @@ impl JevCommand {
             JevSubcommands::Noul(cmd) => cmd.execute().await,
             JevSubcommands::Ask(cmd) => cmd.execute().await,
             JevSubcommands::Route(cmd) => cmd.execute().await,
+            JevSubcommands::VerifyDecision(cmd) => cmd.execute().await,
         }
     }
 }

@@ -343,6 +343,7 @@ mod tests {
             "git commit message staged",
             "git branch create pr",
             "ai chat",
+            "ai jev verify-decision",
         ];
         let expected: [(&str, Vec<&str>); 4] = [
             ("ai-backend", AI.to_vec()),
@@ -356,6 +357,7 @@ mod tests {
                     "worktrees rebase",
                     "worktrees push",
                     "ai jev route",
+                    "ai jev verify-decision",
                 ],
             ),
             (
@@ -419,6 +421,7 @@ mod tests {
             "omni-dev config scopes --repo",
             // `RepoArg` is `global = true` even on this leaf (a no-op there).
             "omni-dev ai jev route --repo",
+            "omni-dev ai jev verify-decision --repo",
             "omni-dev atlassian jira --instance",
             "omni-dev atlassian confluence --instance",
             "omni-dev atlassian auth status --instance",

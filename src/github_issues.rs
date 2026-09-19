@@ -263,7 +263,7 @@ fn issue_fragment(alias: &str, number: u64) -> String {
     format!(
         r"{alias}: issue(number:{number}){{
       title body state url
-      comments(last:{MAX_COMMENTS}){{ totalCount nodes{{ author{{ __typename login }} body }} }}
+      comments(last:{MAX_COMMENTS}){{ totalCount nodes{{ databaseId author{{ __typename login }} body }} }}
       closedByPullRequestsReferences(first:10){{ nodes{{ number }} }}
     }}"
     )
@@ -309,9 +309,11 @@ fn human_comments(item_ref: &ItemRef, node: &Value) -> Vec<Comment> {
                 .and_then(Value::as_str)
                 .unwrap_or(GHOST_LOGIN);
             let body = c.get("body")?.as_str()?.to_string();
+            let id = c.get("databaseId").and_then(Value::as_u64);
             Some(Comment {
                 author: login.to_string(),
                 body,
+                id,
             })
         })
         .collect()
@@ -470,6 +472,218 @@ pub fn fetch_issues(bin: &Path, refs: &[ItemRef]) -> Result<Vec<IssueDoc>> {
                 .get(&(item_ref.project.clone(), item_ref.number))
                 .cloned()
                 .ok_or_else(|| anyhow!("issue {item_ref} missing from the parsed gh reply (bug)"))
+        })
+        .collect()
+}
+
+/// The GraphQL fragment resolving one reference that may be either an issue
+/// or a pull request — used by `verify-decision` to fetch a decision
+/// comment's cited sources, where `#N` is ambiguous until the API answers.
+/// `__typename` decides the [`ItemKind`]; only [`ItemKind::Issue`] carries
+/// comments and closing PRs (a pull request's own body is the whole source).
+fn item_fragment(alias: &str, number: u64) -> String {
+    format!(
+        r"{alias}: issueOrPullRequest(number:{number}){{
+      __typename
+      ... on Issue {{
+        title body state url
+        comments(last:{MAX_COMMENTS}){{ totalCount nodes{{ databaseId author{{ __typename login }} body }} }}
+        closedByPullRequestsReferences(first:10){{ nodes{{ number }} }}
+      }}
+      ... on PullRequest {{
+        title body state url
+      }}
+    }}"
+    )
+}
+
+/// [`build_issue_query`], but for [`item_fragment`] — same repo-grouping and
+/// alias scheme, so [`parse_item_response`] can reuse [`describe_graphql_errors`].
+fn build_item_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
+    if refs.is_empty() {
+        return None;
+    }
+    let mut by_project: BTreeMap<&str, Vec<&ItemRef>> = BTreeMap::new();
+    for item_ref in refs {
+        by_project
+            .entry(item_ref.project.as_str())
+            .or_default()
+            .push(item_ref);
+    }
+    let mut index = HashMap::new();
+    let mut repos = Vec::new();
+    for (ri, (project, items)) in by_project.iter().enumerate() {
+        let Some((owner, name)) = project.split_once('/') else {
+            continue; // validated by the citation parser; defensive skip only
+        };
+        let mut frags = Vec::new();
+        for (ii, item_ref) in items.iter().enumerate() {
+            frags.push(item_fragment(&format!("i{ii}"), item_ref.number));
+            index.insert((ri, ii), (*item_ref).clone());
+        }
+        let owner = Value::String(owner.to_string());
+        let name = Value::String(name.to_string());
+        repos.push(format!(
+            "r{ri}: repository(owner:{owner}, name:{name}){{\n{}\n}}",
+            frags.join("\n")
+        ));
+    }
+    Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
+}
+
+/// Builds an [`IssueDoc`] from an `issueOrPullRequest` node, using
+/// `__typename` — not the caller's `item_ref.kind` hint — to decide whether
+/// this is an issue or a change request: a decision comment citing "PR #N"
+/// when `#N` is actually an issue (or vice versa) must be resolved by what
+/// the item *is*, not by how it was written.
+fn build_item_doc(item_ref: &ItemRef, node: &Value) -> Result<IssueDoc> {
+    let kind = match node.get("__typename").and_then(Value::as_str) {
+        Some("Issue") => ItemKind::Issue,
+        Some("PullRequest") => ItemKind::ChangeRequest,
+        other => bail!("item {item_ref}: unrecognised __typename {other:?}"),
+    };
+    let title = node
+        .get("title")
+        .and_then(Value::as_str)
+        .with_context(|| format!("item {item_ref}: response had no `title`"))?
+        .to_string();
+    let body = node
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let url = node
+        .get("url")
+        .and_then(Value::as_str)
+        .with_context(|| format!("item {item_ref}: response had no `url`"))?
+        .to_string();
+    let state = match node.get("state").and_then(Value::as_str) {
+        Some("OPEN") => ItemState::Open,
+        Some("CLOSED" | "MERGED") => ItemState::Closed,
+        other => bail!("item {item_ref}: unrecognised state {other:?}"),
+    };
+    let (comments, closed_by) = if kind == ItemKind::Issue {
+        (
+            human_comments(item_ref, node),
+            node.get("closedByPullRequestsReferences")
+                .and_then(|c| c.get("nodes"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|pr| {
+                    let number = pr.get("number")?.as_u64()?;
+                    Some(ItemRef {
+                        provider: GitProvider::GitHub,
+                        project: item_ref.project.clone(),
+                        kind: ItemKind::ChangeRequest,
+                        number,
+                    })
+                })
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(IssueDoc {
+        provider: GitProvider::GitHub,
+        project: item_ref.project.clone(),
+        number: item_ref.number,
+        kind,
+        title,
+        state,
+        body,
+        comments,
+        closed_by,
+        url,
+    })
+}
+
+/// Reads every aliased item out of an [`item_fragment`] query reply.
+///
+/// Unlike [`parse_issue_response`], a per-item `NOT_FOUND` is **tolerated**
+/// as `None` rather than failing the whole batch: a decision comment's
+/// citation can be stale or point at a typo, and one bad citation must not
+/// stop `verify-decision` from checking the rest. Any other GraphQL error
+/// (a missing repository, a rate limit) still fails the batch — retrying it
+/// per item would not help.
+fn parse_item_response(
+    body: &Value,
+    index: &QueryIndex,
+) -> Result<HashMap<(String, u64), Option<IssueDoc>>> {
+    let mut not_found: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+        for error in errors {
+            let is_not_found = error.get("type").and_then(Value::as_str) == Some("NOT_FOUND");
+            let path = error.get("path").and_then(Value::as_array);
+            let alias = |segment: Option<&Value>, prefix: char| {
+                segment
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix(prefix))
+                    .and_then(|n| n.parse::<usize>().ok())
+            };
+            let ri = alias(path.and_then(|p| p.first()), 'r');
+            let ii = alias(path.and_then(|p| p.get(1)), 'i');
+            match (is_not_found, ri, ii) {
+                (true, Some(ri), Some(ii)) if index.contains_key(&(ri, ii)) => {
+                    not_found.insert((ri, ii));
+                }
+                _ => bail!(
+                    "{}",
+                    describe_graphql_errors(std::slice::from_ref(error), index)
+                ),
+            }
+        }
+    }
+
+    let data = body
+        .get("data")
+        .context("gh api graphql response had no `data`")?;
+
+    let mut docs = HashMap::with_capacity(index.len());
+    for ((ri, ii), item_ref) in index {
+        let key = (item_ref.project.clone(), item_ref.number);
+        if not_found.contains(&(*ri, *ii)) {
+            docs.insert(key, None);
+            continue;
+        }
+        let node = data
+            .get(format!("r{ri}"))
+            .and_then(|r| r.get(format!("i{ii}")))
+            .filter(|v| !v.is_null());
+        match node {
+            Some(node) => {
+                docs.insert(key, Some(build_item_doc(item_ref, node)?));
+            }
+            None => {
+                docs.insert(key, None);
+            }
+        }
+    }
+    Ok(docs)
+}
+
+/// Fetches a set of references that may be issues or pull requests.
+///
+/// Tolerates a per-reference "not found" (`None`) rather than failing the
+/// whole call — used by `verify-decision` to resolve a decision comment's
+/// citations. Returns one entry per `refs`, in the same order.
+/// **Blocking** — callers must be on a blocking thread.
+pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>> {
+    let mut by_key = HashMap::with_capacity(refs.len());
+    for chunk in refs.chunks(MAX_ISSUES_PER_QUERY) {
+        let Some((query, index)) = build_item_query(chunk) else {
+            continue;
+        };
+        let body = crate::pr_status::run_gh_graphql(bin, &query)?;
+        by_key.extend(parse_item_response(&body, &index)?);
+    }
+    refs.iter()
+        .map(|item_ref| {
+            by_key
+                .get(&(item_ref.project.clone(), item_ref.number))
+                .cloned()
+                .ok_or_else(|| anyhow!("item {item_ref} missing from the parsed gh reply (bug)"))
         })
         .collect()
 }
@@ -890,5 +1104,111 @@ mod tests {
         let numbers =
             retry_on_etxtbsy(|| list_open_issue_numbers(&bin, "rust-works/omni-dev")).unwrap();
         assert_eq!(numbers, vec![1, 2]);
+    }
+
+    // ── fetch_items (fake-gh shim) ────────────────────────────────────
+
+    fn pr_ref(project: &str, number: u64) -> ItemRef {
+        ItemRef {
+            provider: GitProvider::GitHub,
+            project: project.to_string(),
+            kind: ItemKind::ChangeRequest,
+            number,
+        }
+    }
+
+    #[test]
+    fn fetch_items_resolves_an_issue_by_typename() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": {"i0": {
+                    "__typename": "Issue",
+                    "title": "t", "body": "b", "state": "OPEN", "url": "u",
+                    "comments": {"totalCount": 1, "nodes": [
+                        {"databaseId": 42, "author": {"login": "human"}, "body": "hi"}
+                    ]},
+                    "closedByPullRequestsReferences": {"nodes": [{"number": 7}]}
+                }}}
+            })
+            .to_string(),
+            0,
+        );
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &[item_ref("rust-works/omni-dev", 1614)]))
+            .unwrap();
+        let doc = docs[0].as_ref().unwrap();
+        assert_eq!(doc.kind, ItemKind::Issue);
+        assert_eq!(doc.comments[0].id, Some(42));
+        assert_eq!(doc.closed_by[0].number, 7);
+        assert_eq!(doc.closed_by[0].kind, ItemKind::ChangeRequest);
+    }
+
+    #[test]
+    fn fetch_items_resolves_a_pull_request_by_typename_even_when_cited_as_an_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": {"i0": {
+                    "__typename": "PullRequest",
+                    "title": "t", "body": "b", "state": "MERGED", "url": "u"
+                }}}
+            })
+            .to_string(),
+            0,
+        );
+        // Cited with an Issue kind hint (e.g. "#1629"); __typename overrides it.
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &[item_ref("rust-works/omni-dev", 1629)]))
+            .unwrap();
+        let doc = docs[0].as_ref().unwrap();
+        assert_eq!(doc.kind, ItemKind::ChangeRequest);
+        assert_eq!(doc.state, ItemState::Closed);
+        assert!(doc.comments.is_empty());
+    }
+
+    #[test]
+    fn fetch_items_tolerates_a_not_found_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": {"i0": null}},
+                "errors": [{
+                    "type": "NOT_FOUND", "path": ["r0", "i0"],
+                    "message": "Could not resolve to an issue or pull request."
+                }]
+            })
+            .to_string(),
+            0,
+        );
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &[pr_ref("rust-works/omni-dev", 99999)]))
+            .unwrap();
+        assert!(docs[0].is_none());
+    }
+
+    #[test]
+    fn fetch_items_still_bails_on_a_missing_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": null},
+                "errors": [{"type": "NOT_FOUND", "path": ["r0"], "message": "Could not resolve"}]
+            })
+            .to_string(),
+            0,
+        );
+        let err = retry_on_etxtbsy(|| fetch_items(&bin, &[pr_ref("no/such", 1)])).unwrap_err();
+        assert!(err.to_string().contains("no/such"), "{err}");
+    }
+
+    #[test]
+    fn item_fragment_uses_the_polymorphic_field() {
+        let fragment = item_fragment("i0", 42);
+        assert!(fragment.contains("issueOrPullRequest(number:42)"));
+        assert!(fragment.contains("__typename"));
+        assert!(fragment.contains("... on Issue"));
+        assert!(fragment.contains("... on PullRequest"));
     }
 }
