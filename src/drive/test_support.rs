@@ -206,3 +206,18 @@ pub(crate) fn seed_lease_full(
         backup,
     )
 }
+
+// ── Authenticator test doubles ──────────────────────────────────────────
+
+use crate::drive::lease::authenticate::{AuthOutcome, AuthPolicy, Authenticator};
+
+/// An [`Authenticator`] that always returns a fixed, caller-supplied
+/// [`AuthOutcome`] — for tests exercising both the authorized and
+/// denied/unavailable paths without a real prompt.
+pub(crate) struct FakeAuthenticator(pub(crate) AuthOutcome);
+
+impl Authenticator for FakeAuthenticator {
+    fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
+        self.0.clone()
+    }
+}

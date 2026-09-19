@@ -1015,6 +1015,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::lease::authenticate::Unsupported;
+    use crate::drive::test_support::FakeAuthenticator;
     use crate::test_support::AuditLogGuard as AuditGuard;
     use crate::utils::secret::Secret;
 
@@ -1046,13 +1047,6 @@ mod tests {
             &format!("{}/token", server.uri()),
         );
         client
-    }
-
-    struct FakeAuthenticator(AuthOutcome);
-    impl Authenticator for FakeAuthenticator {
-        fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-            self.0.clone()
-        }
     }
 
     /// An [`Authenticator`] that panics if ever called, carrying its own

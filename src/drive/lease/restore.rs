@@ -1169,6 +1169,7 @@ mod tests {
     use crate::drive::lease::ledger::{LeaseRecord, LedgerLock};
     use crate::drive::lease::release::{release, ReleaseOptions, ReleaseResult};
     use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::test_support::FakeAuthenticator;
     use crate::drive::types::{
         GOOGLE_DOC_MIME_TYPE, GOOGLE_FOLDER_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE,
     };
@@ -1214,13 +1215,6 @@ mod tests {
     fn sheets_client_for(server: &wiremock::MockServer, client: &DriveClient) -> SheetsClient {
         let env = MapEnv::new().with(SHEETS_API_URL, &server.uri());
         SheetsClient::from_drive_client_with(&env, client).unwrap()
-    }
-
-    struct FakeAuthenticator(AuthOutcome);
-    impl Authenticator for FakeAuthenticator {
-        fn authenticate(&self, _reason: &str, _policy: AuthPolicy) -> AuthOutcome {
-            self.0.clone()
-        }
     }
 
     struct PanicsIfCalled;
