@@ -68,6 +68,7 @@ Usage: ai <COMMAND>
 Commands:
   chat    Interactive AI chat session
   claude  Claude Code diagnostics and inspection
+  jev     TypeSafe Jev typed judgments (choice, score, yes/no)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -259,6 +260,105 @@ Options:
       --dry-run          Preview the changes without creating symlinks or modifying the exclude file
       --format <FORMAT>  Output format [default: text] [possible values: text, yaml]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev - TypeSafe Jev typed judgments (choice, score, yes/no)
+
+TypeSafe Jev typed judgments (choice, score, yes/no)
+
+Usage: jev <COMMAND>
+
+Commands:
+  choice  Picks one of a labelled set of options
+  score   Rates the state against an ordered scale
+  noul    Estimates the probability of a yes/no condition
+  ask     Answers several questions about one state in a single pass, from a file
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai jev ask - Answers several questions about one state in a single pass, from a file
+
+Answers several questions about one state in a single pass, from a file
+
+Usage: ask [OPTIONS] --questions <FILE> [STATE]
+
+Arguments:
+  [STATE]  The state to judge. Read from stdin if omitted
+
+Options:
+      --state-json         Parses `state` as JSON/YAML instead of sending it as a literal string
+      --questions <FILE>   YAML or JSON file mapping question name to a Jev question spec. Questions are file-only — state stays positional/stdin, so a pipe like `git diff | omni-dev ai jev ask --questions q.yaml` isn't ambiguous about which input stdin feeds
+  -o, --output <OUTPUT>    Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>  Overrides the configured Jev model for this call
+  -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev choice - Picks one of a labelled set of options
+
+Picks one of a labelled set of options
+
+Usage: choice [OPTIONS] --instructions <INSTRUCTIONS> [STATE]
+
+Arguments:
+  [STATE]  The state to judge. Read from stdin if omitted
+
+Options:
+      --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
+      --instructions <INSTRUCTIONS>  What to choose and why
+      --option <NAME=DESC>           A `NAME=DESCRIPTION` option. Repeatable; at least one is required
+  -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>            Overrides the configured Jev model for this call
+  -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev noul - Estimates the probability of a yes/no condition
+
+Estimates the probability of a yes/no condition
+
+Usage: noul [OPTIONS] --instructions <INSTRUCTIONS> [STATE]
+
+Arguments:
+  [STATE]  The state to judge. Read from stdin if omitted
+
+Options:
+      --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
+      --instructions <INSTRUCTIONS>  The yes/no condition to estimate
+      --true-means <TEXT>            What a `true`-leaning answer means
+      --false-means <TEXT>           What a `false`-leaning answer means
+  -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>            Overrides the configured Jev model for this call
+  -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev score - Rates the state against an ordered scale
+
+Rates the state against an ordered scale
+
+Usage: score [OPTIONS] --instructions <INSTRUCTIONS> [STATE]
+
+Arguments:
+  [STATE]  The state to judge. Read from stdin if omitted
+
+Options:
+      --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
+      --instructions <INSTRUCTIONS>  What to rate and how
+      --level <DESC>                 A scale level, low to high. Repeatable; at least two are required. Order is significant and preserved
+  -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>            Overrides the configured Jev model for this call
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
