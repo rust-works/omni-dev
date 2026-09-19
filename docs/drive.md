@@ -1460,6 +1460,42 @@ or deletes its content, the same exemption it has from
 `OMNI_DEV_LOG_DISABLE` and `omni-dev log prune`'s own rotation — see
 [docs/log.md](log.md#audit-log).
 
+### Exit codes
+
+`acquire`, `restore` and `release` each exit **`0`** when the caller ends
+up holding what they asked for, and **`1`** for every refusal, denial or
+failure — under every `-o` format, not just `table`. This is narrower than
+[Move](#move)'s "exit code is always 0, check the output" convention: a
+move is a batch operation with one outcome per file, so no single exit
+code could ever represent all of them, while a single `acquire`/`restore`/
+`release` call has exactly one outcome, so its exit code can name it
+(issue #1775).
+
+The `0` outcomes include two idempotent-reuse cases, not just the obvious
+ones:
+
+| Command   | Exits `0`                    |
+|-----------|-------------------------------|
+| `acquire` | `Acquired`, and `AlreadyLeased` (a live lease already covers the file — its own token is returned for reuse) |
+| `restore` | `Restored`, `RestoredSheet` |
+| `release` | `Released`, and `NotLive` (the token names a lease that was already expired or released — nothing to do, not a failure) |
+
+Everything else exits `1`. Two outcomes are easy to misjudge from their
+name or their payload alone:
+
+- **`restore`'s own `AlreadyLeased` is *not* one of the `0` cases above**,
+  despite sharing a name with `acquire`'s. It means some *other*, unrelated
+  live lease blocked this restore — nothing was restored — and names that
+  lease's token so it can be presented to `--lease`, released, or waited
+  out; see [Restore](#restore).
+- **`FreshLeaseButWriteFailed` still prints a real, usable token** — Touch
+  ID was answered, a backup taken, a ledger row written — but exits `1`
+  regardless, because the restore write itself did not go through.
+
+A script that only checks the exit code — `omni-dev drive lease acquire
+"$ID" > /tmp/out || exit 1` — can now rely on it; one that also wants the
+lease token or the refusal detail still reads the output as before.
+
 ## Sheets
 
 `drive sheets` reads and writes the *cells* of a Google Sheet through the

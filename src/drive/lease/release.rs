@@ -100,6 +100,17 @@ impl ReleaseResult {
             Self::Failed { .. } => "failed",
         }
     }
+
+    /// The CLI's exit code for this outcome (issue #1775): `0` for
+    /// `Released` and, since it's an idempotent no-op rather than a
+    /// failure, `NotLive` too — the caller's goal, "this lease is not
+    /// live", already holds. `NoSuchToken`/`Failed` are `1`.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Released { .. } | Self::NotLive { .. } => 0,
+            Self::NoSuchToken | Self::Failed { .. } => 1,
+        }
+    }
 }
 
 /// Releases `opts.token`, then records the attempt to the audit sink
@@ -466,5 +477,41 @@ mod tests {
         ReleaseResult::NoSuchToken.write_jsonl(&mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"status\":\"no-such-token\""), "{text}");
+    }
+
+    /// Pins the CLI exit-code classification (issue #1775): `NotLive` is
+    /// `0`, the one outcome the issue left open — it's an idempotent
+    /// no-op, not a failure.
+    #[test]
+    fn exit_code_matches_the_documented_classification() {
+        let cases: Vec<(ReleaseResult, i32)> = vec![
+            (
+                ReleaseResult::Released {
+                    token: "tok".to_string(),
+                    file_id: "file-1".to_string(),
+                    expires_at: Utc::now(),
+                },
+                0,
+            ),
+            (
+                ReleaseResult::NotLive {
+                    token: "tok".to_string(),
+                    file_id: "file-1".to_string(),
+                    expires_at: Utc::now(),
+                    released_at: None,
+                },
+                0,
+            ),
+            (ReleaseResult::NoSuchToken, 1),
+            (
+                ReleaseResult::Failed {
+                    detail: "boom".to_string(),
+                },
+                1,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result.exit_code(), expected, "{result:?}");
+        }
     }
 }

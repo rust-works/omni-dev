@@ -344,6 +344,33 @@ impl RestoreResult {
             Self::FreshLeaseButWriteFailed { .. } => "fresh-lease-but-write-failed",
         }
     }
+
+    /// The CLI's exit code for this outcome (issue #1775): `0` only when a
+    /// fresh lease was minted and the restore write itself went through —
+    /// `Restored`/`RestoredSheet`. Every other variant is `1`, **including
+    /// [`Self::AlreadyLeased`]**: unlike `AcquireResult::AlreadyLeased`
+    /// (which reuses the caller's *own* lease), this variant means some
+    /// *other* live lease blocked this restore, so nothing was restored.
+    /// [`Self::FreshLeaseButWriteFailed`] is `1` too — a real, live token is
+    /// printed, but the restore write did not happen.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Restored { .. } | Self::RestoredSheet { .. } => 0,
+            Self::SheetAlreadyRestored { .. }
+            | Self::NoSuchBackupToken
+            | Self::NoTypedRestorePath { .. }
+            | Self::BackupTooLargeForSimpleUpload { .. }
+            | Self::RefusedNoVisibleParents
+            | Self::Blocked { .. }
+            | Self::AlreadyLeased { .. }
+            | Self::RefusedNativeDocument
+            | Self::RefusedConcurrentChange { .. }
+            | Self::Denied { .. }
+            | Self::Unavailable { .. }
+            | Self::Failed { .. }
+            | Self::FreshLeaseButWriteFailed { .. } => 1,
+        }
+    }
 }
 
 /// Runs one restore attempt, then records it to the audit sink regardless
@@ -3874,5 +3901,104 @@ mod tests {
             restored_sheet(true).verdict(),
             "restored-sheet-headless-waiver"
         );
+    }
+
+    /// Pins the CLI exit-code classification (issue #1775) for every
+    /// variant — in particular that `AlreadyLeased` is `1`, unlike
+    /// `AcquireResult::AlreadyLeased`, and that `FreshLeaseButWriteFailed`
+    /// is `1` despite carrying a real, usable token.
+    #[test]
+    fn exit_code_matches_the_documented_classification() {
+        let backup = || LeaseBackup::Bytes {
+            path: PathBuf::from("/tmp/backup"),
+            sha256: "deadbeef".to_string(),
+            size: 0,
+        };
+        let cases: Vec<(RestoreResult, i32)> = vec![
+            (
+                RestoreResult::Restored {
+                    new_token: "tok".to_string(),
+                    expires_at: Utc::now(),
+                    backup: backup(),
+                    headless_waiver: false,
+                },
+                0,
+            ),
+            (
+                RestoreResult::RestoredSheet {
+                    new_token: "tok".to_string(),
+                    expires_at: Utc::now(),
+                    backup: backup(),
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet_id: 1,
+                    sheet_title: "Sheet1".to_string(),
+                    headless_waiver: false,
+                },
+                0,
+            ),
+            (
+                RestoreResult::SheetAlreadyRestored {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet_id: 1,
+                    sheet_title: "Sheet1".to_string(),
+                    restored_at: None,
+                    live_lease: None,
+                },
+                1,
+            ),
+            (RestoreResult::NoSuchBackupToken, 1),
+            (
+                RestoreResult::NoTypedRestorePath {
+                    backup_location: "copy-1".to_string(),
+                },
+                1,
+            ),
+            (RestoreResult::BackupTooLargeForSimpleUpload { size: 1 }, 1),
+            (RestoreResult::RefusedNoVisibleParents, 1),
+            (RestoreResult::Blocked { decided_by: None }, 1),
+            (
+                RestoreResult::AlreadyLeased {
+                    token: "other-tok".to_string(),
+                    expires_at: Utc::now(),
+                },
+                1,
+            ),
+            (RestoreResult::RefusedNativeDocument, 1),
+            (
+                RestoreResult::RefusedConcurrentChange {
+                    detail: "moved".to_string(),
+                },
+                1,
+            ),
+            (
+                RestoreResult::Denied {
+                    detail: "no".to_string(),
+                },
+                1,
+            ),
+            (
+                RestoreResult::Unavailable {
+                    detail: "no authenticator".to_string(),
+                },
+                1,
+            ),
+            (
+                RestoreResult::Failed {
+                    detail: "boom".to_string(),
+                },
+                1,
+            ),
+            (
+                RestoreResult::FreshLeaseButWriteFailed {
+                    token: "tok".to_string(),
+                    expires_at: Utc::now(),
+                    detail: "gate refused".to_string(),
+                },
+                1,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result.exit_code(), expected, "{result:?}");
+        }
     }
 }
