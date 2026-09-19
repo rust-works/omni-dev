@@ -589,14 +589,10 @@ impl LedgerLock {
     /// it. An I/O failure is an `Err`, and no caller retries it — only
     /// `None` is worth waiting out.
     fn try_acquire_once(path: &Path) -> Result<Option<Self>> {
-        match crate::daemon::paths::try_lock_file_exclusive(path) {
-            Ok(inner) => Ok(Some(Self { inner })),
-            Err(crate::daemon::paths::FileLockError::Busy) => Ok(None),
-            Err(crate::daemon::paths::FileLockError::Io(err)) => Err(err.context(format!(
-                "failed to lock the lease lock file at {}",
-                path.display()
-            ))),
-        }
+        Ok(
+            crate::daemon::paths::try_lock_or_busy(path, "the lease lock file")?
+                .map(|inner| Self { inner }),
+        )
     }
 
     /// [`Self::acquire`], but waits for a busy lock instead of refusing

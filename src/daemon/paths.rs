@@ -354,6 +354,23 @@ impl Drop for FileLock {
     }
 }
 
+/// [`try_lock_file_exclusive`], but folding [`FileLockError::Busy`] into
+/// `Ok(None)` instead of an `Err` variant — for callers that want to decide
+/// for themselves whether a busy lock is a wait-and-retry condition or an
+/// immediate failure, rather than that choice being baked into this
+/// function. An I/O failure is still `Err`, wrapped with `what` (a short
+/// noun phrase, e.g. `"the lease lock file"`) describing what was being
+/// locked, for a caller-appropriate error message.
+pub(crate) fn try_lock_or_busy(path: &Path, what: &str) -> Result<Option<FileLock>> {
+    match try_lock_file_exclusive(path) {
+        Ok(inner) => Ok(Some(inner)),
+        Err(FileLockError::Busy) => Ok(None),
+        Err(FileLockError::Io(err)) => {
+            Err(err.context(format!("failed to lock {what} at {}", path.display())))
+        }
+    }
+}
+
 /// Tightens an existing file to owner read/write only (`0600`) on Unix.
 pub fn set_file_0600(path: &Path) -> Result<()> {
     #[cfg(unix)]
