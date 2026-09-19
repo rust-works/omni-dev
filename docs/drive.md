@@ -1065,6 +1065,22 @@ A rename, move or permission change mid-backup bumps `version` without
 touching the bytes, so a byte backup with a checksum is *not* refused for
 it; a native document, having no checksum to compare, conservatively is.
 
+Because a native document's `version` can move for reasons that are not
+edits — Drive's `version` counts "every change made to the file on the
+server, even those not visible to the user" — a moved `version` does not
+refuse straight away. The discarded copy is replaced by a fresh one, up to
+three attempts in all, after the single authentication prompt; only if
+every attempt sees the `version` move does the acquisition refuse, saying
+so:
+
+```bash
+$ omni-dev drive lease acquire 1SomeGoogleSheetId
+Refused: the file's version changed across its backup on each of 3 attempts (last: version 12 immediately before, 13 immediately after). A version that keeps moving may be changing for reasons unrelated to edits, so waiting for the file to be quiet may not help. No lease was minted and the backups were discarded.
+```
+
+A checksum mismatch is not retried: it proves the content itself moved,
+and each attempt would re-download the whole file.
+
 **The token is an identifier, not a bearer credential** — safe to log or
 paste, since a write under it still needs this account's own OAuth
 credentials and folder-permission grant. Present it via `--lease`:
