@@ -997,7 +997,7 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
     setup (env var, `.env`, or CI/CD secrets)
 - **AI Model Selection**: Optional configuration for specific models
   - View available models: `omni-dev config models show`
-  - Pick per-invocation with the global `--model` flag, or configure via
+  - Pick per-invocation with `--model` on an AI command, or configure via
     `OMNI_DEV_MODEL` / the per-backend env chain (`CLAUDE_MODEL`,
     `CLAUDE_CODE_MODEL`, `ANTHROPIC_MODEL` for Claude-family backends;
     `OPENAI_MODEL`; `OLLAMA_MODEL`) or `~/.omni-dev/settings.json`
@@ -1011,8 +1011,10 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ### AI backend selection
 
-omni-dev supports five AI backends. The global `--ai-backend` flag (or
-`OMNI_DEV_AI_BACKEND`) selects one decisively — `default`, `claude-cli`,
+omni-dev supports five AI backends. The `--ai-backend` flag — accepted after
+the AI commands (`git commit message twiddle`, `git commit message check`,
+`git commit message staged`, `git branch create pr`, `ai chat`), or set via
+`OMNI_DEV_AI_BACKEND` — selects one decisively — `default`, `claude-cli`,
 `openai`, `ollama`, or `bedrock`:
 
 - `--ai-backend claude-cli` — sandboxed `claude -p` subprocess that reuses

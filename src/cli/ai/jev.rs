@@ -17,10 +17,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     long_about = "TypeSafe Jev typed judgments (choice, score, yes/no).\n\nJev is a \
-separate typed-judgment API, not a chat model, so the global `--model` flag does \
-**not** apply to these subcommands — it still parses on `ai jev <subcommand> --model \
-...` but is silently ignored. Use `--jev-model` on each subcommand instead to \
-override the Jev model."
+separate typed-judgment API, not a chat model, so jev subcommands do **not** accept \
+the AI backend flags (`--ai-backend`, `--model`, `--claude-cli-*`, ...) or `--repo` — \
+passing any of them is a clap error. An exported `OMNI_DEV_MODEL` is silently \
+ignored. Use `--jev-model` on each subcommand instead to override the Jev model."
 )]
 pub struct JevCommand {
     /// The jev subcommand to execute.

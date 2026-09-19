@@ -977,8 +977,11 @@ omni-dev supports five AI backends. Selection happens once at startup via
 the shared resolver in `src/claude/backend.rs` (used by both the client
 factory and preflight).
 
-The global `--ai-backend` flag accepts `default`, `claude-cli`, `openai`,
-`ollama`, and `bedrock` and is equivalent to setting `OMNI_DEV_AI_BACKEND`
+The `--ai-backend` flag — accepted after the AI commands (`git commit
+message twiddle`, `git commit message check`, `git commit message staged`,
+`git branch create pr`, `ai chat`) — accepts `default`, `claude-cli`,
+`openai`, `ollama`, and `bedrock` and is equivalent to setting
+`OMNI_DEV_AI_BACKEND`
 (the flag wins when both are set). When `OMNI_DEV_AI_BACKEND` is set it
 decides the backend outright — `default` forces the direct Anthropic API
 even when the legacy `USE_*` variables are set; an unknown value is a hard
@@ -998,7 +1001,7 @@ The first match wins; later selectors are ignored.
 Once a backend is chosen, the model name resolves in this precedence
 (highest first), stopping at the first non-empty value:
 
-1. `--model` global flag on any invocation
+1. `--model` on an AI command invocation (placed after the subcommand)
 2. `OMNI_DEV_MODEL` environment variable (what `--model` propagates to;
    also settable via `~/.omni-dev/settings.json` env bundles / profiles)
 3. The backend family's own variables — Claude family (Claude API, Bedrock,
@@ -1028,8 +1031,8 @@ by dropping a YAML file in either of:
 | (Embedded)  | built-in                      | Compile-time fallback; always present                                   |
 
 Layers are deep-merged with **project > user > embedded** precedence. You
-can also pass `--models-yaml <PATH>` as a global CLI flag, which is
-equivalent to setting `OMNI_DEV_MODELS_YAML`.
+can also pass `--models-yaml <PATH>` after one of the AI commands or after
+`config models show`, which is equivalent to setting `OMNI_DEV_MODELS_YAML`.
 
 #### Adding a brand-new model
 

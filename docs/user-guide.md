@@ -639,13 +639,17 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 [Credential Profiles](configuration-best-practices.md#credential-profiles).
 
 To override just the **instance URL** for a single invocation — for example to
-target a specific tenant without switching profiles — pass the global
-`--instance <URL>` flag (or set `OMNI_DEV_ATLASSIAN_INSTANCE`). It applies to
-every JIRA and Confluence command (email and API token still come from the
-environment/settings) and, being global, works before or after the subcommand:
+target a specific tenant without switching profiles — pass the
+`--instance <URL>` flag (or set `OMNI_DEV_ATLASSIAN_INSTANCE`). It is scoped
+to the `atlassian jira` and `atlassian confluence` subtrees (plus the leaf
+`atlassian auth status`), so it applies to every JIRA and Confluence command
+(email and API token still come from the environment/settings) and can be
+placed either right after `atlassian jira`/`atlassian confluence` or after
+the leaf subcommand — but not before `atlassian`, and not on `atlassian
+convert`, `auth login`, or `auth logout`, which never read it:
 
 ```bash
-omni-dev --instance https://other.atlassian.net atlassian jira read PROJ-1
+omni-dev atlassian jira --instance https://other.atlassian.net read PROJ-1
 omni-dev atlassian jira read PROJ-1 --instance https://other.atlassian.net
 ```
 

@@ -590,11 +590,15 @@ omni-dev worktrees heartbeat --key <KEY>    # prints `known` and any pending `cl
 omni-dev worktrees unregister --key <KEY>   # prints whether an entry was removed
 ```
 
-The repository is `--repo-name`, **not** `--repo`: the latter is the global
-`-C/--repo` path flag, and because clap propagates a global arg by its *id*, a
-subcommand-local `repo` displaced it and made every `register` invocation that
-used it panic (#1420). It is a wire-shape no-op — the op's payload key is still
-`repo`.
+The repository is `--repo-name`, **not** `--repo`: at the time of #1420,
+`-C/--repo` was a root-global path flag, and because clap propagates a
+global arg by its *id*, a subcommand-local `repo` displaced it and made
+every `register` invocation that used it panic. `-C/--repo` is no longer
+root-global — it is now scoped to `git`, `coverage`, `config scopes`, and
+the `worktrees rebase`/`worktrees push` leaves (#1778) — but `register`
+keeps the `--repo-name` name regardless, since a subcommand still must not
+reuse a global arg id (a structural test walks the command tree asserting
+this). It is a wire-shape no-op — the op's payload key is still `repo`.
 
 Every command accepts `--socket` to target a non-default control socket. The
 underlying ops are documented in the [companion contract](#companion-contract-for-the-extension-and-other-clients).

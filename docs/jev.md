@@ -15,9 +15,12 @@ probabilities attached. There is no free text to parse, no prompt to coax into
 JSON, and no model-registry token limit to fit into.
 
 Jev lives under `ai` but is deliberately **not** an [AI backend](ai-backends.md).
-It cannot be selected with `--ai-backend`, commit/PR generation never uses it,
-and its request shape (state plus a question map) has nothing in common with a
-chat completion.
+Its subcommands do not accept the AI backend flags (`--ai-backend`, `--model`,
+`--beta-header`, `--claude-cli-*`, `--models-yaml`) — passing any of them is
+now a clap error, "unexpected argument" — nor `--repo`: a Jev call never
+investigates a repository, it judges only the `state` text you give it.
+Commit/PR generation never uses Jev, and its request shape (state plus a
+question map) has nothing in common with a chat completion.
 
 ## Table of Contents
 
@@ -87,12 +90,13 @@ The model is resolved in this order, and the first one set wins:
 2. `TYPESAFE_MODEL` (process env, then `settings.json`).
 3. `jev-latest`.
 
-> **Footgun: the global `--model` flag does not apply to Jev.** It still
-> *parses* on `omni-dev ai jev choice --model x`, because it is a global flag,
-> but it is silently ignored. Jev also never reads `OMNI_DEV_MODEL`, the
-> variable `--model` sets. A user with `OMNI_DEV_MODEL=claude-opus-5` exported
-> for the AI backends must not have every Jev call sent to a model Jev has
-> never heard of. Use `--jev-model` or `TYPESAFE_MODEL`.
+> **Footgun: Jev never reads `OMNI_DEV_MODEL`.** `omni-dev ai jev choice
+> --model x` is now a clap error — `--model` is scoped to the AI backend
+> commands and jev is not one of them, so it no longer even parses there. But
+> the *environment variable* `OMNI_DEV_MODEL` is a different matter: Jev
+> silently ignores it. A user with `OMNI_DEV_MODEL=claude-opus-5` exported for
+> the AI backends must not have every Jev call sent to a model Jev has never
+> heard of. Use `--jev-model` or `TYPESAFE_MODEL`.
 
 The response's `model` field names the **concrete** version that answered,
 such as `jev-1.13.0`, even when you asked for the `jev-latest` alias. Pin that
@@ -699,9 +703,18 @@ When no individual answer is at fault (for example the body is missing
 `answers`), the error is `Failed to parse Jev API response` followed by the
 parser's reason instead.
 
-### `--model` seems to have no effect
+### `--model`, `--ai-backend`, `--repo`, and other flags are rejected
 
-This is expected. See [Choosing a model](#choosing-a-model). Use `--jev-model`.
+```
+error: unexpected argument '--model' found
+```
+
+Jev subcommands accept none of the AI backend flags (`--ai-backend`,
+`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`) or `--repo` —
+clap rejects them outright rather than silently ignoring them (#1778). Use
+`--jev-model` instead; see [Choosing a model](#choosing-a-model). If instead
+an exported `OMNI_DEV_MODEL` seems to have no effect, that part is expected:
+see the footgun note above.
 
 ## See also
 

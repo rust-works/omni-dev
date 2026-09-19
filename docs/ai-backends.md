@@ -42,7 +42,11 @@ its own credentials and model knob (`--jev-model`, not `--model`). See
 
 ## Dispatch Order and Model Selection
 
-The global `--ai-backend` flag accepts `default`, `claude-cli`, `openai`,
+The `--ai-backend` flag is a per-command flag, accepted only by the five AI
+commands (`git commit message twiddle`, `git commit message check`,
+`git commit message staged`, `git branch create pr`, `ai chat`) and placed
+*after* the subcommand, e.g. `omni-dev git commit message twiddle
+--ai-backend claude-cli ...`. It accepts `default`, `claude-cli`, `openai`,
 `ollama`, and `bedrock`, and is equivalent to setting `OMNI_DEV_AI_BACKEND`
 to the same value (the flag wins when both are set). When
 `OMNI_DEV_AI_BACKEND` is set it decides the backend **outright** — including
@@ -62,7 +66,7 @@ strict priority order — the first match wins:
 **Model resolution.** Every backend resolves the model through the same
 precedence chain, stopping at the first non-empty value:
 
-1. `--model <id>` (global CLI flag)
+1. `--model <id>` (per-command CLI flag, placed after the AI subcommand)
 2. `OMNI_DEV_MODEL` (what `--model` propagates to; settable directly or via
    `~/.omni-dev/settings.json` env bundles / profiles)
 3. The backend family's own variables:
@@ -77,7 +81,7 @@ The Claude-family variables are deliberately scoped to Claude-family
 backends: an exported `CLAUDE_MODEL` can never leak a Claude model id into
 the OpenAI or Ollama backends.
 
-**Beta headers.** The global `--beta-header key:value` flag (equivalent to
+**Beta headers.** The per-command `--beta-header key:value` flag (equivalent to
 `OMNI_DEV_BETA_HEADER`) attaches an `anthropic-beta` header to requests on the
 Anthropic backends (Claude API and Bedrock) when the model registry lists it
 as supported. Beta headers are Anthropic-specific, so the non-Anthropic
@@ -115,7 +119,7 @@ Get a key from [console.anthropic.com](https://console.anthropic.com/).
 `claude-sonnet-4-6`. Override per-invocation with `--model`:
 
 ```bash
-omni-dev --model claude-opus-4-6 git commit message twiddle 'origin/main..HEAD' --use-context
+omni-dev git commit message twiddle 'origin/main..HEAD' --use-context --model claude-opus-4-6
 ```
 
 **Structured output.** For structured calls, omni-dev asks the model for a
@@ -143,7 +147,7 @@ separate API key when you already have Claude Code installed and signed in.
 **Selection.** Either flag or env var works; the flag wins if both are set:
 
 ```bash
-omni-dev --ai-backend claude-cli git commit message twiddle 'origin/main..HEAD' --use-context
+omni-dev git commit message twiddle 'origin/main..HEAD' --use-context --ai-backend claude-cli
 # or persistently:
 export OMNI_DEV_AI_BACKEND=claude-cli
 ```
@@ -167,7 +171,7 @@ escape hatches, and the spending cap.
 
 ```bash
 claude --version          # confirm the CLI is installed and authenticated
-omni-dev --ai-backend claude-cli git commit message twiddle 'origin/main..HEAD' --use-context
+omni-dev git commit message twiddle 'origin/main..HEAD' --use-context --ai-backend claude-cli
 ```
 
 ## OpenAI
@@ -177,7 +181,7 @@ Calls the OpenAI Chat Completions API.
 **Selection.**
 
 ```bash
-omni-dev --ai-backend openai ...
+omni-dev <ai-subcommand> ... --ai-backend openai
 # or persistently:
 export OMNI_DEV_AI_BACKEND=openai
 # legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
@@ -198,7 +202,7 @@ export OPENAI_AUTH_TOKEN="sk-..."
 ```bash
 export OPENAI_MODEL="gpt-5"
 # or
-omni-dev --model gpt-5 git commit message twiddle ...
+omni-dev git commit message twiddle ... --model gpt-5
 ```
 
 **Endpoint.** Fixed to `https://api.openai.com/v1/chat/completions`. To point
@@ -229,7 +233,7 @@ over HTTP. No API key required.
 **Selection.**
 
 ```bash
-omni-dev --ai-backend ollama ...
+omni-dev <ai-subcommand> ... --ai-backend ollama
 # or persistently:
 export OMNI_DEV_AI_BACKEND=ollama
 # legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
@@ -284,7 +288,7 @@ Routes Anthropic model calls through AWS Bedrock's bearer-token API.
 **Selection.**
 
 ```bash
-omni-dev --ai-backend bedrock ...
+omni-dev <ai-subcommand> ... --ai-backend bedrock
 # or persistently:
 export OMNI_DEV_AI_BACKEND=bedrock
 # legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
@@ -488,7 +492,7 @@ credentials) — see that section for details and the
 When the nested session needs filesystem or shell access:
 
 ```bash
-omni-dev --ai-backend claude-cli --claude-cli-allow-tools git branch create pr
+omni-dev git branch create pr --ai-backend claude-cli --claude-cli-allow-tools
 # or persistently:
 export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true
 ```
@@ -533,7 +537,7 @@ distinguishable from a forgotten persistent setting (issue #1143).
 When the nested session needs MCP servers from your `~/.claude/settings.json`:
 
 ```bash
-omni-dev --ai-backend claude-cli --claude-cli-allow-mcp git branch create pr
+omni-dev git branch create pr --ai-backend claude-cli --claude-cli-allow-mcp
 # or:
 export OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true
 ```
@@ -559,8 +563,8 @@ without tools, both, or neither.
 Pass a per-invocation cap in USD:
 
 ```bash
-omni-dev --ai-backend claude-cli --claude-cli-max-budget-usd 0.50 \
-  git commit message twiddle 'HEAD~3..HEAD'
+omni-dev git commit message twiddle 'HEAD~3..HEAD' \
+  --ai-backend claude-cli --claude-cli-max-budget-usd 0.50
 # or:
 export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=0.50
 ```
