@@ -476,7 +476,10 @@ fn print_result(result: &AcquireResult) {
             );
         }
         AcquireResult::RefusedConcurrentChange { detail } => {
-            eprintln!("Refused: {detail}");
+            // Carries Drive-supplied `version`/`sha256Checksum` strings —
+            // sanitized like every other server-supplied string this CLI
+            // prints (#1137, issue #1739).
+            eprintln!("Refused: {}", sanitize_for_terminal(detail));
         }
         AcquireResult::Denied { detail } => eprintln!("Denied: {detail}"),
         AcquireResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
@@ -629,7 +632,10 @@ fn print_restore_result(result: &RestoreResult) {
             );
         }
         RestoreResult::RefusedConcurrentChange { detail } => {
-            eprintln!("Refused: {detail}");
+            // Carries Drive-supplied `version`/`sha256Checksum` strings —
+            // sanitized like every other server-supplied string this CLI
+            // prints (#1137, issue #1739).
+            eprintln!("Refused: {}", sanitize_for_terminal(detail));
         }
         RestoreResult::Denied { detail } => eprintln!("Denied: {detail}"),
         RestoreResult::Unavailable { detail } => eprintln!("Unavailable: {detail}"),
