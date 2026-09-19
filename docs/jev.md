@@ -389,11 +389,14 @@ rely on. The cost is that insertion order is never preserved:
   `--option` (or wrote them in an `ask` file). If option order matters to how
   Jev reads the question, spell that out in `--instructions`.
 - **`score` keys sort as strings, not numbers.** `legend` and `probabilities`
-  are keyed `"0"`, `"1"`, `"2"`, and so on, in lexicographic order. With 10 or
-  more levels, `"10"` sorts before `"2"`. The `--level` order you gave is still
-  what is *sent*, because the request's `criteria` is an ordered list, so this
-  only affects how the answer maps are displayed. Sort numerically when
-  consuming them, e.g. `jq '.answer.probabilities | to_entries | sort_by(.key | tonumber)'`.
+  are keyed `"0"`, `"1"`, `"2"`, and so on, in lexicographic order. With 11 or
+  more levels, `"10"` would sort before `"2"`. `jev-1.13.0` accepts at most 10
+  levels (keys `"0"` to `"9"`), so today the string order and the numeric order
+  agree; this only bites if a later model raises that cap. The `--level` order
+  you gave is always what is *sent*, because the request's `criteria` is an
+  ordered list, so this only affects how the answer maps are displayed. To be
+  safe against a future cap, sort numerically when consuming them, e.g.
+  `jq '.answer.probabilities | to_entries | sort_by(.key | tonumber)'`.
 - **`ask` answers are ordered by question name**, not by their order in the
   questions file.
 
