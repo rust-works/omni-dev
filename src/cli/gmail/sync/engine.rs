@@ -135,7 +135,7 @@ pub(crate) async fn run_sync_with_progress(
     let mut report = SyncReport::default();
     let limiter = TokenBucket::new(GMAIL_QUOTA_UNITS_PER_SECOND, GMAIL_QUOTA_UNITS_PER_SECOND);
 
-    let history_id = match loaded {
+    let (history_id, carried) = match loaded {
         LoadOutcome::Present(state) if !opts.full => {
             state::validate_identity(&state, &profile.email_address)?;
             match run_incremental(
@@ -149,7 +149,7 @@ pub(crate) async fn run_sync_with_progress(
             )
             .await
             {
-                Ok(id) => id,
+                Ok(id) => (id, Vec::new()),
                 Err(e) if is_history_not_found(&e) => {
                     report.actions.push(SyncAction::Note {
                         message: "watermark expired (404 on startHistoryId); reconciling"
@@ -165,6 +165,7 @@ pub(crate) async fn run_sync_with_progress(
                         progress,
                     )
                     .await?
+                    .carry_forward(&state.pending_fetch)
                 }
                 Err(e) => return Err(e),
             }
@@ -184,19 +185,19 @@ pub(crate) async fn run_sync_with_progress(
                 progress,
             )
             .await?
+            .carry_forward(&state.pending_fetch)
         }
-        LoadOutcome::Absent => {
-            run_full_sync(
-                client,
-                &mut manifest,
-                &profile,
-                opts,
-                &limiter,
-                &mut report,
-                progress,
-            )
-            .await?
-        }
+        LoadOutcome::Absent => run_full_sync(
+            client,
+            &mut manifest,
+            &profile,
+            opts,
+            &limiter,
+            &mut report,
+            progress,
+        )
+        .await?
+        .carry_forward(&[]),
         LoadOutcome::Corrupt(reason) => {
             report.actions.push(SyncAction::Note {
                 message: format!("state.json unreadable ({reason}); reconciling"),
@@ -211,6 +212,7 @@ pub(crate) async fn run_sync_with_progress(
                 progress,
             )
             .await?
+            .carry_forward(&[])
         }
     };
 
@@ -226,8 +228,15 @@ pub(crate) async fn run_sync_with_progress(
         // window used to be the only way back to a failed id, which meant a
         // chronically rate-limited account could never advance its watermark
         // and was pushed into a full-mailbox reconciliation (#1784).
-        // No dedup needed: both fetch paths already fetch each id once.
-        let pending_fetch = report.errors.iter().map(|e| e.id.clone()).collect();
+        // No dedup needed: both fetch paths already fetch each id once, and
+        // `carried` only holds ids this run's listing never named, so never
+        // an id that could also have failed here.
+        let pending_fetch = report
+            .errors
+            .iter()
+            .map(|e| e.id.clone())
+            .chain(carried)
+            .collect();
         state::save(
             &ArchiveState {
                 history_id,
@@ -266,7 +275,7 @@ async fn run_full_sync(
     limiter: &TokenBucket,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
-) -> Result<String> {
+) -> Result<FullListing> {
     let (ids_tx, ids_rx) = mpsc::unbounded_channel::<String>();
     let messages_api = MessagesApi::new(client);
 
@@ -361,7 +370,42 @@ async fn run_full_sync(
     // — mail arriving mid-listing is simply re-observed as an ordinary
     // `messagesAdded` event on the next incremental run, a self-healing
     // race window rather than a gap.
-    Ok(profile.history_id.clone())
+    Ok(FullListing {
+        history_id: profile.history_id.clone(),
+        scoped: effective_query.is_some_and(|q| !q.trim().is_empty()),
+        listed_ids,
+    })
+}
+
+/// What [`run_full_sync`] listed, for deciding which of a previous run's
+/// `pending_fetch` ids survive it.
+struct FullListing {
+    history_id: String,
+    /// Whether the listing was narrowed by `--query` or a translated
+    /// `--exclude-label` clause, so an id's absence from it doesn't mean the
+    /// message is gone.
+    scoped: bool,
+    listed_ids: HashSet<String>,
+}
+
+impl FullListing {
+    /// Returns the watermark plus the `previous` pending ids to carry forward
+    /// (#1784). A listed id was already retried by the listing itself, so it
+    /// is never carried. An unlisted one is dropped after an unscoped
+    /// listing, where absence means the message is gone, but carried after a
+    /// scoped one, which never looked for it.
+    fn carry_forward(self, previous: &[String]) -> (String, Vec<String>) {
+        let carried = if self.scoped {
+            previous
+                .iter()
+                .filter(|id| !self.listed_ids.contains(*id))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (self.history_id, carried)
+    }
 }
 
 /// Label ids with a well-known, safe `-in:<keyword>` exclusion translation
@@ -3186,6 +3230,35 @@ not-really-a-pdf\r\n\
         let s = load_present(&output_dir);
         assert_eq!(s.history_id, "999");
         assert_eq!(s.pending_fetch, ["m2"]);
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_with_query_carries_forward_a_pending_id_it_did_not_list() {
+        // A `--query`-scoped listing never looked for "outside", so its
+        // absence proves nothing: it must stay pending for the next
+        // incremental run rather than be dropped. "m1" was listed, so the
+        // listing itself retried it and it is not carried.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1", "outside"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1"]).await;
+        mount_raw_get(&server, "m1", "Listed").await;
+        mount_get_never_called(&server, "outside").await;
+
+        let opts = SyncOptions {
+            full: true,
+            query: Some("from:boss@example.com".to_string()),
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        let s = load_present(&output_dir);
+        assert_eq!(s.history_id, "999");
+        assert_eq!(s.pending_fetch, ["outside"]);
     }
 
     #[tokio::test]
