@@ -9,6 +9,13 @@ This guide covers what each backend is, how to wire it up, and how to choose
 between them. For dev-facing notes on the dispatch implementation, see the
 "AI Backend Dispatch" section of [CLAUDE.md](../CLAUDE.md).
 
+TypeSafe's Jev typed-judgment API also lives under `omni-dev ai`, as
+`omni-dev ai jev`, but it is deliberately **not** a backend. You cannot select
+it with `--ai-backend`, commit and PR generation never use it, and its request
+shape (a state plus a map of typed questions) is not a chat completion. It has
+its own credentials and model knob (`--jev-model`, not `--model`). See
+[docs/jev.md](jev.md).
+
 ## Table of Contents
 
 1. [Backends at a Glance](#backends-at-a-glance)
