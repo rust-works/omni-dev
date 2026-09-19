@@ -11,11 +11,15 @@
 //! - [`client`] — the `reqwest` client and its single `POST /v1/systemone` call.
 //! - [`config`] — credential and base-URL resolution.
 //! - [`error`] — the [`error::JevError`] domain error type.
+//! - [`input`] — shared input-text truncation, used by `route` and `verify`.
 //! - [`protocol`] — the request/response wire types.
 //! - [`route`] — stage routing of issues to model classes (`ai jev route`).
+//! - [`verify`] — decision-comment verification (`ai jev verify-decision`).
 
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod input;
 pub mod protocol;
 pub mod route;
+pub mod verify;

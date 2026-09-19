@@ -15,11 +15,14 @@ probabilities attached. There is no free text to parse, no prompt to coax into
 JSON, and no model-registry token limit to fit into.
 
 Jev lives under `ai` but is deliberately **not** an [AI backend](ai-backends.md).
-Its subcommands do not accept the AI backend flags (`--ai-backend`, `--model`,
-`--beta-header`, `--claude-cli-*`, `--models-yaml`) — passing any of them is
-now a clap error, "unexpected argument". Only [`route`](#route) accepts
-`-C/--repo`, and only to decide which repository `#N` means: every other Jev
-call judges only the `state` text you give it.
+Most of its subcommands do not accept the AI backend flags (`--ai-backend`,
+`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`) — passing any
+of them is a clap error, "unexpected argument". [`route`](#route) and
+[`verify-decision`](#verify-decision) are the two exceptions to `-C/--repo`,
+which they use to decide which repository a bare `#N` means.
+[`verify-decision`](#verify-decision) is also the one Jev command that
+**does** accept the AI backend flags: it uses an AI backend, not Jev, to
+split a decision comment into statements before checking each one with Jev.
 Commit/PR generation never uses Jev, and its request shape (state plus a
 question map) has nothing in common with a chat completion.
 
@@ -35,12 +38,13 @@ question map) has nothing in common with a chat completion.
 8. [noul](#noul)
 9. [ask](#ask)
 10. [route](#route)
-11. [Ordering caveats](#ordering-caveats)
-12. [Best practices](#best-practices)
-13. [Retries and timeouts](#retries-and-timeouts)
-14. [Request log](#request-log)
-15. [Troubleshooting](#troubleshooting)
-16. [See also](#see-also)
+11. [verify-decision](#verify-decision)
+12. [Ordering caveats](#ordering-caveats)
+13. [Best practices](#best-practices)
+14. [Retries and timeouts](#retries-and-timeouts)
+15. [Request log](#request-log)
+16. [Troubleshooting](#troubleshooting)
+17. [See also](#see-also)
 
 ## Prerequisites
 
@@ -555,6 +559,130 @@ The sets are small (9, 12 and 16 issues), come from this one repository, and
 the labels are one person's judgement, not ground truth. A newer model behind
 `jev-latest` needs re-checking: note the `model` in the output.
 
+## verify-decision
+
+Checks a decision comment — the kind `route`'s [Decision comments](#decision-comments)
+section asks you to write — against the issues or pull requests it cites.
+Jev trusts a decision comment; `verify-decision` is how you find out whether
+it should. It uses **two** things: the configured [AI backend](ai-backends.md)
+to split the comment into single factual statements, and Jev to check each
+statement, one `noul` question per statement, against the source it names.
+
+```bash
+omni-dev ai jev verify-decision '#1641'
+omni-dev ai jev verify-decision rust-works/omni-dev#1641 --comment 1234567890 -o yaml
+```
+
+By default it checks the issue's most recent comment that cites another
+issue or pull request; `--comment ID` (a numeric comment id) or a full
+`...#issuecomment-<id>` URL selects a specific one instead.
+
+```yaml
+issue: rust-works/omni-dev#1641
+url: https://github.com/rust-works/omni-dev/issues/1641
+comment: {id: 1234567890, author: newhoggy}
+verdict: accepted
+coverage: 0.93
+sources:
+- {source: "#1614 and PR #1629", items: ["#1614", "PR #1629"]}
+statements:
+- {text: "PR #1629 added a `drive_sheets_info` MCP tool.", source: "#1614", supported: 0.99}
+- {text: "For this issue, only `drive_docs_info` and `drive_docs_read` are in scope.", source: null}
+models: {jev: jev-1.13.0, ai: claude-sonnet-5}
+usage: {jev: {input_tokens: 5120, output_tokens: 61}}
+```
+
+- **`verdict`** is `rejected` if any statement scores below `--reject-below`
+  (default `0.3`); otherwise `accepted` if every statement clears
+  `--threshold` (default `0.5`) and coverage did too; otherwise
+  `needs_review` — an uncertain statement, a citation that could not be
+  resolved, low coverage, or a comment that cites nothing verifiable at all
+  (in which case no AI or Jev call is made). `reasons` explains every
+  contributing statement or coverage score. **Rejection is the validated
+  half of this command**: checking one statement at a time against its
+  source accepted 5 of 5 accurate claims and 0 of 20 wrong ones in the
+  #1779 experiment, where checking a whole comment at once let
+  overstatements through (a false claim scored 0.65–0.69 because the source
+  merely *mentioned* the topic).
+- **`coverage`** guards against a splitter that drops or strengthens a
+  claim: a separate Jev call asks whether the split statements together say
+  everything the comment claims. This check is new and unvalidated, unlike
+  the per-statement check above, so a coverage failure alone only downgrades
+  the verdict to `needs_review`, never to `rejected`.
+- **A statement with `source: null`** is a claim about the judged issue
+  itself (`cites: null`) rather than about a cited item — reported, but
+  never checked, since there is nothing external to check it against.
+- **`sources`** lists every cited issue merged with the pull requests that
+  closed it (named `"#1614 and PR #1629"`), or a standalone cited pull
+  request (named `"PR #1629"`) if it did not close any cited issue. A
+  source's text is truncated the same way `route`'s issue text is (see
+  [route](#route)); an `error` field replaces a source's check when its Jev
+  call failed.
+- **`models`** reports both the Jev model and the AI backend model.
+  **`usage`** reports only Jev's token counts (`usage.jev`): no AI backend
+  in this project reports token counts today, only cost, so there is no
+  `usage.ai` to show.
+
+### What the splitter and Jev see
+
+The AI backend receives the comment and every citation `verify-decision`
+found in it (`#N`, `PR #N` / `pull request #N`, `owner/repo#N`, or a full
+GitHub issue/pull URL), and is asked to split it into statements that each
+name one item exactly as the comment names it, keeping the original wording's
+certainty ("was decided" and "was considered" are different facts) and
+adding nothing the comment does not say. This prompt and its JSON schema are
+new to #1779, not validated the way `route`'s questions were.
+
+Each cited source is checked separately. For a cited issue, Jev sees the
+issue's title, body and human comments, followed by the body of every pull
+request that closed it:
+
+```
+## SOURCE: #1614 and PR #1629
+
+# Issue #1614: <title>
+
+<body>
+
+**Comment by <author>:**
+
+<comment body>
+
+
+# Pull request #1629: <title>
+
+<pull request body>
+```
+
+This exact format — including the single blank line before a comment,
+different from `route`'s two-blank-line separator — is the one validated in
+#1779's per-statement experiment. A standalone cited pull request (one that
+did not close any cited issue) uses the same `## SOURCE:` wrapper around
+just its own heading and body; that shape was not exercised by the
+experiment.
+
+### Thresholds
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--threshold` | `0.5` | A statement at or above this is supported. |
+| `--reject-below` | `0.3` | A statement below this rejects the comment. |
+| `--coverage-threshold` | `0.5` | Coverage below this adds a review reason. |
+
+The two statement thresholds come from the experiment: true statements
+scored 0.83 or higher, false ones 0.34 or lower, with a clean gap between
+them at any threshold from 0.3 to 0.5. The coverage threshold is new and
+unvalidated.
+
+### Evidence and its limits
+
+The per-statement check is validated against five sources and 25
+constructed claims (five accurate, twenty wrong in four different ways) in
+[#1779](https://github.com/rust-works/omni-dev/issues/1779). The splitter,
+the coverage check, and cross-repository citations are new work built for
+this command and have not been run against Jev the same way; treat their
+output as a reasonable default, not a measured one, until they have been.
+
 ## Ordering caveats
 
 Every map in the request and the response is kept **sorted by key**. This
@@ -882,13 +1010,15 @@ parser's reason instead.
 error: unexpected argument '--model' found
 ```
 
-Jev subcommands accept none of the AI backend flags (`--ai-backend`,
-`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`), and only
-`route` accepts `-C/--repo` — clap rejects them outright rather than silently
-ignoring them (#1778). Use
-`--jev-model` instead; see [Choosing a model](#choosing-a-model). If instead
-an exported `OMNI_DEV_MODEL` seems to have no effect, that part is expected:
-see the footgun note above.
+Most Jev subcommands accept none of the AI backend flags (`--ai-backend`,
+`--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`) — clap rejects
+them outright rather than silently ignoring them (#1778) — and only `route`
+and `verify-decision` accept `-C/--repo`. `verify-decision` is the exception:
+it accepts the AI backend flags too, since it uses an AI backend to split a
+decision comment into statements. Use `--jev-model` to choose the *Jev*
+model on any subcommand; see [Choosing a model](#choosing-a-model). If
+instead an exported `OMNI_DEV_MODEL` seems to have no effect on a Jev call,
+that part is expected: see the footgun note above.
 
 ## See also
 

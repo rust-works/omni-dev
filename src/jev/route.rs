@@ -17,9 +17,12 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::jev::client::JevClient;
-use crate::jev::error::JevError;
+use crate::jev::error::is_auth_failure;
+use crate::jev::input::truncate_middle;
 use crate::jev::protocol::{Answer, Question, SystemOneRequest, Usage};
 use crate::provider::{IssueDoc, ItemState};
+
+pub use crate::jev::input::TRUNCATION_MARKER;
 
 /// The default tiers, shipped as the default for `--tiers`.
 const DEFAULT_TIERS_YAML: &str = include_str!("../templates/jev-route-tiers.yaml");
@@ -38,10 +41,6 @@ pub const DEFAULT_CLOSE_CALL: f64 = 0.3;
 /// Default cap, in characters, on the issue text sent to Jev. Jev's input
 /// limit is undocumented; the longest input tested was about 48k characters.
 pub const DEFAULT_MAX_INPUT_CHARS: usize = 60_000;
-
-/// Put where an input over the cap was cut, so the truncation is visible to
-/// Jev rather than silent.
-pub const TRUNCATION_MARKER: &str = "[... truncated]";
 
 /// Fewest tiers a tiers file may define — routing between one class is not
 /// a judgment.
@@ -209,24 +208,7 @@ pub fn build_route_state(doc: &IssueDoc, max_chars: usize) -> (String, bool) {
             ));
         }
     }
-    if text.char_indices().nth(max_chars).is_none() {
-        return (text, false);
-    }
-    let total = text.chars().count();
-    let head = max_chars / 2;
-    let tail = max_chars - head;
-    let byte_at = |chars: usize| {
-        text.char_indices()
-            .nth(chars)
-            .map_or(text.len(), |(i, _)| i)
-    };
-    let (head_end, tail_start) = (byte_at(head), byte_at(total - tail));
-    let cut = format!(
-        "{}\n\n{TRUNCATION_MARKER}\n\n{}",
-        &text[..head_end],
-        &text[tail_start..]
-    );
-    (cut, true)
+    truncate_middle(&text, max_chars)
 }
 
 /// Jev's answer for one stage.
@@ -412,18 +394,6 @@ fn failed(item_ref: &str, err: &anyhow::Error) -> RouteOutcome {
     let error = format!("{err:#}");
     warn!("Could not route issue {item_ref}: {error}");
     RouteOutcome::Failed { error }
-}
-
-/// Whether `err` is Jev rejecting the credentials, which no later issue can
-/// get past either.
-fn is_auth_failure(err: &anyhow::Error) -> bool {
-    matches!(
-        err.downcast_ref::<JevError>(),
-        Some(JevError::ApiRequestFailed {
-            status: 401 | 403,
-            ..
-        })
-    )
 }
 
 /// Rejects an empty run, out-of-range knobs, and (by default) closed issues,
@@ -713,10 +683,12 @@ mod tests {
             Comment {
                 author: "alice".to_string(),
                 body: "first\n".to_string(),
+                id: None,
             },
             Comment {
                 author: "bob".to_string(),
                 body: "second".to_string(),
+                id: None,
             },
         ];
         let (state, _) = build_route_state(&d, 1000);
@@ -752,6 +724,7 @@ mod tests {
         d.comments = vec![Comment {
             author: "maintainer".to_string(),
             body: "**Decision**: settled.".to_string(),
+            id: None,
         }];
         let (state, truncated) = build_route_state(&d, 1_000);
         assert!(truncated);
