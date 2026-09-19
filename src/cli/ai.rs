@@ -2,6 +2,7 @@
 
 mod chat;
 mod claude;
+mod jev;
 
 pub use chat::{run_chat, ChatCommand};
 pub use claude::skills::{run_clean, run_status, run_sync, OutputFormat, SkillsFormat};
@@ -24,6 +25,8 @@ pub enum AiSubcommands {
     Chat(ChatCommand),
     /// Claude Code diagnostics and inspection.
     Claude(claude::ClaudeCommand),
+    /// TypeSafe Jev typed judgments (choice, score, yes/no).
+    Jev(jev::JevCommand),
 }
 
 impl AiCommand {
@@ -32,6 +35,7 @@ impl AiCommand {
         match self.command {
             AiSubcommands::Chat(cmd) => cmd.execute().await,
             AiSubcommands::Claude(cmd) => cmd.execute(),
+            AiSubcommands::Jev(cmd) => cmd.execute().await,
         }
     }
 }
