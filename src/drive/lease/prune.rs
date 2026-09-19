@@ -1464,4 +1464,58 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("already be in progress"));
     }
+
+    /// `multi_thread` on purpose — the only flavor on which this loop's
+    /// `offload_short_blocking_io` regions call `tokio::task::block_in_place`
+    /// at all (issue #1766). Every other test in this file runs on the
+    /// default current-thread flavor, so `offload_short_blocking_io` always
+    /// takes its direct-call fallback there and never exercises
+    /// `block_in_place`. The worker hand-off itself is covered by
+    /// `ledger`'s `offload_short_blocking_io_runs_the_closure_on_a_runtime_worker`;
+    /// what only *this* test can pin is `check.rs`'s identically-motivated
+    /// `the_gate_writes_its_audit_records_on_the_calling_thread_on_a_multi_thread_runtime`
+    /// twin: `request_log` routes the audit file through a thread-local, so
+    /// an offload that moved the write to another thread — `spawn_blocking`
+    /// would — writes the forensic record somewhere else entirely, which no
+    /// assertion on `PruneOutcome` alone would catch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_writes_audit_records_on_the_calling_thread_on_a_multi_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let backup_path = dir.path().join("backup");
+        std::fs::write(&backup_path, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(bytes_record(
+            "old",
+            Utc::now() - ChronoDuration::days(1),
+            1,
+            backup_path.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now()),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(
+            audit.verdicts(),
+            vec!["pruned".to_string()],
+            "on a multi-thread runtime, offload_short_blocking_io uses block_in_place \
+             (same OS thread) so this test's thread-local audit redirect must still see \
+             the record; a regression to spawn_blocking would silently misroute it"
+        );
+    }
 }
