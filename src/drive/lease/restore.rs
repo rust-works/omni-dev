@@ -818,15 +818,22 @@ enum SheetDetection {
 /// Decides which [`SheetDetection`] applies, from the backup spreadsheet's
 /// and the live spreadsheet's sheet lists alone.
 ///
-/// `previously_restored_sheet_id` is the live id an earlier restore from
-/// this same backup created ([`LeaseRecord::restored_sheet_id`]). It is
-/// checked **first**, and that order is load-bearing: `copyTo` assigns the
-/// destination a fresh id, so the backup sheet's own id stays missing-live
-/// even after a successful restore and the diff below would happily report
-/// "exactly one deleted sheet" a second time (issue #1689). When that id is
-/// *gone* from live — the restored sheet was deleted again — this falls
+/// The structural diff runs **first**, and that order is load-bearing
+/// (issue #1740): `copyTo` assigns the destination a fresh id, so a
+/// restored sheet's *backup* id stays missing-live forever, and the only
+/// way to tell "the single missing sheet is just that permanent ghost" from
+/// "a different sheet has since been deleted too" is to see whether the
+/// diff is still unambiguous. So `previously_restored_sheet_id` — the live
+/// id an earlier restore from this same backup created
+/// ([`LeaseRecord::restored_sheet_id`]) — is consulted only once the diff
+/// below has found exactly one missing sheet; a second, different deletion
+/// leaves two sheets missing and falls through to the same ambiguous
+/// [`SheetDetection::None`] as any other unrecognised state, rather than
+/// misattributing it to the earlier restore. When that earlier restore's id
+/// is *gone* from live — the restored sheet was deleted again — this falls
 /// through and restores it once more, which is the legitimate flow a blunt
-/// "refuse whenever `restored_at` is set" gate would have blocked.
+/// "refuse whenever `restored_at` is set" gate would have blocked
+/// (issue #1689).
 ///
 /// Any error (wrong resource type — a Docs/Slides backup fails
 /// `spreadsheets.get` outright; a spreadsheet that's vanished; a network
@@ -848,18 +855,6 @@ async fn detect_sheet_restore(
     let Ok(live) = sheets_api.get_spreadsheet(live_spreadsheet_id).await else {
         return SheetDetection::None;
     };
-    if let Some(restored_id) = previously_restored_sheet_id {
-        if let Some(sheet) = live
-            .sheets
-            .iter()
-            .find(|sheet| sheet.sheet_id() == Some(restored_id))
-        {
-            return SheetDetection::AlreadyRestored {
-                sheet_id: restored_id,
-                sheet_title: sheet.title().to_string(),
-            };
-        }
-    }
     let live_ids = live.sheet_ids();
     let mut missing = backup.sheets.iter().filter_map(|sheet| {
         let props = sheet.properties.as_ref()?;
@@ -871,6 +866,22 @@ async fn detect_sheet_restore(
     };
     if missing.next().is_some() {
         return SheetDetection::None;
+    }
+    // Exactly one backup sheet is missing live. That single missing entry
+    // can only be a restored-again ghost or a fresh deletion, never both,
+    // so it's now safe to ask which: if an earlier restore's copy is still
+    // live, this is that ghost, not a new deletion.
+    if let Some(restored_id) = previously_restored_sheet_id {
+        if let Some(sheet) = live
+            .sheets
+            .iter()
+            .find(|sheet| sheet.sheet_id() == Some(restored_id))
+        {
+            return SheetDetection::AlreadyRestored {
+                sheet_id: restored_id,
+                sheet_title: sheet.title().to_string(),
+            };
+        }
     }
     SheetDetection::Deleted {
         sheet_id,
@@ -1865,6 +1876,67 @@ mod tests {
             Some(1001),
             "the row must now point at the newest restore, not the stale 999"
         );
+    }
+
+    #[tokio::test]
+    async fn a_different_sheet_deleted_after_an_earlier_restore_reports_no_typed_restore_path() {
+        // Regression test for issue #1740. An earlier restore's copy (999)
+        // is still live, but a *different* backup sheet (3) has since been
+        // deleted too. The guard must not fire here — it would misreport
+        // this as "already restored" and tell the user to delete the live
+        // copy (a good sheet) for nothing — so this must fall through to
+        // the same honest, ambiguous `NoTypedRestorePath` that any other
+        // two-missing-sheets state reports, exactly as it did pre-#1716.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditLogGuard::redirect(dir.path());
+        let test_opts = opts(dir.path(), "");
+        let old_token = seed_backup_lease(
+            &test_opts.ledger_path,
+            "sheet-1",
+            LeaseBackup::DriveCopy {
+                file_id: "copy-1".to_string(),
+            },
+        );
+        LeaseLedger::mutate_locked(&test_opts.ledger_path, |ledger| {
+            ledger.mark_restored(&old_token, Utc::now(), Some(999));
+        })
+        .unwrap();
+
+        mount_spreadsheet("copy-1", &[(1, "Sheet1"), (2, "Deleted"), (3, "Other")])
+            .mount(&server)
+            .await;
+        // Sheet 2's restored copy (999) is still live; sheet 3 has since
+        // been deleted too — neither backup id 2 nor 3 is live, only 1 and
+        // 999.
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1"), (999, "Deleted")])
+            .mount(&server)
+            .await;
+        // The write-permission gate's own `files.get`, run before the
+        // detection reads above are even reached.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No copy/backup/batchUpdate mock is mounted at all: `PanicsIfCalled`
+        // plus reaching an unmounted path both prove no mutating call — and
+        // no second authentication prompt — is ever spent.
+
+        let result = restore(
+            &client,
+            &sheets,
+            &opts(dir.path(), &old_token),
+            &PanicsIfCalled,
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            RestoreResult::NoTypedRestorePath { backup_location } if backup_location == "copy-1"
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
