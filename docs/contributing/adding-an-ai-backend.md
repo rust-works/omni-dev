@@ -221,7 +221,8 @@ coverage is welcome but not required.
   [ADR-0014](../adrs/adr-0014.md). Don't reshape prompts inside the
   backend module unless the API genuinely needs it (e.g. OpenAI's
   `messages[0]` system role vs. Anthropic's top-level `system` field).
-- **Selection is the global `--ai-backend` flag / `OMNI_DEV_AI_BACKEND`.**
+- **Selection is the `--ai-backend` flag (flattened onto the five AI
+  commands via `AiBackendArgs`) / `OMNI_DEV_AI_BACKEND`.**
   New enum variants surface in the flag's possible values automatically —
   which also means the help snapshot changes, so run the `update-snapshots`
   skill. Don't invent per-backend `USE_*` selector vars; those are legacy.

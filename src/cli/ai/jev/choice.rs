@@ -38,8 +38,8 @@ pub struct ChoiceCommand {
 
     /// Overrides the configured Jev model for this call.
     ///
-    /// Distinct from the global `--model` flag, which does not apply to jev
-    /// (see `omni-dev ai jev --help`).
+    /// Jev subcommands accept no `--model` flag (passing one is a clap error) and no
+    /// other AI backend flags; an exported `OMNI_DEV_MODEL` is ignored too.
     #[arg(long, value_name = "MODEL")]
     pub jev_model: Option<String>,
 }
