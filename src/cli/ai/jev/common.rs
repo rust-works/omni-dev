@@ -45,7 +45,7 @@ pub(super) fn resolve_state(state: Option<String>) -> Result<String> {
 
 /// Reads the whole of stdin as a UTF-8 string.
 ///
-/// A local copy per `docs/jev.md`/the design plan: the three existing
+/// A local copy rather than a shared helper: the three existing
 /// `read_stdin` helpers in the CLI tree are private to their own modules and
 /// unsuitable here (`snowflake.rs` hardcodes a SQL-specific error message,
 /// `drive/edit.rs` returns `Vec<u8>`, `worktrees.rs` reads a single line).
@@ -63,11 +63,25 @@ fn read_stdin() -> Result<String> {
 /// reinterpret plain text that happens to start with `{`. `--state-json`
 /// opts into parsing `raw` as YAML (a JSON superset, so this also accepts
 /// plain JSON) instead.
+///
+/// The API accepts a string, object or array, so a `--state-json` parse
+/// that yields any other scalar (`42`, `true`, `null`) is rejected locally
+/// rather than sent for an opaque `422`. A parsed string is allowed — it is
+/// exactly what the default would have sent.
 pub(super) fn build_state_value(raw: &str, state_json: bool) -> Result<serde_json::Value> {
-    if state_json {
-        serde_yaml::from_str(raw).context("Failed to parse --state-json state as JSON/YAML")
-    } else {
-        Ok(serde_json::Value::String(raw.to_string()))
+    if !state_json {
+        return Ok(serde_json::Value::String(raw.to_string()));
+    }
+    let value: serde_json::Value =
+        serde_yaml::from_str(raw).context("Failed to parse --state-json state as JSON/YAML")?;
+    match value {
+        serde_json::Value::String(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => Ok(value),
+        other => anyhow::bail!(
+            "--state-json state must be an object, array or string, got `{other}`; \
+             drop --state-json to send it as a literal string"
+        ),
     }
 }
 
@@ -197,6 +211,30 @@ mod tests {
     fn build_state_value_json_flag_parses_yaml() {
         let value = build_state_value("a: 1\nb: 2\n", true).unwrap();
         assert_eq!(value, serde_json::json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn build_state_value_json_flag_parses_array() {
+        let value = build_state_value("[1, 2]", true).unwrap();
+        assert_eq!(value, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn build_state_value_json_flag_allows_a_bare_string() {
+        let value = build_state_value("hello world", true).unwrap();
+        assert_eq!(value, serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn build_state_value_json_flag_rejects_non_string_scalars() {
+        for raw in ["42", "true", "null", "1.5"] {
+            let err = build_state_value(raw, true).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must be an object, array or string"),
+                "{raw}: {err}"
+            );
+        }
     }
 
     #[test]

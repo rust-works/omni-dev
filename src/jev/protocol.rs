@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::jev::error::JevError;
+
 /// Default model identifier, used when no `--jev-model` / `TYPESAFE_MODEL`
 /// override is configured.
 pub const DEFAULT_MODEL: &str = "jev-latest";
@@ -70,6 +72,40 @@ pub enum Question {
         #[serde(skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
+}
+
+/// Minimum number of options a [`Question::Choice`] must offer — picking
+/// "one of one" is not a judgment.
+pub const MIN_CHOICE_OPTIONS: usize = 2;
+
+/// Minimum number of levels a [`Question::Score`] scale must have.
+pub const MIN_SCORE_LEVELS: usize = 2;
+
+impl Question {
+    /// Checks the constraints the API would otherwise reject with an opaque
+    /// `422`: a `choice` needs at least [`MIN_CHOICE_OPTIONS`] options and a
+    /// `score` at least [`MIN_SCORE_LEVELS`] levels. `noul` has none.
+    ///
+    /// Duplicate `choice` option names cannot be detected here — a
+    /// [`BTreeMap`] has already collapsed them — so the `--option` parser
+    /// checks those itself.
+    pub fn validate(&self) -> Result<(), JevError> {
+        match self {
+            Self::Choice { criteria, .. } if criteria.len() < MIN_CHOICE_OPTIONS => {
+                Err(JevError::InvalidQuestionSpec(format!(
+                    "a choice question needs at least {MIN_CHOICE_OPTIONS} options, got {}",
+                    criteria.len()
+                )))
+            }
+            Self::Score { criteria, .. } if criteria.len() < MIN_SCORE_LEVELS => {
+                Err(JevError::InvalidQuestionSpec(format!(
+                    "a score question needs at least {MIN_SCORE_LEVELS} levels, got {}",
+                    criteria.len()
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Optional descriptions of the two poles of a [`Question::Noul`] question.
@@ -323,6 +359,54 @@ mod tests {
         });
         let response: SystemOneResponse = serde_json::from_value(json).unwrap();
         assert_eq!(response.usage, Usage::default());
+    }
+
+    // ── Question::validate ──────────────────────────────────────────────
+
+    fn choice_with(n: usize) -> Question {
+        Question::Choice {
+            instructions: "Route this".to_string(),
+            criteria: (0..n)
+                .map(|i| (format!("o{i}"), "desc".to_string()))
+                .collect(),
+        }
+    }
+
+    fn score_with(n: usize) -> Question {
+        Question::Score {
+            instructions: "How urgent".to_string(),
+            criteria: (0..n).map(|i| format!("l{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_choice_with_fewer_than_two_options() {
+        for n in [0, 1] {
+            let err = choice_with(n).validate().unwrap_err();
+            assert!(matches!(err, JevError::InvalidQuestionSpec(_)));
+            assert!(err.to_string().contains(&format!("got {n}")));
+        }
+        choice_with(2).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_score_with_fewer_than_two_levels() {
+        for n in [0, 1] {
+            let err = score_with(n).validate().unwrap_err();
+            assert!(matches!(err, JevError::InvalidQuestionSpec(_)));
+            assert!(err.to_string().contains(&format!("got {n}")));
+        }
+        score_with(2).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_noul_without_criteria() {
+        Question::Noul {
+            instructions: "Urgent?".to_string(),
+            criteria: None,
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]

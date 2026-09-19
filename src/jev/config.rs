@@ -1,6 +1,6 @@
 //! Credential and endpoint resolution for the Jev client.
 //!
-//! Reads through an injected [`EnvSource`](crate::utils::env::EnvSource) —
+//! Reads through an injected [`EnvSource`] —
 //! never `std::env::var` directly (STYLE-0028) — so production resolves via
 //! `settings.json` fallback ([`crate::utils::settings::SettingsEnv`]) while
 //! tests pass a pure `MapEnv` with no process-env mutation.

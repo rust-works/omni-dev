@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Parser;
 
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
+use crate::jev::error::JevError;
 use crate::jev::protocol::{Question, SystemOneRequest};
 
 use super::common::{
@@ -27,7 +28,7 @@ pub struct ChoiceCommand {
     #[arg(long)]
     pub instructions: String,
 
-    /// A `NAME=DESCRIPTION` option. Repeatable; at least one is required.
+    /// A `NAME=DESCRIPTION` option. Repeatable; at least two are required.
     #[arg(long = "option", value_name = "NAME=DESC", value_parser = parse_option_kv)]
     pub option: Vec<(String, String)>,
 
@@ -61,7 +62,7 @@ impl ChoiceCommand {
             self.output,
         )
         .await?;
-        println!("{output}");
+        print!("{output}");
         Ok(())
     }
 }
@@ -82,9 +83,10 @@ fn parse_option_kv(s: &str) -> Result<(String, String), String> {
 
 /// Builds and sends the choice request, returning the formatted output.
 ///
-/// Pure validation (at-least-one option, no duplicate names) happens here
-/// rather than in `execute`, so it is testable without an env or a network
-/// call (STYLE-0025).
+/// Pure validation (duplicate names, then the minimum option count via
+/// [`Question::validate`]) happens here, before stdin is read, rather than
+/// in `execute`, so it is testable without an env or a network call
+/// (STYLE-0025).
 #[allow(clippy::too_many_arguments)]
 async fn run_choice(
     client: &JevClient,
@@ -95,15 +97,20 @@ async fn run_choice(
     options: Vec<(String, String)>,
     format: JevFormat,
 ) -> Result<String> {
-    if options.is_empty() {
-        bail!("at least one --option NAME=DESC is required");
-    }
     let mut criteria = BTreeMap::new();
     for (name, desc) in options {
-        if criteria.insert(name.clone(), desc).is_some() {
-            bail!("duplicate --option name: {name}");
+        if criteria.contains_key(&name) {
+            return Err(
+                JevError::InvalidQuestionSpec(format!("duplicate --option name: {name}")).into(),
+            );
         }
+        criteria.insert(name, desc);
     }
+    let question = Question::Choice {
+        instructions: instructions.to_string(),
+        criteria,
+    };
+    question.validate()?;
 
     let raw_state = resolve_state(state)?;
     let state_value = build_state_value(&raw_state, state_json)?;
@@ -111,13 +118,7 @@ async fn run_choice(
     let request = SystemOneRequest {
         state: state_value,
         model: model.to_string(),
-        questions: BTreeMap::from([(
-            SINGLE_QUESTION_KEY.to_string(),
-            Question::Choice {
-                instructions: instructions.to_string(),
-                criteria,
-            },
-        )]),
+        questions: BTreeMap::from([(SINGLE_QUESTION_KEY.to_string(), question)]),
     };
 
     let response = client.system_one(&request).await?;
@@ -171,7 +172,27 @@ mod tests {
     // ── run_choice validation ───────────────────────────────────────
 
     #[tokio::test]
-    async fn run_choice_requires_at_least_one_option() {
+    async fn run_choice_rejects_a_single_option() {
+        let err = run_choice(
+            &dead_client(),
+            "jev-latest",
+            Some("state".to_string()),
+            false,
+            "route this",
+            vec![("billing".to_string(), "Payments".to_string())],
+            JevFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<JevError>(),
+            Some(JevError::InvalidQuestionSpec(_))
+        ));
+        assert!(err.to_string().contains("at least 2 options, got 1"));
+    }
+
+    #[tokio::test]
+    async fn run_choice_rejects_zero_options() {
         let err = run_choice(
             &dead_client(),
             "jev-latest",
@@ -183,7 +204,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("at least one --option"));
+        assert!(err.to_string().contains("got 0"));
     }
 
     #[tokio::test]
@@ -213,7 +234,10 @@ mod tests {
             Some("   ".to_string()),
             false,
             "route this",
-            vec![("billing".to_string(), "Payments".to_string())],
+            vec![
+                ("billing".to_string(), "Payments".to_string()),
+                ("technical".to_string(), "Bugs".to_string()),
+            ],
             JevFormat::Json,
         )
         .await
@@ -305,7 +329,10 @@ mod tests {
             Some("state".to_string()),
             false,
             "Route this",
-            vec![("billing".to_string(), "Payments".to_string())],
+            vec![
+                ("billing".to_string(), "Payments".to_string()),
+                ("technical".to_string(), "Bugs".to_string()),
+            ],
             JevFormat::Yaml,
         )
         .await

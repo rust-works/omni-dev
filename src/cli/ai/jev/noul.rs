@@ -66,7 +66,7 @@ impl NoulCommand {
             self.output,
         )
         .await?;
-        println!("{output}");
+        print!("{output}");
         Ok(())
     }
 }

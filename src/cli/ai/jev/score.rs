@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Parser;
 
 use crate::jev::client::JevClient;
@@ -12,9 +12,6 @@ use crate::jev::protocol::{Question, SystemOneRequest};
 use super::common::{
     build_state_value, format_single, resolve_state, JevFormat, SINGLE_QUESTION_KEY,
 };
-
-/// Minimum number of `--level` values a scale must have to be meaningful.
-const MIN_LEVELS: usize = 2;
 
 /// Rates the given state against an ordered scale.
 #[derive(Parser)]
@@ -65,16 +62,16 @@ impl ScoreCommand {
             self.output,
         )
         .await?;
-        println!("{output}");
+        print!("{output}");
         Ok(())
     }
 }
 
 /// Builds and sends the score request, returning the formatted output.
 ///
-/// The `--level` minimum-count validation happens here rather than in
-/// `execute`, so it is testable without an env or a network call
-/// (STYLE-0025).
+/// The `--level` minimum-count validation ([`Question::validate`]) happens
+/// here, before stdin is read, rather than in `execute`, so it is testable
+/// without an env or a network call (STYLE-0025).
 #[allow(clippy::too_many_arguments)]
 async fn run_score(
     client: &JevClient,
@@ -85,12 +82,11 @@ async fn run_score(
     levels: Vec<String>,
     format: JevFormat,
 ) -> Result<String> {
-    if levels.len() < MIN_LEVELS {
-        bail!(
-            "at least {MIN_LEVELS} --level values are required, got {}",
-            levels.len()
-        );
-    }
+    let question = Question::Score {
+        instructions: instructions.to_string(),
+        criteria: levels,
+    };
+    question.validate()?;
 
     let raw_state = resolve_state(state)?;
     let state_value = build_state_value(&raw_state, state_json)?;
@@ -98,13 +94,7 @@ async fn run_score(
     let request = SystemOneRequest {
         state: state_value,
         model: model.to_string(),
-        questions: BTreeMap::from([(
-            SINGLE_QUESTION_KEY.to_string(),
-            Question::Score {
-                instructions: instructions.to_string(),
-                criteria: levels,
-            },
-        )]),
+        questions: BTreeMap::from([(SINGLE_QUESTION_KEY.to_string(), question)]),
     };
 
     let response = client.system_one(&request).await?;
@@ -132,7 +122,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("at least 2 --level values"));
+        assert!(err.to_string().contains("at least 2 levels"));
     }
 
     #[tokio::test]
