@@ -3193,6 +3193,81 @@ not-really-a-pdf\r\n\
         assert_eq!(s.pending_fetch, ["m2"]);
     }
 
+    #[tokio::test]
+    async fn run_sync_excludes_a_pending_retry_also_labeled_this_window() {
+        // A pending-retry id can also be touched by a labelsAdded/labelsRemoved
+        // event in the very window that retries it, so it appears in both
+        // `pending_retried` and `labels_touched`. It must still have its
+        // exclusion reconciled against the labels the retry fetch returns.
+        // This does not pin that the reconcile runs only once:
+        // `reconcile_label_exclusion` is idempotent (a second call finds the
+        // record already excluded for the same labels and pushes no action),
+        // so a duplicate call is unobservable here.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_pending(&output_dir, &["m1"]);
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "labelsAdded": [
+                            {"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["SPAM"]},
+                        ],
+                    }],
+                    "historyId": "200",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Not `mount_raw_get` (hardcoded to `labelIds: ["INBOX"]`): the
+        // retry fetch is what tells this run m1 now carries SPAM — the
+        // labelsAdded event above only proves the label was added, not
+        // what else is currently set (m1 was never archived by an earlier
+        // run, so there's no prior manifest label set to merge onto).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "labelIds": ["INBOX", "SPAM"],
+                    "internalDate": "1700000000000",
+                    "historyId": "500",
+                    "raw": raw_message_body("m1", "Retried and spammed"),
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        let deleted_count = report
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::Deleted { id } if id == "m1"))
+            .count();
+        assert_eq!(
+            deleted_count, 1,
+            "the retried id must be soft-deleted as excluded"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_some());
+        assert_eq!(record.excluded_labels, ["SPAM"]);
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
     // ── --dry-run ──────────────────────────────────────────────────────
 
     #[tokio::test]
