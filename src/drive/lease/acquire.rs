@@ -192,14 +192,17 @@ pub async fn acquire(
 }
 
 /// How many backups [`take_pinned_backup`] takes before a version-sandwich
-/// refusal stands (issue #1739). Whether `files.copy` itself bumps the
-/// *source* file's `version` is undocumented, and Drive defines `version`
-/// as reflecting "every change made to the file on the server, even those
-/// not visible to the user" — so a one-off bump unrelated to any edit is
-/// plausible. Retrying lets that self-heal after the prompt has already
-/// been answered, rather than handing the operator a refusal that reads
-/// exactly like a collaborator's edit. Deliberately small: every attempt
-/// is a full `files.copy` (or download) plus two metadata reads.
+/// refusal stands (issue #1739). Drive defines `version` as reflecting
+/// "every change made to the file on the server, even those not visible to
+/// the user", so a one-off bump unrelated to any edit is plausible.
+/// `files.copy` itself is not one: whether it bumps the *source* file's
+/// `version` is undocumented, but a live acquire on 2026-09-19 left both a
+/// Doc (11) and a Sheet (24) unmoved across the copy, and after it — so the
+/// sandwich converges on a quiet native document in one attempt. Retrying
+/// lets any other stray bump self-heal after the prompt has already been
+/// answered, rather than handing the operator a refusal that reads exactly
+/// like a collaborator's edit. Deliberately small: every attempt is a full
+/// `files.copy` (or download) plus two metadata reads.
 const SANDWICH_ATTEMPTS: u32 = 3;
 
 /// The pause between two sandwich attempts — long enough for a transient
