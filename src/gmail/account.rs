@@ -18,8 +18,8 @@ use crate::utils::env::EnvSource;
 use crate::utils::settings::GmailSettings;
 
 /// Selects the active Gmail account for every command, mirroring
-/// `OMNI_DEV_PROFILE`. Propagated by the global `--account` flag in
-/// `Cli::propagate_global_flags`.
+/// `OMNI_DEV_PROFILE`. Propagated by the `gmail`-scoped `--account` flag in
+/// `GmailCommand::execute`.
 pub const GMAIL_ACCOUNT_ENV: &str = "OMNI_DEV_GMAIL_ACCOUNT";
 
 /// Returns the account named by [`GMAIL_ACCOUNT_ENV`] in `raw`, or `None`

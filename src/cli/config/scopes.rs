@@ -25,6 +25,10 @@ pub struct ScopesCommand {
     /// Scopes subcommand to execute.
     #[command(subcommand)]
     pub command: ScopesSubcommands,
+
+    /// `-C/--repo`, inherited by every scopes subcommand.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 /// Scopes subcommands.
@@ -40,8 +44,10 @@ pub enum ScopesSubcommands {
 }
 
 impl ScopesCommand {
-    /// Executes the scopes command.
-    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+    /// Executes the scopes command, resolving `-C/--repo` once
+    /// (`None` = current working directory) for its leaves.
+    pub fn execute(self) -> Result<()> {
+        let repo = self.repo.path();
         match self.command {
             ScopesSubcommands::Usage(usage_cmd) => usage_cmd.execute(repo),
             ScopesSubcommands::Lint(cmd) => cmd.execute(repo),
@@ -843,8 +849,11 @@ mod tests {
                 output: OutputFormat::Text,
                 context_dir: None,
             }),
+            repo: crate::cli::repo_arg::RepoArg {
+                repo: Some("/nonexistent/repo/path".into()),
+            },
         };
-        let result = cmd.execute(Some(Path::new("/nonexistent/repo/path")));
+        let result = cmd.execute();
         assert!(result.is_err());
     }
 

@@ -76,19 +76,17 @@ pub enum WorktreesSubcommands {
 impl WorktreesCommand {
     /// Executes the worktrees command.
     ///
-    /// `repo` is the global `-C/--repo` location, resolved once in [`crate::cli`]
-    /// and threaded down rather than re-read from the ambient CWD. Only `rebase`
-    /// and `push` use it (they are the subcommands that act on the local
-    /// repository); the daemon-client subcommands address worktrees by absolute
-    /// path instead.
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+    /// Only `rebase` and `push` take `-C/--repo` (they are the subcommands that
+    /// act on the local repository); the daemon-client subcommands address
+    /// worktrees by absolute path instead, so they reject it.
+    pub async fn execute(self) -> Result<()> {
         match self.command {
             WorktreesSubcommands::List(cmd) => cmd.execute().await,
             WorktreesSubcommands::Tree(cmd) => cmd.execute().await,
             WorktreesSubcommands::Focus(cmd) => cmd.execute().await,
             WorktreesSubcommands::Close(cmd) => cmd.execute().await,
-            WorktreesSubcommands::Rebase(cmd) => cmd.execute(repo).await,
-            WorktreesSubcommands::Push(cmd) => cmd.execute(repo).await,
+            WorktreesSubcommands::Rebase(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Push(cmd) => cmd.execute().await,
             WorktreesSubcommands::MergeQueue(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reposition(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reload(cmd) => cmd.execute().await,
@@ -393,12 +391,19 @@ pub struct RebaseCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
     pub output: TableOrJson,
+    /// `-C/--repo`: the repository whose worktrees `--all` selects.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 impl RebaseCommand {
     /// Executes the rebase command, confirming interactively via stdin.
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
-        self.execute_with(repo, confirm_rebase).await
+    ///
+    /// `-C/--repo` is resolved once here and threaded explicitly into
+    /// `execute_with` rather than re-read from the ambient CWD.
+    pub async fn execute(self) -> Result<()> {
+        let repo = self.repo.repo.clone();
+        self.execute_with(repo.as_deref(), confirm_rebase).await
     }
 
     /// The rebase core, with the confirm decision injected as
@@ -699,12 +704,19 @@ pub struct PushCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
     pub output: TableOrJson,
+    /// `-C/--repo`: the repository whose worktrees `--all` selects.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 impl PushCommand {
     /// Executes the push command, confirming interactively via stdin.
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
-        self.execute_with(repo, confirm_push).await
+    ///
+    /// `-C/--repo` is resolved once here and threaded explicitly into
+    /// `execute_with` rather than re-read from the ambient CWD.
+    pub async fn execute(self) -> Result<()> {
+        let repo = self.repo.repo.clone();
+        self.execute_with(repo.as_deref(), confirm_push).await
     }
 
     /// The push core, with the confirm decision injected as
@@ -2049,7 +2061,7 @@ mod tests {
                 socket: Some(sock),
             }),
         };
-        cmd.execute(None).await.unwrap();
+        cmd.execute().await.unwrap();
         server.await.unwrap();
     }
 
@@ -3060,7 +3072,7 @@ mod tests {
                 socket: Some(PathBuf::from("/nonexistent/omni-dev-route.sock")),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
 
@@ -3073,7 +3085,7 @@ mod tests {
                 ..rebase_cmd()
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
 
@@ -3086,7 +3098,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3106,7 +3118,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3124,7 +3136,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3142,7 +3154,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3156,7 +3168,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3170,7 +3182,7 @@ mod tests {
                 socket: Some(sock),
             }),
         }
-        .execute(None)
+        .execute()
         .await
         .unwrap();
         server.await.unwrap();
@@ -3249,6 +3261,7 @@ mod tests {
             keep_conflicts: false,
             yes: false,
             output: TableOrJson::Table,
+            repo: crate::cli::repo_arg::RepoArg::default(),
         }
     }
 
@@ -3841,7 +3854,7 @@ mod tests {
                 socket: Some(sock),
             }),
         };
-        cmd.execute(None).await.unwrap();
+        cmd.execute().await.unwrap();
         server.await.unwrap();
     }
 
@@ -4322,6 +4335,7 @@ mod tests {
             dry_run: false,
             yes: false,
             output: TableOrJson::Table,
+            repo: crate::cli::repo_arg::RepoArg::default(),
         }
     }
 

@@ -322,10 +322,10 @@ fn binary_config_models_show_succeeds() {
 fn binary_config_scopes_lint_reports_a_clean_run() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            env!("CARGO_MANIFEST_DIR"),
             "config",
             "scopes",
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
             "lint",
             "-o",
             "json",
@@ -392,10 +392,10 @@ fn binary_config_scopes_lint_project_only_matters() {
 
     let default_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            p.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            p.to_str().unwrap(),
             "lint",
             "-o",
             "json",
@@ -412,10 +412,10 @@ fn binary_config_scopes_lint_project_only_matters() {
 
     let no_project_only_run = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            p.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            p.to_str().unwrap(),
             "lint",
             "--no-project-only",
             "-o",
@@ -715,9 +715,7 @@ async fn cli_execute_dispatches_git_commit_message_view() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        repo: None,
         profile: None,
-        instance: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Commit(CommitCommand {
                 command: CommitSubcommands::Message(MessageCommand {
@@ -726,6 +724,7 @@ async fn cli_execute_dispatches_git_commit_message_view() {
                     }),
                 }),
             }),
+            repo: omni_dev::cli::repo_arg::RepoArg::default(),
         }),
     };
     let _ = cli.execute().await;
@@ -749,9 +748,7 @@ async fn cli_execute_dispatches_git_commit_message_lint() {
     use omni_dev::data::check::OutputFormat;
 
     let cli = Cli {
-        repo: None,
         profile: None,
-        instance: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Commit(CommitCommand {
                 command: CommitSubcommands::Message(MessageCommand {
@@ -771,6 +768,7 @@ async fn cli_execute_dispatches_git_commit_message_lint() {
                     }),
                 }),
             }),
+            repo: omni_dev::cli::repo_arg::RepoArg::default(),
         }),
     };
     let result = cli.execute().await;
@@ -785,13 +783,12 @@ async fn cli_execute_dispatches_git_branch_info() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        repo: None,
         profile: None,
-        instance: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Branch(BranchCommand {
                 command: BranchSubcommands::Info(InfoCommand { base_branch: None }),
             }),
+            repo: omni_dev::cli::repo_arg::RepoArg::default(),
         }),
     };
     let _ = cli.execute().await;
@@ -808,9 +805,7 @@ async fn cli_execute_dispatches_claude_wrap() {
     // reach the terminal check or `std::process::exit`. That makes it the only
     // way to exercise the dispatch arm from a test at all.
     let cli = Cli {
-        repo: None,
         profile: None,
-        instance: None,
         command: Commands::ClaudeWrap(ClaudeWrapCommand {
             socket: None,
             argv: Vec::new(),
@@ -826,9 +821,7 @@ async fn cli_execute_dispatches_ai_chat() {
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
-        repo: None,
         profile: None,
-        instance: None,
         command: Commands::Ai(AiCommand {
             command: AiSubcommands::Chat(ChatCommand {
                 ai: omni_dev::cli::ai_backend_args::AiBackendArgs::default(),
@@ -930,9 +923,9 @@ async fn check_execute_constructs_env_configured_client() {
 
     let output = hermetic_ai_cmd(home.path(), &server.uri())
         .args([
+            "git",
             "-C",
             repo.repo_path.to_str().unwrap(),
-            "git",
             "commit",
             "message",
             "check",
@@ -963,9 +956,9 @@ async fn twiddle_execute_constructs_env_configured_client() {
 
     let output = hermetic_ai_cmd(home.path(), &server.uri())
         .args([
+            "git",
             "-C",
             repo.repo_path.to_str().unwrap(),
-            "git",
             "commit",
             "message",
             "twiddle",
@@ -1002,9 +995,9 @@ async fn create_pr_execute_runs_pr_preflight() {
     // PR preflight is exercised and the command exits non-zero.
     let output = hermetic_ai_cmd(home.path(), &server.uri())
         .args([
+            "git",
             "-C",
             repo.repo_path.to_str().unwrap(),
-            "git",
             "branch",
             "create",
             "pr",
@@ -1480,9 +1473,9 @@ fn worktree_add_records_branch_and_commit() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             repo.repo_path.to_str().unwrap(),
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1532,9 +1525,9 @@ fn worktree_remove_records_recovery_fields_and_is_queryable() -> Result<()> {
     assert!(run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1551,9 +1544,9 @@ fn worktree_remove_records_recovery_fields_and_is_queryable() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "remove",
             "--force",
@@ -1611,9 +1604,9 @@ fn worktree_list_output_json_is_machine_readable() -> Result<()> {
     assert!(run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1627,9 +1620,9 @@ fn worktree_list_output_json_is_machine_readable() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "list",
             "--output-json",
@@ -1664,9 +1657,9 @@ fn worktree_prune_records_pruned_paths() -> Result<()> {
     assert!(run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1682,7 +1675,7 @@ fn worktree_prune_records_pruned_paths() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
-            "--repo", &repo_path, "git", "worktree", "prune", "--expire", "now",
+            "git", "--repo", &repo_path, "worktree", "prune", "--expire", "now",
         ],
     );
     assert!(
@@ -1736,9 +1729,9 @@ fn worktree_move_records_from_to_and_branch() -> Result<()> {
     assert!(run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1752,9 +1745,9 @@ fn worktree_move_records_from_to_and_branch() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "move",
             wt.to_str().unwrap(),
@@ -1800,9 +1793,9 @@ fn worktree_repair_relinks_a_manually_moved_worktree() -> Result<()> {
     assert!(run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "add",
             wt.to_str().unwrap(),
@@ -1820,9 +1813,9 @@ fn worktree_repair_relinks_a_manually_moved_worktree() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "repair",
             wt2.to_str().unwrap(),
@@ -1846,9 +1839,9 @@ fn worktree_repair_relinks_a_manually_moved_worktree() -> Result<()> {
     let out = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "list",
             "--output-json",
@@ -1885,9 +1878,9 @@ fn worktree_list_plain_and_porcelain_record_count() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "list",
             "--porcelain",
@@ -1914,9 +1907,9 @@ fn worktree_failures_still_record() -> Result<()> {
     let output = run_with_log(
         &log,
         &[
+            "git",
             "--repo",
             &repo_path,
-            "git",
             "worktree",
             "remove",
             missing.to_str().unwrap(),
@@ -1940,7 +1933,7 @@ fn worktree_failures_still_record() -> Result<()> {
     // A spawn failure: with an empty PATH git cannot be found; the record
     // carries the spawn error and no exit code.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
-        .args(["--repo", &repo_path, "git", "worktree", "list"])
+        .args(["git", "--repo", &repo_path, "worktree", "list"])
         .env("OMNI_DEV_LOG_FILE", &log)
         .env("PATH", "")
         .output()
@@ -1999,10 +1992,10 @@ scopes:
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "--project-only",
             "-o",
@@ -2048,10 +2041,10 @@ fn binary_config_scopes_usage_empty_range_exits_zero() -> Result<()> {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "HEAD..HEAD",
             "-o",
@@ -2085,10 +2078,10 @@ fn binary_config_scopes_usage_reads_true_first_line_not_folded_paragraph() -> Re
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "-o",
             "json",
@@ -2151,10 +2144,10 @@ fn binary_config_scopes_usage_excludes_merge_commits() -> Result<()> {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "-o",
             "json",
@@ -2199,10 +2192,10 @@ scopes:
     // Without --project-only, `lib` is an accepted ecosystem default.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "-o",
             "json",
@@ -2225,10 +2218,10 @@ scopes:
     // With --project-only, `lib` is absent from scopes.yaml, so it's unknown.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args([
-            "--repo",
-            repo.repo_path.to_str().unwrap(),
             "config",
             "scopes",
+            "--repo",
+            repo.repo_path.to_str().unwrap(),
             "usage",
             "--project-only",
             "-o",

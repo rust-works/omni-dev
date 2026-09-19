@@ -32,6 +32,10 @@ pub struct JiraCommand {
     /// The JIRA subcommand to execute.
     #[command(subcommand)]
     pub command: JiraSubcommands,
+
+    /// `--instance`, inherited by every JIRA subcommand.
+    #[command(flatten)]
+    pub instance: super::InstanceArg,
 }
 
 /// JIRA subcommands.
@@ -86,6 +90,7 @@ pub enum JiraSubcommands {
 impl JiraCommand {
     /// Executes the JIRA command.
     pub async fn execute(self) -> Result<()> {
+        self.instance.apply();
         match self.command {
             JiraSubcommands::Read(cmd) => cmd.execute().await,
             JiraSubcommands::Write(cmd) => cmd.execute().await,
@@ -129,6 +134,7 @@ mod tests {
                 fields: vec![],
                 all_fields: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Read(_)));
     }
@@ -147,6 +153,7 @@ mod tests {
                 force: false,
                 dry_run: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Write(_)));
     }
@@ -157,6 +164,7 @@ mod tests {
             command: JiraSubcommands::Edit(edit::EditCommand {
                 key: "PROJ-1".to_string(),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Edit(_)));
     }
@@ -173,6 +181,7 @@ mod tests {
                 set_fields: vec![],
                 dry_run: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Create(_)));
     }
@@ -188,6 +197,7 @@ mod tests {
                 limit: 50,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Search(_)));
     }
@@ -204,6 +214,7 @@ mod tests {
                     comment: None,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Transition(_)));
     }
@@ -218,6 +229,7 @@ mod tests {
                     limit: 0,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Comment(_)));
     }
@@ -230,6 +242,7 @@ mod tests {
                 force: true,
                 dry_run: false,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Delete(_)));
     }
@@ -244,6 +257,7 @@ mod tests {
                 summary: false,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Dev(_)));
     }
@@ -257,6 +271,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Project(_)));
     }
@@ -270,6 +285,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Field(_)));
     }
@@ -285,6 +301,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Board(_)));
     }
@@ -300,6 +317,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Sprint(_)));
     }
@@ -312,6 +330,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Link(_)));
     }
@@ -324,6 +343,7 @@ mod tests {
                 limit: 50,
                 output: OutputFormat::Table,
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Changelog(_)));
     }
@@ -338,6 +358,7 @@ mod tests {
                     filter: None,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Attachment(_)));
     }
@@ -351,6 +372,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Watcher(_)));
     }
@@ -365,6 +387,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Worklog(_)));
     }
@@ -379,6 +402,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::User(_)));
     }
@@ -396,6 +420,7 @@ mod tests {
                     output: OutputFormat::Table,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Version(_)));
     }
@@ -434,6 +459,7 @@ mod tests {
                     output: OutputFormat::Yaml,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(cmd.execute().await.is_ok());
     }
@@ -461,6 +487,7 @@ mod tests {
                     labels: vec!["backend".to_string()],
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(cmd.execute().await.is_ok());
     }
@@ -494,6 +521,7 @@ mod tests {
                     output: OutputFormat::Yaml,
                 }),
             }),
+            instance: crate::cli::atlassian::InstanceArg::default(),
         };
         assert!(cmd.execute().await.is_ok());
     }
