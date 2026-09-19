@@ -10,7 +10,7 @@
 //! (issue #821) and the per-module env mutexes (#950, #1030) were fighting
 //! over: a test that constructs its own [`EnvSource`] never touches process
 //! env, so it needs no lock and runs fully in parallel. See
-//! [STYLE-0027](../../docs/STYLE_GUIDE.md) and `docs/plan/issue-1030-env-di.md`.
+//! [STYLE-0028](../../docs/STYLE_GUIDE.md) and `docs/plan/issue-1030-env-di.md`.
 //!
 //! `EnvSource` abstracts the **raw** environment only. The
 //! settings.json fallback layer composes on top of it — see
