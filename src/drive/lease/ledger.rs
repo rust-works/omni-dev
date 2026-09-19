@@ -473,14 +473,8 @@ const LEASE_LOCK_WAIT_ENV_VAR: &str = "OMNI_DEV_LEASE_LOCK_WAIT_SECS";
 /// tuned up. The ×4 headroom covers a restore's several sequential calls
 /// against one read-timeout budget.
 pub(super) fn default_lock_wait_timeout() -> Duration {
-    crate::utils::settings::get_env_var(LEASE_LOCK_WAIT_ENV_VAR)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map_or_else(
-            || crate::utils::http::read_timeout() * 4,
-            Duration::from_secs,
-        )
+    let raw = crate::utils::settings::get_env_var(LEASE_LOCK_WAIT_ENV_VAR).ok();
+    crate::utils::http::duration_from_secs(raw, crate::utils::http::read_timeout() * 4)
 }
 
 /// The backoff before the second attempt on a busy lock; each further busy

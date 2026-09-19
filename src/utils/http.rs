@@ -79,8 +79,11 @@ pub(crate) fn read_timeout() -> Duration {
 /// immediately, so it is treated as unset rather than honoured. Pure so it
 /// is unit-testable without mutating the process environment; shared by
 /// [`connect_timeout`] and [`read_timeout`] since both need the identical
-/// parse-or-fall-back rule, just against different defaults.
-fn duration_from_secs(raw: Option<String>, default: Duration) -> Duration {
+/// parse-or-fall-back rule, just against different defaults. `pub(crate)`
+/// rather than private: `drive::lease::ledger::default_lock_wait_timeout`
+/// needs the identical rule for its own env override and reuses this
+/// rather than re-deriving it.
+pub(crate) fn duration_from_secs(raw: Option<String>, default: Duration) -> Duration {
     raw.and_then(|v| v.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map_or(default, Duration::from_secs)
